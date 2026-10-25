@@ -3,7 +3,8 @@
  *
  * For each file, re-extracts and resolves:
  *   - USAGE edges: ordinary identifier references to registered symbols
- *   - CALL_REFERENCE edges: explicit callable-reference syntax (not invocations)
+ *   - CALL_REFERENCE edges: explicit callable-reference syntax (not
+ * invocations)
  *   - THROWS/RAISES edges: exception types
  *   - READS/WRITES edges: variable read/write access patterns
  *
@@ -12,18 +13,18 @@
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
-#include "foundation/constants.h"
-#include "foundation/str_util.h" // cbm_json_escape
-#include "pipeline/pipeline.h"
-#include "pipeline/pipeline_internal.h"
-#include "pipeline/lsp_resolve.h"
-#include "pipeline/pass_lsp_cross.h"
-#include "graph_buffer/graph_buffer.h"
-#include "foundation/log.h"
+#include "cbm.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include "foundation/limits.h"
-#include "cbm.h"
+#include "foundation/log.h"
+#include "foundation/str_util.h" // cbm_json_escape
+#include "graph_buffer/graph_buffer.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,8 +49,9 @@ uint64_t cbm_pipeline_lsp_reference_lookup_test_rows_examined(void) {
 #endif
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
- * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
- * so same-module resolution keys against the directory-based def-node QNs. */
+ * (Java/Go package). MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c) so same-module resolution keys against the
+ * directory-based def-node QNs. */
 static bool pu_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
@@ -99,8 +101,9 @@ static const char *itoa_log(int val) {
 }
 
 /* Check if an exception name is a "checked" exception (Java-style).
- * Checked: Exception, IOException, etc. (extends Exception, not RuntimeException).
- * Simple heuristic: if name contains "Error" or "Panic", it's a runtime exception. */
+ * Checked: Exception, IOException, etc. (extends Exception, not
+ * RuntimeException). Simple heuristic: if name contains "Error" or "Panic",
+ * it's a runtime exception. */
 static bool is_checked_exception(const char *name) {
     if (!name) {
         return false;
@@ -118,15 +121,19 @@ static bool is_checked_exception(const char *name) {
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count, CBMLanguage lang) {
-    return cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result, out_keys,
-                                    out_vals, out_count);
+    int rc = cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result,
+                                      out_keys, out_vals, out_count);
+    if (rc != 0)
+        atomic_store(&ctx->resolver_failed, true);
+    return rc;
 }
 
 static void free_import_map(const char **keys, const char **vals, int count) {
     cbm_pxc_free_import_map(keys, vals, count);
 }
 
-/* Find the graph buffer node for an enclosing function QN, falling back to file node. */
+/* Find the graph buffer node for an enclosing function QN, falling back to file
+ * node. */
 static const cbm_gbuf_node_t *find_enclosing_node(cbm_pipeline_ctx_t *ctx, const char *func_qn,
                                                   const char *rel_path) {
     const cbm_gbuf_node_t *node = NULL;
@@ -177,9 +184,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         if (usage->kind == CBM_USAGE_VALUE &&
             cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel),
                                         usage->is_member_access)) {
-            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
                 &result->resolved_calls, field_index_ready ? &field_index : NULL,
-                usage->enclosing_func_qn, usage->ref_name);
+                usage->enclosing_func_qn, usage->ref_name, usage->site_start_byte,
+                usage->site_end_byte, usage->source_origin);
             char member_esc[CBM_SZ_256];
             cbm_json_escape(member_esc, sizeof(member_esc), usage->ref_name);
             char member_props[CBM_SZ_512];
@@ -372,9 +380,10 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
 
         /* C member read/write: same owner join as resolve_usage_edges. */
         if (cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel), rw->is_member_access)) {
-            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
                 &result->resolved_calls, field_index_ready ? &field_index : NULL,
-                rw->enclosing_func_qn, rw->var_name);
+                rw->enclosing_func_qn, rw->var_name, rw->site_start_byte, rw->site_end_byte,
+                rw->source_origin);
             const char *member_edge = rw->is_write ? "WRITES" : "READS";
             const CBMResolvedCall *owner;
             bool typed = false;

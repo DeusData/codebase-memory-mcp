@@ -218,6 +218,13 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
                               const char **import_names, const char **import_qns, int import_count,
                               TSTree *cached_tree, CBMResolvedCallArray *out);
 
+/* Source result preserves exact caller identity for the shared proof pass. */
+void cbm_run_kotlin_lsp_cross_with_result(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          CBMResolvedCallArray *out, const CBMFileResult *file);
+
 /* Register the curated Kotlin stdlib (kotlin.*, kotlin.collections.*, …)
  * into a registry. Implemented in lsp/generated/kotlin_stdlib_data.c. */
 void cbm_kotlin_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);

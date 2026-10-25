@@ -86,8 +86,8 @@ typedef struct {
     /* Enclosing class / struct / record / interface — the "type" body
      * we're currently inside. NULL outside type body. */
     const char *enclosing_class_qn;
-    const char *enclosing_base_qn;       /* base class QN; NULL if none */
-    const char **enclosing_iface_qns;    /* NULL-terminated; NULL if none */
+    const char *enclosing_base_qn;    /* base class QN; NULL if none */
+    const char **enclosing_iface_qns; /* NULL-terminated; NULL if none */
 
     /* Enclosing function/method/lambda. */
     const char *enclosing_func_qn;
@@ -117,8 +117,7 @@ typedef struct {
 
 /* Initialize a CSLSPContext for processing one file. */
 void cs_lsp_init(CSLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
-                 const CBMTypeRegistry *registry, const char *module_qn,
-                 CBMResolvedCallArray *out);
+                 const CBMTypeRegistry *registry, const char *module_qn, CBMResolvedCallArray *out);
 
 /* Append a using directive. local_name may be NULL/empty for non-alias kinds. */
 void cs_lsp_add_using(CSLSPContext *ctx, CBMCSUsingKind kind, const char *local_name,
@@ -140,7 +139,7 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *name);
 
 /* Look up a method on a type, walking base + interface chains. */
 const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn,
-                                           const char *method_name);
+                                          const char *method_name);
 
 /* Apply the local AST-declared return-type refinement to an already populated
  * registry. Kept as a production-used seam so post-registration signature
@@ -153,9 +152,9 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 /* Cross-file entry. Like Go/C: caller supplies pre-resolved defs from siblings. */
 void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                           const char *module_qn, CBMLSPDef *defs, int def_count,
-                           const char **using_targets, int using_count,
-                           TSTree *cached_tree, CBMResolvedCallArray *out);
+                          const char *module_qn, CBMLSPDef *defs, int def_count,
+                          const char **using_targets, int using_count, TSTree *cached_tree,
+                          CBMResolvedCallArray *out);
 
 /* Tier 2: build a project-wide C# registry ONCE from all defs (filters
  * by lang), shared READ-ONLY across resolve workers. Def-driven. */
@@ -166,6 +165,13 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         const char *module_qn, CBMTypeRegistry *reg,
                                         const char **using_targets, int using_count,
                                         TSTree *cached_tree, CBMResolvedCallArray *out);
+
+/* Exact source callers for the shared proof adapter. */
+void cbm_run_cs_lsp_cross_with_result(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, CBMTypeRegistry *reg,
+                                      const char **using_targets, int using_count,
+                                      TSTree *cached_tree, CBMResolvedCallArray *out,
+                                      const CBMFileResult *file);
 
 /* Batch cross-file entry for one CGo call from the parallel pipeline. */
 typedef struct {
@@ -180,7 +186,7 @@ typedef struct {
 } CBMBatchCSLSPFile;
 
 void cbm_batch_cs_lsp_cross(CBMArena *arena, CBMBatchCSLSPFile *files, int file_count,
-                             CBMResolvedCallArray *out);
+                            CBMResolvedCallArray *out);
 
 /* Register .NET BCL stdlib types and functions. Generated. */
 void cbm_csharp_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);

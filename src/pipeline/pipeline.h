@@ -21,6 +21,7 @@
 
 #include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
 #include "foundation/constants.h" /* CBM_SZ_512 */
+#include "resolve/model.h"
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -246,6 +247,7 @@ typedef struct {
     const char *strategy;       /* resolution strategy name */
     double confidence;          /* 0.0–1.0 */
     int candidate_count;
+    cbm_resolve_result_t proof; /* explicit binding evidence; zero means unproven */
 } cbm_resolution_t;
 
 /* Create/free a function registry. */
@@ -302,9 +304,13 @@ bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qual
 cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
                                               const char *scope_qn, const char *module_qn);
 
-/* Resolve a callee name using prioritized strategies.
- * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
- * Returns result with qualified_name="" if unresolved.
+/* Find an exact import/module binding candidate, with no short-name or suffix
+ * guesses. Import arrays have import_map_count entries; NULL/empty values are
+ * unresolved bindings and block fallback to same-named declarations. Conflicting
+ * duplicate local names are ambiguous, independent of registration order.
+ * A candidate is not an admitted edge: the consumer must validate lexical
+ * context and occurrence role, complete its proof, then use cbm_resolve_admit.
+ * qualified_name is NULL if no exact candidate was found.
  * Never returns a data relation (Table/View): relations are lineage-only
  * registry members and common table names (users, orders, config) collide with
  * code identifiers in every language, so the default resolve vetoes them

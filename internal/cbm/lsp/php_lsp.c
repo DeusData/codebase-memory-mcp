@@ -18,6 +18,7 @@
  */
 
 #include "php_lsp.h"
+#include "php_proof.h"
 #include "lsp_node_iter.h"
 #include "lsp_work.h"
 #include "../helpers.h"
@@ -506,7 +507,7 @@ const CBMType *php_parse_type_node(PHPLSPContext *ctx, TSNode node) {
 
 /* ── PHPDoc minimal parser ──────────────────────────────────────── */
 
-/* Strip leading "/**", trailing "*​/", and per-line "*" prefixes. Returns a
+/* Strip leading "/**", trailing "asterisk-slash", and per-line "*" prefixes. Returns a
  * mutable arena-allocated cleaned copy. */
 static char *phpdoc_clean(CBMArena *a, const char *raw) {
     if (!raw)
@@ -805,7 +806,7 @@ static void bind_phpdoc_var(PHPLSPContext *ctx, const char *docstring) {
 }
 
 /* Walk siblings backwards from `node` to find a leading PHPDoc comment
- * ("/**...*​/"). Returns cleaned doc text or NULL. */
+ * ("/**...asterisk-slash"). Returns cleaned doc text or NULL. */
 static char *fetch_leading_phpdoc(PHPLSPContext *ctx, TSNode node) {
     TSNode parent = ts_node_parent(node);
     if (ts_node_is_null(parent))
@@ -4623,6 +4624,10 @@ void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegi
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name; /* borrowed — d outlives this call */
             rt.short_name = d->short_name;
+            rt.project_source = true;
+            rt.source_flags = d->source_flags;
+            rt.graph_qualified_name = d->graph_qualified_name;
+            rt.declaration_identity = d->declaration_identity;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
             rt.embedded_types = php_split_pipe(arena, d->embedded_types);
             if (d->method_names_str && d->method_names_str[0]) {
@@ -4648,6 +4653,13 @@ void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegi
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name; /* borrowed */
             rf.short_name = d->short_name;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.source_flags = d->source_flags;
+            rf.graph_qualified_name = d->graph_qualified_name;
+            rf.declaration_identity = d->declaration_identity;
+            rf.min_params =
+                (d->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) ? d->signature_param_count : -1;
+            rf.sig = d->sig;
 
             const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
             PHPSignatureParseContext parse_ctx = {
@@ -4874,6 +4886,10 @@ void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, in
     }
 
     php_lsp_process_file(&ctx, root);
+    /* Refinement has finished; proof queries never observe an unindexed tail. */
+    cbm_registry_finalize_into(&reg, &idx_arena);
+    cbm_php_proof_resolve(arena, source, source_len, module_qn, root, &reg, bindings, defs,
+                          def_count, out);
     cbm_arena_destroy(&idx_arena);
 
     if (owns_tree && tree)

@@ -309,19 +309,23 @@ void cbm_rust_crates_register(CBMTypeRegistry *reg, CBMArena *arena);
 typedef struct {
     const char *qualified_name;
     const char *short_name;
-    const char *label;            /* "Function", "Method", "Type", "Trait" */
-    const char *receiver_type;    /* for methods: receiver type QN (NULL for free fns) */
-    const char *def_module_qn;    /* module QN where this def lives */
-    const char *return_types;     /* "|"-separated return type texts          */
-    const char *embedded_types;   /* "|"-separated embedded type QNs          */
-    const char *field_defs;       /* "|"-separated "name:type" pairs          */
-    const char *method_names_str; /* "|"-separated method names for traits   */
+    const char *label;                  /* "Function", "Method", "Type", "Trait" */
+    const char *receiver_type;          /* for methods: receiver type QN (NULL for free fns) */
+    const char *def_module_qn;          /* module QN where this def lives */
+    const char *return_types;           /* "|"-separated return type texts          */
+    const char *embedded_types;         /* "|"-separated embedded type QNs          */
+    const char *field_defs;             /* "|"-separated "name:type" pairs          */
+    const char *method_names_str;       /* "|"-separated method names for traits   */
     const char **signature_param_types; /* borrowed ordered parameter texts    */
     int signature_param_count;          /* positional entries; "?" is unknown */
     const char *trait_qn;               /* raw impl-trait spelling; uniquely canonicalized */
-    bool is_interface;            /* true for traits                          */
-    bool is_rust_impl_relation;   /* independent type-level impl record       */
-    bool is_abstract;             /* required trait declaration (no default)  */
+    bool is_interface;                  /* true for traits                          */
+    bool is_rust_impl_relation;         /* independent type-level impl record       */
+    bool is_abstract;                   /* required trait declaration (no default)  */
+    const char *declaration_identity;
+    const char *graph_qualified_name;
+    const char *sig;
+    uint32_t source_flags;
 } CBMRustLSPDef;
 
 /* Run cross-file resolution on a single file. */

@@ -5,6 +5,7 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
+#include "../resolve/types.h"
 #include "go_lsp.h" // for CBMLSPDef, CBMResolvedCallArray
 
 // CLSPContext holds state for C/C++ expression type evaluation within a file.
@@ -18,7 +19,17 @@ typedef struct {
      * Every refinement (lazy add, min_params, template params) goes here
      * via cbm_registry_*_for_update; nothing behind ->fallback is written. */
     CBMTypeRegistry *registry_head;
+    const CBMTypeRegistry *proof_registry; /* immutable declaration boundary */
+    struct CProofDeclaration *proof_declarations;
+    int proof_declaration_count, proof_declaration_cap;
+    struct CProofInclude *proof_includes;
+    struct CProofUsing *proof_usings;
+    int proof_using_count, proof_using_cap;
+    bool binding_failed;
+    uint32_t proof_syntax_limit; /* first unaudited syntax error; earlier complete sites survive */
+    int callable_flow_depth; /* delayed bodies cannot borrow mutable outer callable state */
     CBMScope *current_scope;
+    CBMResolveTypeMap field_types; /* explicit declaration evidence, keyed by lexical binding */
 
     // Include map: header_path -> namespace QN prefix
     const char **include_paths;
@@ -63,10 +74,8 @@ typedef struct {
     int neg_memo_cap;   // power-of-two; 0 until first insert
     int neg_memo_count; // live entries (grow by rehash at 70% load)
 
-    // Field references already emitted for this file, keyed by (enclosing
-    // function, owner type, field). The function -> Field edge needs one row
-    // per pair; a row per occurrence would cost a record for every member
-    // access in the corpus. Same uint64 hash-set shape and ownership as
+    // Field references already emitted for this file, keyed by occurrence,
+    // enclosing function, owner type and field. Same hash-set ownership as
     // neg_memo; freed at end of c_lsp_process_file.
     uint64_t *field_ref_seen;
     int field_ref_seen_cap;
@@ -92,6 +101,7 @@ typedef struct {
     const char **fp_var_names;
     const char **fp_target_qns;
     const CBMScope **fp_binding_scopes;
+    bool *fp_target_proven;
     int fp_count;
     int fp_cap;
 
@@ -235,22 +245,22 @@ bool cbm_run_c_lsp_cross_with_registry(CBMArena *arena, const char *source, int 
  * mapping/OOM failure may leave partial output that callers must discard. QNs
  * in successful output belong to the supplied output arena. Callers must
  * abort publication on false. Legacy wrappers pass NULL and retain previous behavior. */
-bool cbm_run_c_lsp_with_test_owners(
-    CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-    TSNode root, bool cpp_mode, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners);
-bool cbm_run_c_lsp_cross_with_test_owners(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    bool cpp_mode, CBMLSPDef *defs, int def_count, const char **include_paths,
-    const char **include_ns_qns, int include_count, TSTree *cached_tree,
-    CBMResolvedCallArray *out, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners);
+bool cbm_run_c_lsp_with_test_owners(CBMArena *arena, CBMFileResult *result, const char *source,
+                                    int source_len, TSNode root, bool cpp_mode,
+                                    CBMSourceOrigin source_origin,
+                                    const CBMFileResult *test_owners);
+bool cbm_run_c_lsp_cross_with_test_owners(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
+                                          int def_count, const char **include_paths,
+                                          const char **include_ns_qns, int include_count,
+                                          TSTree *cached_tree, CBMResolvedCallArray *out,
+                                          CBMSourceOrigin source_origin,
+                                          const CBMFileResult *test_owners);
 bool cbm_run_c_lsp_cross_with_registry_with_test_owners(
-    CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    bool cpp_mode, CBMTypeRegistry *reg, const char **include_paths,
-    const char **include_ns_qns, int include_count, TSTree *cached_tree,
-    CBMResolvedCallArray *out, CBMSourceOrigin source_origin,
-    const CBMFileResult *test_owners);
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    CBMSourceOrigin source_origin, const CBMFileResult *test_owners);
 
 // Register C stdlib types and functions into a registry.
 void cbm_c_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);

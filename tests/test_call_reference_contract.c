@@ -61,7 +61,10 @@ static int crc_function_count(cbm_store_t *store, const char *project, const cha
 }
 
 TEST(call_reference_typescript_direct_argument_is_exact) {
-    static const char source[] = "function handler(): void {}\n"
+    /* Explicit module scope keeps this callable-value contract independent of
+     * unsupported script loading/global namespace order. */
+    static const char source[] = "export {};\n"
+                                 "function handler(): void {}\n"
                                  "function register(callback: () => void): void {}\n"
                                  "function bootstrap(): void { register(handler); }\n";
     RProj project;
@@ -126,7 +129,10 @@ TEST(call_reference_python_use_before_local_shadow_is_not_global) {
 }
 
 TEST(call_reference_javascript_use_before_local_shadow_is_not_global) {
-    static const char source[] = "function handler() {}\n"
+    /* Explicit module scope keeps this callable-value contract independent of
+     * unsupported script loading/global namespace order. */
+    static const char source[] = "export {};\n"
+                                 "function handler() {}\n"
                                  "function accept(callback) {}\n"
                                  "function caller() {\n"
                                  "  accept(handler);\n"
@@ -146,7 +152,10 @@ TEST(call_reference_javascript_use_before_local_shadow_is_not_global) {
 }
 
 TEST(call_reference_typescript_use_before_local_shadow_is_not_global) {
-    static const char source[] = "function handler(): void {}\n"
+    /* Explicit module scope keeps this callable-value contract independent of
+     * unsupported script loading/global namespace order. */
+    static const char source[] = "export {};\n"
+                                 "function handler(): void {}\n"
                                  "function accept(callback: () => void): void {}\n"
                                  "function caller(): void {\n"
                                  "  accept(handler);\n"

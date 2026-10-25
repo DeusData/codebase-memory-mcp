@@ -4015,6 +4015,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
             // Numeric byte spans in `expanded` are not raw-source coordinates.
             int calls_before = result->calls.count;
             int usages_before = result->usages.count;
+            int rw_before = result->rw.count;
+            int typerefs_before = result->type_refs.count;
+            int typeassigns_before = result->type_assigns.count;
             int resolved_before = result->resolved_calls.count;
 
             // Parse expanded source with fresh tree
@@ -4064,6 +4067,15 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     }
                     for (int i = usages_before; i < result->usages.count; i++) {
                         result->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = rw_before; i < result->rw.count; i++) {
+                        result->rw.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = typerefs_before; i < result->type_refs.count; i++) {
+                        result->type_refs.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+                    }
+                    for (int i = typeassigns_before; i < result->type_assigns.count; i++) {
+                        result->type_assigns.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
                     }
 
                     // Also run LSP on expanded source for additional type-resolved

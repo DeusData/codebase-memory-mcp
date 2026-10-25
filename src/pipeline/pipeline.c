@@ -1,3 +1,4 @@
+#include "store/store_resolver.h"
 /*
  * pipeline.c — Indexing pipeline orchestrator.
  *
@@ -22,6 +23,8 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 7 };
 #include "pipeline/doc_links.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/shared_resolver.h"
+#include "resolve/policy.h"
 #include "pipeline/pass_ensemble_routing.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
@@ -2262,6 +2265,11 @@ static bool predump_pass_runs(const cbm_pipeline_t *p, predump_gate_t gate) {
 }
 
 /* Results are gone after resolve; so is the store. Logs what spill did. */
+static void predump_resolver(cbm_pipeline_ctx_t *ctx) {
+    if (!cbm_shared_resolver_project(ctx->gbuf))
+        atomic_store(&ctx->resolver_failed, true);
+}
+
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
@@ -2274,6 +2282,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         {predump_doclinks, "doclinks", PREDUMP_EVERY_MODE},
         {predump_route, "route_match", PREDUMP_EVERY_MODE},
         {predump_ensemble, "ensemble_routing", PREDUMP_EVERY_MODE},
+        {predump_resolver, "resolver_admission", PREDUMP_EVERY_MODE},
         {predump_sim, "similarity", PREDUMP_SKIP_FAST},
         {predump_sem, "semantic_edges", PREDUMP_FAST_DOC_CANDIDATES},
         {predump_complexity, "complexity", PREDUMP_EVERY_MODE},
@@ -2380,6 +2389,43 @@ CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, in
     return mt;
 }
 
+static int resolve_sequential_occurrences(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                          int count) {
+    ctx->shared_resolver = cbm_shared_resolver_build(ctx, files, count, ctx->result_cache);
+    if (!ctx->shared_resolver)
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    int rc = 0;
+    for (int i = 0; i < count && rc == 0; i++) {
+        bool loaded = false;
+        CBMFileResult *result =
+            cbm_pipeline_result_acquire(ctx, ctx->result_cache, i, NULL, &loaded);
+        if (!result)
+            continue;
+        const char **keys = NULL, **values = NULL;
+        int imports = 0;
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, files[i].language,
+                                 result, &keys, &values, &imports);
+        cbm_resolver_file_t input = {.ctx = ctx,
+                                     .registry = ctx->registry,
+                                     .graph = ctx->gbuf,
+                                     .output = ctx->gbuf,
+                                     .result = result,
+                                     .rel_path = files[i].rel_path,
+                                     .module_qn = result->module_qn,
+                                     .language = files[i].language,
+                                     .import_keys = keys,
+                                     .import_values = values,
+                                     .import_count = imports};
+        if (!cbm_shared_resolver_file(ctx->shared_resolver, &input))
+            rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        cbm_pxc_free_import_map(keys, values, imports);
+        cbm_pipeline_result_release(result, loaded);
+    }
+    cbm_shared_resolver_free(ctx->shared_resolver);
+    ctx->shared_resolver = NULL;
+    return rc;
+}
+
 static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                    const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -2440,6 +2486,10 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * INFRA_MAPS edges also form on the sequential path, not just the parallel
      * one. process_one_infra_binding self-creates the topic Route node when no
      * code-side dispatch created it (e.g. a standalone scheduler manifest). */
+    if (rc == 0) {
+        rc = seq_cache ? resolve_sequential_occurrences(ctx, files, file_count)
+                       : CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
     if (seq_cache && rc == 0) {
         cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, seq_cache, file_count);
         cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, seq_cache, file_count);
@@ -2680,8 +2730,15 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_log_info("pass.timing", "pass", "doc_links_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
-                              def_count, def_modules, module_def_index, &cross_registries);
+    ctx->shared_resolver = cbm_shared_resolver_build(ctx, files, file_count, cache);
+    rc = ctx->shared_resolver ? cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids,
+                                                     worker_count, all_defs, def_count, def_modules,
+                                                     module_def_index, &cross_registries)
+                              : CBM_PIPELINE_ABORT_PRESERVE_DB;
+    if (atomic_load(&ctx->resolver_failed))
+        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    cbm_shared_resolver_free(ctx->shared_resolver);
+    ctx->shared_resolver = NULL;
     cbm_doclinks_end(ctx);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
@@ -3394,6 +3451,14 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
              cbm_store_upsert_lsp_surface_batch(store, generation->surface_rows,
                                                 generation->surface_row_count) == CBM_STORE_OK;
     }
+    /* Occurrence outcomes are part of this exact graph generation. They
+     * publish atomically with it, including references that produced no edge. */
+    if (ok && generation->gbuf) {
+        size_t count = 0;
+        const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(generation->gbuf, &count);
+        ok = cbm_gbuf_resolutions_complete(generation->gbuf) &&
+             cbm_store_resolver_replace(store, generation->project, rows, count) == CBM_STORE_OK;
+    }
     if (ok && generation->adr_content) {
         ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
              CBM_STORE_OK;
@@ -3810,6 +3875,8 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                const cbm_file_info_t *files, int file_count,
                                const cbm_file_hash_t *baseline_manifest, int baseline_count) {
+    if (!cbm_shared_resolver_project(ctx->gbuf))
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
     int rc = run_tests_and_history(p, ctx, files, file_count);
     if (rc != 0) {
         return rc;
@@ -3818,6 +3885,8 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
+    if (atomic_load(&ctx->resolver_failed))
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (cbm_pipeline_persist_test_take_cancel_after_predump()) {

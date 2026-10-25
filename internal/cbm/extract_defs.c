@@ -9287,8 +9287,11 @@ static void push_var_def_qn_doc(CBMExtractCtx *ctx, const char *name, const char
     def.name = name;
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
-    def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
-                                                     qn_name ? qn_name : name, ctx->language);
+    def.qualified_name =
+        ctx->language == CBM_LANG_KOTLIN && ctx->var_parent_class
+            ? cbm_arena_sprintf(a, "%s.%s", ctx->var_parent_class, qn_name ? qn_name : name)
+            : cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, qn_name ? qn_name : name,
+                                          ctx->language);
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     /* Class-body variables record their declaring class (set by
@@ -9969,6 +9972,20 @@ static void extract_r_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
 
 // PHP variable extraction from expression_statement.
 static void extract_php_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a, const char *kind) {
+    if (strcmp(kind, "const_declaration") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode element = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(element), "const_element") != 0)
+                continue;
+            TSNode name = ts_node_child_by_field_name(element, TS_FIELD("name"));
+            if (ts_node_is_null(name))
+                name = cbm_find_child_by_kind(element, "name");
+            if (!ts_node_is_null(name))
+                push_var_def(ctx, cbm_node_text(a, name, ctx->source), element);
+        }
+        return;
+    }
     if (strcmp(kind, "expression_statement") != 0) {
         return;
     }
@@ -10679,6 +10696,31 @@ static bool yaml_is_k8s_object(CBMExtractCtx *ctx, TSNode root) {
 
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
+        return;
+    }
+
+    /* PHP's const declarations live at file/namespace scope. Do not walk
+     * into functions or classes: their declarations have different owners. */
+    if (ctx->language == CBM_LANG_PHP) {
+        TSNodeStack stack;
+        ts_nstack_init(&stack, ctx, CBM_SZ_32);
+        ts_nstack_push(&stack, root);
+        while (stack.count > 0) {
+            TSNode scope = ts_nstack_pop(&stack);
+            uint32_t count = ts_node_named_child_count(scope);
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode child = ts_node_named_child(scope, i);
+                const char *kind = ts_node_type(child);
+                if (strcmp(kind, "const_declaration") == 0 ||
+                    strcmp(kind, "expression_statement") == 0)
+                    extract_php_vars(ctx, child, ctx->arena, kind);
+                else if (strcmp(kind, "namespace_definition") == 0) {
+                    TSNode body = ts_node_child_by_field_name(child, TS_FIELD("body"));
+                    if (!ts_node_is_null(body))
+                        ts_nstack_push(&stack, body);
+                }
+            }
+        }
         return;
     }
 

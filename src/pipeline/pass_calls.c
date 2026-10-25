@@ -1,10 +1,13 @@
+#include "pipeline/import_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 /*
  * pass_calls.c — Resolve function/method calls into CALLS edges.
  *
  * For each discovered file:
  *   1. Re-extract calls (cbm_extract_file)
  *   2. Build per-file import map from IMPORTS edges in graph buffer
- *   3. Resolve each call via registry (import_map → same_module → unique → suffix)
+ *   3. Resolve each call via registry (import_map → same_module → unique →
+ * suffix)
  *   4. Create CALLS edges in graph buffer with confidence/strategy properties
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
@@ -15,19 +18,19 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
  * resolution is empty (external, unindexed client library) — see #523. */
 #define PC_SVC_PATTERN_CONF 0.5
-#include "pipeline/pipeline.h"
-#include <stdint.h>
-#include "pipeline/pipeline_internal.h"
-#include "pipeline/lsp_resolve.h"
-#include "pipeline/laravel_routing.h"
-#include "graph_buffer/graph_buffer.h"
-#include "foundation/log.h"
+#include "cbm.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/log.h"
 #include "foundation/str_util.h"
-#include "cbm.h"
+#include "graph_buffer/graph_buffer.h"
+#include "pipeline/laravel_routing.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 #include "service_patterns.h"
+#include <stdint.h>
 
 #include "foundation/compat_regex.h"
 
@@ -37,9 +40,9 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include <string.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
- * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
- * so same-module callee resolution keys against the directory-based def-node
- * QNs in the registry. */
+ * (Java/Go package). MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c) so same-module callee resolution keys against the
+ * directory-based def-node QNs in the registry. */
 static bool pc_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
@@ -93,8 +96,9 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from cached extraction result or graph buffer edges.
- * Returns parallel arrays of (local_name, module_qn) pairs. Caller frees. */
+/* Build per-file import map from cached extraction result or graph buffer
+ * edges. Returns parallel arrays of (local_name, module_qn) pairs. Caller
+ * frees. */
 /* The "local_name":"value" of a JSON properties string, as a span of it;
  * false when absent or empty. */
 static bool local_name_span_from_json(const char *props_json, const char **out, size_t *len) {
@@ -127,7 +131,29 @@ static const cbm_gbuf_node_t *pc_find_by_computed_qn(const cbm_gbuf_t *gbuf, con
 
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
+                            const char ***out_vals, int *out_count, CBMLanguage lang) {
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+        lang == CBM_LANG_ARKTS || lang == CBM_LANG_RUST) {
+        int rc = cbm_pxc_build_import_map_ex(ctx->gbuf, ctx->project_name, rel_path, lang, result,
+                                             false, out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
+    if (lang == CBM_LANG_PHP) {
+        int rc = cbm_pipeline_php_import_map(ctx->gbuf, ctx->project_name, rel_path, result,
+                                             out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
+    if (lang == CBM_LANG_PYTHON) {
+        int rc = cbm_pipeline_python_import_map(ctx->gbuf, ctx->project_name, rel_path, result,
+                                                false, out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -150,11 +176,9 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             }
             const cbm_gbuf_node_t *target =
                 cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
-            if (!target) {
-                continue;
-            }
             keys[count] = strdup(imp->local_name);
-            vals[count] = target->qualified_name; /* borrowed from gbuf */
+            /* An unresolved import still shadows an unrelated project name. */
+            vals[count] = target ? target->qualified_name : ""; /* borrowed */
             count++;
         }
         free(file_qn);
@@ -219,7 +243,13 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     return 0;
 }
 
-static void free_import_map(const char **keys, const char **vals, int count) {
+static void free_import_map(const char **keys, const char **vals, int count, CBMLanguage lang) {
+    if (lang == CBM_LANG_PYTHON || lang == CBM_LANG_PHP || lang == CBM_LANG_JAVASCRIPT ||
+        lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS ||
+        lang == CBM_LANG_RUST) {
+        cbm_pxc_free_import_map(keys, vals, count);
+        return;
+    }
     if (keys) {
         for (int i = 0; i < count; i++) {
             free((void *)keys[i]);
@@ -615,8 +645,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
-                char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                           closing brace */
+                char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or
+                                           snprintf cuts the closing brace */
                 char esc_h[CBM_SZ_512];
                 cbm_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
                 snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
@@ -658,10 +688,10 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
  * brace when one was captured. Mirrors finalize_and_emit() on the parallel path
- * so CALLS edges carry their source line regardless of resolution path. Line and
- * args here are restricted to CALLS; HTTP_CALLS / ASYNC_CALLS props are finished
- * by the parallel formatter itself (emit_http_async_edge), because route/service
- * edge props feed full-only predump passes (create_route_nodes /
+ * so CALLS edges carry their source line regardless of resolution path. Line
+ * and args here are restricted to CALLS; HTTP_CALLS / ASYNC_CALLS props are
+ * finished by the parallel formatter itself (emit_http_async_edge), because
+ * route/service edge props feed full-only predump passes (create_route_nodes /
  * create_data_flows) and must not differ between the two passes. */
 /* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
  * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
@@ -767,7 +797,8 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
         char props[CBM_SZ_512];
         snprintf(props, sizeof(props),
-                 "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
+                 "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\","
+                 "\"candidates\":%d}",
                  esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
                  res->candidate_count);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
@@ -837,13 +868,15 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         return;
     }
     if (suppress_plain_calls) {
-        return; /* weak TS/JS member-call match with an unresolved receiver (#606) */
+        return; /* weak TS/JS member-call match with an unresolved receiver (#606)
+                 */
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
+             "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\","
+             "\"candidates\":%d}",
              esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
              res->candidate_count);
     calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
@@ -868,13 +901,15 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     return src;
 }
 
-/* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
+/* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if
+ * not. */
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang,
                                const CBMImportArray *imports, const char *route_mount,
                                const cbm_php_vendor_names_t *php_vendor,
-                               cbm_external_import_index_t *ext_imports) {
+                               cbm_external_import_index_t *ext_imports,
+                               const cbm_pipeline_lsp_field_index_t *field_index) {
     const CBMResolvedCallArray *lsp_calls = &result->resolved_calls;
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
@@ -882,7 +917,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     }
 
     /* LSP-resolved calls take precedence over registry-textual matching.
-     * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
+     * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match).
+     */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
@@ -1009,10 +1045,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool arrow_bound = false;
     if ((!res.qualified_name || res.qualified_name[0] == '\0') &&
         cbm_c_arrow_member_call(lang, call->callee_name)) {
-        arrow_bound = cbm_pipeline_c_member_call_resolve(
-                          lsp_calls, NULL, ctx->gbuf, ctx->registry, ctx->project_name,
-                          call->enclosing_func_qn, call->callee_name,
-                          cbm_c_member_rule_file(lang, rel), &res) != NULL;
+        arrow_bound =
+            cbm_pipeline_c_member_call_resolve_at(
+                lsp_calls, field_index, ctx->gbuf, ctx->registry, ctx->project_name,
+                call->enclosing_func_qn, call->callee_name, cbm_c_member_rule_file(lang, rel),
+                call->site_start_byte, call->site_end_byte, call->source_origin, &res) != NULL;
     }
     /* A call that starts another program (subprocess.run, exec.Command,
      * posix_spawn): a SPAWNS edge to its Process node instead of a CALLS
@@ -1197,10 +1234,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     case CBM_FIELD_CALL_BY_OWNER:
         /* An arrow call was already bound this way above. */
         if (!arrow_bound) {
-            target_node = cbm_pipeline_c_member_call_resolve(
-                lsp_calls, NULL, ctx->gbuf, ctx->registry, ctx->project_name,
+            target_node = cbm_pipeline_c_member_call_resolve_at(
+                lsp_calls, field_index, ctx->gbuf, ctx->registry, ctx->project_name,
                 call->enclosing_func_qn, call->callee_name, cbm_c_member_rule_file(lang, rel),
-                &res);
+                call->site_start_byte, call->site_end_byte, call->source_origin, &res);
         }
         if (!target_node || source_node->id == target_node->id) {
             return 0;
@@ -1390,7 +1427,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count, files[i].language);
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -1399,13 +1436,17 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
                                                       pc_module_is_dir(files[i].language));
 
-        /* Framework mount of this file's routes (Laravel 11+ withRouting, #1146). */
+        /* Framework mount of this file's routes (Laravel 11+ withRouting, #1146).
+         */
         char route_mount[CBM_SZ_128];
         cbm_laravel_file_route_mount(ctx->repo_path, rel, files[i].language, result, route_mount,
                                      sizeof(route_mount));
 
         /* Resolve each call */
         cbm_external_import_index_t ext_imports = {0};
+        cbm_pipeline_lsp_field_index_t field_index = {0};
+        bool field_index_ready =
+            cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1414,17 +1455,19 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             total_calls++;
             if (resolve_single_call(ctx, call, result, rel, module_qn, imp_keys, imp_vals,
                                     imp_count, files[i].language, &result->imports, route_mount,
-                                    &php_vendor, &ext_imports)) {
+                                    &php_vendor, &ext_imports,
+                                    field_index_ready ? &field_index : NULL)) {
                 resolved++;
             } else {
                 unresolved++;
             }
         }
         cbm_pipeline_external_import_index_free(&ext_imports);
+        cbm_pipeline_lsp_field_index_free(&field_index);
 
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count, files[i].language);
         if (result_owned) {
             cbm_free_result(result);
         }
@@ -1445,7 +1488,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
  * creates CALLS edges from the endpoint to the dependency function.
  * Without this, FastAPI auth/DI functions appear as dead code (in_degree=0). */
 
-/* Extract Python function signature text from source starting at given line. Caller frees. */
+/* Extract Python function signature text from source starting at given line.
+ * Caller frees. */
 static char *extract_py_signature(const char *source, int start_line, int end_line) {
     int sig_end = start_line + PC_SIG_SCAN;
     if (end_line > 0 && sig_end > end_line) {
@@ -1479,7 +1523,8 @@ static char *extract_py_signature(const char *source, int start_line, int end_li
     return sig;
 }
 
-/* Scan one function's signature for Depends(func_ref) and create CALLS edges. */
+/* Scan one function's signature for Depends(func_ref) and create CALLS edges.
+ */
 static int scan_depends_in_sig(cbm_pipeline_ctx_t *ctx, const cbm_regex_t *re, const char *sig,
                                const CBMDefinition *def, const char *module_qn, const char **ik,
                                const char **iv, int ic) {
@@ -1560,7 +1605,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count,
+                         files[i].language);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
@@ -1579,7 +1625,7 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         }
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count, files[i].language);
         free(source);
     }
 

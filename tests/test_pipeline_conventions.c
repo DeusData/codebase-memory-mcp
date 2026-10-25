@@ -475,8 +475,8 @@ TEST(pipeline_conventions_required_def_modules_null_preserves_generation) {
     ASSERT_TRUE(preserved); ASSERT_TRUE(recovery); PASS();
 }
 
-/* Body-only edit: unchanged declarations, mode, config and inventory keep the
- * natural closure candidate valid. The route assertion prevents full fallback. */
+/* A body-only edit still rebuilds resolver negative dependencies. Faults must
+ * preserve the prior generation, and a retry must publish the changed body. */
 TEST(pipeline_conventions_closure_def_modules_null_preserves_generation) {
     ASSERT_EQ(pc_init_status, 0);
     pc_env_t env; pc_fixture_t f = {0}; pc_snapshot_t snapshot; char old_hash[65], new_hash[65];
@@ -496,9 +496,9 @@ TEST(pipeline_conventions_closure_def_modules_null_preserves_generation) {
         pc_c_graph(f.db, false) && pc_source_hash(f.db, new_hash) && strcmp(old_hash, new_hash) != 0;
     bool cleanup = pc_close(&f, &env);
     ASSERT_TRUE(setup); ASSERT_TRUE(control); ASSERT_TRUE(changed); ASSERT_TRUE(cleanup);
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(rc, CBM_PIPELINE_ABORT_PRESERVE_DB); ASSERT_TRUE(preserved);
-    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR); ASSERT_TRUE(recovery); PASS();
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL); ASSERT_TRUE(recovery); PASS();
 }
 
 typedef struct {

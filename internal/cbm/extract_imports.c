@@ -223,7 +223,10 @@ static void emit_py_aliased_import(CBMExtractCtx *ctx, TSNode child, const char 
     const char *local = !ts_node_is_null(alias_node) ? cbm_node_text(a, alias_node, ctx->source)
                                                      : path_last(a, name);
     const char *full = mod_prefix ? python_join_from_import(a, mod_prefix, name) : name;
-    CBMImport imp = {.local_name = local, .module_path = full};
+    CBMImport imp = {.local_name = local,
+                     .module_path = full,
+                     .kind = mod_prefix ? CBM_IMPORT_KIND_PYTHON_FROM
+                                        : CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS};
     cbm_imports_push(&ctx->result->imports, a, imp);
 }
 
@@ -239,7 +242,9 @@ static void process_py_import_stmt(CBMExtractCtx *ctx, TSNode node) {
             if (strcmp(ck, "dotted_name") == 0 || strcmp(ck, "identifier") == 0) {
                 char *mod = cbm_node_text(a, child, ctx->source);
                 if (mod && mod[0]) {
-                    CBMImport imp = {.local_name = python_import_root(a, mod), .module_path = mod};
+                    CBMImport imp = {.local_name = python_import_root(a, mod),
+                                     .module_path = mod,
+                                     .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ROOT};
                     cbm_imports_push(&ctx->result->imports, a, imp);
                 }
             } else if (strcmp(ck, "aliased_import") == 0) {
@@ -253,7 +258,9 @@ static void process_py_import_stmt(CBMExtractCtx *ctx, TSNode node) {
     } else {
         char *mod = cbm_node_text(a, name_node, ctx->source);
         if (mod && mod[0]) {
-            CBMImport imp = {.local_name = python_import_root(a, mod), .module_path = mod};
+            CBMImport imp = {.local_name = python_import_root(a, mod),
+                             .module_path = mod,
+                             .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ROOT};
             cbm_imports_push(&ctx->result->imports, a, imp);
         }
     }
@@ -281,7 +288,8 @@ static void emit_py_import_from_name(CBMExtractCtx *ctx, TSNode child, const cha
     char *name = cbm_node_text(a, child, ctx->source);
     if (name && name[0]) {
         const char *full = mod_path ? python_join_from_import(a, mod_path, name) : name;
-        CBMImport imp = {.local_name = name, .module_path = full};
+        CBMImport imp = {
+            .local_name = name, .module_path = full, .kind = CBM_IMPORT_KIND_PYTHON_FROM};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
 }
@@ -1907,15 +1915,28 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
     }
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+            TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (ts_node_is_null(body) && !ts_node_is_null(name)) {
+                const char *module = cbm_node_text(a, name, ctx->source);
+                CBMImport imp = {.local_name = module,
+                                 .module_path = module,
+                                 .kind = CBM_IMPORT_KIND_MODULE_DECLARATION};
+                cbm_imports_push(&ctx->result->imports, a, imp);
+            }
+            continue;
+        }
         if (strcmp(ts_node_type(node), "use_declaration") != 0) {
             continue;
         }
 
-        char *full = cbm_node_text(a, node, ctx->source);
+        TSNode argument = ts_node_child_by_field_name(node, TS_FIELD("argument"));
+        char *full = cbm_node_text(a, ts_node_is_null(argument) ? node : argument, ctx->source);
         if (!full) {
             continue;
         }
-        // Strip "use " prefix and trailing ";"
+        // An argument field excludes visibility (`pub use`) and its semicolon.
         if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
             full += USE_PREFIX_LEN;
         }
@@ -1924,7 +1945,12 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
             full[len - SKIP_ONE] = '\0';
         }
 
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
+        TSNode alias = ts_node_child_by_field_name(argument, TS_FIELD("alias"));
+        const char *local =
+            !ts_node_is_null(alias) && strcmp(ts_node_type(argument), "use_as_clause") == 0
+                ? cbm_node_text(a, alias, ctx->source)
+                : path_last(a, full);
+        CBMImport imp = {.local_name = local, .module_path = full};
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -2001,7 +2027,11 @@ static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
             continue;
         }
 
-        CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+        CBMImport imp = {.local_name = path_last(a, path),
+                         .module_path = path,
+                         .kind = strcmp(ts_node_type(path_node), "string_literal") == 0
+                                     ? CBM_IMPORT_KIND_INCLUDE_QUOTED
+                                     : CBM_IMPORT_KIND_INCLUDE_SYSTEM};
         cbm_imports_push(&ctx->result->imports, a, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);

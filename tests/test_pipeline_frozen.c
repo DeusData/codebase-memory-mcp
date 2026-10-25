@@ -1669,10 +1669,10 @@ TEST(pipeline_frozen_base_repairs_or_rebuilds_to_the_full_graph) {
     ASSERT_TRUE(pf_build_into(&f, NULL, base, &route));
     ASSERT_EQ(route, CBM_PIPELINE_FROZEN_ROUTE_FULL);
 
-    /* A body edit: the closure route repairs the base. */
+    /* Negative resolver dependencies require a full generation rebuild after an edit. */
     ASSERT_TRUE(pf_source_write(&f, "helper.c", "int helper(int x) { return x + 2; }\n"));
     ASSERT_TRUE(pf_build_into(&f, base, repaired, &route));
-    ASSERT_EQ(route, CBM_PIPELINE_FROZEN_ROUTE_INCREMENTAL);
+    ASSERT_EQ(route, CBM_PIPELINE_FROZEN_ROUTE_FULL);
     ASSERT_TRUE(pf_build_into(&f, NULL, full, &route));
     ASSERT_EQ(route, CBM_PIPELINE_FROZEN_ROUTE_FULL);
     unsigned char a[32], b[32], c[32];

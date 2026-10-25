@@ -6182,9 +6182,8 @@ extern const TSLanguage *tree_sitter_rust(void);
  * `module_qn` is ONLY the fallback used to qualify a def's return type when that def
  * carries no def_module_qn; pass NULL for the shared build (all_defs always carry
  * def_module_qn — verified: 0 NULL across the C + Rust kernel corpora). */
-static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
-                                         CBMRustLSPDef *defs, int def_count,
-                                         const char *module_qn) {
+static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena, CBMRustLSPDef *defs,
+                                         int def_count, const char *module_qn) {
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 
@@ -6219,6 +6218,10 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
         rt.short_name = cbm_arena_strdup(arena, d->short_name);
+        rt.project_source = true;
+        rt.source_flags = d->source_flags;
+        rt.declaration_identity = d->declaration_identity;
+        rt.graph_qualified_name = d->graph_qualified_name;
         rt.is_interface =
             d->is_interface || strcmp(d->label, "Trait") == 0 || strcmp(d->label, "Interface") == 0;
         cbm_registry_add_type(reg, rt);
@@ -6266,6 +6269,11 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             rf.qualified_name = cbm_arena_strdup(arena, d->qualified_name);
             rf.short_name = cbm_arena_strdup(arena, d->short_name);
             rf.min_params = -1;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.source_flags = d->source_flags;
+            rf.declaration_identity = d->declaration_identity;
+            rf.graph_qualified_name = d->graph_qualified_name;
+            rf.sig = d->sig;
             if (d->is_abstract) {
                 rf.flags |= CBM_FUNC_FLAG_RUST_ABSTRACT;
             }
@@ -6405,6 +6413,10 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
             rdefs[n].is_interface = defs[i].is_interface;
             rdefs[n].is_rust_impl_relation = defs[i].is_rust_impl_relation;
             rdefs[n].is_abstract = defs[i].is_abstract;
+            rdefs[n].declaration_identity = defs[i].declaration_identity;
+            rdefs[n].graph_qualified_name = defs[i].graph_qualified_name;
+            rdefs[n].sig = defs[i].sig;
+            rdefs[n].source_flags = defs[i].source_flags;
             n++;
         }
     }

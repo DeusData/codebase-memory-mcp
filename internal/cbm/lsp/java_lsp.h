@@ -31,6 +31,7 @@
 
 #include "type_rep.h"
 #include "scope.h"
+#include "../resolve/types.h"
 #include "type_registry.h"
 #include "../cbm.h"
 #include "go_lsp.h" /* CBMLSPDef, CBMResolvedCallArray reused across languages */
@@ -50,6 +51,9 @@ typedef struct {
     int source_len;
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+    CBMResolveTypeMap proven_types;
+    int proof_import_start; /* first source-AST import, excluding legacy supplied mappings */
+    bool proof_failed;
 
     /* Java package — the package declared in the file ("com.example"), or
      * empty string for the unnamed package. Stored in dotted form. */
@@ -91,6 +95,9 @@ typedef struct {
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 } JavaLSPContext;
+
+bool cbm_java_collect_source_facts(CBMArena *arena, const char *source, int source_len,
+                                   const char *module_qn, CBMLSPDef *defs, int def_count);
 
 /* ── Initialization / configuration ───────────────────────────────── */
 

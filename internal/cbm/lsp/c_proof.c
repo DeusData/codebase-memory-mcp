@@ -1,0 +1,229 @@
+#include "c_proof.h"
+#include "../callable_sig.h"
+#include "foundation/hash_table.h"
+#include <string.h>
+
+typedef struct {
+    CBMLSPDef *definition;
+    bool duplicate;
+} csp_entry_t;
+typedef struct {
+    CBMArena *arena;
+    const char *source;
+    uint32_t length, visited;
+    CBMHashTable *definitions;
+    bool failed;
+} csp_context_t;
+
+static bool csp_is(TSNode node, const char *kind) {
+    return !ts_node_is_null(node) && !strcmp(ts_node_type(node), kind);
+}
+static TSNode csp_field(TSNode node, const char *name) {
+    return ts_node_is_null(node) ? (TSNode){0}
+                                 : ts_node_child_by_field_name(node, name, (uint32_t)strlen(name));
+}
+static const char *csp_text(csp_context_t *ctx, TSNode node) {
+    if (ts_node_is_null(node))
+        return NULL;
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    return end > start && end <= ctx->length
+               ? cbm_arena_strndup(ctx->arena, ctx->source + start, end - start)
+               : NULL;
+}
+static bool csp_budget(csp_context_t *ctx, unsigned depth) {
+    if (++ctx->visited > 1000000 || depth > 128)
+        ctx->failed = true;
+    return !ctx->failed;
+}
+static csp_entry_t *csp_entry(csp_context_t *ctx, const char *qn, uint32_t line) {
+    const char *key = qn ? cbm_arena_sprintf(ctx->arena, "%u:%s", line, qn) : NULL;
+    if (!key) {
+        ctx->failed = true;
+        return NULL;
+    }
+    return cbm_ht_get(ctx->definitions, key);
+}
+static void csp_mark(csp_context_t *ctx, TSNode node, const char *qn, uint32_t flags, int arity) {
+    csp_entry_t *entry = csp_entry(ctx, qn, ts_node_start_point(node).row + 1);
+    if (!entry || entry->duplicate)
+        return;
+    entry->definition->source_flags = flags;
+    if (arity >= 0 && entry->definition->signature_param_count == arity)
+        entry->definition->source_flags |= CBM_SOURCE_DECL_FIXED_ARITY;
+}
+static TSNode csp_function_declarator(TSNode node) {
+    TSNode decl = csp_field(node, "declarator");
+    for (unsigned depth = 0; depth < 32 && !ts_node_is_null(decl); depth++) {
+        if (csp_is(decl, "function_declarator"))
+            return decl;
+        if (!csp_is(decl, "pointer_declarator") && !csp_is(decl, "reference_declarator"))
+            break;
+        decl = csp_field(decl, "declarator");
+    }
+    return (TSNode){0};
+}
+static int csp_arity(csp_context_t *ctx, TSNode declarator) {
+    TSNode params = csp_field(declarator, "parameters");
+    if (ts_node_is_null(params))
+        return -1;
+    int count = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(params);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child) || csp_is(child, "comment"))
+                continue;
+            if (!csp_budget(ctx, 0) || !csp_is(child, "parameter_declaration")) {
+                count = -1;
+                break;
+            }
+            if (ts_node_is_null(csp_field(child, "declarator"))) {
+                const char *type = csp_text(ctx, csp_field(child, "type"));
+                if (type && !strcmp(type, "void") && ts_node_named_child_count(params) == 1)
+                    continue;
+            }
+            count++;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+    return count;
+}
+static void csp_method(csp_context_t *ctx, TSNode node, const char *owner, bool is_public) {
+    TSNode decl = csp_function_declarator(node), name_node = csp_field(decl, "declarator");
+    if (!csp_is(name_node, "field_identifier") && !csp_is(name_node, "identifier"))
+        return; /* Pointer fields, operators and constructors need their own contracts. */
+    const char *name = csp_text(ctx, name_node);
+    const char *qn = name ? cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name) : NULL;
+    uint32_t flags =
+        CBM_SOURCE_DECL_KNOWN | (is_public ? CBM_SOURCE_DECL_PUBLIC : CBM_SOURCE_DECL_PRIVATE);
+    csp_mark(ctx, node, qn, flags, csp_arity(ctx, decl));
+}
+static void csp_class(csp_context_t *ctx, TSNode node, const char *parent) {
+    TSNode body = csp_field(node, "body"), name_node = csp_field(node, "name");
+    if (ts_node_is_null(body) || !csp_is(name_node, "type_identifier"))
+        return;
+    const char *name = csp_text(ctx, name_node);
+    const char *qn = name ? cbm_arena_sprintf(ctx->arena, "%s.%s", parent, name) : NULL;
+    if (!qn) {
+        ctx->failed = true;
+        return;
+    }
+    bool complete = true, is_public = csp_is(node, "struct_specifier");
+    TSTreeCursor header = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&header))
+        do {
+            TSNode child = ts_tree_cursor_current_node(&header);
+            if (csp_is(child, "base_class_clause") || csp_is(child, "attribute_specifier") ||
+                csp_is(child, "ms_declspec_modifier"))
+                complete = false;
+        } while (ts_tree_cursor_goto_next_sibling(&header));
+    ts_tree_cursor_delete(&header);
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!csp_budget(ctx, 0)) {
+                complete = false;
+                break;
+            }
+            if (!ts_node_is_named(child) || csp_is(child, "comment"))
+                continue;
+            if (csp_is(child, "access_specifier")) {
+                const char *access = csp_text(ctx, child);
+                is_public = access && !strcmp(access, "public");
+            } else if (csp_is(child, "function_definition") || csp_is(child, "field_declaration") ||
+                       csp_is(child, "declaration")) {
+                csp_method(ctx, child, qn, is_public);
+            } else {
+                complete = false;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+    csp_mark(ctx, node, qn,
+             CBM_SOURCE_DECL_KNOWN | (complete ? CBM_SOURCE_CLASS_DOMAIN_COMPLETE : 0), -1);
+}
+static void csp_walk(csp_context_t *ctx, TSNode node, const char *owner, unsigned depth) {
+    if (!csp_budget(ctx, depth))
+        return;
+    if (csp_is(node, "class_specifier") || csp_is(node, "struct_specifier")) {
+        csp_class(ctx, node, owner);
+        return;
+    }
+    if (csp_is(node, "namespace_definition")) {
+        const char *name = csp_text(ctx, csp_field(node, "name"));
+        TSNode body = csp_field(node, "body");
+        if (name && !strstr(name, "::") && !ts_node_is_null(body)) {
+            const char *qualified = cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name);
+            if (qualified)
+                csp_walk(ctx, body, qualified, depth + 1);
+            else
+                ctx->failed = true;
+        }
+        return;
+    }
+    if (!csp_is(node, "translation_unit") && !csp_is(node, "declaration_list") &&
+        !csp_is(node, "declaration"))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child))
+                csp_walk(ctx, child, owner, depth + 1);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+bool cbm_c_collect_source_facts(CBMArena *arena, const char *source, int length, const char *module,
+                                CBMLSPDef *defs, int count) {
+    if (count < 0 || (count && !defs))
+        return false;
+    for (int i = 0; i < count; i++)
+        defs[i].source_flags = 0;
+    if (!arena || !source || length <= 0 || !module)
+        return false;
+    extern const TSLanguage *tree_sitter_cpp(void);
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return false;
+    ts_parser_set_language(parser, tree_sitter_cpp());
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    ts_parser_delete(parser);
+    if (!tree)
+        return false;
+    csp_context_t ctx = {.arena = arena,
+                         .source = source,
+                         .length = (uint32_t)length,
+                         .definitions = cbm_ht_create(32)};
+    ctx.failed = !ctx.definitions || ts_node_has_error(ts_tree_root_node(tree));
+    for (int i = 0; !ctx.failed && i < count; i++) {
+        CBMLSPDef *def = &defs[i];
+        const char *qn =
+            def->graph_qualified_name ? def->graph_qualified_name : def->qualified_name;
+        if (!qn || !def->source_start_line || !def->short_name)
+            continue;
+        size_t base = cbm_qn_callable_base_len_named(qn, def->short_name);
+        const char *key =
+            cbm_arena_sprintf(arena, "%u:%.*s", def->source_start_line, (int)base, qn);
+        csp_entry_t *entry = key ? cbm_ht_get(ctx.definitions, key) : NULL;
+        if (entry) {
+            entry->duplicate = true;
+            continue;
+        }
+        entry = cbm_arena_calloc(arena, sizeof(*entry));
+        if (!key || !entry) {
+            ctx.failed = true;
+            break;
+        }
+        entry->definition = def;
+        cbm_ht_set(ctx.definitions, key, entry);
+        if (cbm_ht_get(ctx.definitions, key) != entry)
+            ctx.failed = true;
+    }
+    if (!ctx.failed)
+        csp_walk(&ctx, ts_tree_root_node(tree), module, 0);
+    if (ctx.failed)
+        for (int i = 0; i < count; i++)
+            defs[i].source_flags = 0;
+    cbm_ht_free(ctx.definitions);
+    ts_tree_delete(tree);
+    return !ctx.failed;
+}

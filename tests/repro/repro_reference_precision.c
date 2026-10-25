@@ -1313,13 +1313,12 @@ TEST(repro_python_aliased_import_function_value_is_call_reference) {
     }
     int target_node =
         rp_node_count(store, project.project, "Function", "handler", ".target.handler");
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                       "Function", "accept", ".use.accept");
-    int precise_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                          "crossArgument", "Function", "handler",
-                                          ".target.handler");
-    int ordinary_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
-                                       "Function", "handler", ".target.handler");
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                       "accept", ".use.accept");
+    int precise_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                          "Function", "handler", ".target.handler");
+    int ordinary_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument", "Function",
+                                       "handler", ".target.handler");
     int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
                                         "Function", "handler", ".target.handler");
     rh_cleanup(&project, store);
@@ -1345,11 +1344,10 @@ TEST(repro_python_alias_equal_module_leaf_targets_imported_member) {
         rh_cleanup(&project, store);
         FAIL("Python alias/module-leaf collision fixture did not produce a graph store");
     }
-    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                          "crossArgument", "Function", "handler",
-                                          ".target.handler");
-    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "target", ".target.target");
+    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                          "Function", "handler", ".target.handler");
+    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "target", ".target.target");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(correct_reference, 1);
@@ -1378,8 +1376,7 @@ static int rp_assert_python_callback_occurrence_stays_usage(const char *source,
     for (int i = 0; i < raw->usages.count; i++) {
         const CBMUsage *usage = &raw->usages.items[i];
         if (!usage->ref_name || strcmp(usage->ref_name, "callback") != 0 ||
-            !usage->enclosing_func_qn ||
-            !rp_qn_ends_with(usage->enclosing_func_qn, caller) ||
+            !usage->enclosing_func_qn || !rp_qn_ends_with(usage->enclosing_func_qn, caller) ||
             usage->site_start_byte != site_start || usage->site_end_byte != site_end)
             continue;
         if (usage->kind == CBM_USAGE_VALUE)
@@ -1418,13 +1415,13 @@ static int rp_assert_python_imported_callback_fails_closed(const char *source) {
         rh_cleanup(&project, store);
         FAIL("Python module-binding fixture did not produce a graph store");
     }
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                       "Function", "accept", ".use.accept");
-    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                         "crossArgument", NULL, NULL, NULL);
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "handler",
-                                           ".target.handler");
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                       "accept", ".use.accept");
+    int total_references =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", NULL, NULL, NULL);
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "handler", ".target.handler");
     int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
                                         "Function", "handler", ".target.handler");
     rh_cleanup(&project, store);
@@ -1437,8 +1434,7 @@ static int rp_assert_python_imported_callback_fails_closed(const char *source) {
 }
 
 static int rp_assert_python_exact_reference_occurrence(const char *filename, const char *source,
-                                                       const char *marker,
-                                                       const char *site_text,
+                                                       const char *marker, const char *site_text,
                                                        const char *ref_name) {
     CBMFileResult *raw = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "repro",
                                           filename, 0, NULL, NULL);
@@ -1479,8 +1475,8 @@ static int rp_assert_python_exact_reference_occurrence(const char *filename, con
     const CBMResolvedCall *joined =
         carrier ? cbm_pipeline_find_lsp_reference(&raw->resolved_calls, carrier, false) : NULL;
     bool carrier_is_candidate = carrier && carrier->may_be_call_reference;
-    bool exact_join = joined && joined->kind == CBM_RESOLVED_CALL_REFERENCE &&
-                      joined->callee_qn && rp_qn_ends_with(joined->callee_qn, ".handler");
+    bool exact_join = joined && joined->kind == CBM_RESOLVED_CALL_REFERENCE && joined->callee_qn &&
+                      rp_qn_ends_with(joined->callee_qn, ".handler");
     cbm_free_result(raw);
 
     ASSERT_EQ(carrier_count, 1);
@@ -1488,8 +1484,7 @@ static int rp_assert_python_exact_reference_occurrence(const char *filename, con
     ASSERT_EQ(target_reference_rows, 1);
     ASSERT_EQ(target_invocation_rows, 0);
     ASSERT_TRUE(exact_join);
-    return rp_assert_exact_function_value_reference(filename, source, CBM_LANG_PYTHON,
-                                                    "Function");
+    return rp_assert_exact_function_value_reference(filename, source, CBM_LANG_PYTHON, "Function");
 }
 
 TEST(repro_python_module_walrus_shadow_fails_closed) {
@@ -1588,12 +1583,12 @@ TEST(repro_python_read_before_local_assignment_has_no_graph_reference) {
         rh_cleanup(&project, store);
         FAIL("Python read-before-write fixture did not produce a graph store");
     }
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "argument", "Function",
-                                       "accept", NULL);
-    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE", "argument",
-                                         NULL, NULL, NULL);
-    int fabricated_call = rp_edge_count(store, project.project, "CALLS", "argument", "Function",
-                                        "handler", NULL);
+    int registrar_call =
+        rp_edge_count(store, project.project, "CALLS", "argument", "Function", "accept", NULL);
+    int total_references =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "argument", NULL, NULL, NULL);
+    int fabricated_call =
+        rp_edge_count(store, project.project, "CALLS", "argument", "Function", "handler", NULL);
     rh_cleanup(&project, store);
 
     ASSERT_EQ(registrar_call, 1);
@@ -1616,12 +1611,10 @@ TEST(repro_python_local_function_shadows_imported_callable) {
         rh_cleanup(&project, store);
         FAIL("Python local-function shadow fixture did not produce a graph store");
     }
-    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                          "crossArgument", "Function", "callback",
-                                          ".use.callback");
-    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "handler",
-                                        ".target.handler");
+    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                          "Function", "callback", ".use.callback");
+    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "handler", ".target.handler");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(correct_reference, 1);
@@ -1644,12 +1637,10 @@ TEST(repro_python_alias_capture_precedes_later_import_rebinding) {
         rh_cleanup(&project, store);
         FAIL("Python ordered alias-capture fixture did not produce a graph store");
     }
-    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                          "crossArgument", "Function", "callback",
-                                          ".use.callback");
-    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "handler",
-                                        ".target.handler");
+    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                          "Function", "callback", ".use.callback");
+    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "handler", ".target.handler");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(correct_reference, 1);
@@ -1676,12 +1667,12 @@ TEST(repro_python_later_class_clears_function_value_identity) {
         rh_cleanup(&project, store);
         FAIL("Python class-rebinding fixture did not produce a graph store");
     }
-    int local_function_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                                 "crossArgument", "Function", "callback",
-                                                 ".use.callback");
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "handler",
-                                           ".target.handler");
+    int local_function_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "callback", ".use.callback");
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "handler", ".target.handler");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(local_function_reference, 0);
@@ -1707,12 +1698,11 @@ TEST(repro_python_later_wildcard_import_clears_local_function_proof) {
         rh_cleanup(&project, store);
         FAIL("Python wildcard-rebinding fixture did not produce a graph store");
     }
-    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "callback",
-                                        ".use.callback");
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "callback",
-                                           ".target.callback");
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "callback", ".use.callback");
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "callback", ".target.callback");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(local_reference, 0);
@@ -1740,12 +1730,11 @@ TEST(repro_python_decorated_local_shadow_fails_closed) {
         rh_cleanup(&project, store);
         FAIL("Python decorated-shadow fixture did not produce a graph store");
     }
-    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "callback",
-                                        ".use.callback");
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "handler",
-                                           ".target.handler");
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "callback", ".use.callback");
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "handler", ".target.handler");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(local_reference, 0);
@@ -1771,13 +1760,13 @@ TEST(repro_python_module_if_assignment_shadow_fails_closed) {
         rh_cleanup(&project, store);
         FAIL("Python conditional-assignment shadow fixture did not produce a graph store");
     }
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                       "Function", "accept", ".use.accept");
-    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                         "crossArgument", NULL, NULL, NULL);
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "handler",
-                                           ".target.handler");
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                       "accept", ".use.accept");
+    int total_references =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", NULL, NULL, NULL);
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "handler", ".target.handler");
     int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
                                         "Function", "handler", ".target.handler");
     rh_cleanup(&project, store);
@@ -1809,20 +1798,19 @@ TEST(repro_python_module_if_definition_shadow_fails_closed) {
         rh_cleanup(&project, store);
         FAIL("Python conditional-definition shadow fixture did not produce a graph store");
     }
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                       "Function", "accept", ".use.accept");
-    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                         "crossArgument", NULL, NULL, NULL);
-    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "callback",
-                                        ".use.callback");
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "handler",
-                                           ".target.handler");
-    int local_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                   "Function", "callback", ".use.callback");
-    int imported_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                      "Function", "handler", ".target.handler");
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                       "accept", ".use.accept");
+    int total_references =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", NULL, NULL, NULL);
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "callback", ".use.callback");
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "handler", ".target.handler");
+    int local_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                   "callback", ".use.callback");
+    int imported_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                      "handler", ".target.handler");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(registrar_call, 1);
@@ -1848,18 +1836,17 @@ TEST(repro_python_later_import_restores_imported_callable_identity) {
         rh_cleanup(&project, store);
         FAIL("Python later-import fixture did not produce a graph store");
     }
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                       "Function", "accept", ".use.accept");
-    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                         "crossArgument", NULL, NULL, NULL);
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "handler",
-                                           ".target.handler");
-    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "callback",
-                                        ".use.callback");
-    int imported_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
-                                       "Function", "handler", ".target.handler");
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                       "accept", ".use.accept");
+    int total_references =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", NULL, NULL, NULL);
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "handler", ".target.handler");
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "callback", ".use.callback");
+    int imported_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument", "Function",
+                                       "handler", ".target.handler");
     int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
                                         "Function", "handler", ".target.handler");
     rh_cleanup(&project, store);
@@ -1887,18 +1874,17 @@ TEST(repro_python_wildcard_then_local_function_restores_exactness) {
         rh_cleanup(&project, store);
         FAIL("Python wildcard-then-definition fixture did not produce a graph store");
     }
-    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
-                                       "Function", "accept", ".use.accept");
-    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                         "crossArgument", NULL, NULL, NULL);
-    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                        "crossArgument", "Function", "callback",
-                                        ".use.callback");
-    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                           "crossArgument", "Function", "callback",
-                                           ".target.callback");
-    int local_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
-                                    "Function", "callback", ".use.callback");
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument", "Function",
+                                       "accept", ".use.accept");
+    int total_references =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", NULL, NULL, NULL);
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                        "Function", "callback", ".use.callback");
+    int imported_reference =
+        rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument", "Function",
+                      "callback", ".target.callback");
+    int local_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument", "Function",
+                                    "callback", ".use.callback");
     int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
                                         "Function", "callback", ".use.callback");
     rh_cleanup(&project, store);
@@ -1969,11 +1955,10 @@ TEST(repro_python_annotation_only_preserves_imported_callable_identity) {
         rh_cleanup(&project, store);
         FAIL("Python annotation-only fixture did not produce a graph store");
     }
-    int precise_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
-                                          "crossArgument", "Function", "handler",
-                                          ".target.handler");
-    int ordinary_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
-                                       "Function", "handler", ".target.handler");
+    int precise_reference = rp_edge_count(store, project.project, "CALL_REFERENCE", "crossArgument",
+                                          "Function", "handler", ".target.handler");
+    int ordinary_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument", "Function",
+                                       "handler", ".target.handler");
     rh_cleanup(&project, store);
 
     ASSERT_EQ(precise_reference, 1);
@@ -2242,7 +2227,9 @@ static int rp_assert_complex_function_values_stay_usage(const char *filename, co
 }
 
 TEST(repro_javascript_complex_function_value_stays_usage) {
-    static const char source[] = "function handler() {}\n"
+    /* Use a module so this contract has an explicit namespace. */
+    static const char source[] = "export {};\n"
+                                 "function handler() {}\n"
                                  "function alternate() {}\n"
                                  "function accept(callback) {}\n"
                                  "function complex(flag) { accept(flag ? handler : alternate); }\n";
@@ -2254,7 +2241,9 @@ TEST(repro_javascript_complex_function_value_stays_usage) {
 }
 
 TEST(repro_typescript_complex_function_value_stays_usage) {
+    /* Use a module so this contract has an explicit namespace. */
     static const char source[] =
+        "export {};\n"
         "function handler(): void {}\n"
         "function alternate(): void {}\n"
         "function accept(callback: () => void): void {}\n"
@@ -2267,7 +2256,9 @@ TEST(repro_typescript_complex_function_value_stays_usage) {
 }
 
 TEST(repro_tsx_complex_function_value_stays_usage) {
+    /* Use a module so this contract has an explicit namespace. */
     static const char source[] =
+        "export {};\n"
         "function handler(): void {}\n"
         "function alternate(): void {}\n"
         "function accept(callback: () => void): void {}\n"

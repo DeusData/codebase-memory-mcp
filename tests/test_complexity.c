@@ -500,12 +500,14 @@ static bool cx_pyext_control(cbm_store_t *store, const char *project, const cbm_
         for (int i = 0; i < count; i++) {
             if (edges[i].target_id != target.id || !edges[i].properties_json)
                 continue;
-            /* an LSP resolution records an lsp_* strategy (lsp_direct here) */
+            /* Every admitted semantic edge carries the shared resolver proof rule. */
             yyjson_doc *doc =
                 yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0);
             const char *strategy =
                 doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
-            found = found || (strategy && strncmp(strategy, "lsp_", 4) == 0);
+            found = found ||
+                    (strategy && !strcmp(strategy, "shared_resolver") &&
+                     yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "resolver_rule")) > 0);
             yyjson_doc_free(doc);
         }
     }
@@ -612,10 +614,11 @@ static bool cx_pyrange_exact_control(cbm_store_t *store, const char *project,
             edges[i].properties_json
                 ? yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0)
                 : NULL;
-        /* an LSP resolution records an lsp_* strategy */
+        /* Every admitted semantic edge carries the shared resolver proof rule. */
         const char *strategy =
             doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
-        if (strategy && strncmp(strategy, "lsp_", 4) == 0)
+        if (strategy && !strcmp(strategy, "shared_resolver") &&
+            yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "resolver_rule")) > 0)
             exact++;
         yyjson_doc_free(doc);
     }

@@ -1,38 +1,43 @@
+#include "pipeline/import_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 /*
  * pass_semantic.c — Semantic edge passes: INHERITS, DECORATES, IMPLEMENTS.
  *
  * Operates on already-extracted nodes in the graph buffer:
  *   - INHERITS: Class/Interface → base class (from base_classes in extraction)
- *   - DECORATES: Function/Method → decorator function (from decorators in extraction)
- *   - IMPLEMENTS: Struct/Class → Interface (Go implicit + explicit base_classes + Rust impl)
+ *   - DECORATES: Function/Method → decorator function (from decorators in
+ * extraction)
+ *   - IMPLEMENTS: Struct/Class → Interface (Go implicit + explicit base_classes
+ * + Rust impl)
  *
- * These passes re-extract files to access base_classes, decorators, and impl_traits data
- * since that information is in CBMDefinition fields, not stored in node properties JSON.
+ * These passes re-extract files to access base_classes, decorators, and
+ * impl_traits data since that information is in CBMDefinition fields, not
+ * stored in node properties JSON.
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
-#include "foundation/constants.h"
-#include "foundation/mem_core.h"
-#include "foundation/str_util.h" // cbm_json_escape
-#include "pipeline/pipeline.h"
-#include <stdint.h>
-#include "pipeline/pipeline_internal.h"
-#include "graph_buffer/graph_buffer.h"
-#include "foundation/log.h"
+#include "callable_sig.h"
+#include "cbm.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include "foundation/limits.h"
-#include "cbm.h"
-#include "callable_sig.h"
+#include "foundation/log.h"
+#include "foundation/mem_core.h"
+#include "foundation/str_util.h" // cbm_json_escape
+#include "graph_buffer/graph_buffer.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include <stdint.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
- * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
- * so base-class / same-module resolution keys against the directory-based
- * def-node QNs. */
+ * (Java/Go package). MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c) so base-class / same-module resolution keys against
+ * the directory-based def-node QNs. */
 static bool ps_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
@@ -80,10 +85,25 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from cached extraction result or graph buffer edges. */
+/* Build per-file import map from cached extraction result or graph buffer
+ * edges. */
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
+                            const char ***out_vals, int *out_count, CBMLanguage lang) {
+    if (lang == CBM_LANG_PHP) {
+        int rc = cbm_pipeline_php_import_map(ctx->gbuf, ctx->project_name, rel_path, result,
+                                             out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
+    if (lang == CBM_LANG_PYTHON) {
+        int rc = cbm_pipeline_python_import_map(ctx->gbuf, ctx->project_name, rel_path, result,
+                                                true, out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -167,7 +187,11 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     return 0;
 }
 
-static void free_import_map(const char **keys, const char **vals, int count) {
+static void free_import_map(const char **keys, const char **vals, int count, CBMLanguage lang) {
+    if (lang == CBM_LANG_PYTHON || lang == CBM_LANG_PHP) {
+        cbm_pxc_free_import_map(keys, vals, count);
+        return;
+    }
     if (keys) {
         for (int i = 0; i < count; i++) {
             cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)keys[i]);
@@ -179,7 +203,8 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
-/* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
+/* Resolve a class/type name through the registry. Returns borrowed QN or NULL.
+ */
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
                                     const char **imp_vals, int imp_count, CBMLanguage lang) {
@@ -254,7 +279,8 @@ typedef struct {
     int64_t id;
 } go_imethod_t;
 
-/* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE edges. */
+/* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE
+ * edges. */
 static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *cls,
                                      const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
                                      int im_count) {
@@ -427,8 +453,9 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
     }
 
     /* Find candidate concrete types. In Go the type that satisfies an interface
-     * is a struct (now labelled "Struct") or a named type (labelled "Class"); both
-     * sets are checked. Each call returns a borrowed internal array (no free). */
+     * is a struct (now labelled "Struct") or a named type (labelled "Class");
+     * both sets are checked. Each call returns a borrowed internal array (no
+     * free). */
     const cbm_gbuf_node_t **classes = NULL;
     int class_count = 0;
     cbm_gbuf_find_by_label(ctx->gbuf, "Class", &classes, &class_count);
@@ -679,7 +706,8 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     }
 }
 
-/* Get extraction result from cache or re-extract. Sets *owned=true if caller must free. */
+/* Get extraction result from cache or re-extract. Sets *owned=true if caller
+ * must free. */
 static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
                                          const cbm_file_info_t *fi, bool *owned) {
     *owned = false;
@@ -775,7 +803,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count, files[i].language);
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -795,7 +823,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count, files[i].language);
         if (result_owned) {
             cbm_free_result(result);
         }

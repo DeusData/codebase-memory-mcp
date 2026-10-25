@@ -1693,7 +1693,8 @@ TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
     }
-    write_temp_file(g_tmpdir, "infra/main.tf", "module \"net\" {\n  source = \"./modules/net\"\n}\n");
+    write_temp_file(g_tmpdir, "infra/main.tf",
+                    "module \"net\" {\n  source = \"./modules/net\"\n}\n");
     write_temp_file(g_tmpdir, "infra/outputs.tf",
                     "output \"net_vpc\" {\n  value = module.net.vpc_id\n}\n");
     write_temp_file(g_tmpdir, "infra/modules/net/main.tf",
@@ -3633,7 +3634,8 @@ TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
      * added names routes to CLOSURE_REPAIR instead of a forced full
      * rebuild; the convergence assertions below are unchanged and now pin
      * the repaired graph against the same expectations. */
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Preserve the document contracts under conservative resolver generation repair. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     const char *second_project = cbm_pipeline_project_name(second);
     cbm_store_t *second_store = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(second_store);
@@ -3850,8 +3852,9 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
     }
     write_temp_file(tmp, "manifests/app.yaml",
                     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
-    write_temp_file(tmp, "hack/deploy.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
+    write_temp_file(
+        tmp, "hack/deploy.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/shinc.db", tmp);
     static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
@@ -3905,8 +3908,7 @@ static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *rout
     snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
     (void)remove(path);
     if (!legacy) {
-        *after_script =
-            k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+        *after_script = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
         *route = cbm_pipeline_incremental_test_last_route();
     }
     snprintf(path, sizeof(path), "%s/app.py", tmp);
@@ -4152,7 +4154,8 @@ static char *incremental_env_edit(bool legacy, bool dockerfile, cbm_incremental_
         return NULL;
     }
     write_temp_file(tmp, "Dockerfile",
-                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n" : "FROM alpine:3.20\nENV KEEP_D=1\n");
+                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n"
+                               : "FROM alpine:3.20\nENV KEEP_D=1\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web\n    environment:\n      OLD_C: x\n");
     write_temp_file(tmp, "compose.other.yaml",
@@ -4364,10 +4367,11 @@ TEST(incremental_release_values_edit_rebuilds) {
     write_temp_file(tmp, "kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n");
     write_temp_file(tmp, "kz/charts/app/values.yaml",
                     "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n");
-    write_temp_file(tmp, "kz/charts/app/templates/deploy.yaml",
-                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n"
-                    "  template:\n    spec:\n      containers:\n        - name: app\n"
-                    "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n");
+    write_temp_file(
+        tmp, "kz/charts/app/templates/deploy.yaml",
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n"
+        "  template:\n    spec:\n      containers:\n        - name: app\n"
+        "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/relvalues.db", tmp);
     static const char v2[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS' AND "
@@ -4616,7 +4620,8 @@ TEST(helm_render_long_key_mark_whole) {
  * assign is UNKNOWN after it: `$tag = .Values.image.tagNew` under a
  * .Capabilities test leaves no image naming the old tag. */
 TEST(helm_unknown_branch_spoils_what_it_assigns) {
-    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\", tagNew: \"2.0\"}\n";
+    static const char vals[] =
+        "image: {repository: ghcr.io/acme/app, tag: \"1.0\", tagNew: \"2.0\"}\n";
     static const char tpl[] =
         "{{- $tag := .Values.image.tag -}}\n"
         "{{- if semverCompare \">=1.29-0\" .Capabilities.KubeVersion.Version }}"
@@ -4741,9 +4746,10 @@ TEST(helm_skipped_set_of_a_call_result) {
  * through it (`set $img ...` of `index $d "image"`) reaches .Values. */
 TEST(helm_own_map_given_a_shared_one) {
     static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
-    static const char tpl[] = "{{- $d := dict -}}{{- $_ := set $d \"image\" .Values.image -}}\n"
-                              "{{- $img := index $d \"image\" -}}{{- $_ := set $img \"tag\" \"2.0\" -}}\n"
-                              "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    static const char tpl[] =
+        "{{- $d := dict -}}{{- $_ := set $d \"image\" .Values.image -}}\n"
+        "{{- $img := index $d \"image\" -}}{{- $_ := set $img \"tag\" \"2.0\" -}}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 3);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4753,10 +4759,10 @@ TEST(helm_own_map_given_a_shared_one) {
 /* A set whose target is an UNKNOWN call result (index by .Release.Name) may
  * change any map of the values: every image after it is UNKNOWN. */
 TEST(helm_set_of_an_unknown_call_result) {
-    static const char vals[] =
-        "apps: {web: {repository: ghcr.io/acme/web, tag: \"1.0\"}}\n";
-    static const char tpl[] = "{{- $_ := set (index .Values.apps .Release.Name) \"tag\" \"2.0\" }}\n"
-                              "image: \"{{ .Values.apps.web.repository }}:{{ .Values.apps.web.tag }}\"\n";
+    static const char vals[] = "apps: {web: {repository: ghcr.io/acme/web, tag: \"1.0\"}}\n";
+    static const char tpl[] =
+        "{{- $_ := set (index .Values.apps .Release.Name) \"tag\" \"2.0\" }}\n"
+        "image: \"{{ .Values.apps.web.repository }}:{{ .Values.apps.web.tag }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4794,9 +4800,10 @@ TEST(helm_skipped_set_after_redefinition) {
         "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
         "{{- $cfg = .Values.image }}{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
         "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
-    static const char kept[] = "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
-                               "{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
-                               "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    static const char kept[] =
+        "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
+        "{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
     char *got = helm_capture(vals, redefined, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4828,7 +4835,8 @@ TEST(helm_many_changed_maps_keep_reads_right) {
  * what reads it. */
 TEST(helm_define_memo_under_mutual_recursion) {
     static const char defs_src[] =
-        "{{- define \"A\" -}}{{- include \"B\" . -}}{{- $_ := set . \"tag\" \"2.0\" -}}{{- end -}}\n"
+        "{{- define \"A\" -}}{{- include \"B\" . -}}{{- $_ := set . \"tag\" \"2.0\" -}}{{- end "
+        "-}}\n"
         "{{- define \"B\" -}}{{- if false }}{{ include \"A\" . }}{{ end -}}{{- end -}}\n";
     cbm_helm_defines_t *d = cbm_helm_defines_new();
     ASSERT_NOT_NULL(d);
@@ -4919,8 +4927,8 @@ TEST(helm_render_keeps_only_its_results) {
     size_t before = cbm_arena_total(&a);
     bool ok = cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, NULL, &probe, 1);
     size_t kept = cbm_arena_total(&a) - before;
-    bool image = ok && probe.n == 1 && probe.image[0] &&
-                 strcmp(probe.image[0], "ghcr.io/acme/app:1") == 0;
+    bool image =
+        ok && probe.n == 1 && probe.image[0] && strcmp(probe.image[0], "ghcr.io/acme/app:1") == 0;
     cbm_arena_destroy(&a);
     if (doc) {
         yyjson_mut_doc_free(doc);
@@ -4968,10 +4976,9 @@ TEST(helm_render_budget_logs_its_reason) {
  * ($img) was taken of before: every image after it is UNKNOWN. */
 TEST(helm_merge_into_values_root) {
     static const char vals[] = "image: {repository: ghcr.io/acme/app}\n";
-    static const char tpl[] =
-        "{{- $img := .Values.image }}\n"
-        "{{- $_ := merge .Values (dict \"image\" (dict \"tag\" \"2.0\")) }}\n"
-        "image: \"{{ $img.repository }}:{{ $img.tag | default \"1.0\" }}\"\n";
+    static const char tpl[] = "{{- $img := .Values.image }}\n"
+                              "{{- $_ := merge .Values (dict \"image\" (dict \"tag\" \"2.0\")) }}\n"
+                              "image: \"{{ $img.repository }}:{{ $img.tag | default \"1.0\" }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 3);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4982,8 +4989,7 @@ TEST(helm_merge_into_values_root) {
  * the outer $vals (.Values.image), a nested range's own $vals aside --
  * leaves every image after it UNKNOWN. */
 TEST(helm_skipped_set_beside_a_nested_scope) {
-    static const char vals[] =
-        "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\njobs: [a]\n";
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\njobs: [a]\n";
     static const char tpl[] = "{{- $vals := .Values.image }}\n"
                               "{{- if .Capabilities.APIVersions.Has \"batch/v1\" }}\n"
                               "{{- range .Values.jobs }}{{- $vals := dict }}{{- end }}\n"
@@ -5169,10 +5175,9 @@ static const char HELM_IMAGE_VALUES[] =
  * the map above it (.Values.cfg) reaches .Values.image there: the image after
  * it is UNKNOWN. */
 TEST(helm_deep_merge_over_a_change_below) {
-    static const char tpl[] =
-        "{{- $_ := set .Values.cfg.a \"d\" .Values.image }}\n"
-        "{{- $_ := mergeOverwrite .Values.cfg (dict \"a\" (dict \"d\" (dict \"tag\" \"2.0\"))) }}\n"
-        HELM_IMAGE_LINE;
+    static const char tpl[] = "{{- $_ := set .Values.cfg.a \"d\" .Values.image }}\n"
+                              "{{- $_ := mergeOverwrite .Values.cfg (dict \"a\" (dict \"d\" (dict "
+                              "\"tag\" \"2.0\"))) }}\n" HELM_IMAGE_LINE;
     char *got = helm_capture(HELM_IMAGE_VALUES, tpl, NULL, 3);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -5207,9 +5212,9 @@ TEST(helm_and_or_with_an_unknown_operand) {
  * conditions after it -- a set there, or an assignment ($tag = ...), may run:
  * the image after it is UNKNOWN. */
 TEST(helm_later_condition_of_a_skipped_if) {
-    static const char set[] =
-        "{{- if regexMatch \"^v\" .Values.image.tag }}{{- else if set .Values.image \"tag\" \"2.0\" }}"
-        "{{- end }}\n" HELM_IMAGE_LINE;
+    static const char set[] = "{{- if regexMatch \"^v\" .Values.image.tag }}{{- else if set "
+                              ".Values.image \"tag\" \"2.0\" }}"
+                              "{{- end }}\n" HELM_IMAGE_LINE;
     char *got = helm_capture(HELM_IMAGE_VALUES, set, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -5243,9 +5248,8 @@ TEST(helm_parse_error_spoils) {
     char *got = helm_capture(HELM_IMAGE_VALUES, bad, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
-    static const char defs_src[] =
-        "{{- define \"bad\" -}}{{- $x := }}{{- end -}}\n"
-        "{{- define \"good\" -}}ok{{- end -}}\n";
+    static const char defs_src[] = "{{- define \"bad\" -}}{{- $x := }}{{- end -}}\n"
+                                   "{{- define \"good\" -}}ok{{- end -}}\n";
     cbm_helm_defines_t *d = cbm_helm_defines_new();
     ASSERT_NOT_NULL(d);
     cbm_helm_defines_add(d, "charts/app/templates/_bad.tpl", defs_src, strlen(defs_src));
@@ -5253,8 +5257,8 @@ TEST(helm_parse_error_spoils) {
     cbm_helm_defines_add(d, "charts/app/templates/bad.yaml", bad_file, strlen(bad_file));
     static const char good[] = "x: {{ include \"good\" . }}\n" HELM_IMAGE_LINE;
     static const char via_define[] = "x: {{ include \"bad\" . }}\n" HELM_IMAGE_LINE;
-    static const char via_file[] =
-        "x: {{ include (print $.Template.BasePath \"/bad.yaml\") . | sha256sum }}\n" HELM_IMAGE_LINE;
+    static const char via_file[] = "x: {{ include (print $.Template.BasePath \"/bad.yaml\") . | "
+                                   "sha256sum }}\n" HELM_IMAGE_LINE;
     char *ok = helm_capture_chart(HELM_IMAGE_VALUES, good, d, &HELM_APP, 2);
     char *by_define = helm_capture_chart(HELM_IMAGE_VALUES, via_define, d, &HELM_APP, 2);
     char *by_file = helm_capture_chart(HELM_IMAGE_VALUES, via_file, d, &HELM_APP, 2);
@@ -5276,8 +5280,9 @@ TEST(helm_captures_after_a_huge_capture) {
     size_t cap = (size_t)ITEMS * 8 + CBM_SZ_256;
     char *vals = malloc(cap);
     ASSERT_NOT_NULL(vals);
-    size_t o = (size_t)snprintf(vals, cap, "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n"
-                                            "big: [");
+    size_t o = (size_t)snprintf(vals, cap,
+                                "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n"
+                                "big: [");
     for (int i = 0; i < ITEMS; i++) {
         o += (size_t)snprintf(vals + o, cap - o, "%s{x: a}", i ? "," : "");
     }
@@ -5375,8 +5380,9 @@ static char *incremental_docker_build_keep(bool legacy, cbm_incremental_route_t 
         return NULL;
     }
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "build.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(
+        tmp, "build.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/dockerbuild.db", tmp);
     static const char builds[] =
@@ -5427,10 +5433,12 @@ TEST(incremental_second_build_declarer_keeps_the_edge) {
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_twodecl_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "a.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:1 svc\n");
-    write_temp_file(tmp, "b.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:2 svc\n");
+    write_temp_file(tmp, "a.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(tmp, "b.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:2 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/twodecl.db", tmp);
     static const char builds[] =
@@ -5799,7 +5807,8 @@ TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold) {
     cbm_pipeline_t *edited = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
     ASSERT_NOT_NULL(edited);
     ASSERT_EQ(cbm_pipeline_run(edited), 0);
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Preserve the document contracts under conservative resolver generation repair. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     cbm_pipeline_free(edited);
     th_rmtree(tmp);
     PASS();
@@ -6000,10 +6009,12 @@ static void stem_repo(const char *tmp, int fillers) {
     write_temp_file(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
     write_temp_file(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
     write_temp_file(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
-    write_temp_file(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    write_temp_file(tmp, "c/foo.c",
+                    "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
     write_temp_file(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
     write_temp_file(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
-    write_temp_file(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    write_temp_file(tmp, "ts/foo/test/a.ts",
+                    "export function stemProbeB(): number { return 2; }\n");
     write_temp_file(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
     write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
     write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
@@ -6056,7 +6067,8 @@ TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
          "C stem pair Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
          "c/foo/ Folder marked"},
-        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' "
+         "AND "
          "file_path='ts/foo.test.ts'",
          "dotted foo.test.ts Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
@@ -6235,8 +6247,9 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
                     "              value: prod\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web:1\n    build: ./web\n");
-    write_temp_file(tmp, "web/Dockerfile",
-                    "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
+    write_temp_file(
+        tmp, "web/Dockerfile",
+        "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
     write_temp_file(tmp, "web/src/server.js",
                     "const port = process.env.PORT;\nconst mode = process.env.MODE;\n");
     write_temp_file(tmp, "web/lib/conf.js", "module.exports = process.env.MODE;\n");
@@ -6246,9 +6259,9 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
     snprintf(db, sizeof(db), "%s/envjoin.db", tmp);
     static const char joins[] = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
                                 "WHERE e.type='CONFIGURES' AND s.label='EnvVar'";
-#define ENVJOIN_PAIR(key, file)                                                                    \
-    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "               \
-    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE "   \
+#define ENVJOIN_PAIR(key, file)                                                                  \
+    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "             \
+    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE " \
     "'%#env/web/" key "' AND t.file_path='" file "'"
     static const char mode_server[] = ENVJOIN_PAIR("MODE", "web/src/server.js");
     static const char mode_conf[] = ENVJOIN_PAIR("MODE", "web/lib/conf.js");
@@ -6496,7 +6509,8 @@ TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
      * target_a.ts to target_b.ts. Since alias-config governance landed this
      * runs as a closure repair, and the convergence assertions below now
      * prove that route rather than being satisfied by a full rebuild. */
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Preserve the document contracts under conservative resolver generation repair. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     const char *incremental_project = cbm_pipeline_project_name(incremental);
     cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
     ASSERT_NOT_NULL(incremental_store);
@@ -6609,7 +6623,8 @@ TEST(pipeline_publication_stamps_full_and_delta_generations) {
     cbm_pipeline_t *delta = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(delta);
     ASSERT_EQ(cbm_pipeline_run(delta), 0);
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Preserve the document contracts under conservative resolver generation repair. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     cbm_pipeline_free(delta);
     char third[128];
     ASSERT_EQ(read_published_generation(db_path, third, sizeof(third)), CBM_STORE_OK);
@@ -11155,9 +11170,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field) {
 
     /* Both namesakes must exist for the probe to mean anything. */
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     /* A bare C call never names the struct member. */
@@ -11191,9 +11206,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
     ASSERT_NOT_NULL(s);
 
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
@@ -12046,10 +12061,9 @@ TEST(pipeline_python_websocket_decorators_register_routes) {
  * counterpart of the receiver guard above: `run` is a PARAMETER, so `run()`
  * cannot be the module-level `run` and must not bind SatoriLive.run.
  *
- * The positive control is deliberately a CROSS-FILE bare call with no import,
- * so it resolves by a weak short-name strategy — one this guard could have
- * killed. Asserting a same-file (same_module) edge instead would prove nothing,
- * because no guard in this codebase touches same_module for any input.
+ * The positive control has an explicit cross-file import. An unimported
+ * namesake is an additional negative control: a global unique-name guess
+ * must never satisfy either resolver's binding contract.
  * Fewer than 50 files exercises pass_calls.c. */
 TEST(pipeline_python_bare_local_binding_suppresses_weak_edge) {
     char tmp[256];
@@ -12064,13 +12078,16 @@ TEST(pipeline_python_bare_local_binding_suppresses_weak_edge) {
                     "        return 1\n");
     write_temp_file(tmp, "helpers.py",
                     "def compute_widget_total():\n"
-                    "    return 7\n");
+                    "    return 7\n"
+                    "def unbound_widget_total():\n    return 8\n");
     write_temp_file(tmp, "gate.py",
+                    "from helpers import compute_widget_total\n"
                     "def _run_with_heavy_slot(run):\n"
                     "    return run()\n"
                     "\n"
                     "def uses_free_function():\n"
-                    "    return compute_widget_total()\n");
+                    "    return compute_widget_total()\n"
+                    "def unbound_call():\n    return unbound_widget_total()\n");
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/py_bare.db", tmp);
@@ -12086,6 +12103,7 @@ TEST(pipeline_python_bare_local_binding_suppresses_weak_edge) {
     ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "run"));
     /* POSITIVE: an unshadowed cross-file bare call survives. */
     ASSERT_TRUE(cross_file_call_exists(s, project, "uses_free_function", "compute_widget_total"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "unbound_call", "unbound_widget_total"));
     /* Tripwire: a run that emitted no edges at all would satisfy the negative
      * assertion vacuously. */
     ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
@@ -12219,14 +12237,17 @@ TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
                     "        return 2\n");
     write_temp_file(tmp, "helpers.py",
                     "def compute_widget_total():\n"
-                    "    return 7\n");
+                    "    return 7\n"
+                    "def unbound_widget_total():\n    return 8\n");
     write_temp_file(tmp, "gate.py",
+                    "from helpers import compute_widget_total\n"
                     "def _run_with_heavy_slot(run, execute):\n"
                     "    run()\n"
                     "    return execute()\n"
                     "\n"
                     "def uses_free_function():\n"
-                    "    return compute_widget_total()\n");
+                    "    return compute_widget_total()\n"
+                    "def unbound_call():\n    return unbound_widget_total()\n");
     for (int i = 0; i < 52; i++) {
         char name[64];
         char body[128];
@@ -12254,6 +12275,7 @@ TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
     ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "execute"));
     /* POSITIVE: the unshadowed cross-file bare call survives the parallel path. */
     ASSERT_TRUE(cross_file_call_exists(s, project, "uses_free_function", "compute_widget_total"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "unbound_call", "unbound_widget_total"));
     /* Tripwire against a vacuous pass. */
     ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
 
@@ -14654,7 +14676,9 @@ static bool python_module_exact_lsp_edge(cbm_store_t *store, const char *project
             yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
             const char *strategy =
                 doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
-            correct = strategy && strncmp(strategy, "lsp_", 4) == 0;
+            correct =
+                strategy && !strcmp(strategy, "shared_resolver") &&
+                yyjson_get_uint(yyjson_obj_get(yyjson_doc_get_root(doc), "resolver_rule")) > 0;
             if (doc)
                 yyjson_doc_free(doc);
         }
@@ -15015,7 +15039,8 @@ TEST(pipeline_python_namespace_admission_body_alias_and_all) {
         free(phases[i].json);
     bool cleaned = namespace_admission_finish(&fixture);
     ASSERT_TRUE(setup && wrote_all && cleaned && all_healthy && comparisons);
-    ASSERT_EQ(phases[1].route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Resolver outcomes include negative dependencies; edits rebuild this generation. */
+    ASSERT_EQ(phases[1].route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(phases[2].route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(phases[3].route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     PASS();
@@ -15382,8 +15407,8 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
                              : body);
     }
     if (written && cross_walk_stage) {
-        written = python_module_write_fixture_file(root, "memo_def.py",
-                                                    "class S:\n    def m(self):\n        return 1\n");
+        written = python_module_write_fixture_file(
+            root, "memo_def.py", "class S:\n    def m(self):\n        return 1\n");
     }
     if (written && !failure_stage) {
         written = python_module_write_fixture_file(root, "plain.py", body) &&
@@ -15448,8 +15473,10 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
         correct = project &&
                   cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
                       CBM_STORE_OK &&
-                  file_count ==
-                      (cross_walk_stage ? 2 : failure_stage ? 1 : 5) + (parallel ? 52 : 0);
+                  file_count == (cross_walk_stage ? 2
+                                 : failure_stage  ? 1
+                                                  : 5) +
+                                    (parallel ? 52 : 0);
         cbm_store_free_nodes(files, file_count);
         if (project && !failure_stage) {
             const char *modules[] = {"plain", "pkg"};
@@ -17463,14 +17490,13 @@ static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
         snprintf(local_def, sizeof(local_def), "%s.uses_local.helper", files[f]);
         snprintf(module_caller, sizeof(module_caller), "%s.uses_module", files[f]);
         snprintf(module_def, sizeof(module_def), "%s.helper", files[f]);
-        ASSERT_TRUE(
-            pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
+        ASSERT_TRUE(pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
         ASSERT_FALSE(pyn_edge(s, project, local_caller, module_def, "CALLS"));
         ASSERT_TRUE(pyn_edge(s, project, module_caller, module_def, "CALLS"));
         ASSERT_FALSE(pyn_edge(s, project, module_caller, local_def, "CALLS"));
     }
-    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper",
-                              "CALLS", "\"strategy\":\"lexical_scope\""));
+    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper", "CALLS",
+                              "\"strategy\":\"lexical_scope\""));
     ASSERT_FALSE(pyn_edge(s, project, "sa.uses_decorated", "sa.helper", "CALLS"));
     return 0;
 }
@@ -17783,9 +17809,8 @@ static int pyn_run_init_collision(int fillers) {
             const char *project = cbm_pipeline_project_name(p);
             imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
                                     "src.rowpkg.layout.Layout", "IMPORTS");
-            calls[run] =
-                pyn_edge(s, project, "tests.test_app.test_build", "src.rowpkg.layout.Layout",
-                         "CALLS");
+            calls[run] = pyn_edge(s, project, "tests.test_app.test_build",
+                                  "src.rowpkg.layout.Layout", "CALLS");
             method[run] = pyn_edge(s, project, "tests.test_app.test_build",
                                    "src.rowpkg.layout.Layout.create", "CALLS");
             cbm_store_close(s);
@@ -21350,19 +21375,20 @@ TEST(helm_parse_chart_many_dependencies) {
 
 /* ── Function Registry / Resolver tests ─────────────────────────── */
 
-TEST(registry_resolve_single_candidate) {
+TEST(registry_unique_candidate_is_diagnostic_only) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
     cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
 
-    /* Normal resolve unique name */
+    /* An unrelated unique name supplies no binding evidence. */
     cbm_resolution_t r = cbm_registry_resolve(reg, "CreateOrder", "svcC.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "svcA.handlers.CreateOrder");
+    ASSERT_NULL(r.qualified_name);
 
     /* Fuzzy resolve with unknown prefix */
     cbm_fuzzy_result_t fr =
         cbm_registry_fuzzy_resolve(reg, "unknownPkg.CreateOrder", "svcC.caller", NULL, NULL, 0);
     ASSERT_TRUE(fr.ok);
+    ASSERT_EQ(fr.result.proof.facts, 0);
     ASSERT_STR_EQ(fr.result.qualified_name, "svcA.handlers.CreateOrder");
 
     cbm_registry_free(reg);
@@ -21455,16 +21481,14 @@ TEST(registry_confidence_import_map) {
     PASS();
 }
 
-TEST(registry_confidence_import_map_suffix) {
+TEST(registry_import_descendant_guess_is_rejected) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function");
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
     cbm_resolution_t r = cbm_registry_resolve(reg, "other.Foo", "proj.pkg", keys, vals, 1);
-    ASSERT_STR_EQ(r.qualified_name, "proj.other.sub.Foo");
-    ASSERT(r.confidence > 0.80 && r.confidence <= 0.90);
-    ASSERT_STR_EQ(r.strategy, "import_map_suffix");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -21483,28 +21507,24 @@ TEST(registry_confidence_same_module) {
     PASS();
 }
 
-TEST(registry_confidence_unique_name) {
+TEST(registry_unbound_unique_name_is_rejected) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
-    ASSERT(r.confidence > 0.70 && r.confidence <= 0.80);
-    ASSERT_STR_EQ(r.strategy, "unique_name");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
 }
 
-TEST(registry_confidence_suffix_match) {
+TEST(registry_namespace_proximity_is_rejected) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
     cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
-    ASSERT(r.confidence > 0.50 && r.confidence <= 0.60);
-    ASSERT_STR_EQ(r.strategy, "suffix_match");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -21540,36 +21560,32 @@ TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
     PASS();
 }
 
-/* The true positive the gate must not eat: the project extends Calendar itself,
- * so Calendar really is in the receiver chain. */
-TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
+/* A spelling that resembles an extension owner is not a receiver type proof.
+ * A typed adapter must establish the extension's visibility and receiver. */
+TEST(registry_extension_spelling_requires_receiver_proof) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method");
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "Calendar.utcGregorian.startOfDayUTC",
                                               "HomeboxUI.Stats", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "AuthDTOs.Calendar.startOfDayUTC");
-    ASSERT_STR_EQ(r.strategy, "unique_name");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
 }
 
-/* A factory chain into a nested type: Settings.builder().putList names the only
- * putList in the project, Settings.Builder.putList, and Settings — the chain's
- * root — is in the candidate's ancestry even though the candidate's immediate
- * parent (Builder) is not spelled in the chain. The parent-only rule refused
- * 9,473 such unique-name calls on elastic/elasticsearch (v0.10.8 → v0.11.0 A/B,
- * 2026-09-16). */
-TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
+/* A factory chain requires a resolved callable and its established return
+ * type. Shared ancestry spelling cannot establish either fact. The supported
+ * positive return rule is covered by resolver_go_cross_factory_return_requires_source_annotation.
+ */
+TEST(registry_factory_chain_requires_return_type_proof) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "putList", "org.elasticsearch.common.settings.Settings.Builder.putList",
                      "Method");
 
     cbm_resolution_t r = cbm_registry_resolve(
         reg, "Settings.builder().putList", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.settings.Settings.Builder.putList");
-    ASSERT_STR_EQ(r.strategy, "unique_name");
+    ASSERT_NULL(r.qualified_name);
 
     /* The same shape through a value in between: RequestOptions.DEFAULT
      * .toBuilder().setWarningsHandler -> RequestOptions.Builder.setWarningsHandler. */
@@ -21578,8 +21594,7 @@ TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
                      "Method");
     r = cbm_registry_resolve(reg, "RequestOptions.DEFAULT.toBuilder().setWarningsHandler",
                              "org.elasticsearch.client.Rest", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name,
-                  "org.elasticsearch.client.RequestOptions.Builder.setWarningsHandler");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -21597,41 +21612,37 @@ TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
         reg, "Base64.getEncoder", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
     ASSERT_NULL(r.qualified_name);
 
-    /* Nor may a package segment admit it: Math.toIntExact must not bind
-     * org.elasticsearch.common.Math.toIntExact through "Math" appearing as an
-     * ancestry segment ONLY IF that segment really is the type — here it is, and
-     * that is the correct outcome (the project's own Math.toIntExact). */
+    /* A matching type spelling in another namespace still needs an import
+     * or lexical binding. Project membership does not establish visibility. */
     cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method");
     r = cbm_registry_resolve(reg, "Math.toIntExact", "org.elasticsearch.index.IndexSettings", NULL,
                              NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.Math.toIntExact");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
 }
 
-/* A lower-case root names a value, whose type the chain does not show. The gate
- * must not look at it, or every ordinary vm.load style call would be refused. */
-TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
+/* A lower-case root names a value. Without its type, the registry cannot
+ * identify the method merely because one indexed declaration has that name. */
+TEST(registry_unknown_value_receiver_is_rejected) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method");
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "vm.load", "HomeboxUI.Views", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "HomeboxUI.EntityListViewModel.load");
-    ASSERT_STR_EQ(r.strategy, "unique_name");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
 }
 
-/* An unqualified callee has no chain at all and must pass through unchanged. */
-TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
+/* A bare callee still needs a lexical or import binding. */
+TEST(registry_unbound_bare_name_is_rejected) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function");
 
     cbm_resolution_t r = cbm_registry_resolve(reg, "helper", "proj.other", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.helper");
-    ASSERT_STR_EQ(r.strategy, "unique_name");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -21671,11 +21682,11 @@ TEST(registry_negative_import_rejects) {
     cbm_registry_add(reg, "Process", "proj.billing.Process", "Function");
     cbm_registry_add(reg, "Process", "proj.handler.Process", "Function");
 
-    /* Import only handler's module → should prefer handler */
+    /* Importing a namespace does not bind its members as bare local names. */
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
     cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.caller", keys, vals, 1);
-    ASSERT_STR_EQ(r.qualified_name, "proj.handler.Process");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -21756,9 +21767,9 @@ TEST(registry_find_by_name) {
     r = cbm_registry_resolve(reg, "other.Foo", "proj.pkg", keys, vals, 1);
     ASSERT_STR_EQ(r.qualified_name, "proj.other.Foo");
 
-    /* Resolve unique name */
+    /* Inventory membership does not establish visibility in another module. */
     r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
-    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
+    ASSERT_NULL(r.qualified_name);
 
     cbm_registry_free(reg);
     PASS();
@@ -26207,7 +26218,8 @@ TEST(pipeline_doc_candidates_published_and_kept_by_delta) {
     p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Preserve the document contracts under conservative resolver generation repair. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     cbm_pipeline_free(p);
     s = cbm_store_open_path(db);
     ASSERT_NOT_NULL(s);
@@ -26338,7 +26350,8 @@ TEST(pipeline_doc_candidates_off_clears_rows_on_delta) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_doc_candidates_enabled(p, false);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Preserve the document contracts under conservative resolver generation repair. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     cbm_pipeline_free(p);
     s = cbm_store_open_path(db);
     ASSERT_NOT_NULL(s);
@@ -27885,24 +27898,24 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
     /* Function registry / resolver */
-    RUN_TEST(registry_resolve_single_candidate);
+    RUN_TEST(registry_unique_candidate_is_diagnostic_only);
     RUN_TEST(registry_fuzzy_nonexistent);
     RUN_TEST(registry_fuzzy_multiple_best_by_distance);
     RUN_TEST(registry_fuzzy_simple_name_extraction);
     RUN_TEST(registry_fuzzy_empty);
     RUN_TEST(registry_exists);
     RUN_TEST(registry_confidence_import_map);
-    RUN_TEST(registry_confidence_import_map_suffix);
+    RUN_TEST(registry_import_descendant_guess_is_rejected);
     RUN_TEST(registry_confidence_same_module);
-    RUN_TEST(registry_confidence_unique_name);
-    RUN_TEST(registry_confidence_suffix_match);
+    RUN_TEST(registry_unbound_unique_name_is_rejected);
+    RUN_TEST(registry_namespace_proximity_is_rejected);
     RUN_TEST(registry_receiver_chain_refuses_library_unique_name_issue1893);
     RUN_TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893);
-    RUN_TEST(registry_receiver_chain_keeps_project_extension_issue1893);
-    RUN_TEST(registry_receiver_chain_admits_factory_chain_into_nested_type);
+    RUN_TEST(registry_extension_spelling_requires_receiver_proof);
+    RUN_TEST(registry_factory_chain_requires_return_type_proof);
     RUN_TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule);
-    RUN_TEST(registry_receiver_chain_ignores_lowercase_root_issue1893);
-    RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
+    RUN_TEST(registry_unknown_value_receiver_is_rejected);
+    RUN_TEST(registry_unbound_bare_name_is_rejected);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
     RUN_TEST(registry_negative_import_rejects);

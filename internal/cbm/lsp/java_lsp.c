@@ -33,6 +33,9 @@
 
 #include "java_lsp.h"
 #include "../helpers.h"
+#include "../callable_sig.h"
+#include "../resolve/symbols.h"
+#include "../resolve/policy.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -269,6 +272,616 @@ static const CBMType *box_primitive(CBMArena *a, const char *prim) {
     return cbm_type_unknown();
 }
 
+typedef struct {
+    const char *qn;
+    uint32_t line;
+    uint32_t flags;
+    int parameter_count;
+} JavaSourceDeclaration;
+
+typedef struct {
+    JavaLSPContext *ctx;
+    JavaSourceDeclaration *items;
+    int count;
+    int capacity;
+    bool failed;
+} JavaSourceFacts;
+
+static uint32_t java_source_modifiers(JavaLSPContext *ctx, TSNode node, bool interface_member) {
+    uint32_t flags = CBM_SOURCE_DECL_KNOWN;
+    TSNode modifiers = child_by_kind(node, "modifiers");
+    uint32_t count = ts_node_is_null(modifiers) ? 0 : ts_node_child_count(modifiers);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *kind = ts_node_type(ts_node_child(modifiers, i));
+        if (!strcmp(kind, "public"))
+            flags |= CBM_SOURCE_DECL_PUBLIC;
+        else if (!strcmp(kind, "private"))
+            flags |= CBM_SOURCE_DECL_PRIVATE;
+        else if (!strcmp(kind, "protected"))
+            flags |= CBM_SOURCE_DECL_PROTECTED;
+        else if (!strcmp(kind, "static"))
+            flags |= CBM_SOURCE_DECL_STATIC;
+    }
+    if (!(flags & (CBM_SOURCE_DECL_PUBLIC | CBM_SOURCE_DECL_PRIVATE | CBM_SOURCE_DECL_PROTECTED)))
+        flags |= interface_member ? CBM_SOURCE_DECL_PUBLIC : CBM_SOURCE_DECL_PACKAGE;
+    (void)ctx;
+    return flags;
+}
+
+static void java_source_append(JavaSourceFacts *facts, const char *qn, TSNode node, uint32_t flags,
+                               int parameter_count) {
+    if (facts->count == facts->capacity) {
+        int capacity = facts->capacity ? facts->capacity * 2 : 32;
+        JavaSourceDeclaration *next =
+            cbm_arena_alloc(facts->ctx->arena, (size_t)capacity * sizeof(*next));
+        if (!next) {
+            facts->failed = true;
+            return;
+        }
+        if (facts->count)
+            memcpy(next, facts->items, (size_t)facts->count * sizeof(*next));
+        facts->items = next;
+        facts->capacity = capacity;
+    }
+    facts->items[facts->count++] =
+        (JavaSourceDeclaration){qn, ts_node_start_point(node).row + 1, flags, parameter_count};
+}
+
+static void java_source_class(JavaSourceFacts *facts, TSNode node, const char *parent,
+                              bool parent_interface, int depth) {
+    if (depth > 64) {
+        facts->failed = true;
+        return;
+    }
+    JavaLSPContext *ctx = facts->ctx;
+    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    if (ts_node_is_null(name_node))
+        return;
+    const char *name = java_node_text(ctx, name_node);
+    const char *qn = name ? cbm_arena_sprintf(ctx->arena, "%s.%s", parent, name) : NULL;
+    if (!qn) {
+        facts->failed = true;
+        return;
+    }
+    bool interface = !strcmp(ts_node_type(node), "interface_declaration");
+    uint32_t flags = java_source_modifiers(ctx, node, parent_interface);
+    if (depth == 0)
+        flags |= CBM_SOURCE_DECL_TOP_LEVEL;
+    bool complete_domain =
+        ts_node_is_null(ts_node_child_by_field_name(node, "superclass", 10)) &&
+        ts_node_is_null(ts_node_child_by_field_name(node, "interfaces", 10)) &&
+        ts_node_is_null(ts_node_child_by_field_name(node, "type_parameters", 15));
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        const char *kind = ts_node_type(ts_node_named_child(node, i));
+        if (!strcmp(kind, "extends_interfaces") || !strcmp(kind, "super_interfaces") ||
+            !strcmp(kind, "superclass") || !strcmp(kind, "type_parameters"))
+            complete_domain = false;
+    }
+    if (complete_domain && (!strcmp(ts_node_type(node), "class_declaration") || interface))
+        flags |= CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+    java_source_append(facts, qn, node, flags, -1);
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            const char *kind = ts_node_type(child);
+            if (!strcmp(kind, "method_declaration") || !strcmp(kind, "constructor_declaration")) {
+                TSNode method_name = ts_node_child_by_field_name(child, "name", 4);
+                const char *method =
+                    ts_node_is_null(method_name) ? NULL : java_node_text(ctx, method_name);
+                const char *method_qn =
+                    method ? cbm_arena_sprintf(ctx->arena, "%s.%s", qn, method) : NULL;
+                if (!method_qn) {
+                    facts->failed = true;
+                    break;
+                }
+                uint32_t method_flags = java_source_modifiers(ctx, child, interface);
+                if (!ts_node_is_null(ts_node_child_by_field_name(child, "type_parameters", 15)))
+                    method_flags = 0;
+                TSNode parameters = ts_node_child_by_field_name(child, "parameters", 10);
+                int parameter_count = ts_node_is_null(parameters) ? -1 : 0;
+                uint32_t parameter_nodes =
+                    ts_node_is_null(parameters) ? 0 : ts_node_named_child_count(parameters);
+                for (uint32_t i = 0; i < parameter_nodes; i++) {
+                    const char *parameter_kind = ts_node_type(ts_node_named_child(parameters, i));
+                    if (!strcmp(parameter_kind, "formal_parameter"))
+                        parameter_count++;
+                    else if (strcmp(parameter_kind, "receiver_parameter") &&
+                             strcmp(parameter_kind, "block_comment") &&
+                             strcmp(parameter_kind, "line_comment")) {
+                        parameter_count = -1;
+                        break;
+                    }
+                }
+                java_source_append(facts, method_qn, child, method_flags, parameter_count);
+            } else if (!strcmp(kind, "class_declaration") ||
+                       !strcmp(kind, "interface_declaration") ||
+                       !strcmp(kind, "enum_declaration") || !strcmp(kind, "record_declaration")) {
+                java_source_class(facts, child, qn, interface, depth + 1);
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
+static int java_source_compare(const void *left, const void *right) {
+    const JavaSourceDeclaration *a = left, *b = right;
+    int cmp = strcmp(a->qn, b->qn);
+    return cmp ? cmp : (a->line > b->line) - (a->line < b->line);
+}
+
+bool cbm_java_collect_source_facts(CBMArena *arena, const char *source, int source_len,
+                                   const char *module_qn, CBMLSPDef *defs, int def_count) {
+    if (def_count < 0 || (def_count && !defs))
+        return false;
+    for (int i = 0; i < def_count; i++)
+        defs[i].source_flags = 0;
+    if (!arena || !source || source_len <= 0 || !module_qn)
+        return false;
+    TSParser *parser = ts_parser_new();
+    if (!parser)
+        return false;
+    extern const TSLanguage *tree_sitter_java(void);
+    ts_parser_set_language(parser, tree_sitter_java());
+    TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+    ts_parser_delete(parser);
+    if (!tree)
+        return false;
+    TSNode root = ts_tree_root_node(tree);
+    JavaLSPContext ctx = {.arena = arena, .source = source, .source_len = source_len};
+    JavaSourceFacts facts = {.ctx = &ctx, .failed = ts_node_has_error(root)};
+    const char *declared_package = "";
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    if (!facts.failed && ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            const char *kind = ts_node_type(child);
+            if (!strcmp(kind, "class_declaration") || !strcmp(kind, "interface_declaration") ||
+                !strcmp(kind, "enum_declaration") || !strcmp(kind, "record_declaration")) {
+                java_source_class(&facts, child, module_qn, false, 0);
+            } else if (!strcmp(kind, "package_declaration")) {
+                uint32_t count = ts_node_named_child_count(child);
+                for (uint32_t i = 0; i < count; i++) {
+                    TSNode name = ts_node_named_child(child, i);
+                    const char *name_kind = ts_node_type(name);
+                    if (!strcmp(name_kind, "identifier") ||
+                        !strcmp(name_kind, "scoped_identifier")) {
+                        declared_package = java_node_text(&ctx, name);
+                        if (!declared_package)
+                            facts.failed = true;
+                    }
+                }
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    ts_tree_delete(tree);
+    if (facts.failed)
+        return false;
+    if (facts.count)
+        qsort(facts.items, (size_t)facts.count, sizeof(*facts.items), java_source_compare);
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *def = &defs[i];
+        const char *qn =
+            def->graph_qualified_name ? def->graph_qualified_name : def->qualified_name;
+        if (!qn || !def->source_start_line)
+            continue;
+        size_t base_len = cbm_qn_callable_base_len_named(qn, def->short_name);
+        const char *base = qn[base_len] ? cbm_arena_strndup(arena, qn, base_len) : qn;
+        if (!base) {
+            for (int j = 0; j < def_count; j++)
+                defs[j].source_flags = 0;
+            return false;
+        }
+        JavaSourceDeclaration key = {.qn = base, .line = def->source_start_line};
+        int lo = 0, hi = facts.count;
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (java_source_compare(&facts.items[mid], &key) < 0)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < facts.count && !java_source_compare(&facts.items[lo], &key) &&
+            (lo + 1 == facts.count || java_source_compare(&facts.items[lo + 1], &key))) {
+            def->source_flags = facts.items[lo].flags;
+            if (facts.items[lo].parameter_count >= 0 &&
+                facts.items[lo].parameter_count == def->signature_param_count)
+                def->source_flags |= CBM_SOURCE_DECL_FIXED_ARITY;
+            def->namespace_name = declared_package;
+        }
+    }
+    return true;
+}
+
+static uint32_t *java_local_source_flags(JavaLSPContext *ctx, CBMFileResult *result) {
+    int count = result->defs.count;
+    if (!count)
+        return NULL;
+    CBMLSPDef *defs = cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(*defs));
+    uint32_t *flags = cbm_arena_alloc(ctx->arena, (size_t)count * sizeof(*flags));
+    if (!defs || !flags) {
+        ctx->proof_failed = true;
+        return NULL;
+    }
+    memset(defs, 0, (size_t)count * sizeof(*defs));
+    for (int i = 0; i < count; i++) {
+        defs[i].graph_qualified_name = result->defs.items[i].qualified_name;
+        defs[i].short_name = result->defs.items[i].name;
+        defs[i].signature_param_count = result->defs.items[i].signature_param_count;
+        defs[i].source_start_line = result->defs.items[i].start_line;
+    }
+    if (!cbm_java_collect_source_facts(ctx->arena, ctx->source, ctx->source_len, ctx->module_qn,
+                                       defs, count))
+        ctx->proof_failed = true;
+    for (int i = 0; i < count; i++)
+        flags[i] = defs[i].source_flags;
+    return flags;
+}
+
+/* Exact source names are separate from file-based graph identities. No
+ * short-name fallback, return-value inference, or overload ranking supplies
+ * evidence to this adapter. */
+static cbm_resolve_result_t java_proof_unknown(const char *reason) {
+    return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED, .reason = reason};
+}
+
+static bool java_proof_same_type(const CBMRegisteredType *left, const CBMRegisteredType *right) {
+    return left == right ||
+           (left && right && left->qualified_name && right->qualified_name &&
+            !strcmp(left->graph_qualified_name ? left->graph_qualified_name : left->qualified_name,
+                    right->graph_qualified_name ? right->graph_qualified_name
+                                                : right->qualified_name) &&
+            left->declaration_identity && right->declaration_identity &&
+            !strcmp(left->declaration_identity, right->declaration_identity));
+}
+
+static bool java_proof_choose_type(const CBMRegisteredType **chosen,
+                                   const CBMRegisteredType *candidate) {
+    if (!candidate || !candidate->project_source || candidate->alias_of)
+        return false;
+    if (*chosen && !java_proof_same_type(*chosen, candidate))
+        return false;
+    *chosen = candidate;
+    return true;
+}
+
+static const CBMRegisteredType *java_proof_namespace(JavaLSPContext *ctx, const char *namespace,
+                                                     const char *name, bool *complete) {
+    CBMNamespaceTypeIter iterator;
+    cbm_registry_types_in_namespace(ctx->registry, namespace, name, &iterator);
+    const CBMRegisteredType *chosen = NULL, *candidate;
+    while ((candidate = cbm_namespace_type_next(&iterator, NULL))) {
+        if (!java_proof_choose_type(&chosen, candidate)) {
+            *complete = false;
+            return NULL;
+        }
+    }
+    if (!iterator.complete)
+        *complete = false;
+    return *complete ? chosen : NULL;
+}
+
+static const CBMRegisteredType *java_proof_exact_type(JavaLSPContext *ctx, const char *qn,
+                                                      bool *complete) {
+    if (!qn)
+        return NULL;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (const unsigned char *p = (const unsigned char *)qn; *p; p++) {
+        hash ^= *p;
+        hash *= UINT64_C(0x100000001b3);
+    }
+    const CBMRegisteredType *chosen = NULL;
+    unsigned links = 0, work = 0;
+    for (const CBMTypeRegistry *reg = ctx->registry; reg; reg = reg->fallback) {
+        if (++links > 64 || reg->type_count != reg->type_qn_entry_count ||
+            (reg->type_count &&
+             (!reg->type_qn_buckets || !reg->type_qn_entries || reg->type_qn_bucket_count <= 0))) {
+            *complete = false;
+            return NULL;
+        }
+        if (!reg->type_count)
+            continue;
+        int index = reg->type_qn_buckets[hash & (uint64_t)(reg->type_qn_bucket_count - 1)];
+        while (index >= 0) {
+            if (++work > 65536 || index >= reg->type_qn_entry_count) {
+                *complete = false;
+                return NULL;
+            }
+            const CBMRegistryHashEntry *entry = &reg->type_qn_entries[index];
+            if (entry->payload_index < 0 || entry->payload_index >= reg->type_count) {
+                *complete = false;
+                return NULL;
+            }
+            const CBMRegisteredType *candidate = &reg->types[entry->payload_index];
+            if (entry->hash == hash && candidate->qualified_name &&
+                !strcmp(candidate->qualified_name, qn) &&
+                !java_proof_choose_type(&chosen, candidate)) {
+                *complete = false;
+                return NULL;
+            }
+            index = entry->next_index;
+        }
+    }
+    return chosen;
+}
+
+static bool java_proof_simple_name(const char *name) {
+    if (!name || !(isalpha((unsigned char)*name) || *name == '_' || *name == '$'))
+        return false;
+    for (const unsigned char *p = (const unsigned char *)name + 1; *p; p++)
+        if (!isalnum(*p) && *p != '_' && *p != '$' && *p != '.')
+            return false;
+    return true;
+}
+
+static const CBMRegisteredType *java_proof_type_name(JavaLSPContext *ctx, const char *name) {
+    if (ctx->proof_failed || !java_proof_simple_name(name))
+        return NULL;
+    bool complete = true;
+    const char *dot = strrchr(name, '.');
+    if (dot) {
+        const char *namespace = cbm_arena_strndup(ctx->arena, name, (size_t)(dot - name));
+        return namespace ? java_proof_namespace(ctx, namespace, dot + 1, &complete) : NULL;
+    }
+    /* Exact local/nested declarations precede imported package names. */
+    for (int i = ctx->enclosing_class_depth - 1; i >= 0; i--) {
+        const char *owner = ctx->enclosing_class_stack[i];
+        const char *leaf = strrchr(owner, '.');
+        const char *qn = leaf && !strcmp(leaf + 1, name)
+                             ? owner
+                             : cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name);
+        const CBMRegisteredType *type = java_proof_exact_type(ctx, qn, &complete);
+        if (!complete || type)
+            return complete ? type : NULL;
+    }
+    const char *local = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    const CBMRegisteredType *type = java_proof_exact_type(ctx, local, &complete);
+    if (!complete || type)
+        return complete ? type : NULL;
+    const CBMRegisteredType *chosen = NULL;
+    bool explicit_import = false;
+    for (int i = ctx->proof_import_start; i < ctx->import_count; i++) {
+        if (ctx->import_kinds[i] != CBM_JAVA_IMPORT_TYPE ||
+            strcmp(ctx->import_local_names[i], name))
+            continue;
+        explicit_import = true;
+        const char *target = ctx->import_target_qns[i];
+        const char *split = strrchr(target, '.');
+        const char *namespace =
+            split ? cbm_arena_strndup(ctx->arena, target, (size_t)(split - target)) : "";
+        type = namespace
+                   ? java_proof_namespace(ctx, namespace, split ? split + 1 : target, &complete)
+                   : NULL;
+        if (!complete || !type || !java_proof_choose_type(&chosen, type))
+            return NULL;
+    }
+    if (explicit_import)
+        return chosen;
+    type = java_proof_namespace(ctx, ctx->package_name, name, &complete);
+    if (!complete || type)
+        return complete ? type : NULL;
+    /* On-demand imports compete. An unresolved namespace is not proof of
+     * absence (it may be external), so this initial bridge abstains. */
+    for (int i = ctx->proof_import_start; i < ctx->import_count; i++)
+        if (ctx->import_kinds[i] == CBM_JAVA_IMPORT_ON_DEMAND ||
+            ctx->import_kinds[i] == CBM_JAVA_IMPORT_STATIC_OD)
+            return NULL;
+    return NULL;
+}
+
+static cbm_resolve_result_t java_proof_type(const CBMRegisteredType *type) {
+    if (!type)
+        return java_proof_unknown("java_declared_type_unresolved");
+    return (cbm_resolve_result_t){
+        .binding = CBM_RESOLVE_BINDING_UNIQUE,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
+        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                 CBM_RESOLVE_FACT_TYPE_BOUND,
+        .target = type->graph_qualified_name ? type->graph_qualified_name : type->qualified_name,
+        .candidate_count = 1};
+}
+
+static bool java_proof_annotation_shadowed(JavaLSPContext *ctx, TSNode type_node) {
+    const char *name = java_node_text(ctx, type_node);
+    if (!name || strchr(name, '.'))
+        return false;
+    int depth = 0;
+    for (TSNode parent = ts_node_parent(type_node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (++depth > 64)
+            return true;
+        TSNode parameters = ts_node_child_by_field_name(parent, "type_parameters", 15);
+        uint32_t count = ts_node_is_null(parameters) ? 0 : ts_node_named_child_count(parameters);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode parameter = ts_node_named_child(parameters, i);
+            TSNode type_name = ts_node_child_by_field_name(parameter, "name", 4);
+            if (ts_node_is_null(type_name) && ts_node_named_child_count(parameter))
+                type_name = ts_node_named_child(parameter, 0);
+            const char *spelling =
+                ts_node_is_null(type_name) ? NULL : java_node_text(ctx, type_name);
+            if (spelling && !strcmp(spelling, name))
+                return true;
+        }
+    }
+    return false;
+}
+
+static void java_proof_bind(JavaLSPContext *ctx, const char *name, TSNode type_node, TSNode site) {
+    const char *kind = ts_node_is_null(type_node) ? "" : ts_node_type(type_node);
+    const CBMRegisteredType *type = NULL;
+    if ((!strcmp(kind, "type_identifier") || !strcmp(kind, "scoped_type_identifier")) &&
+        !java_proof_annotation_shadowed(ctx, type_node))
+        type = java_proof_type_name(ctx, java_node_text(ctx, type_node));
+    cbm_resolve_result_t proof = java_proof_type(type);
+    const CBMType *observed = cbm_scope_lookup(ctx->current_scope, name);
+    if (type) {
+        observed = cbm_type_named(ctx->arena, type->qualified_name);
+        if (!cbm_scope_bind_checked(ctx->current_scope, name, observed)) {
+            ctx->proof_failed = true;
+            return;
+        }
+    }
+    if (!cbm_resolve_types_observe(&ctx->proven_types, ctx->current_scope, name,
+                                   ts_node_start_byte(site), observed, CBM_RESOLVE_TYPE_ANNOTATION,
+                                   &proof))
+        ctx->proof_failed = true;
+}
+
+static void java_scope_bind(JavaLSPContext *ctx, const char *name, const CBMType *type) {
+    if (!cbm_scope_bind_checked(ctx->current_scope, name, type))
+        ctx->proof_failed = true;
+}
+
+typedef struct {
+    JavaLSPContext *ctx;
+    bool class_receiver;
+} JavaProofSelection;
+
+static cbm_resolve_method_candidate_t java_proof_candidate(const cbm_resolve_method_query_t *query,
+                                                           const CBMTypeRegistry *owner,
+                                                           const CBMRegisteredFunc *candidate,
+                                                           void *context) {
+    (void)query;
+    (void)owner;
+    JavaProofSelection *selection = context;
+    JavaLSPContext *ctx = selection->ctx;
+    cbm_resolve_method_candidate_t proof = {.exposed = CBM_RESOLVE_METHOD_YES};
+    if (!(candidate->flags & CBM_FUNC_FLAG_PROJECT_SOURCE) || candidate->type_param_names ||
+        (candidate->source_flags & (CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC)) !=
+            (CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC))
+        return proof;
+    if (selection->class_receiver && !(candidate->source_flags & CBM_SOURCE_DECL_STATIC))
+        return proof;
+    proof.applicable = CBM_RESOLVE_METHOD_YES;
+    proof.domain = CBM_RESOLVE_DOMAIN_PROJECT;
+    const char *graph = candidate->graph_qualified_name ? candidate->graph_qualified_name
+                                                        : candidate->qualified_name;
+    proof.graph_target = !candidate->graph_qualified_name && candidate->sig && candidate->sig[0]
+                             ? cbm_arena_sprintf(ctx->arena, "%s%s", graph, candidate->sig)
+                             : graph;
+    proof.graph_target_exact = proof.graph_target != NULL;
+    proof.declaration_identity = candidate->declaration_identity;
+    proof.declaration_identity_exact = candidate->declaration_identity != NULL;
+    return proof;
+}
+
+static cbm_resolve_result_t java_proof_member(JavaLSPContext *ctx, TSNode receiver,
+                                              const char *name, uint32_t at, int argument_count) {
+    if (ctx->proof_failed || !name || ts_node_is_null(receiver) ||
+        strcmp(ts_node_type(receiver), "identifier"))
+        return java_proof_unknown("java_receiver_domain_unsupported");
+    const char *variable = java_node_text(ctx, receiver);
+    if (!variable)
+        return java_proof_unknown("java_receiver_name_missing");
+    bool class_receiver = !cbm_scope_contains(ctx->current_scope, variable);
+    cbm_resolve_type_fact_t fact = {0};
+    if (class_receiver) {
+        if (java_proof_annotation_shadowed(ctx, receiver))
+            return java_proof_unknown("java_receiver_type_parameter");
+        const CBMRegisteredType *type = java_proof_type_name(ctx, variable);
+        if (type) {
+            fact.type = cbm_type_named(ctx->arena, type->qualified_name);
+            fact.status = CBM_RESOLVE_TYPE_KNOWN;
+            fact.evidence = java_proof_type(type);
+        }
+    } else {
+        fact = cbm_resolve_types_lookup(&ctx->proven_types, ctx->current_scope, variable, at);
+    }
+    if (fact.status != CBM_RESOLVE_TYPE_KNOWN || !fact.type || fact.type->kind != CBM_TYPE_NAMED)
+        return java_proof_unknown("java_receiver_type_unproven");
+    const char *qn = fact.type->data.named.qualified_name;
+    bool complete = true;
+    const CBMRegisteredType *owner = java_proof_exact_type(ctx, qn, &complete);
+    if (!complete || !owner)
+        return java_proof_unknown("java_receiver_declaration_ambiguous");
+    const uint32_t required =
+        CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC | CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+    if ((owner->source_flags & required) != required)
+        return java_proof_unknown("java_receiver_source_domain_incomplete");
+    /* Unmodelled parent/interface branches can add overloads. Object methods
+     * also compete even when no explicit superclass was written. */
+    if (owner->embedded_types)
+        for (int i = 0; owner->embedded_types[i]; i++)
+            if (strcmp(owner->embedded_types[i], "java.lang.Object"))
+                return java_proof_unknown("java_inheritance_domain_incomplete");
+    static const char *const object_methods[] = {"equals", "hashCode",  "toString",
+                                                 "clone",  "finalize",  "getClass",
+                                                 "notify", "notifyAll", "wait"};
+    for (size_t i = 0; i < sizeof(object_methods) / sizeof(object_methods[0]); i++)
+        if (!strcmp(name, object_methods[i]))
+            return java_proof_unknown("java_object_member_domain_incomplete");
+    JavaProofSelection selection = {.ctx = ctx, .class_receiver = class_receiver};
+    cbm_resolve_method_query_t query = {.registry = ctx->registry,
+                                        .receiver = &fact,
+                                        .receiver_qn = qn,
+                                        .method_name = name,
+                                        .argument_count = -1,
+                                        .adapter_facts = CBM_RESOLVE_METHOD_DIRECT_DOMAIN_COMPLETE |
+                                                         CBM_RESOLVE_METHOD_OCCURRENCE_EXACT |
+                                                         CBM_RESOLVE_METHOD_NAME_IDENTITY,
+                                        .classify = java_proof_candidate,
+                                        .context = &selection};
+    cbm_resolve_method_result_t selected = cbm_resolve_method(&query);
+    if (cbm_resolve_admit(&selected.result) && argument_count >= 0 &&
+        (!selected.method || !(selected.method->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) ||
+         selected.method->min_params != argument_count))
+        return java_proof_unknown("java_argument_count_unproven");
+    /* Nonempty invocation applicability also needs source-proven conversion
+     * facts; a sole name is not evidence that its arguments are compatible. */
+    if (cbm_resolve_admit(&selected.result) && argument_count > 0)
+        return java_proof_unknown("java_argument_applicability_unproven");
+    return selected.result;
+}
+
+static int java_proof_argument_count(TSNode call) {
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    if (ts_node_is_null(args))
+        return -2;
+    int count = 0;
+    uint32_t children = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < children; i++) {
+        const char *kind = ts_node_type(ts_node_named_child(args, i));
+        if (strcmp(kind, "block_comment") && strcmp(kind, "line_comment"))
+            count++;
+    }
+    return count;
+}
+
+static bool java_emit_proof(JavaLSPContext *ctx, TSNode receiver, TSNode name_node, TSNode site,
+                            CBMResolvedKind kind, int argument_count) {
+    if (ts_node_is_null(name_node) || ts_node_is_null(site))
+        return false;
+    if (kind == CBM_RESOLVED_INVOCATION) {
+        argument_count = java_proof_argument_count(site);
+        if (argument_count < 0)
+            return false;
+    }
+    const char *name = java_node_text(ctx, name_node);
+    cbm_resolve_result_t proof =
+        java_proof_member(ctx, receiver, name, ts_node_start_byte(site), argument_count);
+    if (!cbm_resolve_admit(&proof) || !ctx->resolved_calls || !ctx->enclosing_method_qn)
+        return false;
+    CBMResolvedCall row = {.caller_qn = ctx->enclosing_method_qn,
+                           .callee_qn = proof.target,
+                           .strategy = "lsp_proven_declared_receiver",
+                           .confidence = 1.0f,
+                           .reason = name,
+                           .kind = kind,
+                           .site_start_byte = ts_node_start_byte(site),
+                           .site_end_byte = ts_node_end_byte(site),
+                           .source_origin = CBM_SOURCE_ORIGIN_RAW,
+                           .evidence = {proof.analysis, proof.rule, proof.facts}};
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, row);
+    return true;
+}
+
 /* ── Initialization ───────────────────────────────────────────────── */
 
 void java_lsp_init(JavaLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
@@ -283,6 +896,8 @@ void java_lsp_init(JavaLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->module_qn = module_qn ? module_qn : "";
     ctx->resolved_calls = out;
     ctx->current_scope = cbm_scope_push(arena, NULL);
+    cbm_resolve_types_init(&ctx->proven_types, arena, 0);
+    ctx->proof_failed = ctx->current_scope == NULL;
 
     const char *dbg = getenv("CBM_LSP_DEBUG");
     ctx->debug = (dbg && dbg[0]);
@@ -299,8 +914,10 @@ void java_lsp_add_import(JavaLSPContext *ctx, const char *local_name, const char
         const char **new_qns =
             (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*new_qns));
         int *new_kinds = (int *)cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*new_kinds));
-        if (!new_names || !new_qns || !new_kinds)
+        if (!new_names || !new_qns || !new_kinds) {
+            ctx->proof_failed = true;
             return;
+        }
         if (ctx->import_count > 0) {
             memcpy(new_names, ctx->import_local_names,
                    (size_t)ctx->import_count * sizeof(*new_names));
@@ -1357,7 +1974,7 @@ void java_process_statement(JavaLSPContext *ctx, TSNode node) {
             if ((is_var || cbm_type_is_unknown(rt)) && !ts_node_is_null(rvalue)) {
                 rt = java_eval_expr_type(ctx, rvalue);
             }
-            cbm_scope_bind(ctx->current_scope, rn, rt ? rt : cbm_type_unknown());
+            java_scope_bind(ctx, rn, rt ? rt : cbm_type_unknown());
         }
     } else if (strcmp(kind, "catch_clause") == 0) {
         /* catch (Type|Type2 var) { body } — bind var into a fresh scope. */
@@ -1382,7 +1999,7 @@ void java_process_statement(JavaLSPContext *ctx, TSNode node) {
                         pt = java_parse_type_node(ctx, ptype);
                     }
                 }
-                cbm_scope_bind(ctx->current_scope, pn, pt);
+                java_scope_bind(ctx, pn, pt);
             }
         }
     }
@@ -1417,7 +2034,8 @@ static void process_local_var_decl(JavaLSPContext *ctx, TSNode node) {
         if ((is_var || cbm_type_is_unknown(bind_type)) && !ts_node_is_null(value_node)) {
             bind_type = java_eval_expr_type(ctx, value_node);
         }
-        cbm_scope_bind(ctx->current_scope, vname, bind_type ? bind_type : cbm_type_unknown());
+        java_scope_bind(ctx, vname, bind_type ? bind_type : cbm_type_unknown());
+        java_proof_bind(ctx, vname, type_node, c);
     }
 }
 
@@ -1453,7 +2071,7 @@ static void process_enhanced_for(JavaLSPContext *ctx, TSNode node) {
             t = iter_t->data.template_type.template_args[0];
         }
     }
-    cbm_scope_bind(ctx->current_scope, vname, t ? t : cbm_type_unknown());
+    java_scope_bind(ctx, vname, t ? t : cbm_type_unknown());
 }
 
 static void process_block(JavaLSPContext *ctx, TSNode node) {
@@ -1488,7 +2106,7 @@ static void process_field_decl(JavaLSPContext *ctx, TSNode node) {
         char *fname = java_node_text(ctx, name_node);
         if (!fname)
             continue;
-        cbm_scope_bind(ctx->current_scope, fname, static_type);
+        java_scope_bind(ctx, fname, static_type);
     }
 }
 
@@ -1537,7 +2155,9 @@ static void process_method_decl(JavaLSPContext *ctx, TSNode node, const char *cl
             if (strcmp(pk, "spread_parameter") == 0 && pt) {
                 pt = cbm_type_slice(ctx->arena, pt);
             }
-            cbm_scope_bind(ctx->current_scope, pn, pt);
+            java_scope_bind(ctx, pn, pt);
+            if (strcmp(pk, "spread_parameter"))
+                java_proof_bind(ctx, pn, ptype, p);
         }
     }
 
@@ -1596,7 +2216,8 @@ static void process_constructor_decl(JavaLSPContext *ctx, TSNode node, const cha
                 continue;
             const CBMType *pt =
                 ts_node_is_null(ptype) ? cbm_type_unknown() : java_parse_type_node(ctx, ptype);
-            cbm_scope_bind(ctx->current_scope, pn, pt);
+            java_scope_bind(ctx, pn, pt);
+            java_proof_bind(ctx, pn, ptype, p);
         }
     }
 
@@ -1727,6 +2348,9 @@ static void java_process_class_decl(JavaLSPContext *ctx, TSNode node) {
 void java_lsp_process_file(JavaLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
+    ctx->proof_import_start = ctx->import_count;
+    if (ts_node_has_error(root))
+        ctx->proof_failed = true;
     /* First scan: package_declaration + imports (already pushed via init). */
     uint32_t n = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < n; i++) {
@@ -1989,6 +2613,8 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
     if (!mname)
         return;
     int arity = count_call_args(call);
+    if (java_emit_proof(ctx, obj, name_node, call, CBM_RESOLVED_INVOCATION, arity))
+        return;
 
     /* Bare call: `foo()`. */
     if (ts_node_is_null(obj)) {
@@ -2483,7 +3109,7 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
                         if (strcmp(pn_kind, "identifier") == 0) {
                             char *pname = java_node_text(ctx, params_node);
                             if (pname)
-                                cbm_scope_bind(ctx->current_scope, pname, h_p0);
+                                java_scope_bind(ctx, pname, h_p0);
                         } else if (strcmp(pn_kind, "inferred_parameters") == 0 ||
                                    strcmp(pn_kind, "formal_parameters") == 0) {
                             uint32_t pc = ts_node_named_child_count(params_node);
@@ -2505,8 +3131,7 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
                                     }
                                 }
                                 if (pname) {
-                                    cbm_scope_bind(ctx->current_scope, pname,
-                                                   pt ? pt : cbm_type_unknown());
+                                    java_scope_bind(ctx, pname, pt ? pt : cbm_type_unknown());
                                     idx++;
                                 }
                             }
@@ -2590,7 +3215,7 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
                 if (pname) {
                     const CBMType *pt =
                         sam_param_type(ctx->arena, fi_qn, 0, resolved_fi_targs, resolved_count);
-                    cbm_scope_bind(ctx->current_scope, pname, pt);
+                    java_scope_bind(ctx, pname, pt);
                 }
             } else if (strcmp(pn_kind, "inferred_parameters") == 0 ||
                        strcmp(pn_kind, "formal_parameters") == 0) {
@@ -2617,7 +3242,7 @@ static uint32_t bind_lambda_args(JavaLSPContext *ctx, TSNode call_node,
                                                 resolved_count);
                     }
                     if (pname) {
-                        cbm_scope_bind(ctx->current_scope, pname, pt ? pt : cbm_type_unknown());
+                        java_scope_bind(ctx, pname, pt ? pt : cbm_type_unknown());
                         idx++;
                     }
                 }
@@ -2688,6 +3313,9 @@ static void resolve_method_reference(JavaLSPContext *ctx, TSNode mref,
         }
     }
     if (!mname || !mname[0])
+        return;
+
+    if (java_emit_proof(ctx, lhs, name_node, name_node, CBM_RESOLVED_CALL_REFERENCE, -1))
         return;
 
     /* Determine arity: from the SAM of the outer call's expected param. */
@@ -2888,6 +3516,8 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
+    if (!strcmp(kind, "class_declaration") || !strcmp(kind, "interface_declaration"))
+        ctx->proof_failed = true;
 
     /* Standalone method_reference (e.g. `return StringBuilder::new;` or
      * `Function<X, Y> f = X::method;`): without an enclosing method call
@@ -3195,6 +3825,7 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
                                                   CBMFileResult *result) {
     CBMArena *a = ctx->arena;
     const char *module_qn = ctx->module_qn;
+    uint32_t *source_flags = java_local_source_flags(ctx, result);
 
     /* Pass 1a: register all class/interface types WITHOUT embedded_types so
      * that subsequent base-class qualification (Pass 1b) can look them up
@@ -3214,6 +3845,15 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
         stub.qualified_name = d->qualified_name;
         stub.short_name = d->name;
         stub.is_interface = (strcmp(d->label, "Interface") == 0);
+        stub.project_source = true;
+        stub.source_flags = source_flags ? source_flags[i] : 0;
+        stub.graph_qualified_name = d->qualified_name;
+        stub.declaration_identity =
+            d->file_path ? cbm_arena_sprintf(a, "%zu:%s:%d", strlen(d->file_path), d->file_path, i)
+                         : NULL;
+        const char *top_qn = cbm_arena_sprintf(a, "%s.%s", module_qn, d->name);
+        if (top_qn && !strcmp(top_qn, d->qualified_name))
+            stub.namespace_qn = result->namespace_name ? result->namespace_name : "";
         cbm_registry_add_type(reg, stub);
     }
 
@@ -3349,6 +3989,14 @@ static void register_local_func_or_type_from_file(JavaLSPContext *ctx, CBMTypeRe
         rf.qualified_name = d->qualified_name;
         rf.short_name = d->name;
         rf.min_params = -1;
+        rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+        rf.source_flags = source_flags ? source_flags[i] : 0;
+        if (rf.source_flags & CBM_SOURCE_DECL_FIXED_ARITY)
+            rf.min_params = d->signature_param_count;
+        rf.graph_qualified_name = d->qualified_name;
+        rf.declaration_identity =
+            d->file_path ? cbm_arena_sprintf(a, "%zu:%s:%d", strlen(d->file_path), d->file_path, i)
+                         : NULL;
 
         /* Build param types — qualify with parent_class chain so inner-class
          * references like `Box` inside `Main` resolve to "test.Main.Main.Box"
@@ -3721,7 +4369,8 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
         }
     }
 
-    /* Walk the file. */
+    /* Source registration/refinement is complete before read-only proof lookup. */
+    cbm_registry_finalize(&reg);
     java_lsp_process_file(&ctx, root);
 }
 
@@ -3740,6 +4389,12 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
+            rt.project_source = true;
+            rt.source_flags = d->source_flags;
+            rt.graph_qualified_name = d->graph_qualified_name;
+            rt.declaration_identity = d->declaration_identity;
+            if (d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL)
+                rt.namespace_qn = d->namespace_name;
             /* Embedded types from "|"-separated text. */
             if (d->embedded_types && d->embedded_types[0]) {
                 int n = 1;
@@ -3773,6 +4428,13 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
             rf.short_name = d->short_name;
             rf.min_params = -1;
             rf.receiver_type = d->receiver_type;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.source_flags = d->source_flags;
+            if (rf.source_flags & CBM_SOURCE_DECL_FIXED_ARITY)
+                rf.min_params = d->signature_param_count;
+            rf.sig = d->sig;
+            rf.graph_qualified_name = d->graph_qualified_name;
+            rf.declaration_identity = d->declaration_identity;
             JavaSignatureParseContext parse_ctx = {
                 .parent_class = d->receiver_type,
                 .module_qn = d->def_module_qn,

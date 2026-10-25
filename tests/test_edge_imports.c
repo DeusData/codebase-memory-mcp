@@ -51,7 +51,10 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <pipeline/pipeline_internal.h>
+#include <pipeline/import_resolve.h>
+#include "resolve/policy.h"
 #include <foundation/log.h>
+#include <foundation/win_utf8.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -85,7 +88,8 @@ static void ei_to_fwd_slashes(char *p) {
 }
 
 /* Write files, run index_repository, open graph DB.  Returns NULL on failure. */
-static cbm_store_t *ei_index_files(EILangProj *lp, const EILangFile *files, int nfiles) {
+static cbm_store_t *ei_index_files_configured(EILangProj *lp, const EILangFile *files, int nfiles,
+                                              const char *compile_flags) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_ei_XXXXXX");
     if (!cbm_mkdtemp(lp->tmpdir))
@@ -107,6 +111,19 @@ static cbm_store_t *ei_index_files(EILangProj *lp, const EILangFile *files, int 
             return NULL;
         fputs(files[i].content, f);
         fclose(f);
+    }
+
+    if (compile_flags) {
+        char path[700];
+        snprintf(path, sizeof(path), "%s/compile_commands.json", lp->tmpdir);
+        FILE *config = cbm_fopen(path, "wb");
+        if (!config)
+            return NULL;
+        fprintf(config,
+                "[{\"directory\":\"%s\",\"file\":\"main.cpp\","
+                "\"command\":\"c++ %s -c main.cpp\"}]",
+                lp->tmpdir, compile_flags);
+        fclose(config);
     }
 
     /* Freed before reassigning: a fixture that indexes more than once would
@@ -139,6 +156,10 @@ static cbm_store_t *ei_index_files(EILangProj *lp, const EILangFile *files, int 
     return cbm_store_open_path(lp->dbpath);
 }
 
+static cbm_store_t *ei_index_files(EILangProj *lp, const EILangFile *files, int nfiles) {
+    return ei_index_files_configured(lp, files, nfiles, NULL);
+}
+
 static char *ei_slurp_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -169,7 +190,8 @@ static char *ei_slurp_file(const char *path) {
 }
 
 static cbm_store_t *ei_index_fixture_files(EILangProj *lp, const char *fixture_root,
-                                           const EILangFixtureFile *files, int nfiles) {
+                                           const EILangFixtureFile *files, int nfiles,
+                                           const char *compile_flags) {
     EILangFile *loaded = (EILangFile *)calloc((size_t)nfiles, sizeof(EILangFile));
     char **contents = (char **)calloc((size_t)nfiles, sizeof(char *));
     if (!loaded || !contents) {
@@ -190,7 +212,7 @@ static cbm_store_t *ei_index_fixture_files(EILangProj *lp, const char *fixture_r
         loaded[i].content = contents[i];
     }
 
-    store = ei_index_files(lp, loaded, nfiles);
+    store = ei_index_files_configured(lp, loaded, nfiles, compile_flags);
 
 done:
     for (int i = 0; i < nfiles; i++) {
@@ -325,7 +347,8 @@ TEST(ei_relative_astro_css_imports_issue2558) {
         {"src/layouts/Layout.astro",
          "---\nimport '../styles/global.css';\nimport './local.css';\n---\n"
          "<html><body><slot /></body></html>\n"},
-        {"src/lib/format.ts", "export function formatTitle(t: string): string { return t.trim(); }\n"},
+        {"src/lib/format.ts",
+         "export function formatTitle(t: string): string { return t.trim(); }\n"},
         {"src/lib/registry.ts",
          "import Badge from '../components/Badge.astro';\n"
          "import '../styles/global.css';\n"
@@ -335,13 +358,12 @@ TEST(ei_relative_astro_css_imports_issue2558) {
          "import { formatTitle } from '../format';\n"
          "import { registry } from '../registry.ts';\n"
          "export function deep(): string { registry(); return formatTitle('x'); }\n"},
-        {"src/pages/index.astro",
-         "---\nimport Layout from '../layouts/Layout.astro';\n"
-         "import Card from '../components/Card.astro';\n"
-         "import Outside from '../../../Badge.astro';\n"
-         "import { formatTitle } from '../lib/format';\n"
-         "const title = formatTitle(' Home ');\n---\n"
-         "<Layout><h1>{title}</h1><Card /></Layout>\n"},
+        {"src/pages/index.astro", "---\nimport Layout from '../layouts/Layout.astro';\n"
+                                  "import Card from '../components/Card.astro';\n"
+                                  "import Outside from '../../../Badge.astro';\n"
+                                  "import { formatTitle } from '../lib/format';\n"
+                                  "const title = formatTitle(' Home ');\n---\n"
+                                  "<Layout><h1>{title}</h1><Card /></Layout>\n"},
     };
     static const EIFileEdgeExpect want[] = {
         {"src/components/Card.astro", "src/components/Badge.astro"},
@@ -986,12 +1008,12 @@ static int ei_py_external_base_case(int pad) {
     /* #1278: TransactionTestCase declares no setUp. The nearest declaring
      * project ancestor of TestCase.setUp is SimpleTestCase.setUp. The missing
      * external INHERITS edge must still forbid the reverse override. */
-    int forward = store ? ei_testcases_override(store, lp.project, "TestCase.setUp",
-                                                "SimpleTestCase.setUp")
-                        : -1;
-    int reverse = store ? ei_testcases_override(store, lp.project, "SimpleTestCase.setUp",
-                                                "TestCase.setUp")
-                        : -1;
+    int forward =
+        store ? ei_testcases_override(store, lp.project, "TestCase.setUp", "SimpleTestCase.setUp")
+              : -1;
+    int reverse =
+        store ? ei_testcases_override(store, lp.project, "SimpleTestCase.setUp", "TestCase.setUp")
+              : -1;
     int ok = simple == 0 && bare == 0 && alias == 0 && tx == 1 && w_tx == 1 && tc == 1 &&
              w_tc == 1 && rel == 1 && w_rel == 1 && dot == 1 && w_dot == 1 && overrides == 1 &&
              forward == 1 && reverse == 0;
@@ -1028,7 +1050,7 @@ TEST(ei_cpp_header_include_targets_header_file) {
     EILangProj lp;
     cbm_store_t *store =
         ei_index_fixture_files(&lp, "tests/fixtures/cpp_include", fixture_files,
-                               (int)(sizeof(fixture_files) / sizeof(fixture_files[0])));
+                               (int)(sizeof(fixture_files) / sizeof(fixture_files[0])), "-I .");
     ASSERT_NOT_NULL(store);
 
     int64_t main_id = ei_node_id_for_file_label(store, lp.project, "main.cpp", "File");
@@ -1908,8 +1930,8 @@ TEST(ei_php_declared_functions_and_alias_issue1186) {
     PASS();
 }
 
-/* Exercise the NULL namespace-map contract used by CALLS directly. Try both
- * a direct module-path collision and an earlier-sorting symbol-name collision. */
+/* Without namespace context neither unrelated PHP nor non-PHP namesakes
+ * prove Lib\render. Missing evidence must block the import binding. */
 static int ei_php_null_map_candidate(bool direct_collision) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new("phpimports", "/tmp");
     if (!gbuf) {
@@ -1927,13 +1949,13 @@ static int ei_php_null_map_candidate(bool direct_collision) {
     cbm_pipeline_set_pkgmap(NULL);
     const cbm_gbuf_node_t *target =
         cbm_pipeline_resolve_import_node(&ctx, "main.php", "phpimports.main.__file__", &imp, NULL);
-    int ok = decoy > 0 && valid > 0 && target && target->id == valid;
+    int ok = decoy > 0 && valid > 0 && target == NULL;
     cbm_pipeline_set_pkgmap(saved_pkgmap);
     cbm_gbuf_free(gbuf);
     return ok;
 }
 
-TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186) {
+TEST(ei_php_null_namespace_map_does_not_guess_issue1186) {
     ASSERT_TRUE(ei_php_null_map_candidate(false));
     ASSERT_TRUE(ei_php_null_map_candidate(true));
     PASS();
@@ -1944,8 +1966,9 @@ TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186) {
 TEST(ei_php_require_path_keeps_generic_resolution_issue1186) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new("phpimports", "/tmp");
     ASSERT_NOT_NULL(gbuf);
-    int64_t valid = cbm_gbuf_upsert_node(gbuf, "File", "helper.php", "phpimports.lib.helper",
-                                         "lib/helper.php", 1, 1, "{}");
+    int64_t valid =
+        cbm_gbuf_upsert_node(gbuf, "File", "helper.php", "phpimports.lib.helper.php.__file__",
+                             "lib/helper.php", 1, 1, "{}");
     cbm_pipeline_ctx_t ctx = {.project_name = "phpimports", .gbuf = gbuf};
     CBMImport imp = {.local_name = "helper", .module_path = "lib/helper.php"};
     CBMHashTable *map = cbm_pipeline_namespace_map_build_names("phpimports", NULL, NULL, 0);
@@ -2394,7 +2417,408 @@ TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown) {
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* Strict resolver contract: a name match without an admissible import path is
+ * a false-positive bug, even when only one project definition has the name. */
+TEST(ei_strict_import_never_binds_unrelated_namesake) {
+    static const char *sources[] = {"main.py",    "main.ts", "main.js", "main.rb",
+                                    "main.java",  "main.kt", "main.rs", "main.lua",
+                                    "main.swift", "main.cs", "main.php"};
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Class", "Remote", "strictimports.unrelated.Remote",
+                                   "unrelated.py", 1, 2, "{}"),
+              0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "Remote", .module_path = "absent.Remote"};
+    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    bool rejected = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        if (cbm_pipeline_resolve_import_node(&ctx, sources[i], "strictimports.main.__file__", &imp,
+                                             NULL))
+            rejected = false;
+    }
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(rejected);
+    PASS();
+}
+
+/* Include roots and their order are configuration, not the shortest path in
+ * the repository. Neither suffix candidate proves a target. */
+TEST(ei_strict_include_does_not_rank_suffix_candidates) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.include.util.__file__",
+                                   "include/util.h", 1, 2, "{}"),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.tools.util.__file__",
+                                   "tools/util.h", 1, 2, "{}"),
+              0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "util.h", .module_path = "util.h"};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "src/main.c", "strictimports.src.main.__file__", &imp, NULL);
+    cbm_gbuf_free(gb);
+    ASSERT_NULL(target);
+    PASS();
+}
+
+/* A namespace import cannot arbitrarily nominate one file from a namespace
+ * spread over several source files. Missing namespace-node support is a recall
+ * gap; selecting the first file is an incorrect graph target. */
+TEST(ei_strict_namespace_import_does_not_pick_first_file) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    const char *rels[] = {"a.cs", "b.cs"};
+    const char *namespaces[] = {"Example.Lib", "Example.Lib"};
+    for (int i = 0; i < 2; i++) {
+        char *qn = cbm_pipeline_fqn_compute("strictimports", rels[i], "__file__");
+        ASSERT_NOT_NULL(qn);
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", rels[i], qn, rels[i], 1, 2, "{}"), 0);
+        free(qn);
+    }
+    CBMHashTable *map =
+        cbm_pipeline_namespace_map_build_names("strictimports", namespaces, rels, 2);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "Lib", .module_path = "Example.Lib"};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "main.cs", "strictimports.main.__file__", &imp, map);
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(gb);
+    ASSERT_NULL(target);
+    PASS();
+}
+
+/* A name match without an admissible import path is a false-positive bug,
+ * even when only one indexed definition has that name. */
+TEST(ei_strict_import_never_binds_unrelated_namesake) {
+    static const char *sources[] = {"main.py",    "main.ts", "main.js", "main.rb",
+                                    "main.java",  "main.kt", "main.rs", "main.lua",
+                                    "main.swift", "main.cs", "main.php"};
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Class", "Remote", "strictimports.unrelated.Remote",
+                                   "unrelated.py", 1, 2, "{}"),
+              0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "Remote", .module_path = "absent.Remote"};
+    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    bool rejected = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        if (cbm_pipeline_resolve_import_node(&ctx, sources[i], "strictimports.main.__file__", &imp,
+                                             NULL))
+            rejected = false;
+    }
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(rejected);
+    PASS();
+}
+
+/* Include roots/order are configuration, not shortest paths in the repository. */
+TEST(ei_strict_include_does_not_rank_suffix_candidates) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.include.util.__file__",
+                                   "include/util.h", 1, 2, "{}"),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.tools.util.__file__",
+                                   "tools/util.h", 1, 2, "{}"),
+              0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "util.h", .module_path = "util.h"};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "src/main.c", "strictimports.src.main.__file__", &imp, NULL);
+    cbm_gbuf_free(gb);
+    ASSERT_NULL(target);
+    PASS();
+}
+
+/* Without a materialized namespace target, a multi-file namespace import has
+ * a recall gap. Arbitrarily selecting one declaring file fabricates a target. */
+TEST(ei_strict_namespace_import_does_not_pick_first_file) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    const char *rels[] = {"a.cs", "b.cs"};
+    const char *namespaces[] = {"Example.Lib", "Example.Lib"};
+    for (int i = 0; i < 2; i++) {
+        char *qn = cbm_pipeline_fqn_compute("strictimports", rels[i], "__file__");
+        ASSERT_NOT_NULL(qn);
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", rels[i], qn, rels[i], 1, 2, "{}"), 0);
+        free(qn);
+    }
+    CBMHashTable *map =
+        cbm_pipeline_namespace_map_build_names("strictimports", namespaces, rels, 2);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "Lib", .module_path = "Example.Lib"};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "main.cs", "strictimports.main.__file__", &imp, map);
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(gb);
+    ASSERT_NULL(target);
+    PASS();
+}
+
+TEST(ei_strict_namespace_member_targets_declaring_file) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    const char *rels[] = {"first.kt", "second.kt"};
+    const char *namespaces[] = {"Example.Lib", "Example.Lib"};
+    int64_t expected = 0;
+    for (int i = 0; i < 2; i++) {
+        char *qn = cbm_pipeline_fqn_compute("strictimports", rels[i], "__file__");
+        ASSERT_NOT_NULL(qn);
+        int64_t id = cbm_gbuf_upsert_node(gb, "File", rels[i], qn, rels[i], 1, 2, "{}");
+        ASSERT_GT(id, 0);
+        if (i == 1)
+            expected = id;
+        free(qn);
+    }
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Class", "Wanted", "strictimports.second.Wanted",
+                                   "second.kt", 1, 2, "{}"),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Class", "Wanted", "strictimports.decoy.Wanted", "decoy.kt",
+                                   1, 2, "{}"),
+              0);
+    CBMHashTable *map =
+        cbm_pipeline_namespace_map_build_names("strictimports", namespaces, rels, 2);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "Alias", .module_path = "Example.Lib.Wanted"};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "main.kt", "strictimports.main.__file__", &imp, map);
+    bool correct = target && target->id == expected;
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(correct);
+    PASS();
+}
+
+TEST(ei_strict_quoted_include_exact_target_and_unmodeled_system_gap) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    char *qn = cbm_pipeline_fqn_compute("strictimports", "src/util.h", "__file__");
+    ASSERT_NOT_NULL(qn);
+    int64_t expected = cbm_gbuf_upsert_node(gb, "File", "util.h", qn, "src/util.h", 1, 2, "{}");
+    free(qn);
+    ASSERT_GT(expected, 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.decoy.util.h.__file__",
+                                   "decoy/util.h", 1, 2, "{}"),
+              0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {
+        .local_name = "util.h", .module_path = "util.h", .kind = CBM_IMPORT_KIND_INCLUDE_QUOTED};
+    const cbm_gbuf_node_t *target = NULL;
+    cbm_resolve_result_t result = cbm_pipeline_resolve_import_result(
+        &ctx, "src/main.c", "strictimports.src.main.c.__file__", &imp, NULL, &target);
+    ASSERT_TRUE(cbm_resolve_admit(&result));
+    ASSERT_NOT_NULL(target);
+    ASSERT_EQ(target->id, expected);
+    imp.kind = CBM_IMPORT_KIND_INCLUDE_SYSTEM;
+    result = cbm_pipeline_resolve_import_result(
+        &ctx, "src/main.c", "strictimports.src.main.c.__file__", &imp, NULL, &target);
+    /* Without a compile context, an angle include has no proven search root.
+     * The configured-order regression below covers the same capability once
+     * an actual compile_commands entry supplies the missing evidence. */
+    ASSERT_FALSE(cbm_resolve_admit(&result));
+    ASSERT_NULL(target);
+    ASSERT_EQ(result.analysis, CBM_RESOLVE_ANALYSIS_UNSUPPORTED);
+    ASSERT_STR_EQ(result.reason, "include_search_roots_unknown");
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(ei_strict_bare_es_package_does_not_bind_root_module) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Module", "vendor", "strictimports.vendor", "vendor.ts", 1,
+                                   2, "{}"),
+              0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "vendor", .module_path = "vendor"};
+    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "main.ts", "strictimports.main.ts.__file__", &imp, NULL);
+    cbm_pipeline_set_pkgmap(saved);
+    cbm_gbuf_free(gb);
+    ASSERT_NULL(target);
+    PASS();
+}
+
+TEST(ei_strict_relative_import_above_root_stays_unresolved) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(
+        cbm_gbuf_upsert_node(gb, "Module", "util", "strictimports.util", "util.py", 1, 2, "{}"), 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "util", .module_path = "..util"};
+    const cbm_gbuf_node_t *target = NULL;
+    cbm_resolve_result_t result = cbm_pipeline_resolve_import_result(
+        &ctx, "main.py", "strictimports.main.py.__file__", &imp, NULL, &target);
+    ASSERT_NULL(target);
+    ASSERT_FALSE(cbm_resolve_admit(&result));
+    ASSERT_STR_EQ(result.reason, "relative_import_above_root");
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(ei_strict_namespace_dependency_has_canonical_endpoint) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    const char *rels[] = {"a.cs", "b.cs", "main.cs"};
+    const char *spaces[] = {"Example.Lib", "Example.Lib", "Consumer"};
+    for (int i = 0; i < 3; i++) {
+        char *qn = cbm_pipeline_fqn_compute("strictimports", rels[i], "__file__");
+        ASSERT_NOT_NULL(qn);
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", rels[i], qn, rels[i], 1, 2, "{}"), 0);
+        free(qn);
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names("strictimports", spaces, rels, 3);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
+    CBMImport imp = {.local_name = "Example.Lib", .module_path = "Example.Lib"};
+    CBMFileResult result = {0};
+    result.imports.items = &imp;
+    result.imports.count = 1;
+    ASSERT_EQ(cbm_pipeline_create_import_edges(&ctx, &result, "main.cs", map), 1);
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "main.cs", "strictimports.main.cs.__file__", &imp, map);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->label, "Module");
+    char expected[CBM_SZ_256];
+    snprintf(expected, sizeof(expected), "strictimports.__namespace.%d.Example.Lib",
+             CBM_LANG_CSHARP);
+    ASSERT_STR_EQ(target->qualified_name, expected);
+    ASSERT_STR_EQ(target->file_path, "");
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(ei_strict_rust_undeclared_module_namesake_is_not_imported) {
+    static const EILangFile files[] = {
+        {"main.rs", "use crate::util::helper;\nfn main() {}\n"},
+        {"util.rs", "pub fn helper() {}\n"},
+    };
+    ASSERT_TRUE(ei_edge_count_is(files, 2, "IMPORTS", 0));
+    PASS();
+}
+
+TEST(ei_strict_rust_custom_crate_root_and_decoy) {
+    static const EILangFile files[] = {
+        {"Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\n"
+                       "[lib]\npath = \"entry/start.rs\"\n"},
+        {"entry/start.rs", "mod util;\nuse crate::util::helper;\n"},
+        {"entry/util.rs", "pub fn helper() {}\n"},
+        {"src/util.rs", "pub fn helper() {}\n"},
+    };
+    const EIFileEdgeExpect expected[] = {{"entry/start.rs", "entry/util.rs"}};
+    ASSERT_TRUE(ei_file_edges_match(files, 4, expected, 1, 2));
+    PASS();
+}
+
+TEST(ei_strict_rust_ambiguous_declared_module_is_not_ranked) {
+    static const EILangFile files[] = {
+        {"main.rs", "mod util;\nuse crate::util::helper;\nfn main() {}\n"},
+        {"util.rs", "pub fn helper() {}\n"},
+        {"util/mod.rs", "pub fn helper() {}\n"},
+    };
+    ASSERT_TRUE(ei_edge_count_is(files, 3, "IMPORTS", 0));
+    PASS();
+}
+
+TEST(ei_strict_configured_include_group_order) {
+    static const EILangFile files[] = {
+        {"main.cpp", "#include <target.h>\n#include \"quote.h\"\nint main() { return 0; }\n"},
+        {"system/target.h", "int from_system();\n"},
+        {"user/target.h", "int from_user();\n"},
+        {"quotes/quote.h", "int from_quote();\n"},
+        {"user/quote.h", "int decoy_quote();\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store =
+        ei_index_files_configured(&lp, files, 5, "-isystem system -I user -iquote quotes");
+    ASSERT_NOT_NULL(store);
+    int64_t source = ei_node_id_for_file_label(store, lp.project, "main.cpp", "File");
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, source, "IMPORTS", &edges, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    int saw_user = 0, saw_quote = 0;
+    for (int i = 0; i < count; i++) {
+        cbm_node_t *target = calloc(1, sizeof(*target));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        saw_user += strcmp(target->file_path, "user/target.h") == 0;
+        saw_quote += strcmp(target->file_path, "quotes/quote.h") == 0;
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, count);
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(saw_user, 1);
+    ASSERT_EQ(saw_quote, 1);
+    PASS();
+}
+
+TEST(ei_strict_duplicate_system_include_root_keeps_compiler_order) {
+    static const EILangFile files[] = {
+        {"main.cpp", "#include <target.h>\nint main() { return 0; }\n"},
+        {"shared/target.h", "int system_target();\n"},
+        {"user/target.h", "int user_target();\n"},
+    };
+    /* The spelling with .. must compare equal by directory identity. GCC and
+     * Clang keep a root listed by both -I and -isystem in its system position,
+     * even when its -I occurrence precedes another user include directory. */
+    static const char *const flags[] = {
+        "-I shared -I user -isystem shared/../shared",
+        "-isystem shared/../shared -I shared -I user",
+    };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        EILangProj lp;
+        cbm_store_t *store = ei_index_files_configured(&lp, files, 3, flags[i]);
+        ASSERT_NOT_NULL(store);
+        int64_t source = ei_node_id_for_file_label(store, lp.project, "main.cpp", "File");
+        int64_t expected = ei_node_id_for_file_label(store, lp.project, "user/target.h", "File");
+        int64_t decoy = ei_node_id_for_file_label(store, lp.project, "shared/target.h", "File");
+        ASSERT_GT(source, 0);
+        ASSERT_GT(expected, 0);
+        ASSERT_GT(decoy, 0);
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        ASSERT_EQ(cbm_store_find_edges_by_source_type(store, source, "IMPORTS", &edges, &count),
+                  CBM_STORE_OK);
+        bool correct = count == 1 && edges[0].target_id == expected && edges[0].target_id != decoy;
+        cbm_store_free_edges(edges, count);
+        ei_cleanup(&lp, store);
+        ASSERT_TRUE(correct);
+    }
+    PASS();
+}
+
 SUITE(edge_imports) {
+    RUN_TEST(ei_strict_duplicate_system_include_root_keeps_compiler_order);
+    RUN_TEST(ei_strict_namespace_dependency_has_canonical_endpoint);
+    RUN_TEST(ei_strict_rust_undeclared_module_namesake_is_not_imported);
+    RUN_TEST(ei_strict_rust_custom_crate_root_and_decoy);
+    RUN_TEST(ei_strict_rust_ambiguous_declared_module_is_not_ranked);
+    RUN_TEST(ei_strict_configured_include_group_order);
+
+    RUN_TEST(ei_strict_quoted_include_exact_target_and_unmodeled_system_gap);
+    RUN_TEST(ei_strict_bare_es_package_does_not_bind_root_module);
+    RUN_TEST(ei_strict_relative_import_above_root_stays_unresolved);
+    RUN_TEST(ei_strict_namespace_member_targets_declaring_file);
+    RUN_TEST(ei_strict_import_never_binds_unrelated_namesake);
+    RUN_TEST(ei_strict_include_does_not_rank_suffix_candidates);
+    RUN_TEST(ei_strict_namespace_import_does_not_pick_first_file);
+    RUN_TEST(ei_strict_import_never_binds_unrelated_namesake);
+    RUN_TEST(ei_strict_include_does_not_rank_suffix_candidates);
+    RUN_TEST(ei_strict_namespace_import_does_not_pick_first_file);
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
 
     /* ── GREEN GUARDS — Python (must stay passing) ── */
@@ -2488,7 +2912,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_vendor_use_empty_namespace_map_issue1186);
     RUN_TEST(ei_php_global_use_keeps_php_candidate_issue1186);
     RUN_TEST(ei_php_declared_functions_and_alias_issue1186);
-    RUN_TEST(ei_php_null_namespace_map_keeps_php_candidate_issue1186);
+    RUN_TEST(ei_php_null_namespace_map_does_not_guess_issue1186);
     RUN_TEST(ei_php_require_path_keeps_generic_resolution_issue1186);
     RUN_TEST(ei_php_vendor_types_never_bind_by_name_issue1186);
     RUN_TEST(ei_php_binding_snapshot_requires_current_complete_evidence);

@@ -449,7 +449,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/store_resolver.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -501,12 +501,25 @@ PIPELINE_SRCS = \
     src/pipeline/path_alias.c \
     src/pipeline/laravel_routing.c \
     src/pipeline/registry.c \
+    internal/cbm/resolve/capabilities.c \
+    internal/cbm/resolve/policy.c \
+    internal/cbm/resolve/types.c \
+    internal/cbm/resolve/binding.c \
+    internal/cbm/resolve/symbols.c \
+    internal/cbm/lsp/ts_proof.c \
+    internal/cbm/lsp/php_proof.c \
+    internal/cbm/lsp/kotlin_proof.c \
+    internal/cbm/lsp/cs_proof.c \
+    internal/cbm/lsp/rust_proof.c \
+    internal/cbm/lsp/py_proof.c \
+    internal/cbm/lsp/c_proof.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
     src/pipeline/pass_calls.c \
+    src/pipeline/pass_resolver.c \
     src/pipeline/pass_spawns.c \
     src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_usages.c \
@@ -704,7 +717,7 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 # Vendored trees are deliberately excluded — they are pinned, they carry their
 # own explicit dep lists (LSP_UNITY_DEPS, TS_RUNTIME_DEPS), and globbing tens of
 # thousands of grammar headers would cost more than it protects.
-PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h tests/*.h \
+PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h $(CBM_DIR)/resolve/*.h tests/*.h \
                tests/repro/*.h)
 
 # ── Test sources ─────────────────────────────────────────────────
@@ -811,7 +824,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = tests/test_resolver_quality.c tests/test_resolver_capabilities.c tests/test_resolver_rust.c tests/test_resolver_py_types.c tests/test_resolver_cs.c tests/test_resolver_kotlin.c tests/test_resolver_php.c tests/test_resolver_python.c tests/test_resolver_diagnostics.c tests/test_resolver_java.c tests/test_resolver_binding_generic.c tests/test_resolver_c.c tests/test_resolver_binding_js.c tests/test_resolver_ts.c tests/test_resolver_symbols.c tests/test_resolver_go.c tests/test_resolver_integration.c tests/test_resolver_pipeline.c tests/test_resolver_binding.c tests/test_resolver_contract.c tests/test_resolver_types.c tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 

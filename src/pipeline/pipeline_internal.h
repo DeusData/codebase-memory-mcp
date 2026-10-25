@@ -26,6 +26,7 @@
 #include <string.h>
 
 typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
+typedef struct cbm_shared_resolver cbm_shared_resolver_t;
 
 typedef enum {
     CBM_PIPELINE_FROZEN_OK = 0,
@@ -441,6 +442,9 @@ typedef struct {
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
+    /* Immutable export proofs shared by all resolution workers. */
+    cbm_shared_resolver_t *shared_resolver;
+    _Atomic bool resolver_failed;
 
     /* Run-owned immutable snapshot; direct borrow also works for probe contexts
      * whose pipeline back-pointer is NULL. Workers only write the fatal latch. */
@@ -1646,7 +1650,8 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
  *      An index built before holds none of them, so it rebuilds once on
  *      upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 9 };
+/* 10: evidence-admitted resolution and per-occurrence outcomes publish together. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 10 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

@@ -1,3 +1,5 @@
+#include "store/store_resolver.h"
+#include "resolve/capabilities.h"
 /*
  * mcp.c — MCP server: JSON-RPC 2.0 over stdio with graph tools.
  *
@@ -772,7 +774,8 @@ static const tool_def_t TOOLS[] = {
 
     {"index_status",
      "Project readiness, counts, root, watch state, coverage gaps, and doc_links (doc-comment "
-     "references: MENTIONS edges, unresolved by reason). diagnostics adds coverage rows; verbose "
+     "references: MENTIONS edges, unresolved by reason). diagnostics adds coverage and resolver "
+     "rows; verbose "
      "adds Git paths. Best-effort only; verify cited paths with check_index_coverage.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"verbose\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Add worktree/"
@@ -780,6 +783,13 @@ static const tool_def_t TOOLS[] = {
      "\"diagnostics\":{\"type\":\"string\",\"enum\":[\"none\",\"summary\",\"full\"],"
      "\"default\":\"none\",\"description\":\"Coverage rows: counts, five samples, or up to "
      "500.\"},"
+     "\"resolver_capabilities\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Include every language's configured syntax, supported proof subsets and "
+     "limitations.\"},"
+     "\"resolver_offset\":{\"type\":\"integer\",\"minimum\":0,\"default\":0,"
+     "\"description\":\"Offset for abstained resolver occurrences.\"},"
+     "\"resolver_limit\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":500,"
+     "\"description\":\"Resolver rows per page; defaults to the diagnostics sample count.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
      "\"required\":["
      "\"project\"]}"},
@@ -7378,6 +7388,129 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
     return result;
 }
 
+typedef struct {
+    yyjson_mut_doc *doc;
+    yyjson_mut_val *rows;
+} resolver_diagnostic_writer_t;
+
+static bool add_resolver_miss(const cbm_resolve_record_t *row, void *context) {
+    resolver_diagnostic_writer_t *writer = context;
+    yyjson_mut_doc *doc = writer->doc;
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    const char *binding = row->result.binding == CBM_RESOLVE_BINDING_UNIQUE      ? "unique"
+                          : row->result.binding == CBM_RESOLVE_BINDING_AMBIGUOUS ? "ambiguous"
+                                                                                 : "unresolved";
+    const char *analysis = row->result.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE  ? "complete"
+                           : row->result.analysis == CBM_RESOLVE_ANALYSIS_LIMITED ? "limited"
+                           : row->result.analysis == CBM_RESOLVE_ANALYSIS_FAILED  ? "failed"
+                                                                                  : "unsupported";
+    const char *domain = row->result.domain == CBM_RESOLVE_DOMAIN_PROJECT    ? "project"
+                         : row->result.domain == CBM_RESOLVE_DOMAIN_EXTERNAL ? "external"
+                                                                             : "unknown";
+    return item && yyjson_mut_obj_add_strcpy(doc, item, "file", row->file_path) &&
+           yyjson_mut_obj_add_strcpy(doc, item, "scope", row->scope) &&
+           yyjson_mut_obj_add_strcpy(doc, item, "relation", row->relation) &&
+           yyjson_mut_obj_add_strcpy(doc, item, "spelling", row->spelling) &&
+           yyjson_mut_obj_add_uint(doc, item, "start_byte", row->start_byte) &&
+           yyjson_mut_obj_add_uint(doc, item, "end_byte", row->end_byte) &&
+           yyjson_mut_obj_add_uint(doc, item, "source_origin", row->source_origin) &&
+           yyjson_mut_obj_add_str(doc, item, "binding", binding) &&
+           yyjson_mut_obj_add_str(doc, item, "analysis", analysis) &&
+           yyjson_mut_obj_add_str(doc, item, "domain", domain) &&
+           yyjson_mut_obj_add_strcpy(doc, item, "reason", row->result.reason) &&
+           yyjson_mut_arr_add_val(writer->rows, item);
+}
+
+static bool add_resolver_capabilities(yyjson_mut_doc *doc, yyjson_mut_val *root) {
+    static const struct {
+        uint32_t flag;
+        const char *name;
+    } features[] = {{CBM_RESOLVE_CAP_SCOPE, "scope_binding"},
+                    {CBM_RESOLVE_CAP_IMPORT_EXPORT, "import_export_binding"},
+                    {CBM_RESOLVE_CAP_DECLARED_TYPE, "declared_type"},
+                    {CBM_RESOLVE_CAP_MEMBER, "member_lookup"},
+                    {CBM_RESOLVE_CAP_TYPE_FLOW, "type_propagation"},
+                    {CBM_RESOLVE_CAP_CALLABLE, "callable_identity"}};
+    yyjson_mut_val *rows = yyjson_mut_arr(doc);
+    if (!rows)
+        return false;
+    for (int i = 0; i < CBM_LANG_COUNT; i++) {
+        cbm_resolve_capabilities_t cap;
+        if (!cbm_resolve_capabilities((CBMLanguage)i, &cap))
+            return false;
+        yyjson_mut_val *row = yyjson_mut_obj(doc), *syntax = yyjson_mut_obj(doc),
+                       *proofs = yyjson_mut_arr(doc);
+        bool ok = row && syntax && proofs &&
+                  yyjson_mut_obj_add_str(doc, row, "language", cbm_language_name((CBMLanguage)i)) &&
+                  yyjson_mut_obj_add_str(doc, row, "adapter", cap.adapter) &&
+                  yyjson_mut_obj_add_str(doc, row, "limitation", cap.limitation) &&
+                  yyjson_mut_obj_add_bool(doc, syntax, "declarations", cap.syntax_declarations) &&
+                  yyjson_mut_obj_add_bool(doc, syntax, "calls", cap.syntax_calls) &&
+                  yyjson_mut_obj_add_bool(doc, syntax, "imports", cap.syntax_imports) &&
+                  yyjson_mut_obj_add_bool(doc, syntax, "writes", cap.syntax_writes) &&
+                  yyjson_mut_obj_add_val(doc, row, "syntax_configured", syntax) &&
+                  yyjson_mut_obj_add_val(doc, row, "supported_proof_subsets", proofs);
+        for (size_t j = 0; ok && j < sizeof(features) / sizeof(features[0]); j++)
+            if (cap.proof_subsets & features[j].flag)
+                ok = yyjson_mut_arr_add_str(doc, proofs, features[j].name);
+        if (!ok || !yyjson_mut_arr_add_val(rows, row))
+            return false;
+    }
+    return yyjson_mut_obj_add_val(doc, root, "resolver_capabilities", rows);
+}
+
+static bool add_resolver_status(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                const char *project, size_t offset, size_t limit) {
+    cbm_resolve_counts_t counts = {0};
+    bool present = false;
+    int rc = cbm_store_resolver_summary(store, project, &counts, &present);
+    yyjson_mut_val *report = yyjson_mut_obj(doc);
+    if (!report)
+        return false;
+    bool ok = yyjson_mut_obj_add_str(doc, report, "status",
+                                     rc != CBM_STORE_OK ? "error"
+                                     : present          ? "available"
+                                                        : "unavailable");
+    if (present && rc == CBM_STORE_OK) {
+        ok = ok &&
+             yyjson_mut_obj_add_uint(doc, report, "rules_version", CBM_RESOLVER_RULES_VERSION) &&
+             yyjson_mut_obj_add_uint(doc, report, "occurrences", counts.occurrences) &&
+             yyjson_mut_obj_add_uint(doc, report, "admitted", counts.emitted) &&
+             yyjson_mut_obj_add_uint(doc, report, "not_admitted",
+                                     counts.occurrences - counts.emitted) &&
+             yyjson_mut_obj_add_uint(doc, report, "ambiguous", counts.ambiguous) &&
+             yyjson_mut_obj_add_uint(doc, report, "unresolved", counts.unresolved) &&
+             yyjson_mut_obj_add_uint(doc, report, "unsupported", counts.unsupported) &&
+             yyjson_mut_obj_add_uint(doc, report, "limited", counts.limited) &&
+             yyjson_mut_obj_add_uint(doc, report, "failed", counts.failed);
+        if (ok && limit) {
+            size_t returned = 0, total = counts.occurrences - counts.emitted;
+            resolver_diagnostic_writer_t writer = {.doc = doc, .rows = yyjson_mut_arr(doc)};
+            ok = writer.rows &&
+                 cbm_store_resolver_visit_misses(store, project, offset, limit, add_resolver_miss,
+                                                 &writer, &returned) == CBM_STORE_OK;
+            bool more = offset < total && returned < total - offset;
+            ok = ok && yyjson_mut_obj_add_val(doc, report, "samples", writer.rows) &&
+                 yyjson_mut_obj_add_uint(doc, report, "sample_offset", offset) &&
+                 yyjson_mut_obj_add_uint(doc, report, "sample_limit", limit) &&
+                 yyjson_mut_obj_add_uint(doc, report, "sample_total", total) &&
+                 yyjson_mut_obj_add_uint(doc, report, "sample_returned", returned) &&
+                 yyjson_mut_obj_add_bool(doc, report, "has_more", more);
+            if (ok && more)
+                ok = yyjson_mut_obj_add_uint(doc, report, "next_offset", offset + returned);
+        }
+    }
+    ok = ok &&
+         yyjson_mut_obj_add_str(
+             doc, report, "interpretation",
+             "Counts describe extracted occurrences and may overlap. They are not recall or "
+             "precision measurements. Missing real edges are resolver quality issues; false "
+             "positive edges are bugs. Source-labelled fixtures must also cover references "
+             "that extraction missed.") &&
+         yyjson_mut_obj_add_val(doc, root, "resolver", report);
+    return ok;
+}
+
 /* index_status "watch" object (#2167): is this project kept fresh by the
  * background watcher right now, and if not, why. Auto-sync covers the active
  * MCP session's project only; anything else needs index_repository again. */
@@ -7470,10 +7603,20 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         (void)cbm_cross_repo_add_status_json(doc, root, store, project);
         bool doc_links_built =
             add_doc_links_report(doc, root, store, project, coverage_samples == COVERAGE_FILE_CAP);
+        int resolver_offset = cbm_mcp_get_int_arg(args, "resolver_offset", 0);
+        int resolver_limit = cbm_mcp_get_int_arg(args, "resolver_limit", coverage_samples);
+        resolver_offset = resolver_offset < 0 ? 0 : resolver_offset;
+        resolver_limit = resolver_limit < 0 ? 0 : resolver_limit;
+        if (resolver_limit > COVERAGE_FILE_CAP)
+            resolver_limit = COVERAGE_FILE_CAP;
+        bool resolver_built = add_resolver_status(doc, root, store, project,
+                                                  (size_t)resolver_offset, (size_t)resolver_limit);
+        if (cbm_mcp_get_bool_arg(args, "resolver_capabilities"))
+            resolver_built = add_resolver_capabilities(doc, root) && resolver_built;
         safe_str_free(&proj_info.name);
         safe_str_free(&proj_info.indexed_at);
         safe_str_free(&proj_info.root_path);
-        if (!doc_links_built) {
+        if (!doc_links_built || !resolver_built) {
             failed = true;
         } else if (counts_unreadable) {
             const char *hint;

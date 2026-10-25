@@ -3,11 +3,9 @@
  * registry.c — Function/Method/Class registry for call resolution.
  *
  * Indexes all callable symbols by qualified name and simple name.
- * Resolution uses a prioritized strategy chain:
- *   1. Import map lookup
- *   2. Same-module match
- *   3. Unique name (single candidate project-wide)
- *   4. Suffix match with import distance scoring
+ * Ordinary resolution accepts exact imported or lexical/module bindings.
+ * Project-wide short-name, suffix and distance candidates are suggestions only;
+ * their legacy chain is retained separately for SQL lineage.
  */
 #include "foundation/constants.h"
 
@@ -24,14 +22,14 @@ enum { REG_MAX_CANDIDATES = 256 };
 #define REG_HALF_PENALTY 0.5
 
 #define DEFAULT_CONFIDENCE 0.5
-#include "pipeline/pipeline.h"
-#include "pipeline/pipeline_internal.h"
+#include "callable_sig.h"      /* cbm_qn_callable_base_len_named: overloads share the name key */
 #include "cbm.h"               /* cbm_label_is_relation — the resolve-time relation veto */
 #include "foundation/compat.h" /* CBM_TLS */
-#include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
+#include "foundation/hash_table.h"
 #include "foundation/platform.h"
-#include "callable_sig.h" /* cbm_qn_callable_base_len_named: overloads share the name key */
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -307,10 +305,11 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
     return strcmp(candidate, best) < 0;
 }
 
-/* Pick candidate with highest composite score (test-deprioritization + namespace
- * proximity), ties settled by candidate_outranks_on_tie. `is_test_flags` and
- * `lang_flags` are the candidates' cached test verdicts and languages, or NULL
- * when the caller has none (a filtered subset carries its own copies). */
+/* Pick candidate with highest composite score (test-deprioritization +
+ * namespace proximity), ties settled by candidate_outranks_on_tie.
+ * `is_test_flags` and `lang_flags` are the candidates' cached test verdicts and
+ * languages, or NULL when the caller has none (a filtered subset carries its
+ * own copies). */
 static const char *best_by_import_distance(const cbm_registry_t *r, const char **candidates,
                                            const uint8_t *is_test_flags, const uint8_t *lang_flags,
                                            int count, const char *module_qn) {
@@ -398,6 +397,10 @@ void cbm_registry_reach_cache_end(void) {
  * Each lookup becomes O(1). Keys and values are BORROWED from the
  * caller's import_map — they outlive the cache scope. */
 static CBM_TLS CBMHashTable *_import_map_cache = NULL;
+/* Distinct address, never a graph target. Conflicting imports cannot be
+ * resolved by registration order; an empty ordinary string instead records a
+ * missing imported target and still shadows local names. */
+static const char ambiguous_import[] = "";
 
 void cbm_registry_import_map_cache_begin(const char **keys, const char **vals, int count) {
     if (_import_map_cache) {
@@ -410,9 +413,13 @@ void cbm_registry_import_map_cache_begin(const char **keys, const char **vals, i
     if (!_import_map_cache)
         return;
     for (int i = 0; i < count; i++) {
-        if (keys[i] && vals[i]) {
-            cbm_ht_set(_import_map_cache, keys[i], (void *)(uintptr_t)vals[i]);
-        }
+        if (!keys[i])
+            continue;
+        const char *value = vals[i] ? vals[i] : "";
+        const char *previous = cbm_ht_get(_import_map_cache, keys[i]);
+        if (previous == ambiguous_import || (previous && strcmp(previous, value) != 0))
+            value = ambiguous_import;
+        cbm_ht_set(_import_map_cache, keys[i], (void *)(uintptr_t)value);
     }
 }
 
@@ -441,7 +448,8 @@ void cbm_registry_import_map_cache_end(void) {
 typedef struct {
     cbm_resolution_t res;
     size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
-    bool skip_members; /* a C call and a C reference to the same name share it too */
+    bool skip_members; /* a C call and a C reference to the same name share it too
+                        */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -595,9 +603,11 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     }
     if (strcmp(strategy, "same_module") == 0 || strcmp(strategy, "import_map") == 0 ||
         strcmp(strategy, "import_map_suffix") == 0) {
-        return false; /* high-confidence import/same-module match — keep the genuine edge */
+        return false; /* high-confidence import/same-module match — keep the genuine
+                         edge */
     }
-    return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
+    return true; /* weak short-name match (suffix_match / unique_name / …) → drop
+                  */
 }
 
 /* Dynamic-language analogue of the Perl guard above (#592/#606/#1276
@@ -622,11 +632,12 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
 /* The weak short-name strategies that actually reach the call-resolution
  * guards: the registry's suffix_match / unique_name and the parallel
  * field_type_hint. "fuzzy" is listed as defensive insurance only —
- * cbm_registry_fuzzy_resolve is not wired into the sequential/parallel resolvers
- * today, so it never reaches these helpers, but naming it keeps a future wiring
- * from silently reintroducing the noise. Everything else — same_module /
- * import_map / import_map_suffix / qualified_suffix / callee_suffix /
- * service_pattern / lsp_* — is a receiver- or import-aware match and is KEPT.
+ * cbm_registry_fuzzy_resolve is not wired into the sequential/parallel
+ * resolvers today, so it never reaches these helpers, but naming it keeps a
+ * future wiring from silently reintroducing the noise. Everything else —
+ * same_module / import_map / import_map_suffix / qualified_suffix /
+ * callee_suffix / service_pattern / lsp_* — is a receiver- or import-aware
+ * match and is KEPT.
  *
  * Shared by BOTH weak-call guards below so the drop-list exists exactly once: a
  * list that drifted between the member guard and the local-binding guard would
@@ -734,9 +745,9 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
  * This is deliberately NOT keyed on the callee's spelling. A list of
  * "generic-looking" names (get / run / execute) asserts that certain spellings
  * are usually noise, which is a claim about corpus fashion rather than about
- * what the resolver knew — and it ages invisibly, because nothing fails when the
- * distribution shifts, the graph just quietly loses different edges. A parameter
- * binding is a fact about THIS file's scope, decidable outright.
+ * what the resolver knew — and it ages invisibly, because nothing fails when
+ * the distribution shifts, the graph just quietly loses different edges. A
+ * parameter binding is a fact about THIS file's scope, decidable outright.
  *
  * `enabled` is the caller's per-language gate, kept out of the helper for the
  * same reason as the member guard: the two call sites in pass_calls.c and
@@ -786,7 +797,8 @@ bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *s
  * `PkgConfigView.patch`). The caller decides whether the binding contradicts
  * the target (cbm_python_import_binding_contradicts: a SCOPE FACT about this
  * file, not a spelling list); only weak strategies are dropped, so import_map /
- * same_module / lsp_* edges are untouched. Pure; unit-tested in test_registry.c. */
+ * same_module / lsp_* edges are untouched. Pure; unit-tested in
+ * test_registry.c. */
 bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
                                          const char *strategy) {
     if (!enabled || !import_binding_contradicts) {
@@ -813,8 +825,9 @@ static bool c_cpp_family(CBMLanguage lang) {
  * caller's language can actually call the target by that name
  * (cbm_registry_name_guess_vetoed). same_module joins them: module QNs drop
  * the extension, so tests/x.c and tests/x.py share one module, and a call in
- * the C file found the Python function by name inside it. Families are the interop
- * groups the resolvers already honour, plus the well-known interop pairs:
+ * the C file found the Python function by name inside it. Families are the
+ * interop groups the resolvers already honour, plus the well-known interop
+ * pairs:
  *   - JS family: JS/TS/TSX/ArkTS (the #725 and #1928 guards) and the script
  *     hosts whose calls ARE JS/TS (HTML/Vue/Svelte/Astro, the weak-member
  *     guard's embedded-script set; QML embeds JS and imports .js files).
@@ -1539,7 +1552,7 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
             }
         }
     }
-    if (!resolved) {
+    if (!resolved || !resolved[0] || resolved == ambiguous_import) {
         return empty_result();
     }
 
@@ -1562,7 +1575,7 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     if (!suffix || !suffix[0]) {
         const char *direct = cbm_ht_get_key(r->exact, resolved);
         if (direct) {
-            return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+            return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED, {0}};
         }
     }
     char candidate[CBM_SZ_512];
@@ -1574,7 +1587,7 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     /* Use cbm_ht_get_key to get the persistent heap-owned key string */
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
     if (stored_key) {
-        return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+        return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED, {0}};
     }
 
     /* import_map_suffix fallback: find a QN starting with resolved+"." and
@@ -1597,8 +1610,8 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
                 size_t klen = strlen(qn);
                 if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
                     strcmp(qn + klen - ds_len, dot_suffix) == 0) {
-                    return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
-                                              REG_RESOLVED};
+                    return (cbm_resolution_t){
+                        qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX, REG_RESOLVED, {0}};
                 }
             }
         }
@@ -1644,7 +1657,7 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
     if (!stored_key && suffix && suffix[0])
         stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
     if (stored_key)
-        return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+        return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED, {0}};
     return empty_result();
 }
 
@@ -1672,14 +1685,14 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
     }
     if (fcount == SKIP_ONE) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
+        return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count, {0}};
     }
     if (fcount > SKIP_ONE) {
         const char *best = best_by_import_distance(r, filtered, flags ? filtered_test : NULL,
                                                    langs ? filtered_lang : NULL, fcount, module_qn);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
-            return (cbm_resolution_t){best, "suffix_match", conf, fcount};
+            return (cbm_resolution_t){best, "suffix_match", conf, fcount, {0}};
         }
     }
     /* No import-reachable — use all candidates with penalty */
@@ -1687,7 +1700,7 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
                                                qn_lang_flags(arr), arr->count, module_qn);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
-        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
+        return (cbm_resolution_t){best, "suffix_match", conf, arr->count, {0}};
     }
     return empty_result();
 }
@@ -1701,13 +1714,14 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
  * disambiguate among same-simple-name candidates by matching the FULL qualified
  * tail against each candidate QN at a segment boundary. Returns the sole
  * candidate whose QN equals or ends with ".<dotted-callee>", or NULL when zero
- * or several candidates match (the caller then falls back to bare-name scoring).
+ * or several candidates match (the caller then falls back to bare-name
+ * scoring).
  *
  * Fixes qualified cross-file calls collapsing onto one namespace when the bare
- * symbol name is defined in several — e.g. Perl's Foo::Bar::run and Foo::Baz::run
- * both reduce to "run", so the bare-name scorer would route every caller to a
- * single winner. Language agnostic: callees with no separator return NULL and
- * leave behavior unchanged. */
+ * symbol name is defined in several — e.g. Perl's Foo::Bar::run and
+ * Foo::Baz::run both reduce to "run", so the bare-name scorer would route every
+ * caller to a single winner. Language agnostic: callees with no separator
+ * return NULL and leave behavior unchanged. */
 static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
     /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
     char dotted[CBM_SZ_512];
@@ -1749,13 +1763,14 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
-/* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
- * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
- * throw away, and throwing it away binds Foundation's URLSession.shared.data to
- * a project's own PickedFile.data: high confidence, and nothing in the graph
- * shows it is wrong. Require instead that the candidate's own parent segment
- * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
- * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
+/* A dotted callee whose FIRST segment starts upper-case names a type —
+ * URLSession, Calendar, JSONEncoder. That receiver chain is evidence the
+ * bare-name scorers throw away, and throwing it away binds Foundation's
+ * URLSession.shared.data to a project's own PickedFile.data: high confidence,
+ * and nothing in the graph shows it is wrong. Require instead that the
+ * candidate's own parent segment appears somewhere in the chain.
+ * Calendar.utcGregorian.startOfDayUTC resolving to
+ * AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
  *
  * Only an upper-case first segment is guarded. A lower-case root names a value
  * (vm.load, http.Get, os.path.join) whose declared type the chain does not
@@ -1881,7 +1896,8 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
     if (arr->count > 1) {
         const char *q = qualified_suffix_match(arr, callee_name);
         if (q) {
-            return (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
+            return (cbm_resolution_t){
+                q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED, {0}};
         }
     }
 
@@ -1895,7 +1911,7 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
             conf *= DEFAULT_CONFIDENCE;
         }
-        return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
+        return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED, {0}};
     }
 
     /* Strategy 4: multiple candidates */
@@ -1909,7 +1925,7 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
             return empty_result();
         }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
+        return (cbm_resolution_t){best, "suffix_match", conf, arr->count, {0}};
     }
     return empty_result();
 }
@@ -2037,6 +2053,127 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
                                            registry_entry_language(r, res->qualified_name));
 }
 
+/* A registry exact hit proves only this module/import binding. Consumers must
+ * still validate occurrence role and lexical shadowing before admission. */
+static cbm_resolution_t binding_result(const char *target, const char *strategy, double confidence,
+                                       cbm_resolve_rule_t rule, uint32_t binding_fact) {
+    bool complete = rule == CBM_RESOLVE_RULE_MODULE_PATH;
+    return (cbm_resolution_t){
+        .qualified_name = target,
+        .strategy = strategy,
+        .confidence = confidence,
+        .candidate_count = 1,
+        .proof = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                  .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                  .analysis =
+                      complete ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                  .rule = rule,
+                  .facts = CBM_RESOLVE_FACT_EXACT_TARGET | binding_fact |
+                           (complete ? CBM_RESOLVE_FACT_LOOKUP_COMPLETE : 0),
+                  .target = target,
+                  .candidate_count = 1,
+                  .reason = complete ? "exact_binding" : "lexical_context_required"}};
+}
+
+static cbm_resolution_t unresolved_binding(const char *reason) {
+    cbm_resolution_t result = {0};
+    result.proof.reason = reason;
+    return result;
+}
+
+/* NULL: no binding; empty string: a binding with no project target; the
+ * distinct ambiguous_import address: incompatible bindings. Cache and linear
+ * paths deliberately use the same conflict rule. */
+static const char *import_binding(const char *prefix, const char **keys, const char **values,
+                                  int count) {
+    if (!keys || !values || count <= 0)
+        return NULL;
+    if (_import_map_cache)
+        return cbm_ht_get(_import_map_cache, prefix);
+    const char *target = NULL;
+    for (int i = 0; i < count; i++) {
+        if (!keys[i] || strcmp(keys[i], prefix) != 0)
+            continue;
+        const char *value = values[i] ? values[i] : "";
+        if (target && strcmp(target, value) != 0)
+            return ambiguous_import;
+        target = value;
+    }
+    return target;
+}
+
+/* Preserve complete qualification. In particular unknown.run never becomes
+ * run, and imported.run never searches imported.hidden.run. An import whose
+ * target cannot be represented blocks a same-named local declaration. */
+static cbm_resolution_t registry_resolve_binding(const cbm_registry_t *r, const char *name,
+                                                 const char *module, const char **keys,
+                                                 const char **values, int count, size_t scope_len,
+                                                 bool skip_members) {
+    size_t length = strlen(name);
+    char prefix[CBM_SZ_1K];
+    if (length == 0 || length >= sizeof(prefix))
+        return unresolved_binding("unsupported_binding_name");
+    memcpy(prefix, name, length + 1);
+    const char *separator = NULL;
+    size_t separator_len = 1;
+    const char *imported = NULL;
+    /* A loaded Python module can have a dotted local spelling. Probe exact
+     * imported prefixes longest-first; a root blocker then prevents an
+     * unimported sibling from borrowing the package's indexed descendants. */
+    for (size_t cut = length;;) {
+        prefix[cut] = '\0';
+        imported = import_binding(prefix, keys, values, count);
+        if (imported) {
+            separator = cut == length ? NULL : name + cut;
+            separator_len = separator && *separator == ':' ? 2 : 1;
+            break;
+        }
+        size_t previous = cut;
+        while (previous > 0) {
+            previous--;
+            if (name[previous] == '.')
+                break;
+            if (name[previous] == ':' && previous > 0 && name[previous - 1] == ':') {
+                previous--;
+                break;
+            }
+        }
+        if (previous == 0)
+            break;
+        cut = previous;
+    }
+    if (imported == ambiguous_import) {
+        cbm_resolution_t result = unresolved_binding("ambiguous_import_binding");
+        result.proof.binding = CBM_RESOLVE_BINDING_AMBIGUOUS;
+        result.proof.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
+        result.proof.candidate_count = 2;
+        return result;
+    }
+    const char *target = NULL;
+    if (imported) {
+        if (!imported[0])
+            return unresolved_binding("import_target_unresolved");
+        if (!separator)
+            target = cbm_ht_get_key(r->exact, imported);
+        if (!target) {
+            const char *member = separator ? separator + separator_len : prefix;
+            target = same_module_candidate(r, imported, strlen(imported), member);
+        }
+        if (!target)
+            return unresolved_binding("import_member_unresolved");
+        return binding_result(target, "import_map", CONF_IMPORT_MAP,
+                              CBM_RESOLVE_RULE_IMPORT_BINDING, CBM_RESOLVE_FACT_IMPORT_BOUND);
+    }
+    target = same_module_candidate(r, module, scope_len, name);
+    if (!target)
+        return unresolved_binding("binding_not_found");
+    const char *label = cbm_ht_get(r->exact, target);
+    if (skip_members && label && (strcmp(label, "Field") == 0 || strcmp(label, "Method") == 0))
+        return unresolved_binding("member_requires_receiver");
+    return binding_result(target, "same_module", CONF_SAME_MODULE, CBM_RESOLVE_RULE_SCOPE_BINDING,
+                          CBM_RESOLVE_FACT_SCOPE_BOUND);
+}
+
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
@@ -2054,8 +2191,8 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
         return cached->res;
 
     cbm_resolution_t res =
-        registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                               import_map_count, scope_len, skip_members);
+        registry_resolve_binding(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                 import_map_count, scope_len, skip_members);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2264,7 +2401,8 @@ cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const cha
     const char *qn = NULL;
     switch (psr4_member_qn(gbuf, handler_ref, fqn_len, member, &qn)) {
     case CBM_PSR4_MEMBER_RESOLVED:
-        return (cbm_resolution_t){qn, "php_psr4", CONF_PSR4_MEMBER, REG_RESOLVED};
+        return binding_result(qn, "php_psr4", CONF_PSR4_MEMBER, CBM_RESOLVE_RULE_MODULE_PATH,
+                              CBM_RESOLVE_FACT_PATH_BOUND);
     case CBM_PSR4_MEMBER_UNRESOLVED:
         /* A covered class lives where PSR-4 says or nowhere; a namespace-
          * mirroring folder elsewhere would be a guessed edge (#1186). */
@@ -2274,8 +2412,8 @@ cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const cha
     }
     qn = aligned_member_qn(r, handler_ref, ns_len, cls, cls_len, member);
     if (qn) {
-        return (cbm_resolution_t){qn, "php_namespace_path", CONF_NAMESPACE_PATH_MEMBER,
-                                  REG_RESOLVED};
+        return (cbm_resolution_t){
+            qn, "php_namespace_path", CONF_NAMESPACE_PATH_MEMBER, REG_RESOLVED, {0}};
     }
     return empty_result();
 }
@@ -2327,8 +2465,8 @@ cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const cha
             const char *stored_key =
                 n > 0 && (size_t)n < sizeof(candidate) ? cbm_ht_get_key(r->exact, candidate) : NULL;
             if (stored_key) {
-                return (cbm_resolution_t){stored_key, "lexical_scope", CONF_LEXICAL_SCOPE,
-                                          REG_RESOLVED};
+                return binding_result(stored_key, "lexical_scope", CONF_LEXICAL_SCOPE,
+                                      CBM_RESOLVE_RULE_SCOPE_BINDING, CBM_RESOLVE_FACT_SCOPE_BOUND);
             }
         }
         char *dot = strrchr(scope, '.');
@@ -2404,7 +2542,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             !is_import_reachable(arr->items[0], import_map_vals, import_map_count)) {
             conf *= DEFAULT_CONFIDENCE;
         }
-        return (cbm_fuzzy_result_t){{arr->items[0], "fuzzy", conf, REG_RESOLVED}, true};
+        return (cbm_fuzzy_result_t){{arr->items[0], "fuzzy", conf, REG_RESOLVED, {0}}, true};
     }
 
     /* Multiple candidates: filter by import reachability */
@@ -2426,14 +2564,20 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             return no_match;
         }
         return (cbm_fuzzy_result_t){
-            {best, "fuzzy",
-             candidate_count_penalty(CONF_FUZZY_MULTI * REG_HALF_PENALTY, arr->count), arr->count},
+            {best,
+             "fuzzy",
+             candidate_count_penalty(CONF_FUZZY_MULTI * REG_HALF_PENALTY, arr->count),
+             arr->count,
+             {0}},
             true};
     }
     if (fcount == SKIP_ONE) {
-        return (cbm_fuzzy_result_t){
-            {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
-            true};
+        return (cbm_fuzzy_result_t){{fptr[0],
+                                     "fuzzy",
+                                     candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count),
+                                     arr->count,
+                                     {0}},
+                                    true};
     }
     const bool all = fptr == (const char **)arr->items;
     const char *best = best_by_import_distance(r, fptr, all ? qn_test_flags(arr) : NULL,
@@ -2442,7 +2586,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
         return no_match;
     }
     return (cbm_fuzzy_result_t){
-        {best, "fuzzy", candidate_count_penalty(CONF_FUZZY_MULTI, fcount), fcount}, true};
+        {best, "fuzzy", candidate_count_penalty(CONF_FUZZY_MULTI, fcount), fcount, {0}}, true};
 }
 
 /* ── FindEndingWith ─────────────────────────────────────────────── */

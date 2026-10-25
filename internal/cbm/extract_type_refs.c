@@ -103,7 +103,8 @@ static const char *extract_type_text(CBMArena *a, TSNode node, const char *sourc
 }
 
 // Add a type reference for a function.
-static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn) {
+static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn,
+                          TSNode site) {
     if (!type_name || !type_name[0]) {
         return;
     }
@@ -115,9 +116,16 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
         return;
     }
 
-    CBMTypeRef tr;
+    CBMTypeRef tr = {0};
     tr.type_name = type_name;
     tr.enclosing_func_qn = func_qn;
+    tr.site_start_byte = ts_node_start_byte(site);
+    tr.site_end_byte = ts_node_end_byte(site);
+    size_t length = strlen(type_name);
+    tr.site_is_exact = tr.site_end_byte > tr.site_start_byte &&
+                       tr.site_end_byte <= (uint32_t)ctx->source_len &&
+                       length == tr.site_end_byte - tr.site_start_byte &&
+                       memcmp(ctx->source + tr.site_start_byte, type_name, length) == 0;
     cbm_typerefs_push(&ctx->result->type_refs, ctx->arena, tr);
 }
 
@@ -129,7 +137,7 @@ static void extract_param_type_refs(CBMExtractCtx *ctx, TSNode params, const cha
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
         if (!ts_node_is_null(type_node)) {
             const char *tname = extract_type_text(ctx->arena, type_node, ctx->source);
-            add_type_ref(ctx, tname, func_qn);
+            add_type_ref(ctx, tname, func_qn, type_node);
         }
     }
 }
@@ -141,7 +149,7 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
             const char *tname = extract_type_text(ctx->arena, rt, ctx->source);
-            add_type_ref(ctx, tname, func_qn);
+            add_type_ref(ctx, tname, func_qn, rt);
             break;
         }
     }
@@ -151,7 +159,7 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
 static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
     TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
     if (!ts_node_is_null(type_node)) {
-        add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn);
+        add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn, type_node);
     }
 }
 
@@ -166,7 +174,7 @@ static void extract_ts_body_type_refs(CBMExtractCtx *ctx, TSNode node, const cha
             TSNode child = ts_node_child(node, i);
             if (strcmp(ts_node_type(child), "type_identifier") == 0 ||
                 strcmp(ts_node_type(child), "identifier") == 0) {
-                add_type_ref(ctx, cbm_node_text(ctx->arena, child, ctx->source), func_qn);
+                add_type_ref(ctx, cbm_node_text(ctx->arena, child, ctx->source), func_qn, child);
             }
         }
     } else if (strcmp(kind, "variable_declarator") == 0) {
@@ -176,7 +184,8 @@ static void extract_ts_body_type_refs(CBMExtractCtx *ctx, TSNode node, const cha
             if (strcmp(ts_node_type(child), "type_annotation") == 0) {
                 if (ts_node_child_count(child) > 0) {
                     TSNode inner = ts_node_child(child, ts_node_child_count(child) - SKIP_ONE);
-                    add_type_ref(ctx, extract_type_text(ctx->arena, inner, ctx->source), func_qn);
+                    add_type_ref(ctx, extract_type_text(ctx->arena, inner, ctx->source), func_qn,
+                                 inner);
                 }
             }
         }
@@ -197,7 +206,7 @@ static void extract_java_body_type_refs(CBMExtractCtx *ctx, TSNode node, const c
                 for (uint32_t j = 0; j < nta; j++) {
                     TSNode ta = ts_node_child(child, j);
                     if (strcmp(ts_node_type(ta), "type_identifier") == 0) {
-                        add_type_ref(ctx, cbm_node_text(ctx->arena, ta, ctx->source), func_qn);
+                        add_type_ref(ctx, cbm_node_text(ctx->arena, ta, ctx->source), func_qn, ta);
                     }
                 }
             }
@@ -229,7 +238,8 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
         if (strcmp(kind, "assignment") == 0) {
             TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
             if (!ts_node_is_null(type_node)) {
-                add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), func_qn);
+                add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), func_qn,
+                             type_node);
             }
         }
         break;
@@ -352,10 +362,23 @@ void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, 
         return;
     }
 
+    int before = ctx->result->type_refs.count;
     if (cbm_kind_in_set(node, spec->function_node_types)) {
         extract_signature_type_refs(ctx, node, state);
+    } else {
+        process_body_type_ref(ctx, node, state->enclosing_func_qn);
+    }
+    if (before == ctx->result->type_refs.count) {
         return;
     }
-
-    process_body_type_ref(ctx, node, state->enclosing_func_qn);
+    uint32_t scope_id = state->root_lexical_scope_id;
+    for (int i = state->scope_top - 1; i >= 0; i--) {
+        if (state->scopes[i].lexical_scope_id) {
+            scope_id = state->scopes[i].lexical_scope_id;
+            break;
+        }
+    }
+    for (int i = before; i < ctx->result->type_refs.count; i++) {
+        ctx->result->type_refs.items[i].lexical_scope_id = scope_id;
+    }
 }

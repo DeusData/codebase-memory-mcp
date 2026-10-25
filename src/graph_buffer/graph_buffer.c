@@ -117,6 +117,11 @@ struct cbm_gbuf {
     /* Edge storage: array of pointers to individually heap-allocated edges */
     CBM_DYN_ARRAY(cbm_gbuf_edge_t *) edges;
 
+    cbm_resolve_record_t *resolutions;
+    size_t resolution_count;
+    size_t resolution_capacity;
+    bool resolution_failed;
+
     /* Edge dedup index: "srcID:tgtID:type" → cbm_gbuf_edge_t* */
     edge_key_map_t edge_by_key; /* dedup: 128-bit key hash -> edge */
 
@@ -165,6 +170,50 @@ static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
         cbm_ht_set(gb->intern_pool, copy, copy); /* key == value == owned copy */
     }
     return copy;
+}
+
+bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record) {
+    if (!gb || !record || gb->resolution_failed)
+        return false;
+    if (gb->resolution_count == gb->resolution_capacity) {
+        size_t next = gb->resolution_capacity ? gb->resolution_capacity * 2 : 64;
+        if (next < gb->resolution_capacity || next > SIZE_MAX / sizeof(*gb->resolutions)) {
+            gb->resolution_failed = true;
+            return false;
+        }
+        cbm_resolve_record_t *rows = realloc(gb->resolutions, next * sizeof(*rows));
+        if (!rows) {
+            gb->resolution_failed = true;
+            return false;
+        }
+        gb->resolutions = rows;
+        gb->resolution_capacity = next;
+    }
+    cbm_resolve_record_t row = *record;
+    row.file_path = gb_intern(gb, record->file_path ? record->file_path : "");
+    row.scope = gb_intern(gb, record->scope ? record->scope : "");
+    row.relation = gb_intern(gb, record->relation ? record->relation : "");
+    row.spelling = gb_intern(gb, record->spelling ? record->spelling : "");
+    row.properties_json = gb_intern(gb, record->properties_json ? record->properties_json : "{}");
+    row.result.target = gb_intern(gb, record->result.target ? record->result.target : "");
+    row.result.reason = gb_intern(gb, record->result.reason ? record->result.reason : "");
+    if (!row.file_path || !row.scope || !row.relation || !row.spelling || !row.result.target ||
+        !row.result.reason || !row.properties_json) {
+        gb->resolution_failed = true;
+        return false;
+    }
+    gb->resolutions[gb->resolution_count++] = row;
+    return true;
+}
+
+const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count) {
+    if (count)
+        *count = gb ? gb->resolution_count : 0;
+    return gb ? gb->resolutions : NULL;
+}
+
+bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb) {
+    return gb && !gb->resolution_failed;
 }
 
 static void make_id_key(char *buf, size_t bufsz, int64_t id) {
@@ -683,6 +732,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
     }
+    free(gb->resolutions);
     if (gb->variant_spans) {
         cbm_ht_foreach(gb->variant_spans, gb_free_span_vec, NULL);
         cbm_ht_free(gb->variant_spans);
@@ -2187,6 +2237,12 @@ static void merge_remap_edges(cbm_gbuf_t *dst, cbm_gbuf_t *src, CBMHashTable *re
 int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     if (!dst || !src) {
         return CBM_NOT_FOUND;
+    }
+    if (src->resolution_failed)
+        dst->resolution_failed = true;
+    for (size_t i = 0; i < src->resolution_count; i++) {
+        if (!cbm_gbuf_record_resolution(dst, &src->resolutions[i]))
+            return CBM_NOT_FOUND;
     }
     if (src->nodes.count == 0 && src->edges.count == 0) {
         return 0;

@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include "resolve/record.h"
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -19,6 +20,12 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 /* Forward declare store for dump path */
 typedef struct cbm_store cbm_store_t;
+
+/* Resolution diagnostics are separate from endpoint-deduplicated graph edges.
+ * Each worker records into its own buffer; merge copies and interns strings. */
+bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record);
+const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count);
+bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
 
 /* ── Node / Edge structs (owned by the buffer) ───────────────────── */
 

@@ -7,6 +7,7 @@
 #include "test_framework.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h" /* cbm_python_import_binding_contradicts (#2127) */
+#include "resolve/policy.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -286,62 +287,62 @@ TEST(resolve_same_module) {
     PASS();
 }
 
-/* A package/namespace-qualified callee whose bare name is defined in several
- * places must resolve to the package named in the call — not collapse onto a
- * single winner. Regression for qualified cross-file calls (e.g. Perl
- * Foo::Bar::sub()) where the same sub name exists in multiple packages. */
-TEST(resolve_qualified_disambiguates_same_name) {
+/* A matching qualified tail is insufficient without a language namespace
+ * binding. An explicit imported namespace retains the exact positive case. */
+TEST(resolve_qualified_names_require_explicit_binding) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "save", "proj.lib.App.Alpha.save", "Function");
     cbm_registry_add(r, "save", "proj.lib.App.Beta.save", "Function");
     cbm_registry_add(r, "save", "proj.lib.App.Gamma.save", "Function");
 
-    /* Each fully-qualified call routes to its own package. */
+    /* Graph path suffixes do not establish language namespace bindings. */
     cbm_resolution_t a =
         cbm_registry_resolve(r, "App::Alpha::save", "proj.lib.App.Caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(a.qualified_name, "proj.lib.App.Alpha.save");
-    ASSERT_STR_EQ(a.strategy, "qualified_suffix");
+    ASSERT_NULL(a.qualified_name);
 
     cbm_resolution_t b =
         cbm_registry_resolve(r, "App::Beta::save", "proj.lib.App.Caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(b.qualified_name, "proj.lib.App.Beta.save");
+    ASSERT_NULL(b.qualified_name);
 
     cbm_resolution_t g =
         cbm_registry_resolve(r, "App::Gamma::save", "proj.lib.App.Caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(g.qualified_name, "proj.lib.App.Gamma.save");
+    ASSERT_NULL(g.qualified_name);
 
-    /* The dotted callee form (Go/Python/C#) disambiguates identically. */
+    /* Dotted syntax needs the same evidence as double-colon syntax. */
     cbm_resolution_t dotted =
         cbm_registry_resolve(r, "App.Beta.save", "proj.lib.App.Caller", NULL, NULL, 0);
+    ASSERT_NULL(dotted.qualified_name);
+    /* A matching tail is insufficient; the explicit namespace binding works. */
+    const char *keys[] = {"App"};
+    const char *vals[] = {"proj.lib.App"};
+    dotted = cbm_registry_resolve(r, "App.Beta.save", "proj.lib.App.Caller", keys, vals, 1);
     ASSERT_STR_EQ(dotted.qualified_name, "proj.lib.App.Beta.save");
-    ASSERT_STR_EQ(dotted.strategy, "qualified_suffix");
+    ASSERT_STR_EQ(dotted.strategy, "import_map");
 
-    /* A qualified callee whose tail matches NO candidate falls through to the
-     * existing bare-name scoring (never a qualified_suffix result). */
+    /* A wrong namespace must not fall back to bare-name scoring. */
     cbm_resolution_t nomatch =
         cbm_registry_resolve(r, "Other::Pkg::save", "proj.lib.App.Caller", NULL, NULL, 0);
-    ASSERT_TRUE(!nomatch.strategy || strcmp(nomatch.strategy, "qualified_suffix") != 0);
+    ASSERT_NULL(nomatch.qualified_name);
 
     /* A bare call stays ambiguous (no qualifier → no disambiguation signal). */
     cbm_resolution_t bare = cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
-    ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "qualified_suffix") != 0);
+    ASSERT_NULL(bare.qualified_name);
 
     cbm_registry_free(r);
     PASS();
 }
 
-/* When two candidates share the same qualified tail, a qualified callee is
- * genuinely ambiguous and must fall through to bare-name scoring rather than
- * pick arbitrarily under the high-confidence qualified_suffix strategy. */
-TEST(resolve_qualified_ambiguous_tail_falls_through) {
+/* Multiple qualified-tail matches remain unresolved; a tie-break is never
+ * semantic evidence for choosing one of them. */
+TEST(resolve_qualified_ambiguous_tail_is_unresolved) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "run", "proj.svcA.Foo.Bar.run", "Function");
     cbm_registry_add(r, "run", "proj.svcB.Foo.Bar.run", "Function");
 
-    /* "Foo::Bar::run" tail matches BOTH candidates → not unique → fall through. */
+    /* "Foo::Bar::run" matches both tails, with no binding to either module. */
     cbm_resolution_t res =
         cbm_registry_resolve(r, "Foo::Bar::run", "proj.svcA.Caller", NULL, NULL, 0);
-    ASSERT_TRUE(!res.strategy || strcmp(res.strategy, "qualified_suffix") != 0);
+    ASSERT_NULL(res.qualified_name);
 
     cbm_registry_free(r);
     PASS();
@@ -357,7 +358,12 @@ TEST(registry_indexes_by_passed_name_not_qn_tail) {
     cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function");
 
     cbm_resolution_t res = cbm_registry_resolve(r, "add", "proj.lib.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.lib.add#cfg(test)");
+    ASSERT_NULL(res.qualified_name);
+    const char **candidates = NULL;
+    int count = 0;
+    cbm_registry_find_by_name(r, "add", &candidates, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(candidates[0], "proj.lib.add#cfg(test)");
 
     cbm_registry_free(r);
     PASS();
@@ -384,14 +390,22 @@ TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
     cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module");
 
     cbm_resolution_t tail = cbm_registry_resolve(r, "web", "proj.main", NULL, NULL, 0);
-    ASSERT_STR_EQ(tail.qualified_name, "proj.main.resource.aws_instance.web");
+    ASSERT_NULL(tail.qualified_name);
+    const char **candidates = NULL;
+    int count = 0;
+    cbm_registry_find_by_name(r, "web", &candidates, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(candidates[0], "proj.main.resource.aws_instance.web");
 
     cbm_resolution_t whole =
         cbm_registry_resolve(r, "resource.aws_instance.web", "proj.main", NULL, NULL, 0);
     ASSERT_STR_EQ(whole.qualified_name, "proj.main.resource.aws_instance.web");
 
     cbm_resolution_t stem = cbm_registry_resolve(r, "helper", "proj.pkg.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(stem.qualified_name, "proj.pkg.helper");
+    ASSERT_NULL(stem.qualified_name);
+    cbm_registry_find_by_name(r, "helper", &candidates, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(candidates[0], "proj.pkg.helper");
 
     cbm_registry_free(r);
     PASS();
@@ -479,15 +493,15 @@ TEST(resolve_import_map_aliased_from_import) {
     PASS();
 }
 
-TEST(resolve_unique_name) {
+TEST(resolve_unique_name_is_not_binding) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
 
-    /* Call "UniqueFunc" — only one candidate project-wide */
+    /* Project-wide uniqueness says nothing about whether this name is bound. */
     cbm_resolution_t res =
         cbm_registry_resolve(r, "UniqueFunc", "proj.other.module", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.deep.path.UniqueFunc");
-    ASSERT_STR_EQ(res.strategy, "unique_name");
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.proof.reason, "binding_not_found");
 
     cbm_registry_free(r);
     PASS();
@@ -548,16 +562,14 @@ TEST(confidence_band_speculative) {
 
 /* ── Suffix match resolution ──────────────────────────────────── */
 
-TEST(resolve_suffix_match) {
+TEST(resolve_suffix_match_is_not_binding) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.svcA.Process", "Function");
     cbm_registry_add(r, "Process", "proj.svcB.Process", "Function");
 
-    /* Caller in svcA — should prefer svcA via import distance */
+    /* Directory proximity cannot make an unimported name visible. */
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.svcA.caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.svcA.Process");
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
-    ASSERT_TRUE(res.confidence >= 0.50 && res.confidence <= 0.60);
+    ASSERT_NULL(res.qualified_name);
 
     cbm_registry_free(r);
     PASS();
@@ -590,19 +602,17 @@ TEST(resolve_caps_unresolvably_ambiguous_names) {
 
 /* ── Import map suffix resolution ─────────────────────────────── */
 
-TEST(resolve_import_map_suffix) {
+TEST(resolve_import_map_does_not_search_descendants) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Foo", "proj.other.sub.Foo", "Function");
 
     const char *keys[] = {"other"};
     const char *vals[] = {"proj.other"};
 
-    /* "other.Foo" → exact "proj.other.Foo" not found →
-     * suffix scan finds "proj.other.sub.Foo" */
+    /* The import does not export the descendant sub.Foo as other.Foo. */
     cbm_resolution_t res = cbm_registry_resolve(r, "other.Foo", "proj.pkg", keys, vals, 1);
-    ASSERT_STR_EQ(res.qualified_name, "proj.other.sub.Foo");
-    ASSERT_STR_EQ(res.strategy, "import_map_suffix");
-    ASSERT_TRUE(res.confidence >= 0.80 && res.confidence <= 0.90);
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_STR_EQ(res.proof.reason, "import_member_unresolved");
 
     cbm_registry_free(r);
     PASS();
@@ -611,24 +621,23 @@ TEST(resolve_import_map_suffix) {
 /* ── Import reachability tests ────────────────────────────────── */
 
 TEST(resolve_is_import_reachable) {
-    /* Test import reachability through unique_name confidence penalty.
-     * is_import_reachable is static, so we test it indirectly. */
+    /* Reachability remains a diagnostic helper, never binding authority. */
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Helper", "proj.shared.utils.Helper", "Function");
 
-    /* With import covering the module → full confidence */
+    /* Importing utils does not bind its Helper member as a bare name. */
     const char *keys1[] = {"utils"};
     const char *vals1[] = {"proj.shared.utils"};
     cbm_resolution_t res = cbm_registry_resolve(r, "Helper", "proj.caller", keys1, vals1, 1);
-    ASSERT_STR_EQ(res.strategy, "unique_name");
-    ASSERT_TRUE(res.confidence >= 0.70); /* 0.75, not halved */
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_TRUE(cbm_registry_is_import_reachable("proj.shared.utils.Helper", vals1, 1));
 
-    /* With import NOT covering the module → halved */
+    /* An unrelated import also cannot bind Helper. */
     const char *keys2[] = {"other"};
     const char *vals2[] = {"proj.other"};
     res = cbm_registry_resolve(r, "Helper", "proj.caller", keys2, vals2, 1);
-    ASSERT_STR_EQ(res.strategy, "unique_name");
-    ASSERT_TRUE(res.confidence <= 0.40); /* 0.75 * 0.5 = 0.375 */
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_FALSE(cbm_registry_is_import_reachable("proj.shared.utils.Helper", vals2, 1));
 
     cbm_registry_free(r);
     PASS();
@@ -642,8 +651,8 @@ TEST(resolve_import_reachable_prefix) {
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.caller", keys, vals, 1);
-    ASSERT_STR_EQ(res.strategy, "unique_name");
-    ASSERT_TRUE(res.confidence >= 0.70); /* reachable → no penalty */
+    ASSERT_NULL(res.qualified_name);
+    ASSERT_TRUE(cbm_registry_is_import_reachable("proj.handler.sub.Process", vals, 1));
 
     cbm_registry_free(r);
     PASS();
@@ -694,10 +703,12 @@ TEST(negative_import_rejects_unimported) {
     cbm_registry_add(r, "Process", "proj.billing.Process", "Function");
     cbm_registry_add(r, "Process", "proj.handler.Process", "Function");
 
-    /* Import only handler's module — suffix_match should prefer handler */
+    /* Importing handler makes handler.Process usable, not bare Process. */
     const char *keys[] = {"handler"};
     const char *vals[] = {"proj.handler"};
     cbm_resolution_t res = cbm_registry_resolve(r, "Process", "proj.caller", keys, vals, 1);
+    ASSERT_NULL(res.qualified_name);
+    res = cbm_registry_resolve(r, "handler.Process", "proj.caller", keys, vals, 1);
     ASSERT_STR_EQ(res.qualified_name, "proj.handler.Process");
 
     cbm_registry_free(r);
@@ -922,7 +933,7 @@ TEST(cross_language_config_caller_drops_unique_name_too) {
  * The tie is now a function of the candidate set: the more plainly callable
  * candidate (the function over the fields), then the smaller QN, whichever
  * order the registry was built in (O9). */
-TEST(registry_tie_break_is_independent_of_registration_order) {
+TEST(registry_unbound_ties_are_rejected_in_every_registration_order) {
     const char *cands[] = {
         "proj.drivers.media.cec.i2c.ch7322.ch7322_conn_match.dev_name", /* struct field */
         "proj.sound.soc.codecs.tas2783-sdw.tas2783_prv.dev_name",       /* struct field */
@@ -944,14 +955,10 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
         cbm_registry_resolve(forward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
     cbm_resolution_t b =
         cbm_registry_resolve(backward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
-    ASSERT_NOT_NULL(f.qualified_name);
-    ASSERT_NOT_NULL(b.qualified_name);
-    ASSERT_STR_EQ(f.qualified_name, "proj.include.linux.device.dev_name");
-    ASSERT_STR_EQ(b.qualified_name, "proj.include.linux.device.dev_name");
-    ASSERT_STR_EQ(f.strategy, "suffix_match");
-    ASSERT_STR_EQ(b.strategy, "suffix_match");
+    ASSERT_NULL(f.qualified_name);
+    ASSERT_NULL(b.qualified_name);
 
-    /* Equal kind: the smaller QN, from either order. */
+    /* Equal kind and lexical ordering provide no additional evidence. */
     cbm_registry_t *lex_a = cbm_registry_new();
     cbm_registry_t *lex_b = cbm_registry_new();
     cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
@@ -962,17 +969,17 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
         cbm_registry_resolve(lex_a, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
     cbm_resolution_t lb =
         cbm_registry_resolve(lex_b, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
-    ASSERT_STR_EQ(la.qualified_name, "proj.include.linux.scatterlist.sg_next");
-    ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
+    ASSERT_NULL(la.qualified_name);
+    ASSERT_NULL(lb.qualified_name);
 
-    /* Proximity outranks the tie order: the sibling wins over a shallower stranger. */
+    /* A nearer sibling is still not a binding. */
     cbm_registry_t *near = cbm_registry_new();
     cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
     cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
                      "Function");
     cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
                                                "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
-    ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
+    ASSERT_NULL(nr.qualified_name);
 
     cbm_registry_free(forward);
     cbm_registry_free(backward);
@@ -982,13 +989,10 @@ TEST(registry_tie_break_is_independent_of_registration_order) {
     PASS();
 }
 
-/* A call names something callable. When same-named candidates tie, a method
- * must not lose to a property or field that merely shares its name. Exposed
- * (Kotlin): `cities.selectAll().where { ... }` bound to the property
- * `AbstractQuery.where` instead of the jdbc `Query.where` function, because the
- * two QNs have the same depth and "exposed-core" sorts first; main moved 785 ->
- * 1,648 Kotlin CALLS edges onto Variable/Field targets this way. */
-TEST(registry_tie_prefers_callable_over_property) {
+/* Callable kind filters impossible targets, but does not prove that a
+ * receiver denotes any remaining method. Keep the former tie fixtures as
+ * negative cases so candidate scoring cannot return through another route. */
+TEST(registry_callable_kind_does_not_prove_binding) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(
         r, "where",
@@ -997,7 +1001,7 @@ TEST(registry_tie_prefers_callable_over_property) {
     cbm_registry_add(r, "where",
                      "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where",
                      "Method");
-    /* A deeper method still beats a shallower field: kind decides before order. */
+    /* Neither candidate kind nor nesting depth supplies receiver evidence. */
     cbm_registry_add(r, "limit", "proj.exposed-core.Table.limit", "Field");
     cbm_registry_add(r, "limit", "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit", "Method");
 
@@ -1005,39 +1009,28 @@ TEST(registry_tie_prefers_callable_over_property) {
         "proj.exposed-tests.src.test.kotlin.org.jetbrains.exposed.v1.tests.SelectTests";
     cbm_resolution_t w = cbm_registry_resolve(r, "where", caller, NULL, NULL, 0);
     cbm_resolution_t l = cbm_registry_resolve(r, "limit", caller, NULL, NULL, 0);
-    ASSERT_STR_EQ(w.qualified_name,
-                  "proj.exposed-jdbc.src.main.kotlin.org.jetbrains.exposed.v1.jdbc.Query.where");
-    ASSERT_STR_EQ(l.qualified_name, "proj.exposed-jdbc.src.main.kotlin.jdbc.Query.limit");
+    ASSERT_NULL(w.qualified_name);
+    ASSERT_NULL(l.qualified_name);
     cbm_registry_free(r);
     PASS();
 }
 
-/* Nesting depth says nothing about which same-named method a call means.
- * django: `Model.objects.filter(...)` from tests/ tied between
- * `QuerySet.filter` and the template `Library.filter`; "least nested wins"
- * picked Library (one segment shallower) for most of the ~5,600 `objects.X`
- * calls (QuerySet share 57 % -> 24 %). Equal-kind ties now fall to the QN
- * order alone, which is still a pure function of the candidate set (O9). */
-TEST(registry_tie_ignores_nesting_depth) {
+/* Neither nesting depth nor deterministic QN ordering identifies which
+ * same-named method a receiver denotes. */
+TEST(registry_nesting_depth_does_not_prove_binding) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "filter", "proj.django.template.library.Library.filter", "Method");
     cbm_registry_add(r, "filter", "proj.django.db.models.query.QuerySet.filter", "Method");
     cbm_resolution_t f =
         cbm_registry_resolve(r, "filter", "proj.tests.lookup.tests", NULL, NULL, 0);
-    ASSERT_STR_EQ(f.qualified_name, "proj.django.db.models.query.QuerySet.filter");
-    ASSERT_STR_EQ(f.strategy, "suffix_match");
+    ASSERT_NULL(f.qualified_name);
     cbm_registry_free(r);
     PASS();
 }
 
-/* .NET reference assemblies (`src/libraries/<Asm>/ref/<Asm>.cs`) declare every
- * public member of an assembly with a `throw null` body in one shallow file.
- * A call that ties between such a stub and the implementation must reach the
- * implementation: dotnet/runtime had 14.1 % of its CALLS on ref/ stubs (4.9 %
- * in v0.11.0) once ties preferred the shallower, then the smaller ("ref" <
- * "src") QN. The preference is C#'s alone: elsewhere a `ref` directory is an
- * ordinary name. */
-TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
+/* Reference/implementation directory names do not choose the declaration
+ * selected by language binding. Keep both forms as unbound negative cases. */
+TEST(registry_implementation_path_does_not_prove_binding) {
     cbm_registry_t *r = cbm_registry_new();
     /* Shallower stub vs deeper implementation (MemoryStream). */
     cbm_registry_add_lang(
@@ -1065,12 +1058,9 @@ TEST(registry_tie_prefers_csharp_implementation_over_ref_stub) {
     cbm_resolution_t ms = cbm_registry_resolve(r, "MemoryStream", caller, NULL, NULL, 0);
     cbm_resolution_t wc = cbm_registry_resolve(r, "WithCancellation", caller, NULL, NULL, 0);
     cbm_resolution_t jv = cbm_registry_resolve(r, "resolve", "proj.app.Main", NULL, NULL, 0);
-    ASSERT_STR_EQ(
-        ms.qualified_name,
-        "proj.src.libraries.System.Private.CoreLib.src.System.IO.MemoryStream.MemoryStream");
-    ASSERT_STR_EQ(wc.qualified_name, "proj.src.libraries.System.Linq.Parallel.src.System.Linq."
-                                     "ParallelEnumerable.WithCancellation");
-    ASSERT_STR_EQ(jv.qualified_name, "proj.lib.ref.Resolver.resolve");
+    ASSERT_NULL(ms.qualified_name);
+    ASSERT_NULL(wc.qualified_name);
+    ASSERT_NULL(jv.qualified_name);
     cbm_registry_free(r);
     PASS();
 }
@@ -1123,24 +1113,21 @@ TEST(name_guess_vetoed_across_languages) {
     /* JS `app.get`: the only "get" is Python's -> EMPTY, not unique_name. */
     cbm_resolution_t res = xl_resolve(r, CBM_LANG_JAVASCRIPT, "app.get", "proj.app");
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
-    /* Python keeps its own builtin. */
+    /* Matching the caller language does not prove the receiver's type. */
     res = xl_resolve(r, CBM_LANG_PYTHON, "d.get", "proj.tool");
-    ASSERT_STR_EQ(res.qualified_name, "builtins.dict.get");
-    ASSERT_STR_EQ(res.strategy, "unique_name");
-    /* Two same-named candidates: the chain still picks by import distance;
-     * the answer stands only for a caller that can call the winner. */
+    ASSERT_NULL(res.qualified_name);
+    /* Neither same-language candidate is bound by directory proximity. */
     res = xl_resolve(r, CBM_LANG_PYTHON, "patch", "proj.api.x");
-    ASSERT_STR_EQ(res.qualified_name, "proj.api.client.patch");
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_NULL(res.qualified_name);
     res = xl_resolve(r, CBM_LANG_TYPESCRIPT, "patch", "proj.api.x");
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
     res = xl_resolve(r, CBM_LANG_TYPESCRIPT, "patch", "proj.web.ui");
-    ASSERT_STR_EQ(res.qualified_name, "proj.web.Panel.patch");
-    /* Unknown-language entries and an unknown caller are never vetoed. */
+    ASSERT_NULL(res.qualified_name);
+    /* Unknown language cannot turn unbound names into bindings either. */
     res = xl_resolve(r, CBM_LANG_GO, "legacy", "proj.go");
-    ASSERT_STR_EQ(res.qualified_name, "proj.x.legacy");
+    ASSERT_NULL(res.qualified_name);
     res = xl_resolve(r, CBM_LANG_COUNT, "app.get", "proj.app");
-    ASSERT_STR_EQ(res.qualified_name, "builtins.dict.get");
+    ASSERT_NULL(res.qualified_name);
 
     /* Evidence-backed strategies are never vetoed, whatever the language. */
     cbm_resolution_t imp = {.qualified_name = "builtins.dict.get",
@@ -1259,12 +1246,10 @@ TEST(go_bare_ref_never_binds_field) {
     PASS();
 }
 
-TEST(c_bare_call_does_not_weigh_field_namesakes) {
-    /* 2026-10-13 kernel audit: a struct member named like a header function
-     * made the bare name two candidates, the answer a suffix_match, and the
-     * #725 guard (.h is C++) refused it -- `put_page(page)` 345 -> 9 callers.
-     * A bare C call never names a member, so its Field namesakes do not
-     * compete: the function is the unique name it was in v0.11.0. */
+TEST(c_bare_call_requires_binding_despite_candidate_kinds) {
+    /* Excluding impossible member candidates cannot make an unimported C
+     * function visible. The exact import positive below retains the valid
+     * function while the old unique-name and suffix guesses are rejected. */
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add_lang(r, "put_page", "proj.include.linux.mm.put_page", "Function",
                           CBM_LANG_CPP);
@@ -1274,14 +1259,12 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
     const char *mod = "proj.arch.arm64.kernel.elfcore";
     cbm_resolution_t res =
         cbm_registry_resolve_call_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_C);
-    ASSERT_STR_EQ(res.qualified_name, "proj.include.linux.mm.put_page");
-    ASSERT_STR_EQ(res.strategy, "unique_name");
-    /* The reference resolver and C++ (which reaches its own members bare) still
-     * weigh the member: two candidates. */
+    ASSERT_NULL(res.qualified_name);
+    /* Reference and C++ call resolution need binding evidence as well. */
     res = cbm_registry_resolve_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_C);
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_NULL(res.qualified_name);
     res = cbm_registry_resolve_call_lang(r, "put_page", mod, NULL, NULL, 0, CBM_LANG_CPP);
-    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_NULL(res.qualified_name);
     /* A name only members carry is no bare C call target at all -- neither a
      * struct member nor a C++ method: redis's libc `read()` became the unique
      * name of a Qt adapter's `read` Method once only Fields were set aside. */
@@ -1294,9 +1277,14 @@ TEST(c_bare_call_does_not_weigh_field_namesakes) {
                           CBM_LANG_C);
     res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_C);
     ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
-    /* C++ still reaches the method by name. */
+    /* C++ cannot identify the receiver by the member name alone. */
     res = cbm_registry_resolve_call_lang(r, "read", mod, NULL, NULL, 0, CBM_LANG_CPP);
-    ASSERT_TRUE(res.qualified_name && res.qualified_name[0] != '\0');
+    ASSERT_NULL(res.qualified_name);
+    /* The same target is retained when an actual import binding names it. */
+    const char *keys[] = {"put_page"};
+    const char *vals[] = {"proj.include.linux.mm.put_page"};
+    res = cbm_registry_resolve_call_lang(r, "put_page", mod, keys, vals, 1, CBM_LANG_C);
+    ASSERT_STR_EQ(res.qualified_name, "proj.include.linux.mm.put_page");
     cbm_registry_free(r);
     PASS();
 }
@@ -1833,7 +1821,7 @@ TEST(registry_python_package_scope_is_explicit) {
     PASS();
 }
 
-TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
+TEST(registry_python_scope_keeps_import_precedence_without_scoring) {
     cbm_registry_t *r = cbm_registry_new();
     ASSERT_NOT_NULL(r);
     cbm_registry_add(r, "Field", "proj.vendor.Field", "Class");
@@ -1850,12 +1838,7 @@ TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring) {
     cbm_resolution_t raw = cbm_registry_resolve(r, "choose", "proj.pkg.__init__", NULL, NULL, 0);
     cbm_resolution_t python =
         cbm_registry_resolve_lang(r, "choose", "proj.pkg.__init__", NULL, NULL, 0, CBM_LANG_PYTHON);
-    bool scoring =
-        raw.qualified_name && python.qualified_name && raw.strategy && python.strategy &&
-        strcmp(raw.qualified_name, "proj.pkg.__init__.child.choose") == 0 &&
-        strcmp(python.qualified_name, raw.qualified_name) == 0 &&
-        strcmp(raw.strategy, "suffix_match") == 0 && strcmp(python.strategy, raw.strategy) == 0 &&
-        python.confidence == raw.confidence && python.candidate_count == raw.candidate_count;
+    bool scoring = raw.qualified_name == NULL && python.qualified_name == NULL;
     cbm_registry_free(r);
     ASSERT_TRUE(seeded && precedence && scoring);
     PASS();
@@ -2006,9 +1989,8 @@ TEST(registry_python_scope_qualified_terminal_bucket_uncapped) {
         cbm_resolution_t suffix =
             cbm_registry_resolve_lang(r, prefixed, module, NULL, NULL, 0, CBM_LANG_PYTHON);
         resolved = canonical && direct.qualified_name == canonical &&
-                   suffix.qualified_name == canonical &&
-                   registry_scope_match(direct, target, "same_module") &&
-                   registry_scope_match(suffix, target, "same_module") && resolved;
+                   suffix.qualified_name == NULL &&
+                   registry_scope_match(direct, target, "same_module") && resolved;
     }
     bool seeded = cbm_registry_size(r) == 302;
     cbm_registry_free(r);
@@ -2127,7 +2109,7 @@ TEST(registry_resolve_lexical_walks_enclosing_defs_issue1548) {
  * index: discovery order; incremental: node-id order), and the lexical walk of
  * a caller in layout.py never enters the __init__ function. */
 TEST(registry_python_local_bound_at_own_file_issue1548) {
-    const size_t init_prefix = strlen("proj.pkg");      /* pkg/__init__.py */
+    const size_t init_prefix = strlen("proj.pkg");       /* pkg/__init__.py */
     const size_t mod_prefix = strlen("proj.pkg.layout"); /* pkg/layout.py */
     for (int order = 0; order < 2; order++) {
         cbm_registry_t *r = cbm_registry_new();
@@ -2168,8 +2150,8 @@ TEST(registry_python_local_bound_at_own_file_issue1548) {
 /* The prefix every def of a file carries, without allocating; the same as
  * cbm_pipeline_fqn_compute(project, path, name) minus ".name". */
 TEST(fqn_symbol_prefix_len_matches_fqn_compute) {
-    static const char *const paths[] = {"pkg/layout.py", "pkg/__init__.py", "a.py",
-                                        "deep/x/y/mod.py", "web/index.py", "noext"};
+    static const char *const paths[] = {"pkg/layout.py",   "pkg/__init__.py", "a.py",
+                                        "deep/x/y/mod.py", "web/index.py",    "noext"};
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         char *qn = cbm_pipeline_fqn_compute("proj", paths[i], "sym");
         ASSERT_NOT_NULL(qn);
@@ -2182,10 +2164,94 @@ TEST(fqn_symbol_prefix_len_matches_fqn_compute) {
     PASS();
 }
 
+/* A project-wide namesake is not a binding. These regressions deliberately
+ * put plausible decoys next to the real lookup domain. */
+TEST(strict_binding_rejects_unbound_names_and_receiver_stripping) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "run", "proj.other.run", "Function");
+    cbm_registry_add(r, "save", "proj.current.save", "Function");
+    cbm_resolution_t unique = cbm_registry_resolve(r, "run", "proj.current", NULL, NULL, 0);
+    ASSERT_NULL(unique.qualified_name);
+    cbm_resolution_t member =
+        cbm_registry_resolve(r, "unknown.save", "proj.current", NULL, NULL, 0);
+    ASSERT_NULL(member.qualified_name);
+    cbm_resolution_t local = cbm_registry_resolve(r, "save", "proj.current", NULL, NULL, 0);
+    ASSERT_STR_EQ(local.qualified_name, "proj.current.save");
+    ASSERT_STR_EQ(local.proof.reason, "lexical_context_required");
+    ASSERT_FALSE(cbm_resolve_admit(&local.proof));
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(strict_binding_imports_do_not_search_descendants_or_rebind_missing_aliases) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "run", "proj.imported.hidden.run", "Function");
+    cbm_registry_add(r, "run", "proj.current.run", "Function");
+    cbm_registry_add(r, "alias", "proj.current.alias", "Function");
+    const char *keys[] = {"dep", "alias"};
+    const char *vals[] = {"proj.imported", "external.missing"};
+    cbm_resolution_t descendant = cbm_registry_resolve(r, "dep.run", "proj.current", keys, vals, 2);
+    ASSERT_NULL(descendant.qualified_name);
+    cbm_resolution_t shadow = cbm_registry_resolve(r, "alias", "proj.current", keys, vals, 2);
+    ASSERT_NULL(shadow.qualified_name);
+    cbm_registry_add(r, "run", "proj.imported.run", "Function");
+    cbm_resolution_t exact = cbm_registry_resolve(r, "dep.run", "proj.current", keys, vals, 2);
+    ASSERT_STR_EQ(exact.qualified_name, "proj.imported.run");
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(strict_binding_conflicting_imports_are_ambiguous_with_and_without_cache) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "run", "proj.a.run", "Function");
+    cbm_registry_add(r, "run", "proj.b.run", "Function");
+    const char *keys[] = {"dep", "dep"};
+    const char *vals[] = {"proj.a", "proj.b"};
+    for (int cached = 0; cached < 2; cached++) {
+        if (cached)
+            cbm_registry_import_map_cache_begin(keys, vals, 2);
+        cbm_resolution_t result = cbm_registry_resolve(r, "dep.run", "proj.current", keys, vals, 2);
+        ASSERT_NULL(result.qualified_name);
+        ASSERT_EQ(result.proof.binding, CBM_RESOLVE_BINDING_AMBIGUOUS);
+        ASSERT_EQ(result.proof.candidate_count, 2);
+        ASSERT_FALSE(cbm_resolve_admit(&result.proof));
+        if (cached)
+            cbm_registry_import_map_cache_end();
+    }
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(strict_binding_loaded_module_prefix_does_not_expose_siblings) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "Base", "proj.pkg.models.Base", "Class");
+    cbm_registry_add(r, "Base", "proj.pkg.other.Base", "Class");
+    const char *keys[] = {"pkg", "pkg.models"};
+    const char *values[] = {"", "proj.pkg.models"};
+    for (int cached = 0; cached < 2; cached++) {
+        if (cached)
+            cbm_registry_import_map_cache_begin(keys, values, 2);
+        cbm_resolution_t loaded =
+            cbm_registry_resolve(r, "pkg.models.Base", "proj.current", keys, values, 2);
+        cbm_resolution_t sibling =
+            cbm_registry_resolve(r, "pkg.other.Base", "proj.current", keys, values, 2);
+        ASSERT_STR_EQ(loaded.qualified_name, "proj.pkg.models.Base");
+        ASSERT_NULL(sibling.qualified_name);
+        if (cached)
+            cbm_registry_import_map_cache_end();
+    }
+    cbm_registry_free(r);
+    PASS();
+}
+
 SUITE(registry) {
+    RUN_TEST(strict_binding_loaded_module_prefix_does_not_expose_siblings);
+    RUN_TEST(strict_binding_rejects_unbound_names_and_receiver_stripping);
+    RUN_TEST(strict_binding_imports_do_not_search_descendants_or_rebind_missing_aliases);
+    RUN_TEST(strict_binding_conflicting_imports_are_ambiguous_with_and_without_cache);
     RUN_TEST(python_symbol_scope_len_preserves_file_identity);
     RUN_TEST(registry_python_package_scope_is_explicit);
-    RUN_TEST(registry_python_scope_keeps_import_precedence_and_raw_scoring);
+    RUN_TEST(registry_python_scope_keeps_import_precedence_without_scoring);
     RUN_TEST(registry_python_scope_cache_modes_and_raw_lineage);
     RUN_TEST(registry_python_scope_complete_candidate_boundaries);
     RUN_TEST(registry_python_scope_qualified_terminal_bucket_uncapped);
@@ -2217,8 +2283,8 @@ SUITE(registry) {
     RUN_TEST(registry_no_duplicates);
     /* Resolution */
     RUN_TEST(resolve_same_module);
-    RUN_TEST(resolve_qualified_disambiguates_same_name);
-    RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(resolve_qualified_names_require_explicit_binding);
+    RUN_TEST(resolve_qualified_ambiguous_tail_is_unresolved);
     RUN_TEST(registry_indexes_by_passed_name_not_qn_tail);
     RUN_TEST(registry_indexes_a_dotted_name_under_its_tail_too);
     RUN_TEST(resolve_import_map);
@@ -2226,7 +2292,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
-    RUN_TEST(resolve_unique_name);
+    RUN_TEST(resolve_unique_name_is_not_binding);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */
@@ -2234,9 +2300,9 @@ SUITE(registry) {
     RUN_TEST(confidence_band_medium);
     RUN_TEST(confidence_band_speculative);
     /* Suffix match + import map suffix */
-    RUN_TEST(resolve_suffix_match);
+    RUN_TEST(resolve_suffix_match_is_not_binding);
     RUN_TEST(resolve_caps_unresolvably_ambiguous_names);
-    RUN_TEST(resolve_import_map_suffix);
+    RUN_TEST(resolve_import_map_does_not_search_descendants);
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);
     RUN_TEST(resolve_import_reachable_prefix);
@@ -2264,14 +2330,14 @@ SUITE(registry) {
     RUN_TEST(name_guess_vetoed_across_languages);
     RUN_TEST(same_module_vetoed_across_languages);
     RUN_TEST(cross_language_config_caller_drops_unique_name_too);
-    RUN_TEST(registry_tie_break_is_independent_of_registration_order);
-    RUN_TEST(registry_tie_prefers_callable_over_property);
-    RUN_TEST(registry_tie_ignores_nesting_depth);
-    RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
+    RUN_TEST(registry_unbound_ties_are_rejected_in_every_registration_order);
+    RUN_TEST(registry_callable_kind_does_not_prove_binding);
+    RUN_TEST(registry_nesting_depth_does_not_prove_binding);
+    RUN_TEST(registry_implementation_path_does_not_prove_binding);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
-    RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
+    RUN_TEST(c_bare_call_requires_binding_despite_candidate_kinds);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);
     RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
     RUN_TEST(c_member_access_binds_by_owner_only);

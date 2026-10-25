@@ -8,9 +8,11 @@
  * Each file is read and parsed ONCE (Phase 3A). The CBMFileResult is cached
  * and reused for resolution (Phase 4), eliminating 3x redundant I/O + parsing.
  *
- * Depends on: worker_pool, graph_buffer (shared IDs + merge), extraction (cbm.h)
+ * Depends on: worker_pool, graph_buffer (shared IDs + merge), extraction
+ * (cbm.h)
  */
 #include "foundation/constants.h"
+#include "pipeline/import_resolve.h"
 
 enum {
     PP_RING = 4,
@@ -68,39 +70,40 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
  * operator/caller choice). */
 #define PP_RETAIN_TOTAL_HARD_MAX_BYTES (1024ULL * 1024 * 1024)  /* 1 GiB default ceiling */
 #define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
-#include "pipeline/pipeline.h"
-#include "pipeline/pipeline_internal.h"
-#include "pipeline/doc_links.h" /* cbm_doclinks_resolve_file: MENTIONS beside CALLS */
-#include "result_spill.h"
-#include "foundation/platform.h"     /* cbm_resolve_cache_dir */
-#include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
-#include "pipeline/lsp_resolve.h"
-#include "pipeline/laravel_routing.h"
-#include "lsp/rust_cargo.h"
-#include "lsp/c_lsp.h"
-#include "lsp/py_lsp.h"
-#include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
-#include "pipeline/worker_pool.h"
+#include "arena.h"
+#include "cbm.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
-#include "foundation/compat_thread.h"
-#include "foundation/mem_core.h"
-#include "graph_buffer/graph_buffer.h"
-#include "service_patterns.h"
-#include "foundation/platform.h"
-#include "foundation/hash_table.h"
-#include "foundation/log.h"
-#include "foundation/slab_alloc.h"
-#include "foundation/mem.h"
-#include "foundation/str_util.h"
-#include "foundation/profile.h"
 #include "foundation/compat_regex.h"
+#include "foundation/compat_thread.h"
+#include "foundation/hash_table.h"
 #include "foundation/limits.h"
-#include "cbm.h"
-#include "arena.h"
+#include "foundation/log.h"
+#include "foundation/mem.h"
+#include "foundation/mem_core.h"
+#include "foundation/platform.h" /* cbm_resolve_cache_dir */
+#include "foundation/platform.h"
+#include "foundation/profile.h"
+#include "foundation/slab_alloc.h"
+#include "foundation/str_util.h"
+#include "graph_buffer/graph_buffer.h"
+#include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
+#include "lsp/rust_cargo.h"
 #include "macro_table.h"
-#include "simhash/minhash.h"
+#include "pipeline/doc_links.h" /* cbm_doclinks_resolve_file: MENTIONS beside CALLS */
+#include "pipeline/laravel_routing.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
+#include "pipeline/worker_pool.h"
+#include "result_spill.h"
 #include "semantic/ast_profile.h"
+#include "service_patterns.h"
+#include "simhash/minhash.h"
 
 #include <errno.h>
 #include <stdatomic.h>
@@ -111,9 +114,10 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include <time.h>
 
 /* Back-pressure nap-cycle counter (test observability): each execution of the
- * over-budget collect+nap gate counts one cycle. Lets tests assert the gate does
- * not re-pay the full nap tax on every file pull when napping cannot reclaim
- * memory (the resident floor, not in-flight transients, holds the budget). */
+ * over-budget collect+nap gate counts one cycle. Lets tests assert the gate
+ * does not re-pay the full nap tax on every file pull when napping cannot
+ * reclaim memory (the resident floor, not in-flight transients, holds the
+ * budget). */
 static _Atomic long g_bp_nap_cycles = 0;
 static _Atomic uint64_t g_lsp_linear_fallback_rows = 0;
 /* Defined here, declared in lsp_resolve.h — the uncapped tail-match scan's
@@ -513,11 +517,14 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     int n;
     if (is_fn) {
         n = snprintf(buf, bufsize,
-                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%d,"
+                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%"
+                     "d,"
                      "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
-                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
+                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":"
+                     "%s,"
                      "\"unguarded_recursion\":%s,"
-                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%s",
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%"
+                     "s",
                      def->complexity, def->cognitive, def->loop_count, def->loop_depth,
                      def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
                      def->linear_scan_in_loop, def->alloc_in_loop,
@@ -554,7 +561,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
     append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
     append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
-    /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
+    /* A document definition's facts (an ADR's id, status, date, ...): key, value
+     * pairs. */
     for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
         append_json_string(buf, bufsize, &pos, kv[0], kv[SKIP_ONE]);
     }
@@ -573,7 +581,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         append_json_string(buf, bufsize, &pos, "sp", def->structural_profile);
     }
 
-    /* Body tokens — raw identifiers from function body AST for semantic search. */
+    /* Body tokens — raw identifiers from function body AST for semantic search.
+     */
     if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
         append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
     }
@@ -585,9 +594,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 }
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
- * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
- * and pxc_module_is_dir() (pass_lsp_cross.c) so same-module callee resolution
- * keys against the directory-based def-node QNs in the registry. */
+ * (Java/Go package). MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c) and pxc_module_is_dir() (pass_lsp_cross.c) so
+ * same-module callee resolution keys against the directory-based def-node QNs
+ * in the registry. */
 static bool pp_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
@@ -691,14 +701,16 @@ typedef struct {
     cbm_pipeline_ctx_t *pctx;         /* spill store + mode latch live here */
     _Atomic uint8_t *slot_state;      /* per file: 0 in progress, 1 cached, 2 parked */
     _Atomic int spill_sweeps_running; /* workers inside pp_spill_sweep right now */
-    int spill_env;        /* CBM_MEM_SPILL for this run: 1 force, 0 off, 2 budget decides */
-    cbm_mutex_t spill_mu; /* serializes the one store open */
+    int spill_env;                 /* CBM_MEM_SPILL for this run: 1 force, 0 off, 2 budget decides
+                                    */
+    cbm_mutex_t spill_mu;          /* serializes the one store open */
     _Atomic int spill_unavailable; /* store could not open: never retry */
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 
     bool retain_sources;              /* copy source into result->arena for cross-file LSP */
-    size_t retain_total_budget_bytes; /* project-wide retention cap (peak-RSS bound) */
+    size_t retain_total_budget_bytes; /* project-wide retention cap (peak-RSS
+                                         bound) */
     size_t retain_per_file_max_bytes; /* per-file retention cap */
     _Atomic int64_t retained_bytes;   /* total source bytes copied into result arenas */
     _Atomic int retain_cap_warned;    /* WARN index.retain_capped emitted once per run */
@@ -727,13 +739,13 @@ typedef struct {
     cbm_scale_probe_t scale;
 } extract_ctx_t;
 
-/* Cap on the number of index.file_oversized WARN lines (the full list still goes
- * to the response/logfile — this only throttles the stderr noise). */
+/* Cap on the number of index.file_oversized WARN lines (the full list still
+ * goes to the response/logfile — this only throttles the stderr noise). */
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Upper bound of build_def_props' fixed prefix: the Function/Method metrics
- * literal (about 330 B) with nine ints and seven true/false/test_role strings at
- * their widest stays under 600 B. */
+ * literal (about 330 B) with nine ints and seven true/false/test_role strings
+ * at their widest stays under 600 B. */
 enum { PP_PROPS_PREFIX_MAX = CBM_SZ_1K };
 
 /* Serialized size of one optional field as append_json_string emits it
@@ -756,10 +768,10 @@ static size_t pp_arr_field_len(const char *key, const char **arr) {
 
 /* A def's properties buffer, sized so EVERY field build_def_props appends fits:
  * the fixed metrics prefix (PP_PROPS_PREFIX_MAX) plus each optional field's
- * whole serialized form. A field that does not fit is dropped whole, so a buffer
- * sized for only some of them let a long signature, decorator list or parameter
- * list squeeze out the MinHash fingerprint ("fp"), structural profile ("sp") and
- * body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
+ * whole serialized form. A field that does not fit is dropped whole, so a
+ * buffer sized for only some of them let a long signature, decorator list or
+ * parameter list squeeze out the MinHash fingerprint ("fp"), structural profile
+ * ("sp") and body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
  * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
  * ImageController actions, 2026-10-18). fp/sp/bt are appended behind their own
  * room checks, so both the check's reserve and the field are counted. Returns
@@ -1282,7 +1294,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * index and status stays "indexed". No-op unless the supervisor set
          * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
          * single-threaded recovery run instead takes the sequential path
-         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
+         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both.
+         */
         if (cbm_index_is_quarantined(fi->rel_path)) {
             const char *phase = cbm_index_quarantine_phase(fi->rel_path);
             if (!phase) {
@@ -1426,11 +1439,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                      result->tree_nodes);
             pp_err_add(errs, fi->rel_path, how_far, "walk_truncated");
         } else if (result->lsp_skipped && !result->has_error) {
-            /* has_error already recorded its precise cause above. Indexed, but without the per-file
-             * and cross-file LSP refinement: the same kind of hole from the other direction.
-             * Nothing in production sets this any more except a truncated walk (handled above) and
-             * the test seam — it is reported anyway, so that if something sets it again the gap
-             * arrives named, not silent. */
+            /* has_error already recorded its precise cause above. Indexed, but
+             * without the per-file and cross-file LSP refinement: the same kind of
+             * hole from the other direction. Nothing in production sets this any more
+             * except a truncated walk (handled above) and the test seam — it is
+             * reported anyway, so that if something sets it again the gap arrives
+             * named, not silent. */
             char size_text[CBM_SZ_64];
             snprintf(size_text, sizeof(size_text), "%u nodes", result->tree_nodes);
             pp_err_add(errs, fi->rel_path, size_text, "lsp_skipped");
@@ -1546,7 +1560,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
     /* Final cleanup (parser already destroyed in loop, just slab state) */
     cbm_work_arena_release(); /* the working arena kept between files */
     cbm_slab_destroy_thread();
-    cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset cache */
+    cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset
+                                     cache */
 }
 
 static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_entries,
@@ -1576,7 +1591,8 @@ static void log_extract_mem_stats(int worker_count) {
     }
 }
 
-/* Forward declaration: macro table builder lives in pipeline.c (shared path). */
+/* Forward declaration: macro table builder lives in pipeline.c (shared path).
+ */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
                                                 const char *repo_path);
 
@@ -1644,7 +1660,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     }
     memset(workers, 0, (size_t)worker_count * sizeof(extract_worker_state_t));
 
-    /* Per-worker manifest entry arrays (separate from cache-line-aligned worker state) */
+    /* Per-worker manifest entry arrays (separate from cache-line-aligned worker
+     * state) */
     cbm_pkg_entries_t *pkg_entries = calloc((size_t)worker_count, sizeof(cbm_pkg_entries_t));
     if (!pkg_entries) {
         cbm_aligned_free(workers);
@@ -1731,7 +1748,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_scale_end(&ec.scale);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
 
-    /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
+    /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not
+     * thread-safe) */
     CBM_PROF_START(t_merge);
     int total_nodes = 0;
     int total_errors = 0;
@@ -1799,7 +1817,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
 /* ── Phase 3B: Serial Registry Build ─────────────────────────────── */
 
-/* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
+/* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns
+ * edge count. */
 /* `file_node_id` is the defining file's node id (0 when it has none), looked up
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
@@ -1873,36 +1892,7 @@ static void pp_add_file_doc(const cbm_gbuf_node_t *file_node, const char *doc) {
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                 const char *rel, CBMHashTable *namespace_map) {
-    int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!source_node) {
-        free(file_qn);
-        return 0;
-    }
-    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
-        count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
-                                                     namespace_map);
-    } else {
-        for (int j = 0; j < result->imports.count; j++) {
-            CBMImport *imp = &result->imports.items[j];
-            if (!imp->module_path) {
-                continue;
-            }
-            const cbm_gbuf_node_t *target =
-                cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-            if (target && target->id != source_node->id) {
-                char esc_ln[CBM_SZ_128];
-                cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-                char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-                count++;
-            }
-        }
-    }
-    free(file_qn);
-    return count;
+    return cbm_pipeline_create_import_edges(ctx, result, rel, namespace_map);
 }
 
 /* Find channel source node (enclosing function or file). */
@@ -2021,7 +2011,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             int64_t file_node_id = file_node ? file_node->id : 0;
             free(file_qn);
             pp_add_file_doc(file_node, result->module_doc);
-            /* Bounds the function-local detection to this file (pass_definitions.c). */
+            /* Bounds the function-local detection to this file (pass_definitions.c).
+             */
             size_t py_prefix_len = files[i].language == CBM_LANG_PYTHON
                                        ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
                                        : 0;
@@ -2105,10 +2096,10 @@ typedef struct {
     const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
-     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
-     * all filter to subsets never pay the O(all_defs) build + multi-GB RSS. Built
-     * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
-     * torn down after the worker dispatch. */
+     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust
+     * files all filter to subsets never pay the O(all_defs) build + multi-GB RSS.
+     * Built under rust_shared_mu into rust_shared_arena, published via
+     * rust_shared_reg; torn down after the worker dispatch. */
     _Atomic(CBMTypeRegistry *) rust_shared_reg;
     cbm_mutex_t rust_shared_mu;
     CBMArena rust_shared_arena;
@@ -2159,8 +2150,8 @@ typedef struct {
 /* Minimum buffer space needed per arg JSON object */
 #define CBM_ARG_JSON_GUARD CBM_SZ_32
 
-/* Append arg data as JSON to edge properties: ,"args":[{"i":0,"e":"x","v":"val"},...]
- * Returns new position in buffer. */
+/* Append arg data as JSON to edge properties:
+ * ,"args":[{"i":0,"e":"x","v":"val"},...] Returns new position in buffer. */
 /* Sanitize expression string for JSON (in-place). */
 static void sanitize_expr(char *expr_buf, const char *expr) {
     if (expr) {
@@ -2404,7 +2395,8 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
                                    const cbm_gbuf_node_t *target, const CBMCall *call,
                                    const cbm_resolution_t *res) {
     /* A CALLS edge needs a real target; the HTTP/ASYNC external-client bypass
-     * (#523) can reach emit_service_edge with target==NULL, so guard the deref. */
+     * (#523) can reach emit_service_edge with target==NULL, so guard the deref.
+     */
     if (!target) {
         return;
     }
@@ -2412,13 +2404,15 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props),
-                     "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d",
+                     "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\","
+                     "\"candidates\":%d",
                      esc_c, res->confidence, res->strategy ? res->strategy : "unknown",
                      res->candidate_count);
     finalize_and_emit(gbuf, source->id, target->id, "CALLS", props, n, call);
 }
 
-/* Classify a resolved call by library identity and emit the appropriate edge. */
+/* Classify a resolved call by library identity and emit the appropriate edge.
+ */
 /* Create Route node + CALLS + HANDLES edges for a route registration call.
  * route_mount is the framework mount of the registering file ("/api" for a
  * Laravel 11+ `withRouting(api: ...)` file, #1146) or "". */
@@ -2463,8 +2457,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
-                char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                       closing brace */
+                char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf
+                                       cuts the closing brace */
                 char esc_h2[CBM_SZ_512];
                 cbm_json_escape(esc_h2, sizeof(esc_h2), hres.qualified_name);
                 snprintf(hp, sizeof(hp), "{\"handler\":\"%s\"}", esc_h2);
@@ -2615,7 +2609,8 @@ bool extract_grpc_service_method(const char *callee, char *service, size_t srv_s
     }
     snprintf(method, meth_sz, "%s", last_dot + SKIP_ONE);
 
-    /* Extract service name: everything before the last dot, stripped of prefixes/suffixes */
+    /* Extract service name: everything before the last dot, stripped of
+     * prefixes/suffixes */
     size_t prefix_len = (size_t)(last_dot - callee);
     char raw[CBM_SZ_256];
     if (prefix_len >= sizeof(raw)) {
@@ -2695,19 +2690,20 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_1K];
     snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\",\"confidence\":%.2f}", esc_c,
-             service, method, res->confidence);
+             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\","
+             "\"confidence\":%.2f}",
+             esc_c, service, method, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRPC_CALLS", props);
 }
 
 /* Emit GRAPHQL_CALLS edge. The Route is keyed by the operation NAME only
  * (#598), never by the operation text:
- *   named operation          -> __graphql__<Name>                  name "<Name>"
- *   anonymous query/mutation/ -> __graphql__<type>__anonymous       name "(anonymous <type>)"
- *   subscription (incl. the `{ ... }` query shorthand)
- *   no GraphQL document      -> __graphql__operation__anonymous    name "(anonymous operation)"
- *   (URL, variable, missing string argument)
- * Keys are bounded by the GraphQL Name grammar and deterministic. */
+ *   named operation          -> __graphql__<Name>                  name
+ * "<Name>" anonymous query/mutation/ -> __graphql__<type>__anonymous       name
+ * "(anonymous <type>)" subscription (incl. the `{ ... }` query shorthand) no
+ * GraphQL document      -> __graphql__operation__anonymous    name "(anonymous
+ * operation)" (URL, variable, missing string argument) Keys are bounded by the
+ * GraphQL Name grammar and deterministic. */
 static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                               const cbm_resolution_t *res) {
     const char *op_type = "operation";
@@ -2779,10 +2775,11 @@ static void emit_trpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
 
 /* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
  * match, #592/#606), every service classification below still runs — only the
- * plain CALLS fall-through (emit_normal_calls_edge) is skipped. detect_url_in_args
- * and the HTTP/ASYNC/gRPC/GraphQL/tRPC/CONFIG/route branches are unaffected, so
- * a verb-suffix HTTP client (api.patch('/x')), broker, or route registration
- * keeps its edge; only the fabricated project CALLS edge is dropped. */
+ * plain CALLS fall-through (emit_normal_calls_edge) is skipped.
+ * detect_url_in_args and the HTTP/ASYNC/gRPC/GraphQL/tRPC/CONFIG/route branches
+ * are unaffected, so a verb-suffix HTTP client (api.patch('/x')), broker, or
+ * route registration keeps its edge; only the fabricated project CALLS edge is
+ * dropped. */
 static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_gbuf_node_t *target, const CBMCall *call,
                               const cbm_resolution_t *res, const char *module_qn,
@@ -2793,8 +2790,9 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
-    /* Also detect route registration by callee name suffix alone (handles unresolved
-     * local variables like app.include_router where QN resolution fails). */
+    /* Also detect route registration by callee name suffix alone (handles
+     * unresolved local variables like app.include_router where QN resolution
+     * fails). */
     if (svc == CBM_SVC_NONE && cbm_service_pattern_route_method(call->callee_name) != NULL) {
         svc = CBM_SVC_ROUTE_REG;
     }
@@ -3332,10 +3330,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 field_index_built = true;
             }
             arrow_bound =
-                cbm_pipeline_c_member_call_resolve(
+                cbm_pipeline_c_member_call_resolve_at(
                     &result->resolved_calls, field_index_ready ? &field_index : NULL, rc->main_gbuf,
                     rc->registry, rc->project_name, call->enclosing_func_qn, call->callee_name,
-                    cbm_c_member_rule_file(lang, rel), &res) != NULL;
+                    cbm_c_member_rule_file(lang, rel), call->site_start_byte, call->site_end_byte,
+                    call->source_origin, &res) != NULL;
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -3557,10 +3556,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                         cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
                     field_index_built = true;
                 }
-                target_node = cbm_pipeline_c_member_call_resolve(
+                target_node = cbm_pipeline_c_member_call_resolve_at(
                     &result->resolved_calls, field_index_ready ? &field_index : NULL, rc->main_gbuf,
                     rc->registry, rc->project_name, call->enclosing_func_qn, call->callee_name,
-                    cbm_c_member_rule_file(lang, rel), &res);
+                    cbm_c_member_rule_file(lang, rel), call->site_start_byte, call->site_end_byte,
+                    call->source_origin, &res);
                 if (!target_node || source_node->id == target_node->id) {
                     continue;
                 }
@@ -3644,9 +3644,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (usage->kind == CBM_USAGE_VALUE &&
             cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel),
                                         usage->is_member_access)) {
-            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
                 &result->resolved_calls, field_index_ready ? &field_index : NULL,
-                usage->enclosing_func_qn, usage->ref_name);
+                usage->enclosing_func_qn, usage->ref_name, usage->site_start_byte,
+                usage->site_end_byte, usage->source_origin);
             char member_esc[CBM_SZ_256];
             cbm_json_escape(member_esc, sizeof(member_esc), usage->ref_name);
             char member_props[CBM_SZ_512];
@@ -3833,9 +3834,10 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         /* C member read/write: same owner join as resolve_file_usages. Mirrors
          * the sequential twin (pass_usages.c). */
         if (cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel), rw->is_member_access)) {
-            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
                 &result->resolved_calls, field_index_ready ? &field_index : NULL,
-                rw->enclosing_func_qn, rw->var_name);
+                rw->enclosing_func_qn, rw->var_name, rw->site_start_byte, rw->site_end_byte,
+                rw->source_origin);
             const char *member_edge = rw->is_write ? "WRITES" : "READS";
             const CBMResolvedCall *owner;
             bool typed = false;
@@ -3996,8 +3998,9 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
             char dp[CBM_SZ_512];
             snprintf(dp, sizeof(dp), "{\"decorator\":\"%s\"}", esc_dec);
             cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn_id, "DECORATES", dp);
-            /* Ensure a reference-style edge exists so the decorator appears in queries
-             * without being misclassified as a real call by downstream passes. */
+            /* Ensure a reference-style edge exists so the decorator appears in
+             * queries without being misclassified as a real call by downstream
+             * passes. */
             cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn_id, "USAGE", "{}");
             ws->semantic_resolved++;
         }
@@ -4045,11 +4048,12 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     }
 }
 
-/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by the
- * first worker that hits a NULL-filter rust file; later null-files reuse it. Fast
- * path is a lock-free atomic load; the build happens under rust_shared_mu into the
- * dedicated rust_shared_arena (never a shared pipeline arena from a worker thread).
- * Returns NULL if there are no defs (caller falls back to the per-file build). */
+/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by
+ * the first worker that hits a NULL-filter rust file; later null-files reuse
+ * it. Fast path is a lock-free atomic load; the build happens under
+ * rust_shared_mu into the dedicated rust_shared_arena (never a shared pipeline
+ * arena from a worker thread). Returns NULL if there are no defs (caller falls
+ * back to the per-file build). */
 static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
     CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
     if (p)
@@ -4074,7 +4078,8 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
 }
 
 /* void*-typed adapter so the shared dispatch helper (pass_lsp_cross.c) can
- * borrow the lazily-built shared Rust registry without knowing resolve_ctx_t. */
+ * borrow the lazily-built shared Rust registry without knowing resolve_ctx_t.
+ */
 static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
     return pp_rust_shared_registry((resolve_ctx_t *)ctx);
 }
@@ -4147,9 +4152,9 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
         if (usage->kind != CBM_USAGE_VALUE || !usage->is_member_access || !usage->ref_name) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners =
-            cbm_pipeline_lsp_field_cursor(&result->resolved_calls, ready ? &field_index : NULL,
-                                          usage->enclosing_func_qn, usage->ref_name);
+        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
+            &result->resolved_calls, ready ? &field_index : NULL, usage->enclosing_func_qn,
+            usage->ref_name, usage->site_start_byte, usage->site_end_byte, usage->source_origin);
         unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
     }
     for (int i = 0; i < result->rw.count && !unowned; i++) {
@@ -4157,9 +4162,9 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
         if (!rw->is_member_access || !rw->var_name) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners =
-            cbm_pipeline_lsp_field_cursor(&result->resolved_calls, ready ? &field_index : NULL,
-                                          rw->enclosing_func_qn, rw->var_name);
+        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
+            &result->resolved_calls, ready ? &field_index : NULL, rw->enclosing_func_qn,
+            rw->var_name, rw->site_start_byte, rw->site_end_byte, rw->source_origin);
         unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
     }
     for (int i = 0; i < result->calls.count && !unowned; i++) {
@@ -4168,9 +4173,10 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
             (!strchr(call->callee_name, '.') && !strstr(call->callee_name, "->"))) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
             &result->resolved_calls, ready ? &field_index : NULL, call->enclosing_func_qn,
-            cbm_lsp_bare_segment(call->callee_name));
+            cbm_lsp_bare_segment(call->callee_name), call->site_start_byte, call->site_end_byte,
+            call->source_origin);
         unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
     }
     cbm_pipeline_lsp_field_index_free(&field_index);
@@ -4288,8 +4294,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
-            result->rw.count == 0 && result->defs.count == 0 && result->impl_traits.count == 0 &&
-            !cross_lsp_eligible) {
+            result->rw.count == 0 && result->type_refs.count == 0 && result->defs.count == 0 &&
+            result->impl_traits.count == 0 && !cross_lsp_eligible) {
             continue;
         }
 
@@ -4300,8 +4306,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
-                                 &imp_vals, &imp_count);
+        if (cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
+                                     &imp_vals, &imp_count) != 0)
+            atomic_store(&rc->pctx->resolver_failed, true);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
         cbm_php_vendor_names_t php_vendor;
@@ -4382,8 +4389,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 int lsp_count = 0;
                 bool own_lsp_map = cbm_pxc_result_has_type_only_import(result);
                 if (own_lsp_map) {
-                    cbm_pxc_build_import_map_ex(rc->main_gbuf, rc->project_name, rel, lang, result,
-                                                true, &lsp_keys, &lsp_vals, &lsp_count);
+                    if (cbm_pxc_build_import_map_ex(rc->main_gbuf, rc->project_name, rel, lang,
+                                                    result, true, &lsp_keys, &lsp_vals,
+                                                    &lsp_count) != 0)
+                        atomic_store(&rc->pctx->resolver_failed, true);
                 }
                 cbm_pxc_dispatch_file_with_php_bindings(
                     lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
@@ -4484,6 +4493,22 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         if (rc->pctx && rc->pctx->doc_links) {
             cbm_doclinks_resolve_file(rc->pctx->doc_links, file_idx, result, rc->main_gbuf,
                                       ws->local_edge_buf);
+        }
+
+        if (rc->pctx && rc->pctx->shared_resolver) {
+            cbm_resolver_file_t input = {.ctx = rc->pctx,
+                                         .registry = rc->registry,
+                                         .graph = rc->main_gbuf,
+                                         .output = ws->local_edge_buf,
+                                         .result = result,
+                                         .rel_path = rel,
+                                         .module_qn = module_qn,
+                                         .language = lang,
+                                         .import_keys = imp_keys,
+                                         .import_values = imp_vals,
+                                         .import_count = imp_count};
+            if (!cbm_shared_resolver_file(rc->pctx->shared_resolver, &input))
+                atomic_store(&rc->pctx->resolver_failed, true);
         }
 
     resolve_file_cleanup:
@@ -4604,7 +4629,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_mutex_init(&rc.rust_shared_mu);
     rc.rust_shared_arena_live = false;
 
-    /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
+    /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution,
+     * PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_scale_begin(&rc.scale, "parallel_resolve", (long)file_count);
@@ -4619,8 +4645,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     }
     cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
-     * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
-     * all QNs, so freeing all_defs afterward is safe). */
+     * Free its dedicated arena + the lock (registry was self-contained: it
+     * strdup'd all QNs, so freeing all_defs afterward is safe). */
     if (rc.rust_shared_arena_live) {
         cbm_arena_destroy(&rc.rust_shared_arena);
         rc.rust_shared_arena_live = false;

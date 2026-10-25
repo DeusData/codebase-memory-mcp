@@ -39,14 +39,16 @@ static const char *extract_new_expr_type(CBMArena *a, TSNode rhs, const char *so
 // Extract class/type name from a constructor expression.
 // e.g., new Foo() -> "Foo", Foo() -> "Foo" (if uppercase), Foo{} -> "Foo"
 static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char *source,
-                                            CBMLanguage lang) {
+                                            CBMLanguage lang, CBMTypeAssignKind *evidence_kind) {
     const char *kind = ts_node_type(rhs);
 
     if (strcmp(kind, "new_expression") == 0 || strcmp(kind, "object_creation_expression") == 0) {
+        *evidence_kind = CBM_TYPE_ASSIGN_CONSTRUCTOR_SYNTAX;
         return extract_new_expr_type(a, rhs, source);
     }
 
     if (strcmp(kind, "call") == 0 || strcmp(kind, "call_expression") == 0) {
+        *evidence_kind = CBM_TYPE_ASSIGN_NAMING_HINT;
         TSNode func = ts_node_child_by_field_name(rhs, TS_FIELD("function"));
         if (ts_node_is_null(func) && ts_node_child_count(rhs) > 0) {
             func = ts_node_child(rhs, 0);
@@ -79,6 +81,7 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
     }
 
     if (strcmp(kind, "composite_literal") == 0) {
+        *evidence_kind = CBM_TYPE_ASSIGN_CONSTRUCTOR_SYNTAX;
         TSNode type_node = ts_node_child_by_field_name(rhs, TS_FIELD("type"));
         if (!ts_node_is_null(type_node)) {
             return cbm_node_text(a, type_node, source);
@@ -86,6 +89,7 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
     }
 
     if (lang == CBM_LANG_RUST && strcmp(kind, "struct_expression") == 0) {
+        *evidence_kind = CBM_TYPE_ASSIGN_CONSTRUCTOR_SYNTAX;
         TSNode name = ts_node_child_by_field_name(rhs, TS_FIELD("name"));
         if (!ts_node_is_null(name)) {
             return cbm_node_text(a, name, source);
@@ -99,13 +103,19 @@ static const char *extract_constructor_type(CBMArena *a, TSNode rhs, const char 
 static void try_emit_type_assign(CBMExtractCtx *ctx, TSNode var_node, TSNode rhs_node,
                                  const char *func_qn) {
     char *var_name = cbm_node_text(ctx->arena, var_node, ctx->source);
+    CBMTypeAssignKind kind = CBM_TYPE_ASSIGN_UNSPECIFIED;
     const char *type_name =
-        extract_constructor_type(ctx->arena, rhs_node, ctx->source, ctx->language);
+        extract_constructor_type(ctx->arena, rhs_node, ctx->source, ctx->language, &kind);
     if (var_name && var_name[0] && type_name && type_name[0]) {
-        CBMTypeAssign ta;
+        CBMTypeAssign ta = {0};
         ta.var_name = var_name;
         ta.type_name = type_name;
         ta.enclosing_func_qn = func_qn;
+        ta.site_start_byte = ts_node_start_byte(var_node);
+        ta.site_end_byte = ts_node_end_byte(var_node);
+        ta.value_start_byte = ts_node_start_byte(rhs_node);
+        ta.value_end_byte = ts_node_end_byte(rhs_node);
+        ta.kind = kind;
         cbm_typeassign_push(&ctx->result->type_assigns, ctx->arena, ta);
     }
 }
@@ -208,5 +218,19 @@ void cbm_extract_type_assigns(CBMExtractCtx *ctx) {
 
 void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                          WalkState *state) {
+    int before = ctx->result->type_assigns.count;
     process_type_assign_node(ctx, node, spec, state->enclosing_func_qn);
+    if (before == ctx->result->type_assigns.count) {
+        return;
+    }
+    uint32_t scope_id = state->root_lexical_scope_id;
+    for (int i = state->scope_top - 1; i >= 0; i--) {
+        if (state->scopes[i].lexical_scope_id) {
+            scope_id = state->scopes[i].lexical_scope_id;
+            break;
+        }
+    }
+    for (int i = before; i < ctx->result->type_assigns.count; i++) {
+        ctx->result->type_assigns.items[i].lexical_scope_id = scope_id;
+    }
 }

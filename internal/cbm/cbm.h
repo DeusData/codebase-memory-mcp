@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "arena.h"
+#include "resolve/model.h"
 #include "tree_sitter/api.h"
 
 /* Field lookups by NAME resolve the name with a linear strncmp scan over the
@@ -383,13 +384,19 @@ typedef struct {
                                      // guard's unique-name exemption. Default false.
 } CBMCall;
 
-// What an import statement names, when the syntax says so. Only PHP's
-// `use function` / `use const` set a non-default kind today: they name a
-// namespace MEMBER, so they must never be mapped to a class file (#1186).
+// What an import statement names, when the syntax says so. PHP namespace
+// members, C include delimiters, and Rust module declarations carry distinct
+// evidence and must not be conflated with a default module/class binding.
 typedef enum {
-    CBM_IMPORT_KIND_DEFAULT = 0, // module / class / namespace (language default)
-    CBM_IMPORT_KIND_FUNCTION,    // PHP `use function A\b`
-    CBM_IMPORT_KIND_CONST,       // PHP `use const A\B`
+    CBM_IMPORT_KIND_DEFAULT = 0,         // module / class / namespace (language default)
+    CBM_IMPORT_KIND_FUNCTION,            // PHP `use function A\b`
+    CBM_IMPORT_KIND_CONST,               // PHP `use const A\B`
+    CBM_IMPORT_KIND_INCLUDE_QUOTED,      // C-family include relative to the importing file
+    CBM_IMPORT_KIND_INCLUDE_SYSTEM,      // C-family include requiring configured search roots
+    CBM_IMPORT_KIND_MODULE_DECLARATION,  // Rust `mod name;` file membership
+    CBM_IMPORT_KIND_PYTHON_MODULE_ROOT,  // `import a.b`: binds root a
+    CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS, // `import a.b as x`: binds module a.b
+    CBM_IMPORT_KIND_PYTHON_FROM,         // `from a import b`: binds member/submodule b
 } CBMImportKind;
 
 typedef struct {
@@ -525,11 +532,19 @@ typedef struct {
     bool is_member_access;         // var_name is the field half of a selector/member LHS
                                    // (`t.err = x` → "err"); the receiver is stripped here,
                                    // so this is the only record of selector shape (#1962)
+    uint32_t site_start_byte;      // exact written identifier, not the containing assignment
+    uint32_t site_end_byte;
+    CBMSourceOrigin source_origin;
 } CBMReadWrite;
 
 typedef struct {
     const char *type_name;         // referenced type/class name
     const char *enclosing_func_qn; // QN of enclosing function
+    uint32_t site_start_byte;      // annotation syntax in source_origin's buffer
+    uint32_t site_end_byte;
+    uint32_t lexical_scope_id; // extraction-local; zero means unavailable
+    CBMSourceOrigin source_origin;
+    bool site_is_exact; // span is precisely type_name, not a stripped wrapper
 } CBMTypeRef;
 
 typedef struct {
@@ -537,10 +552,23 @@ typedef struct {
     const char *enclosing_func_qn; // QN of enclosing function
 } CBMEnvAccess;
 
+typedef enum {
+    CBM_TYPE_ASSIGN_UNSPECIFIED = 0,
+    CBM_TYPE_ASSIGN_CONSTRUCTOR_SYNTAX, // new/object/composite/struct expression; still unresolved
+    CBM_TYPE_ASSIGN_NAMING_HINT,        // Foo() or New...Client/Stub; never type proof
+} CBMTypeAssignKind;
+
 typedef struct {
     const char *var_name;          // variable being assigned
     const char *type_name;         // class/type name of RHS constructor
     const char *enclosing_func_qn; // QN of enclosing function
+    uint32_t site_start_byte;      // LHS binding syntax, not a binding identity by itself
+    uint32_t site_end_byte;
+    uint32_t value_start_byte; // RHS expression for a language adapter to resolve
+    uint32_t value_end_byte;
+    uint32_t lexical_scope_id; // extraction-local; zero means unavailable
+    CBMSourceOrigin source_origin;
+    CBMTypeAssignKind kind;
 } CBMTypeAssign;
 
 // String reference: URL, config key, or async target found in source.
@@ -608,10 +636,11 @@ typedef struct {
 typedef enum {
     CBM_RESOLVED_INVOCATION = 0,
     CBM_RESOLVED_CALL_REFERENCE,
-    /* C-family member access `a.b` / `a->b`: callee_qn is the Field `b` of the
-     * type of `a`. One row per (caller, field), not per occurrence, and no site
-     * span: the join is by enclosing function and member name. */
+    /* C-family member access at the exact field-identifier occurrence.
+     * Field ownership alone never identifies a function-pointer call target. */
     CBM_RESOLVED_FIELD_REFERENCE,
+    /* A source annotation or explicit type name bound to its declaration. */
+    CBM_RESOLVED_TYPE_REFERENCE,
 } CBMResolvedKind;
 
 // LSP-resolved invocation/reference: high-confidence type-aware resolution.
@@ -629,6 +658,7 @@ typedef struct {
      * appended to callee_qn when the edge is written; NULL = none (always,
      * until a language enables its callable_identity mode). */
     const char *callee_sig;
+    cbm_resolve_evidence_t evidence; // zero means the adapter supplied no binding proof
 } CBMResolvedCall;
 
 typedef struct {

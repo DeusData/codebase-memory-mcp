@@ -1,3 +1,4 @@
+#include "store/store_resolver.h"
 /*
  * pipeline_incremental.c — Disk-based incremental re-indexing.
  *
@@ -3947,13 +3948,22 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_log_info("incremental.noop", "reason", "semantic_manifest_equal");
             return 0;
         }
-        if (force_full_on_mismatch) {
+        bool resolver_requires_full = false;
+        if (cbm_store_resolver_requires_full(store, project, &resolver_requires_full) !=
+            CBM_STORE_OK) {
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+        if (force_full_on_mismatch || resolver_requires_full) {
             cbm_store_free_file_hashes(stored, stored_count);
             cbm_store_close(store);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 #endif
-            cbm_log_info("incremental.force_full", "reason", "mode_downgrade_changed");
+            cbm_log_info("incremental.force_full", "reason",
+                         resolver_requires_full ? "resolver_negative_dependencies"
+                                                : "mode_downgrade_changed");
             return CBM_PIPELINE_FORCE_FULL_REINDEX;
         }
         /* Manifest delta. Closure repair recomputes exactly the changed

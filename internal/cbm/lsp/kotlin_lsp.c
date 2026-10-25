@@ -35,6 +35,7 @@
  */
 
 #include "kotlin_lsp.h"
+#include "kotlin_proof.h"
 #include "../helpers.h"
 /* CBMHashTable — cross-registry field bucketing. Relative path: the LSP
  * amalgamation compiles with -Iinternal/cbm only, not -Isrc. */
@@ -3297,8 +3298,7 @@ static const CBMType *kt_eval_navigation_expression_type_at(KotlinLSPContext *ct
             if (is_member) {
                 /* A member call on an `object`/`companion object` singleton is a
                  * static dispatch; on a regular class instance it is a method. */
-                const CBMRegisteredType *recv_rt =
-                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                const CBMRegisteredType *recv_rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
                 strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
             }
             /* A call through the lambda implicit parameter `it` (e.g. inside
@@ -5377,11 +5377,16 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = d->qualified_name;
         rt.short_name = d->short_name;
+        rt.project_source = true;
+        rt.declaration_identity = d->declaration_identity;
+        rt.graph_qualified_name = d->graph_qualified_name;
+        rt.source_flags = d->source_flags;
+        if (d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL)
+            rt.namespace_qn = d->namespace_name;
         rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
         if (field_map) {
             const KtCrossFieldList *fl =
-                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map,
-                                                     d->qualified_name);
+                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map, d->qualified_name);
             if (fl && fl->count > 0) {
                 rt.field_names = fl->names;
                 rt.field_types = fl->types;
@@ -5421,12 +5426,26 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         memset(&rf, 0, sizeof(rf));
         rf.qualified_name = d->qualified_name;
         rf.short_name = d->short_name;
-        rf.min_params = -1;
+        rf.min_params =
+            (d->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) ? d->signature_param_count : -1;
+        rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+        rf.declaration_identity = d->declaration_identity;
+        rf.graph_qualified_name = d->graph_qualified_name;
+        rf.source_flags = d->source_flags;
+        rf.sig = d->sig;
         /* receiver_type distinguishes a top-level fun (NULL) from a method
          * (set) — the sole-definer fallback only matches top-level funs. */
         rf.receiver_type = d->receiver_type;
         rf.signature = kt_cross_func_sig_with_return(arena, d);
         cbm_registry_add_func(reg, rf);
+    } else if (strcmp(d->label, "Variable") == 0 || strcmp(d->label, "Constant") == 0) {
+        /* A property can be a callable value. Retain it as an unknown
+         * competitor so name lookup cannot silently skip that branch. */
+        CBMRegisteredFunc blocker = {.qualified_name = d->qualified_name,
+                                     .short_name = d->short_name,
+                                     .receiver_type = d->receiver_type,
+                                     .min_params = -1};
+        cbm_registry_add_func(reg, blocker);
     }
 }
 
@@ -5503,10 +5522,11 @@ void cbm_kotlin_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const C
     }
 }
 
-void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                              const char *module_qn, CBMLSPDef *defs, int def_count,
-                              const char **import_names, const char **import_qns, int import_count,
-                              TSTree *cached_tree, CBMResolvedCallArray *out) {
+void cbm_run_kotlin_lsp_cross_with_result(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          CBMResolvedCallArray *out, const CBMFileResult *file) {
     if (!arena || !source) {
         return;
     }
@@ -5621,6 +5641,7 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     }
 
     kotlin_lsp_process_file(&ctx, root);
+    cbm_kotlin_proof_resolve(arena, source, source_len, root, &reg, file, out);
     cbm_arena_destroy(&idx_arena);
     cbm_ht_free(type_short);
     cbm_ht_free(cross_field_map);
@@ -5628,4 +5649,13 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     if (owns_tree) {
         ts_tree_delete(tree);
     }
+}
+
+void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                              const char *module_qn, CBMLSPDef *defs, int def_count,
+                              const char **import_names, const char **import_qns, int import_count,
+                              TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_kotlin_lsp_cross_with_result(arena, source, source_len, module_qn, defs, def_count,
+                                         import_names, import_qns, import_count, cached_tree, out,
+                                         NULL);
 }

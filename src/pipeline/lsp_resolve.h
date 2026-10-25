@@ -122,18 +122,11 @@ static inline const char *cbm_pipeline_call_callee_leaf(const char *callee_name)
     return cbm_lsp_bare_segment(callee_name);
 }
 
-/* Gate for the unique-`Class.method`-tail fallbacks below. Tail-matching by
- * leaf is safe where class-per-file package semantics hold — the JVM
- * languages (Java/Kotlin): the declared `package` is ground truth, a class
- * name is unique within a package, and mixed Gradle/Maven source roots
- * (`src/main/java` + `src/main/kotlin`) legitimately produce path-derived
- * module QNs that disagree with the package-shaped QNs the LSP emits, so
- * the tail is the only reliable join key. In other languages the same-name
- * guarantee does not exist (Python/TS re-export shims, Go internal clones,
- * C++ template instantiations), and a single wrong-module coincidence
- * would fabricate a CALLS edge — so the fallbacks stay off there. */
+/* Package/file identity mismatches need an explicit canonical mapping.
+ * A matching class/method suffix is never binding evidence. */
 static inline bool cbm_pipeline_lsp_allow_tail_match(CBMLanguage lang) {
-    return lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN;
+    (void)lang;
+    return false;
 }
 
 /* When a JVM callable-reference occurrence has no exact semantic target, its
@@ -980,25 +973,27 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_reference(
     return cbm_pipeline_find_lsp_reference_in_graph(arr, usage, allow_tail_match, NULL, NULL);
 }
 
-/* ── C member access: bind a field through its owner ─────────────────
- *
- * The member half of `a.b` / `a->b` is not a name in any scope: only the type
- * of `a` gives `b` a meaning. The C LSP publishes that as FIELD_REFERENCE rows,
- * one per (enclosing function, owner field). The usage and read/write
- * resolvers join them by enclosing function and member name, which is exactly
- * the granularity of the function -> Field edge they emit. */
-
-/* FIELD_REFERENCE rows sorted by (caller, member name, target). A NULL `rows`
- * with a nonzero source array means the allocation failed and lookups scan the
- * array instead, so no typed edge is ever lost to an index. */
+/* C fields retain occurrence identity before graph aggregation. The index
+ * orders (caller, member, origin, start, end, target); a lookup only examines
+ * the exact occurrence's duplicates. Missing indexes and legacy spanless
+ * carriers abstain, rather than performing an unbounded scan per reference. */
 typedef struct {
     const CBMResolvedCall **rows;
     int count;
 } cbm_pipeline_lsp_field_index_t;
 
 static inline bool cbm_pipeline_lsp_field_row_usable(const CBMResolvedCall *row) {
-    return row->kind == CBM_RESOLVED_FIELD_REFERENCE && row->caller_qn && row->callee_qn &&
-           row->confidence >= CBM_LSP_CONFIDENCE_FLOOR;
+    return row && row->kind == CBM_RESOLVED_FIELD_REFERENCE && row->caller_qn && row->callee_qn;
+}
+
+static inline bool cbm_pipeline_lsp_field_row_proven(const CBMResolvedCall *row) {
+    const uint32_t required = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                              CBM_RESOLVE_FACT_RECEIVER_TYPED | CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
+    return cbm_pipeline_lsp_field_row_usable(row) &&
+           row->evidence.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE &&
+           row->evidence.rule == CBM_RESOLVE_RULE_TYPE_MEMBER &&
+           (row->evidence.facts & required) == required &&
+           cbm_pipeline_source_site_present(row->site_start_byte, row->site_end_byte);
 }
 
 static inline int cbm_pipeline_lsp_field_key_cmp(const CBMResolvedCall *row, const char *caller_qn,
@@ -1007,202 +1002,194 @@ static inline int cbm_pipeline_lsp_field_key_cmp(const CBMResolvedCall *row, con
     return by_caller != 0 ? by_caller : strcmp(cbm_lsp_bare_segment(row->callee_qn), member);
 }
 
+static inline int cbm_pipeline_lsp_field_site_cmp(const CBMResolvedCall *row, const char *caller_qn,
+                                                  const char *member, uint32_t start, uint32_t end,
+                                                  CBMSourceOrigin origin) {
+    int by_key = cbm_pipeline_lsp_field_key_cmp(row, caller_qn, member);
+    if (by_key)
+        return by_key;
+    if (row->source_origin != origin)
+        return row->source_origin < origin ? -1 : 1;
+    if (row->site_start_byte != start)
+        return row->site_start_byte < start ? -1 : 1;
+    if (row->site_end_byte != end)
+        return row->site_end_byte < end ? -1 : 1;
+    return 0;
+}
+
 static inline int cbm_pipeline_lsp_field_row_cmp(const void *left_ptr, const void *right_ptr) {
     const CBMResolvedCall *left = *(const CBMResolvedCall *const *)left_ptr;
     const CBMResolvedCall *right = *(const CBMResolvedCall *const *)right_ptr;
-    int by_key = cbm_pipeline_lsp_field_key_cmp(left, right->caller_qn,
-                                                cbm_lsp_bare_segment(right->callee_qn));
-    return by_key != 0 ? by_key : strcmp(left->callee_qn, right->callee_qn);
+    int by_key = cbm_pipeline_lsp_field_site_cmp(
+        left, right->caller_qn, cbm_lsp_bare_segment(right->callee_qn), right->site_start_byte,
+        right->site_end_byte, right->source_origin);
+    return by_key ? by_key : strcmp(left->callee_qn, right->callee_qn);
 }
 
-/* False means only allocation failure; lookups then take the linear path. */
 static inline bool cbm_pipeline_lsp_field_index_build(const CBMResolvedCallArray *arr,
                                                       cbm_pipeline_lsp_field_index_t *index) {
-    index->rows = NULL;
-    index->count = 0;
-    int field_count = 0;
+    *index = (cbm_pipeline_lsp_field_index_t){0};
+    int count = 0;
     for (int i = 0; arr && i < arr->count; i++) {
-        if (cbm_pipeline_lsp_field_row_usable(&arr->items[i])) {
-            field_count++;
-        }
+        if (cbm_pipeline_lsp_field_row_usable(&arr->items[i]))
+            count++;
     }
-    if (field_count == 0) {
+    if (!count)
         return true;
-    }
-    const CBMResolvedCall **rows = (const CBMResolvedCall **)cbm_alloc(
-        CBM_MEM_CLASS_EXTRACT, (size_t)field_count * sizeof(*rows));
-    if (!rows) {
+    const CBMResolvedCall **rows = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)count * sizeof(*rows));
+    if (!rows)
         return false;
-    }
     int next = 0;
     for (int i = 0; i < arr->count; i++) {
-        if (cbm_pipeline_lsp_field_row_usable(&arr->items[i])) {
+        if (cbm_pipeline_lsp_field_row_usable(&arr->items[i]))
             rows[next++] = &arr->items[i];
-        }
     }
-    qsort(rows, (size_t)field_count, sizeof(*rows), cbm_pipeline_lsp_field_row_cmp);
+    qsort(rows, (size_t)count, sizeof(*rows), cbm_pipeline_lsp_field_row_cmp);
     index->rows = rows;
-    index->count = field_count;
+    index->count = count;
     return true;
 }
 
 static inline void cbm_pipeline_lsp_field_index_free(cbm_pipeline_lsp_field_index_t *index) {
     cbm_free(CBM_MEM_CLASS_EXTRACT, (void *)index->rows);
-    index->rows = NULL;
-    index->count = 0;
+    *index = (cbm_pipeline_lsp_field_index_t){0};
 }
 
-/* Walks the owner rows of one (function, member name). `index` NULL selects
- * the linear scan over `arr`. */
 typedef struct {
-    const cbm_pipeline_lsp_field_index_t *index;
-    const CBMResolvedCallArray *arr;
-    const char *caller_qn;
-    const char *member;
-    int next;
+    const CBMResolvedCall *row;
+    bool typed;
 } cbm_pipeline_lsp_field_cursor_t;
 
+static inline cbm_pipeline_lsp_field_cursor_t cbm_pipeline_lsp_field_cursor_at(
+    const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_field_index_t *index,
+    const char *caller, const char *member, uint32_t start, uint32_t end, CBMSourceOrigin origin) {
+    (void)arr;
+    cbm_pipeline_lsp_field_cursor_t cursor = {0};
+    if (!index || !caller || !member || !cbm_pipeline_source_site_present(start, end))
+        return cursor;
+    int low = 0;
+    int high = index->count;
+    while (low < high) {
+        int middle = low + (high - low) / 2;
+        if (cbm_pipeline_lsp_field_site_cmp(index->rows[middle], caller, member, start, end,
+                                            origin) < 0)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    bool rejected = false;
+    for (int i = low; i < index->count; i++) {
+        const CBMResolvedCall *row = index->rows[i];
+        if (cbm_pipeline_lsp_field_site_cmp(row, caller, member, start, end, origin))
+            break;
+        cursor.typed = true;
+        if (!cbm_pipeline_lsp_field_row_proven(row) ||
+            (cursor.row && strcmp(cursor.row->callee_qn, row->callee_qn) != 0))
+            rejected = true;
+        if (!cursor.row)
+            cursor.row = row;
+    }
+    if (rejected)
+        cursor.row = NULL;
+    return cursor;
+}
+
+/* Kept for source compatibility. Aggregated rows cannot prove an occurrence. */
 static inline cbm_pipeline_lsp_field_cursor_t cbm_pipeline_lsp_field_cursor(
     const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_field_index_t *index,
-    const char *caller_qn, const char *member) {
-    cbm_pipeline_lsp_field_cursor_t cursor = {index, arr, caller_qn, member, 0};
-    if (index && caller_qn && member) {
-        int low = 0;
-        int high = index->count;
-        while (low < high) {
-            int middle = low + (high - low) / 2;
-            if (cbm_pipeline_lsp_field_key_cmp(index->rows[middle], caller_qn, member) < 0) {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        cursor.next = low;
-    }
-    return cursor;
+    const char *caller, const char *member) {
+    return cbm_pipeline_lsp_field_cursor_at(arr, index, caller, member, 0, 0,
+                                            CBM_SOURCE_ORIGIN_RAW);
 }
 
 static inline const CBMResolvedCall *cbm_pipeline_lsp_field_next(
     cbm_pipeline_lsp_field_cursor_t *cursor) {
-    if (!cursor->caller_qn || !cursor->member) {
-        return NULL;
-    }
-    if (cursor->index) {
-        if (cursor->next >= cursor->index->count) {
-            return NULL;
-        }
-        const CBMResolvedCall *row = cursor->index->rows[cursor->next];
-        if (cbm_pipeline_lsp_field_key_cmp(row, cursor->caller_qn, cursor->member) != 0) {
-            return NULL;
-        }
-        cursor->next++;
-        return row;
-    }
-    while (cursor->arr && cursor->next < cursor->arr->count) {
-        const CBMResolvedCall *row = &cursor->arr->items[cursor->next++];
-        if (cbm_pipeline_lsp_field_row_usable(row) &&
-            cbm_pipeline_lsp_field_key_cmp(row, cursor->caller_qn, cursor->member) == 0) {
-            return row;
-        }
-    }
-    return NULL;
+    const CBMResolvedCall *row = cursor->row;
+    cursor->row = NULL;
+    return row;
 }
 
-/* The graph node of an owner row, or NULL when the owner is not a project
- * Field (a libc struct, say). Exact QN only: a name fallback here would undo
- * the typing the row carries. */
 static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_field_node(const cbm_gbuf_t *gbuf,
                                                                  const char *project_name,
                                                                  const CBMResolvedCall *row) {
+    if (!cbm_pipeline_lsp_field_row_proven(row))
+        return NULL;
     const cbm_gbuf_node_t *node =
         cbm_pipeline_lsp_target_node_policy(gbuf, project_name, row->callee_qn, false, false);
     return node && node->label && strcmp(node->label, "Field") == 0 ? node : NULL;
 }
 
-/* The Field a C/C++ member call (`cb.close(ctx)`) lands on, decided by the
- * type of its object: among the owner rows of (enclosing function, member
- * name) that name a project Field, the one with the smallest QN, so the
- * sequential scan and the sorted index agree. *typed says whether the LSP
- * typed the object at all; NULL with *typed set means "typed, and no project
- * Field is meant", NULL without it means the caller may try the member name. */
-static inline const cbm_gbuf_node_t *cbm_pipeline_c_member_call_field(
+static inline const cbm_gbuf_node_t *cbm_pipeline_c_member_call_field_at(
     const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_field_index_t *index,
-    const cbm_gbuf_t *gbuf, const char *project_name, const char *enclosing_func_qn,
-    const char *callee_text, bool *typed) {
-    cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
-        arr, index, enclosing_func_qn, cbm_lsp_bare_segment(callee_text));
-    const cbm_gbuf_node_t *best = NULL;
-    const CBMResolvedCall *owner;
-    *typed = false;
-    while ((owner = cbm_pipeline_lsp_field_next(&owners)) != NULL) {
-        *typed = true;
-        const cbm_gbuf_node_t *field = cbm_pipeline_lsp_field_node(gbuf, project_name, owner);
-        if (field && (!best || strcmp(field->qualified_name, best->qualified_name) < 0)) {
-            best = field;
-        }
-    }
-    return best;
+    const cbm_gbuf_t *gbuf, const char *project_name, const char *caller, const char *callee,
+    uint32_t start, uint32_t end, CBMSourceOrigin origin, bool *typed) {
+    cbm_pipeline_lsp_field_cursor_t cursor = cbm_pipeline_lsp_field_cursor_at(
+        arr, index, caller, cbm_lsp_bare_segment(callee), start, end, origin);
+    *typed = cursor.typed;
+    return cursor.row ? cbm_pipeline_lsp_field_node(gbuf, project_name, cursor.row) : NULL;
 }
 
-/* Confidence of a member call bound by the type of its object, and of one
- * bound because the project holds exactly one Field of that name. */
-#define CBM_CONF_MEMBER_TYPED 0.95
-#define CBM_CONF_MEMBER_UNIQUE 0.75
+static inline const cbm_gbuf_node_t *cbm_pipeline_c_member_call_field(
+    const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_field_index_t *index,
+    const cbm_gbuf_t *gbuf, const char *project_name, const char *caller, const char *callee,
+    bool *typed) {
+    (void)index;
+    (void)gbuf;
+    (void)project_name;
+    *typed = false;
+    for (int i = 0; arr && caller && callee && i < arr->count; i++) {
+        const CBMResolvedCall *row = &arr->items[i];
+        if (cbm_pipeline_lsp_field_row_usable(row) &&
+            !cbm_pipeline_lsp_field_key_cmp(row, caller, cbm_lsp_bare_segment(callee))) {
+            *typed = true;
+            break;
+        }
+    }
+    return NULL;
+}
 
-/* The complete rule for a C/C++ member call: the Field the object's type
- * names; for an object the LSP could not type, the one Field of that name in
- * the project, where allow_unique_name says the file follows the C member rule
- * (cbm_c_member_rule_file) -- in other C++ files an untyped `u->size()` is a
- * method of a type the project does not hold far more often than a call
- * through some struct's member; otherwise NULL. On a hit *res is rewritten to
- * that Field. */
-static inline const cbm_gbuf_node_t *cbm_pipeline_c_member_call_resolve(
+#define CBM_CONF_MEMBER_TYPED 0.95
+
+static inline const cbm_gbuf_node_t *cbm_pipeline_c_member_call_resolve_at(
     const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_field_index_t *index,
     const cbm_gbuf_t *gbuf, const cbm_registry_t *registry, const char *project_name,
-    const char *enclosing_func_qn, const char *callee_text, bool allow_unique_name,
-    cbm_resolution_t *res) {
+    const char *caller, const char *callee, bool allow_unique_name, uint32_t start, uint32_t end,
+    CBMSourceOrigin origin, cbm_resolution_t *res) {
+    (void)registry;
+    (void)allow_unique_name;
     bool typed = false;
-    const cbm_gbuf_node_t *field = cbm_pipeline_c_member_call_field(
-        arr, index, gbuf, project_name, enclosing_func_qn, callee_text, &typed);
-    if (!field && !typed && allow_unique_name) {
-        const char *only =
-            cbm_registry_unique_field_qn(registry, cbm_lsp_bare_segment(callee_text));
-        field = only ? cbm_gbuf_find_by_qn(gbuf, only) : NULL;
-    }
+    const cbm_gbuf_node_t *field = cbm_pipeline_c_member_call_field_at(
+        arr, index, gbuf, project_name, caller, callee, start, end, origin, &typed);
     if (field) {
-        res->qualified_name = field->qualified_name;
-        res->strategy = typed ? "lsp_field_access" : "unique_name";
-        res->confidence = typed ? CBM_CONF_MEMBER_TYPED : CBM_CONF_MEMBER_UNIQUE;
-        res->candidate_count = SKIP_ONE;
+        *res = (cbm_resolution_t){
+            .qualified_name = field->qualified_name,
+            .strategy = "lsp_field_access",
+            .confidence = CBM_CONF_MEMBER_TYPED,
+            .candidate_count = 1,
+            .proof = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                      .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                      .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                      .rule = CBM_RESOLVE_RULE_TYPE_MEMBER,
+                      .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                               CBM_RESOLVE_FACT_RECEIVER_TYPED | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+                      .target = field->qualified_name,
+                      .candidate_count = 1}};
     }
     return field;
 }
 
-/* Resolve an LSP-emitted callee_qn to a graph-buffer node.
- *
- * Per-file LSPs sometimes emit `callee_qn` as the raw package-shaped
- * import path the source code uses rather than the project-qualified QN
- * the gbuf actually stores. The fallback rule is:
- *   1. try the LSP-emitted QN as-is;
- *   2. retry with `<project>.<callee_qn>` when needed;
- *   3. if both fail AND allow_tail_match is set (JVM callers only, see
- *      cbm_pipeline_lsp_allow_tail_match), use the exact node-name index
- *      to narrow candidates by short method name and accept exactly one
- *      Function/Method whose qualified_name has the same Class.method
- *      tail;
- *   4. when a package-shaped top-level JVM QN cannot share a tail with the
- *      graph's file-shaped QN, accept one globally unique callable short name.
- *
- * Returns the matching node, or NULL if neither lookup hits. */
-/* Tail-match cost counters (#1669).
- *
- * The scan below is the one candidate loop in the resolve path with NO cap —
- * cbm_registry_resolve bails at REG_MAX_CANDIDATES=256, this does not. Its
- * candidate set is every node sharing a short name, which grows with the
- * corpus, so `candidates scanned` is the quantity that turns resolve from O(n)
- * into O(n^2). Counted always (two relaxed adds), surfaced by pass_parallel at
- * end of resolve: a candidates/lookup ratio that grows with corpus size IS the
- * regression, visible in one run. */
+static inline const cbm_gbuf_node_t *cbm_pipeline_c_member_call_resolve(
+    const CBMResolvedCallArray *arr, const cbm_pipeline_lsp_field_index_t *index,
+    const cbm_gbuf_t *gbuf, const cbm_registry_t *registry, const char *project_name,
+    const char *caller, const char *callee, bool allow_unique_name, cbm_resolution_t *res) {
+    return cbm_pipeline_c_member_call_resolve_at(arr, index, gbuf, registry, project_name, caller,
+                                                 callee, allow_unique_name, 0, 0,
+                                                 CBM_SOURCE_ORIGIN_RAW, res);
+}
+
+/* Materialize canonical identity only: exact QN, project qualification, or
+ * the established C macro spelling. Names and class/method suffixes supply
+ * no target identity and never participate. Counters remain ABI-compatible. */
 extern _Atomic uint64_t g_lsp_tail_lookups;
 extern _Atomic uint64_t g_lsp_tail_candidates;
 
@@ -1251,57 +1238,9 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
             }
         }
     }
-    if (!allow_tail_match) {
-        return NULL;
-    }
-
-    const char *short_name = strrchr(callee_qn, '.');
-    short_name = short_name ? short_name + SKIP_ONE : callee_qn;
-    const char *callee_tail = cbm_pipeline_qn_class_method_tail(callee_qn);
-    if (!callee_tail) {
-        return NULL;
-    }
-    const cbm_gbuf_node_t **hits = NULL;
-    int hit_count = 0;
-    if (cbm_gbuf_find_by_name(gbuf, short_name, &hits, &hit_count) != 0 || hit_count == 0) {
-        return NULL;
-    }
-    atomic_fetch_add_explicit(&g_lsp_tail_lookups, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_lsp_tail_candidates, (uint64_t)hit_count, memory_order_relaxed);
-
-    const cbm_gbuf_node_t *match = NULL;
-    const cbm_gbuf_node_t *unique_callable = NULL;
-    bool tail_ambiguous = false;
-    bool callable_ambiguous = false;
-    for (int i = 0; i < hit_count; i++) {
-        const cbm_gbuf_node_t *cand = hits[i];
-        if (!cand || !cand->label || !cand->qualified_name) {
-            continue;
-        }
-        if (strcmp(cand->label, "Function") != 0 && strcmp(cand->label, "Method") != 0) {
-            continue;
-        }
-        if (!unique_callable) {
-            unique_callable = cand;
-        } else if (unique_callable->id != cand->id) {
-            callable_ambiguous = true;
-        }
-        if (!cbm_pipeline_qn_class_method_tail_eq(cand->qualified_name, callee_tail)) {
-            continue;
-        }
-        if (match && match->id != cand->id) {
-            tail_ambiguous = true;
-            continue;
-        }
-        match = cand;
-    }
-    if (match) {
-        return tail_ambiguous ? NULL : match;
-    }
-    if (!allow_unique_callable_fallback) {
-        return NULL;
-    }
-    return callable_ambiguous ? NULL : unique_callable;
+    (void)allow_tail_match;
+    (void)allow_unique_callable_fallback;
+    return NULL;
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

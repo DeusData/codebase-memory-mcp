@@ -149,7 +149,9 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 // Sets *is_member_out when the written name is the field half of a
 // member/selector LHS — the receiver is stripped from the returned name, so
 // this out-param is the only surviving record of the selector shape (#1962).
-static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_member_out) {
+static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_member_out,
+                                    TSNode *site_out) {
+    *site_out = (TSNode){0};
     // Unwrap a single-element expression_list (Go).
     if (strcmp(ts_node_type(left), "expression_list") == 0) {
         if (ts_node_named_child_count(left) != 1) {
@@ -159,6 +161,7 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
     }
     const char *lk = ts_node_type(left);
     if (strcmp(lk, "identifier") == 0 || strcmp(lk, "simple_identifier") == 0) {
+        *site_out = left;
         return cbm_node_text(ctx->arena, left, ctx->source);
     }
     // Indexed write: write the base operand's identifier (`cache[k]` → cache).
@@ -173,6 +176,7 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
         if (!ts_node_is_null(base)) {
             const char *bk = ts_node_type(base);
             if (strcmp(bk, "identifier") == 0 || strcmp(bk, "simple_identifier") == 0) {
+                *site_out = base;
                 return cbm_node_text(ctx->arena, base, ctx->source);
             }
         }
@@ -190,6 +194,7 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
             if (is_member_out) {
                 *is_member_out = true;
             }
+            *site_out = fld;
             return cbm_node_text(ctx->arena, fld, ctx->source);
         }
         return NULL;
@@ -258,13 +263,16 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
         return;
     }
     bool is_member = false;
-    char *name = resolve_lhs_write_name(ctx, left, &is_member);
+    TSNode site = {0};
+    char *name = resolve_lhs_write_name(ctx, left, &is_member, &site);
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-        CBMReadWrite rw;
+        CBMReadWrite rw = {0};
         rw.var_name = name;
         rw.is_write = true;
         rw.enclosing_func_qn = func_qn;
         rw.is_member_access = is_member;
+        rw.site_start_byte = ts_node_start_byte(site);
+        rw.site_end_byte = ts_node_end_byte(site);
         cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
     }
 }
@@ -338,13 +346,16 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
 
         if (!ts_node_is_null(left)) {
             bool is_member = false;
-            char *name = resolve_lhs_write_name(ctx, left, &is_member);
+            TSNode site = {0};
+            char *name = resolve_lhs_write_name(ctx, left, &is_member, &site);
             if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-                CBMReadWrite rw;
+                CBMReadWrite rw = {0};
                 rw.var_name = name;
                 rw.is_write = true;
                 rw.enclosing_func_qn = state->enclosing_func_qn;
                 rw.is_member_access = is_member;
+                rw.site_start_byte = ts_node_start_byte(site);
+                rw.site_end_byte = ts_node_end_byte(site);
                 cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
             }
         }
