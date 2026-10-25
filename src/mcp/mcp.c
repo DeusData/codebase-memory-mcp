@@ -1468,8 +1468,10 @@ static const char MCP_SERVER_INSTRUCTIONS[] =
     "query_graph runs multi-hop Cypher queries; get_architecture summarizes structure; "
     "detect_changes maps the current diff to affected symbols. Grep and file reads fit literal "
     "text, config values, comments and non-code files better; search_code combines text search "
-    "with graph context. The session project's index refreshes automatically; other projects "
-    "need index_repository. check_index_coverage tells whether a cited file was fully indexed. "
+    "with graph context. With auto_watch enabled, an index registered by an active MCP session "
+    "refreshes automatically; sessions register their root and successful explicit "
+    "index_repository targets. CLI calls do not add watches. check_index_coverage tells whether "
+    "a cited file was fully indexed. "
     "Results are paginated.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
@@ -7379,8 +7381,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 }
 
 /* index_status "watch" object (#2167): is this project kept fresh by the
- * background watcher right now, and if not, why. Auto-sync covers the active
- * MCP session's project only; anything else needs index_repository again. */
+ * background watcher right now, and if not, why. Active MCP sessions register
+ * their root on connect and successful explicit index_repository targets. */
 static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   const char *project) {
     cbm_mcp_watch_status_t status = {0};
@@ -7406,8 +7408,8 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
     } else {
         yyjson_mut_obj_add_str(doc, watch, "reason", status.reason ? status.reason : "unknown");
         yyjson_mut_obj_add_str(doc, watch, "hint",
-                               "Auto-sync watches only the active MCP session's project; "
-                               "re-run index_repository to refresh this index.");
+                               "To register this project for auto-sync, successfully "
+                               "re-index it from an active MCP session with auto_watch enabled.");
     }
     yyjson_mut_obj_add_val(doc, root, "watch", watch);
 }
