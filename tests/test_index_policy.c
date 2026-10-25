@@ -371,7 +371,8 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
     (void)snprintf(args, sizeof(args),
                    "{\"repo_path\":\"%s\",\"name\":\"ResourcePolicyFixture\","
                    "\"mode\":\"fast\",\"_cbm_index_policy\":{"
-                   "\"index_max_files\":\"off\",\"index_max_source_mb\":\"off\"}}",
+                   "\"index_max_files\":\"off\",\"index_max_source_mb\":\"off\","
+                   "\"index_secret_files\":\"false\"}}",
                    repo);
     char *limited_response =
         configured && server ? cbm_mcp_handle_tool(server, "index_repository", args) : NULL;
