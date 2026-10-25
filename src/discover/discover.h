@@ -162,6 +162,10 @@ bool cbm_should_skip_dir(const char *dirname, cbm_index_mode_t mode);
 bool cbm_has_ignored_suffix(const char *filename, cbm_index_mode_t mode);
 
 /* Check if a specific filename should be skipped in fast mode (e.g. LICENSE, go.sum). */
+/* True for secret-bearing files (.env*, private keys, credential files) that are
+ * skipped unless the index_secret_files setting is on. Templates such as
+ * .env.example are not secret. */
+bool cbm_is_secret_filename(const char *filename);
 bool cbm_should_skip_filename(const char *filename, cbm_index_mode_t mode);
 
 /* Check if a path matches fast-mode substring patterns (e.g. .d.ts, .pb.go). */
@@ -226,7 +230,7 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
 typedef struct {
     char *rel_path; /* heap-allocated, relative to repo root */
     char *reason;   /* heap-allocated: "gitignore" | "cbmignore" |
-                     * "skip-list" | "ignored-suffix" | "fast-pattern" |
+                     * "skip-list" | "secret-file" | "ignored-suffix" | "fast-pattern" |
                      * "size-cap" */
 } cbm_ignored_file_t;
 

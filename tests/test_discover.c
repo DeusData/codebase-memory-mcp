@@ -336,6 +336,79 @@ TEST(discover_prunes_the_cache_tree) {
     PASS();
 }
 
+/* Secret-bearing files are skipped by default and indexed only on opt-in. */
+TEST(secret_filename_classification) {
+    ASSERT_TRUE(cbm_is_secret_filename(".env"));
+    ASSERT_TRUE(cbm_is_secret_filename(".env.local"));
+    ASSERT_TRUE(cbm_is_secret_filename(".env.production"));
+    ASSERT_TRUE(cbm_is_secret_filename("prod.env"));
+    ASSERT_TRUE(cbm_is_secret_filename("server.key"));
+    ASSERT_TRUE(cbm_is_secret_filename("cert.pem"));
+    ASSERT_TRUE(cbm_is_secret_filename("id_ed25519"));
+    ASSERT_TRUE(cbm_is_secret_filename(".npmrc"));
+    ASSERT_TRUE(cbm_is_secret_filename("credentials.json"));
+    ASSERT_FALSE(cbm_is_secret_filename(".env.example"));
+    ASSERT_FALSE(cbm_is_secret_filename(".env.sample"));
+    ASSERT_FALSE(cbm_is_secret_filename("environment.ts"));
+    ASSERT_FALSE(cbm_is_secret_filename("keyboard.c"));
+    ASSERT_FALSE(cbm_is_secret_filename("main.go"));
+    ASSERT_FALSE(cbm_is_secret_filename(NULL));
+    PASS();
+}
+
+static int count_rel_path(cbm_file_info_t *files, int count, const char *rel) {
+    int hits = 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel) == 0) {
+            hits++;
+        }
+    }
+    return hits;
+}
+
+TEST(discover_skips_secret_files_by_default) {
+    char *base = th_mktempdir("cbm_disc_secret");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "config.json"), "{}\n");
+    th_write_file(TH_PATH(base, "credentials.json"), "{\"k\":1}\n");
+    th_write_file(TH_PATH(base, "service-account.json"), "{\"k\":2}\n");
+    th_write_file(TH_PATH(base, ".env.example"), "KEY=\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_EQ(count_rel_path(files, count, "src/main.go"), 1);
+    ASSERT_EQ(count_rel_path(files, count, "config.json"), 1);
+    ASSERT_EQ(count_rel_path(files, count, ".env.example"), 1);
+    ASSERT_EQ(count_rel_path(files, count, "credentials.json"), 0);
+    ASSERT_EQ(count_rel_path(files, count, "service-account.json"), 0);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_indexes_secret_files_when_opted_in) {
+    char *base = th_mktempdir("cbm_disc_secret_optin");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "src/main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "credentials.json"), "{\"k\":1}\n");
+
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.index_secret_files = true;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .resource_policy = &policy};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_EQ(count_rel_path(files, count, "src/main.go"), 1);
+    ASSERT_EQ(count_rel_path(files, count, "credentials.json"), 1);
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_simple) {
     char *base = th_mktempdir("cbm_disc_simple");
     ASSERT(base != NULL);
@@ -2464,6 +2537,9 @@ SUITE(discover) {
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
+    RUN_TEST(secret_filename_classification);
+    RUN_TEST(discover_skips_secret_files_by_default);
+    RUN_TEST(discover_indexes_secret_files_when_opted_in);
     RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);

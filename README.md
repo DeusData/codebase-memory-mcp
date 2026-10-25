@@ -973,6 +973,7 @@ codebase-memory-mcp config set watcher_enabled false     # stop the watcher thre
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config set index_secret_files true   # also index .env / key / credential files (default: false = skipped)
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
