@@ -426,8 +426,12 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
     if (depth >= MANIFEST_WALK_MAX_DEPTH)
         return 0;
     cbm_dir_t *dir = cbm_opendir(abs_dir);
-    if (!dir)
-        return CBM_NOT_FOUND;
+    if (!dir) {
+        /* A nested directory we can't open has no control files to
+         * contribute; skip it like discover.c's walk_dir already does.
+         * The root call (depth 0) still fails closed. */
+        return depth == 0 ? CBM_NOT_FOUND : 0;
+    }
     int rc = 0;
     cbm_dirent_t *entry;
     while (rc == 0 && (entry = cbm_readdir(dir)) != NULL) {
@@ -2312,6 +2316,8 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
      * leaked one map per probed run (LSan, macOS CI). */
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
     cbm_path_alias_collection_free(aliases);
     cbm_gbuf_free(probe_gbuf);
     return rc;
@@ -3537,6 +3543,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     }
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
     if (phase_rc != 0) {
         cbm_log_error("delta.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));
         if (phase_rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
@@ -4293,6 +4301,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * full pipeline's ownership boundary on both success and failure. */
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
 
     if (phase_rc != 0) {
         cbm_log_error("incremental.err", "phase", "extract_resolve", "rc", itoa_buf(phase_rc));

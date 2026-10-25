@@ -2899,11 +2899,22 @@ static cyp_partial_t partial_or(cyp_partial_t l, cyp_partial_t r) {
                                                               : CYP_PARTIAL_UNKNOWN;
 }
 
-/* A condition whose alias is not bound yet is UNKNOWN; a literal-only LHS
- * (func condition with no variable arg) has nothing to wait for. */
+static bool partial_alias_unbound(binding_t *b, const char *alias) {
+    return alias && !binding_get(b, alias) && !binding_get_edge(b, alias);
+}
+
+/* A condition is UNKNOWN while any alias it reads is not bound yet: its own
+ * variable, and every function argument's -- a func condition is filed under
+ * its first argument's alias, so the b in coalesce(a.x, b.name) is only seen
+ * here. A literal-only LHS has nothing to wait for. */
 static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t *b) {
-    if (c->variable && !binding_get(b, c->variable) && !binding_get_edge(b, c->variable)) {
+    if (partial_alias_unbound(b, c->variable)) {
         return CYP_PARTIAL_UNKNOWN;
+    }
+    for (int i = 0; i < c->arg_count; i++) {
+        if (partial_alias_unbound(b, c->args[i].variable)) {
+            return CYP_PARTIAL_UNKNOWN;
+        }
     }
     return eval_condition(c, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
 }

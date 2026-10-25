@@ -416,6 +416,33 @@ static TSNode resolve_lean_func_name(TSNode node, TSNode name) {
     return cbm_find_child_by_kind(node, "ident");
 }
 
+// Haskell infix-form definition head (`a <+> b`, ``x `plus` y``): the defined
+// name is the operator, not the left operand that is the head's first child. A
+// backticked `infix_id` yields its inner variable (`plus`); a symbolic `operator`
+// is returned as-is and parenthesised by cbm_func_name_node_text, matching the
+// prefix form `(<+>) a b = ...` (#2440).
+static TSNode resolve_haskell_infix_head_name(TSNode head) {
+    enum { INFIX_MIN_CHILDREN = 3, INFIX_OP_IDX = 1 };
+    TSNode op = ts_node_child_by_field_name(head, TS_FIELD("operator"));
+    if (ts_node_is_null(op) && ts_node_child_count(head) >= INFIX_MIN_CHILDREN) {
+        op = ts_node_child(head, INFIX_OP_IDX);
+    }
+    if (!ts_node_is_null(op)) {
+        const char *ok = ts_node_type(op);
+        if (strcmp(ok, "operator") == 0) {
+            return op;
+        }
+        if (strcmp(ok, "infix_id") == 0) {
+            TSNode v = cbm_find_child_by_kind(op, "variable");
+            if (!ts_node_is_null(v)) {
+                return v;
+            }
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
 // Haskell: resolve function name from first named child (variable/name).
 static TSNode resolve_haskell_func_name(TSNode node) {
     if (ts_node_named_child_count(node) > 0) {
@@ -423,6 +450,9 @@ static TSNode resolve_haskell_func_name(TSNode node) {
         const char *hk = ts_node_type(head);
         if (strcmp(hk, "variable") == 0 || strcmp(hk, "name") == 0) {
             return head;
+        }
+        if (strcmp(hk, "infix") == 0) {
+            return resolve_haskell_infix_head_name(head);
         }
         if (ts_node_named_child_count(head) > 0) {
             TSNode v = ts_node_named_child(head, 0);
@@ -8893,6 +8923,68 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
     }
 }
 
+/* True for a C# 14 extension block. The vendored tree-sitter-c-sharp has no
+ * `extension` production, so `extension(string text) { ... }` parses as a
+ * constructor_declaration named `extension` and nothing flags it: has_error
+ * stays 0. A constructor carries its own type's name, so this shape can only be
+ * a genuine constructor inside a type literally called `extension` (#2071). */
+static bool csharp_is_extension_block(TSNode node, TSNode class_node, const char *source) {
+    if (strcmp(ts_node_type(node), "constructor_declaration") != 0) {
+        return false;
+    }
+    TSNode name = resolve_method_name(node, CBM_LANG_CSHARP);
+    if (ts_node_is_null(name)) {
+        return false;
+    }
+    const size_t kw_len = sizeof("extension") - 1;
+    uint32_t len = ts_node_end_byte(name) - ts_node_start_byte(name);
+    if (len != kw_len || strncmp(source + ts_node_start_byte(name), "extension", kw_len) != 0) {
+        return false;
+    }
+    TSNode type_name = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
+    if (!ts_node_is_null(type_name)) {
+        const char *type_text = source + ts_node_start_byte(type_name);
+        uint32_t tlen = ts_node_end_byte(type_name) - ts_node_start_byte(type_name);
+        /* A verbatim identifier names the same type: class @extension may
+         * declare a genuine constructor spelled extension(). */
+        if (tlen > 0 && type_text[0] == '@') {
+            type_text++;
+            tlen--;
+        }
+        if (tlen == kw_len && strncmp(type_text, "extension", kw_len) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Lift the members of a misparsed C# 14 extension block onto the enclosing
+ * type. They sit in the block the grammar took for a constructor body, which
+ * nothing recurses into, so every one of them was dropped. Methods land there
+ * as local_function_statement; a property in the block parses as ERROR and is
+ * beyond recovery without a grammar that knows the construct (#2071). */
+static void extract_csharp_extension_members(CBMExtractCtx *ctx, TSNode ext_node, TSNode class_node,
+                                             const char *class_qn, const CBMLangSpec *spec) {
+    TSNode body = cbm_find_child_by_kind(ext_node, "block");
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    member_iter_t it;
+    member_iter_init(&it, body, ctx->language, false);
+    TSNode member;
+    while (member_iter_next(&it, &member)) {
+        if (strcmp(ts_node_type(member), "local_function_statement") != 0) {
+            continue;
+        }
+        TSNode name = resolve_method_name(member, ctx->language);
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        push_method_def(ctx, member, class_node, class_qn, spec, name);
+    }
+    member_iter_done(&it);
+}
+
 // Extract methods inside a class body
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec) {
@@ -8905,6 +8997,15 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
     member_iter_init(&it, body, ctx->language, false);
     TSNode child;
     while (member_iter_next(&it, &child)) {
+
+        /* C# 14 extension block: emit the members it holds as methods of the
+         * enclosing type, rather than the block itself as a constructor named
+         * `extension` with its members buried in the body (#2071). */
+        if (ctx->language == CBM_LANG_CSHARP &&
+            csharp_is_extension_block(child, class_node, ctx->source)) {
+            extract_csharp_extension_members(ctx, child, class_node, class_qn, spec);
+            continue;
+        }
 
         if (ctx->language == CBM_LANG_OBJC &&
             strcmp(ts_node_type(child), "implementation_definition") == 0) {

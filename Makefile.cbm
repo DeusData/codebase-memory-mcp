@@ -1299,6 +1299,16 @@ $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c $(BUILD_DIR)/.build-co
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
+# The part of OBJS_VENDORED_PROD that holds no first-party code: everything but
+# prod_lsp_all.o (first-party LSP unity) and prod_preprocessor.o (first-party
+# code around vendored simplecpp). CodeQL's light PR scan builds these BEFORE
+# it starts tracing (scripts/build.sh --vendored-only), so the traced build
+# (--reuse-vendored) compiles first-party code only: the grammars alone are
+# most of the 1.3 GB of vendored C, against ~45 MB of first-party code.
+OBJS_THIRD_PARTY_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+.PHONY: cbm-third-party
+cbm-third-party: $(OBJS_THIRD_PARTY_PROD)
+
 MAIN_SRC = src/main.c
 
 # Rebuild when the build CONFIGURATION changes, not only when sources do. The
@@ -1376,6 +1386,7 @@ LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
 CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
 CPPCHECK ?= cppcheck
+CPPCHECK_JOBS ?= 2
 
 # macOS SDK sysroot (needed for Homebrew LLVM to find system headers)
 SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
@@ -1400,10 +1411,16 @@ lint-tidy:
 lint-tidy-diff:
 	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
-# cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck: complementary analysis (config in .cppcheck). A build directory
+# retains whole-program analysis with parallel workers; each run owns its state.
 lint-cppcheck:
 	@echo "=== cppcheck ==="
-	@$(CPPCHECK) --enable=warning,style,performance,portability \
+	@set -e; \
+		cppcheck_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/cbm-cppcheck.XXXXXX"); \
+		trap 'status=$$?; rm -rf "$$cppcheck_dir" || :; exit "$$status"' EXIT; \
+		trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+		$(CPPCHECK) -j$(CPPCHECK_JOBS) --cppcheck-build-dir="$$cppcheck_dir" \
+		--enable=warning,style,performance,portability \
 		--std=c11 --language=c \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \

@@ -2,9 +2,10 @@
 # Each step can be skipped for faster iteration.
 #
 # Pipeline:  lint → test → build + candidate scan/select → smoke/soak
-# Security:  security-static + codeql-gate                    (independent island)
+# Security:  security-static + license-gate                   (independent island)
+# CodeQL:    codeql.yml full scan of this commit + alert check (independent island)
 #
-# Security does NOT block lint/test/build/smoke/soak. All jobs must pass
+# Security and CodeQL do NOT block lint/test/build/smoke/soak. All jobs must pass
 # for the overall workflow to be green.
 #
 # Candidate VirusTotal scanning and tuple-local selection are part of the
@@ -62,14 +63,23 @@ jobs:
   # ── Security (independent island — does not block main pipeline) ──
   security:
     uses: ./.github/workflows/_security.yml
-    # The called job requests security-events:read to count code-scanning
-    # alerts; a reusable workflow cannot request more than its caller grants,
-    # so withholding this here fails the whole run at startup.
+    # No job in _security.yml reads code scanning or the Actions API any more
+    # (the CodeQL gate moved to codeql.yml), so the token stays read-only.
     permissions:
       contents: read
-      security-events: read
-      actions: read
     secrets: inherit
+
+  # ── CodeQL: full scan of this exact commit + the open-alert check ──
+  # Every language, vendored C included (PRs run the narrower PR scan).
+  # codeql.yml uploads results and reads the alerts: a called workflow
+  # cannot request more than its caller grants, so withholding either
+  # permission fails the whole run at startup.
+  codeql:
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
 
   # ── Lint (cppcheck + clang-format) ────────────────────────────
   lint:
