@@ -2417,80 +2417,6 @@ TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown) {
  * SUITE registration
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Strict resolver contract: a name match without an admissible import path is
- * a false-positive bug, even when only one project definition has the name. */
-TEST(ei_strict_import_never_binds_unrelated_namesake) {
-    static const char *sources[] = {"main.py",    "main.ts", "main.js", "main.rb",
-                                    "main.java",  "main.kt", "main.rs", "main.lua",
-                                    "main.swift", "main.cs", "main.php"};
-    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
-    ASSERT_NOT_NULL(gb);
-    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Class", "Remote", "strictimports.unrelated.Remote",
-                                   "unrelated.py", 1, 2, "{}"),
-              0);
-    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
-    CBMImport imp = {.local_name = "Remote", .module_path = "absent.Remote"};
-    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
-    cbm_pipeline_set_pkgmap(NULL);
-    bool rejected = true;
-    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
-        if (cbm_pipeline_resolve_import_node(&ctx, sources[i], "strictimports.main.__file__", &imp,
-                                             NULL))
-            rejected = false;
-    }
-    cbm_pipeline_set_pkgmap(saved);
-    cbm_gbuf_free(gb);
-    ASSERT_TRUE(rejected);
-    PASS();
-}
-
-/* Include roots and their order are configuration, not the shortest path in
- * the repository. Neither suffix candidate proves a target. */
-TEST(ei_strict_include_does_not_rank_suffix_candidates) {
-    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
-    ASSERT_NOT_NULL(gb);
-    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.include.util.__file__",
-                                   "include/util.h", 1, 2, "{}"),
-              0);
-    ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", "util.h", "strictimports.tools.util.__file__",
-                                   "tools/util.h", 1, 2, "{}"),
-              0);
-    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
-    CBMImport imp = {.local_name = "util.h", .module_path = "util.h"};
-    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
-        &ctx, "src/main.c", "strictimports.src.main.__file__", &imp, NULL);
-    cbm_gbuf_free(gb);
-    ASSERT_NULL(target);
-    PASS();
-}
-
-/* A namespace import cannot arbitrarily nominate one file from a namespace
- * spread over several source files. Missing namespace-node support is a recall
- * gap; selecting the first file is an incorrect graph target. */
-TEST(ei_strict_namespace_import_does_not_pick_first_file) {
-    cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
-    ASSERT_NOT_NULL(gb);
-    const char *rels[] = {"a.cs", "b.cs"};
-    const char *namespaces[] = {"Example.Lib", "Example.Lib"};
-    for (int i = 0; i < 2; i++) {
-        char *qn = cbm_pipeline_fqn_compute("strictimports", rels[i], "__file__");
-        ASSERT_NOT_NULL(qn);
-        ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", rels[i], qn, rels[i], 1, 2, "{}"), 0);
-        free(qn);
-    }
-    CBMHashTable *map =
-        cbm_pipeline_namespace_map_build_names("strictimports", namespaces, rels, 2);
-    ASSERT_NOT_NULL(map);
-    cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
-    CBMImport imp = {.local_name = "Lib", .module_path = "Example.Lib"};
-    const cbm_gbuf_node_t *target =
-        cbm_pipeline_resolve_import_node(&ctx, "main.cs", "strictimports.main.__file__", &imp, map);
-    cbm_pipeline_namespace_map_free(map);
-    cbm_gbuf_free(gb);
-    ASSERT_NULL(target);
-    PASS();
-}
-
 /* A name match without an admissible import path is a false-positive bug,
  * even when only one indexed definition has that name. */
 TEST(ei_strict_import_never_binds_unrelated_namesake) {
@@ -2813,9 +2739,6 @@ SUITE(edge_imports) {
     RUN_TEST(ei_strict_bare_es_package_does_not_bind_root_module);
     RUN_TEST(ei_strict_relative_import_above_root_stays_unresolved);
     RUN_TEST(ei_strict_namespace_member_targets_declaring_file);
-    RUN_TEST(ei_strict_import_never_binds_unrelated_namesake);
-    RUN_TEST(ei_strict_include_does_not_rank_suffix_candidates);
-    RUN_TEST(ei_strict_namespace_import_does_not_pick_first_file);
     RUN_TEST(ei_strict_import_never_binds_unrelated_namesake);
     RUN_TEST(ei_strict_include_does_not_rank_suffix_candidates);
     RUN_TEST(ei_strict_namespace_import_does_not_pick_first_file);
