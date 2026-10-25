@@ -3055,7 +3055,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                 <summary>Selection details</summary>
                 <div className="atlas-galaxy-selection-details-body">{selectionContent}</div>
             </details>}
-            {note.length > 0 && !scope.loading && (
+            {note.length > 0 && !scope.loading && !organicTask.loading && (
                 <p className="atlas-galaxy-note" data-testid="atlas-galaxy-note">
                     {props.workspaceExpanded && note === GALAXY_NO_FOCUS_NOTE
                         ? 'Select a node or entry point to attach graph context to chat.' : note}

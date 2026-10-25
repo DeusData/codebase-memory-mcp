@@ -26,6 +26,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ts_lsp.h"
+#include <limits.h>
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
@@ -306,6 +307,21 @@ TEST(tslsp_return_inferred_local) {
                                   "function go() { const c = makeConn(); c.ping(); }\n");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(require_resolved(r, ".go", "ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* infer_return_type_from_body visits children last-child first, so of two returns
+ * the one later in the body is tried first. Pinned so that a change to the walk
+ * order (#2091) is a visible decision rather than a side effect. */
+TEST(tslsp_return_walk_order_prefers_later_return) {
+    CBMFileResult *r =
+        extract_ts("class A { a(): void {} }\n"
+                   "class B { b(): void {} }\n"
+                   "function pick(f) { if (f) { return new A(); } return new B(); }\n"
+                   "function go() { const x = pick(true); x.b(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".go", "b"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -1153,6 +1169,125 @@ TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites) {
     ASSERT_EQ(semantic_count, 2);
     ASSERT_TRUE(self_exact);
     ASSERT_TRUE(open_exact);
+    PASS();
+}
+
+TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity) {
+    const char *source = "function Card(): JSX.Element { return <span/>; }\n"
+                         "const Direct = async () => <Card/>;\n"
+                         "export const Exported = async () => <Card/>;\n"
+                         "function Declared(): JSX.Element { return <Card/>; }\n";
+    const char *const declarations[] = {"const Direct", "export const Exported",
+                                        "function Declared"};
+    const char *const callers[] = {"test.main.Direct", "test.main.Exported", "test.main.Declared"};
+    CBMFileResult *r = extract_tsx(source);
+    const bool result_created = r != NULL;
+    bool exact_carrier[3] = {false};
+    bool exact_resolution[3] = {false};
+    bool resolved_invocation[3] = {false};
+    bool resolved_card_callee[3] = {false};
+    bool resolved_jsx_strategy[3] = {false};
+    int carrier_count[3] = {0};
+    int failed_cases = result_created ? 0 : 1;
+
+    if (!result_created)
+        printf("  JSX caller diagnostic: extraction failed\n");
+    if (r) {
+        for (int i = 0; i < 3; i++) {
+            const char *declaration = strstr(source, declarations[i]);
+            const char *site = declaration ? strstr(declaration, "<Card/>") : NULL;
+            if (!site) {
+                printf("  JSX caller diagnostic: source site missing for %s\n", callers[i]);
+                failed_cases++;
+                continue;
+            }
+            const uint32_t start = (uint32_t)(site - source);
+            const uint32_t end = start + (uint32_t)strlen("<Card/>");
+            const CBMCall *carrier = NULL;
+            for (int j = 0; j < r->calls.count; j++) {
+                const CBMCall *call = &r->calls.items[j];
+                if (call->callee_name && strcmp(call->callee_name, "Card") == 0 &&
+                    call->site_start_byte == start && call->site_end_byte == end) {
+                    carrier = call;
+                    carrier_count[i]++;
+                }
+            }
+
+            const CBMResolvedCall *resolved = carrier ? cbm_pipeline_find_lsp_resolution(
+                                                            &r->resolved_calls, carrier, false)
+                                                      : NULL;
+            exact_carrier[i] = carrier && carrier->enclosing_func_qn &&
+                               strcmp(carrier->enclosing_func_qn, callers[i]) == 0 &&
+                               carrier->site_start_byte == start && carrier->site_end_byte == end &&
+                               carrier->requires_lsp_resolution;
+            exact_resolution[i] = resolved && resolved->caller_qn &&
+                                  strcmp(resolved->caller_qn, callers[i]) == 0 &&
+                                  resolved->site_start_byte == start && resolved->site_end_byte == end;
+            resolved_invocation[i] = resolved && resolved->kind == CBM_RESOLVED_INVOCATION;
+            if (resolved && resolved->callee_qn) {
+                const size_t callee_len = strlen(resolved->callee_qn);
+                resolved_card_callee[i] = callee_len >= strlen(".Card") &&
+                                           strcmp(resolved->callee_qn + callee_len - strlen(".Card"),
+                                                  ".Card") == 0;
+            }
+            resolved_jsx_strategy[i] =
+                resolved && resolved->strategy && strcmp(resolved->strategy, "lsp_ts_jsx") == 0;
+            if (carrier_count[i] != 1 || !exact_carrier[i] || !exact_resolution[i] ||
+                !resolved_invocation[i] || !resolved_card_callee[i] || !resolved_jsx_strategy[i]) {
+                printf("  JSX caller diagnostic: expected=%s span=%u:%u carriers=%d caller=%s "
+                       "requires_lsp=%d resolution=%s resolution_span=%u:%u kind=%d callee=%s "
+                       "strategy=%s\n",
+                       callers[i], start, end, carrier_count[i],
+                       carrier && carrier->enclosing_func_qn ? carrier->enclosing_func_qn : "(null)",
+                       carrier ? carrier->requires_lsp_resolution : 0,
+                       resolved && resolved->caller_qn ? resolved->caller_qn : "(null)",
+                       resolved ? resolved->site_start_byte : 0, resolved ? resolved->site_end_byte : 0,
+                       resolved ? resolved->kind : -1,
+                       resolved && resolved->callee_qn ? resolved->callee_qn : "(null)",
+                       resolved && resolved->strategy ? resolved->strategy : "(null)");
+                failed_cases++;
+            }
+        }
+    }
+
+    cbm_free_result(r);
+    ASSERT_EQ(failed_cases, 0);
+    PASS();
+}
+
+/* An exported arrow const is a module definition, not a lexical local.  Bound
+ * into the module scope, it made the JSX resolver fail closed on `<Badge />`
+ * (the edge was lost: JSX carriers have no other resolver) and the exact
+ * same-module call path skip `formatLabel()`.  Both callers must resolve both
+ * targets exactly, whether the caller is a function or an arrow const. */
+static bool ts_resolved_with_strategy(const CBMFileResult *r, const char *caller,
+                                      const char *callee, const char *strategy) {
+    int idx = require_resolved(r, caller, callee);
+    const char *got = idx >= 0 ? r->resolved_calls.items[idx].strategy : NULL;
+    if (idx >= 0 && (!got || strcmp(got, strategy) != 0)) {
+        printf("  %s -> %s resolved by %s, expected %s\n", caller, callee, got ? got : "(null)",
+               strategy);
+    }
+    return got && strcmp(got, strategy) == 0;
+}
+
+TEST(tslsp_jsx_exported_arrow_component_resolves_in_same_module) {
+    CBMFileResult *r =
+        extract_tsx("export const Badge = () => <span/>;\n"
+                    "export const formatLabel = (s: string) => s.trim();\n"
+                    "export function FnUser() { formatLabel('a'); return <Badge/>; }\n"
+                    "export const ArrowUser = () => { formatLabel('b'); return <Badge/>; };\n");
+    ASSERT_NOT_NULL(r);
+    bool fn_jsx = ts_resolved_with_strategy(r, "main.FnUser", "main.Badge", "lsp_ts_jsx");
+    bool arrow_jsx = ts_resolved_with_strategy(r, "main.ArrowUser", "main.Badge", "lsp_ts_jsx");
+    bool fn_call = ts_resolved_with_strategy(r, "main.FnUser", "main.formatLabel", "lsp_ts_local");
+    bool arrow_call =
+        ts_resolved_with_strategy(r, "main.ArrowUser", "main.formatLabel", "lsp_ts_local");
+    cbm_free_result(r);
+    ASSERT_TRUE(fn_jsx);
+    ASSERT_TRUE(arrow_jsx);
+    ASSERT_TRUE(fn_call);
+    ASSERT_TRUE(arrow_call);
     PASS();
 }
 
@@ -3314,6 +3449,122 @@ TEST(tslsp_stress_many_classes) {
     PASS();
 }
 
+TEST(tslsp_signature_walk_keeps_first_local_registration) {
+    CBMRegisteredFunc base_funcs[] = {{.qualified_name = "test.base.only"}};
+    CBMTypeRegistry base = {.funcs = base_funcs, .func_count = 1, .read_only = true};
+    CBMRegisteredFunc funcs[] = {
+        {.qualified_name = NULL},
+        {.qualified_name = "test.main.identity"},
+        {.qualified_name = "test.main.identity"},
+        {.qualified_name = "test.main.Box.identity"},
+    };
+    CBMTypeRegistry overlay = {.funcs = funcs, .func_count = 4, .fallback = &base};
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.main.identity"), 1);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.main.Box.identity"), 3);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.base.only"), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_signature_func_index(&overlay, "test.missing"), -1);
+    ASSERT_EQ(overlay.func_count, 4);
+    ASSERT_EQ(base.func_count, 1);
+    PASS();
+}
+
+TEST(tslsp_walk_pending_count_rejects_overflow) {
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(255, 300), 555);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(INT_MAX - 1, 1), INT_MAX);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(INT_MAX, 1), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(1, (uint32_t)INT_MAX), -1);
+    ASSERT_EQ(cbm_ts_lsp_test_walk_pending_count(0, UINT32_MAX), -1);
+    PASS();
+}
+
+/* Count actual registry work, independent of machine speed. Both inputs exceed
+ * the old walk cap, and every declaration exercises rebuild and generic rewrite. */
+TEST(tslsp_signature_walk_lookup_scales_linearly) {
+    unsigned long work[2] = {0};
+    for (int scale = 0; scale < 2; scale++) {
+        const int count = 300 << scale;
+        const size_t capacity = (size_t)count * 160 + 512;
+        char *source = (char *)malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        size_t used = 0;
+        for (int i = 0; i < count; i++) {
+            used += (size_t)snprintf(source + used, capacity - used,
+                                     "export function identity%d<T>(x: T): T { return x; }\n", i);
+        }
+        snprintf(source + used, capacity - used,
+                 "class Box { use(): void {} }\n"
+                 "function go() { const b = identity%d(new Box()); b.use(); }\n",
+                 count - 1);
+        CBMFileResult *r = extract_ts(source);
+        free(source);
+        ASSERT_NOT_NULL(r);
+        work[scale] = cbm_ts_lsp_test_signature_lookup_work();
+        ASSERT_GTE(require_resolved(r, ".go", "use"), 0);
+        cbm_free_result(r);
+    }
+    printf("  signature lookup work: 300=%lu 600=%lu\n", work[0], work[1]);
+    ASSERT_GT(work[0], 0);
+    /* Allow 25% above ideal doubling for hash-bucket distribution. */
+    ASSERT_LT(work[1], work[0] * 5 / 2);
+    PASS();
+}
+
+TEST(tslsp_stress_declarations_past_stack_cap) {
+    /* 300 padding functions, then the generic pair that needs the AST walk.
+     * The walk used to hold 256 nodes at most, so every top-level declaration
+     * after the 256th was dropped without a word and kept whatever signature
+     * the first extraction pass had guessed. */
+    enum { BUF_CAP = 64 * 1024 };
+    char *buf = (char *)malloc(BUF_CAP);
+    ASSERT_NOT_NULL(buf);
+    char *p = buf;
+    char *end = buf + BUF_CAP;
+    for (int i = 0; i < 300; i++) {
+        p += snprintf(p, (size_t)(end - p), "function pad%d(): void {}\n", i);
+    }
+    p += snprintf(p, (size_t)(end - p), "function identity<T>(x: T): T { return x; }\n");
+    p += snprintf(p, (size_t)(end - p), "class Box { use(): void {} }\n");
+    p += snprintf(p, (size_t)(end - p),
+                  "function go() { const b = identity(new Box()); b.use(); }\n");
+    *p = '\0';
+
+    CBMFileResult *r = extract_ts(buf);
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    /* Same claim as tslsp_generic_identity_inference, 300 declarations deeper. */
+    ASSERT_GTE(require_resolved(r, ".go", "use"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_stress_return_past_stack_cap) {
+    /* infer_return_type_from_body reads the return type out of a body that
+     * carries no written one. The return here sits after 300 statements, more
+     * than the old fixed cap held, so the walk used to stop before reaching it
+     * and answer "unknown return type". */
+    enum { BUF_CAP = 64 * 1024 };
+    char *buf = (char *)malloc(BUF_CAP);
+    ASSERT_NOT_NULL(buf);
+    char *p = buf;
+    char *end = buf + BUF_CAP;
+    p += snprintf(p, (size_t)(end - p), "class Conn { ping(): void {} }\n");
+    p += snprintf(p, (size_t)(end - p), "function makeConn() {\n");
+    for (int i = 0; i < 300; i++) {
+        p += snprintf(p, (size_t)(end - p), "  let a%d = 0;\n", i);
+    }
+    p += snprintf(p, (size_t)(end - p), "  return new Conn();\n}\n");
+    p += snprintf(p, (size_t)(end - p), "function go() { const c = makeConn(); c.ping(); }\n");
+    *p = '\0';
+
+    CBMFileResult *r = extract_ts(buf);
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    /* Same claim as tslsp_return_inferred_local, 300 statements deeper. */
+    ASSERT_GTE(require_resolved(r, ".go", "ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_stress_deep_inheritance) {
     /* Chain of 30 classes via extends, leaf method on root. */
     char buf[16 * 1024];
@@ -4741,6 +4992,7 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_return_simple);
     RUN_TEST(tslsp_return_chain);
     RUN_TEST(tslsp_return_inferred_local);
+    RUN_TEST(tslsp_return_walk_order_prefers_later_return);
     RUN_TEST(tslsp_return_async_promise);
     RUN_TEST(tslsp_return_method_no_rttype);
 
@@ -4863,6 +5115,8 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_jsx_component_with_children);
     RUN_TEST(tslsp_jsx_import_requires_registered_component);
     RUN_TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites);
+    RUN_TEST(tslsp_jsx_top_level_async_arrow_callers_keep_exact_identity);
+    RUN_TEST(tslsp_jsx_exported_arrow_component_resolves_in_same_module);
     RUN_TEST(tslsp_jsx_local_tag_shadow_blocks_module_component);
     RUN_TEST(tslsp_jsx_intrinsic_skipped);
     RUN_TEST(tslsp_jsx_nested_component);
@@ -5068,6 +5322,11 @@ SUITE(ts_lsp) {
 
     /* Stress tests */
     RUN_TEST(tslsp_stress_many_classes);
+    RUN_TEST(tslsp_signature_walk_keeps_first_local_registration);
+    RUN_TEST(tslsp_walk_pending_count_rejects_overflow);
+    RUN_TEST(tslsp_signature_walk_lookup_scales_linearly);
+    RUN_TEST(tslsp_stress_declarations_past_stack_cap);
+    RUN_TEST(tslsp_stress_return_past_stack_cap);
     RUN_TEST(tslsp_stress_deep_inheritance);
     RUN_TEST(tslsp_stress_long_method_chain);
     RUN_TEST(tslsp_stress_megafile_mixed);

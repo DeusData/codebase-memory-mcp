@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import GalaxyPanel, { type GalaxyPanelProps } from './GalaxyPanel';
 import type { GraphData, GraphNode } from './types';
+import type { OrganicLayoutRequest, OrganicLayoutResponse } from './organic-layout.worker';
 
 /** The layout can be capped; focused relationships come independently from RPC. */
 function graphFetch(nodes: GraphNode[], edges: GraphData['edges'], total = nodes.length) {
@@ -102,10 +103,24 @@ it('opens a file hierarchy without a caret symbol and follows literal marked ran
     expect(fetchLayout.mock.calls.filter(([url]) => String(url).includes('/api/layout'))).toHaveLength(1);
 });
 
-it('does not report a file missing from a capped layout while its indexed scope is loading', async () => {
+it.each([true, false])('does not report a file missing while its scope or layout is loading (indexed: %s)', async indexed => {
+    let worker!: LayoutWorker;
+    class LayoutWorker {
+        onmessage: ((event: MessageEvent<OrganicLayoutResponse>) => void) | null = null;
+        requests: OrganicLayoutRequest[] = [];
+        constructor() { worker = this; }
+        postMessage(request: OrganicLayoutRequest) { this.requests.push(request); }
+        terminate() {}
+        reply() {
+            const { sequence, data } = this.requests.at(-1)!;
+            this.onmessage?.(new MessageEvent<OrganicLayoutResponse>('message', { data: { sequence,
+                result: { data, groups: [], groupByNode: new Map() } } }));
+        }
+    }
+    vi.stubGlobal('Worker', LayoutWorker);
     const node: GraphNode = { id: 15, name: 'outside', qualified_name: 'sample.outside', label: 'Function',
         file_path: 'src/a.ts', start_line: 1, end_line: 10, x: 0, y: 0, z: 0, size: 1, color: '#999999' };
-    const source = graphFetch([node], []);
+    const source = graphFetch(indexed ? [node] : [], []);
     let release!: () => void;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const fetchImpl = vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
@@ -114,15 +129,27 @@ it('does not report a file missing from a capped layout while its indexed scope 
         return source(url, init);
     });
     await act(async () => root.render(<GalaxyPanel project="sample" visible focusFilePath="src/a.ts" onOpenNode={vi.fn()} fetch={fetchImpl} />));
-    // Hand test K8: the status names the layer that is loading instead of an endless "Loading relationships".
-    // It may first say "Checking index…" while the index generation is read; wait for the load itself.
-    await vi.waitFor(() => expect(host.textContent).toContain('Loading layer 1…'));
+    expect(host.textContent).toContain('Loading layer 1…');
+    // Finish the empty capped-layout preview while the indexed scope is held.
+    // This leaves a missing-file note in state, hidden until the scope finishes.
+    expect(worker.requests).toHaveLength(1);
+    expect(worker.requests[0]!.data.nodes).toEqual([]);
+    await act(async () => worker.reply());
     expect(host.querySelector('[data-testid="atlas-galaxy-note"]')).toBeNull();
     await act(async () => { release(); });
     expect(host.textContent).toContain('All indexed direct dependencies included.');
+    // The scope is complete, but its new picture has not been arranged yet.
+    expect(worker.requests).toHaveLength(2);
+    expect(host.querySelector('[role="status"][data-state="arranging"]')).not.toBeNull();
+    expect(host.querySelector('[data-testid="atlas-galaxy-note"]')).toBeNull();
     expect(host.textContent).not.toContain('not in the loaded graph');
+    await act(async () => worker.reply());
+    expect(host.querySelector('[role="status"][data-state="complete"]')).not.toBeNull();
+    expect(JSON.parse(host.querySelector('[data-testid="graph-selection"]')!.textContent!)).toEqual(indexed ? [15] : []);
+    if (indexed) expect(host.querySelector('[data-testid="atlas-galaxy-note"]')).toBeNull();
+    else expect(host.querySelector('[data-testid="atlas-galaxy-note"]')?.textContent).toBe('src/a.ts is not in the loaded graph layout.');
 });
-afterEach(async () => { await act(async () => root.unmount()); host.remove(); globalThis.__atlasGalaxy = undefined; });
+afterEach(async () => { await act(async () => root.unmount()); host.remove(); globalThis.__atlasGalaxy = undefined; vi.unstubAllGlobals(); });
 
 it('selects the whole file, narrows only to marked code, and restores the file when the mark clears', async () => {
     const common = { file_path: 'src/a.ts', x: 0, y: 0, z: 0, size: 1, color: '#999999' };

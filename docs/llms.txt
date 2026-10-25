@@ -1,6 +1,6 @@
 # codebase-memory-mcp
 
-> Local code intelligence for developers and AI agents. Connect code, documentation, configuration, and infrastructure in a persistent knowledge graph. Search for a feature, follow callers and dependencies, trace services and deployments, inspect change impact, and explore the evidence in CBM Lens. Access the same backend through MCP or the CLI. Indexing, graph queries, and semantic embeddings run locally without a hosted service or API key; Lens optionally downloads a browser model after opt-in for on-device code chat.
+> Codebase Memory is an open-source local MCP server for AI coding agents. It connects code, documentation, configuration, and infrastructure in a persistent knowledge graph, with 17 MCP tools and native CLI access. Search for a feature, follow callers and dependencies, trace services and deployments, and inspect change impact. Indexing, graph queries, and semantic embeddings run locally without a hosted service or API key. CBM Lens is the optional visual companion, currently in open beta (v0.0.1); its optional browser model supports on-device code chat after an opt-in download.
 
 ## Capabilities
 
@@ -13,9 +13,10 @@
 - Change impact: detect_changes maps diffs to affected symbols and investigates related tests with scope: "tests"; compare_graphs compares indexed snapshots.
 - Smart CI (experimental): repository-specific changed-file rules select CI jobs; test-impact select combines static reachability, changed tests, and admitted per-test coverage to select tests. Narrowing supports C/C++ family code with supported test-harness conventions and an explicitly configured runner. Missing or doubtful evidence broadens the selection or runs all tests. Other indexed languages are not automatically supported for test narrowing. test-impact publish creates the baseline graph-and-coverage bundle. Start in shadow mode; consult the guide for version requirements.
 - Architecture decisions and runtime evidence: manage_adr stores the project's decision record; ingest_traces adds separately collected observed call relationships alongside static analysis.
-- CBM Lens Beta: local browser interface with source exploration, Galaxy graph navigation, architecture and behavior views, ADR editing, index-coverage diagnostics, daemon/system information, and optional local code chat. Static graph animations are not live execution traces. Activity overlays are experimental source-build features, not a standard-release promise.
+- CBM Lens open beta (v0.0.1): optional visual companion to the MCP server, with a local browser interface with source exploration, Galaxy graph navigation, architecture and behavior views, ADR editing, index-coverage diagnostics, daemon/system information, and optional local code chat. Static graph animations are not live execution traces. Activity overlays are experimental source-build features, not a standard-release promise.
 - Agent integrations: 45 automatic or conditional client surfaces. Installation configures supported MCP entries, durable instructions, skills, Scout/Verify/Auditor profiles, and applicable session, compaction, search, and read hooks. Coverage and activation vary by client and platform. Hooks provide context without blocking or replacing the user's tool call; some clients require trust or use parent-agent handoff instead.
 - Persistent operation: a per-account daemon coordinates sessions and indexing. Existing indexes can stay synchronized during eligible active MCP sessions; initial auto-indexing is separately opt-in. Optional team graph artifacts share a baseline while each user keeps a local query database.
+- Token-efficient retrieval: targeted graph queries, focused source snippets, and compact, paged results can reduce token use and repeated file reads during code exploration.
 - Distribution: native C backend, MIT license, standard native releases for macOS, Linux, and Windows include CBM Lens; Linux portable archives provide static builds. Nix and development source builds can omit the UI. Package-manager options and release verification are documented in the README.
 
 ## Client coverage
@@ -24,7 +25,9 @@
 
 ## Measurement and limits
 
-Published performance and token comparisons apply to specific workloads, hardware, and agent setups, not a universal percentage saving. The README Performance section preserves the historical comparison and research quality tradeoff. Check index generation, freshness, and exact path/scope coverage before relying on graph results, especially absence claims; read source when coverage is partial, skipped, excluded, stale, or unknown. Infrastructure relationships are static, and test-selection support is narrower than language-indexing support.
+A March 2026 preprint across 31 real-world repositories reports 10× lower token use and 2.1× fewer tool calls compared with file-by-file exploration. These historical backend measurements cover the study’s workloads and agent setup. The paper documents the full evaluation; the README Performance section links to the research and earlier measurements.
+
+Graph evidence depends on index generation, freshness, and exact path/scope coverage. Partial, skipped, excluded, stale, or unknown coverage requires source verification, especially for absence claims. Infrastructure relationships are static, and test-selection support is narrower than language-indexing support.
 
 ## Links
 
@@ -39,7 +42,8 @@ Published performance and token comparisons apply to specific workloads, hardwar
 - Smart CI guide: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/SMART_CI.md
 - Configuration: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/CONFIGURATION.md
 - MCP tools: https://github.com/DeusData/codebase-memory-mcp#mcp-tools
-- Performance and research limits: https://github.com/DeusData/codebase-memory-mcp#performance
+- Token savings and evidence: https://deusdata.github.io/codebase-memory-mcp/#token-savings
+- Performance and research: https://github.com/DeusData/codebase-memory-mcp#performance
 - Benchmark report: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
 - Research paper: https://arxiv.org/abs/2603.27277
 - Security and release verification: https://github.com/DeusData/codebase-memory-mcp#security
