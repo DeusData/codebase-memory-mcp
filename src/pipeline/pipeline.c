@@ -1437,6 +1437,22 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     }
 }
 
+/* Two workers is the smallest width that takes the parallel route. */
+enum { PL_PARALLEL_MIN_WORKERS = 2 };
+
+/* Background refreshes leave CPU headroom, but never drop below two workers
+ * while the foreground width is two or more. WHY: one worker sends the indexer
+ * down the sequential route, which still builds a different graph than the
+ * parallel route (fewer Route and HANDLES edges, churned CALLS). Until the two
+ * routes agree, an automatic refresh must not change the graph only because
+ * the host has two or fewer performance cores. */
+int cbm_pipeline_background_worker_width(int foreground, int headroom) {
+    if (foreground >= PL_PARALLEL_MIN_WORKERS && headroom < PL_PARALLEL_MIN_WORKERS) {
+        return PL_PARALLEL_MIN_WORKERS;
+    }
+    return headroom;
+}
+
 /* Effective worker count. The crash supervisor re-runs its worker single-
  * threaded (CBM_INDEX_SINGLE_THREAD=1) so a per-file marker can pin the EXACT
  * crasher; a parallel re-run would race the marker. Honour that override
@@ -1447,8 +1463,11 @@ int cbm_pipeline_worker_count(const cbm_pipeline_t *p) {
     int workers;
     if (st && st[0] == '1') {
         workers = 1;
+    } else if (p && p->background) {
+        workers = cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                       cbm_default_worker_count(false));
     } else {
-        workers = cbm_default_worker_count(!p || !p->background);
+        workers = cbm_default_worker_count(true);
     }
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     atomic_store(&g_last_worker_count, workers);

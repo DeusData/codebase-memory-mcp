@@ -79,6 +79,11 @@ void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background);
  * crash-recovery overrides. */
 int cbm_pipeline_worker_count(const cbm_pipeline_t *p);
 
+/* Background width from the foreground width and the headroom width: the
+ * headroom, floored at two whenever the foreground width is two or more so an
+ * automatic refresh keeps the parallel route. */
+int cbm_pipeline_background_worker_width(int foreground, int headroom);
+
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 void cbm_pipeline_worker_count_test_reset(void);
 int cbm_pipeline_worker_count_test_last(void);

@@ -140,12 +140,19 @@ TEST(pipeline_background_worker_policy_preserves_overrides) {
     int foreground_default = cbm_pipeline_worker_count(foreground);
     int background_default = cbm_pipeline_worker_count(background);
     bool defaults_match = foreground_default == cbm_default_worker_count(true) &&
-                          background_default == cbm_default_worker_count(false) &&
-                          foreground_default >= 1 && background_default >= 1;
+                          background_default == cbm_pipeline_background_worker_width(
+                                                    cbm_default_worker_count(true),
+                                                    cbm_default_worker_count(false)) &&
+                          foreground_default >= 1 && background_default >= 1 &&
+                          (foreground_default < 2 || background_default >= 2);
 
+    /* A pinned single worker leaves no parallel route to preserve. */
+    cbm_setenv("CBM_WORKERS", "1", 1);
+    bool env_override =
+        cbm_pipeline_worker_count(foreground) == 1 && cbm_pipeline_worker_count(background) == 1;
     cbm_setenv("CBM_WORKERS", "3", 1);
-    bool env_override = cbm_pipeline_worker_count(foreground) == 3 &&
-                        cbm_pipeline_worker_count(background) == 3;
+    env_override = env_override && cbm_pipeline_worker_count(foreground) == 3 &&
+                   cbm_pipeline_worker_count(background) == 3;
 
     cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
     bool recovery_override = cbm_pipeline_worker_count(foreground) == 1 &&
@@ -162,6 +169,25 @@ TEST(pipeline_background_worker_policy_preserves_overrides) {
     ASSERT_TRUE(defaults_match);
     ASSERT_TRUE(env_override);
     ASSERT_TRUE(recovery_override);
+    PASS();
+}
+
+/* An automatic refresh keeps CPU headroom but never falls to one worker, the
+ * sequential route, while the foreground width could run in parallel. Each
+ * host shape is given as the two widths cbm_default_worker_count() derives
+ * from it (foreground: every core; headroom: performance cores minus one, at
+ * least one), so the verdict does not depend on the machine running it. */
+TEST(pipeline_background_worker_width_keeps_parallel_route) {
+    /* One core: foreground 1, headroom 1. Nothing to preserve. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(1, 1), 1);
+    /* Two performance cores: headroom alone would be 1. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(2, 1), 2);
+    /* Two performance cores beside efficiency cores: same floor. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(8, 1), 2);
+    /* Larger hosts keep their headroom unchanged. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(3, 2), 2);
+    ASSERT_EQ(cbm_pipeline_background_worker_width(4, 3), 3);
+    ASSERT_EQ(cbm_pipeline_background_worker_width(18, 5), 5);
     PASS();
 }
 
@@ -28325,6 +28351,7 @@ SUITE(pipeline) {
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_background_worker_policy_preserves_overrides);
+    RUN_TEST(pipeline_background_worker_width_keeps_parallel_route);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     RUN_TEST(pipeline_surface_respects_total_worker_budget);
 #endif

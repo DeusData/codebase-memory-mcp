@@ -23303,7 +23303,9 @@ static int mcp_assert_inprocess_worker_policy(bool committed, bool automatic) {
     }
     /* Capture while CBM_WORKERS is still unset. Restoring first makes the
      * expected count follow the lane override instead of this policy. */
-    int expected = cbm_default_worker_count(!committed);
+    int expected = committed ? cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                                    cbm_default_worker_count(false))
+                             : cbm_default_worker_count(true);
     mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
     bool cleaned = !cache_ready || th_rmtree(cache) == 0;
 
