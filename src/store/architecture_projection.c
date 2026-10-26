@@ -2079,6 +2079,7 @@ done:
 int cbm_store_architecture_projection(cbm_store_t *store, const char *project,
                                       const cbm_architecture_projection_options_t *options,
                                       char **out_json) {
+    cbm_store_note_local_graph_read(store, "architecture");
     if (!store || !project || !project[0] || !out_json)
         return CBM_STORE_ERR;
     *out_json = NULL;

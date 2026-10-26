@@ -62,6 +62,16 @@ char *cbm_mcp_text_result(const char *text, bool is_error);
  * result; returns it unchanged when it is not an MCP tool-result object. */
 char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason);
 
+/* "neo4j", "neo4j+local" or "local" for a request that read graph data with
+ * that mix of remote queries / local graph reads; NULL when it read none. */
+const char *cbm_mcp_graph_served_by(uint64_t remote_queries, int local_reads);
+
+/* Mark a reply of a Neo4j-backed project with where its graph data came from
+ * (graph_backend served_by neo4j / neo4j+local / local, plus a text notice).
+ * Unchanged when the tool read no graph data. Takes ownership of result. */
+char *cbm_mcp_result_add_graph_served(char *result, uint64_t remote_queries, int local_reads,
+                                      const char *local_what);
+
 /* Attach a notice to a complete MCP tool result: a JSON-object payload gains a
  * "notice" key (content text and structuredContent stay in step), a text
  * payload gains a trailing paragraph. Takes

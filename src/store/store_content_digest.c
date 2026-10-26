@@ -167,12 +167,14 @@ static int sc_digest(cbm_store_t *s, const char *project, const char *domain,
 
 int cbm_store_graph_content_digest(cbm_store_t *s, const char *project,
                                    unsigned char out[CBM_SHA256_DIGEST_LEN]) {
+    cbm_store_note_local_graph_read(s, "graph digest");
     return sc_digest(s, project, "cbm.graph.content.v1", sc_queries,
                      sizeof(sc_queries) / sizeof(sc_queries[0]), out);
 }
 
 int cbm_store_graph_topology_digest(cbm_store_t *s, const char *project,
                                     unsigned char out[CBM_SHA256_DIGEST_LEN]) {
+    cbm_store_note_local_graph_read(s, "graph digest");
     return sc_digest(s, project, "cbm.graph.topology.v1", sc_topology_queries,
                      sizeof(sc_topology_queries) / sizeof(sc_topology_queries[0]), out);
 }

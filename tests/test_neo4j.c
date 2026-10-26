@@ -332,6 +332,235 @@ TEST(neo4j_store_remote_routing) {
     PASS();
 }
 
+/* ── Routed lookups keep the local predicates exactly ────────────── */
+
+typedef struct {
+    int search_calls;
+    int last_limit;
+    int last_offset;
+    char last_name_hint[64];
+    uint64_t queries;
+} fake2_t;
+
+static fake2_t g_fake2;
+
+static void fake2_node(cbm_node_t *n, int64_t id, const char *name, const char *qn,
+                       const char *file) {
+    memset(n, 0, sizeof(*n));
+    n->id = id;
+    n->project = fake_dup("p");
+    n->label = fake_dup("Function");
+    n->name = fake_dup(name);
+    n->qualified_name = fake_dup(qn);
+    n->file_path = fake_dup(file);
+    n->properties_json = fake_dup("{}");
+}
+
+static int fake2_find_nodes(void *ctx, cbm_remote_node_query_t kind, const char *project,
+                            const char *arg, cbm_node_t **out, int *count) {
+    g_fake2.queries++;
+    /* Deliberately broad candidate sets: store.c must apply the exact
+     * SQLite predicate to them. */
+    cbm_node_t *n = calloc(4, sizeof(cbm_node_t));
+    if (kind == CBM_REMOTE_NODES_QN_ENDS_CI) {
+        fake2_node(&n[0], 1, "Foo", "p.a.Foo", "a.c");      /* ".foo", any case: kept */
+        fake2_node(&n[1], 2, "xfoo", "p.a.xfoo", "a.c");    /* no '.' before: dropped */
+        fake2_node(&n[2], 3, "foo", "foo", "a.c");          /* exact QN: kept */
+        fake2_node(&n[3], 4, "bar", "p.b.foo.bar", "a.c"); /* not a suffix: dropped */
+        *count = 4;
+    } else if (kind == CBM_REMOTE_NODES_QN_CONTAINS_CI) {
+        fake2_node(&n[0], 1, "run", "p.a.run(int)", "a.c");       /* base p.a.run: kept */
+        fake2_node(&n[1], 2, "run", "p.a.run", "a.c");            /* unsuffixed: dropped */
+        fake2_node(&n[2], 3, "runner", "p.a.runner(int)", "a.c"); /* other base: dropped */
+        *count = 3;
+    } else {
+        *count = 0;
+    }
+    *out = n;
+    return CBM_STORE_OK;
+}
+
+static int fake2_search(void *ctx, const cbm_remote_search_t *q, cbm_search_result_t **out,
+                        int *count, int *total) {
+    g_fake2.queries++;
+    g_fake2.search_calls++;
+    g_fake2.last_limit = q->limit;
+    g_fake2.last_offset = q->offset;
+    snprintf(g_fake2.last_name_hint, sizeof(g_fake2.last_name_hint), "%s",
+             q->name_contains_ci && q->name_contains_ci[0] ? q->name_contains_ci[0] : "");
+    /* Candidates in (name, id) order, as the backend returns them. */
+    static const char *const names[] = {"Alpha", "alphabet", "Beta", "gamma_alpha"};
+    static const char *const files[] = {"src/x.c", "lib/y.c", "src/z.c", "src/w.c"};
+    cbm_search_result_t *rows = calloc(4, sizeof(cbm_search_result_t));
+    for (int i = 0; i < 4; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "p.%s", names[i]);
+        fake2_node(&rows[i].node, i + 1, names[i], qn, files[i]);
+        rows[i].in_degree = i;
+        rows[i].out_degree = 1;
+    }
+    *out = rows;
+    *count = 4;
+    *total = 99; /* what the backend counted when it paged itself */
+    return CBM_STORE_OK;
+}
+
+static uint64_t fake2_queries(void *ctx) {
+    return g_fake2.queries;
+}
+
+static const cbm_store_remote_ops_t k_fake2_ops = {
+    .close = fake_close,
+    .error = fake_error,
+    .find_nodes = fake2_find_nodes,
+    .search = fake2_search,
+    .queries = fake2_queries,
+};
+
+static int search_names(cbm_store_t *s, const char *name_pattern, const char *file_pattern,
+                        int limit, int offset, char *buf, size_t sz, int *total) {
+    cbm_search_params_t p = {.project = "p",
+                             .name_pattern = name_pattern,
+                             .file_pattern = file_pattern,
+                             .min_degree = -1,
+                             .max_degree = -1,
+                             .limit = limit,
+                             .offset = offset};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &p, &out);
+    buf[0] = '\0';
+    size_t off = 0;
+    for (int i = 0; rc == CBM_STORE_OK && i < out.count && off < sz; i++) {
+        off += (size_t)snprintf(buf + off, sz - off, "%s,", out.results[i].node.name);
+    }
+    *total = out.total;
+    cbm_store_search_free(&out);
+    return rc;
+}
+
+TEST(neo4j_routed_lookups_apply_local_predicates) {
+    memset(&g_fake, 0, sizeof(g_fake));
+    memset(&g_fake2, 0, sizeof(g_fake2));
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_attach_remote(s, &k_fake2_ops, &g_fake);
+
+    /* QN suffix: SQLite's  qn LIKE '%.foo' (ASCII any case) OR qn = 'foo'. */
+    cbm_node_t *nodes = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "p", "foo", &nodes, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "p.a.Foo");
+    ASSERT_STR_EQ(nodes[1].qualified_name, "foo");
+    cbm_store_free_nodes(nodes, n);
+
+    /* QN base: only callable-suffixed QNs whose base is exactly p.a.run. */
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "p", "p.a.run", false, &nodes, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "p.a.run(int)");
+    cbm_store_free_nodes(nodes, n);
+
+    /* search: the regex (cbm, POSIX ERE, unanchored, any case) and the file
+     * glob run locally over the candidates; total and paging follow them. */
+    char names[128];
+    int total = 0;
+    ASSERT_EQ(search_names(s, "^alpha", "src/*", 10, 0, names, sizeof(names), &total),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(names, "Alpha,");
+    ASSERT_EQ(total, 1);
+    ASSERT_EQ(g_fake2.last_limit, -1); /* local filters: every candidate, unpaged */
+    ASSERT_STR_EQ(g_fake2.last_name_hint, "alpha");
+    ASSERT_EQ(search_names(s, "alpha", NULL, 1, 1, names, sizeof(names), &total), CBM_STORE_OK);
+    ASSERT_STR_EQ(names, "alphabet,");
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(search_names(s, "(", NULL, 10, 0, names, sizeof(names), &total), CBM_STORE_ERR);
+    ASSERT_NOT_NULL(strstr(cbm_store_error(s), "invalid regex"));
+
+    /* No pattern: the backend pages and counts itself. */
+    ASSERT_EQ(search_names(s, NULL, NULL, 2, 5, names, sizeof(names), &total), CBM_STORE_OK);
+    ASSERT_EQ(g_fake2.last_limit, 2);
+    ASSERT_EQ(g_fake2.last_offset, 5);
+    ASSERT_EQ(total, 99);
+
+    /* Backend usage: remote queries since the reset, plus local graph reads. */
+    cbm_store_backend_usage_t usage;
+    cbm_store_backend_usage(s, &usage);
+    ASSERT_EQ((int)usage.remote_queries, (int)g_fake2.queries);
+    ASSERT_EQ(usage.local_reads, 0);
+    cbm_store_backend_usage_reset(s);
+    cbm_store_note_local_graph_read(s, "architecture");
+    cbm_store_note_local_graph_read(s, "text search");
+    cbm_store_note_local_graph_read(s, "architecture");
+    cbm_store_backend_usage(s, &usage);
+    ASSERT_EQ((int)usage.remote_queries, 0);
+    ASSERT_EQ(usage.local_reads, 3);
+    ASSERT_STR_EQ(usage.local_what, "architecture, text search");
+    cbm_store_close(s);
+
+    /* Without a remote the marks are no-ops. */
+    s = cbm_store_open_memory();
+    cbm_store_note_local_graph_read(s, "architecture");
+    cbm_store_backend_usage(s, &usage);
+    ASSERT_EQ(usage.local_reads, 0);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(neo4j_marker_found_for_renamed_database) {
+    clear_neo4j_env();
+    char *dir = th_mktempdir("cbm_n4_rename");
+    ASSERT_NOT_NULL(dir);
+    char canonical[512];
+    char renamed[512];
+    snprintf(canonical, sizeof(canonical), "%s/proj.db", dir);
+    snprintf(renamed, sizeof(renamed), "%s/dummy.db", dir);
+    char found[600];
+    ASSERT_EQ(cbm_neo4j_sidecar_locate(renamed, "proj", found, sizeof(found)), 1);
+    cbm_neo4j_config_t c;
+    char err[256];
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://side:7474", "u", "p", NULL, &c, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_neo4j_sidecar_write(canonical, &c, "u1g1"), 0);
+    /* The database was found under another name; its marker by project name. */
+    ASSERT_EQ(cbm_neo4j_sidecar_locate(renamed, "proj", found, sizeof(found)), 0);
+    ASSERT_STR_EQ(found, canonical);
+    ASSERT_EQ(cbm_neo4j_sidecar_locate(canonical, "proj", found, sizeof(found)), 0);
+    ASSERT_STR_EQ(found, canonical);
+    ASSERT_EQ(cbm_neo4j_sidecar_locate(renamed, "other", found, sizeof(found)), 1);
+    th_rmtree(dir);
+    PASS();
+}
+
+TEST(neo4j_served_by_is_named_in_replies) {
+    ASSERT_STR_EQ(cbm_mcp_graph_served_by(3, 0), "neo4j");
+    ASSERT_STR_EQ(cbm_mcp_graph_served_by(3, 1), "neo4j+local");
+    ASSERT_STR_EQ(cbm_mcp_graph_served_by(0, 2), "local");
+    ASSERT_NULL(cbm_mcp_graph_served_by(0, 0));
+
+    char *reply = cbm_mcp_result_add_graph_served(cbm_mcp_text_result("{\"rows\":1}", false), 4, 1,
+                                                  "text search");
+    yyjson_doc *d = yyjson_read(reply, strlen(reply), 0);
+    yyjson_val *root = yyjson_doc_get_root(d);
+    const char *notice =
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get(yyjson_obj_get(root, "content"), 1), "text"));
+    ASSERT_NOT_NULL(notice);
+    ASSERT_NOT_NULL(strstr(notice, "neo4j+local"));
+    ASSERT_NOT_NULL(strstr(notice, "text search"));
+    yyjson_val *gb = yyjson_obj_get(yyjson_obj_get(root, "structuredContent"), "graph_backend");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "served_by")), "neo4j+local");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "status")), "serving");
+    ASSERT_EQ((int)yyjson_get_int(yyjson_obj_get(gb, "remote_queries")), 4);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "local")), "text search");
+    yyjson_doc_free(d);
+    free(reply);
+
+    /* A tool that read no graph data is left untouched. */
+    char *plain = cbm_mcp_text_result("ok", false);
+    char *same = cbm_mcp_result_add_graph_served(plain, 0, 0, NULL);
+    ASSERT_TRUE(same == plain);
+    free(same);
+    PASS();
+}
+
 TEST(neo4j_native_query_is_read_only) {
     static const char *const writes[] = {
         "MATCH (n) DETACH DELETE n",  "create (n:X)",
@@ -499,6 +728,92 @@ static int bfs_signature(cbm_store_t *s, int64_t start, const char *dir, bool mu
     return CBM_STORE_OK;
 }
 
+/* One string describing what each newly routed read returns, so the local
+ * and the Neo4j answer for the same database can be compared verbatim. */
+static void routed_signature(cbm_store_t *s, int64_t b, char *buf, size_t sz) {
+    size_t off = 0;
+#define SIG(...)                                                                                   \
+    do {                                                                                           \
+        if (off < sz) {                                                                            \
+            off += (size_t)snprintf(buf + off, sz - off, __VA_ARGS__);                             \
+        }                                                                                          \
+    } while (0)
+    cbm_search_params_t p = {.project = "live",
+                             .name_pattern = "^[ab]",
+                             .min_degree = -1,
+                             .max_degree = -1,
+                             .limit = 10};
+    cbm_search_output_t so = {0};
+    SIG("search rc=%d:", cbm_store_search(s, &p, &so));
+    for (int i = 0; i < so.count; i++) {
+        SIG("%s/%d/%d,", so.results[i].node.name, so.results[i].in_degree,
+            so.results[i].out_degree);
+    }
+    SIG(" total=%d", so.total);
+    cbm_store_search_free(&so);
+    cbm_search_params_t p2 = {
+        .project = "live", .min_degree = 1, .max_degree = -1, .limit = 2, .offset = 1};
+    SIG(" | page rc=%d:", cbm_store_search(s, &p2, &so));
+    for (int i = 0; i < so.count; i++) {
+        SIG("%s,", so.results[i].node.name);
+    }
+    SIG(" total=%d", so.total);
+    cbm_store_search_free(&so);
+
+    cbm_schema_info_t sch = {0};
+    SIG(" | schema rc=%d:", cbm_store_get_schema(s, "live", &sch));
+    for (int i = 0; i < sch.node_label_count; i++) {
+        SIG("%s=%d[", sch.node_labels[i].label, sch.node_labels[i].count);
+        for (int k = 0; k < sch.node_labels[i].property_count; k++) {
+            SIG("%s ", sch.node_labels[i].properties[k]);
+        }
+        SIG("]");
+    }
+    for (int i = 0; i < sch.edge_type_count; i++) {
+        SIG("%s=%d[", sch.edge_types[i].type, sch.edge_types[i].count);
+        for (int k = 0; k < sch.edge_types[i].property_count; k++) {
+            SIG("%s ", sch.edge_types[i].properties[k]);
+        }
+        SIG("]");
+    }
+    cbm_store_schema_free(&sch);
+
+    cbm_node_t *nodes = NULL;
+    int n = 0;
+    SIG(" | qn_suffix rc=%d:", cbm_store_find_nodes_by_qn_suffix(s, "live", "B", &nodes, &n));
+    for (int i = 0; i < n; i++) {
+        SIG("%s,", nodes[i].qualified_name);
+    }
+    cbm_store_free_nodes(nodes, n);
+
+    char **files = NULL;
+    int nf = 0;
+    SIG(" | files rc=%d:", cbm_store_list_files(s, "live", &files, &nf));
+    for (int i = 0; i < nf; i++) {
+        SIG("%s,", files[i]);
+        free(files[i]);
+    }
+    free(files);
+
+    char **callers = NULL;
+    char **callees = NULL;
+    int nc = 0;
+    int ne = 0;
+    SIG(" | neighbors rc=%d:",
+        cbm_store_node_neighbor_names(s, b, 10, &callers, &nc, &callees, &ne));
+    for (int i = 0; i < nc; i++) {
+        SIG("<%s", callers[i]);
+        free(callers[i]);
+    }
+    for (int i = 0; i < ne; i++) {
+        SIG(">%s", callees[i]);
+        free(callees[i]);
+    }
+    free(callers);
+    free(callees);
+#undef SIG
+}
+
 /* The live test needs a real Neo4j server, so the suite registers it only
  * when one is configured (see SUITE below) -- never a silent skip. */
 static bool live_neo4j_configured(void) {
@@ -558,7 +873,40 @@ TEST(neo4j_live_sync_and_read) {
     ASSERT_EQ(n.id, b);
     ASSERT_NOT_NULL(strstr(n.properties_json, "complexity"));
     cbm_node_free_fields(&n);
+
+    /* Every newly routed read: identical answers from Neo4j and from the
+     * local index of the same generation. */
+    cbm_store_t *local = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(local);
+    static char local_sig[4096];
+    static char remote_sig[4096];
+    routed_signature(local, b, local_sig, sizeof(local_sig));
+    cbm_store_backend_usage_reset(s);
+    routed_signature(s, b, remote_sig, sizeof(remote_sig));
+    ASSERT_STR_EQ(remote_sig, local_sig);
+    cbm_store_backend_usage_t usage;
+    cbm_store_backend_usage(s, &usage);
+    ASSERT_TRUE(usage.remote_queries >= 7); /* every read went to Neo4j */
+    ASSERT_EQ(usage.local_reads, 0);
+    cbm_store_close(local);
     cbm_store_close(s);
+
+    /* A rejected login is not retried right away (Neo4j counts each one
+     * toward its lockout); the right password is unaffected. */
+    cbm_neo4j_config_t bad = cfg;
+    snprintf(bad.password, sizeof(bad.password), "definitely-wrong");
+    cbm_neo4j_t *badc = cbm_neo4j_connect(&bad, err, sizeof(err));
+    ASSERT_NOT_NULL(badc);
+    ASSERT_EQ(cbm_neo4j_ping(badc), -1);
+    ASSERT_NULL(strstr(cbm_neo4j_error(badc), "not retrying"));
+    ASSERT_EQ(cbm_neo4j_ping(badc), -1);
+    ASSERT_NOT_NULL(strstr(cbm_neo4j_error(badc), "not retrying"));
+    cbm_neo4j_close(badc);
+    cbm_neo4j_t *goodc = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(goodc);
+    ASSERT_EQ(cbm_neo4j_ping(goodc), 0);
+    cbm_neo4j_close(goodc);
+    cbm_neo4j_test_reset_auth_backoff();
 
     /* Native Cypher sees flattened scalar properties and binds $project. */
     cbm_cypher_result_t r;
@@ -605,6 +953,9 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_rejects_malformed_2xx_bodies);
     RUN_TEST(neo4j_sidecar_records_last_sync_error);
     RUN_TEST(neo4j_fallback_is_visible_in_tool_replies);
+    RUN_TEST(neo4j_routed_lookups_apply_local_predicates);
+    RUN_TEST(neo4j_marker_found_for_renamed_database);
+    RUN_TEST(neo4j_served_by_is_named_in_replies);
     if (live_neo4j_configured()) {
         RUN_TEST(neo4j_live_sync_and_read);
     } else {

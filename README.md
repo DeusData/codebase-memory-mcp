@@ -460,13 +460,32 @@ codebase-memory-mcp cli index_repository --repo-path /path/to/repo \
 - **Credentials**: flags win; otherwise `NEO4J_USER` (or `NEO4J_USERNAME`), `NEO4J_PASSWORD` and `NEO4J_DATABASE` are used, defaulting to user `neo4j` and database `neo4j`. Indexing fails fast, before any work starts, when Neo4j is unreachable or rejects the login.
 - **Password handling**: the password is never written to disk and is never put on the index worker's command line. The daemon that ran the index keeps it in memory for later reads. After a daemon restart, reads need `NEO4J_PASSWORD` in the environment of the MCP server (or of whichever session starts the daemon); see the note under Environment Variables.
 - **What lives where**: indexing still builds the local SQLite index, which serves incremental re-indexing, coverage, ADRs, full-text and semantic search. After every successful publish (a full index, an incremental update, or the watcher's auto-refresh), the graph is mirrored into Neo4j. The marker `<cache>/<project>.db.graph.json` (URL, user and database, no password) keeps later re-indexes syncing to the same target with no flags.
-- **Reads**: the graph primitives come from Neo4j. These are node lookups by id, qualified name, name, label and file, edge lookups, degrees, node/edge counts, and every BFS (shortest-path, multi-seed, and the trail expansion behind variable-length Cypher). That covers `query_graph`, `trace_path`, and the lookups inside `get_code_snippet`, `index_status` and `detect_changes`. Some reads still use the local copy, which holds exactly the same generation: QN-suffix and overload matching, `search_graph` (filters, BM25, semantic), `get_graph_schema`, `get_architecture`, the impact walk, and the UI.
-- **Consistency**: each sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. If Neo4j is down, rejects the login, or holds an older generation (a failed sync), reads fall back to the identical local copy. `index_status` reports `graph_backend.status` as `serving` or as `sqlite_fallback` with the reason.
+- **Reads**: graph data comes from Neo4j in every tool:
+  - Node lookups by id, qualified name, QN suffix, overload base, name, label and file.
+  - Edge lookups, degrees, caller and callee names, node and edge counts, the indexed file list, and label, type and property schema.
+  - Every BFS: shortest-path, multi-seed, and the trail expansion behind variable-length Cypher.
+  - `search_graph`'s structured search (name/QN regex, label, file glob, degree, relationship and entry-point filters). Neo4j narrows the candidates, and the same regex and glob code as the local search applies the exact filter, so results are identical.
+
+  That covers `search_graph`, `query_graph`, `trace_path`, `get_code_snippet`, `get_graph_schema`, `search_code`, `index_status` and most of `detect_changes`. A few reads have no Neo4j equivalent and use the local copy, which holds exactly the same generation:
+  - BM25 text ranking (`search_graph` `query=`) and `semantic_query`
+  - `get_architecture`'s aggregates
+  - the impact walk in `detect_changes`
+  - file outlines and the UI
+- **Which backend answered**: every reply for a Neo4j-backed project names its source in the text and in `structuredContent.graph_backend`:
+  - `served_by: neo4j`: all graph data came from Neo4j.
+  - `neo4j+local`: the reply also lists what came from the local copy.
+  - `local`
+  - `sqlite_fallback`: with the reason.
+
+  The daemon log (`<cache>/logs/cbm-daemon.log`) records the same per call (`graph.backend tool=… served_by=… remote_queries=N`). With `CBM_LOG_LEVEL=debug` it also logs each Cypher round trip (`neo4j.query`).
+- **Consistency**: each sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. If Neo4j is down, rejects the login, or holds an older generation (a failed sync), reads fall back to the identical local copy and the reply says so. `index_status` reports `graph_backend.status` as `serving` or as `sqlite_fallback` with the reason, plus `in_sync` and `last_sync_error` for background syncs.
+- **Login safety**: an indexed project first uses the login it was last synced with, then `NEO4J_PASSWORD`. After Neo4j rejects a login, the same credentials are not retried for 60 s, because every rejected attempt counts toward Neo4j's lockout, which would then refuse the correct password too.
+- **Renamed databases**: a project's database found under another file name still uses Neo4j. Its marker is also looked up by project name.
 - **Native Cypher**: `query_graph` with `native: true` runs the query in Neo4j itself (read-only; write clauses and `CALL` are refused), with `$project`, `$db` and `$gen` bound:
   ```cypher
   MATCH (f:Function {db:$db, gen:$gen})-[:CALLS]->(g) RETURN f.name, count(g) AS fan_out ORDER BY fan_out DESC LIMIT 10
   ```
-- **Model**: nodes are `(:CbmNode:<Label> {db, gen, project, id, label, name, qualified_name, file_path, start_line, end_line, properties_json, ...top-level scalar properties})`, and edges are `[:<TYPE> {id, type, properties_json, ...}]`.
+- **Model**: nodes are `(:CbmNode:<Label> {db, gen, project, id, label, name, qualified_name, file_path, start_line, end_line, properties_json, prop_keys, ...top-level scalar properties})`, and edges are `[:<TYPE> {id, type, properties_json, prop_keys, ...}]`. `prop_keys` lists every top-level property key, for `get_graph_schema`. `(:CbmProject).sync_format` versions this layout; a graph uploaded in an older layout is re-uploaded on the next index run.
 - **Turning it off**: `--graph-db sqlite` returns the project to local-only reads and leaves the Neo4j data in place. `delete_project` removes the project's graph from Neo4j as well.
 
 ## How It Works

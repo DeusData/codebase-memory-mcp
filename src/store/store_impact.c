@@ -679,6 +679,7 @@ static int impact_open(cbm_store_t *s, cbm_store_read_scope_t *scope,
 
 int cbm_impact_walk_open(cbm_store_t *s, const cbm_impact_policy_t *policy,
                          cbm_impact_walk_t **out) {
+    cbm_store_note_local_graph_read(s, "impact walk");
     return impact_open(s, NULL, policy, out);
 }
 

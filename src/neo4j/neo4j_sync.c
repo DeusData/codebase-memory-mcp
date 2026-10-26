@@ -21,10 +21,16 @@
 
 /* Columns written explicitly; a flattened property never overwrites them. */
 static const char *const k_reserved_node_keys[] = {
-    "db",         "gen",      "project",         "id",
-    "label",      "name",     "qualified_name",  "file_path",
-    "start_line", "end_line", "properties_json", NULL};
-static const char *const k_reserved_edge_keys[] = {"id", "type", "properties_json", NULL};
+    "db",         "gen",      "project",         "id",        "label",
+    "name",       "qualified_name", "file_path", "start_line", "end_line",
+    "properties_json", "prop_keys", NULL};
+static const char *const k_reserved_edge_keys[] = {"id", "type", "properties_json", "prop_keys",
+                                                   NULL};
+
+/* Layout version of a synced graph (CbmProject.sync_format). Bump when the
+ * stored shape changes; an older graph is re-uploaded on the next sync even
+ * if the SQLite generation is unchanged. 2: prop_keys on nodes and edges. */
+#define N4_SYNC_FORMAT 2
 
 static void sync_err(char *err, size_t err_sz, const char *what, const char *detail) {
     if (err && err_sz) {
@@ -72,6 +78,43 @@ int cbm_neo4j_sidecar_read(const char *db_path, cbm_neo4j_config_t *cfg, char *s
     }
     free(buf);
     return rc == 0 ? 0 : -1;
+}
+
+int cbm_neo4j_sidecar_locate(const char *db_path, const char *project, char *out,
+                             size_t out_sz) {
+    char path[4096];
+    if (cbm_neo4j_sidecar_path(db_path, path, sizeof(path)) == 0) {
+        FILE *f = cbm_fopen(path, "rb");
+        if (f) {
+            (void)fclose(f);
+            (void)snprintf(out, out_sz, "%s", db_path);
+            return 0;
+        }
+    }
+    if (!project || !project[0]) {
+        return 1;
+    }
+    /* The database was found under another file name (the #704 internal-name
+     * scan): its marker still carries the project's canonical name. */
+    size_t dir_len = 0;
+    for (const char *p = db_path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            dir_len = (size_t)(p - db_path) + 1;
+        }
+    }
+    char canonical[4096];
+    int n = snprintf(canonical, sizeof(canonical), "%.*s%s.db", (int)dir_len, db_path, project);
+    if (n <= 0 || (size_t)n >= sizeof(canonical) ||
+        cbm_neo4j_sidecar_path(canonical, path, sizeof(path)) != 0) {
+        return 1;
+    }
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return 1;
+    }
+    (void)fclose(f);
+    (void)snprintf(out, out_sz, "%s", canonical);
+    return 0;
 }
 
 int cbm_neo4j_sidecar_field(const char *db_path, const char *key, char *out, size_t out_sz) {
@@ -223,9 +266,12 @@ static bool key_reserved(const char *k, const char *const *reserved) {
 
 /* Copy top-level scalar members of properties_json into obj. Arrays of
  * scalars are kept too (Neo4j stores homogeneous lists); nested objects stay
- * only inside properties_json. */
+ * only inside properties_json. prop_keys lists every top-level key -- the
+ * set SQLite's json_each reports for get_graph_schema -- flattened or not. */
 static void flatten_props(yyjson_mut_doc *d, yyjson_mut_val *obj, const char *json,
                           const char *const *reserved) {
+    yyjson_mut_val *prop_keys = yyjson_mut_arr(d);
+    yyjson_mut_obj_add_val(d, obj, "prop_keys", prop_keys);
     if (!json || !*json || strcmp(json, "{}") == 0) {
         return;
     }
@@ -241,6 +287,9 @@ static void flatten_props(yyjson_mut_doc *d, yyjson_mut_val *obj, const char *js
     yyjson_val *v;
     yyjson_obj_foreach(root, idx, max, k, v) {
         const char *key = yyjson_get_str(k);
+        if (key) {
+            yyjson_mut_arr_add_strcpy(d, prop_keys, key);
+        }
         if (!key || key_reserved(key, reserved)) {
             continue;
         }
@@ -521,7 +570,8 @@ int cbm_neo4j_sync_db(cbm_neo4j_t *c, const char *db_path, const char *project,
         cbm_neo4j_batch_add(&b, "MATCH (p:CbmProject {name: $db}) SET p.gen = $gen, "
                                 "p.generation = $generation, p.root_path = $root, "
                                 "p.indexed_at = $indexed_at, p.node_count = $nodes, "
-                                "p.edge_count = $edges");
+                                "p.edge_count = $edges, p.sync_format = $format");
+    yyjson_mut_obj_add_int(b.doc, params, "format", N4_SYNC_FORMAT);
     yyjson_mut_obj_add_strcpy(b.doc, params, "db", project);
     yyjson_mut_obj_add_int(b.doc, params, "gen", new_gen);
     yyjson_mut_obj_add_strcpy(b.doc, params, "generation", generation);
@@ -565,16 +615,20 @@ fail:
 }
 
 /* The SQLite generation Neo4j currently publishes for project ("" when the
- * project is absent). 0, or -1 on a transport/Cypher failure. */
+ * project is absent, or was synced in an older layout and must be re-sent).
+ * 0, or -1 on a transport/Cypher failure. */
 static int remote_generation(cbm_neo4j_t *c, const char *project, char *out, size_t out_sz) {
     out[0] = '\0';
     cbm_neo4j_result_t r;
-    if (run_simple(c, "MATCH (p:CbmProject {name: $db}) RETURN p.generation", project, 0, &r) !=
-        0) {
+    if (run_simple(c,
+                   "MATCH (p:CbmProject {name: $db}) RETURN p.generation, coalesce(p.sync_format, 1)",
+                   project, 0, &r) != 0) {
         return -1;
     }
-    yyjson_val *v = cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0)), 0);
-    (void)snprintf(out, out_sz, "%s", yyjson_is_str(v) ? yyjson_get_str(v) : "");
+    yyjson_val *row = yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0));
+    yyjson_val *v = cbm_neo4j_row_col(row, 0);
+    bool current_format = cbm_neo4j_val_int(cbm_neo4j_row_col(row, 1), 1) >= N4_SYNC_FORMAT;
+    (void)snprintf(out, out_sz, "%s", current_format && yyjson_is_str(v) ? yyjson_get_str(v) : "");
     cbm_neo4j_result_free(&r);
     return 0;
 }
