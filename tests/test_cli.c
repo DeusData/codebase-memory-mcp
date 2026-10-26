@@ -4245,6 +4245,212 @@ TEST(cli_find_cli_fallback_paths) {
     PASS();
 }
 
+/* ── #221 regression: PATH longer than the old 4 KB copy ───────────────── */
+
+/* Snapshot/restore one environment variable. The suite swaps PATH and the
+ * Windows profile roots, and a leaked swap would poison every later suite. */
+static char *cli_issue221_save_env(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void cli_issue221_restore_env(const char *name, char *saved) {
+    if (saved) {
+        cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv(name);
+    }
+}
+
+/*
+ * cli_find_cli_long_path_beyond_four_kb_issue221
+ *
+ * find_in_path() used to copy PATH into a fixed 4096-byte stack buffer through
+ * cbm_safe_getenv(). That helper does not truncate -- it REFUSES a value it
+ * cannot fit -- so on a machine whose PATH exceeds 4096 characters the whole
+ * PATH was skipped and every agent on it read as "not installed". That is the
+ * layout the #221 reporter had: mise, npm and scoop each append entries.
+ *
+ * The fixture directory is the LAST PATH entry, so any truncation of the copy
+ * hides exactly the directory under test and nothing else. This case is not
+ * Windows-specific -- the same 4 KB cap hid entries on macOS and Linux.
+ *
+ * RED before the fix (empty result), GREEN after it.
+ */
+TEST(cli_find_cli_long_path_beyond_four_kb_issue221) {
+    const char *created = th_mktempdir("repro221long");
+    if (!created) {
+        FAIL("th_mktempdir failed");
+    }
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s", created);
+
+#ifdef _WIN32
+    const char *fixture_name = "cbm-repro221-long.cmd";
+    const char *fixture_body = "@echo off\r\nrem fake long-PATH agent\r\n";
+    const char path_delim = ';';
+#else
+    const char *fixture_name = "cbm-repro221-long";
+    const char *fixture_body = "#!/bin/sh\n# fake long-PATH agent\n";
+    const char path_delim = ':';
+#endif
+
+    char fixture_path[1024];
+    snprintf(fixture_path, sizeof(fixture_path), "%s/%s", tmpdir, fixture_name);
+    if (th_write_file(fixture_path, fixture_body) != 0) {
+        th_cleanup(tmpdir);
+        FAIL("could not write the long-PATH fixture");
+    }
+    th_make_executable(fixture_path);
+
+    /*
+     * Filler entries name directories that do not exist: the scan has to walk
+     * past every one of them to reach the fixture, which is appended after the
+     * filler so that it always sits beyond the 4096-byte mark.
+     */
+    enum { FILLER_TARGET = 4600, PATH_CAP = FILLER_TARGET + 1024 };
+    char long_path[PATH_CAP];
+    size_t used = 0U;
+    while (used < (size_t)FILLER_TARGET) {
+        int written = snprintf(long_path + used, sizeof(long_path) - used,
+                               "/nonexistent-repro221-filler%05zu%c", used, path_delim);
+        if (written <= 0 || (size_t)written >= sizeof(long_path) - used) {
+            th_cleanup(tmpdir);
+            FAIL("could not build the long PATH filler");
+        }
+        used += (size_t)written;
+    }
+    ASSERT_GT(used, 4096);
+    int tail = snprintf(long_path + used, sizeof(long_path) - used, "%s", tmpdir);
+    if (tail <= 0 || (size_t)tail >= sizeof(long_path) - used) {
+        th_cleanup(tmpdir);
+        FAIL("could not append the fixture directory to the long PATH");
+    }
+
+    char *saved_path = cli_issue221_save_env("PATH");
+    cbm_setenv("PATH", long_path, 1);
+
+    /* A home that does not exist keeps the PATH-independent fallbacks out of
+     * the way: the fixture's directory is the only place that can satisfy it. */
+    const char *result = cbm_find_cli("cbm-repro221-long", "/nonexistent-repro221-home");
+
+    cli_issue221_restore_env("PATH", saved_path);
+
+    ASSERT_NOT_NULL(result);
+    ASSERT(result[0] != '\0');
+    ASSERT(strncmp(result, tmpdir, strlen(tmpdir)) == 0);
+    ASSERT(strstr(result, "cbm-repro221-long") != NULL);
+
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+/* ── #221 regression: the Windows fallback shim locations ───────────────── */
+
+/*
+ * cli_find_cli_windows_fallback_shims_issue221
+ *
+ * An agent the PATH scan cannot see must still be found where Windows actually
+ * puts CLIs: %APPDATA%\npm (npm's global bin), %LOCALAPPDATA%\mise\shims,
+ * %USERPROFILE%\scoop\shims, plus the pipx and cargo homes (~\.local\bin,
+ * ~\.cargo\bin) that were already probed before #221 passed and must not be
+ * dropped by the fix.
+ *
+ * Each location is reached through its own seam -- APPDATA / LOCALAPPDATA, or
+ * the home_dir argument -- so this never reads the developer's real profile.
+ * Every shim carries a .cmd extension, which is why the fallback probe needs
+ * the same PATHEXT treatment the PATH scan got.
+ *
+ * Windows-only: the directory layout it asserts is the one Windows installers
+ * produce. */
+TEST(cli_find_cli_windows_fallback_shims_issue221) {
+#ifndef _WIN32
+    SKIP_PLATFORM("Windows-only: npm/mise/scoop shim fallback layout");
+#else
+    const char *created = th_mktempdir("repro221fb");
+    if (!created) {
+        FAIL("th_mktempdir failed");
+    }
+    char root[512];
+    snprintf(root, sizeof(root), "%s", created);
+
+    char *saved_appdata = cli_issue221_save_env("APPDATA");
+    char *saved_localappdata = cli_issue221_save_env("LOCALAPPDATA");
+    char *saved_userprofile = cli_issue221_save_env("USERPROFILE");
+    char *saved_path = cli_issue221_save_env("PATH");
+
+    /* APPDATA/LOCALAPPDATA/USERPROFILE all point at the fixture root. The
+     * scoop, pipx and cargo entries are built from the home_dir ARGUMENT, so
+     * USERPROFILE here mirrors what a real profile would supply. */
+    cbm_setenv("APPDATA", root, 1);
+    cbm_setenv("LOCALAPPDATA", root, 1);
+    cbm_setenv("USERPROFILE", root, 1);
+    cbm_setenv("PATH", "/nonexistent-repro221-path", 1);
+
+    /* One shim at a time, so the returned path proves which entry matched
+     * rather than merely that something did. Each case removes its shim before
+     * the next one runs, so the earlier entries cannot shadow the later ones. */
+    const struct {
+        const char *subdir;
+        const char *label;
+    } cases[] = {
+        {".local/bin", "pipx home"},         {".cargo/bin", "cargo home"},  {"npm", "APPDATA npm"},
+        {"mise/shims", "LOCALAPPDATA mise"}, {"scoop/shims", "scoop home"},
+    };
+    const char *shim_name = "cbm-repro221-fb.cmd";
+    const size_t case_count = sizeof(cases) / sizeof(cases[0]);
+
+    for (size_t i = 0; i < case_count; i++) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s/%s", root, cases[i].subdir);
+        if (th_mkdir_p(dir) != 0) {
+            cli_issue221_restore_env("PATH", saved_path);
+            cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+            cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+            cli_issue221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("could not create the fallback fixture directory");
+        }
+        char shim[1024];
+        snprintf(shim, sizeof(shim), "%s/%s", dir, shim_name);
+        if (th_write_file(shim, "@echo off\r\nrem fake fallback shim\r\n") != 0) {
+            cli_issue221_restore_env("PATH", saved_path);
+            cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+            cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+            cli_issue221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("could not write the fallback shim");
+        }
+
+        const char *result = cbm_find_cli("cbm-repro221-fb", root);
+        char expected_prefix[512];
+        snprintf(expected_prefix, sizeof(expected_prefix), "%s/%s/", root, cases[i].subdir);
+        bool matched = result != NULL && result[0] != '\0' &&
+                       strncmp(result, expected_prefix, strlen(expected_prefix)) == 0;
+        (void)remove(shim);
+
+        if (!matched) {
+            printf("  fallback case %zu (%s) did not resolve in %s\n", i, cases[i].label, dir);
+            cli_issue221_restore_env("PATH", saved_path);
+            cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+            cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+            cli_issue221_restore_env("APPDATA", saved_appdata);
+            th_cleanup(root);
+            FAIL("a Windows fallback shim location was not probed");
+        }
+    }
+
+    cli_issue221_restore_env("PATH", saved_path);
+    cli_issue221_restore_env("USERPROFILE", saved_userprofile);
+    cli_issue221_restore_env("LOCALAPPDATA", saved_localappdata);
+    cli_issue221_restore_env("APPDATA", saved_appdata);
+
+    th_cleanup(root);
+    PASS();
+#endif
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Dry-run flag parsing (port of TestDryRun)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -12197,6 +12403,89 @@ TEST(cli_codex_session_hook_issue330) {
     PASS();
 }
 
+/* The block installs up to v0.12 wrote: the lifecycle pair only, inside the
+ * markers. Upgrades and uninstalls must still recognize it as ours. */
+static const char test_codex_previous_hook_block[] =
+    "# >>> codebase-memory-mcp SessionStart >>>\n"
+    "[[hooks.SessionStart]]\n"
+    "matcher = \"startup|resume|clear|compact\"\n\n"
+    "[[hooks.SessionStart.hooks]]\n"
+    "type = \"command\"\ncommand = \"codebase-memory-mcp hook-augment\"\n"
+    "command_windows = \"codebase-memory-mcp hook-augment\"\ntimeout = 5\n\n"
+    "[[hooks.SubagentStart]]\nmatcher = \"*\"\n\n"
+    "[[hooks.SubagentStart.hooks]]\n"
+    "type = \"command\"\ncommand = \"codebase-memory-mcp hook-augment\"\n"
+    "command_windows = \"codebase-memory-mcp hook-augment\"\ntimeout = 5\n"
+    "# <<< codebase-memory-mcp SessionStart <<<\n";
+
+/* Codex shell searches get graph context in flow: the managed block adds a
+ * PreToolUse Bash hook, upgrades the previous block in place, removes either
+ * generation, keeps a user's own inline hooks.PreToolUse (TOML cannot mix an
+ * inline array with array-of-tables entries for one key), and replaces the
+ * inline form Codex may normalize ours to. */
+TEST(cli_codex_pretooluse_hook_lifecycle) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexpre-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+
+    /* fresh install: one PreToolUse Bash hook running hook-augment, idempotent */
+    write_test_file(cfg, "[mcp_servers.other]\ncommand = \"x\"\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]\nmatcher = \"Bash\""), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse.hooks]]"), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.PreToolUse"));
+    ASSERT_NOT_NULL(strstr(d, "[mcp_servers.other]"));
+
+    /* upgrade: the previous block is replaced, never refused as ambiguous */
+    char previous[2048];
+    snprintf(previous, sizeof(previous), "[mcp_servers.other]\ncommand = \"x\"\n\n%s",
+             test_codex_previous_hook_block);
+    write_test_file(cfg, previous);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]"), 1U);
+
+    /* uninstall of the previous generation */
+    write_test_file(cfg, previous);
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.SessionStart"));
+    ASSERT_NULL(strstr(d, "hook-augment"));
+
+    /* a user's own inline PreToolUse stays, and our block leaves PreToolUse out */
+    const char *foreign = "[hooks]\nPreToolUse = [{ matcher = \"Bash\", hooks = [{ type = "
+                          "\"command\", command = \"/usr/local/bin/audit-shell\" }] }]\n";
+    write_test_file(cfg, foreign);
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(strstr(d, "audit-shell"));
+    ASSERT_NULL(strstr(d, "[[hooks.PreToolUse]]"));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.SessionStart]]"), 1U);
+
+    /* Codex's inline form of our own PreToolUse is replaced, not duplicated */
+    write_test_file(cfg, "[hooks]\nPreToolUse = [{ matcher = \"Bash\", hooks = [{ type = "
+                         "\"command\", command = \"codebase-memory-mcp hook-augment\", "
+                         "command_windows = \"codebase-memory-mcp hook-augment\", "
+                         "timeout = 5 }] }]\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "PreToolUse = ["));
+    ASSERT_EQ(test_count_substring(d, "[[hooks.PreToolUse]]"), 1U);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* Gemini/Antigravity SessionStart reminder parity (settings.json JSON path). */
 TEST(cli_gemini_session_hook_parity) {
     char tmpdir[256];
@@ -13221,7 +13510,8 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     bool lifecycle_ok = first_rc == 0 && repeat_rc == 0 && dry_rc == 0 && first && repeated &&
                         after_dry && strcmp(first, repeated) == 0 && strcmp(first, after_dry) == 0;
     bool migrated = migration_rc == 0 && toml && !strstr(toml, "SessionStart") && hooks &&
-                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart");
+                    strstr(hooks, "SessionStart") && strstr(hooks, "SubagentStart") &&
+                    strstr(hooks, "PreToolUse");
     free(first);
     free(repeated);
     free(after_dry);
@@ -13577,6 +13867,47 @@ TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter) {
 
     if (!reached)
         FAIL("PreToolUse Bash must reach graph search augmentation");
+    PASS();
+}
+
+/* Codex sends PreToolUse for its shell tool as tool_name "Bash" with a string
+ * tool_input.command, plus its own fields (turn_id, model, permission_mode,
+ * tool_use_id, a null transcript_path). The default dialect must augment it. */
+TEST(cli_hook_augment_codex_pretooluse_payload) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *input = "{\"session_id\":\"0199a1b2-codex\",\"turn_id\":\"turn-1\","
+                        "\"transcript_path\":null,\"cwd\":\"/tmp/hookproj\","
+                        "\"hook_event_name\":\"PreToolUse\",\"model\":\"gpt-5.6\","
+                        "\"permission_mode\":\"default\",\"tool_name\":\"Bash\","
+                        "\"tool_input\":{\"command\":\"rg -n someIndexedSymbol .\"},"
+                        "\"tool_use_id\":\"call_1\"}";
+    char *output = cbm_hook_augment_process(srv, input);
+    bool reached = output && strstr(output, "\"hookEventName\":\"PreToolUse\"") &&
+                   strstr(output, "additionalContext") && strstr(output, "someIndexedSymbol");
+    free(output);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    if (!reached)
+        FAIL("a Codex-shaped PreToolUse Bash payload must reach graph search augmentation");
     PASS();
 }
 
@@ -18307,6 +18638,8 @@ SUITE(cli) {
     RUN_TEST(cli_find_cli_result_is_thread_local);
     RUN_TEST(cli_find_cli_on_path);
     RUN_TEST(cli_find_cli_fallback_paths);
+    RUN_TEST(cli_find_cli_long_path_beyond_four_kb_issue221);
+    RUN_TEST(cli_find_cli_windows_fallback_shims_issue221);
 
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
@@ -18500,6 +18833,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_metadata_rejects_truncated_utf8_without_oob);
     RUN_TEST(cli_aider_config_loads_installed_conventions);
     RUN_TEST(cli_codex_session_hook_issue330);
+    RUN_TEST(cli_codex_pretooluse_hook_lifecycle);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);
     RUN_TEST(cli_claude_hook_mutation_converges_mixed_owned_duplicates);
@@ -18525,6 +18859,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_context_names_graph_follow_ups);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
+    RUN_TEST(cli_hook_augment_codex_pretooluse_payload);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);

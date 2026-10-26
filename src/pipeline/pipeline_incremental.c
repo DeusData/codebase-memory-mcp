@@ -426,8 +426,12 @@ static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,
     if (depth >= MANIFEST_WALK_MAX_DEPTH)
         return 0;
     cbm_dir_t *dir = cbm_opendir(abs_dir);
-    if (!dir)
-        return CBM_NOT_FOUND;
+    if (!dir) {
+        /* A nested directory we can't open has no control files to
+         * contribute; skip it like discover.c's walk_dir already does.
+         * The root call (depth 0) still fails closed. */
+        return depth == 0 ? CBM_NOT_FOUND : 0;
+    }
     int rc = 0;
     cbm_dirent_t *entry;
     while (rc == 0 && (entry = cbm_readdir(dir)) != NULL) {

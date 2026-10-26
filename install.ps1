@@ -277,8 +277,20 @@ try {
 
 # Validate the zip namespace before extraction. Windows paths are
 # case-insensitive, so two entries that differ only in case are ambiguous and
-# must never be allowed to overwrite each other. The official five entries are
+# must never be allowed to overwrite each other. The official four entries are
 # required at the archive root with their exact release names.
+#
+# Two failure classes are reported differently (both still exit 1; nothing is
+# relaxed). An unsafe entry path or a duplicate/case-conflicting entry is a
+# hostile archive shape. A well-formed archive whose root file SET differs from
+# $WindowsArchiveNames already passed checksum verification above, so it is
+# the published artifact for $BaseUrl -- the usual cause is this script being
+# newer or older than that release (e.g. install.ps1 run from main ahead of
+# the latest release, #1218). Calling that "unsafe" sends the user hunting for
+# tampering that is not there. Every entry is screened for the hostile class
+# BEFORE any layout verdict, so a bad path can never hide behind a layout
+# message just because an unexpected entry happened to come first.
+$LayoutMismatch = $false
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead("$TmpDir\$Archive")
@@ -286,6 +298,7 @@ try {
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
         $archiveCounts = @{}
         foreach ($archiveName in $WindowsArchiveNames) { $archiveCounts[$archiveName] = 0 }
+        $layoutProblem = $null
         foreach ($entry in $zip.Entries) {
             $entryName = $entry.FullName.Replace('\', '/')
             $isDirectory = $entryName.EndsWith('/')
@@ -304,10 +317,16 @@ try {
                 throw "duplicate or case-conflicting zip entry: $($entry.FullName)"
             }
             if (-not ($WindowsArchiveNames -ccontains $entryName) -or $isDirectory) {
-                throw "archive contains an unexpected root entry: $($entry.FullName)"
+                if ($null -eq $layoutProblem) {
+                    $layoutProblem = "archive contains an unexpected root entry: $($entry.FullName)"
+                }
+                continue
             }
             $archiveCounts[$entryName] = $archiveCounts[$entryName] + 1
         }
+        # Every entry passed the hostile-shape checks; only now judge the layout.
+        $LayoutMismatch = $true
+        if ($null -ne $layoutProblem) { throw $layoutProblem }
         foreach ($archiveName in $WindowsArchiveNames) {
             if ($archiveCounts[$archiveName] -ne 1) {
                 throw "archive must contain exactly one $archiveName"
@@ -316,11 +335,21 @@ try {
         if ($seen.Count -ne $WindowsArchiveNames.Count) {
             throw "archive does not match the exact Windows release allowlist"
         }
+        $LayoutMismatch = $false
     } finally {
         $zip.Dispose()
     }
 } catch {
-    Write-Host "error: unsafe or incomplete release archive: $_" -ForegroundColor Red
+    if ($LayoutMismatch) {
+        Write-Host "error: release archive layout does not match this installer: $_" -ForegroundColor Red
+        Write-Host "  The archive matched the checksum published with it at $BaseUrl, so it is"
+        Write-Host "  the genuine release artifact, built for a different installer version."
+        Write-Host "  This installer expects: $($WindowsArchiveNames -join ', ')"
+        Write-Host "  Fix: run the install.ps1 shipped inside that same release archive, or"
+        Write-Host "  re-run this script after the next release is published."
+    } else {
+        Write-Host "error: unsafe release archive: $_" -ForegroundColor Red
+    }
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     exit 1
 }
