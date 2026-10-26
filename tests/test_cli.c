@@ -9227,7 +9227,8 @@ TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
  * produces a file the client cannot even parse (the prelude redeclares the
  * user's own import and const names, and both sides declare a default export).
  * The installer must leave that file alone, and the dry run must say so instead
- * of promising a write it will not make. */
+ * of promising a write it will not make. A dry run never writes, so the byte
+ * check below follows a REAL install: that is the run that appended. */
 TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
     char home[256];
     char bin[320];
@@ -9260,6 +9261,7 @@ TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
         redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
     }
     long plan_output_start = -1;
+    long plan_output_end = -1;
     char *plan = NULL;
     if (redirected) {
         (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, true);
@@ -9269,6 +9271,10 @@ TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
          * nothing: stdout carries the receipt JSON. */
         plan_output_start = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
         plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+        fflush(stdout);
+        /* The real install, the run #2204 is about. */
+        plan_output_end = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
+        (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, false);
         fflush(stdout);
         (void)dup2(saved_stdout, STDOUT_FILENO);
     }
@@ -9296,11 +9302,22 @@ TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
         fclose(capture);
     }
 
-    bool warned = strstr(output, "cbm-augment.ts") != NULL && strstr(output, "not ours") != NULL;
+    /* Each phase owns its slice of stdout: [0, start) dry run, [start, end)
+     * plan mode, [end, len) real install, so no phase passes on another's
+     * line. Checked back to front, cutting the buffer at each boundary. */
+    bool sliced = plan_output_start >= 0 && plan_output_end >= plan_output_start &&
+                  (size_t)plan_output_end <= strlen(output);
+    bool reported =
+        sliced && strstr(output + plan_output_end, "cbm-augment.ts left untouched") != NULL;
+    if (sliced)
+        output[plan_output_end] = '\0';
+    bool plan_silent = sliced && strstr(output + plan_output_start, "cbm-augment.ts") == NULL;
+    if (sliced)
+        output[plan_output_start] = '\0';
+    bool warned =
+        sliced && strstr(output, "cbm-augment.ts") != NULL && strstr(output, "not ours") != NULL;
     bool untouched = got == sizeof(foreign) - 1U && memcmp(bytes, foreign, got) == 0;
     bool plan_omits = plan && strstr(plan, "cbm-augment.ts") == NULL;
-    bool plan_silent = plan_output_start >= 0 && (size_t)plan_output_start <= strlen(output) &&
-                       strstr(output + plan_output_start, "cbm-augment.ts") == NULL;
     bool control_lists = control_plan && strstr(control_plan, "cbm-augment.ts") != NULL;
     free(plan);
     free(control_plan);
@@ -9308,10 +9325,14 @@ TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
     test_rmdir_r(home);
     if (!redirected)
         FAIL("stdout capture failed");
+    if (!sliced)
+        FAIL("stdout capture lost a phase boundary");
     if (!warned)
         FAIL("dry-run must predict an untouched user-owned OpenCode module (#2204)");
     if (!untouched)
-        FAIL("the user-owned OpenCode module must not be modified (#2204)");
+        FAIL("a real install must leave the user-owned OpenCode module byte-identical (#2204)");
+    if (!reported)
+        FAIL("a real install must report the user-owned OpenCode module as left untouched (#2204)");
     if (!plan_omits)
         FAIL("the install plan must not list a module the run leaves untouched (#2204)");
     if (!plan_silent)
