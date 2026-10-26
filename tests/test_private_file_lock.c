@@ -166,7 +166,10 @@ static void private_lock_fixture_finish(private_lock_fixture_t *fixture) {
                                         "lock-attempt-cleanup.lock",
                                         "acl-directory.lock",
                                         "acl-file.lock",
-                                        "fork.lock"};
+                                        "fork.lock",
+                                        "touch.lock",
+                                        "touch-rename.lock",
+                                        "touch-renamed.lock"};
     if (fixture->root[0]) {
         for (size_t index = 0; index < sizeof(files) / sizeof(files[0]); index++) {
             if (!private_lock_path(path, fixture, files[index])) {
@@ -476,6 +479,107 @@ TEST(private_file_lock_consumed_close_error_never_retries_recycled_fd) {
     ASSERT_TRUE(terminally_cleared);
     ASSERT_TRUE(descriptor_reused);
     ASSERT_TRUE(replacement_alive);
+    PASS();
+#endif
+}
+
+/* #2178: macOS tmp_cleaner unlinks /tmp files whose atime, mtime and ctime are
+ * all older than three days, including empty lock files a daemon holds for its
+ * whole life. The next participant then creates and locks a fresh inode, so
+ * the old lock coordinates nothing. Touch must keep a held file young and
+ * report the loss once the path stops naming it. */
+TEST(private_file_lock_touch_refreshes_held_file_and_detects_unlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("age-based temp cleaning and unlink-while-held are POSIX behaviors");
+#else
+    private_lock_fixture_t fixture;
+    bool started = private_lock_fixture_start(&fixture);
+    char path[PRIVATE_LOCK_TEST_PATH_CAP];
+    bool path_ok = started && private_lock_path(path, &fixture, "touch.lock");
+    cbm_private_file_lock_t *held = NULL;
+    cbm_private_file_lock_t *successor = NULL;
+    cbm_private_file_lock_status_t acquired =
+        path_ok ? cbm_private_file_lock_try_acquire(fixture.directory, "touch.lock",
+                                                    CBM_PRIVATE_FILE_LOCK_EX, &held)
+                : CBM_PRIVATE_FILE_LOCK_IO;
+    const time_t stale = 1000000000;
+    struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+    bool aged = acquired == CBM_PRIVATE_FILE_LOCK_OK &&
+                futimens(cbm_private_file_lock_native_fd_for_test(held), stale_times) == 0;
+    cbm_private_file_lock_status_t linked_touch =
+        aged ? cbm_private_file_lock_touch(held) : CBM_PRIVATE_FILE_LOCK_IO;
+    struct stat refreshed = {0};
+    bool refreshed_ok = linked_touch == CBM_PRIVATE_FILE_LOCK_OK && stat(path, &refreshed) == 0;
+
+    bool unlinked = refreshed_ok && unlink(path) == 0;
+    cbm_private_file_lock_status_t unlinked_touch =
+        unlinked ? cbm_private_file_lock_touch(held) : CBM_PRIVATE_FILE_LOCK_IO;
+    /* The hazard itself: with the path gone, a peer's EX succeeds while the
+     * original holder still believes it is exclusive. */
+    cbm_private_file_lock_status_t successor_status =
+        unlinked ? cbm_private_file_lock_try_acquire(fixture.directory, "touch.lock",
+                                                     CBM_PRIVATE_FILE_LOCK_EX, &successor)
+                 : CBM_PRIVATE_FILE_LOCK_IO;
+    if (successor) {
+        (void)cbm_private_file_lock_release(&successor);
+    }
+    if (held) {
+        (void)cbm_private_file_lock_release(&held);
+    }
+    private_lock_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(acquired, CBM_PRIVATE_FILE_LOCK_OK);
+    ASSERT_TRUE(aged);
+    ASSERT_EQ(linked_touch, CBM_PRIVATE_FILE_LOCK_OK);
+    ASSERT_TRUE(refreshed_ok);
+    ASSERT_TRUE(refreshed.st_atime > stale);
+    ASSERT_TRUE(refreshed.st_mtime > stale);
+    ASSERT_TRUE(unlinked);
+    ASSERT_EQ(unlinked_touch, CBM_PRIVATE_FILE_LOCK_UNSAFE);
+    ASSERT_EQ(successor_status, CBM_PRIVATE_FILE_LOCK_OK);
+    PASS();
+#endif
+}
+
+/* A rename-away keeps the held inode linked (st_nlink stays 1) while the
+ * canonical path no longer names it, so a peer would create and lock a fresh
+ * file there. Touch must compare the path with the handle, not just count
+ * links. */
+TEST(private_file_lock_touch_detects_rename_away) {
+#ifdef _WIN32
+    SKIP_PLATFORM("renaming a held lock file away is POSIX behavior");
+#else
+    private_lock_fixture_t fixture;
+    bool started = private_lock_fixture_start(&fixture);
+    char path[PRIVATE_LOCK_TEST_PATH_CAP];
+    char moved[PRIVATE_LOCK_TEST_PATH_CAP];
+    bool paths_ok = started && private_lock_path(path, &fixture, "touch-rename.lock") &&
+                    private_lock_path(moved, &fixture, "touch-renamed.lock");
+    cbm_private_file_lock_t *held = NULL;
+    cbm_private_file_lock_status_t acquired =
+        paths_ok ? cbm_private_file_lock_try_acquire(fixture.directory, "touch-rename.lock",
+                                                     CBM_PRIVATE_FILE_LOCK_EX, &held)
+                 : CBM_PRIVATE_FILE_LOCK_IO;
+    cbm_private_file_lock_status_t intact_touch = acquired == CBM_PRIVATE_FILE_LOCK_OK
+                                                      ? cbm_private_file_lock_touch(held)
+                                                      : CBM_PRIVATE_FILE_LOCK_IO;
+    bool renamed = intact_touch == CBM_PRIVATE_FILE_LOCK_OK && rename(path, moved) == 0;
+    struct stat moved_status = {0};
+    bool still_linked = renamed && stat(moved, &moved_status) == 0 && moved_status.st_nlink == 1;
+    cbm_private_file_lock_status_t renamed_touch =
+        renamed ? cbm_private_file_lock_touch(held) : CBM_PRIVATE_FILE_LOCK_IO;
+    if (held) {
+        (void)cbm_private_file_lock_release(&held);
+    }
+    private_lock_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(acquired, CBM_PRIVATE_FILE_LOCK_OK);
+    ASSERT_EQ(intact_touch, CBM_PRIVATE_FILE_LOCK_OK);
+    ASSERT_TRUE(renamed);
+    ASSERT_TRUE(still_linked);
+    ASSERT_EQ(renamed_touch, CBM_PRIVATE_FILE_LOCK_UNSAFE);
     PASS();
 #endif
 }
@@ -863,6 +967,8 @@ SUITE(private_file_lock) {
     RUN_TEST(private_file_lock_unlock_failure_retains_retryable_lock);
     RUN_TEST(private_file_lock_close_failure_retries_without_duplicate_unlock);
     RUN_TEST(private_file_lock_consumed_close_error_never_retries_recycled_fd);
+    RUN_TEST(private_file_lock_touch_refreshes_held_file_and_detects_unlink);
+    RUN_TEST(private_file_lock_touch_detects_rename_away);
     RUN_TEST(private_file_lock_post_acquire_failure_returns_cleanup_owner);
     RUN_TEST(private_file_lock_windows_lock_attempt_failure_returns_cleanup_owner);
     RUN_TEST(private_file_lock_rejects_unsafe_entries_and_replaced_root);
