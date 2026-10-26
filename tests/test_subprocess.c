@@ -1407,6 +1407,20 @@ TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop) {
 #endif
 }
 
+TEST(subprocess_fd_close_cap_is_bounded_for_fork_children) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX descriptor sweep cap; Windows uses a handle allow-list");
+#else
+    long cap = cbm_posix_fd_close_cap();
+    /* The cap bounds a close() sweep in the fork child. A non-positive or
+     * oversized value would either skip the sweep (leaking inherited
+     * descriptors into the exec'd daemon) or make the int loop wrap. */
+    ASSERT_TRUE(cap > STDERR_FILENO);
+    ASSERT_TRUE(cap <= 1048576L);
+    PASS();
+#endif
+}
+
 TEST(subprocess_root_exit_drains_surviving_descendant) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group descendant probe; native Windows coverage pending");
@@ -2658,6 +2672,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
     RUN_TEST(subprocess_child_close_fds_uses_one_syscall_not_rlimit_loop);
+    RUN_TEST(subprocess_fd_close_cap_is_bounded_for_fork_children);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
     RUN_TEST(subprocess_strip_git_repo_env_is_per_child);
     RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
