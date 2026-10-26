@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "haskell",
+      "camelcase": "Haskell",
+      "scope": "source.haskell",
+      "path": ".",
+      "file-types": ["hs", "hs-boot"]
+    }
+  ],
+  "metadata": {
+    "version": "0.23.1-cbm.1",
+    "license": "MIT",
+    "description": "cbm fork of tree-sitter-haskell @ 7fa19f1 (escaped char literal fix, #2439)"
+  }
+}
