@@ -23,6 +23,7 @@
 #include <mimalloc.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -538,6 +539,20 @@ static void write_diagnostics(void) {
      * macOS/Windows, and peak is reconciled to never undercut current. */
     current_rss = cbm_mem_rss();
     peak_rss = cbm_mem_peak_rss();
+    /* The committed pair has the same failure: the counter is signed and
+     * merged per thread at thread exit, so a thread-per-connection daemon
+     * reads it negative once short-lived threads have freed what a long-lived
+     * one committed (query-leak soak, Linux 2026-09-14: heap_committed_bytes
+     * printed 2^64 - 121 MB from the second sample on). cbm_mem_allocator_
+     * committed reports 0 for a negative reading; the peak never undercuts
+     * the current value and never carries a wrapped one. */
+    current_commit = cbm_mem_allocator_committed();
+    if (peak_commit > (SIZE_MAX >> 1)) {
+        peak_commit = 0;
+    }
+    if (peak_commit < current_commit) {
+        peak_commit = current_commit;
+    }
 
     int fds = count_open_fds();
     time_t now = time(NULL);

@@ -12,12 +12,14 @@
  */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "discover/discover.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/win_utf8.h"
@@ -25,13 +27,15 @@
 
 #include <yyjson/yyjson.h>
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
-/* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
+/* Read an entire file into a core-owned buffer (class extract; release with
+ * cbm_free(CBM_MEM_CLASS_EXTRACT, ...)). Returns NULL on failure. */
 static char *pkgmap_read_file(const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
     if (!f) {
@@ -44,7 +48,7 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
         (void)fclose(f);
         return NULL;
     }
-    char *buf = (char *)malloc((size_t)size + SKIP_ONE);
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)size + SKIP_ONE);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -440,9 +444,12 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     }
 }
 
-/* Extract PSR-4 autoload entries from composer.json root. */
-static void extract_psr4(yyjson_val *root, const char *dir, cbm_pkg_entries_t *entries) {
-    yyjson_val *autoload = yyjson_obj_get(root, "autoload");
+/* Extract PSR-4 entries from one composer.json autoload section ("autoload"
+ * or "autoload-dev": composer registers both, so test namespaces such as
+ * Tests\ map to their directory as well). */
+static void extract_psr4(yyjson_val *root, const char *section, const char *dir,
+                         cbm_pkg_entries_t *entries) {
+    yyjson_val *autoload = yyjson_obj_get(root, section);
     if (!yyjson_is_obj(autoload)) {
         return;
     }
@@ -459,6 +466,12 @@ static void extract_psr4(yyjson_val *root, const char *dir, cbm_pkg_entries_t *e
         }
         const char *ns_prefix = yyjson_get_str(key);
         const char *ns_dir = yyjson_get_str(val);
+        while (ns_dir[0] == '.' && ns_dir[SKIP_ONE] == '/') {
+            ns_dir += PAIR_LEN; /* "./src/" names src/ */
+        }
+        if (strcmp(ns_dir, ".") == 0) {
+            ns_dir = ""; /* "." names the manifest's own directory */
+        }
         char ns_entry[PKGMAP_PATH_BUF];
         if (dir[0]) {
             snprintf(ns_entry, sizeof(ns_entry), "%s/%s", dir, ns_dir);
@@ -497,7 +510,8 @@ static void parse_composer_json(const char *source, int source_len, const char *
         }
     }
 
-    extract_psr4(root, dir, entries);
+    extract_psr4(root, "autoload", dir, entries);
+    extract_psr4(root, "autoload-dev", dir, entries);
 
     free(dir);
     yyjson_doc_free(doc);
@@ -987,6 +1001,12 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 
 /* ── Merge: per-worker entries → hash table ────────────────────── */
 
+/* A composer.json `autoload.psr-4` key: a namespace prefix ending in '\\'. */
+static bool pkgmap_is_psr4_prefix(const char *pkg_name) {
+    size_t n = pkg_name ? strlen(pkg_name) : 0;
+    return n > 0 && pkg_name[n - SKIP_ONE] == '\\';
+}
+
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name) {
     /* Count total entries */
@@ -1004,8 +1024,14 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     for (int w = 0; w < worker_count; w++) {
         cbm_pkg_entries_t *we = &worker_entries[w];
         for (int i = 0; i < we->count; i++) {
-            /* Convert entry_rel to QN: project.dir.parts */
-            char *qn = cbm_pipeline_fqn_module(project_name, we->items[i].entry_rel);
+            /* Convert entry_rel to QN: project.dir.parts. A PSR-4 namespace
+             * prefix (key ends in '\\') keeps its repo-relative DIRECTORY
+             * instead: its readers map `Prefix\Sub\Class` onto a file path
+             * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
+            const char *entry_rel = we->items[i].entry_rel;
+            char *qn = pkgmap_is_psr4_prefix(we->items[i].pkg_name)
+                           ? cbm_strndup(entry_rel, strlen(entry_rel))
+                           : cbm_pipeline_fqn_module(project_name, entry_rel);
             if (!qn) {
                 continue;
             }
@@ -1179,7 +1205,7 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
             parsed++;
         }
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
     cbm_closedir(dir);
     return parsed;
@@ -1225,7 +1251,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
@@ -1260,7 +1286,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
 
     int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
@@ -1355,7 +1381,8 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
 }
 
 /* Try backslash-based prefix matching (PHP PSR-4: App\\Controllers\\Foo).
- * Returns heap QN or NULL. */
+ * The map value of a PSR-4 prefix is its repo-relative directory (see
+ * cbm_pkgmap_build). Returns heap QN or NULL. */
 static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path,
                                       const char *project_name) {
     char *buf = strdup(module_path);
@@ -1375,7 +1402,8 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
         }
         const char *subpath = module_path + (size_t)(bs - buf) + SKIP_ONE;
         char path_result[PKGMAP_PATH_BUF];
-        snprintf(path_result, sizeof(path_result), "%s/%s", base_dir, subpath);
+        snprintf(path_result, sizeof(path_result), "%s%s%s", base_dir, base_dir[0] ? "/" : "",
+                 subpath);
         for (char *c = path_result; *c; c++) {
             if (*c == '\\') {
                 *c = '/';
@@ -1543,6 +1571,239 @@ static bool import_targetable_label(const char *label) {
     return false;
 }
 
+/* #2127: a Python import path spells the module chain that owns the imported
+ * name (`from unittest.mock import patch` -> unittest, mock). Strategy 3 matches
+ * the leaf name alone, so an EXTERNAL import (stdlib / third party: no project
+ * module, Strategy 1 misses) bound to any same-named project definition -- a
+ * REST view's `patch` handler became the target of every mock.patch call at
+ * import_map confidence. For such an external import, accept a symbol hit only
+ * when the module segments preceding `name` in the import path occur, in
+ * order, among the hit's enclosing QN segments -- a src/ layout or sys.path
+ * root the module resolver missed (`from template_tests.utils import setup` ->
+ * proj.tests.template_tests.utils.setup) still qualifies. Relative prefixes
+ * (leading dots) carry no segment and are skipped. Imports of project modules
+ * are never judged by it (they may re-export from anywhere). Python only. */
+enum { PY_IMPORT_MAX_SEGS = 64 };
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn) {
+    if (!module_path || !name || !hit_qn) {
+        return true;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s", module_path);
+    char *as = strstr(path, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    const char *p = path;
+    while (*p == '.') {
+        p++;
+    }
+    /* Segments of the import path; name_at = index of the LAST `name`. */
+    const char *segs[PY_IMPORT_MAX_SEGS];
+    size_t lens[PY_IMPORT_MAX_SEGS];
+    int nseg = 0;
+    int name_at = -1;
+    size_t name_len = strlen(name);
+    while (*p && nseg < PY_IMPORT_MAX_SEGS) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len == name_len && strncmp(p, name, len) == 0) {
+            name_at = nseg;
+        }
+        segs[nseg] = p;
+        lens[nseg] = len;
+        nseg++;
+        if (!dot) {
+            break;
+        }
+        p = dot + SKIP_ONE;
+    }
+    if (name_at <= 0) {
+        return true; /* no module chain before the name: nothing to check */
+    }
+    /* Ordered-subsequence match against the hit's enclosing segments (every
+     * segment before the hit's own leaf). */
+    const char *leaf = strrchr(hit_qn, '.');
+    const char *q = hit_qn;
+    int want = 0;
+    while (want < name_at && leaf && q < leaf) {
+        const char *dot = strchr(q, '.');
+        size_t len = (size_t)(dot - q);
+        if (len == lens[want] && strncmp(q, segs[want], len) == 0) {
+            want++;
+        }
+        q = dot + SKIP_ONE;
+    }
+    return want == name_at;
+}
+
+/* #2127, call side: an imported name binds the file's identifier to that
+ * import for the whole module, exactly like a parameter binds it for a body.
+ * When the import could not be materialized (external module) the resolver
+ * falls through to project-wide short-name strategies and binds `patch(...)`
+ * (or `mock.patch(...)`) to whatever project definition shares the leaf. True
+ * when the callee's root identifier is bound by this file's Python imports and
+ * EVERY such binding's module chain (`unittest.mock` for `from unittest.mock
+ * import patch`; the callee's own dotted path for a root `import a.b`) is
+ * absent from `resolved_qn`'s enclosing segments AND the binding is external
+ * (no IMPORTS edge materialized it: the module is not in the project). An
+ * internal binding is never judged here -- a project module can re-export a
+ * name from anywhere -- and a chain consistent with the target (src/ layout)
+ * keeps the edge. `gbuf` NULL means "no IMPORTS edges" (all external). */
+static bool python_import_local_materialized(const cbm_gbuf_t *gbuf, const char *project_name,
+                                             const char *rel_path, const char *local_name) {
+    if (!gbuf || !rel_path) {
+        return false;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
+    safe_free(file_qn);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                         &edge_count) != 0) {
+        return false;
+    }
+    char needle[CBM_SZ_256];
+    snprintf(needle, sizeof(needle), "\"local_name\":\"%s\"", local_name);
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i]->properties_json && strstr(edges[i]->properties_json, needle)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path) {
+    if (!imports || imports->count <= 0 || !callee_name || !callee_name[0] || !resolved_qn ||
+        !resolved_qn[0]) {
+        return false;
+    }
+    const char *root_end = strchr(callee_name, '.');
+    size_t root_len = root_end ? (size_t)(root_end - callee_name) : strlen(callee_name);
+    bool bound = false;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || !imp->module_path || strlen(imp->local_name) != root_len ||
+            strncmp(imp->local_name, callee_name, root_len) != 0) {
+            continue;
+        }
+        char full[1024];
+        snprintf(full, sizeof(full), "%s", imp->module_path);
+        char *as = strstr(full, " as ");
+        if (as) {
+            *as = '\0';
+        }
+        const char *path_leaf_seg = strrchr(full, '.');
+        bool from_import = path_leaf_seg && strcmp(path_leaf_seg + SKIP_ONE, imp->local_name) == 0;
+        if (!as && !from_import && strncmp(full, callee_name, root_len) == 0 &&
+            (full[root_len] == '.' || full[root_len] == '\0')) {
+            /* `import a.b` binds the ROOT package `a`: the callee already
+             * spells its own full dotted path (`a.b.f()`). */
+            snprintf(full, sizeof(full), "%s", callee_name);
+        } else if (!as && !path_leaf_seg && full[0] != '.' && strcmp(full, imp->local_name) != 0) {
+            /* `import m as y` (the extractor stores module_path `m`, local
+             * `y`; a from-import always spells a dotted path): `y` IS module
+             * `m`, so `y.T` spells `m.T`. */
+            snprintf(full, sizeof(full), "%s%s", imp->module_path, callee_name + root_len);
+        }
+        /* Otherwise (`from m import x [as y]`) only the import's own module
+         * chain is evidence: members reached THROUGH x (`x.objects.create`)
+         * may live on any type, so they are not compared. */
+        const char *leaf = strrchr(full, '.');
+        leaf = leaf ? leaf + SKIP_ONE : full;
+        if (cbm_python_import_path_matches_qn(full, leaf, resolved_qn) ||
+            python_import_local_materialized(gbuf, project_name, rel_path, imp->local_name)) {
+            return false; /* consistent with the target, or a project import */
+        }
+        bound = true;
+    }
+    return bound;
+}
+
+/* Base-class twin of the #2127 call gate. `class SimpleTestCase(
+ * unittest.TestCase)` under `import unittest` names the STDLIB base; the
+ * registry's same-module suffix fallback (`unittest.TestCase` -> module's
+ * `TestCase`) or a short-name strategy bound it to a same-named PROJECT class
+ * (django: an inheritance cycle SimpleTestCase -> TestCase ->
+ * TransactionTestCase -> SimpleTestCase, plus fabricated OVERRIDEs). An
+ * external import binding (never materialized as an IMPORTS edge) whose
+ * module chain the target does not spell can never be that target, whatever
+ * the registry strategy. Exact metadata import maps remain valid when the
+ * target spells the imported module chain. Every base resolver (sequential
+ * + parallel semantic, cross-LSP pxc) calls this ONE
+ * gate so the venues cannot diverge. Python only. */
+bool cbm_python_external_base_contradicts(CBMLanguage lang, const CBMImportArray *imports,
+                                          const char *base_spelling, const char *base_qn,
+                                          const cbm_gbuf_t *gbuf, const char *project_name,
+                                          const char *rel_path) {
+    return lang == CBM_LANG_PYTHON &&
+           cbm_python_import_binding_contradicts(imports, base_spelling, base_qn, gbuf,
+                                                 project_name, rel_path);
+}
+
+/* #2127: whether a Python import's module lives in this project. Relative
+ * imports always do; otherwise the module part (the path minus the imported
+ * name) must resolve to a graph node. Strategy 1 has already failed on the
+ * full path when this is asked. */
+static bool python_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                            const char *module_path) {
+    if (!module_path || module_path[0] == '.') {
+        return true;
+    }
+    char part[1024];
+    snprintf(part, sizeof(part), "%s", module_path);
+    char *as = strstr(part, " as ");
+    if (as) {
+        *as = '\0';
+    }
+    char *dot = strrchr(part, '.');
+    if (!dot) {
+        return false; /* `import x`: Strategy 1 already missed x itself */
+    }
+    *dot = '\0';
+    char *qn = cbm_pipeline_resolve_module(ctx, source_rel, part);
+    bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
+    safe_free(qn);
+    return found;
+}
+
+/* `import a.b` / `import a` (as opposed to `from a import b`): every segment
+ * names a module. The extractor binds the ROOT (`a`) for a dotted plain
+ * import and the leaf for a from-import; a dot-less path is always a plain
+ * import. An aliased form is ambiguous and reads as a from-import. */
+static bool python_is_plain_module_import(const CBMImport *imp) {
+    const char *p = imp->module_path;
+    if (!p || p[0] == '.' || strstr(p, " as ")) {
+        return false;
+    }
+    const char *first_dot = strchr(p, '.');
+    if (!first_dot) {
+        return true;
+    }
+    const char *leaf = strrchr(p, '.') + SKIP_ONE;
+    size_t root_len = (size_t)(first_dot - p);
+    return imp->local_name && strlen(imp->local_name) == root_len &&
+           strncmp(imp->local_name, p, root_len) == 0 && strcmp(leaf, imp->local_name) != 0;
+}
+
+/* #2127: Strategy 3 hit filter for an EXTERNAL Python import. The hit must
+ * spell the import's module chain (a src/ layout the module resolver missed
+ * still does), and whatever names a module -- an enclosing path segment, or
+ * any segment of a plain `import x` -- can only be a Module/File node (`import
+ * copy` must not fall back to a project method called `copy`). */
+static bool python_external_hit_rejected(const CBMImport *imp, const char *name,
+                                         bool enclosing_segment, const cbm_gbuf_node_t *hit) {
+    if (!cbm_python_import_path_matches_qn(imp->module_path, name, hit->qualified_name)) {
+        return true;
+    }
+    bool names_module = enclosing_segment || python_is_plain_module_import(imp);
+    return names_module && strcmp(hit->label, "Module") != 0 && strcmp(hit->label, "File") != 0;
+}
+
 /* #1934: whether the name-guess import fallbacks — Strategy 1b (sibling file,
  * whose label filter admits symbols) and Strategy 3 (symbol name) — may run
  * for imports from this language. A Go import path names a package — never a
@@ -1558,6 +1819,38 @@ bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
     return lang != CBM_LANG_GO;
 }
 
+/* A Python def or class declared inside a function body -- a closure, a
+ * decorator's `wrapper`, a test's local class -- is a local of that function:
+ * no import can name it. Its QN extends a Function/Method node's
+ * (proj.tests.mock_inputs.inner.wrapper.mock_getpass.getpass), which is how it
+ * is recognised; the symbol-name fallback bound `import getpass` to exactly
+ * that def. Only an enclosing def of the SAME file counts: a package
+ * __init__.py function can share a submodule's QN (poetry: layouts/__init__.py
+ * `def layout` vs layouts/layout.py `class Layout`). Mirrors
+ * cbm_registry_add_lang_in_module, which keeps the same symbols out of the call
+ * resolver's short-name index. */
+static bool import_candidate_is_python_local(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *cand) {
+    const char *qn = cand->qualified_name;
+    const char *slash = cand->file_path ? strrchr(cand->file_path, '/') : NULL;
+    char scope[CBM_SZ_512];
+    size_t len = qn ? strlen(qn) : 0;
+    if (!cand->file_path || len == 0 || len >= sizeof(scope) ||
+        cbm_language_for_filename(slash ? slash + SKIP_ONE : cand->file_path) != CBM_LANG_PYTHON) {
+        return false;
+    }
+    memcpy(scope, qn, len + SKIP_ONE);
+    for (char *dot = strrchr(scope, '.'); dot; dot = strrchr(scope, '.')) {
+        *dot = '\0';
+        const cbm_gbuf_node_t *outer = cbm_gbuf_find_by_qn(gbuf, scope);
+        if (outer && outer->label && outer->file_path &&
+            strcmp(outer->file_path, cand->file_path) == 0 &&
+            (strcmp(outer->label, "Function") == 0 || strcmp(outer->label, "Method") == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *path_leaf(const char *path) {
     const char *leaf = path;
     for (const char *p = path; p && *p; p++) {
@@ -1566,6 +1859,10 @@ static const char *path_leaf(const char *path) {
         }
     }
     return leaf;
+}
+
+static bool node_in_php_file(const cbm_gbuf_node_t *n) {
+    return n && n->file_path && cbm_language_for_filename(path_leaf(n->file_path)) == CBM_LANG_PHP;
 }
 
 static bool is_header_include(const char *path) {
@@ -1597,6 +1894,49 @@ static bool is_c_family_source(const char *source_rel) {
         }
     }
     return false;
+}
+
+/* Directory depth of a repo-relative path: how many directories sit above it. */
+static int include_path_depth(const char *path) {
+    int depth = 0;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Total order among nodes whose file path ends with the include path. The
+ * by-name hits arrive in node-registration order, which under parallel
+ * extraction is the workers' merge order and differs run to run; taking the
+ * first hit made `#include <linux/device.h>` target include/linux/device.h in
+ * one index of the kernel and tools/virtio/linux/device.h in the next (5,821
+ * IMPORTS edges moved, and every CALLS edge resolved through those files'
+ * import maps moved with them). The include names a file, so a File node
+ * outranks a symbol declared in it; among files the least nested path wins
+ * (include/ over tools/virtio/), then the smaller path, then the smaller QN
+ * — a function of the candidate set alone (O9). */
+static bool include_target_outranks(const cbm_gbuf_node_t *cand, const cbm_gbuf_node_t *best) {
+    if (!best) {
+        return true;
+    }
+    bool cand_file = strcmp(cand->label, "File") == 0;
+    bool best_file = strcmp(best->label, "File") == 0;
+    if (cand_file != best_file) {
+        return cand_file;
+    }
+    int cd = include_path_depth(cand->file_path);
+    int bd = include_path_depth(best->file_path);
+    if (cd != bd) {
+        return cd < bd;
+    }
+    int by_path = strcmp(cand->file_path, best->file_path);
+    if (by_path != 0) {
+        return by_path < 0;
+    }
+    return cand->qualified_name && best->qualified_name &&
+           strcmp(cand->qualified_name, best->qualified_name) < 0;
 }
 
 static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
@@ -1651,18 +1991,12 @@ static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *
                 strcmp(cand->qualified_name, source_file_qn) == 0) {
                 continue;
             }
-            if (strcmp(cand->label, "File") == 0) {
-                return cand;
-            }
-            if (!best) {
+            if (include_target_outranks(cand, best)) {
                 best = cand;
             }
         }
-        if (best) {
-            return best;
-        }
     }
-    return NULL;
+    return best;
 }
 
 static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
@@ -1719,7 +2053,7 @@ static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *c
 static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx,
                                                    const char *source_rel,
                                                    const char *source_file_qn,
-                                                   const char *module_path) {
+                                                   const char *module_path, bool php_only) {
     if (!module_path || !module_path[0]) {
         return NULL;
     }
@@ -1770,7 +2104,7 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         }
         const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
         free(qn);
-        if (n && import_targetable_label(n->label) &&
+        if (n && (!php_only || node_in_php_file(n)) && import_targetable_label(n->label) &&
             (!source_file_qn || !n->qualified_name ||
              strcmp(n->qualified_name, source_file_qn) != 0)) {
             found = n;
@@ -1781,23 +2115,254 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
-const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
-                                                        const char *source_rel,
-                                                        const char *source_file_qn,
-                                                        const CBMImport *imp,
-                                                        CBMHashTable *namespace_map) {
-    if (!ctx || !imp || !imp->module_path) {
+/* The File an explicit relative import (`./x`, `../x`) names exactly, for
+ * files whose File QN differs from the module QN Strategy 1 tries
+ * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). Resolved in
+ * stack buffers by cbm_repo_rel_join, which refuses a path above the
+ * repository root. */
+static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
+                                                    const char *source_rel, const char *module_path,
+                                                    bool php_only) {
+    if (!source_rel || !module_path || module_path[0] != '.' ||
+        !(module_path[1] == '/' || (module_path[1] == '.' && module_path[2] == '/'))) {
         return NULL;
     }
-
-    /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
-     * module nodes do not steal the edge target. */
-    const cbm_gbuf_node_t *header_target =
-        resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
-    if (header_target) {
-        return header_target;
+    char dir[PKGMAP_PATH_BUF];
+    int dir_len = snprintf(dir, sizeof(dir), "%s", source_rel);
+    if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
+        return NULL;
     }
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+    char path[PKGMAP_PATH_BUF];
+    if (!cbm_repo_rel_join(dir, module_path, path, sizeof(path))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+    return file && (!php_only || node_in_php_file(file)) ? file : NULL;
+}
 
+/* ── PHP PSR-4 class imports (#1186) ──────────────────────────────── */
+
+typedef enum {
+    PSR4_NOT_APPLICABLE = 0, /* no composer psr-4 prefix covers the import */
+    PSR4_RESOLVED,           /* the class file exists: *out is its File node */
+    PSR4_UNRESOLVED,         /* a prefix covers it but no class file exists */
+} psr4_outcome_t;
+
+/* The File node at exactly `rel_path`, or NULL. Looked up through the name
+ * index (File nodes are named by basename) and matched on the full path, so
+ * a same-named file in another directory never qualifies. */
+static const cbm_gbuf_node_t *psr4_file_node(const cbm_gbuf_t *gbuf, const char *rel_path) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, path_leaf(rel_path), &hits, &hit_count) != 0 || !hits) {
+        return NULL;
+    }
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *n = hits[i];
+        if (n && n->label && strcmp(n->label, "File") == 0 && n->file_path &&
+            strcmp(n->file_path, rel_path) == 0) {
+            return n;
+        }
+    }
+    return NULL;
+}
+
+/* Resolve a PHP class import `use A\B\C;` the way composer's PSR-4 autoloader
+ * does: for every autoload.psr-4 prefix covering the name, longest first, the
+ * class lives in exactly <prefix-dir>/<rest>.php with sub-namespaces as
+ * subdirectories; the first existing file wins. When a prefix covers the name
+ * but no such file exists the import is UNRESOLVED: it must never fall through
+ * to the namespace bucket, which binds it to whichever file of the namespace
+ * came first. `use function` / `use const` name namespace members, not class
+ * files, so they are not applicable. */
+static psr4_outcome_t resolve_php_psr4_class(const cbm_gbuf_t *gbuf, const char *source_file_qn,
+                                             const CBMImport *imp, const cbm_gbuf_node_t **out) {
+    *out = NULL;
+    CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (!pkgmap || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
+        return PSR4_NOT_APPLICABLE;
+    }
+    const char *name = imp->module_path;
+    if (name[0] == '\\') {
+        name++; /* fully qualified `use \App\X;` */
+    }
+    char key[PKGMAP_PATH_BUF];
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len >= sizeof(key) || !strchr(name, '\\')) {
+        return PSR4_NOT_APPLICABLE;
+    }
+    bool covered = false;
+    /* Right to left: each '\' ends a candidate prefix, longest first. */
+    for (size_t cut = name_len - SKIP_ONE; cut > 0; cut--) {
+        if (name[cut - SKIP_ONE] != '\\') {
+            continue;
+        }
+        memcpy(key, name, cut);
+        key[cut] = '\0';
+        const char *dir = (const char *)cbm_ht_get(pkgmap, key);
+        if (!dir) {
+            continue;
+        }
+        covered = true;
+        char rel[PKGMAP_PATH_BUF];
+        int w = snprintf(rel, sizeof(rel), "%s%s%s.php", dir, dir[0] ? "/" : "", name + cut);
+        if (w <= 0 || (size_t)w >= sizeof(rel)) {
+            continue;
+        }
+        for (char *c = rel; *c; c++) {
+            if (*c == '\\') {
+                *c = '/';
+            }
+        }
+        const cbm_gbuf_node_t *file = psr4_file_node(gbuf, rel);
+        if (file && (!source_file_qn || !file->qualified_name ||
+                     strcmp(file->qualified_name, source_file_qn) != 0)) {
+            *out = file;
+            return PSR4_RESOLVED;
+        }
+    }
+    return covered ? PSR4_UNRESOLVED : PSR4_NOT_APPLICABLE;
+}
+
+static bool psr4_class_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Trait") == 0 || strcmp(label, "Enum") == 0);
+}
+
+/* The QN of `member` on the class `cls` defined in `file_path`, or NULL when
+ * that file defines no such class or the class has no such member. */
+static const char *psr4_member_in_file(const cbm_gbuf_t *gbuf, const char *file_path,
+                                       const char *cls, const char *member) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, cls, &hits, &hit_count) != 0 || !hits) {
+        return NULL;
+    }
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *c = hits[i];
+        if (!c || !psr4_class_label(c->label) || !c->qualified_name || !c->file_path ||
+            strcmp(c->file_path, file_path) != 0) {
+            continue;
+        }
+        char qn[CBM_SZ_1K];
+        int w = snprintf(qn, sizeof(qn), "%s.%s", c->qualified_name, member);
+        if (w <= 0 || (size_t)w >= sizeof(qn)) {
+            return NULL;
+        }
+        const cbm_gbuf_node_t *m = cbm_gbuf_find_by_qn(gbuf, qn);
+        return m ? m->qualified_name : NULL;
+    }
+    return NULL;
+}
+
+cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char *class_fqn,
+                                              const char *member, const char **out_qn) {
+    *out_qn = NULL;
+    if (!gbuf || !class_fqn || !member || !member[0]) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    const CBMImport imp = {.module_path = class_fqn, .kind = CBM_IMPORT_KIND_DEFAULT};
+    const cbm_gbuf_node_t *file = NULL;
+    psr4_outcome_t placed = resolve_php_psr4_class(gbuf, NULL, &imp, &file);
+    if (placed == PSR4_NOT_APPLICABLE) {
+        return CBM_PSR4_MEMBER_NOT_COVERED;
+    }
+    /* Covered from here on: composer would load this file or none, so a
+     * missing file, class or member leaves the member unresolved. */
+    if (placed != PSR4_RESOLVED || !file->file_path) {
+        return CBM_PSR4_MEMBER_UNRESOLVED;
+    }
+    const char *cls = strrchr(class_fqn, '\\');
+    cls = cls ? cls + SKIP_ONE : class_fqn;
+    *out_qn = psr4_member_in_file(gbuf, file->file_path, cls, member);
+    return *out_qn ? CBM_PSR4_MEMBER_RESOLVED : CBM_PSR4_MEMBER_UNRESOLVED;
+}
+
+/* A kustomization entry naming a remote base -- a URL, a go-getter host path,
+ * an ssh remote or a `?ref=` pin -- lies outside the repository. */
+static bool kustomize_remote_entry(const char *entry) {
+    static const char *const hosts[] = {"github.com/", "gitlab.com/", "bitbucket.org/", "git@",
+                                        NULL};
+    if (strstr(entry, "://") || strstr(entry, "?ref=") || strstr(entry, ".git/")) {
+        return true;
+    }
+    for (int i = 0; hosts[i]; i++) {
+        if (strncmp(entry, hosts[i], strlen(hosts[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool kustomize_file_label(const char *label) {
+    return label && (strcmp(label, "Module") == 0 || strcmp(label, "File") == 0);
+}
+
+/* The Folder of a directory entry: plain, or `proj.pkg.base/` when a file
+ * beside it shares the stem (cbm_stem_marks_t). */
+static const cbm_gbuf_node_t *kustomize_folder(const cbm_pipeline_ctx_t *ctx, const char *path) {
+    char *fqn = cbm_pipeline_fqn_folder(ctx->project_name, path);
+    if (!fqn) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, fqn);
+    if (!n || !n->label || strcmp(n->label, "Folder") != 0) {
+        char marked[PKGMAP_PATH_BUF];
+        int len = snprintf(marked, sizeof(marked), "%s/", fqn);
+        n = len > 0 && (size_t)len < sizeof(marked) ? cbm_gbuf_find_by_qn(ctx->gbuf, marked) : NULL;
+    }
+    free(fqn);
+    return n && n->label && strcmp(n->label, "Folder") == 0 ? n : NULL;
+}
+
+/* A kustomization entry is a path relative to the kustomization's own
+ * directory -- a manifest file or a directory -- or a remote base; it never
+ * names a symbol. Resolve it exactly or not at all: the name-guess strategies
+ * bound a remote base's URL segment `deploy` to a shell function, component
+ * paths to Go structs, and an entry's basename to a same-named file beside
+ * the importer. */
+static const cbm_gbuf_node_t *resolve_kustomize_entry(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel, const char *entry) {
+    if (!entry[0] || kustomize_remote_entry(entry)) {
+        return NULL;
+    }
+    /* "x.yaml" and "./x.yaml" name the same file; make every entry relative. */
+    bool dotted = entry[0] == '.' && (entry[1] == '/' || (entry[1] == '.' && entry[2] == '/'));
+    char rel[PKGMAP_PATH_BUF];
+    snprintf(rel, sizeof(rel), "%s%s", dotted ? "" : "./", entry);
+    char *path = cbm_pipeline_resolve_relative_import(source_rel, rel);
+    if (!path) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = NULL;
+    char *qn = cbm_pipeline_fqn_module(ctx->project_name, path);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+    free(qn);
+    /* The Module must be the entry's own file: a directory entry `base`
+     * beside `base.yaml` shares its module QN but names the directory. */
+    if (n && kustomize_file_label(n->label) && n->file_path && strcmp(n->file_path, path) == 0) {
+        found = n;
+    } else {
+        found = kustomize_folder(ctx, path);
+    }
+    free(path);
+    return found;
+}
+
+/* Language-generic strategies retain their ordering. PHP name imports with
+ * no namespace information (and global uses) restrict candidates before any
+ * winner is selected, so a non-PHP collision cannot hide a later PHP hit.
+ * src_lang is the importing file's language; it gates the name-guess
+ * fallbacks (#1934). */
+static const cbm_gbuf_node_t *resolve_import_strategies(
+    const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
+    const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only) {
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
      * No label filter here: directory-module languages (Go/Java packages)
      * legitimately resolve straight to a Folder node -- that's the intended,
@@ -1808,7 +2373,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
-    if (target) {
+    if (target && (!php_only || node_in_php_file(target))) {
         /* Python/TS from-import of a member: module_path is often
          * "pkg.mod.symbol" while resolve_module lands on the Module node
          * "pkg.mod". Prefer the member Function/Class when it exists —
@@ -1825,7 +2390,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     char member_qn[CBM_SZ_512];
                     snprintf(member_qn, sizeof(member_qn), "%s.%s", target->qualified_name, sym);
                     const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
-                    if (member && import_targetable_label(member->label) &&
+                    if (member && (!php_only || node_in_php_file(member)) &&
+                        import_targetable_label(member->label) &&
                         strcmp(member->label, "Module") != 0 &&
                         strcmp(member->label, "File") != 0) {
                         return member;
@@ -1839,14 +2405,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
      * symbol-name) are gated per importing-file language — see
      * cbm_import_symbol_fallback_allowed (#1934). */
-    const char *src_base = source_rel ? source_rel : "";
-    for (const char *pb = src_base; *pb; pb++) {
-        if (*pb == '/' || *pb == '\\') {
-            src_base = pb + SKIP_ONE;
-        }
-    }
-    const bool symbol_fallback_allowed =
-        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+    const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
@@ -1855,10 +2414,19 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
      * closer (`os/exec` → a same-package exec() method) — gated the same. */
     if (symbol_fallback_allowed) {
         const cbm_gbuf_node_t *sib =
-            resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path);
+            resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path, php_only);
         if (sib) {
             return sib;
         }
+    }
+
+    /* Strategy 1c: relative non-module files can have a File QN that does not
+     * match the module QN above. Resolve the exact file after module and
+     * sibling lookup. */
+    const cbm_gbuf_node_t *rel_file =
+        resolve_relative_file(ctx, source_rel, imp->module_path, php_only);
+    if (rel_file) {
+        return rel_file;
     }
 
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
@@ -1914,7 +2482,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     memcpy(qbuf, seg, len);
                     qbuf[len] = '\0';
                     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
-                    if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                    if (n && (!php_only || node_in_php_file(n)) &&
+                        (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
                         return n;
                     }
                 }
@@ -1996,6 +2565,11 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *dot = '\0';
             end = dot;
         }
+        /* #2127: a Python import whose module is not in the project (stdlib /
+         * third party) may only fall back to a hit that spells its chain. */
+        const bool py_external =
+            symbol_fallback_allowed && src_lang == CBM_LANG_PYTHON &&
+            !python_import_module_in_project(ctx, source_rel, imp->module_path);
         for (int ci = 0; symbol_fallback_allowed && ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
@@ -2010,12 +2584,20 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 const cbm_gbuf_node_t *best = NULL;
                 for (int i = 0; i < n; i++) {
                     const cbm_gbuf_node_t *cand = hits[i];
-                    if (!cand || !import_targetable_label(cand->label)) {
+                    if (!cand || (php_only && !node_in_php_file(cand)) ||
+                        !import_targetable_label(cand->label)) {
+                        continue;
+                    }
+                    /* A Python def-local (#1548) is no importable name. */
+                    if (import_candidate_is_python_local(ctx->gbuf, cand)) {
                         continue;
                     }
                     if (source_file_qn && cand->qualified_name &&
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
+                    }
+                    if (py_external && python_external_hit_rejected(imp, cands[ci], ci > 0, cand)) {
+                        continue; /* #2127: not the external module's symbol */
                     }
                     if (!best || (cand->qualified_name && best->qualified_name &&
                                   strcmp(cand->qualified_name, best->qualified_name) < 0)) {
@@ -2081,7 +2663,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
                 const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
                 free(rqn);
-                if (n && import_targetable_label(n->label) &&
+                if (n && (!php_only || node_in_php_file(n)) && import_targetable_label(n->label) &&
                     (!source_file_qn || !n->qualified_name ||
                      strcmp(n->qualified_name, source_file_qn) != 0)) {
                     return n;
@@ -2098,34 +2680,686 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     return NULL;
 }
 
-/* ── Namespace map ───────────────────────────────────────────────── */
+/* ── PHP `use` of a namespaced name (#1186 follow-up) ─────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
-    CBMHashTable *map = NULL;
-    for (int i = 0; i < count; i++) {
-        const CBMFileResult *r = results[i];
-        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+/* The shape of a PHP `use` import. The importing file is PHP and the path is
+ * a name: identifier segments, joined by '\' when qualified. require/include
+ * paths ("lib/x.php", 'a\b.php') contain '/', '.' or quotes: PHP_USE_NONE. */
+typedef enum {
+    PHP_USE_NONE = 0,   /* not a PHP `use` (other language, require/include) */
+    PHP_USE_GLOBAL,     /* `use Closure;` names the global namespace */
+    PHP_USE_NAMESPACED, /* `use A\B\C;` */
+} php_use_shape_t;
+
+enum { PHP_NON_ASCII_MIN = 0x80 }; /* PHP identifiers admit any byte >= 0x80 */
+
+static bool php_ident_byte(unsigned char c) {
+    return c == '_' || isalnum(c) || c >= PHP_NON_ASCII_MIN;
+}
+
+static php_use_shape_t php_use_shape(const char *source_rel, const CBMImport *imp) {
+    if (!source_rel || cbm_language_for_filename(path_leaf(source_rel)) != CBM_LANG_PHP) {
+        return PHP_USE_NONE;
+    }
+    const char *p = imp->module_path;
+    if (p[0] == '\\') {
+        p++;
+    }
+    if (!p[0]) {
+        return PHP_USE_NONE;
+    }
+    bool qualified = false;
+    for (; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\') {
+            qualified = true;
+        } else if (!php_ident_byte(c)) {
+            return PHP_USE_NONE;
+        }
+    }
+    return qualified ? PHP_USE_NAMESPACED : PHP_USE_GLOBAL;
+}
+
+/* The next usable file of a namespace-map bucket (a '\n'-delimited list of
+ * __file__ QNs): a PHP File node that is not the importing file. Advances
+ * *cursor past the entry. */
+static const cbm_gbuf_node_t *php_bucket_next(const cbm_pipeline_ctx_t *ctx, const char **cursor,
+                                              const char *source_file_qn) {
+    while (*cursor && **cursor) {
+        const char *seg = *cursor;
+        const char *eol = strchr(seg, '\n');
+        size_t len = eol ? (size_t)(eol - seg) : strlen(seg);
+        *cursor = eol ? eol + SKIP_ONE : NULL;
+        char qbuf[CBM_SZ_1K];
+        if (len == 0 || len >= sizeof(qbuf)) {
             continue;
         }
-        if (!map) {
-            map = cbm_ht_create(CBM_SZ_64);
-            if (!map) {
-                return NULL;
+        memcpy(qbuf, seg, len);
+        qbuf[len] = '\0';
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
+        if (n && n->label && strcmp(n->label, "File") == 0 && node_in_php_file(n) &&
+            (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+            return n;
+        }
+    }
+    return NULL;
+}
+
+/* The file of `bucket` that defines a symbol named `leaf`, or NULL. Exact:
+ * the definition must live in that very file (same file_path). */
+static const cbm_gbuf_node_t *php_bucket_declaring(const cbm_pipeline_ctx_t *ctx,
+                                                   const char *bucket, const char *source_file_qn,
+                                                   const char *leaf) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (!bucket || cbm_gbuf_find_by_name(ctx->gbuf, leaf, &hits, &hit_count) != 0 || !hits) {
+        return NULL;
+    }
+    const char *cursor = bucket;
+    for (const cbm_gbuf_node_t *f = php_bucket_next(ctx, &cursor, source_file_qn); f;
+         f = php_bucket_next(ctx, &cursor, source_file_qn)) {
+        for (int i = 0; i < hit_count; i++) {
+            const cbm_gbuf_node_t *h = hits[i];
+            if (h && h->label && strcmp(h->label, "File") != 0 && h->file_path && f->file_path &&
+                strcmp(h->file_path, f->file_path) == 0) {
+                return f;
             }
         }
-        char *file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
-        if (!file_qn) {
+    }
+    return NULL;
+}
+
+/* Resolve a PHP namespaced `use` that no psr-4 prefix covers, through the
+ * namespaces project files DECLARE. `use A\B\C` names C in namespace A\B (or
+ * the namespace A\B\C itself, as an alias): the target is the A\B file that
+ * defines C, else a file declaring namespace A\B\C, else the first A\B file.
+ * A namespace no project PHP file declares (Illuminate\, Spatie\, ...) is
+ * outside the project: the import stays unresolved instead of binding by name
+ * to a same-named project symbol, possibly in another language. */
+static const cbm_gbuf_node_t *resolve_php_declared_use(const cbm_pipeline_ctx_t *ctx,
+                                                       const char *source_file_qn,
+                                                       const CBMImport *imp,
+                                                       CBMHashTable *namespace_map) {
+    const char *name = imp->module_path[0] == '\\' ? imp->module_path + SKIP_ONE : imp->module_path;
+    char key[CBM_SZ_1K];
+    if (strlen(name) >= sizeof(key)) {
+        return NULL;
+    }
+    snprintf(key, sizeof(key), "%s", name);
+    for (char *p = key; *p; p++) {
+        if (*p == '\\') {
+            *p = '.';
+        }
+    }
+    const char *full_bucket = (const char *)cbm_ht_get(namespace_map, key);
+    char *dot = strrchr(key, '.');
+    *dot = '\0'; /* PHP_USE_NAMESPACED guarantees a separator */
+    const char *parent_bucket = (const char *)cbm_ht_get(namespace_map, key);
+    const char *leaf = dot + SKIP_ONE;
+
+    const cbm_gbuf_node_t *hit = php_bucket_declaring(ctx, parent_bucket, source_file_qn, leaf);
+    if (!hit) {
+        const char *cursor = full_bucket;
+        hit = php_bucket_next(ctx, &cursor, source_file_qn);
+    }
+    if (!hit) {
+        const char *cursor = parent_bucket;
+        hit = php_bucket_next(ctx, &cursor, source_file_qn);
+    }
+    return hit;
+}
+
+const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *source_rel,
+                                                        const char *source_file_qn,
+                                                        const CBMImport *imp,
+                                                        CBMHashTable *namespace_map) {
+    if (!ctx || !imp || !imp->module_path) {
+        return NULL;
+    }
+
+    /* The importing file's language gates the strategies below. */
+    const char *src_base = source_rel ? source_rel : "";
+    for (const char *pb = src_base; *pb; pb++) {
+        if (*pb == '/' || *pb == '\\') {
+            src_base = pb + SKIP_ONE;
+        }
+    }
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    if (src_lang == CBM_LANG_KUSTOMIZE) {
+        return resolve_kustomize_entry(ctx, source_rel, imp->module_path);
+    }
+
+    /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
+     * module nodes do not steal the edge target. */
+    const cbm_gbuf_node_t *header_target =
+        resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
+    if (header_target) {
+        return header_target;
+    }
+
+    /* PHP class imports covered by a composer psr-4 prefix name exactly one
+     * file; when it is absent the import stays unresolved (#1186). */
+    const cbm_gbuf_node_t *psr4_target = NULL;
+    switch (resolve_php_psr4_class(ctx->gbuf, source_file_qn, imp, &psr4_target)) {
+    case PSR4_RESOLVED:
+        return psr4_target;
+    case PSR4_UNRESOLVED:
+        return NULL;
+    case PSR4_NOT_APPLICABLE:
+        break;
+    }
+
+    const php_use_shape_t php_use = php_use_shape(source_rel, imp);
+    if (php_use == PHP_USE_NONE) {
+        return resolve_import_strategies(ctx, source_rel, source_file_qn, imp, namespace_map,
+                                         src_lang, false);
+    }
+    /* Any other PHP namespaced `use` resolves only through declared namespaces.
+     * A global-namespace `use Closure;` and the CALLS import map (which passes
+     * no namespace map) keep the generic strategies, but a PHP `use` never
+     * binds to a non-PHP file. */
+    if (php_use == PHP_USE_NAMESPACED && namespace_map) {
+        return resolve_php_declared_use(ctx, source_file_qn, imp, namespace_map);
+    }
+    return resolve_import_strategies(ctx, source_rel, source_file_qn, imp, namespace_map, src_lang,
+                                     true);
+}
+
+/* PHP binding evidence is per File. The first field is canonical so its
+ * completion bit can be invalidated without allocating, before a rebuild.
+ * Node properties are exclusively owned heap strings; both writers run on
+ * the coordinator before resolve workers borrow the graph read-only. */
+static const char php_import_complete[] = "{\"php_imports_complete\":1,";
+
+/* A resolver NULL can also mean unsupported input or a failed lookup. Only
+ * the bounded namespace-only path and an unaliased global class `use` with no
+ * same-named PHP type anywhere admit an absence proof. A covered-but-missing
+ * PSR-4 file, any other global use, or an unavailable namespace map leaves the
+ * whole file unknown; already resolved IMPORTS are still written. */
+/* A global-namespace class `use Exception;` names a project type only when a
+ * PHP file declares a class-like symbol of that name. With no such node at all
+ * (namespaced ones included, so the proof stays conservative), the import is
+ * absent from the project: the PHP builtin or a vendor class. Without this a
+ * single `use Exception;` left the whole file's evidence unknown, and its
+ * project imports reached the PHP LSP as File QNs again. */
+static bool php_global_use_known_absent(const cbm_gbuf_t *gbuf, const CBMImport *imp) {
+    if (!gbuf || imp->kind != CBM_IMPORT_KIND_DEFAULT) {
+        return false;
+    }
+    const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+    if (!name[0] || strcmp(name, imp->local_name) != 0) {
+        return false; /* `use X as Y;` keeps the old, unknown verdict */
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, name, &nodes, &count) != 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *n = nodes[i];
+        if (!n || !n->label || !node_in_php_file(n)) {
             continue;
+        }
+        if (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0 ||
+            strcmp(n->label, "Trait") == 0 || strcmp(n->label, "Enum") == 0 ||
+            strcmp(n->label, "File") == 0 || strcmp(n->label, "Module") == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool php_import_known_absent(const cbm_gbuf_t *gbuf, const char *rel, const CBMImport *imp,
+                                    CBMHashTable *namespace_map) {
+    if (!namespace_map || !imp->module_path || !imp->local_name || !imp->local_name[0] ||
+        (imp->kind != CBM_IMPORT_KIND_DEFAULT && imp->kind != CBM_IMPORT_KIND_FUNCTION &&
+         imp->kind != CBM_IMPORT_KIND_CONST))
+        return false;
+    php_use_shape_t shape = php_use_shape(rel, imp);
+    if (shape == PHP_USE_GLOBAL)
+        return php_global_use_known_absent(gbuf, imp);
+    if (shape != PHP_USE_NAMESPACED)
+        return false;
+    const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+    char key[CBM_SZ_1K];
+    size_t length = strlen(name);
+    if (length >= sizeof(key) || name[0] == '\\' || name[length - 1] == '\\' ||
+        strstr(name, "\\\\"))
+        return false;
+    CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+    if (pkgmap && imp->kind == CBM_IMPORT_KIND_DEFAULT) {
+        /* The resolver does not handle Composer's fallback empty prefix.
+         * Its presence therefore cannot support a negative proof either. */
+        if (cbm_ht_get(pkgmap, ""))
+            return false;
+        for (size_t cut = length - 1; cut > 0; cut--) {
+            if (name[cut - 1] != '\\')
+                continue;
+            memcpy(key, name, cut);
+            key[cut] = '\0';
+            if (cbm_ht_get(pkgmap, key))
+                return false;
+        }
+    }
+    memcpy(key, name, length + 1);
+    for (char *p = key; *p; p++)
+        if (*p == '\\')
+            *p = '.';
+    if (cbm_ht_get(namespace_map, key))
+        return false;
+    *strrchr(key, '.') = '\0';
+    return cbm_ht_get(namespace_map, key) == NULL;
+}
+
+static bool php_json_string_eq(yyjson_val *value, const char *text) {
+    return text ? yyjson_is_str(value) && yyjson_get_len(value) == strlen(text) &&
+                      strcmp(yyjson_get_str(value), text) == 0
+                : yyjson_is_null(value);
+}
+
+static size_t php_json_key_count(yyjson_val *obj, const char *name) {
+    size_t idx, max, count = 0;
+    yyjson_val *key, *value;
+    yyjson_obj_foreach(obj, idx, max, key, value) {
+        (void)value;
+        if (php_json_string_eq(key, name))
+            count++;
+    }
+    return count;
+}
+
+static bool php_binding_identity(yyjson_val *value, const CBMImport *imp) {
+    yyjson_val *kind = yyjson_obj_get(value, "kind");
+    yyjson_val *def = yyjson_obj_get(value, "is_default");
+    return yyjson_is_obj(value) && yyjson_obj_size(value) == 5 && yyjson_is_int(kind) &&
+           yyjson_get_int(kind) == (int)imp->kind && yyjson_is_bool(def) &&
+           yyjson_get_bool(def) == imp->is_default &&
+           php_json_string_eq(yyjson_obj_get(value, "local_name"), imp->local_name) &&
+           php_json_string_eq(yyjson_obj_get(value, "module_path"), imp->module_path);
+}
+
+static bool php_json_add_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
+                                const char *text) {
+    return text ? yyjson_mut_obj_add_strcpy(doc, obj, key, text)
+                : yyjson_mut_obj_add_null(doc, obj, key);
+}
+
+static yyjson_mut_val *php_binding_json(yyjson_mut_doc *doc, const CBMImport *imp,
+                                        const char *target) {
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    if (!obj || !php_json_add_string(doc, obj, "local_name", imp->local_name) ||
+        !php_json_add_string(doc, obj, "module_path", imp->module_path) ||
+        !yyjson_mut_obj_add_int(doc, obj, "kind", imp->kind) ||
+        !yyjson_mut_obj_add_bool(doc, obj, "is_default", imp->is_default) ||
+        !php_json_add_string(doc, obj, "target", target)) {
+        return NULL;
+    }
+    return obj;
+}
+
+/* Validate the entire snapshot, including bindings that coalesced into one
+ * (source, target, local_name) edge. A positive insertion ID alone is not
+ * evidence that all properties and secondary indexes were stored. */
+static bool php_read_binding_snapshot(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *file,
+                                      const CBMFileResult *result, const char *json,
+                                      cbm_php_vendor_names_t *out) {
+    if (!json || strncmp(json, php_import_complete, sizeof(php_import_complete) - 1) != 0)
+        return false;
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *manifest = yyjson_obj_get(root, "php_import_bindings");
+    int count = result->imports.count;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    const char **targets = NULL;
+    int *seen = NULL;
+    bool ok =
+        count >= 0 && (count == 0 || result->imports.items) &&
+        php_json_key_count(root, "php_imports_complete") == 1 &&
+        php_json_key_count(root, "php_import_bindings") == 1 && yyjson_is_arr(manifest) &&
+        yyjson_arr_size(manifest) == (size_t)count &&
+        cbm_gbuf_find_edges_by_source_type(gbuf, file->id, "IMPORTS", &edges, &edge_count) == 0 &&
+        edge_count >= 0 && (edge_count == 0 || edges);
+    if (!ok)
+        goto done;
+    size_t slots = count > 0 ? (size_t)count : 1;
+    if (slots > SIZE_MAX / sizeof(*targets) || slots > SIZE_MAX / sizeof(*seen)) {
+        ok = false;
+        goto done;
+    }
+    targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
+    seen = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*seen));
+    if (!targets || !seen) {
+        ok = false;
+        goto done;
+    }
+    for (int i = 0; ok && i < count; i++) {
+        yyjson_val *entry = yyjson_arr_get(manifest, (size_t)i);
+        yyjson_val *target = yyjson_obj_get(entry, "target");
+        ok = php_binding_identity(entry, &result->imports.items[i]);
+        if (yyjson_is_str(target)) {
+            const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, yyjson_get_str(target));
+            ok = ok && node && node->id != file->id && node->qualified_name &&
+                 php_json_string_eq(target, node->qualified_name);
+            if (ok)
+                targets[i] = node->qualified_name;
+        } else if (!yyjson_is_null(target)) {
+            ok = false;
+        }
+    }
+    for (int e = 0; ok && e < edge_count; e++) {
+        const cbm_gbuf_edge_t *edge = edges[e];
+        if (!edge) {
+            ok = false;
+            break;
+        }
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edge->target_id);
+        yyjson_doc *edoc = edge->properties_json ? yyjson_read(edge->properties_json,
+                                                               strlen(edge->properties_json), 0)
+                                                 : NULL;
+        yyjson_val *obj = edoc ? yyjson_doc_get_root(edoc) : NULL;
+        yyjson_val *local = yyjson_obj_get(obj, "local_name");
+        yyjson_val *bindings = yyjson_obj_get(obj, "php_import_bindings");
+        ok = target && target->qualified_name && yyjson_is_obj(obj) && yyjson_obj_size(obj) == 2 &&
+             yyjson_is_str(local) && yyjson_is_arr(bindings) && yyjson_arr_size(bindings) > 0;
+        for (size_t b = 0; ok && b < yyjson_arr_size(bindings); b++) {
+            yyjson_val *binding = yyjson_arr_get(bindings, b);
+            int match = -1;
+            for (int i = 0; i < count; i++) {
+                if (targets[i] && strcmp(targets[i], target->qualified_name) == 0 &&
+                    php_binding_identity(binding, &result->imports.items[i]) &&
+                    php_json_string_eq(local, result->imports.items[i].local_name) &&
+                    php_json_string_eq(yyjson_obj_get(binding, "target"), targets[i])) {
+                    if (match != -1) {
+                        ok = false;
+                        break;
+                    }
+                    match = i;
+                }
+            }
+            if (match < 0 || ++seen[match] != 1)
+                ok = false;
+        }
+        yyjson_doc_free(edoc);
+    }
+    for (int i = 0; ok && i < count; i++)
+        ok = seen[i] == (targets[i] ? 1 : 0);
+done:
+    if (ok) {
+        out->imports = &result->imports;
+        out->targets = targets;
+        targets = NULL;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, targets);
+    cbm_free(CBM_MEM_CLASS_OTHER, seen);
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+/* Shared by the sequential and parallel PHP IMPORTS writers. Other languages
+ * retain their original writer and property layout. */
+int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                         const char *rel, const char *file_qn,
+                                         const cbm_gbuf_node_t *file, CBMHashTable *namespace_map) {
+    char *old_json = file->properties_json;
+    if (old_json && strncmp(old_json, php_import_complete, sizeof(php_import_complete) - 1) == 0)
+        old_json[sizeof(php_import_complete) - 3] = '0';
+
+    int count = result->imports.count;
+    if (count < 0 || (count > 0 && !result->imports.items))
+        return 0;
+    size_t slots = count > 0 ? (size_t)count : 1;
+    if (slots > SIZE_MAX / sizeof(const cbm_gbuf_node_t *))
+        return 0;
+    const cbm_gbuf_node_t **targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
+    yyjson_doc *old = old_json ? yyjson_read(old_json, strlen(old_json), 0) : NULL;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    yyjson_mut_val *manifest = doc ? yyjson_mut_arr(doc) : NULL;
+    bool ok = targets && root && manifest &&
+              (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
+              yyjson_mut_obj_add_int(doc, root, "php_imports_complete", 1) &&
+              yyjson_mut_obj_add_val(doc, root, "php_import_bindings", manifest);
+    int written = 0;
+    bool complete = true;
+    if (!ok)
+        goto done;
+    yyjson_mut_doc_set_root(doc, root);
+    if (old) {
+        size_t idx, max;
+        yyjson_val *key, *value;
+        yyjson_obj_foreach(yyjson_doc_get_root(old), idx, max, key, value) {
+            const char *name = yyjson_get_str(key);
+            if (strcmp(name, "php_imports_complete") == 0 ||
+                strcmp(name, "php_import_bindings") == 0)
+                continue;
+            yyjson_mut_val *copy = yyjson_val_mut_copy(doc, value);
+            if (!copy || !yyjson_mut_obj_add_val(doc, root, name, copy)) {
+                ok = false;
+                goto done;
+            }
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        targets[i] = imp->module_path
+                         ? cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map)
+                         : NULL;
+        if (targets[i] && targets[i]->id == file->id)
+            targets[i] = NULL;
+        if (!targets[i] && !php_import_known_absent(ctx->gbuf, rel, imp, namespace_map))
+            complete = false;
+        yyjson_mut_val *entry =
+            php_binding_json(doc, imp, targets[i] ? targets[i]->qualified_name : NULL);
+        if (!entry || !yyjson_mut_arr_add_val(manifest, entry)) {
+            ok = false;
+            goto done;
+        }
+    }
+    for (int i = 0; ok && i < count; i++) {
+        if (!targets[i])
+            continue;
+        const char *local = result->imports.items[i].local_name;
+        if (!local || !local[0]) {
+            ok = false;
+            break;
+        }
+        bool prior = false;
+        for (int j = 0; j < i; j++)
+            if (targets[j] && targets[j]->id == targets[i]->id &&
+                result->imports.items[j].local_name &&
+                strcmp(local, result->imports.items[j].local_name) == 0)
+                prior = true;
+        if (prior)
+            continue;
+        yyjson_mut_val *edge = yyjson_mut_obj(doc);
+        yyjson_mut_val *bindings = yyjson_mut_arr(doc);
+        ok = edge && bindings && yyjson_mut_obj_add_strcpy(doc, edge, "local_name", local) &&
+             yyjson_mut_obj_add_val(doc, edge, "php_import_bindings", bindings);
+        for (int j = i; ok && j < count; j++) {
+            if (!targets[j] || targets[j]->id != targets[i]->id ||
+                !result->imports.items[j].local_name ||
+                strcmp(local, result->imports.items[j].local_name) != 0)
+                continue;
+            yyjson_mut_val *entry =
+                php_binding_json(doc, &result->imports.items[j], targets[j]->qualified_name);
+            ok = entry && yyjson_mut_arr_add_val(bindings, entry);
+        }
+        char *props = ok ? yyjson_mut_val_write(edge, 0, NULL) : NULL;
+        ok = props &&
+             cbm_gbuf_insert_edge(ctx->gbuf, file->id, targets[i]->id, "IMPORTS", props) > 0;
+        free(props);
+        if (ok)
+            written++;
+    }
+    if (ok && complete) {
+        char *props = yyjson_mut_write(doc, 0, NULL);
+        cbm_php_vendor_names_t check = {0};
+        if (props && php_read_binding_snapshot(ctx->gbuf, file, result, props, &check)) {
+            /* Failure leaves the earlier completion bit disabled. */
+            (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, props);
+        }
+        cbm_pipeline_php_vendor_names_free(&check);
+        free(props);
+    }
+done:
+    yyjson_doc_free(old);
+    yyjson_mut_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, targets);
+    return written;
+}
+
+void cbm_pipeline_php_vendor_names_build(const cbm_gbuf_t *gbuf, const char *project_name,
+                                         const char *rel, const CBMFileResult *result,
+                                         cbm_php_vendor_names_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!gbuf || !result || !rel || cbm_language_for_filename(path_leaf(rel)) != CBM_LANG_PHP)
+        return;
+    char *qn = cbm_pipeline_fqn_compute(project_name, rel, "__file__");
+    const cbm_gbuf_node_t *file = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    free(qn);
+    if (file)
+        (void)php_read_binding_snapshot(gbuf, file, result, file->properties_json, out);
+}
+
+void cbm_pipeline_php_vendor_names_free(cbm_php_vendor_names_t *value) {
+    if (value) {
+        cbm_free(CBM_MEM_CLASS_OTHER, value->targets);
+        memset(value, 0, sizeof(*value));
+    }
+}
+
+static bool php_vendor_kind(const cbm_php_vendor_names_t *value, const char *name, int kind) {
+    if (!value || !value->targets || !value->imports || !name || name[0] == '\\')
+        return false;
+    size_t length = 0;
+    while (php_ident_byte((unsigned char)name[length]))
+        length++;
+    if (length == 0)
+        return false;
+    for (int i = 0; i < value->imports->count; i++) {
+        const CBMImport *imp = &value->imports->items[i];
+        if (!imp->local_name || !imp->module_path || value->targets[i] ||
+            (kind >= 0 && (int)imp->kind != kind))
+            continue;
+        if (strlen(imp->local_name) == length && strncmp(imp->local_name, name, length) == 0)
+            return true;
+    }
+    return false;
+}
+
+bool cbm_pipeline_php_vendor_bound(const cbm_php_vendor_names_t *value, const char *name) {
+    return php_vendor_kind(value, name, CBM_IMPORT_KIND_DEFAULT);
+}
+
+/* Existing occurrence metadata can identify a constructor or a type without
+ * adding serialized fields. If its tree/source was not retained, -1 preserves
+ * uncertainty: only an unresolved matching import can veto a guessed edge. */
+static int php_import_kind_at_site(const CBMFileResult *result, uint32_t start, uint32_t end,
+                                   CBMSourceOrigin origin, bool call) {
+    if (!result || origin != CBM_SOURCE_ORIGIN_RAW || end <= start)
+        return -1;
+    if (result->cached_tree) {
+        TSNode node = ts_node_descendant_for_byte_range(ts_tree_root_node(result->cached_tree),
+                                                        start, end - 1);
+        for (int depth = 0; !ts_node_is_null(node) && depth < 16; depth++) {
+            const char *type = ts_node_type(node);
+            if (strcmp(type, "named_type") == 0 || strcmp(type, "base_clause") == 0 ||
+                strcmp(type, "class_interface_clause") == 0)
+                return CBM_IMPORT_KIND_DEFAULT;
+            if (strcmp(type, "object_creation_expression") == 0 ||
+                strcmp(type, "scoped_call_expression") == 0 ||
+                strcmp(type, "class_constant_access_expression") == 0) {
+                TSNode scope = ts_node_named_child(node, 0);
+                if (call || (!ts_node_is_null(scope) && ts_node_start_byte(scope) <= start &&
+                             ts_node_end_byte(scope) >= end))
+                    return CBM_IMPORT_KIND_DEFAULT;
+                break;
+            }
+            if (strcmp(type, "function_call_expression") == 0) {
+                TSNode function = ts_node_child_by_field_name(node, "function", 8);
+                if (call || (!ts_node_is_null(function) && ts_node_start_byte(function) <= start &&
+                             ts_node_end_byte(function) >= end))
+                    return CBM_IMPORT_KIND_FUNCTION;
+                break;
+            }
+            if (strcmp(type, "namespace_use_declaration") == 0 ||
+                strcmp(type, "method_declaration") == 0 || strcmp(type, "function_definition") == 0)
+                break;
+            node = ts_node_parent(node);
+        }
+    }
+    if (call && result->source && end <= (uint32_t)result->source_len && end - start > 3 &&
+        memcmp(result->source + start, "new", 3) == 0 &&
+        isspace((unsigned char)result->source[start + 3]))
+        return CBM_IMPORT_KIND_DEFAULT;
+    return -1;
+}
+
+bool cbm_pipeline_php_vendor_call(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
+                                  const CBMCall *call) {
+    if (!call || !call->callee_name)
+        return false;
+    int kind = strstr(call->callee_name, "::")
+                   ? CBM_IMPORT_KIND_DEFAULT
+                   : php_import_kind_at_site(result, call->site_start_byte, call->site_end_byte,
+                                             call->source_origin, true);
+    return php_vendor_kind(value, call->callee_name, kind);
+}
+
+bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
+                                   const CBMUsage *usage) {
+    if (!usage)
+        return false;
+    int kind = php_import_kind_at_site(result, usage->site_start_byte, usage->site_end_byte,
+                                       usage->source_origin, false);
+    return php_vendor_kind(value, usage->ref_name, kind);
+}
+
+/* ── Namespace map ───────────────────────────────────────────────── */
+
+/* The namespace names themselves, so a caller that has parked some results on
+ * disk can still contribute their namespaces (see
+ * cbm_result_spill_namespace). A file missing from this map does not fail to
+ * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
+ * an incomplete map changed edge counts in both directions rather than only
+ * losing edges. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count) {
+    /* NULL means no namespace information (e.g. the CALLS import map), while
+     * an empty map means no project file declares a namespace. A partial map
+     * cannot prove a PHP import absent, so every construction failure returns
+     * NULL after releasing the accumulated entries. */
+    if (count < 0 || (count > 0 && (!namespaces || !rels)))
+        return NULL;
+    CBMHashTable *map = cbm_ht_create(CBM_SZ_64);
+    if (!map) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        const char *namespace_name = namespaces[i];
+        if (!namespace_name || !namespace_name[0]) {
+            continue;
+        }
+        char *file_qn = NULL;
+        char *key = NULL;
+        bool ok = false;
+        if (!rels[i])
+            goto item_done;
+        file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
+        if (!file_qn) {
+            goto item_done;
         }
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(r->namespace_name);
+        key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, namespace_name);
         if (!key) {
-            free(file_qn);
-            continue;
+            goto item_done;
         }
         for (char *p = key; *p; p++) {
             if (*p == '\\' || *p == ':' || *p == '/') {
@@ -2134,37 +3368,85 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         }
         /* Store ALL files declaring a namespace as a '\n'-delimited list so the
          * resolver can pick a non-importer sibling (see resolve loop). The hash
-         * table does not copy keys, so the strdup'd key is owned by the map and
-         * freed in ns_map_free_entry. */
+         * table does not copy keys. The map owns memory-core keys and libc
+         * values from fqn_compute or the combined allocation below. */
         if (!cbm_ht_has(map, key)) {
             cbm_ht_set(map, key, file_qn); /* map owns key + file_qn */
+            /* set returns NULL for both insertion and allocation failure.
+             * These lookups allocate nothing and verify ownership transfer. */
+            const char *stored_key = cbm_ht_get_key(map, key);
+            void *stored_value = cbm_ht_get(map, key);
+            ok = stored_key == key && stored_value == file_qn;
+            if (stored_key == key)
+                key = NULL;
+            if (stored_value == file_qn)
+                file_qn = NULL;
         } else {
             /* Append to the existing list. Re-key with the STORED key pointer
-             * (not our fresh strdup) so the map's key pointer never changes —
-             * otherwise Verstable would adopt the new key and our free(key)
+             * (not our fresh copy) so the map's key pointer never changes —
+             * otherwise Verstable would adopt the new key and our cleanup
              * below would free the live key (use-after-free). */
             const char *stored_key = cbm_ht_get_key(map, key);
             const char *cur = (const char *)cbm_ht_get(map, key);
             char *combined = NULL;
             if (stored_key && cur) {
-                size_t need = strlen(cur) + 1 + strlen(file_qn) + 1;
+                size_t cur_len = strlen(cur), file_len = strlen(file_qn);
+                if (file_len > SIZE_MAX - 2 || cur_len > SIZE_MAX - file_len - 2) {
+                    goto item_done;
+                }
+                size_t need = cur_len + 1 + file_len + 1;
                 combined = malloc(need);
                 if (combined) {
                     snprintf(combined, need, "%s\n%s", cur, file_qn);
-                    void *prev = cbm_ht_set(map, stored_key, combined);
-                    free(prev); /* old value string */
+                    (void)cbm_ht_set(map, stored_key, combined);
+                    if (cbm_ht_get(map, stored_key) != combined) {
+                        free(combined);
+                        combined = NULL;
+                    } else {
+                        free((void *)cur); /* replaced value string */
+                    }
                 }
             }
-            free(key);     /* our fresh strdup — never stored */
-            free(file_qn); /* content copied into combined */
+            ok = combined != NULL;
+        }
+    item_done:
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        free(file_qn);
+        if (!ok) {
+            cbm_pipeline_namespace_map_free(map);
+            return NULL;
         }
     }
     return map;
 }
 
+/* Convenience for callers whose results are all in memory (the sequential
+ * definitions pass). A caller that can SPILL must use the _names variant and
+ * fill the parked slots from cbm_result_spill_namespace, or its map silently
+ * loses those files. */
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    if (count < 0 || (count > 0 && (!results || !rels)) ||
+        (size_t)count > SIZE_MAX / sizeof(char *))
+        return NULL;
+    if (count == 0)
+        return cbm_pipeline_namespace_map_build_names(project_name, NULL, rels, 0);
+    const char **names = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        names[i] = results[i] ? results[i]->namespace_name : NULL;
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names(project_name, names, rels, count);
+    cbm_free(CBM_MEM_CLASS_OTHER, names);
+    return map;
+}
+
 static void ns_map_free_entry(const char *key, void *value, void *ud) {
     (void)ud;
-    free((void *)key); /* strdup'd in cbm_pipeline_namespace_map_build */
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
     free(value);
 }
 

@@ -2,9 +2,12 @@
 #include "arena.h" // cbm_arena_sprintf
 #include "cbm.h"   // CBMExtractCtx
 #include "helpers.h"
-#include "lang_specs.h"      // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
-#include "tree_sitter/api.h" // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
+#include "extract_url_fold.h" // cbm_url_fold_record_constant (#706, #1147)
+#include "lang_specs.h"       // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
+#include "tree_sitter/api.h"  // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
 #include "foundation/constants.h"
+#include "foundation/compat.h" // cbm_thread_cpu_time_ns
+#include <stdlib.h>
 
 enum { MAX_INFRA_BINDINGS = 8 };
 
@@ -913,9 +916,31 @@ static const char *objectscript_get_method_qn(CBMExtractCtx *ctx, TSNode node,
     return NULL;
 }
 
+/* Python: the nearest named scope around the node -- a def or a class. A def
+ * or class nested in a def is qualified by that def (proj.mod.create_app.index),
+ * exactly as extract_defs.c mints it; enclosing_class_qn alone would skip the
+ * def and hand a def nested in a method its method's QN. Lambdas push no named
+ * frame, so they stay transparent. */
+static const char *py_nearest_scope_qn(const WalkState *state) {
+    for (int i = state->scope_top - SKIP_ONE; i >= 0; i--) {
+        const CBMWalkScope *f = &state->scopes[i];
+        if ((f->kind == SCOPE_FUNC || f->kind == SCOPE_CLASS) && f->qn) {
+            return f->qn;
+        }
+    }
+    return NULL;
+}
+
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
+    /* Raw configured definitions already own the canonical QN, including
+     * namespace scope. Never rederive it from the bare macro identifier. */
+    const char *configured_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_qn) {
+        return configured_qn;
+    }
+
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
@@ -1085,6 +1110,29 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    /* Go method `func (s *Storage) Close() {...}`: the def extractor records
+     * this as Method "proj.pkg.Storage.Close" (receiver-qualified, mirroring
+     * the C++ out-of-line rule above). The call-scope QN must match — a bare
+     * "proj.pkg.Close" names a node that no longer exists, so every call
+     * inside the method body would fall back to File-node attribution
+     * (calls_find_source). Same ONE-formula contract as the def side:
+     * cbm_go_receiver_type_name + cbm_fqn_compute_source_lang. */
+    if (ctx->language == CBM_LANG_GO && strcmp(ts_node_type(node), "method_declaration") == 0) {
+        TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
+        if (!ts_node_is_null(recv)) {
+            char *recv_type = cbm_go_receiver_type_name(ctx->arena, recv, ctx->source);
+            if (recv_type && recv_type[0]) {
+                const char *type_qn = cbm_fqn_compute_source_lang(
+                    ctx->arena, ctx->project, ctx->rel_path, recv_type, ctx->language);
+                /* NULL only on allocation failure: fall through to the flat
+                 * QN, as the def side does (extract_defs.c). */
+                if (type_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, name);
+                }
+            }
+        }
+    }
+
     /* Nix: a binding's own attrpath contributes scope (`a.b.fn = …`), and the def
      * extractor bakes it into the def QN. Compose it identically here — otherwise
      * an in-body call sources to a QN one or more segments short of the def, and
@@ -1097,8 +1145,10 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
-    if (state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
+    const char *outer_qn =
+        ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state) : state->enclosing_class_qn;
+    if (outer_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
@@ -1149,12 +1199,32 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     if (!name || !name[0]) {
         return NULL;
     }
+    /* Rust: the impl's type text carries its generic arguments (`impl<T> Gen<T>`,
+     * `impl<'a> Parser<'a>`), which the def side strips before naming the type
+     * (extract_defs.c extract_rust_impl: `Buffer<T>` -> `Buffer`). Strip them the
+     * same way, or every method of a generic impl gets a scope QN no node carries
+     * and all its calls fall back to the File node. */
+    if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
+        char *lt = strchr(name, '<');
+        if (lt == name) {
+            return NULL; /* `<T as Tr>`-style self type: no name to scope by */
+        }
+        if (lt) {
+            *lt = '\0';
+        }
+    }
 
     /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this
      * scope QN matches the def-side class QN (extract_defs.c compute_class_qn /
-     * extract_class_def), which the lsp_resolve join requires for nested types. */
-    if (state && state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+     * extract_class_def), which the lsp_resolve join requires for nested types.
+     * Python: a class inside a def is qualified by the def (py_nearest_scope_qn). */
+    const char *outer_qn = NULL;
+    if (state) {
+        outer_qn = ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state)
+                                                    : state->enclosing_class_qn;
+    }
+    if (outer_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, name);
     }
 
     /* Java/Go: directory-based module (see compute_func_qn). */
@@ -1203,6 +1273,14 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* Name must be an identifier */
     const char *name_kind = ts_node_type(name_node);
     if (strcmp(name_kind, "identifier") != 0 && strcmp(name_kind, "constant") != 0) {
+        return;
+    }
+
+    /* Python and JS/TS fold the value: `BASE + "/path"`, `${BASE}/path`,
+     * f"{BASE}/path" and object-literal endpoint maps (#706, #1147). */
+    if (cbm_url_fold_lang(ctx->language)) {
+        cbm_url_fold_record_constant(ctx, cbm_node_text(ctx->arena, name_node, ctx->source),
+                                     value_node);
         return;
     }
 
@@ -2368,7 +2446,12 @@ static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth)
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth,
                                  const CBMInvocationDescriptor *invocation) {
-    if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
+    const char *configured_body_qn = NULL;
+    if (ctx->language == CBM_LANG_C && strcmp(ts_node_type(node), "compound_statement") == 0)
+        configured_body_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_body_qn) {
+        (void)push_function_scope(state, depth, configured_body_qn, node);
+    } else if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
          * but the def walk does not descend into function bodies, so it emits no
          * node for it. Pushing a func scope here would attribute in-body calls to
@@ -2596,9 +2679,39 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.branch_depth = 0;
 
     uint32_t depth = 0;
+    uint32_t visited = 0;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* CBM_TEST_WALK_BUDGET_NODES=<n>: spend the budget after n nodes. Production
+     * now counts nodes too, so this seam only shortens the budget; it no longer
+     * has to stand in for a mechanism of its own. */
+    uint32_t budget_nodes = ctx->walk_budget_nodes;
+    {
+        const char *seam = getenv("CBM_TEST_WALK_BUDGET_NODES");
+        if (seam && seam[0]) {
+            budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
+        }
+    }
+#else
+    const uint32_t budget_nodes = ctx->walk_budget_nodes;
+#endif
+    /* A Terraform / OpenTofu module file's references resolve inside its
+     * module directory (pass_terraform.c); a call or usage by name here would
+     * meet same-named blocks of any module and a builtin function's name. */
+    const char *ext = ctx->rel_path ? strrchr(ctx->rel_path, '.') : NULL;
+    bool tf_module = ctx->language == CBM_LANG_HCL && ext &&
+                     (strcmp(ext, ".tf") == 0 || strcmp(ext, ".tofu") == 0);
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        visited++;
+        /* The budget is spent in nodes, so the walk of a given file always ends
+         * on the same node — on any machine, under any load. A CPU deadline
+         * here made the graph differ between two runs on one machine; see
+         * CBM_WALK_MAX_NODES_DEFAULT (cbm.c). */
+        if (budget_nodes != 0 && visited > budget_nodes) {
+            ctx->walk_budget_exhausted = true;
+            break;
+        }
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred
@@ -2612,8 +2725,11 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             handle_string_constants(ctx, node, &state);
             handle_objectscript_type_map(ctx, node, &state);
             handle_url_builders(ctx, node, &state);
-            CBMInvocationDescriptor invocation = handle_calls(ctx, node, spec, &state);
-            handle_usages(ctx, node, spec, &state);
+            CBMInvocationDescriptor invocation =
+                tf_module ? (CBMInvocationDescriptor){0} : handle_calls(ctx, node, spec, &state);
+            if (!tf_module) {
+                handle_usages(ctx, node, spec, &state);
+            }
             handle_throws(ctx, node, spec, &state);
             handle_readwrites(ctx, node, spec, &state);
             handle_type_refs(ctx, node, spec, &state);
@@ -2652,6 +2768,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     cbm_finalize_lexical_usages(ctx, &state);
+    ctx->walk_nodes_visited = visited;
     ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);
 }

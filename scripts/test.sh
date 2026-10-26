@@ -10,7 +10,7 @@ cd "$ROOT"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
+Usage: scripts/test.sh [--suites LIST | --tsan | --contracts-only] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
@@ -29,6 +29,10 @@ Modes:
   --tsan         ThreadSanitizer leg (data-race gate): builds and runs the
                  widened TSan runner via make test-tsan — the same leg CI's
                  tsan jobs and the compose test-tsan service run.
+  --contracts-only
+                 Only the static contract steps (Step 0*) of the default leg:
+                 no compiler, no build, no suites. PR CI runs this for
+                 docs-only and non-product changes (tiers T0a, T0b).
 
 Options:
   --arch ARCH    Force target arch (arm64 | x86_64), e.g. under Rosetta.
@@ -50,6 +54,11 @@ Environment:
   CBM_RUN_HANG_TEST=1     Opt-in C++ index-hang regression (#410, needs prod).
   CBM_NO_CCACHE=1         Disable the content-verified compiler cache.
   CBM_TEST_SHARD/_LEG     Set by CI's sharded legs; leave unset locally.
+  CBM_TEST_SELECTION_DIR  PR CI's test selection (smart CI): a directory with
+                          test-only.txt (suite / suite:test lines) and
+                          optional-suites.txt. Narrows the parallel suite step
+                          only; contract steps and CBM_TEST_SEQUENTIAL=1 runs
+                          keep running everything.
 
 Examples:
   scripts/test.sh                          # the full venue leg (what CI runs)
@@ -64,11 +73,13 @@ EOF
 # silently swallowed — agents must know exactly what a run will do.
 SUITES=""
 TSAN=0
+CONTRACTS_ONLY=0
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
         --tsan) :;;
+        --contracts-only) :;;
         --suites) :;; # next arg is the value, handled below
         --suites=*) SUITES="${arg#--suites=}" ;;
         --arch) :;; # next arg is the value, handled below
@@ -96,6 +107,7 @@ done
 for arg in "$@"; do
     case "$arg" in
         --tsan) TSAN=1 ;;
+        --contracts-only) CONTRACTS_ONLY=1 ;;
         arm64|x86_64)
             if [[ "${prev_arg2:-}" == "--arch" ]]; then
                 export CBM_ARCH="$arg"
@@ -119,6 +131,10 @@ case "${prev_arg:-}" in
 esac
 if [ "$TSAN" -eq 1 ] && [ -n "$SUITES" ]; then
     echo "test.sh: --tsan and --suites are separate modes (the TSan leg has its own suite set). Please consult --help." >&2
+    exit 2
+fi
+if [ "$CONTRACTS_ONLY" -eq 1 ] && { [ "$TSAN" -eq 1 ] || [ -n "$SUITES" ]; }; then
+    echo "test.sh: --contracts-only is its own mode (no build, no suites). Please consult --help." >&2
     exit 2
 fi
 prev_arg=""
@@ -145,16 +161,21 @@ source "$ROOT/scripts/path-safety.sh"
 MAKE_ARGS=()
 BUILD_DIR="build/c"
 SANITIZE_GIVEN=0
+SANITIZE_VALUE=""
 prev_arg=""
 for arg in "$@"; do
     case "$arg" in
         CC=*|CXX=*) export "${arg}" ;;
         --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
-        --tsan) ;; # already handled
+        --tsan|--contracts-only) ;; # already handled
         --suites|--suites=*) ;; # already handled (value skipped via prev_arg below)
         BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
-        SANITIZE=*) SANITIZE_GIVEN=1; MAKE_ARGS+=("$arg") ;;
+        SANITIZE=*)
+            SANITIZE_GIVEN=1
+            SANITIZE_VALUE="${arg#SANITIZE=}"
+            MAKE_ARGS+=("$arg")
+            ;;
         *=*)
             if [[ "${prev_arg:-}" != "--suites" ]]; then
                 MAKE_ARGS+=("$arg") # forward any VAR=VAL to make
@@ -174,6 +195,54 @@ if [ "$SANITIZE_GIVEN" -eq 0 ] && [ "${MSYSTEM:-}" = "CLANGARM64" ]; then
     MAKE_ARGS+=("SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer")
 fi
 
+# ASan stack-use-after-return runs in the test-diag lane only (_test.yml and
+# `make -f Makefile.cbm diag` set detect_stack_use_after_return=1). gcc's
+# libasan turns it ON by default, and on aarch64 gcc 13/14 never clear a freed
+# fake frame's in-use flag: past 8,192 frames per size class every instrumented
+# call scans that flag array and the check stops detecting anything (gcc arm64
+# ran `extraction` in 688 s, amd64 in 16 s). Off here; an explicit setting wins.
+case "${ASAN_OPTIONS:-}" in
+    *detect_stack_use_after_return*) ;;
+    *) ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_stack_use_after_return=0" ;;
+esac
+export ASAN_OPTIONS
+
+EXPECTED_SANITIZED=1
+if [ "$SANITIZE_GIVEN" -eq 1 ]; then
+    case "$SANITIZE_VALUE" in
+        *[![:space:]]*) EXPECTED_SANITIZED=1 ;;
+        *) EXPECTED_SANITIZED=0 ;;
+    esac
+fi
+
+# Refuse to run suites when the built runner disagrees with the lane that
+# produced it. Exact output keeps missing, duplicate, or future unhandled
+# fields fail-closed instead of silently weakening the gate.
+assert_test_runner_build_config() {
+    local runner="$1"
+    local expected_sanitized="$2"
+    local expected="sanitized=$expected_sanitized test_seams=1"
+    local marker="__cbm_build_config_end__"
+    local captured=""
+    local actual=""
+    local probe_ok=0
+
+    if captured="$("$runner" --build-config && printf '%s' "$marker")"; then
+        probe_ok=1
+        actual="${captured%"$marker"}"
+    else
+        actual="$captured"
+    fi
+    if [ "$probe_ok" -ne 1 ] || [ "$actual" != "$expected"$'\n' ]; then
+        local reported="${actual//$'\n'/\\n}"
+        printf 'ERROR: build config mismatch for %s\n' "$runner" >&2
+        printf '  expected: %s\n' "$expected" >&2
+        printf '  reported: %s\n' "${reported:-<empty>}" >&2
+        printf '%s\n' 'Refusing to run suites; check sanitizer flags and CBM_SANITIZED_BUILD wiring.' >&2
+        return 1
+    fi
+}
+
 print_env "test.sh"
 
 # ── TSan mode (--tsan): the data-race gate ──
@@ -182,6 +251,7 @@ print_env "test.sh"
 if [ "$TSAN" -eq 1 ]; then
     echo "=== test.sh: TSan leg (make test-tsan) ==="
     make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner-tsan" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    assert_test_runner_build_config "$BUILD_DIR/test-runner-tsan" 1
     make -f Makefile.cbm test-tsan ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
     exit "$?"
 fi
@@ -192,6 +262,7 @@ fi
 if [ -n "$SUITES" ]; then
     echo "=== test.sh: ITERATION mode — suites: $SUITES (incremental build) ==="
     make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    assert_test_runner_build_config "$BUILD_DIR/test-runner" "$EXPECTED_SANITIZED"
     # shellcheck disable=SC2086  # suite list is deliberately word-split
     "$BUILD_DIR/test-runner" $SUITES
     exit "$?"
@@ -212,6 +283,9 @@ bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
 echo "=== Step 0d: daemon soak recovery contract ==="
 bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
 
+echo "=== Step 0d2: soak harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_soak_runtime_isolation_contract.sh"
+
 echo "=== Step 0e: Windows launcher bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
@@ -227,11 +301,20 @@ bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 echo "=== Step 0g: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
+echo "=== Step 0g2: memlab harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_memlab_runtime_isolation_contract.sh"
+
 echo "=== Step 0h: smoke release-fixture contract ==="
 bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 
 echo "=== Step 0i: parallel suite scheduler contract ==="
 bash "$ROOT/tests/test_parallel_harness_contract.sh"
+
+# Step 0i2: a red suite's summary must show the sanitizer report and the test
+# that was running, not only "FAIL" lines and a shadow-byte legend. Drives the
+# real summary functions with fabricated suite logs, so it runs everywhere.
+echo "=== Step 0i2: suite failure-report contract ==="
+bash "$ROOT/tests/test_failure_report_contract.sh"
 
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
@@ -266,6 +349,9 @@ bash "$ROOT/tests/test_release_gate_chain_contract.sh"
 echo "=== Step 0t: test runtime isolation contract (#1691) ==="
 bash "$ROOT/tests/test_runtime_isolation_contract.sh"
 
+echo "=== Step 0t2: smoke harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_smoke_runtime_isolation_contract.sh"
+
 echo "=== Step 0u: shell line-ending contract ==="
 bash "$ROOT/tests/test_shell_line_endings.sh"
 
@@ -277,6 +363,55 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
+
+# Step 0y: the Windows leg must not decide its verdict from an exit status that
+# the ssh/msys2_shell chain can mangle — a channel that turns 0 into 1 can turn
+# 1 into 0, and that direction reports a RED Windows leg as green. Runs
+# everywhere (it drives synthetic logs, no VM needed) because the guard it pins
+# is what every Windows verdict rests on.
+echo "=== Step 0y: VM leg verdict contract ==="
+bash "$ROOT/tests/test_vm_verdict_contract.sh"
+
+echo "=== Step 0y2: isolated Windows venue contract ==="
+bash "$ROOT/tests/test_vm_isolation_contract.sh"
+
+echo "=== Step 0y3: setup scripts install through the installers' verified path ==="
+bash "$ROOT/tests/test_setup_scripts_contract.sh"
+
+# Step 0z: PR CI runs only the lanes scripts/ci/select-lanes.sh selects, so a
+# wrong selection is a silent gate loss. The decision table, and the replay of
+# every September 2026 PR push and real failure against it.
+echo "=== Step 0z: PR lane selector contract ==="
+bash "$ROOT/tests/test_select_lanes.sh"
+echo "=== Step 0z1: CodeQL retraces affected prebuilt objects ==="
+bash "$ROOT/tests/test_codeql_retrace.sh"
+echo "=== Step 0z2: lane selector history replay ==="
+bash "$ROOT/scripts/test-impact/replay-selector.sh"
+echo "=== Step 0z3: lane-aware aggregate gates (ci-ok, shard union) ==="
+bash "$ROOT/tests/test_lane_gate_contract.sh"
+echo "=== Step 0z4: lane wiring (PRs select, dry run and release run all) ==="
+bash "$ROOT/tests/test_lane_wiring_contract.sh"
+echo "=== Step 0z5: test-impact shadow prediction contract ==="
+bash "$ROOT/tests/test_test_impact_predict.sh"
+# Step 0z6: the per-test coverage map must never report a test as executing
+# less than it did: every case where the builder cannot know (a killed forked
+# child, an unreadable profile, a failed suite) has to come out `incomplete`.
+echo "=== Step 0z6: per-test coverage map builder contract ==="
+bash "$ROOT/tests/test_coverage_map.sh"
+# Step 0z7: a push's incremental coverage map carries the suites it did not
+# re-run onto the new image's function table; a wrong remap would hand the PR
+# selection a map that claims tests ran functions they never touched.
+echo "=== Step 0z7: incremental coverage map merge contract ==="
+bash "$ROOT/tests/test_coverage_merge.sh"
+# Step 0z8: the one place a test-impact answer becomes what PR CI runs. Only a
+# well-formed, self-consistent selection may narrow; everything else runs all.
+echo "=== Step 0z8: test selection (answer -> runner filter) contract ==="
+bash "$ROOT/tests/test_test_impact_selection.sh"
+
+if [ "$CONTRACTS_ONLY" -eq 1 ]; then
+    echo "=== test.sh: contracts-only — every contract step passed ==="
+    exit 0
+fi
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
@@ -290,11 +425,54 @@ BUILD_DIR="$BUILD_DIR" scripts/clean.sh
 # pass/fail/skip totals aggregate to the same numbers as the sequential run).
 # CBM_TEST_SEQUENTIAL=1 restores the single-process runner.
 make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+assert_test_runner_build_config "$BUILD_DIR/test-runner" "$EXPECTED_SANITIZED"
+
+# Step 2b: per-test selection process regression. CBM_TEST_ONLY must run exactly
+# the tests it names and fail on a token that matches nothing; a suite cannot
+# assert that about the runner executing it. Runs against the runner just built
+# and BEFORE the suites: it takes seconds, and a selection that silently drops
+# tests is a property of the harness every later result depends on.
+echo "=== Step 2b: per-test selection regression (CBM_TEST_ONLY) ==="
+CBM_TEST_RUNNER="$ROOT/$BUILD_DIR/test-runner" bash "$ROOT/tests/test_harness_test_only.sh"
+# Step 2c: PR CI's test selection (smart CI) through the parallel harness — the
+# selected suites only, unknown suites and tests fail, conditional ones drop.
+echo "=== Step 2c: parallel-harness test selection regression ==="
+CBM_TEST_RUNNER="$ROOT/$BUILD_DIR/test-runner" bash "$ROOT/tests/test_harness_selection.sh"
+
+# PR CI's test selection (smart CI, the select-tests job) narrows the parallel
+# suite step and nothing else (scripts/run-tests-parallel.sh). A selection that
+# was promised but is missing is a plumbing fault: fail, never run silently.
+SELECTION_ENV=()
+if [ -n "${CBM_TEST_SELECTION_DIR:-}" ]; then
+    selection_dir="$CBM_TEST_SELECTION_DIR"
+    if command -v cygpath > /dev/null 2>&1; then
+        selection_dir="$(cygpath -u "$selection_dir")"
+    fi
+    if [ ! -s "$selection_dir/test-only.txt" ]; then
+        echo "FAIL: CBM_TEST_SELECTION_DIR=$CBM_TEST_SELECTION_DIR holds no test-only.txt" >&2
+        exit 1
+    fi
+    SELECTION_ENV=(CBM_TEST_SELECTION_FILE="$selection_dir/test-only.txt")
+    if [ -f "$selection_dir/optional-suites.txt" ]; then
+        SELECTION_ENV+=(CBM_TEST_SELECTION_OPTIONAL="$selection_dir/optional-suites.txt")
+    fi
+    if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
+        echo "test.sh: CBM_TEST_SEQUENTIAL=1 runs every test; the selection narrows the parallel harness only"
+    fi
+fi
+
 if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
     make -f Makefile.cbm test ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 else
-    make -f Makefile.cbm test-par ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+    env ${SELECTION_ENV[@]+"${SELECTION_ENV[@]}"} \
+        make -f Makefile.cbm test-par ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 fi
+
+# Step 3a: the runner must ignore an inherited git repository environment
+# (#2003: the pre-commit hook exports GIT_DIR, which overrides `git -C` and
+# pointed fixture git commands at the committer's real repository).
+echo "=== Step 3a: inherited git environment isolation (#2003) ==="
+bash "$ROOT/tests/test_git_env_isolation_contract.sh" "$ROOT/$BUILD_DIR/test-runner"
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
@@ -317,6 +495,15 @@ echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
+
+# Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which
+# makes it the first casualty when static TLS grows — glibc takes the TLS block
+# out of each thread's own stack allocation. Checked here, against the binary
+# Step 5 just built, because the failure it prevents surfaces nowhere near its
+# cause (PR #2233: a thread-local cache in an extraction file stopped the index
+# worker from starting, on x86-64 only).
+echo "=== Step 5a: static-TLS budget against the smallest thread stack ==="
+bash "$ROOT/tests/test_thread_stack_tls_contract.sh" "$WATCHDOG_BINARY"
 
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
 # (`cli --index-worker …`) whose supervisor dies must self-exit instead of

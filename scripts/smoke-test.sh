@@ -22,6 +22,8 @@ they stage the release fixture, start the fixture server, and sandbox
 HOME/TEMP/agent-config destinations. Called bare, the download/checksum/
 install-script phases (12-13) SKIP for lack of a fixture server, and the run
 mutates the REAL profile — the venue-parity contract forbids that in any venue.
+The daemon runtime and cache are private to the run either way: every product
+process is started under a CBM_RUNTIME_DIR/CBM_CACHE_DIR this harness owns.
 
 Arguments:
   <binary-path>         product binary to smoke
@@ -40,6 +42,20 @@ if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
   exit 2
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+
+# Every product process below — the phases, the install/update E2E and the
+# daemon retirements — must reach a daemon rendezvous this run owns. Only
+# CBM_RUNTIME_DIR moves that rendezvous; the wrappers' HOME/TMPDIR/CBM_CACHE_DIR
+# sandbox does not, so without this the retirements land on the operator's live
+# account daemon (#1691, #1696).
+# shellcheck source=test-runtime.sh
+source "$REPO_ROOT/scripts/test-runtime.sh"
+cbm_test_runtime_init
+# Armed here rather than only with the fixture trap below: the fixture mktemp
+# and its cygpath conversion sit between the two, and under `set -e` a failure
+# there would otherwise leave the private root behind. The fixture trap
+# replaces this one and keeps the same cleanup as its first step.
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 smoke_mktemp_file() {
   if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
@@ -100,8 +116,18 @@ copy_smoke_binary() {
   cp "$BINARY" "$destination"
 }
 
-# Retire the shared account daemon (if one is running) and wait until it
-# reports not-running. Install/uninstall flows leave an ephemeral daemon
+# A fixture home that belongs to a Claude Code user. An empty ~/.claude is not
+# evidence of one (#1180: other tools create that directory, and install then
+# configured a client the user never had); the user config Claude Code itself
+# writes is. Same seed as test_mark_claude_code_installed in tests/test_cli.c.
+mark_claude_code_installed() {
+  local home="$1"
+  mkdir -p "$home/.claude"
+  echo '{}' > "$home/.claude.json"
+}
+
+# Retire this run's private account daemon (if one is running) and wait until
+# it reports not-running. Install/uninstall flows leave an ephemeral daemon
 # draining asynchronously whose mapped generation backing and open logs
 # block rm on Windows (POSIX rm doesn't care) — so every cleanup of a
 # fixture HOME that received an install, and the final cache removal, must
@@ -149,7 +175,11 @@ CODEX_LIFECYCLE_HOME=""
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
+# Runtime cleanup first, so no earlier cleanup step stands between the exit
+# and the private daemon's retirement; on Windows that retirement is also what
+# unblocks the fixture rm (mapped binary, open logs). smoke_rmtree never fails,
+# so the fixture removal still runs after it.
+trap 'cbm_test_runtime_cleanup "$BINARY"; smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
 
 CLI_STDERR=$(smoke_mktemp_file)
 # 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
@@ -172,6 +202,29 @@ cli() {
     } >&2
   fi
   return "$rc"
+}
+
+# A worker failure says "inspect log: <path>" — and in CI that path dies with the
+# job's sandbox, so the one artifact naming the cause is the one nobody can open.
+# A worker killed by a signal writes no summary of its own either, which is
+# exactly the case that most needs the log (PR #2233: "index worker ended with
+# killed (exit=-1, signal=9)" on ubuntu-latest, unreproducible on every local
+# venue). Print it while it still exists.
+smoke_dump_worker_log() {
+  local log
+  log=$(sed -n 's/.*inspect log: \([^ ]*\).*/\1/p' "$CLI_STDERR" 2>/dev/null | tail -1)
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    # The path is only printed for some failures; fall back to the newest log
+    # the run produced.
+    log=$(ls -t "${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"/logs/.worker-log-* 2>/dev/null | head -1)
+  fi
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    echo "--- worker log: $log ---"
+    tail -80 "$log"
+    echo "--- end worker log ---"
+  else
+    echo "--- no worker log found (cache ${CBM_CACHE_DIR:-unset}) ---"
+  fi
 }
 
 echo "=== Phase 1: version ==="
@@ -334,6 +387,7 @@ GENEOF
 if ! RESULT=$(cli index_repository --repo-path "$TMPDIR"); then
   echo "FAIL: index_repository (flag form) exited non-zero"
   cat "$CLI_STDERR"
+  smoke_dump_worker_log
   exit 1
 fi
 echo "$RESULT"
@@ -2082,27 +2136,33 @@ sys.exit(0 if ok else 1)
 fi
 echo "OK 8w-ii: Kiro MCP + steering + isolated exact-tool graph agent"
 
-# 8x: Hermes Agent YAML MCP mapping
+# 8x: Hermes Agent YAML MCP mapping. Native Windows Hermes keeps its home in
+# %LOCALAPPDATA%\hermes (#1180); the stub-only FAKE_HOME has no legacy ~/.hermes.
+if [[ "$BINARY" == *.exe ]]; then
+  HERMES_HOME_DIR="$FAKE_HOME/AppData/Local/hermes"
+else
+  HERMES_HOME_DIR="$FAKE_HOME/.hermes"
+fi
 HERMES_CMD=$(sed -n '/^  codebase-memory-mcp:/{n;s/^ *command: *//p;}' \
-  "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null | head -1)
-if ! grep -q '^mcp_servers:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
-   ! grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+  "$HERMES_HOME_DIR/config.yaml" 2>/dev/null | head -1)
+if ! grep -q '^mcp_servers:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+   ! grep -q '^  codebase-memory-mcp:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
    ! quoted_path_value_matches "$HERMES_CMD" "$SELF_PATH"; then
   echo "FAIL 8x: Hermes MCP mapping missing or malformed"
   exit 1
 fi
 echo "OK 8x: Hermes Agent MCP"
-if ! grep -q '^name: codebase-memory$' "$FAKE_HOME/.hermes/skills/codebase-memory/SKILL.md" 2>/dev/null ||
-   ! grep -q 'delegate_task' "$FAKE_HOME/.hermes/skills/codebase-memory/SKILL.md" 2>/dev/null ||
-   ! grep -q '`context`' "$FAKE_HOME/.hermes/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+if ! grep -q '^name: codebase-memory$' "$HERMES_HOME_DIR/skills/codebase-memory/SKILL.md" 2>/dev/null ||
+   ! grep -q 'delegate_task' "$HERMES_HOME_DIR/skills/codebase-memory/SKILL.md" 2>/dev/null ||
+   ! grep -q '`context`' "$HERMES_HOME_DIR/skills/codebase-memory/SKILL.md" 2>/dev/null; then
   echo "FAIL 8x-i: Hermes delegation skill missing"
   exit 1
 fi
 echo "OK 8x-i: Hermes durable delegation skill"
-if ! grep -q '^hooks:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
-   ! grep -q '^  pre_llm_call:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
-   ! grep -q 'hook-augment' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
-   ! grep -q -- '--dialect hermes' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null; then
+if ! grep -q '^hooks:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+   ! grep -q '^  pre_llm_call:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+   ! grep -q 'hook-augment' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+   ! grep -q -- '--dialect hermes' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null; then
   echo "FAIL 8x-ii: Hermes pre_llm_call context hook missing"
   exit 1
 fi
@@ -3104,8 +3164,8 @@ fi
 echo "OK 9l: JSON agents, lifecycle hooks, and Kilo cleaned; foreign settings preserved"
 
 # 9m: YAML/TOML new agents are cleaned.
-if grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
-   grep -q '^  pre_llm_call:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+if grep -q '^  codebase-memory-mcp:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
+   grep -q '^  pre_llm_call:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null ||
    grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
    grep -q 'codebase-memory-mcp' "$FAKE_HOME/.grok/config.toml" 2>/dev/null ||
    grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
@@ -3159,7 +3219,7 @@ echo "OK 9m-i: durable instruction blocks removed"
 
 # 9n: Skills removed (consolidated skill dir)
 if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ] ||
-   [ -d "$FAKE_HOME/.hermes/skills/codebase-memory" ] ||
+   [ -d "$HERMES_HOME_DIR/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.agents/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.qoder/skills/codebase-memory" ] ||
    [ -d "$CUSTOM_KIMI_HOME/skills/codebase-memory" ] ||
@@ -3237,9 +3297,40 @@ echo "OK 9b-1: install with minimal agents exits cleanly"
 retire_account_daemon "9b-1-cleanup"
 smoke_rmtree "$EMPTY_HOME"
 
+# 9b-1b (#1180): an empty ~/.claude directory is not a Claude Code install.
+# The empty home above is this venue's control: where it showed no Claude Code,
+# the same home plus a bare ~/.claude must not be configured for it either.
+#
+# SKIP_WHITELIST: a venue with a claude executable (a developer machine) detects
+# Claude Code in every home, so there is nothing for the bare directory to
+# change. Narrowing PATH for this one install does not make such a venue
+# claude-free: with HOME as the scanned home the product also probes fixed
+# locations (/usr/local/bin, /opt/homebrew/bin). A venue without one, such as
+# the Linux test image, runs the check.
+if grep -q 'Detected agents:.* Claude-Code' <<<"$INSTALL_OUT"; then
+  echo "SKIP 9b-1b: a claude executable is installed in this venue (whitelisted above)"
+else
+  BARE_HOME=$(smoke_mktemp_dir)
+  mkdir -p "$BARE_HOME/.claude" "$BARE_HOME/.local/bin"
+  BARE_RC=0
+  BARE_OUT=$(HOME="$BARE_HOME" LOCALAPPDATA="$BARE_HOME/AppData/Local" "$BINARY" install -y 2>&1) || BARE_RC=$?
+  if [ "$BARE_RC" -ge 128 ] ||
+     ! grep -q 'Detected agents:' <<<"$BARE_OUT" ||
+     grep -q 'Detected agents:.* Claude-Code' <<<"$BARE_OUT" ||
+     [ -e "$BARE_HOME/.claude.json" ] ||
+     [ -n "$(ls -A "$BARE_HOME/.claude" 2>/dev/null)" ]; then
+    echo "FAIL 9b-1b: a bare ~/.claude directory was configured as a Claude Code install"
+    exit 1
+  fi
+  echo "OK 9b-1b: a bare ~/.claude directory is not configured as Claude Code"
+  retire_account_daemon "9b-1b-cleanup"
+  smoke_rmtree "$BARE_HOME"
+fi
+
 # 9b-2: Install twice (idempotent)
 IDEM_HOME=$(smoke_mktemp_dir)
-mkdir -p "$IDEM_HOME/.claude" "$IDEM_HOME/.local/bin"
+mkdir -p "$IDEM_HOME/.local/bin"
+mark_claude_code_installed "$IDEM_HOME"
 copy_smoke_binary "$IDEM_HOME/.local/bin/codebase-memory-mcp"
 run_no_crash 9b-2 env HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$BINARY" install -y
 IDEM_INSTALLER="$BINARY"
@@ -3263,7 +3354,8 @@ smoke_rmtree "$IDEM_HOME"
 
 # 9b-3: Uninstall without prior install
 CLEAN_HOME=$(smoke_mktemp_dir)
-mkdir -p "$CLEAN_HOME/.claude" "$CLEAN_HOME/.local/bin"
+mkdir -p "$CLEAN_HOME/.local/bin"
+mark_claude_code_installed "$CLEAN_HOME"
 UNINSTALL_RC=0
 UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$BINARY" uninstall -y -n 2>&1) || UNINSTALL_RC=$?
 if [ "$UNINSTALL_RC" -ge 128 ]; then
@@ -3287,7 +3379,8 @@ smoke_rmtree "$CORRUPT_HOME"
 
 # 9b-8: Double uninstall
 DBL_HOME=$(smoke_mktemp_dir)
-mkdir -p "$DBL_HOME/.claude" "$DBL_HOME/.local/bin"
+mkdir -p "$DBL_HOME/.local/bin"
+mark_claude_code_installed "$DBL_HOME"
 copy_smoke_binary "$DBL_HOME/.local/bin/codebase-memory-mcp"
 run_no_crash 9b-8-install env HOME="$DBL_HOME" "$BINARY" install -y
 DBL_UNINSTALLER="$BINARY"
@@ -3784,7 +3877,7 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
   echo "--- Phase 13: install.sh E2E ---"
   INSTALL_TEST_HOME=$(smoke_mktemp_dir)
   INSTALL_TEST_DIR=$(smoke_mktemp_dir)
-  mkdir -p "$INSTALL_TEST_HOME/.claude"
+  mark_claude_code_installed "$INSTALL_TEST_HOME"
   mkdir -p "$INSTALL_TEST_HOME/.local/bin"
 
   # 13a: run install.sh with local URL + isolated HOME
@@ -3821,7 +3914,8 @@ if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
     echo "OK 13d: no signing needed ($DL_OS)"
   fi
 
-  # 13e: agent configs created (at least Claude Code since we made ~/.claude)
+  # 13e: agent configs created (at least Claude Code: the fixture home is a
+  # Claude Code user's)
   if [ -f "$INSTALL_TEST_HOME/.claude.json" ] && grep -q 'codebase-memory-mcp' "$INSTALL_TEST_HOME/.claude.json" 2>/dev/null; then
     echo "OK 13e: agent configs created by install.sh"
   else
@@ -3848,7 +3942,7 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   echo "--- Phase 13: install.ps1 E2E (Windows) ---"
   PS1_TEST_HOME=$(smoke_mktemp_dir)
   PS1_TEST_DIR=$(smoke_mktemp_dir)
-  mkdir -p "$PS1_TEST_HOME/.claude"
+  mark_claude_code_installed "$PS1_TEST_HOME"
 
   # Convert MSYS paths to Windows paths for PowerShell
   if command -v cygpath &>/dev/null; then
@@ -3900,6 +3994,18 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   smoke_rmtree "$PS1_TEST_HOME" "$PS1_TEST_DIR"
 else
   echo "SKIP Phase 13: no install script available for this platform"
+fi
+
+# ── Phase 13w: package-wrapper install E2E ──
+# The npm, PyPI and Go wrappers install the same release archive as above,
+# from this checkout, the way a user's package manager runs them (#2657: a
+# wrapper cap refused every shipped binary). SMOKE_REQUIRE_WRAPPERS=1 (CI)
+# makes a missing node/python/go toolchain a failure, not a skip.
+echo ""
+echo "--- Phase 13w: package-wrapper install E2E ---"
+if ! bash "$REPO_ROOT/scripts/smoke-wrappers.sh" "$SMOKE_DOWNLOAD_URL"; then
+  echo "FAIL 13w: a package wrapper could not install the release binary"
+  exit 1
 fi
 
 else

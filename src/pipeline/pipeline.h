@@ -19,8 +19,9 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-#include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
-#include "foundation/constants.h" /* CBM_SZ_512 */
+#include "discover/discover.h"     /* cbm_ignored_file_t (#963) */
+#include "foundation/constants.h"  /* CBM_SZ_512 */
+#include "foundation/hash_table.h" /* CBMHashTable (#1355 pkgmap lookup) */
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -53,6 +54,31 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Doc -> code candidates (the doc_candidates setting). Never set, the index
+ * mode decides: on for full, off for moderate and fast. The setter makes an
+ * explicit choice that wins in every mode. Off skips scoring documentation
+ * sections against code and leaves the project with no doc_link_candidates
+ * rows; nodes and edges are unchanged. On in fast mode scores them without
+ * fast's skipped SIMILAR_TO / SEMANTICALLY_RELATED edges. The scoring grows
+ * with sections x functions, which is the cost on very large repositories.
+ * enabled() reports the effective choice for the pipeline's current mode. */
+void cbm_pipeline_set_doc_candidates_enabled(cbm_pipeline_t *p, bool enabled);
+bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
+
+/* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
+ * when the run succeeded / did not reach post-publish export. Used to
+ * truthfully attribute a failed run to the persistence export (#1665) instead
+ * of the generic pipeline-error hint. Valid until the next cbm_pipeline_run or
+ * cbm_pipeline_free(). Returns "" for NULL p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -71,6 +97,8 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * written, the previous DB is intact (#1997 #832). Distinct from the cancel
  * sentinel so callers can name the cause instead of "pipeline failed". */
 #define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
+/* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
+#define CBM_PIPELINE_RESOURCE_LIMIT (-6)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
@@ -173,6 +201,12 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
 
+/* Length of the prefix cbm_pipeline_fqn_compute(project, rel_path, name) puts
+ * before a symbol `name` (the joining dot excluded): the QN prefix every
+ * definition of that file carries, __init__ / index already dropped. Computed
+ * without allocating; 0 when unavailable. */
+size_t cbm_pipeline_fqn_symbol_prefix_len(const char *project, const char *rel_path);
+
 /* Language-aware module QN. When `module_is_dir` is true (Java/Go package
  * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
  * stem is dropped), so it agrees with the extraction-side def QNs; when false
@@ -197,6 +231,13 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
  * Caller must free() the returned string. */
 char *cbm_project_name_from_path(const char *abs_path);
 
+/* The name-mapping half of cbm_project_name_from_path, WITHOUT path
+ * canonicalization: maps any string to the stored project-name form (unsafe
+ * ASCII -> '-', non-ASCII bytes -> two hex digits, dash/dot collapse, trim,
+ * #624 length cap). Lets a selector such as a bare non-ASCII folder name be
+ * encoded exactly like the segment it came from (#1827). Caller frees. */
+char *cbm_project_name_sanitize(const char *name_path);
+
 /* ── Function Registry ──────────────────────────────────────────── */
 
 typedef struct cbm_registry cbm_registry_t;
@@ -212,9 +253,55 @@ typedef struct {
 cbm_registry_t *cbm_registry_new(void);
 void cbm_registry_free(cbm_registry_t *r);
 
-/* Register a function/method/class. All strings are copied. */
+/* Register a function/method/class. All strings are copied. The entry's
+ * language is unknown, so name-based resolution never filters it out. */
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
+
+/* As cbm_registry_add, recording `lang`: the DETECTED language of the file
+ * that defines the symbol (CBM_LANG_COUNT = unknown), which the cross-language
+ * veto (cbm_registry_name_guess_vetoed) checks against the caller. Detects no
+ * function-local symbols: that needs the defining file's module QN, see
+ * cbm_registry_add_lang_in_module. */
+void cbm_registry_add_lang(cbm_registry_t *r, const char *name, const char *qualified_name,
+                           const char *label, CBMLanguage lang);
+
+/* As cbm_registry_add_lang. A Python symbol declared inside a function body of
+ * its own file (cbm_registry_qn_is_function_local, bounded by
+ * `module_prefix_len`: cbm_pipeline_fqn_symbol_prefix_len of the defining file)
+ * is registered for exact lookups only, never offered to the short-name
+ * strategies. The three graph
+ * registration sites (pass_definitions.c, pass_parallel.c,
+ * pipeline_incremental.c) all register through this, so full and incremental
+ * indexes agree. 0 = no local detection. */
+void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
+                                     const char *qualified_name, const char *label,
+                                     CBMLanguage lang, size_t module_prefix_len);
+
+/* True when code in `caller` can call a symbol defined in `target` by bare
+ * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
+ * ObjC, JVM, .NET, ...; the table lives in registry.c), or Swift with the C
+ * family. An unknown language (CBM_LANG_COUNT) on either side is compatible. */
+bool cbm_lang_resolution_compatible(CBMLanguage caller, CBMLanguage target);
+
+/* Language of a synthetic definition source minted by a language's own LSP
+ * layer ("<python-builtins>" -> Python, "<kotlin-builtins>" -> Kotlin);
+ * CBM_LANG_COUNT for anything else. */
+CBMLanguage cbm_registry_synthetic_path_language(const char *file_path);
+
+/* True when a proper prefix of `qualified_name` longer than
+ * `module_prefix_len` (cbm_pipeline_fqn_symbol_prefix_len of the defining file)
+ * is a registered Function or Method, i.e. the symbol was declared inside a
+ * function body of its own file. False when module_prefix_len is 0. */
+bool cbm_registry_qn_is_function_local(const cbm_registry_t *r, const char *qualified_name,
+                                       size_t module_prefix_len);
+
+/* Python bare-name lexical lookup: the def or class named `callee_name` bound
+ * in the nearest function scope enclosing `scope_qn` (the caller's QN),
+ * skipping class bodies, stopping at the caller's module (`module_qn`).
+ * Strategy "lexical_scope"; qualified_name is NULL when no such local exists. */
+cbm_resolution_t cbm_registry_resolve_lexical(const cbm_registry_t *r, const char *callee_name,
+                                              const char *scope_qn, const char *module_qn);
 
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
@@ -226,6 +313,21 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Cross-language veto for a CALLS resolution made by a caller written in
+ * `caller_lang` (its file's detected language). True when `res` is a
+ * name-only answer (qualified_suffix, unique_name, suffix_match, the
+ * parallel field_type_hint re-pick, or same_module: two files of different
+ * languages with the same path stem share a module QN) whose target's recorded language the
+ * caller cannot call (cbm_lang_resolution_compatible): a JS call must never
+ * bind a Python symbol by spelling alone. Callers treat a vetoed answer as
+ * EMPTY before their empty-resolution fallbacks (route registration, HTTP
+ * clients), so those still classify the call. A veto, not a re-pick: the
+ * strategy chain is unchanged. Import-map and lsp_* answers are never
+ * vetoed; CBM_LANG_COUNT never vetoes. pass_calls.c and pass_parallel.c
+ * MUST apply it identically. Pure; unit-tested in test_registry.c. */
+bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_lang,
+                                    const cbm_resolution_t *res);
 
 /* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
  * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
@@ -285,6 +387,20 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
+/* True if `name` is a method of a Python builtin type (str/bytes/list/dict/set/
+ * file) or a builtin function seen as an attribute call. A language fact, kept
+ * as a sorted table like the Perl builtins. */
+bool cbm_python_is_builtin_member(const char *name);
+
+/* The member guard's exemption: a Python member call whose receiver is an
+ * attribute chain rooted at self/cls (an object the class owns), whose callee has
+ * exactly one project definition (strategy unique_name) and is not a builtin
+ * type's own method keeps its edge. Combine at the call sites as
+ * `suppress && !exempt`; both pass_calls.c and pass_parallel.c must do the same.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy);
+
 /* Bare-call counterpart of the guard above. True when a resolved BARE call edge
  * binds a callee that is shadowed by an enclosing parameter, and the match came
  * from a weak short-name strategy — so the edge is fabricated by construction
@@ -296,6 +412,44 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
+/* #1355: drop a project-wide same-name guess (suffix_match / unique_name /
+ * field_type_hint / fuzzy) for a BARE call whose name the calling file binds to
+ * a NON-RELATIVE (package) import that resolved to nothing in the graph —
+ * `import { eq } from "drizzle-orm"` must not make `eq(...)` a CALLS edge to an
+ * unrelated project `eq`. A name the import map does bind, a relative
+ * specifier, a member/qualified callee, and every import-/receiver-aware
+ * strategy are all kept. `indexed_packages` is the pipeline package map: a
+ * specifier naming a package the tree itself declares (a workspace sibling)
+ * counts as in-tree and is kept too; NULL disables that check.
+ * `declared_packages` is the pipeline namespace map and does the same job for
+ * package-path specifiers, which have no in-tree/external shape of their own:
+ * `import org.example.util.assertThing` is kept when some indexed file
+ * declares `package org.example.util`; NULL disables that check.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
+                                         const CBMImportArray *file_imports,
+                                         const char **import_map_keys, int import_map_count,
+                                         const CBMHashTable *indexed_packages,
+                                         const CBMHashTable *declared_packages);
+
+/* Go analog of the TS/JS guard, same failure class: a selector call whose
+ * receiver the Go LSP could not type must not be bound by a receiver-blind
+ * short-name strategy. Drops suffix_match / fuzzy always, and unique_name only
+ * when its confidence is import-unreachability-penalized (the stdlib/vendor
+ * hijack shape). field_type_hint is deliberately NOT dropped for Go — struct
+ * fields carry declared types, so the hint is receiver-aware there. */
+bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
+                                       double confidence);
+
+/* Import-binding counterpart (#2127). True when the callee's root identifier
+ * is bound by an import of this file whose module chain contradicts the
+ * resolved target (`from unittest.mock import patch; patch()` must not bind a
+ * project `PkgConfigView.patch`), and the match came from a weak short-name
+ * strategy. Same drop-list as the guards above; the language set lives at the
+ * call sites and must be identical in pass_calls.c and pass_parallel.c.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
+                                         const char *strategy);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
@@ -321,13 +475,57 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
  * unit-tested in test_registry.c. */
 bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
+/* What to do with a call whose registry resolution landed on a Field node.
+ * Pure; unit-tested in test_registry.c. */
+typedef enum {
+    CBM_FIELD_CALL_KEEP = 0, /* not a Field target, or a language this rule leaves alone */
+    CBM_FIELD_CALL_DROP,     /* a Field can never be this call's target */
+    CBM_FIELD_CALL_BY_OWNER, /* C/C++ member call: the object's type names the Field */
+} cbm_field_call_policy_t;
+cbm_field_call_policy_t cbm_call_onto_field_policy(CBMLanguage caller_lang, const char *callee_text,
+                                                   const char *target_label,
+                                                   const char *target_file_path);
+
+/* True for a C/C++ call spelled through an arrow (`p->open(fd)`). The
+ * short-name registry splits a callee on `.` and `::` only, so such a call
+ * comes back from it unresolved; the caller then asks the object's type for
+ * the member, as for a dot call. Pure; unit-tested in test_registry.c. */
+bool cbm_c_arrow_member_call(CBMLanguage caller_lang, const char *callee_text);
+
+/* True when a reference is the member half of a C `a.b` / `a->b`. Such a
+ * reference binds through the C LSP's field-owner rows (the type of `a`); with
+ * no typed owner it binds only cbm_registry_unique_field_qn(). C only. Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access);
+
+/* True when a file's member accesses follow the C member rule above: every C
+ * file, and every `.h`. A `.h` is parsed as C++ because it may be either, and
+ * `a.b` / `a->b` means the same in both: the type of `a` names `b`. Without it
+ * the inline functions of a C header kept binding members by bare name. Other
+ * C++ files are left to their own resolution. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_c_member_rule_file(CBMLanguage lang, const char *rel_path);
+
+/* The QN of the Field `member_name` names when exactly one Field in the
+ * registry carries that name (symbols of other labels are not candidates for
+ * a member); NULL when none or several do. */
+const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
+
+/* A read, a write or a plain value reference never denotes a call: when `qn`
+ * is a Method whose class body also declares a same-named field (the extractor
+ * fences that field as `<qn>#field`), the field is the target. Returns the
+ * field's QN, else `qn`. Pure; unit-tested in test_registry.c. */
+const char *cbm_registry_value_target(const cbm_registry_t *r, const char *qn);
 
 /* Find all QNs with a given simple name. Sets *out and *count.
  * Caller does NOT free the array (owned by registry). */
 int cbm_registry_find_by_name(const cbm_registry_t *r, const char *name, const char ***out,
                               int *count);
+
+bool cbm_registry_has_type_named(const cbm_registry_t *r, const char *name);
 
 /* Return total number of entries. */
 int cbm_registry_size(const cbm_registry_t *r);

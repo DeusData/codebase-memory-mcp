@@ -193,6 +193,101 @@ TEST(store_project_delete) {
     PASS();
 }
 
+/* ── QN suffix / callable-base lookups (#2061) ─────────────────── */
+
+static void qn_lookup_node(cbm_store_t *s, const char *name, const char *qn) {
+    cbm_node_t n = {.project = "test",
+                    .label = "Method",
+                    .name = name,
+                    .qualified_name = qn,
+                    .file_path = "a.java",
+                    .start_line = 1,
+                    .end_line = 2};
+    cbm_store_upsert_node(s, &n);
+}
+
+/* The suffix tier matches its text literally: '_' is not a LIKE wildcard,
+ * so `my_func` must not also find `myXfunc`. */
+TEST(store_qn_suffix_is_literal) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    qn_lookup_node(s, "my_func", "test.a.my_func");
+    qn_lookup_node(s, "myXfunc", "test.a.myXfunc");
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "test", "my_func", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "test.a.my_func");
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A suffix longer than the old 512-byte pattern buffer is not truncated into
+ * a pattern that matches nothing. */
+TEST(store_qn_suffix_is_unbounded) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    char leaf[601];
+    memset(leaf, 'a', sizeof(leaf) - 1);
+    leaf[sizeof(leaf) - 1] = '\0';
+    char long_qn[640];
+    char long_suffix[640];
+    snprintf(long_qn, sizeof(long_qn), "test.m.%s", leaf);
+    snprintf(long_suffix, sizeof(long_suffix), "m.%s", leaf);
+    qn_lookup_node(s, leaf, long_qn);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "test", long_suffix, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, long_qn);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A bare base QN (exact, or as a dotted suffix) finds every signature-
+ * qualified overload of it, and never an unsuffixed QN — so the tier is inert
+ * until a language mints suffixes. */
+TEST(store_qn_base_finds_overloads_only) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    qn_lookup_node(s, "work", "test.S.work(int)");
+    qn_lookup_node(s, "work", "test.S.work(String)");
+    qn_lookup_node(s, "work", "test.S.work");
+    qn_lookup_node(s, "workx", "test.S.workx(int)");
+    qn_lookup_node(s, "operator()", "test.S.operator()");
+    qn_lookup_node(s, "Work", "test.C.Work<T>(T)");
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.S.work", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "S.work", true, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.C.Work", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(nodes, count);
+
+    /* `operator()` is a bare C++ leaf, not "operator" + "()". */
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.S.operator", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Node CRUD ──────────────────────────────────────────────────── */
 
 TEST(store_node_crud) {
@@ -303,6 +398,122 @@ TEST(store_node_find_by_label) {
     ASSERT_STR_EQ(nodes[0].name, "B");
     cbm_store_free_nodes(nodes, count);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+static bool scan_str_same(const char *a, const char *b) {
+    return (!a && !b) || (a && b && strcmp(a, b) == 0);
+}
+
+static bool scan_node_same(const cbm_node_t *a, const cbm_node_t *b) {
+    return a->id == b->id && scan_str_same(a->project, b->project) &&
+           scan_str_same(a->label, b->label) && scan_str_same(a->name, b->name) &&
+           scan_str_same(a->qualified_name, b->qualified_name) &&
+           scan_str_same(a->file_path, b->file_path) && a->start_line == b->start_line &&
+           a->end_line == b->end_line && scan_str_same(a->properties_json, b->properties_json);
+}
+
+/* The streamed scan gives the eager scan's rows, field for field and in the
+ * same order, at any batch size, while other lookups (including the eager
+ * scans' own cached statements) run between batches. Returns the row count,
+ * or -1 on the first difference; *paged tells whether the scan paged. */
+static int scan_matches_eager(cbm_store_t *s, const char *project, const char *label, int batch,
+                              bool *paged) {
+    cbm_node_t *eager = NULL;
+    int n = 0;
+    int rc = label ? cbm_store_find_nodes_by_label(s, project, label, &eager, &n)
+                   : cbm_store_find_nodes(s, project, &eager, &n);
+    if (rc != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_node_scan_t *scan = cbm_store_node_scan_open(s, project, label);
+    *paged = cbm_store_node_scan_paged(scan);
+    cbm_node_t buf[64];
+    int seen = 0;
+    bool same = scan != NULL && batch <= 64;
+    int got = 0;
+    while (same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got > 0) {
+        for (int i = 0; i < got; i++, seen++) {
+            same = same && seen < n && scan_node_same(&buf[i], &eager[seen]);
+            cbm_node_free_fields(&buf[i]);
+        }
+        cbm_node_t *other = NULL;
+        int other_n = 0;
+        (void)cbm_store_find_nodes(s, project, &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+        (void)cbm_store_find_nodes_by_label(s, project, "Class", &other, &other_n);
+        cbm_store_free_nodes(other, other_n);
+    }
+    /* An exhausted scan stays exhausted. */
+    same = same && cbm_store_node_scan_next(scan, buf, batch, &got) == CBM_STORE_OK && got == 0;
+    cbm_store_node_scan_close(scan);
+    cbm_store_free_nodes(eager, n);
+    return same && seen == n ? n : -1;
+}
+
+/* Pages of 1, 3 and 64 rows end inside files, at file boundaries and inside
+ * the NULL file_path rows, which the eager all-nodes order puts first. The
+ * upsert API stores "" for a missing path; other writers may store NULL. */
+TEST(store_node_scan_streams_eager_scan_order) {
+    enum { SCAN_NODES = 60 };
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_project(s, "other", "/tmp/other");
+    static const char *const labels[] = {"Function", "Class", "Method"};
+    static const char *const files[] = {"b.c", "a.c", "", "c.c"};
+    int in_test = 0;
+    int test_functions = 0;
+    int other_methods = 0;
+    for (int i = 0; i < SCAN_NODES; i++) {
+        bool other = i % 4 == 3;
+        char name[32];
+        char qn[64];
+        char props[64];
+        snprintf(name, sizeof(name), "n%d", (i * 17) % 40);
+        snprintf(qn, sizeof(qn), "%s.n%d", other ? "other" : "test", i);
+        snprintf(props, sizeof(props), "{\"complexity\":%d}", i);
+        cbm_node_t n = {.project = other ? "other" : "test",
+                        .label = labels[i % 3],
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = files[(i / 2) % 4],
+                        .start_line = i,
+                        .end_line = i + 5,
+                        .properties_json = i % 5 ? props : NULL};
+        ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
+        in_test += other ? 0 : 1;
+        test_functions += !other && i % 3 == 0 ? 1 : 0;
+        other_methods += other && i % 3 == 2 ? 1 : 0;
+    }
+    ASSERT_EQ(cbm_store_exec(s, "UPDATE nodes SET file_path = NULL WHERE start_line % 7 = 0;"), 0);
+    cbm_node_t *eager = NULL;
+    int eager_n = 0;
+    ASSERT_EQ(cbm_store_find_nodes(s, "test", &eager, &eager_n), CBM_STORE_OK);
+    ASSERT_TRUE(eager_n > 0 && eager[0].file_path == NULL); /* NULL rows come first */
+    cbm_store_free_nodes(eager, eager_n);
+
+    static const int batches[] = {1, 3, 64};
+    bool paged = false;
+    for (size_t b = 0; b < sizeof(batches) / sizeof(batches[0]); b++) {
+        ASSERT_EQ(scan_matches_eager(s, "test", NULL, batches[b], &paged), in_test);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "test", "Function", batches[b], &paged), test_functions);
+        ASSERT_TRUE(paged);
+        ASSERT_EQ(scan_matches_eager(s, "other", NULL, batches[b], &paged),
+                  SCAN_NODES - in_test); /* project filter */
+        ASSERT_EQ(scan_matches_eager(s, "other", "Method", batches[b], &paged), other_methods);
+        ASSERT_EQ(scan_matches_eager(s, "test", "NoSuchLabel", batches[b], &paged), 0);
+        ASSERT_EQ(scan_matches_eager(s, "missing", NULL, batches[b], &paged), 0);
+    }
+
+    /* Without the node indexes the eager queries take other plans, which the
+     * pages would not reproduce: the scan hands out the eager rows instead. */
+    ASSERT_EQ(cbm_store_drop_indexes(s), 0);
+    ASSERT_EQ(scan_matches_eager(s, "test", NULL, 3, &paged), in_test);
+    ASSERT_FALSE(paged);
+    ASSERT_EQ(scan_matches_eager(s, "test", "Function", 3, &paged), test_functions);
+    ASSERT_FALSE(paged);
     cbm_store_close(s);
     PASS();
 }
@@ -2030,6 +2241,37 @@ TEST(store_count_nodes_unknown_project) {
     PASS();
 }
 
+/* A COUNT(*) that cannot be read must not be reported as a count of zero:
+ * index_status renders that as the positive assertion status "empty", so a
+ * corrupt project looks like one that was never indexed. Dropping the table
+ * after the statement is cached makes the step fail deterministically. */
+TEST(store_count_failed_read_is_not_zero) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "File",
+                    .name = "main.c",
+                    .qualified_name = "test.main.c",
+                    .file_path = "main.c"};
+    cbm_store_upsert_node(s, &n);
+
+    /* Sanity: a readable table still counts normally. */
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+    ASSERT_TRUE(cbm_store_count_edges(s, "test") >= 0);
+
+    /* Make the read fail. The statements are cached by the calls above, so the
+     * step (not the prepare) is what fails once the tables are gone. */
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE nodes;"), 0);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE edges;"), 0);
+
+    ASSERT_TRUE(cbm_store_count_nodes(s, "test") < 0);
+    ASSERT_TRUE(cbm_store_count_edges(s, "test") < 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Index coverage (#963) ──────────────────────────────────────── */
 
 /* Round-trip + deleted-file prune + shadow miss-graph materialization +
@@ -2362,6 +2604,9 @@ TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
 }
 
 SUITE(store_nodes) {
+    RUN_TEST(store_qn_suffix_is_literal);
+    RUN_TEST(store_qn_suffix_is_unbounded);
+    RUN_TEST(store_qn_base_finds_overloads_only);
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
@@ -2387,6 +2632,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
+    RUN_TEST(store_node_scan_streams_eager_scan_order);
     RUN_TEST(store_node_find_by_file);
     RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
     RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);
@@ -2432,4 +2678,5 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_properties_special_chars);
     RUN_TEST(store_delete_nodes_nonexistent);
     RUN_TEST(store_count_nodes_unknown_project);
+    RUN_TEST(store_count_failed_read_is_not_zero);
 }

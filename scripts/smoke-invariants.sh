@@ -520,10 +520,10 @@ inv_mcp_initialize() {
     return 0
 }
 
-# ── Invariant 4: tools/list returns all expected tools ─────────────────────
-# Cross-check against the canonical 14-tool list (TOOLS[] in src/mcp/mcp.c).
-EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status detect_changes manage_adr ingest_traces"
-EXPECTED_TOOL_COUNT=14
+# ── Invariant 4: tools/list returns exactly the expected tools ─────────────
+# Cross-check against the canonical registry (TOOLS[] in src/mcp/mcp.c).
+EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_file_outline get_graph_schema compare_graphs get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes manage_adr ingest_traces"
+EXPECTED_TOOL_COUNT="$(printf '%s\n' $EXPECTED_TOOLS | grep -c .)"
 inv_tools_list() {
     if ! mcp_alive; then
         fail "tools-list" "server not alive"
@@ -573,7 +573,7 @@ print(r.get("nextCursor") or "")' 2>/dev/null)"
         fail "tools-list" "got $got_count tools across $page page(s), expected $EXPECTED_TOOL_COUNT; names=[$got_names]"
         return
     fi
-    local missing=""
+    local missing="" extra="" duplicates=""
     local t
     for t in $EXPECTED_TOOLS; do
         case " $got_names " in
@@ -581,10 +581,21 @@ print(r.get("nextCursor") or "")' 2>/dev/null)"
             *) missing="$missing $t" ;;
         esac
     done
+    for t in $got_names; do
+        case " $EXPECTED_TOOLS " in
+            *" $t "*) ;;
+            *) extra="$extra $t" ;;
+        esac
+    done
+    duplicates="$(printf '%s\n' $got_names | sort | uniq -d | tr '\n' ' ')"
     if [ -n "$missing" ]; then
         fail "tools-list" "missing tools:$missing"
+    elif [ -n "$extra" ]; then
+        fail "tools-list" "unexpected tools:$extra"
+    elif [ -n "$duplicates" ]; then
+        fail "tools-list" "duplicate tools: $duplicates"
     else
-        pass "tools-list (all $EXPECTED_TOOL_COUNT tools present)"
+        pass "tools-list (exactly $EXPECTED_TOOL_COUNT unique tools present)"
     fi
 }
 
@@ -626,7 +637,7 @@ inv_every_tool() {
         return
     fi
 
-    # name|minimal-args (JSON object) for the remaining 13 tools.
+    # name|minimal-args (JSON object) for the remaining 16 tools.
     # Args chosen to be minimally valid per TOOLS[] required fields.
     local p="$PROJ_NAME"
     local -a CALLS
@@ -635,11 +646,14 @@ inv_every_tool() {
         "query_graph|{\"project\":\"$p\",\"query\":\"MATCH (n) RETURN n.name LIMIT 5\"}"
         "trace_path|{\"project\":\"$p\",\"function_name\":\"compute\",\"direction\":\"both\"}"
         "get_code_snippet|{\"project\":\"$p\",\"qualified_name\":\"compute\"}"
+        "get_file_outline|{\"project\":\"$p\",\"file_path\":\"src/main.py\"}"
         "get_graph_schema|{\"project\":\"$p\"}"
+        "compare_graphs|{\"base_project\":\"$p\",\"target_project\":\"$p\"}"
         "get_architecture|{\"project\":\"$p\"}"
         "search_code|{\"project\":\"$p\",\"pattern\":\"def \"}"
         "list_projects|{}"
         "index_status|{\"project\":\"$p\"}"
+        "check_index_coverage|{\"project\":\"$p\",\"paths\":[\"src/main.py\"]}"
         "detect_changes|{\"project\":\"$p\"}"
         "manage_adr|{\"project\":\"$p\",\"mode\":\"get\"}"
         "ingest_traces|{\"project\":\"$p\",\"traces\":[]}"

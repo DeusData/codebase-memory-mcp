@@ -1,0 +1,4 @@
+index.js
+const http = require('http');
+function handler(req, res) { res.end(req.url); }
+module.exports = () => http.createServer(handler).listen(8080);

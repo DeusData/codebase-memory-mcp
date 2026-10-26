@@ -138,6 +138,16 @@ void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
         activation_note_refusal(predicate, os_error);
     }
 }
+
+/* Test seam: the next `count` staging writes fail with errno = os_error, so a
+ * caller's report of a full disk is testable without filling one. */
+static unsigned int activation_write_failures_for_testing;
+static int activation_write_failure_errno_for_testing;
+
+void cbm_activation_transaction_write_failures_set_for_testing(unsigned int count, int os_error) {
+    activation_write_failures_for_testing = count;
+    activation_write_failure_errno_for_testing = os_error;
+}
 #endif
 
 #ifdef _WIN32
@@ -890,8 +900,16 @@ static bool activation_posix_acl_empty(int descriptor) {
 }
 
 static char *activation_posix_walk_path(const char *directory) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
+    /* macOS and immutable Linux layouts can expose writable trees through
+     * root-owned aliases (for example /tmp and /home on Atomic systems).
+     * Resolve only these trusted system aliases; arbitrary user symlinks must
+     * still fail the O_NOFOLLOW walk below. */
+#ifdef __linux__
+    static const char *const aliases[] = {"/tmp", "/var", "/home"};
+#else
     static const char *const aliases[] = {"/tmp", "/var"};
+#endif
     for (size_t index = 0; index < sizeof(aliases) / sizeof(aliases[0]); index++) {
         const char *alias = aliases[index];
         size_t alias_length = strlen(alias);
@@ -901,8 +919,13 @@ static char *activation_posix_walk_path(const char *directory) {
         }
         struct stat alias_status;
         char resolved[4096];
-        if (lstat(alias, &alias_status) != 0 || !S_ISLNK(alias_status.st_mode) ||
-            alias_status.st_uid != 0 || !realpath(alias, resolved)) {
+        if (lstat(alias, &alias_status) != 0) {
+            continue;
+        }
+        if (!S_ISLNK(alias_status.st_mode)) {
+            continue;
+        }
+        if (alias_status.st_uid != 0 || !realpath(alias, resolved)) {
             return NULL;
         }
         struct stat resolved_status;
@@ -1121,6 +1144,13 @@ static bool activation_native_sync(activation_native_file_t file) {
 
 static bool activation_native_write_all(activation_native_file_t file, const void *data,
                                         size_t length) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (activation_write_failures_for_testing > 0) {
+        activation_write_failures_for_testing--;
+        errno = activation_write_failure_errno_for_testing;
+        return false;
+    }
+#endif
     const unsigned char *cursor = data;
     while (length > 0) {
 #ifdef _WIN32
@@ -1605,6 +1635,16 @@ static void activation_failed_stage_cleanup(cbm_activation_transaction_t *transa
     }
 }
 
+/* A failed stage write reports IO with errno restored, after the cleanup, to
+ * the error of the call that failed (0 when none applies), so the caller can
+ * name it. */
+static cbm_activation_transaction_status_t activation_stage_io_failure(
+    cbm_activation_transaction_t *transaction, int os_error) {
+    activation_failed_stage_cleanup(transaction);
+    errno = os_error;
+    return CBM_ACTIVATION_TRANSACTION_IO;
+}
+
 cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     const char *target_path, const void *candidate, size_t candidate_size,
     cbm_activation_transaction_t **transaction_out) {
@@ -1630,11 +1670,20 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     }
     transaction->staged_exists = true;
     bool written = activation_native_write_all(staged, candidate, candidate_size);
+    int os_error = written ? 0 : errno;
     bool durable = written && activation_native_sync(staged);
+    if (written && !durable) {
+        os_error = errno;
+    }
     bool closed = activation_native_close(staged);
-    if (!written || !durable || !closed || !activation_sync_directory(transaction)) {
-        activation_failed_stage_cleanup(transaction);
-        return CBM_ACTIVATION_TRANSACTION_IO;
+    if (!closed && os_error == 0) {
+        os_error = errno;
+    }
+    if (!written || !durable || !closed) {
+        return activation_stage_io_failure(transaction, os_error);
+    }
+    if (!activation_sync_directory(transaction)) {
+        return activation_stage_io_failure(transaction, errno);
     }
     *transaction_out = transaction;
     return CBM_ACTIVATION_TRANSACTION_OK;
@@ -1784,28 +1833,45 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_file(
     unsigned char buffer[64U * 1024U];
     size_t total = 0;
     bool copied = true;
+    int os_error = 0;
     for (;;) {
         size_t amount = 0;
         if (!activation_native_read(source, buffer, sizeof(buffer), &amount)) {
             copied = false;
+            os_error = errno;
             break;
         }
         if (amount == 0) {
             break;
         }
-        if (SIZE_MAX - total < amount || !activation_native_write_all(staged, buffer, amount)) {
+        if (SIZE_MAX - total < amount) {
             copied = false;
+            break;
+        }
+        if (!activation_native_write_all(staged, buffer, amount)) {
+            copied = false;
+            os_error = errno;
             break;
         }
         total += amount;
     }
     bool durable = copied && total > 0 && activation_native_sync(staged);
+    if (copied && total > 0 && !durable) {
+        os_error = errno;
+    }
     bool source_closed = activation_native_close(source);
+    if (!source_closed && os_error == 0) {
+        os_error = errno;
+    }
     bool staged_closed = activation_native_close(staged);
-    if (!copied || total == 0 || !durable || !source_closed || !staged_closed ||
-        !activation_sync_directory(transaction)) {
-        activation_failed_stage_cleanup(transaction);
-        return CBM_ACTIVATION_TRANSACTION_IO;
+    if (!staged_closed && os_error == 0) {
+        os_error = errno;
+    }
+    if (!copied || total == 0 || !durable || !source_closed || !staged_closed) {
+        return activation_stage_io_failure(transaction, os_error);
+    }
+    if (!activation_sync_directory(transaction)) {
+        return activation_stage_io_failure(transaction, errno);
     }
     *transaction_out = transaction;
     return CBM_ACTIVATION_TRANSACTION_OK;

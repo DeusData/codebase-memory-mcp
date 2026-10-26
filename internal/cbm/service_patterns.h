@@ -12,6 +12,7 @@
 #define CBM_SERVICE_PATTERNS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Edge type returned by pattern match. */
 typedef enum {
@@ -48,6 +49,22 @@ bool cbm_service_pattern_is_global_fetch(const char *callee_name);
  * Rejects filesystem paths and non-HTTP string consumers. */
 bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
+/* True when a JS/TS-family call is client-side navigation rather than a
+ * network request (#1250): Angular Router.navigate/navigateByUrl, Ionic navigation, Nuxt
+ * navigateTo, react-router navigate, router/history push|replace|prefetch,
+ * History pushState/replaceState, Location go|assign|replace, bare goto /
+ * redirect / permanentRedirect. Its slash-prefixed argument is a client route,
+ * so it must not mint an arg_url HTTP_CALLS edge. js_family is the caller's
+ * FILE-language gate: false always returns false, so no other language's
+ * recall is traded (suppressors stay per-language). */
+bool cbm_service_pattern_is_client_navigation(bool js_family, const char *callee_name);
+
+/* True when text that reached a path slot is a source comment rather than a
+ * path: a block comment (slash-star … star-slash), a line comment (slash-slash
+ * followed by a space), or any text with a line break. The wildcard route
+ * (slash-star alone) is a path. */
+bool cbm_service_pattern_is_comment_text(const char *text);
+
 /* Per-worker TLS cache for cbm_service_pattern_match results. The
  * pattern matcher runs once per resolved CALL edge in emit_service_
  * edge — that's 6 pattern lists × ~30 patterns × strstr per call ≈
@@ -70,5 +87,18 @@ const char *cbm_service_pattern_route_method(const char *callee_name);
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);
+
+/* GraphQL operation identity of a client call argument (#598).
+ * Scans `doc` as a GraphQL document (skipping comments, strings, `${...}`
+ * template interpolations and leading fragment definitions) and reports the
+ * first operation: *op_type is "query", "mutation" or "subscription" ("query"
+ * for the `{ ... }` shorthand). Returns true and writes the operation name to
+ * name_buf when the operation is named. Returns false for an anonymous
+ * operation, or with *op_type = "operation" when `doc` is not a GraphQL
+ * document (NULL, a URL, a bare word such as a dict key ...). The operation
+ * text itself is never copied, so callers can key Routes on a bounded
+ * identity. */
+bool cbm_service_pattern_graphql_operation(const char *doc, const char **op_type, char *name_buf,
+                                           size_t name_sz);
 
 #endif /* CBM_SERVICE_PATTERNS_H */

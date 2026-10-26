@@ -17,8 +17,11 @@
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/platform.h"
+#include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/mem.h"
 #include "cbm.h"
+#include "result_spill.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +119,33 @@ static int setup_parallel_repo(void) {
         return -1;
     fprintf(f, "package probe;\npublic class Base extends Circle {\n"
                "    @Override\n    public double area() { return 0.0; }\n}\n");
+    fclose(f);
+
+    /* NAMESPACE-declaring files whose import resolves through the namespace
+     * map (PHP `use`; C# `using` and Java package imports take the same path).
+     * Without these the spill-parity test compared a Go+Java fixture that never
+     * touches that map, so it passed while spilling silently changed import
+     * resolution for every namespaced repository: the map is built from the
+     * in-memory result cache, where a PARKED result is NULL, so a spilled file
+     * contributed no namespace at all and its imports fell through to the
+     * looser fallback (php corpus, 2026-09-18: 57,182 edges in memory against
+     * 59,379 while spilling, same binary, reproducible 3/3 each way). */
+    snprintf(path, sizeof(path), "%s/app", g_par_tmpdir);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/app/Models.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Models;\n\n"
+               "class User {\n    public function name() { return \"u\"; }\n}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/app/Services.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Services;\n\nuse App\\Models\\User;\n\n"
+               "class UserService {\n"
+               "    public function make() { $u = new User(); return $u->name(); }\n}\n");
     fclose(f);
 
     return 0;
@@ -271,6 +301,13 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross(const char *project, const char
 
 /* ── Run parallel pipeline on files, returning gbuf ───────────────── */
 
+/* Spill mode for the harness: the run below opts its context in (the way
+ * run_parallel_pipeline does) and records how many results the store parked. */
+static bool g_harness_spill = false;
+static int64_t g_harness_parked = -1;
+/* Opt-in: hand cbm_parallel_resolve the production Tier-2 C# registry. */
+static bool g_harness_cs_registry = false;
+
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
     int worker_count, const cbm_parallel_extract_opts_t *extract_opts,
@@ -286,6 +323,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         .gbuf = gbuf,
         .registry = reg,
         .cancelled = &cancelled,
+        .spill_allowed = g_harness_spill,
     };
 
     if (seed_structure) {
@@ -306,6 +344,14 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
     }
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+    if (g_harness_spill) {
+        int64_t bytes = 0;
+        int64_t loads = 0;
+        g_harness_parked = -1;
+        if (ctx.spill) {
+            cbm_result_spill_stats(ctx.spill, &g_harness_parked, &bytes, &loads);
+        }
+    }
 
     if (mutator) {
         mutator(result_cache, file_count, mutator_ud);
@@ -323,20 +369,31 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
      * cbm_pxc_run_one(_ts) per file BEFORE materializing CALLS edges. */
     char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
     int def_count = 0;
+    CBMArena cross_arena;
+    cbm_arena_init(&cross_arena);
     CBMLSPDef *all_defs =
-        def_modules ? cbm_pxc_collect_all_defs(&ctx, result_cache, files, file_count,
+        def_modules ? cbm_pxc_collect_all_defs(&ctx, &cross_arena, result_cache, files, file_count,
                                                ctx.project_name, def_modules, &def_count, NULL)
                     : NULL;
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
+    /* C# has no per-file cross path (cbm_pxc_run_one has no C# case): production
+     * resolves it only through the Tier-2 registry, so a harness run that opts
+     * in builds that one registry exactly as run_parallel_pipeline does. */
+    CBMCrossLspRegistries harness_registries = {0};
+    if (g_harness_cs_registry && all_defs) {
+        harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
+    }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,
-                         NULL /* cross_registries — tests use per-file path */);
+                         g_harness_cs_registry ? &harness_registries
+                                               : NULL /* tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
+    cbm_arena_destroy(&cross_arena);
     if (def_modules) {
         for (int i = 0; i < file_count; i++) {
             free(def_modules[i]);
@@ -348,6 +405,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         if (result_cache[i])
             cbm_free_result(result_cache[i]);
     free(result_cache);
+    cbm_pipeline_spill_close(&ctx);
 
     harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
@@ -528,6 +586,190 @@ TEST(parallel_total_edges) {
     PASS();
 }
 
+/* ── Spill mode: the graph is the in-memory graph ─────────────────── */
+
+/* CBM_MEM_SPILL=1 parks every compacted result on disk the moment it is
+ * extracted; registry build, def collection, surfaces, resolve and the infra
+ * passes read each one back only for the moment they need it. The graph must
+ * not be able to tell: same nodes, same edges per type as the in-memory run
+ * of the same repo -- and every file must actually have gone through the
+ * store (a store that failed to open would silently test nothing). */
+TEST(parallel_spill_mode_builds_the_same_graph) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_setenv("CBM_MEM_SPILL", "1", 1);
+    g_harness_spill = true;
+    cbm_gbuf_t *spilled = run_parallel("par-test", g_par_tmpdir, files, file_count, 2);
+    g_harness_spill = false;
+    cbm_unsetenv("CBM_MEM_SPILL");
+    cbm_discover_free(files, file_count);
+    ASSERT(spilled != NULL);
+
+    ASSERT_EQ((int)g_harness_parked, file_count);
+    ASSERT_EQ(cbm_gbuf_node_count(spilled), cbm_gbuf_node_count(g_par_gbuf));
+    ASSERT_EQ(cbm_gbuf_edge_count(spilled), cbm_gbuf_edge_count(g_par_gbuf));
+    static const char *const types[] = {"CALLS", "DEFINES",  "DEFINES_METHOD", "IMPORTS",
+                                        "USES",  "INHERITS", "IMPLEMENTS"};
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int in_memory = cbm_gbuf_edge_count_by_type(g_par_gbuf, types[t]);
+        int on_disk = cbm_gbuf_edge_count_by_type(spilled, types[t]);
+        if (in_memory != on_disk) {
+            printf("  FAIL: %s edges: in_memory=%d spilled=%d\n", types[t], in_memory, on_disk);
+        }
+        ASSERT_EQ(in_memory, on_disk);
+    }
+    cbm_gbuf_free(spilled);
+    PASS();
+}
+
+/* ── #2184: the post-extraction phases are charged before they run ─── */
+
+/* Order-independent fingerprint of a whole graph: every node (label, QN, file,
+ * lines, properties) and every edge (type, source QN, target QN, properties)
+ * hashed and folded with a sum and an xor. Two graphs that differ in any field
+ * of any node or edge -- not just in a per-type count -- disagree here. */
+typedef struct {
+    const cbm_gbuf_t *gb;
+    uint64_t sum;
+    uint64_t xr;
+    long count;
+} graph_fp_t;
+
+static uint64_t fp_mix(uint64_t h, const char *s) {
+    for (const unsigned char *p = (const unsigned char *)(s ? s : "\x01"); *p; p++) {
+        h = (h ^ *p) * 1099511628211ULL; /* FNV-1a */
+    }
+    return (h ^ 0xffU) * 1099511628211ULL; /* field separator */
+}
+
+static uint64_t fp_mix_int(uint64_t h, long long v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", v);
+    return fp_mix(h, buf);
+}
+
+static void fp_fold(graph_fp_t *fp, uint64_t h) {
+    fp->sum += h;
+    fp->xr ^= h * 0x9E3779B97F4A7C15ULL;
+    fp->count++;
+}
+
+static void fp_visit_node(const cbm_gbuf_node_t *n, void *ud) {
+    uint64_t h = fp_mix(1469598103934665603ULL, "N");
+    h = fp_mix(h, n->label);
+    h = fp_mix(h, n->qualified_name);
+    h = fp_mix(h, n->file_path);
+    h = fp_mix_int(h, n->start_line);
+    h = fp_mix_int(h, n->end_line);
+    h = fp_mix(h, n->properties_json);
+    fp_fold(ud, h);
+}
+
+static void fp_visit_edge(const cbm_gbuf_edge_t *e, void *ud) {
+    graph_fp_t *fp = ud;
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(fp->gb, e->source_id);
+    const cbm_gbuf_node_t *dst = cbm_gbuf_find_by_id(fp->gb, e->target_id);
+    uint64_t h = fp_mix(1469598103934665603ULL, "E");
+    h = fp_mix(h, e->type);
+    h = fp_mix(h, src ? src->qualified_name : NULL);
+    h = fp_mix(h, dst ? dst->qualified_name : NULL);
+    h = fp_mix(h, e->properties_json);
+    fp_fold(fp, h);
+}
+
+static graph_fp_t graph_fingerprint(const cbm_gbuf_t *gb) {
+    graph_fp_t fp = {.gb = gb};
+    cbm_gbuf_foreach_node(gb, fp_visit_node, &fp);
+    cbm_gbuf_foreach_edge(gb, fp_visit_edge, &fp);
+    return fp;
+}
+
+/* Mutator hook: runs between extraction and registry build, i.e. exactly where
+ * the post-extraction phases start. Records how many results are still held
+ * in memory there. */
+static void count_cached_results(CBMFileResult **cache, int file_count, void *ud) {
+    int n = 0;
+    for (int i = 0; i < file_count; i++) {
+        n += cache[i] != NULL;
+    }
+    *(int *)ud = n;
+}
+
+/* #2184: spill was entered only DURING extraction, when the charge crossed
+ * budget - budget/16. A run that ended extraction just under that line kept
+ * every result in memory, and the phases that cannot spill (registry build,
+ * cross-LSP prepare, resolve) then grew the process past the budget -- openclaw
+ * at 8 workers, 4079 MB budget: 3678 MB at extraction end, 5829 MB in resolve.
+ * The extraction end now projects that growth from the result counts and
+ * spills first when budget - budget/16 would be crossed.
+ *
+ * The charge is pinned through the test seam (it is the process footprint
+ * otherwise): run A ends extraction ONE BYTE under the latch -- the extraction
+ * gate never fires, only the projection can spill; run B has the whole budget
+ * free -- the projection fits and nothing may spill. Both graphs must be
+ * identical, field for field, to each other and to the plain in-memory run. */
+TEST(parallel_post_extract_projection_spills_before_resolve) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    const size_t saved_budget = cbm_mem_budget();
+    const size_t budget = (size_t)1024 * 1024 * 1024;
+    const size_t latch = budget - budget / 16; /* spill latches on charged > latch */
+    cbm_mem_set_budget_for_tests(budget);
+    g_harness_spill = true;
+
+    cbm_mem_set_charged_for_tests(latch);
+    int cached_near = -1;
+    cbm_gbuf_t *gb_near =
+        run_parallel_with_extract_opts_and_mutator("par-test", g_par_tmpdir, files, file_count, 2,
+                                                   NULL, count_cached_results, &cached_near, false);
+    int64_t parked_near = g_harness_parked;
+
+    cbm_mem_set_charged_for_tests((size_t)1);
+    int cached_roomy = -1;
+    cbm_gbuf_t *roomy = run_parallel_with_extract_opts_and_mutator(
+        "par-test", g_par_tmpdir, files, file_count, 2, NULL, count_cached_results, &cached_roomy,
+        false);
+    int64_t parked_roomy = g_harness_parked;
+
+    cbm_mem_set_charged_for_tests(0);
+    g_harness_spill = false;
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_discover_free(files, file_count);
+    ASSERT(gb_near != NULL);
+    ASSERT(roomy != NULL);
+
+    /* A: every result went to disk before registry build. */
+    ASSERT_EQ((int)parked_near, file_count);
+    ASSERT_EQ(cached_near, 0);
+    /* B: the projection fits, so no store was opened and results stay cached. */
+    ASSERT_EQ((int)parked_roomy, -1);
+    ASSERT_GT(cached_roomy, 0);
+
+    graph_fp_t fp_near = graph_fingerprint(gb_near);
+    graph_fp_t fp_roomy = graph_fingerprint(roomy);
+    graph_fp_t fp_mem = graph_fingerprint(g_par_gbuf);
+    ASSERT_GT(fp_mem.count, 0);
+    ASSERT_EQ(fp_near.count, fp_mem.count);
+    ASSERT_EQ(fp_roomy.count, fp_mem.count);
+    ASSERT_TRUE(fp_near.sum == fp_mem.sum && fp_near.xr == fp_mem.xr);
+    ASSERT_TRUE(fp_roomy.sum == fp_mem.sum && fp_roomy.xr == fp_mem.xr);
+    cbm_gbuf_free(gb_near);
+    cbm_gbuf_free(roomy);
+    PASS();
+}
+
 /* ── Empty file list ──────────────────────────────────────────────── */
 
 TEST(parallel_empty_files) {
@@ -602,6 +844,91 @@ TEST(parallel_args_json_no_overflow) {
     cbm_gbuf_free(gbuf);
     cbm_discover_free(files, file_count);
     th_rmtree(dir);
+    PASS();
+}
+
+/* F14: a definition's properties buffer was sized for its docstring and variants
+ * only. A wide signature (50 annotated parameters) filled the rest of the 2 KB, and
+ * the MinHash fingerprint "fp", structural profile "sp" and body tokens "bt"
+ * appended behind it were dropped whole: no SIMILAR_TO edge and fewer
+ * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
+ * ImageController actions, 2026-10-18). `small` has the same body and is the
+ * control that the fixture produces all three at all. Both resolvers. */
+static const char f14_body[] =
+    "    total = 0\n"
+    "    for item in range(10):\n"
+    "        if item % 3 == 0:\n"
+    "            total += item * 2\n"
+    "        elif item % 5 == 1:\n"
+    "            total -= len(str(item))\n"
+    "        else:\n"
+    "            total ^= hash((item, total))\n"
+    "    values = [x * x for x in range(total % 7 + 3)]\n"
+    "    mapping = {str(k): v for k, v in enumerate(values)}\n"
+    "    while total > 100:\n"
+    "        total //= 3\n"
+    "    try:\n"
+    "        result = sorted(mapping.items(), key=lambda kv: kv[1])\n"
+    "    except ValueError as err:\n"
+    "        result = [(\"error\", str(err))]\n"
+    "    return result, total, mapping\n";
+
+static bool f14_props_have(const cbm_gbuf_t *gb, const char *project, const char *name,
+                           const char *venue) {
+    char *qn = cbm_pipeline_fqn_compute(project, "pkg/wide.py", name);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(gb, qn) : NULL;
+    free(qn);
+    const char *p = n && n->properties_json ? n->properties_json : "";
+    bool fp = strstr(p, "\"fp\":\"") != NULL;
+    bool sp = strstr(p, "\"sp\":\"") != NULL;
+    bool bt = strstr(p, "\"bt\":\"") != NULL;
+    bool sig = strstr(p, "\"signature\":\"") != NULL;
+    printf("  f14 %s %s: found=%d len=%zu fp=%d sp=%d bt=%d signature=%d\n", venue, name, n != NULL,
+           strlen(p), fp, sp, bt, sig);
+    return n && fp && sp && bt && sig;
+}
+
+TEST(parallel_wide_definition_keeps_fp_sp_bt_f14) {
+    char params[CBM_SZ_4K];
+    size_t pos = 0;
+    for (int i = 0; i < 50; i++) {
+        pos += (size_t)snprintf(params + pos, sizeof(params) - pos, "%sp%02d: Dict[str, int] = None",
+                                i ? ", " : "", i);
+    }
+    char src[CBM_SZ_8K];
+    snprintf(src, sizeof(src), "def small(a, b):\n%s\n\ndef wide(%s):\n%s", f14_body, params,
+             f14_body);
+    const char *project = "cbm_f14";
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_f14_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/pkg/wide.py", tmpdir);
+    if (th_write_file(path, src) != 0) {
+        th_rmtree(tmpdir);
+        FAIL("failed to write the F14 fixture");
+    }
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"pkg/wide.py";
+    files[0].language = CBM_LANG_PYTHON;
+    cbm_gbuf_t *graphs[2] = {run_sequential(project, tmpdir, files, 1),
+                             run_parallel(project, tmpdir, files, 1, 2)};
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        const char *venue = g == 0 ? "sequential" : "parallel";
+        bool control = f14_props_have(graphs[g], project, "small", venue);
+        bool wide = f14_props_have(graphs[g], project, "wide", venue);
+        all = all && control && wide;
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
     PASS();
 }
 
@@ -714,6 +1041,157 @@ TEST(gbuf_next_id_accessors) {
     ASSERT_GTE(id, 100);
 
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_raise_next_id_never_lowers) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/");
+    cbm_gbuf_raise_next_id(gb, 100);
+    ASSERT_EQ(cbm_gbuf_next_id(gb), 100);
+    cbm_gbuf_raise_next_id(gb, 40);
+    ASSERT_EQ(cbm_gbuf_next_id(gb), 100);
+    int64_t id = cbm_gbuf_upsert_node(gb, "Function", "foo", "proj.foo", "f.go", 1, 5, "{}");
+    ASSERT_EQ(id, 100);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* Edge ids in the main buffer stay unique through the parallel phases.
+ * Merged worker nodes keep their shared ids, and merged edges take fresh ids
+ * from the main counter after the highest of them, so the main counter can
+ * end above the shared one (12 of 17 infra corpora, deckhouse by 229,233).
+ * The sync after each parallel phase used to set the main counter to the
+ * shared value anyway, and later passes reused the merged edges' ids. Where
+ * the counter ends depends on worker timing, so the seam pins it: right before
+ * each sync the hook takes ID_SYNC_PUSH edge ids from the main buffer. */
+enum { ID_FILES = 64, ID_SYNC_PUSH = 3 };
+
+typedef struct {
+    bool push;
+    int syncs;
+} id_sync_probe_t;
+
+static void id_sync_hook(cbm_gbuf_t *gb, void *ctx) {
+    id_sync_probe_t *probe = ctx;
+    probe->syncs++;
+    const cbm_gbuf_node_t **fns = NULL;
+    int n = 0;
+    if (!probe->push || cbm_gbuf_find_by_label(gb, "Function", &fns, &n) != 0 || n < 2) {
+        return;
+    }
+    char props[CBM_SZ_64];
+    for (int i = 0; i < ID_SYNC_PUSH; i++) {
+        snprintf(props, sizeof(props), "{\"id_sync_probe\":%d}", probe->syncs * ID_SYNC_PUSH + i);
+        cbm_gbuf_insert_edge(gb, fns[0]->id, fns[1]->id, "CALLS", props);
+    }
+}
+
+typedef struct {
+    int edges;
+    int duplicates;
+} edge_id_probe_t;
+
+static void probe_edge_ids(const cbm_gbuf_t *gb, void *ctx) {
+    edge_id_probe_t *probe = ctx;
+    probe->edges = cbm_gbuf_edge_count(gb);
+    probe->duplicates = cbm_gbuf_duplicate_edge_ids(gb);
+}
+
+/* `count` Go files; each function calls the next file's. */
+static bool write_id_fixture(const char *repo, int count) {
+    char path[512];
+    char source[256];
+    for (int i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/f%02d.go", repo, i);
+        snprintf(source, sizeof(source),
+                 "package main\n\nfunc F%02d() int {\n\treturn F%02d() + 1\n}\n", i,
+                 (i + 1) % count);
+        if (th_write_file(path, source) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(parallel_full_index_keeps_edge_ids_unique) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    /* More files than MIN_FILES_FOR_PARALLEL (50): the parallel route. */
+    if (!write_id_fixture(repo, ID_FILES)) {
+        th_rmtree(repo);
+        FAIL("failed to write the edge-id fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ids.db", repo);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    id_sync_probe_t syncs = {.push = true};
+    edge_id_probe_t probe = {0};
+    cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int rc = CBM_NOT_FOUND;
+    if (p) {
+        cbm_pipeline_set_before_dump_hook_for_tests(p, probe_edge_ids, &probe);
+        rc = cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(repo);
+
+    ASSERT_EQ(rc, 0);
+    /* Both full-route syncs (after extract, after resolve) go through the helper. */
+    ASSERT_EQ(syncs.syncs, 2);
+    ASSERT_GT(probe.edges, ID_FILES);
+    ASSERT_EQ(probe.duplicates, 0);
+    PASS();
+}
+
+/* The closure-repair route always runs the parallel phases; both of its
+ * syncs go through the same helper. */
+TEST(parallel_closure_repair_syncs_ids_through_the_helper) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    if (!write_id_fixture(repo, 3)) {
+        th_rmtree(repo);
+        FAIL("failed to write the edge-id fixture");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ids.db", repo);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int first_rc = first ? cbm_pipeline_run(first) : CBM_NOT_FOUND;
+    cbm_pipeline_free(first);
+
+    /* A body-only edit (no new names) routes to closure repair. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/f01.go", repo);
+    int write_rc =
+        th_write_file(path, "package main\n\nfunc F01() int {\n\treturn F02() + 40 + 2\n}\n");
+    id_sync_probe_t syncs = {.push = false};
+    cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    int second_rc = second ? cbm_pipeline_run(second) : CBM_NOT_FOUND;
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(second);
+    cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    th_rmtree(repo);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(write_rc, 0);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(syncs.syncs, 2);
     PASS();
 }
 
@@ -2242,6 +2720,191 @@ static kotlin_implicit_probe_t probe_kotlin_implicit_site(const CBMFileResult *r
     return probe;
 }
 
+/* #2120: two C# projects declare a class with the same simple name in
+ * namespaces that share a root (Contoso.Platform.Identity.UserIdentityInfo vs
+ * Contoso.Platform.BackOffice.Identity.UserIdentityInfo). Graph QNs are
+ * path-derived, so the namespace-prefix lookups never hit a project type and
+ * the short-name fallback scored both variants 0 against the file namespace:
+ * registration order picked the target, ignoring the caller's `using`
+ * directive. Each caller below can see exactly ONE variant (C# binding rules),
+ * so exactly one edge per caller is correct whatever the file order: plain
+ * `using` (both directions), enclosing-namespace proximity, and a
+ * fully-qualified name. The last case is a reference-assembly shape: one file
+ * declaring several namespaces, whose file-level namespace is only the FIRST
+ * one; the decoy is registered first, so a mislabeled namespace falls back to
+ * it. `partial` pieces of one type are separate registry entries, so a member
+ * declared on another piece must still bind to that piece. */
+TEST(parallel_csharp_same_name_class_binds_by_namespace) {
+    static const char platform_src[] =
+        "namespace Contoso.Platform.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char backoffice_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char bo_handler_src[] =
+        "using Contoso.Platform.BackOffice.Identity;\n"
+        "namespace Contoso.Platform.BackOffice.CqrsHandlers;\n"
+        "public class Handler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char pf_handler_src[] =
+        "using Contoso.Platform.Identity;\n"
+        "namespace Contoso.Platform.Api;\n"
+        "public class PlatformHandler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char nested_ns_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity.Claims\n"
+        "{\n"
+        "    public class ClaimReader {\n"
+        "        public string Read(string claim) {\n"
+        "            var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "            return info.ToString();\n"
+        "        }\n"
+        "    }\n"
+        "}\n";
+    static const char fq_src[] = "namespace Contoso.Platform.Reports;\n"
+                                 "public class Report {\n"
+                                 "    public string Build(string claim) {\n"
+                                 "        var info = Contoso.Platform.BackOffice.Identity"
+                                 ".UserIdentityInfo.ParseFromClaim(claim);\n"
+                                 "        return info.ToString();\n"
+                                 "    }\n"
+                                 "}\n";
+    static const char decoy_src[] = "namespace Contoso.Decoy;\n"
+                                    "public class Worker {\n"
+                                    "    public void Start() { }\n"
+                                    "    public void Beta() { }\n"
+                                    "}\n";
+    static const char multi_ns_src[] = "namespace Contoso.Win32 { public class SafeHandle { } }\n"
+                                       "namespace Contoso.Threading {\n"
+                                       "    public class Worker { public void Start() { } }\n"
+                                       "}\n";
+    static const char runner_src[] = "using Contoso.Threading;\n"
+                                     "namespace Contoso.App;\n"
+                                     "public class Runner {\n"
+                                     "    public void Run() {\n"
+                                     "        var w = new Worker();\n"
+                                     "        w.Start();\n"
+                                     "    }\n"
+                                     "}\n";
+    static const char part_a_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Alpha() { } }\n";
+    static const char part_b_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Beta() { } }\n";
+    static const char part_user_src[] = "using Contoso.Parts;\n"
+                                        "namespace Contoso.App;\n"
+                                        "public class PartUser {\n"
+                                        "    public void Use() {\n"
+                                        "        var t = new Thing();\n"
+                                        "        t.Alpha();\n"
+                                        "        t.Beta();\n"
+                                        "    }\n"
+                                        "}\n";
+    const char *project = "cbm_cs_same_name";
+    static const char *rels[] = {
+        "src/Decoy/Worker.cs",
+        "src/Contoso.Platform/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/CqrsHandlers/Handler.cs",
+        "src/Contoso.Platform/Api/PlatformHandler.cs",
+        "src/Contoso.Platform.BackOffice/Identity/Claims/ClaimReader.cs",
+        "src/Contoso.Platform/Reports/Report.cs",
+        "src/Ref/Threading.cs",
+        "src/App/Runner.cs",
+        "src/Parts/Thing.A.cs",
+        "src/Parts/Thing.B.cs",
+        "src/App/PartUser.cs",
+    };
+    const char *srcs[] = {decoy_src,      platform_src,  backoffice_src, bo_handler_src,
+                          pf_handler_src, nested_ns_src, fq_src,         multi_ns_src,
+                          runner_src,     part_a_src,    part_b_src,     part_user_src};
+    enum { N_FILES = 12, N_CHECKS = 13 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_same_name_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write C# same-name fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *pf = "cbm_cs_same_name.src.Contoso.Platform.Identity.UserIdentityInfo."
+                     "UserIdentityInfo.ParseFromClaim";
+    const char *bo = "cbm_cs_same_name.src.Contoso.Platform.BackOffice.Identity."
+                     "UserIdentityInfo.UserIdentityInfo.ParseFromClaim";
+    const char *ref_start = "cbm_cs_same_name.src.Ref.Threading.Worker.Start";
+    const char *decoy_start = "cbm_cs_same_name.src.Decoy.Worker.Worker.Start";
+    const char *part_alpha = "cbm_cs_same_name.src.Parts.Thing.A.Thing.Alpha";
+    const char *part_beta = "cbm_cs_same_name.src.Parts.Thing.B.Thing.Beta";
+    const char *decoy_beta = "cbm_cs_same_name.src.Decoy.Worker.Worker.Beta";
+    bool ok[2][N_CHECKS];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
+        ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
+        ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
+        ok[g][3] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", bo, "CALLS");
+        ok[g][4] = has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
+        ok[g][5] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", pf, "CALLS");
+        ok[g][6] = has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
+        ok[g][7] = !has_edge_from_callable_to_qn(gb, "Report.Build", pf, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "Runner.Run", decoy_start, "CALLS");
+        ok[g][10] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
+        ok[g][11] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
+        ok[g][12] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", decoy_beta, "CALLS");
+        for (int k = 0; k < N_CHECKS; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  C# same-name diagnostic %s: using_bo=%d/%d using_pf=%d/%d "
+                   "enclosing_ns=%d/%d fully_qualified=%d/%d multi_ns_file=%d/%d "
+                   "partial=%d/%d/%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10], ok[g][11],
+                   ok[g][12]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
+}
+
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
@@ -2583,10 +3246,9 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
  * the test green.  The optional crate_b-local helper pins the second failure
  * mode where a confident in-file resolution used to suppress cross-LSP. */
 static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
-    static const char workspace_toml[] =
-        "[workspace]\n"
-        "members = [\"crate_a\", \"crate_b\"]\n"
-        "resolver = \"2\"\n";
+    static const char workspace_toml[] = "[workspace]\n"
+                                         "members = [\"crate_a\", \"crate_b\"]\n"
+                                         "resolver = \"2\"\n";
     static const char crate_a_toml[] =
         "[package]\nname = \"crate_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
     static const char crate_b_toml[] =
@@ -2594,13 +3256,11 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
         "\n[dependencies]\ncrate_a = { path = \"../crate_a\" }\n";
     static const char crate_a_source[] = "pub fn helper() {}\n";
     static const char unlisted_source[] = "pub fn helper() {}\n";
-    static const char caller_without_local[] =
-        "fn run() { crate_a::helper(); }\n"
-        "fn main() { run(); }\n";
-    static const char caller_with_local[] =
-        "fn helper() {}\n"
-        "fn run() { crate_a::helper(); }\n"
-        "fn main() { run(); }\n";
+    static const char caller_without_local[] = "fn run() { crate_a::helper(); }\n"
+                                               "fn main() { run(); }\n";
+    static const char caller_with_local[] = "fn helper() {}\n"
+                                            "fn run() { crate_a::helper(); }\n"
+                                            "fn main() { run(); }\n";
 
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_issue56_parallel_XXXXXX");
@@ -2669,13 +3329,12 @@ TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest) {
     const cbm_gbuf_edge_t *correct =
         find_call_edge_to_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool correct_found = correct != NULL;
-    const bool unlisted =
-        callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
+    const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
     const bool manifest_strategy =
         correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
     if (!correct || unlisted || !manifest_strategy) {
-        printf("  issue56 manifest diagnostic: correct=%d unlisted=%d strategy=%d\n",
-               correct_found, unlisted, manifest_strategy);
+        printf("  issue56 manifest diagnostic: correct=%d unlisted=%d strategy=%d\n", correct_found,
+               unlisted, manifest_strategy);
     }
     cbm_gbuf_free(gbuf);
 
@@ -2692,8 +3351,7 @@ TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution) {
     const cbm_gbuf_edge_t *correct =
         find_call_edge_to_target_fragment(gbuf, "main.run", ".crate_a.");
     const bool correct_found = correct != NULL;
-    const bool wrong_local =
-        callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
+    const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
     const bool manifest_strategy =
         correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
     if (!correct || wrong_local || !manifest_strategy) {
@@ -3038,6 +3696,40 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+/* #2053 contract for cbm_pipeline_rust_external_target: only a Rust row whose
+ * strategy names a registered target, and whose QN lies outside the project
+ * prefix, counts as external. The end-to-end probes live in test_pipeline.c
+ * (pipeline_rust_std_receiver_never_binds_project_method*). */
+TEST(parallel_rust_external_target_contract) {
+    const char *proj = "proj";
+    /* External: registered std / seeded-crate targets. */
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_deref_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_constructor",
+                                                  "core.sync.atomic.AtomicUsize.new", proj));
+    /* A prefix that is not a whole segment is still outside the project. */
+    ASSERT_TRUE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "projx.helper", proj));
+    /* Project-prefixed targets keep the registry fallback. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                   "proj.src.lib.EvidenceTier.join", proj));
+    /* Synthesized / non-registered strategies are not evidence. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_prelude_trait",
+                                                   "std.path.PathBuf.clone", proj));
+    ASSERT_FALSE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_unresolved", "root.join", proj));
+    /* Per-language: no other language is affected. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_GO, "lsp_method_dispatch",
+                                                   "std.path.Path.join", proj));
+    /* Defensive NULL/empty inputs. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, NULL, "std.x", proj));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "std.x", NULL));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "", proj));
+    PASS();
+}
+
 /* Gate guard for the JVM-only unique-tail fallbacks (lsp_resolve.h).
  *
  * The tail fallbacks join LSP overrides across QN drift by unique
@@ -3259,7 +3951,8 @@ static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char
                    r->defs.count, r->imports.count, r->calls.count, r->resolved_calls.count);
             for (int j = 0; j < r->resolved_calls.count; j++) {
                 const CBMResolvedCall *rc = &r->resolved_calls.items[j];
-                printf("  [diag]   rc caller=%s callee=%s strategy=%s conf=%.2f kind=%d span=[%u,%u)\n",
+                printf("  [diag]   rc caller=%s callee=%s strategy=%s conf=%.2f kind=%d "
+                       "span=[%u,%u)\n",
                        rc->caller_qn ? rc->caller_qn : "?", rc->callee_qn ? rc->callee_qn : "?",
                        rc->strategy ? rc->strategy : "?", rc->confidence, (int)rc->kind,
                        (unsigned)rc->site_start_byte, (unsigned)rc->site_end_byte);
@@ -3267,13 +3960,16 @@ static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char
             for (int j = 0; j < r->calls.count; j++) {
                 const CBMCall *c = &r->calls.items[j];
                 printf("  [diag]   call callee=%s enclosing=%s span=[%u,%u) req=%d\n",
-                       c->callee_name ? c->callee_name : "?", c->enclosing_func_qn ? c->enclosing_func_qn : "?",
-                       (unsigned)c->site_start_byte, (unsigned)c->site_end_byte, (int)c->requires_lsp_resolution);
+                       c->callee_name ? c->callee_name : "?",
+                       c->enclosing_func_qn ? c->enclosing_func_qn : "?",
+                       (unsigned)c->site_start_byte, (unsigned)c->site_end_byte,
+                       (int)c->requires_lsp_resolution);
             }
             for (int j = 0; j < r->defs.count; j++) {
                 const CBMDefinition *d = &r->defs.items[j];
-                printf("  [diag]   def label=%s qn=%s parent=%s ret=%s\n", d->label ? d->label : "?",
-                       d->qualified_name ? d->qualified_name : "?", d->parent_class ? d->parent_class : "?",
+                printf("  [diag]   def label=%s qn=%s parent=%s ret=%s\n",
+                       d->label ? d->label : "?", d->qualified_name ? d->qualified_name : "?",
+                       d->parent_class ? d->parent_class : "?",
                        d->return_type ? d->return_type : "?");
             }
         }
@@ -3324,11 +4020,13 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
                                 "\n"
                                 "type OrderService struct{}\n"
                                 "\n"
-                                "func (s *OrderService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
+                                "func (s *OrderService) PlaceOrder(ctx context.Context, req "
+                                "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
                                 "    return nil, nil\n"
                                 "}\n"
                                 "\n"
-                                "func (s *OrderService) ListOrders(ctx context.Context, req *pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
+                                "func (s *OrderService) ListOrders(ctx context.Context, req "
+                                "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
                                 "    return nil, nil\n"
                                 "}\n") != 0 ||
         th_write_file(app_path, "package handler\n"
@@ -3353,15 +4051,18 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
                                 "    searchSvc    *service.SearchService\n"
                                 "}\n"
                                 "\n"
-                                "func (h *OrderHandler) ListOrders(ctx context.Context, req *pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
+                                "func (h *OrderHandler) ListOrders(ctx context.Context, req "
+                                "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
                                 "    return h.orderSvc.ListOrders(ctx, req)\n"
                                 "}\n"
                                 "\n"
-                                "func (h *OrderHandler) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
+                                "func (h *OrderHandler) PlaceOrder(ctx context.Context, req "
+                                "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
                                 "    return h.orderSvc.PlaceOrder(ctx, req)\n"
                                 "}\n"
                                 "\n"
-                                "func (h *OrderHandler) UpdateCart(ctx context.Context, req *pb.UpdateCartReq) (*pb.UpdateCartRsp, error) {\n"
+                                "func (h *OrderHandler) UpdateCart(ctx context.Context, req "
+                                "*pb.UpdateCartReq) (*pb.UpdateCartRsp, error) {\n"
                                 "    return h.cartSvc.UpdateCart(ctx, req)\n"
                                 "}\n") != 0) {
         th_rmtree(tmpdir);
@@ -3379,11 +4080,12 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
     cbm_gbuf_t *gbuf = run_go_field_chain_sequential("go_field_fold", tmpdir, files, 2);
     ASSERT_NOT_NULL(gbuf);
 
-    const cbm_gbuf_edge_t *edge = find_call_edge_to_target_fragment(gbuf, "handler.PlaceOrder", ".service.PlaceOrder");
+    /* Since #1909, Go method QNs are receiver-qualified on both endpoints. */
+    const cbm_gbuf_edge_t *edge = find_call_edge_to_target_fragment(
+        gbuf, "OrderHandler.PlaceOrder", ".service.OrderService.PlaceOrder");
     const bool found = edge != NULL;
-    const bool dispatch =
-        edge && edge->properties_json &&
-        strstr(edge->properties_json, "\"strategy\":\"lsp_type_dispatch\"");
+    const bool dispatch = edge && edge->properties_json &&
+                          strstr(edge->properties_json, "\"strategy\":\"lsp_type_dispatch\"");
     if (!found || !dispatch) {
         printf("  go field chain diagnostic: found=%d dispatch=%d\n", found, dispatch);
         if (edge && edge->properties_json) {
@@ -3414,8 +4116,7 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
                         all[i] ? cbm_gbuf_find_by_id(gbuf, all[i]->source_id) : NULL;
                     const cbm_gbuf_node_t *dst =
                         all[i] ? cbm_gbuf_find_by_id(gbuf, all[i]->target_id) : NULL;
-                    printf("  CALLS edge: %s -> %s  props=%s\n",
-                           src ? src->qualified_name : "?",
+                    printf("  CALLS edge: %s -> %s  props=%s\n", src ? src->qualified_name : "?",
                            dst ? dst->qualified_name : "?",
                            all[i]->properties_json ? all[i]->properties_json : "{}");
                 }
@@ -3797,8 +4498,8 @@ TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous) {
     const char *project = "proj";
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, "/tmp");
     ASSERT_NOT_NULL(gbuf);
-    int64_t target_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler",
-                                             "proj.mod.Target.handler", "target.py", 1, 1, "{}");
+    int64_t target_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler", "proj.mod.Target.handler",
+                                             "target.py", 1, 1, "{}");
     ASSERT_GT(target_id, 0);
 
     CBMCall call = make_call("proj.mod.Caller.run", "handler");
@@ -3807,8 +4508,7 @@ TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous) {
     CBMResolvedCall raw = make_rc("proj.mod.Caller.run", "mod.Target.handler", 0.75f);
     raw.site_start_byte = call.site_start_byte;
     raw.site_end_byte = call.site_end_byte;
-    CBMResolvedCall prefixed =
-        make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
+    CBMResolvedCall prefixed = make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
     prefixed.site_start_byte = call.site_start_byte;
     prefixed.site_end_byte = call.site_end_byte;
     CBMResolvedCall items[] = {raw, prefixed};
@@ -3827,9 +4527,8 @@ TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist) 
     ASSERT_NOT_NULL(gbuf);
     int64_t raw_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler", "mod.Target.handler",
                                           "raw.py", 1, 1, "{}");
-    int64_t prefixed_id = cbm_gbuf_upsert_node(gbuf, "Function", "handler",
-                                               "proj.mod.Target.handler", "prefixed.py", 1, 1,
-                                               "{}");
+    int64_t prefixed_id = cbm_gbuf_upsert_node(
+        gbuf, "Function", "handler", "proj.mod.Target.handler", "prefixed.py", 1, 1, "{}");
     ASSERT_GT(raw_id, 0);
     ASSERT_GT(prefixed_id, 0);
     ASSERT(raw_id != prefixed_id);
@@ -3840,8 +4539,7 @@ TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist) 
     CBMResolvedCall raw = make_rc("proj.mod.Caller.run", "mod.Target.handler", 0.75f);
     raw.site_start_byte = call.site_start_byte;
     raw.site_end_byte = call.site_end_byte;
-    CBMResolvedCall prefixed =
-        make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
+    CBMResolvedCall prefixed = make_rc("proj.mod.Caller.run", "proj.mod.Target.handler", 0.90f);
     prefixed.site_start_byte = call.site_start_byte;
     prefixed.site_end_byte = call.site_end_byte;
     CBMResolvedCall items[] = {raw, prefixed};
@@ -4271,7 +4969,553 @@ TEST(lsp_target_node_supports_long_prefixed_qualified_name) {
 
 /* ── Suite Registration ──────────────────────────────────────────── */
 
+/* ── PHP vendor-imported types never bind by name (#1186) ─────────── */
+
+/* Foo.php imports `Request` from a vendor namespace no project file declares,
+ * so the import stays unresolved. The project has its own class Request
+ * (another namespace) and a TypeScript function sendAsync. Every edge from
+ * Foo.php that names the vendor Request -- its base class, calls on a
+ * Request-typed receiver, the `new`, the type references -- used to bind by
+ * name to those project symbols. Svc is imported from a declared project
+ * namespace and is the control that must keep resolving. */
+static const struct {
+    const char *rel;
+    CBMLanguage lang;
+    const char *src;
+} k_php_vendor_files[] = {
+    {"lib/Requests/Request.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Http\\Requests;\n\nclass Request {\n"
+     "    public function validated() { return 1; }\n"
+     "    public static function makeIt() { return 2; }\n"
+     "    public function get($k) { return $k; }\n}\n"},
+    {"lib/Services/Svc.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Services;\n\nclass Svc {\n"
+     "    public function go() { return 3; }\n"
+     "    public static function build() { return 4; }\n}\n"},
+    {"web/api.ts", CBM_LANG_TYPESCRIPT, "export function sendAsync(x: number) { return x; }\n"},
+    {"lib/Integrations/Foo.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Http\\Integrations;\n\n"
+     "use Saloon\\Http\\Request;\nuse App\\Services\\Svc;\n\n"
+     "class Foo extends Request {\n"
+     "    public function run(Request $r, Svc $s) {\n"
+     "        $r->validated();\n"
+     "        Request::makeIt();\n"
+     "        $made = new Request();\n"
+     "        $s->go();\n"
+     "        Svc::build();\n"
+     "        $r->get('id');\n"
+     "        return $r->sendAsync(1);\n"
+     "    }\n}\n\n"
+     "class Bar extends Svc {\n}\n"},
+    {"lib/Integrations/Clients.php", CBM_LANG_PHP,
+     "<?php\nnamespace App\\Http\\Integrations;\n"
+     "use GuzzleHttp\\Client as GuzzleClient;\nuse Kafka\\Producer as KafkaProducer;\n"
+     "class Clients { function run() {\n"
+     " GuzzleClient::get('/api/vendor-health');\n"
+     " KafkaProducer::publish('vendor-orders', 'payload');\n}\n}\n"},
+};
+enum { PHP_VENDOR_FILE_COUNT = (int)(sizeof(k_php_vendor_files) / sizeof(k_php_vendor_files[0])) };
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *type;
+    const char *src_rel;
+    const char *tgt_rel;
+    int count;
+    int source_nodes;
+    bool query_failed;
+} php_file_edge_count_t;
+
+static void php_count_source_edges(const cbm_gbuf_node_t *source, void *ud) {
+    php_file_edge_count_t *c = ud;
+    if (!source->file_path || strcmp(source->file_path, c->src_rel) != 0)
+        return;
+    c->source_nodes++;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(c->gbuf, source->id, c->type, &edges, &count) != 0) {
+        c->query_failed = true;
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(c->gbuf, edges[i]->target_id);
+        if (!target) {
+            c->query_failed = true;
+        } else if (target->file_path && strcmp(target->file_path, c->tgt_rel) == 0) {
+            c->count++;
+        }
+    }
+}
+
+static int php_file_edges(const cbm_gbuf_t *gbuf, const char *type, const char *source,
+                          const char *target) {
+    char *source_qn = cbm_pipeline_fqn_compute("cbm_par_phpvendor", source, "__file__");
+    char *target_qn = cbm_pipeline_fqn_compute("cbm_par_phpvendor", target, "__file__");
+    const cbm_gbuf_node_t *s = source_qn ? cbm_gbuf_find_by_qn(gbuf, source_qn) : NULL;
+    const cbm_gbuf_node_t *t = target_qn ? cbm_gbuf_find_by_qn(gbuf, target_qn) : NULL;
+    bool files_exist = s && t && s->label && t->label && strcmp(s->label, "File") == 0 &&
+                       strcmp(t->label, "File") == 0;
+    free(source_qn);
+    free(target_qn);
+    if (!files_exist)
+        return -1;
+    php_file_edge_count_t c = {.gbuf = gbuf, .type = type, .src_rel = source, .tgt_rel = target};
+    cbm_gbuf_foreach_node(gbuf, php_count_source_edges, &c);
+    return c.query_failed || c.source_nodes == 0 ? -1 : c.count;
+}
+
+static bool php_vendor_extracted_sites(void) {
+    for (int file = 3; file < PHP_VENDOR_FILE_COUNT; file++) {
+        const char *source = k_php_vendor_files[file].src;
+        CBMFileResult *r =
+            cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "cbm_par_phpvendor",
+                             k_php_vendor_files[file].rel, 0, NULL, NULL);
+        if (!r)
+            return false;
+        bool ok = r->defs.count > 0 && r->imports.count == 2;
+        const char *core[] = {"validated", "makeIt", "go", "build", "get", "sendAsync"};
+        const char *service[] = {"get", "publish"};
+        const char *const *wanted = file == 3 ? core : service;
+        int wanted_count = file == 3 ? 6 : 2;
+        for (int i = 0; i < wanted_count; i++) {
+            int count = 0;
+            for (int j = 0; j < r->calls.count; j++) {
+                const CBMCall *c = &r->calls.items[j];
+                if (!c->callee_name || !c->enclosing_func_qn ||
+                    strcmp(cbm_pipeline_call_callee_leaf(c->callee_name), wanted[i]) != 0 ||
+                    c->site_end_byte <= c->site_start_byte || c->site_end_byte > strlen(source))
+                    continue;
+                if (file == 4) {
+                    const char *arg = i == 0 ? "/api/vendor-health" : "vendor-orders";
+                    const char *alias = i == 0 ? "GuzzleClient::" : "KafkaProducer::";
+                    /* The extractor names a scoped call by its method alone
+                     * (it keeps only a literal `Route::` scope, #952), so the
+                     * aliased scope is proven on the occurrence text. */
+                    if (!c->first_string_arg || strcmp(c->first_string_arg, arg) != 0 ||
+                        strncmp(source + c->site_start_byte, alias, strlen(alias)) != 0)
+                        continue;
+                }
+                count++;
+            }
+            ok = count == 1 && ok;
+        }
+        cbm_free_result(r);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+static bool php_vendor_service_edge(const cbm_gbuf_t *gb, const char *type, const char *name) {
+    const cbm_gbuf_node_t *source = find_unique_callable_node_by_tail(gb, "Clients.run");
+    if (!source)
+        return false;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gb, source->id, type, &edges, &count) != 0 || count != 1)
+        return false;
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, edges[0]->target_id);
+    return target && target->label && strcmp(target->label, "Route") == 0 &&
+           edges[0]->properties_json && strstr(edges[0]->properties_json, name);
+}
+
+static void php_vendor_edge_fp(const cbm_gbuf_edge_t *edge, void *ud) {
+    if (strcmp(edge->type, "CALLS") == 0 || strcmp(edge->type, "USAGE") == 0 ||
+        strcmp(edge->type, "INHERITS") == 0 || strcmp(edge->type, "IMPORTS") == 0 ||
+        strcmp(edge->type, "HTTP_CALLS") == 0 || strcmp(edge->type, "ASYNC_CALLS") == 0)
+        fp_visit_edge(edge, ud);
+}
+
+/* 1 when the graph holds no vendor-named edge and every control edge. */
+static int php_vendor_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
+    static const char *const foo = "lib/Integrations/Foo.php";
+    static const char *const req = "lib/Requests/Request.php";
+    static const char *const svc = "lib/Services/Svc.php";
+    struct {
+        const char *type;
+        const char *tgt;
+        int want_min;
+        int want_max;
+    } checks[] = {
+        {"INHERITS", req, 0, 0},       {"CALLS", req, 0, 0},       {"USAGE", req, 0, 0},
+        {"CALLS", "web/api.ts", 0, 0}, {"INHERITS", svc, 1, 1},    {"CALLS", svc, 2, 2},
+        {"CALLS", foo, 0, 0},          {"USAGE", svc, 1, 1 << 20},
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        int got = php_file_edges(gbuf, checks[i].type, foo, checks[i].tgt);
+        if (got < checks[i].want_min || got > checks[i].want_max) {
+            printf("  [%s] %s Foo.php -> %s: got %d, want %d..%d\n", driver, checks[i].type,
+                   checks[i].tgt, got, checks[i].want_min, checks[i].want_max);
+            ok = 0;
+        }
+    }
+    return ok && php_vendor_service_edge(gbuf, "HTTP_CALLS", "/api/vendor-health") &&
+           php_vendor_service_edge(gbuf, "ASYNC_CALLS", "vendor-orders");
+}
+
+TEST(parallel_php_vendor_types_never_bind_by_name_issue1186) {
+    ASSERT_TRUE(php_vendor_extracted_sites());
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_phpvendor_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[PHP_VENDOR_FILE_COUNT][512];
+    cbm_file_info_t files[PHP_VENDOR_FILE_COUNT];
+    memset(files, 0, sizeof(files));
+    for (int i = 0; i < PHP_VENDOR_FILE_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, k_php_vendor_files[i].rel);
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", paths[i]);
+        *strrchr(dir, '/') = '\0';
+        cbm_mkdir_p(dir, 0755);
+        FILE *f = fopen(paths[i], "w");
+        if (!f) {
+            th_rmtree(tmpdir);
+            FAIL("fopen failed");
+        }
+        bool wrote = fputs(k_php_vendor_files[i].src, f) >= 0;
+        bool closed = fclose(f) == 0;
+        if (!wrote || !closed) {
+            th_rmtree(tmpdir);
+            FAIL("fixture write failed");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)k_php_vendor_files[i].rel;
+        files[i].language = k_php_vendor_files[i].lang;
+    }
+
+    cbm_gbuf_t *seq = run_sequential_with_lsp_cross_and_mutator(
+        "cbm_par_phpvendor", tmpdir, files, PHP_VENDOR_FILE_COUNT, NULL, NULL, true);
+    cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpvendor", tmpdir, files, PHP_VENDOR_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    const size_t saved_budget = cbm_mem_budget();
+    const size_t budget = (size_t)1024 * 1024 * 1024;
+    cbm_mem_set_budget_for_tests(budget);
+    cbm_mem_set_charged_for_tests(budget - budget / 16);
+    g_harness_spill = true;
+    int cached = -1;
+    cbm_gbuf_t *spilled = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpvendor", tmpdir, files, PHP_VENDOR_FILE_COUNT, 2, NULL, count_cached_results,
+        &cached, true);
+    int64_t parked = g_harness_parked;
+    g_harness_spill = false;
+    cbm_mem_set_charged_for_tests(0);
+    cbm_mem_set_budget_for_tests(saved_budget);
+    int seq_ok = seq ? php_vendor_graph_ok(seq, "sequential") : 0;
+    int par_ok = par ? php_vendor_graph_ok(par, "parallel") : 0;
+    int spill_ok = spilled ? php_vendor_graph_ok(spilled, "spilled") : 0;
+    graph_fp_t seq_edges = {.gb = seq}, par_edges = {.gb = par};
+    graph_fp_t par_all = {0}, spill_all = {0};
+    if (seq)
+        cbm_gbuf_foreach_edge(seq, php_vendor_edge_fp, &seq_edges);
+    if (par) {
+        cbm_gbuf_foreach_edge(par, php_vendor_edge_fp, &par_edges);
+        par_all = graph_fingerprint(par);
+    }
+    if (spilled)
+        spill_all = graph_fingerprint(spilled);
+    bool edge_parity = seq_edges.count > 0 && seq_edges.count == par_edges.count &&
+                       seq_edges.sum == par_edges.sum && seq_edges.xr == par_edges.xr;
+    bool spill_parity = par_all.count > 0 && par_all.count == spill_all.count &&
+                        par_all.sum == spill_all.sum && par_all.xr == spill_all.xr;
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    cbm_gbuf_free(spilled);
+    th_rmtree(tmpdir);
+    ASSERT_EQ(cached, 0);
+    ASSERT_EQ((int)parked, PHP_VENDOR_FILE_COUNT);
+    ASSERT_TRUE(seq_ok);
+    ASSERT_TRUE(par_ok);
+    ASSERT_TRUE(spill_ok);
+    ASSERT_TRUE(edge_parity);
+    ASSERT_TRUE(spill_parity);
+    PASS();
+}
+
+/* ── PHP LSP types receivers of imported project classes (#1186) ─── */
+
+/* Foo.php calls methods on receivers typed with classes imported from OTHER
+ * project files: a promoted property (`$this->svc->go()`) and an aliased
+ * import (`R $r` -> `$r->find()`). The import map handed to the PHP LSP held
+ * the IMPORTS edge target -- the imported file's File node QN
+ * (`...Svc.php.__file__`) -- as the class, so no receiver ever typed and the
+ * calls fell to name-only strategies (the #1186 "useful calls at 0.38"). The
+ * decoy App\Other\Svc shares the short name and the method, so a name-only
+ * match cannot tell the two apart. Controls: the vendor-typed receiver
+ * (`Client $c`) must stay unresolved, and the same-file calls keep their LSP
+ * strategies. */
+static const struct {
+    const char *rel;
+    const char *src;
+} k_php_xfile_files[] = {
+    {"lib/Services/Svc.php", "<?php\nnamespace App\\Services;\n\nclass Svc {\n"
+                             "    public function go() { return 1; }\n}\n"},
+    {"lib/Other/Svc.php", "<?php\nnamespace App\\Other;\n\nclass Svc {\n"
+                          "    public function go() { return 2; }\n}\n"},
+    {"lib/Repo/Repo.php", "<?php\nnamespace App\\Repo;\n\nclass Repo {\n"
+                          "    public function find() { return 3; }\n}\n"},
+    {"lib/Http/Foo.php",
+     "<?php\nnamespace App\\Http;\n\n"
+     "use App\\Services\\Svc;\nuse App\\Repo\\Repo as R;\nuse Vendor\\Pkg\\Client;\n\n"
+     "class Foo {\n"
+     "    public function __construct(private Svc $svc) {}\n"
+     "    public function run(R $r, Client $c) {\n"
+     "        $this->svc->go();\n"
+     "        $r->find();\n"
+     "        $c->go();\n"
+     "        $this->local();\n"
+     "        (new Local())->ping();\n"
+     "    }\n"
+     "    private function local() { return 4; }\n}\n\n"
+     "class Local {\n"
+     "    public function ping() { return 5; }\n}\n"},
+};
+enum { PHP_XFILE_FILE_COUNT = (int)(sizeof(k_php_xfile_files) / sizeof(k_php_xfile_files[0])) };
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *src_rel;
+    const char *tgt_rel;
+    const char *tgt_suffix;
+    const char *strategy_prefix;
+    int total;
+    int with_strategy;
+} php_xfile_edge_count_t;
+
+static void php_xfile_count_edge(const cbm_gbuf_edge_t *edge, void *ud) {
+    php_xfile_edge_count_t *c = ud;
+    if (!edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    const cbm_gbuf_node_t *s = cbm_gbuf_find_by_id(c->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(c->gbuf, edge->target_id);
+    if (!s || !t || !s->file_path || !t->file_path || !t->qualified_name ||
+        strcmp(s->file_path, c->src_rel) != 0 || strcmp(t->file_path, c->tgt_rel) != 0) {
+        return;
+    }
+    size_t qlen = strlen(t->qualified_name);
+    size_t slen = strlen(c->tgt_suffix);
+    if (qlen < slen || strcmp(t->qualified_name + qlen - slen, c->tgt_suffix) != 0) {
+        return;
+    }
+    c->total++;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s", c->strategy_prefix);
+    if (edge->properties_json && strstr(edge->properties_json, needle)) {
+        c->with_strategy++;
+    }
+}
+
+/* 1 when every cross-file receiver resolved through the PHP LSP, the decoy and
+ * the vendor receiver drew nothing, and the same-file controls held. */
+static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
+    static const char *const foo = "lib/Http/Foo.php";
+    struct {
+        const char *tgt;
+        const char *suffix;
+        int want_total;
+        int want_lsp;
+    } checks[] = {
+        {"lib/Services/Svc.php", ".Svc.go", 1, 1}, /* $this->svc->go(), not $c->go() */
+        {"lib/Other/Svc.php", ".Svc.go", 0, 0},    /* decoy: same short name + method */
+        {"lib/Repo/Repo.php", ".Repo.find", 1, 1}, /* aliased import */
+        {foo, ".Foo.local", 1, 1},                 /* same-file control */
+        {foo, ".Local.ping", 1, 1},                /* same-file control */
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
+        php_xfile_edge_count_t c = {gbuf, foo, checks[i].tgt, checks[i].suffix, "php_", 0, 0};
+        cbm_gbuf_foreach_edge(gbuf, php_xfile_count_edge, &c);
+        if (c.total != checks[i].want_total || c.with_strategy != checks[i].want_lsp) {
+            printf("  [%s] CALLS Foo.php -> %s%s: %d edge(s), %d via php_*; want %d, %d\n", driver,
+                   checks[i].tgt, checks[i].suffix, c.total, c.with_strategy, checks[i].want_total,
+                   checks[i].want_lsp);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* Run the fixture on both venues. extra_use (nullable) is one more `use` line
+ * added to Foo.php. Returns 1 when both graphs pass, 0 when not, -1 on setup
+ * failure. */
+static int php_xfile_run(const char *extra_use) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_phpxfile_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return -1;
+    }
+    char paths[PHP_XFILE_FILE_COUNT][512];
+    cbm_file_info_t files[PHP_XFILE_FILE_COUNT];
+    memset(files, 0, sizeof(files));
+    static const char foo_use[] = "use Vendor\\Pkg\\Client;\n";
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, k_php_xfile_files[i].rel);
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", paths[i]);
+        *strrchr(dir, '/') = '\0';
+        cbm_mkdir_p(dir, 0755);
+        char src[2048];
+        const char *s = k_php_xfile_files[i].src;
+        const char *at = extra_use ? strstr(s, foo_use) : NULL;
+        if (at) {
+            size_t head = (size_t)(at - s) + sizeof(foo_use) - 1;
+            snprintf(src, sizeof(src), "%.*s%s%s", (int)head, s, extra_use, s + head);
+            s = src;
+        }
+        if (th_write_file(paths[i], s) != 0) {
+            th_rmtree(tmpdir);
+            return -1;
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)k_php_xfile_files[i].rel;
+        files[i].language = CBM_LANG_PHP;
+    }
+
+    cbm_gbuf_t *seq = run_sequential_with_lsp_cross_and_mutator(
+        "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, NULL, NULL, true);
+    cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
+        "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    int seq_ok = seq ? php_xfile_graph_ok(seq, "sequential") : 0;
+    int par_ok = par ? php_xfile_graph_ok(par, "parallel") : 0;
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(tmpdir);
+    return seq_ok && par_ok;
+}
+
+TEST(parallel_php_lsp_types_imported_project_receivers_issue1186) {
+    ASSERT_EQ(php_xfile_run(NULL), 1);
+    PASS();
+}
+
+/* The same file with one more import that no file in the project declares,
+ * the global class `use Exception;` written in most namespaced PHP files.
+ * The typed import evidence leaves such a file "unknown" as a whole (#2520),
+ * so the class-valued import mapping must not depend on that evidence. */
+TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue1186) {
+    ASSERT_EQ(php_xfile_run("use Exception;\n"), 1);
+    PASS();
+}
+
+
+/* A fresh PHP external row replaces stale evidence for its exact occurrence,
+ * including an older external row, without clearing a real project invocation
+ * of the same method at the next occurrence. Test both old-row orders. */
+TEST(parallel_php_external_row_replaces_only_its_exact_occurrence) {
+    const char *source = "<?php\nnamespace App;\nuse Vendor\\Http\\Request;\n"
+                         "use App\\Project\\Request as LocalRequest;\n"
+                         "class Caller { function run(Request $r, LocalRequest $p) {\n"
+                         " $r->validated();\n $p->validated();\n}\n}\n";
+    const char *project_type = "p.lib.Request.Request";
+    CBMLSPDef defs[] = {
+        {.qualified_name = project_type,
+         .short_name = "Request",
+         .label = "Class",
+         .def_module_qn = "p.lib.Request",
+         .lang = CBM_LANG_PHP},
+        {.qualified_name = "p.lib.Request.Request.validated",
+         .short_name = "validated",
+         .label = "Method",
+         .receiver_type = project_type,
+         .def_module_qn = "p.lib.Request",
+         .lang = CBM_LANG_PHP},
+    };
+    for (int order = 0; order < 2; order++) {
+        CBMFileResult *r = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PHP, "p",
+                                            "main.php", 0, NULL, NULL);
+        ASSERT_NOT_NULL(r);
+        ASSERT_EQ(r->imports.count, 2);
+        const CBMCall *sites[2] = {0};
+        int count = 0;
+        for (int i = 0; i < r->calls.count; i++) {
+            const CBMCall *call = &r->calls.items[i];
+            if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "Caller.run") &&
+                call->callee_name &&
+                strcmp(cbm_pipeline_call_callee_leaf(call->callee_name), "validated") == 0 &&
+                call->site_end_byte > call->site_start_byte) {
+                ASSERT_TRUE(count < 2);
+                sites[count++] = call;
+            }
+        }
+        ASSERT_EQ(count, 2);
+        if (sites[0]->site_start_byte > sites[1]->site_start_byte) {
+            const CBMCall *swap = sites[0];
+            sites[0] = sites[1];
+            sites[1] = swap;
+        }
+        ASSERT_TRUE(sites[0]->site_end_byte <= sites[1]->site_start_byte);
+        CBMResolvedCall stale = {0};
+        stale.caller_qn = sites[0]->enclosing_func_qn;
+        stale.callee_qn = "p.lib.Request.Request.validated";
+        stale.strategy = "test_stale_project";
+        stale.confidence = 0.99f;
+        stale.kind = CBM_RESOLVED_INVOCATION;
+        stale.site_start_byte = sites[0]->site_start_byte;
+        stale.site_end_byte = sites[0]->site_end_byte;
+        stale.source_origin = sites[0]->source_origin;
+        CBMResolvedCall old_external = stale;
+        old_external.callee_qn = "Old.Vendor.Request.validated";
+        old_external.strategy = "php_external_receiver";
+        CBMResolvedCall separate = stale;
+        separate.strategy = "test_separate_project";
+        separate.site_start_byte = sites[1]->site_start_byte;
+        separate.site_end_byte = sites[1]->site_end_byte;
+        separate.source_origin = sites[1]->source_origin;
+        r->resolved_calls.count = 0;
+        cbm_resolvedcall_push(&r->resolved_calls, &r->arena, order ? old_external : stale);
+        cbm_resolvedcall_push(&r->resolved_calls, &r->arena, order ? stale : old_external);
+        cbm_resolvedcall_push(&r->resolved_calls, &r->arena, separate);
+        const char *targets[2] = {0};
+        for (int i = 0; i < r->imports.count; i++)
+            if (strcmp(r->imports.items[i].local_name, "LocalRequest") == 0)
+                targets[i] = "p.lib.Request.__file__";
+        CBMPHPImportBindings bindings = {.imports = &r->imports, .targets = targets};
+        const char *keys[] = {"LocalRequest"};
+        const char *vals[] = {project_type};
+        cbm_pxc_run_one_with_php_bindings(CBM_LANG_PHP, r, source, (int)strlen(source), "p.main",
+                                          defs, 2, keys, vals, 1, &bindings);
+        int external_count = 0, project_count = 0;
+        for (int i = 0; i < r->resolved_calls.count; i++) {
+            const CBMResolvedCall *row = &r->resolved_calls.items[i];
+            if (!row->caller_qn || strcmp(row->caller_qn, sites[0]->enclosing_func_qn) != 0 ||
+                row->kind != CBM_RESOLVED_INVOCATION)
+                continue;
+            if (row->site_start_byte == sites[0]->site_start_byte &&
+                row->site_end_byte == sites[0]->site_end_byte &&
+                row->source_origin == sites[0]->source_origin) {
+                ASSERT_STR_EQ(row->callee_qn, "Vendor.Http.Request.validated");
+                ASSERT_STR_EQ(row->strategy, "php_external_receiver");
+                external_count++;
+            } else if (row->site_start_byte == sites[1]->site_start_byte &&
+                       row->site_end_byte == sites[1]->site_end_byte &&
+                       row->source_origin == sites[1]->source_origin) {
+                ASSERT_STR_EQ(row->callee_qn, "p.lib.Request.Request.validated");
+                project_count++;
+            }
+        }
+        ASSERT_EQ(external_count, 1);
+        ASSERT_EQ(project_count, 1);
+        const CBMResolvedCall *vendor =
+            cbm_pipeline_find_lsp_resolution(&r->resolved_calls, sites[0], false);
+        const CBMResolvedCall *project =
+            cbm_pipeline_find_lsp_resolution(&r->resolved_calls, sites[1], false);
+        ASSERT_NOT_NULL(vendor);
+        ASSERT_NOT_NULL(project);
+        ASSERT_STR_EQ(vendor->strategy, "php_external_receiver");
+        ASSERT_STR_EQ(project->callee_qn, "p.lib.Request.Request.validated");
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 SUITE(parallel) {
+    RUN_TEST(parallel_php_external_row_replaces_only_its_exact_occurrence);
+    RUN_TEST(parallel_php_vendor_types_never_bind_by_name_issue1186);
+    RUN_TEST(parallel_php_lsp_types_imported_project_receivers_issue1186);
+    RUN_TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue1186);
     RUN_TEST(usage_semantic_reference_candidate_trusts_marked_producer);
     RUN_TEST(lsp_bare_segment_skips_preprocessor_spacing);
     RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
@@ -4308,6 +5552,9 @@ SUITE(parallel) {
     RUN_TEST(gbuf_merge_empty_src);
     RUN_TEST(gbuf_merge_src_free_safe);
     RUN_TEST(gbuf_next_id_accessors);
+    RUN_TEST(gbuf_raise_next_id_never_lowers);
+    RUN_TEST(parallel_full_index_keeps_edge_ids_unique);
+    RUN_TEST(parallel_closure_repair_syncs_ids_through_the_helper);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);
@@ -4325,6 +5572,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_module_value_usage_respects_lexical_shadows);
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
+    RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);
@@ -4338,6 +5586,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_rust_external_target_contract);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
@@ -4348,8 +5597,11 @@ SUITE(parallel) {
     RUN_TEST(parallel_implements_parity);
     RUN_TEST(parallel_semantic_fixture_expected_counts);
     RUN_TEST(parallel_total_edges);
+    RUN_TEST(parallel_spill_mode_builds_the_same_graph);
+    RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
+    RUN_TEST(parallel_wide_definition_keeps_fp_sp_bt_f14);
 
     /* Cleanup shared state */
     parity_teardown();
