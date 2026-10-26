@@ -5,6 +5,7 @@
 #include "neo4j/neo4j_http.h"
 
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 
 #include <ctype.h>
@@ -22,7 +23,14 @@ struct cbm_neo4j {
     char uri[CBM_NEO4J_URI_MAX];
     char commit_path[CBM_NEO4J_DATABASE_MAX + 32];
     char err[CBM_NEO4J_ERR_MAX];
+    uint64_t cred_key; /* hash of uri + user + password, for the login backoff */
 };
+
+/* After Neo4j rejects a login, the same credentials are not offered again for
+ * this long: every rejected attempt counts toward Neo4j's lockout
+ * (AuthenticationRateLimit), which then refuses the CORRECT password too. */
+#define N4_AUTH_BACKOFF_MS 60000ULL
+#define N4_AUTH_BACKOFF_SLOTS 16
 
 /* ── Credential cache ───────────────────────────────────────────── */
 
@@ -105,15 +113,22 @@ static bool n4_nonempty(const char *s) {
     return s && *s;
 }
 
-static void resolve_password(cbm_neo4j_config_t *out, const char *explicit_pw) {
+/* CBM_NEO4J_PASSWORD is only ever set by the index supervisor for one worker
+ * and carries that request's --graph-password, so it outranks everything but
+ * an explicit value. For an already-indexed project (prefer_cache) the login
+ * this process last used successfully for exactly that uri + user comes next:
+ * the ambient NEO4J_PASSWORD may belong to another Neo4j altogether, and
+ * trying it first is how a wrong global password locked a project's server
+ * out. */
+static void resolve_password(cbm_neo4j_config_t *out, const char *explicit_pw, bool prefer_cache) {
     char buf[CBM_NEO4J_PASSWORD_MAX];
-    /* CBM_NEO4J_PASSWORD is only ever set by the index supervisor for one
-     * worker and carries that request's --graph-password, so it outranks the
-     * user's ambient NEO4J_PASSWORD. */
     if (n4_nonempty(explicit_pw)) {
         copy_str(out->password, sizeof(out->password), explicit_pw);
     } else if (cbm_safe_getenv(CBM_NEO4J_PASSWORD_ENV, buf, sizeof(buf), NULL) && buf[0]) {
         copy_str(out->password, sizeof(out->password), buf);
+    } else if (prefer_cache &&
+               cred_lookup(out->uri, out->user, out->password, sizeof(out->password))) {
+        /* the project's own last good login */
     } else if (cbm_safe_getenv("NEO4J_PASSWORD", buf, sizeof(buf), NULL) && buf[0]) {
         copy_str(out->password, sizeof(out->password), buf);
     } else {
@@ -166,7 +181,7 @@ int cbm_neo4j_config_resolve(const char *uri, const char *user, const char *pass
             return -1;
         }
     }
-    resolve_password(out, password);
+    resolve_password(out, password, false);
     return 0;
 }
 
@@ -214,11 +229,82 @@ int cbm_neo4j_config_from_meta(const char *meta_json, cbm_neo4j_config_t *out, c
     if (!out->database[0]) {
         copy_str(out->database, sizeof(out->database), N4_DEFAULT_DATABASE);
     }
-    resolve_password(out, NULL);
+    resolve_password(out, NULL, true);
     return 0;
 }
 
 /* ── Client ─────────────────────────────────────────────────────── */
+
+/* ── Login backoff ──────────────────────────────────────────────── */
+
+typedef struct {
+    uint64_t key;
+    uint64_t failed_at_ms;
+} n4_auth_failure_t;
+
+static n4_auth_failure_t g_auth_failures[N4_AUTH_BACKOFF_SLOTS];
+
+static uint64_t n4_fnv1a(uint64_t h, const char *s) {
+    for (; s && *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211ULL;
+    }
+    return h * 1099511628211ULL; /* separator, so "ab"+"c" != "a"+"bc" */
+}
+
+static uint64_t n4_cred_key(const cbm_neo4j_config_t *cfg) {
+    uint64_t h = 14695981039346656037ULL;
+    h = n4_fnv1a(h, cfg->uri);
+    h = n4_fnv1a(h, cfg->user);
+    return n4_fnv1a(h, cfg->password);
+}
+
+/* Milliseconds left in this key's backoff (0 = may try). */
+static uint64_t n4_auth_backoff_left(uint64_t key) {
+    uint64_t left = 0;
+    uint64_t now = cbm_now_ms();
+    cred_lock();
+    for (int i = 0; i < N4_AUTH_BACKOFF_SLOTS; i++) {
+        if (g_auth_failures[i].key == key && g_auth_failures[i].failed_at_ms &&
+            now - g_auth_failures[i].failed_at_ms < N4_AUTH_BACKOFF_MS) {
+            left = N4_AUTH_BACKOFF_MS - (now - g_auth_failures[i].failed_at_ms);
+        }
+    }
+    cbm_mutex_unlock(&g_cred_mu);
+    return left;
+}
+
+/* failed: start (or restart) the backoff; !failed: the login worked. */
+static void n4_auth_note(uint64_t key, bool failed) {
+    uint64_t now = cbm_now_ms();
+    cred_lock();
+    int slot = -1;
+    int oldest = 0;
+    for (int i = 0; i < N4_AUTH_BACKOFF_SLOTS; i++) {
+        if (g_auth_failures[i].key == key) {
+            slot = i;
+        }
+        if (g_auth_failures[i].failed_at_ms < g_auth_failures[oldest].failed_at_ms) {
+            oldest = i;
+        }
+    }
+    if (failed) {
+        if (slot < 0) {
+            slot = oldest;
+        }
+        g_auth_failures[slot].key = key;
+        g_auth_failures[slot].failed_at_ms = now ? now : 1;
+    } else if (slot >= 0) {
+        memset(&g_auth_failures[slot], 0, sizeof(g_auth_failures[slot]));
+    }
+    cbm_mutex_unlock(&g_cred_mu);
+}
+
+void cbm_neo4j_test_reset_auth_backoff(void) {
+    cred_lock();
+    memset(g_auth_failures, 0, sizeof(g_auth_failures));
+    cbm_mutex_unlock(&g_cred_mu);
+}
 
 cbm_neo4j_t *cbm_neo4j_connect(const cbm_neo4j_config_t *cfg, char *err, size_t err_sz) {
     cbm_neo4j_url_t url;
@@ -237,6 +323,7 @@ cbm_neo4j_t *cbm_neo4j_connect(const cbm_neo4j_config_t *cfg, char *err, size_t 
     copy_str(c->uri, sizeof(c->uri), cfg->uri);
     (void)snprintf(c->commit_path, sizeof(c->commit_path), "/db/%s/tx/commit",
                    cfg->database[0] ? cfg->database : N4_DEFAULT_DATABASE);
+    c->cred_key = n4_cred_key(cfg);
     return c;
 }
 
@@ -326,6 +413,27 @@ const char *cbm_neo4j_result_shape_error(yyjson_val *results, int statements) {
     return NULL;
 }
 
+/* One debug line per round trip (CBM_LOG_LEVEL=debug): which Neo4j, how many
+ * statements, the first one's Cypher, HTTP status and latency. */
+static void n4_log_request(const cbm_neo4j_t *c, cbm_neo4j_batch_t *b, int status,
+                           uint64_t elapsed_ms) {
+    if (cbm_log_get_level() > CBM_LOG_DEBUG) {
+        return;
+    }
+    yyjson_mut_val *first = yyjson_mut_arr_get_first(b->statements);
+    const char *cypher = yyjson_mut_get_str(yyjson_mut_obj_get(first, "statement"));
+    char head[200];
+    (void)snprintf(head, sizeof(head), "%s", cypher ? cypher : "");
+    char stmts[16];
+    char st[16];
+    char ms[24];
+    (void)snprintf(stmts, sizeof(stmts), "%d", b->count);
+    (void)snprintf(st, sizeof(st), "%d", status);
+    (void)snprintf(ms, sizeof(ms), "%llu", (unsigned long long)elapsed_ms);
+    cbm_log_debug("neo4j.query", "uri", c->uri, "statements", stmts, "status", st, "ms", ms,
+                  "cypher", head);
+}
+
 int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t *out) {
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -334,6 +442,18 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
         return -1;
     }
     c->err[0] = '\0';
+    uint64_t backoff = n4_auth_backoff_left(c->cred_key);
+    if (backoff > 0) {
+        char secs[16];
+        (void)snprintf(secs, sizeof(secs), "%llu", (unsigned long long)((backoff + 999) / 1000));
+        set_err(c,
+                "Neo4j rejected these credentials for %s; not retrying them for another %s s "
+                "(each rejected login counts toward Neo4j's lockout). Fix the password and retry "
+                "after that.",
+                c->uri, secs);
+        return -1;
+    }
+    uint64_t started_ms = cbm_now_ms();
     size_t body_len = 0;
     char *body = yyjson_mut_write(b->doc, 0, &body_len);
     if (!body) {
@@ -348,12 +468,14 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
     int rc = cbm_neo4j_http_post(c->http, c->commit_path, body, body_len, &status, &resp, &resp_len,
                                  terr, sizeof(terr));
     free(body);
+    n4_log_request(c, b, rc == 0 ? status : -1, cbm_now_ms() - started_ms);
     if (rc != 0) {
         set_err(c, "%s%s", terr[0] ? terr : "Neo4j request failed", NULL);
         free(resp);
         return -1;
     }
     if (status == 401 || status == 403) {
+        n4_auth_note(c->cred_key, true);
         set_err(c,
                 "Neo4j rejected the credentials for %s (HTTP 401/403); check "
                 "--graph-user/--graph-password or NEO4J_USER/NEO4J_PASSWORD%s",
@@ -382,8 +504,14 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
     yyjson_val *errors = yyjson_obj_get(root, "errors");
     if (errors && yyjson_arr_size(errors) > 0) {
         yyjson_val *e0 = yyjson_arr_get_first(errors);
-        set_err(c, "Neo4j error %s: %s", yyjson_get_str(yyjson_obj_get(e0, "code")),
-                yyjson_get_str(yyjson_obj_get(e0, "message")));
+        const char *code = yyjson_get_str(yyjson_obj_get(e0, "code"));
+        /* A rejected login, or Neo4j's lockout after too many: either way the
+         * same credentials must not be offered again right away. */
+        if (code && (strstr(code, "Security.Unauthorized") ||
+                     strstr(code, "Security.AuthenticationRateLimit"))) {
+            n4_auth_note(c->cred_key, true);
+        }
+        set_err(c, "Neo4j error %s: %s", code, yyjson_get_str(yyjson_obj_get(e0, "message")));
         yyjson_doc_free(d);
         return -1;
     }
@@ -404,6 +532,7 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
         yyjson_doc_free(d);
         return -1;
     }
+    n4_auth_note(c->cred_key, false);
     if (out) {
         out->doc = d;
         out->results = yyjson_obj_get(root, "results");

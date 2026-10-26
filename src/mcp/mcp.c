@@ -2525,6 +2525,24 @@ typedef enum {
     STORE_RECOVERY_CORRUPT,
 } store_recovery_status_t;
 
+/* A Neo4j-backed project answers graph reads from Neo4j; the SQLite file keeps
+ * serving everything else (and the graph too when Neo4j is unusable -- named
+ * in the reply by cbm_mcp_handle_tool). Called on both resolve paths, the
+ * direct <project>.db open and the internal-name scan (#704), so a database
+ * found under another file name is no silent exception. */
+static void mcp_attach_graph_backend(cbm_mcp_server_t *srv, const char *db_path,
+                                     const char *project) {
+    if (!srv->store || !db_path) {
+        return;
+    }
+    char graph_err[CBM_SZ_512];
+    if (cbm_neo4j_store_attach(srv->store, db_path, project, graph_err, sizeof(graph_err)) ==
+        CBM_NEO4J_ATTACH_FALLBACK) {
+        (void)snprintf(srv->graph_fallback_reason, sizeof(srv->graph_fallback_reason), "%s",
+                       graph_err[0] ? graph_err : "Neo4j unavailable");
+    }
+}
+
 static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *project,
                                            bool mutation_already_held, bool nonblocking_recovery,
                                            store_recovery_status_t *recovery_status,
@@ -2672,15 +2690,7 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
             srv->owns_store = true;
             free(srv->current_project);
             srv->current_project = heap_strdup(project);
-            /* A Neo4j-backed project answers graph reads from Neo4j; the
-             * SQLite file keeps serving everything else (and the graph too
-             * when Neo4j is unusable — logged by the attach). */
-            char graph_err[CBM_SZ_512];
-            if (cbm_neo4j_store_attach(srv->store, path, project, graph_err, sizeof(graph_err)) ==
-                CBM_NEO4J_ATTACH_FALLBACK) {
-                (void)snprintf(srv->graph_fallback_reason, sizeof(srv->graph_fallback_reason), "%s",
-                               graph_err[0] ? graph_err : "Neo4j unavailable");
-            }
+            mcp_attach_graph_backend(srv, path, project);
             return srv->store; /* fast path: filename == internal name */
         }
         /* #704: <project>.db exists but its INTERNAL project name differs from
@@ -2702,6 +2712,7 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
         srv->owns_store = true;
         free(srv->current_project);
         srv->current_project = heap_strdup(project);
+        mcp_attach_graph_backend(srv, cbm_store_db_path(scanned), project);
     }
 
     return srv->store;
@@ -4297,6 +4308,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!db) {
         return NULL;
     }
+    /* BM25 ranking (FTS5, camelCase-split tokens) has no Neo4j equivalent. */
+    cbm_store_note_local_graph_read(store, "text search");
     char fts_query[BM25_QUERY_BUF];
     int tok_count = bm25_build_match(query, fts_query, sizeof(fts_query));
     if (tok_count == 0) {
@@ -20787,7 +20800,14 @@ static bool mcp_tool_reads_in_batch(const char *tool_name) {
  * that Neo4j did not serve it. Appends a text notice to content and, for a
  * structured reply, a graph_backend object. Takes ownership of result; on any
  * failure the original reply is returned unchanged. */
-char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
+/* Append a graph_backend report to an MCP tool result: `notice` as a text
+ * content item, and {kind: neo4j, status, served_by, remote_queries, local,
+ * reason} as structuredContent.graph_backend when the reply is structured and
+ * does not already carry one (index_status). Takes ownership of result; on
+ * any failure the original reply is returned unchanged. */
+static char *mcp_result_append_backend(char *result, const char *notice, const char *status,
+                                       const char *served_by, int64_t remote_queries,
+                                       const char *local_what, const char *reason) {
     if (!result) {
         return NULL;
     }
@@ -20800,12 +20820,6 @@ char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
         yyjson_mut_doc_free(doc);
         return result;
     }
-    char notice[CBM_SZ_1K];
-    (void)snprintf(notice, sizeof(notice),
-                   "graph_backend: sqlite_fallback -- this Neo4j-backed project was answered from "
-                   "the local index, not Neo4j (%s). The answer is current; Neo4j is not. Re-run "
-                   "index_repository with graph_db to resync, and see index_status.",
-                   reason);
     yyjson_mut_val *item = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, item, "type", "text");
     yyjson_mut_obj_add_strcpy(doc, item, "text", notice);
@@ -20814,8 +20828,19 @@ char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
     if (yyjson_mut_is_obj(structured) && !yyjson_mut_obj_get(structured, "graph_backend")) {
         yyjson_mut_val *gb = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_str(doc, gb, "kind", "neo4j");
-        yyjson_mut_obj_add_str(doc, gb, "status", "sqlite_fallback");
-        yyjson_mut_obj_add_strcpy(doc, gb, "reason", reason);
+        yyjson_mut_obj_add_strcpy(doc, gb, "status", status);
+        if (served_by) {
+            yyjson_mut_obj_add_strcpy(doc, gb, "served_by", served_by);
+        }
+        if (remote_queries >= 0) {
+            yyjson_mut_obj_add_int(doc, gb, "remote_queries", remote_queries);
+        }
+        if (local_what && local_what[0]) {
+            yyjson_mut_obj_add_strcpy(doc, gb, "local", local_what);
+        }
+        if (reason) {
+            yyjson_mut_obj_add_strcpy(doc, gb, "reason", reason);
+        }
         yyjson_mut_obj_add_val(doc, structured, "graph_backend", gb);
     }
     char *out = yy_doc_to_str(doc);
@@ -20825,6 +20850,79 @@ char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
     }
     free(result);
     return out;
+}
+
+char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
+    char notice[CBM_SZ_1K];
+    (void)snprintf(notice, sizeof(notice),
+                   "graph_backend: sqlite_fallback -- this Neo4j-backed project was answered from "
+                   "the local index, not Neo4j (%s). The answer is current; Neo4j is not. Re-run "
+                   "index_repository with graph_db to resync, and see index_status.",
+                   reason);
+    return mcp_result_append_backend(result, notice, "sqlite_fallback", "local", -1, NULL, reason);
+}
+
+const char *cbm_mcp_graph_served_by(uint64_t remote_queries, int local_reads) {
+    if (remote_queries > 0) {
+        return local_reads > 0 ? "neo4j+local" : "neo4j";
+    }
+    return local_reads > 0 ? "local" : NULL;
+}
+
+char *cbm_mcp_result_add_graph_served(char *result, uint64_t remote_queries, int local_reads,
+                                      const char *local_what) {
+    const char *served_by = cbm_mcp_graph_served_by(remote_queries, local_reads);
+    if (!served_by) {
+        return result; /* the tool read no graph data */
+    }
+    const char *what = local_what && local_what[0] ? local_what : "some graph data";
+    char notice[CBM_SZ_1K];
+    if (strcmp(served_by, "neo4j") == 0) {
+        (void)snprintf(notice, sizeof(notice),
+                       "graph_backend: neo4j -- the graph data in this answer came from Neo4j "
+                       "(%llu queries).",
+                       (unsigned long long)remote_queries);
+    } else if (strcmp(served_by, "neo4j+local") == 0) {
+        (void)snprintf(notice, sizeof(notice),
+                       "graph_backend: neo4j+local -- graph lookups came from Neo4j (%llu "
+                       "queries); %s came from the local index, which holds the same generation "
+                       "(no Neo4j equivalent).",
+                       (unsigned long long)remote_queries, what);
+    } else {
+        (void)snprintf(notice, sizeof(notice),
+                       "graph_backend: local -- %s came from the local index of this Neo4j-backed "
+                       "project, which holds the same generation as Neo4j (no Neo4j equivalent).",
+                       what);
+    }
+    return mcp_result_append_backend(result, notice, "serving", served_by,
+                                     (int64_t)remote_queries, local_reads > 0 ? what : NULL, NULL);
+}
+
+/* Name the graph backend in every reply of a Neo4j-backed project, and log it
+ * (info, so the daemon log answers "did this come from Neo4j?" afterwards). */
+static char *mcp_report_graph_backend(cbm_mcp_server_t *srv, const char *tool_name,
+                                      char *result) {
+    const char *project = srv->current_project ? srv->current_project : "";
+    if (srv->graph_fallback_reason[0]) {
+        cbm_log_info("graph.backend", "tool", tool_name, "project", project, "served_by",
+                     "sqlite_fallback", "reason", srv->graph_fallback_reason);
+        return cbm_mcp_result_add_graph_fallback(result, srv->graph_fallback_reason);
+    }
+    if (!srv->store || !cbm_store_is_remote(srv->store)) {
+        return result;
+    }
+    cbm_store_backend_usage_t usage;
+    cbm_store_backend_usage(srv->store, &usage);
+    const char *served_by = cbm_mcp_graph_served_by(usage.remote_queries, usage.local_reads);
+    if (!served_by) {
+        return result;
+    }
+    char queries[CBM_SZ_32];
+    (void)snprintf(queries, sizeof(queries), "%llu", (unsigned long long)usage.remote_queries);
+    cbm_log_info("graph.backend", "tool", tool_name, "project", project, "served_by", served_by,
+                 "remote_queries", queries, "local", usage.local_what);
+    return cbm_mcp_result_add_graph_served(result, usage.remote_queries, usage.local_reads,
+                                           usage.local_what);
 }
 
 /* File-backed query stores are request-scoped. Keeping one open between MCP
@@ -20865,10 +20963,11 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     if (srv) {
         srv->read_batch_tool = mcp_tool_reads_in_batch(tool_name);
         srv->graph_fallback_reason[0] = '\0';
+        cbm_store_backend_usage_reset(srv->store);
     }
     char *result = dispatch_tool(srv, tool_name, args_json);
-    if (srv && srv->graph_fallback_reason[0]) {
-        result = cbm_mcp_result_add_graph_fallback(result, srv->graph_fallback_reason);
+    if (srv) {
+        result = mcp_report_graph_backend(srv, tool_name, result);
     }
     if (srv) {
         /* An embedded store outlives the request: end its batch here. */

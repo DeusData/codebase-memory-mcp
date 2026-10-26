@@ -66,6 +66,10 @@ void cbm_neo4j_close(cbm_neo4j_t *c);
 const char *cbm_neo4j_error(const cbm_neo4j_t *c);
 const char *cbm_neo4j_uri(const cbm_neo4j_t *c);
 
+/* Tests: forget every login rejection (the 60 s per-credential backoff that
+ * keeps repeated wrong passwords from tripping Neo4j's lockout). */
+void cbm_neo4j_test_reset_auth_backoff(void);
+
 /* Round-trip "RETURN 1" to verify reachability, credentials and database. */
 int cbm_neo4j_ping(cbm_neo4j_t *c);
 

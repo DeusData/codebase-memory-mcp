@@ -391,7 +391,31 @@ typedef enum {
     CBM_REMOTE_NODES_BY_NAME, /* exact name */
     CBM_REMOTE_NODES_BY_LABEL,
     CBM_REMOTE_NODES_BY_FILE,
+    /* Candidate sets, deliberately broader than the SQLite predicate (Unicode
+     * vs ASCII case folding); store.c re-applies the exact predicate. */
+    CBM_REMOTE_NODES_QN_ENDS_CI,     /* qn ends with "." + arg (any case), or qn == arg */
+    CBM_REMOTE_NODES_QN_CONTAINS_CI, /* qn contains arg (any case) */
 } cbm_remote_node_query_t;
+
+/* Candidate query behind cbm_store_search. Every field is an exact filter
+ * except the *_contains_ci literals, which only narrow: store.c applies the
+ * real name/qn regex and file glob to what comes back. */
+typedef struct {
+    const char *project;
+    const char *label;                 /* exact; NULL/"" = any */
+    const char *const *exclude_labels; /* NULL-terminated, or NULL */
+    const char *relationship;          /* node touches an edge of this type; NULL = any */
+    bool exclude_entry_points;
+    const char *kind;           /* properties kind (exact); NULL/"" = any */
+    const char *namespace_name; /* third obj_key segment (any case); NULL/"" = any */
+    const char *const *name_contains_ci; /* NULL-terminated literals, all required */
+    const char *const *qn_contains_ci;
+    const char *const *file_contains_ci;
+    int min_degree; /* -1 = none; degree = in + out over the search edge types */
+    int max_degree;
+    int limit; /* < 0: every match, unpaged */
+    int offset;
+} cbm_remote_search_t;
 
 typedef enum {
     CBM_REMOTE_COUNT_NODES = 0,
@@ -420,12 +444,39 @@ typedef struct cbm_store_remote_ops {
     int (*bfs)(void *ctx, const int64_t *seeds, int seed_count, bool multi, const char *direction,
                const char **edge_types, int edge_type_count, int max_depth, int max_results,
                bool trail, int max_edges, cbm_traverse_result_t *out, bool *truncated);
+    /* Rows (with in/out degree over the search edge types) ordered by name,
+     * id; *total counts every match before paging. */
+    int (*search)(void *ctx, const cbm_remote_search_t *q, cbm_search_result_t **out, int *count,
+                  int *total);
+    /* Distinct caller / callee names over CALLS, HTTP_CALLS, ASYNC_CALLS. */
+    int (*neighbor_names)(void *ctx, int64_t node_id, int limit, char ***callers,
+                          int *caller_count, char ***callees, int *callee_count);
+    /* Same set and order as cbm_store_list_files. */
+    int (*list_files)(void *ctx, const char *project, char ***out, int *count);
+    /* Label / edge-type counts, and with_props the property keys, like
+     * cbm_store_get_schema / cbm_store_get_schema_counts. */
+    int (*schema)(void *ctx, const char *project, bool with_props, cbm_schema_info_t *out);
+    /* Remote queries issued so far (for the per-request backend report). */
+    uint64_t (*queries)(void *ctx);
 } cbm_store_remote_ops_t;
 
 /* Route this store's graph reads to a remote backend. The store owns ctx
  * from now on and releases it with ops->close in cbm_store_close. */
 void cbm_store_attach_remote(cbm_store_t *s, const cbm_store_remote_ops_t *ops, void *ctx);
 bool cbm_store_is_remote(const cbm_store_t *s);
+
+/* Which backend answered a request. A graph read that has no remote
+ * implementation (architecture aggregates, impact walk, text/vector search)
+ * marks itself local with cbm_store_note_local_graph_read; remote queries
+ * are counted by the backend. Both are no-ops / zero without a remote. */
+void cbm_store_note_local_graph_read(cbm_store_t *s, const char *what);
+typedef struct {
+    uint64_t remote_queries;
+    int local_reads;
+    char local_what[160]; /* comma-separated, first few kinds read locally */
+} cbm_store_backend_usage_t;
+void cbm_store_backend_usage(const cbm_store_t *s, cbm_store_backend_usage_t *out);
+void cbm_store_backend_usage_reset(cbm_store_t *s);
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 

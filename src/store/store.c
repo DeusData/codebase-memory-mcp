@@ -152,6 +152,10 @@ struct cbm_store {
      * are answered by remote_ops; the SQLite db stays the sidecar. */
     const cbm_store_remote_ops_t *remote_ops;
     void *remote_ctx;
+    /* Per-request backend report (cbm_store_backend_usage). */
+    uint64_t remote_queries_base;
+    int local_graph_reads;
+    char local_graph_what[160];
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -218,10 +222,50 @@ void cbm_store_attach_remote(cbm_store_t *s, const cbm_store_remote_ops_t *ops, 
     }
     s->remote_ops = ops;
     s->remote_ctx = ctx;
+    cbm_store_backend_usage_reset(s);
 }
 
 bool cbm_store_is_remote(const cbm_store_t *s) {
     return s && s->remote_ops;
+}
+
+void cbm_store_note_local_graph_read(cbm_store_t *s, const char *what) {
+    if (!s || !s->remote_ops) {
+        return;
+    }
+    s->local_graph_reads++;
+    if (what && what[0] && !strstr(s->local_graph_what, what)) {
+        size_t used = strlen(s->local_graph_what);
+        int n = snprintf(s->local_graph_what + used, sizeof(s->local_graph_what) - used, "%s%s",
+                         used ? ", " : "", what);
+        if (n < 0 || (size_t)n >= sizeof(s->local_graph_what) - used) {
+            s->local_graph_what[used] = '\0'; /* keep the list whole, not cut mid-word */
+        }
+    }
+}
+
+static uint64_t store_remote_queries(const cbm_store_t *s) {
+    return (s && s->remote_ops && s->remote_ops->queries) ? s->remote_ops->queries(s->remote_ctx)
+                                                          : 0;
+}
+
+void cbm_store_backend_usage(const cbm_store_t *s, cbm_store_backend_usage_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->remote_ops) {
+        return;
+    }
+    out->remote_queries = store_remote_queries(s) - s->remote_queries_base;
+    out->local_reads = s->local_graph_reads;
+    snprintf(out->local_what, sizeof(out->local_what), "%s", s->local_graph_what);
+}
+
+void cbm_store_backend_usage_reset(cbm_store_t *s) {
+    if (!s) {
+        return;
+    }
+    s->remote_queries_base = store_remote_queries(s);
+    s->local_graph_reads = 0;
+    s->local_graph_what[0] = '\0';
 }
 
 static int exec_sql(cbm_store_t *s, const char *sql) {
@@ -3791,6 +3835,7 @@ int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *
                                const char *const *labels, int label_count, int limit, int offset,
                                cbm_store_cancel_fn cancel, void *cancel_context,
                                cbm_file_outline_row_t **out, int *count, int *total) {
+    cbm_store_note_local_graph_read(s, "file outline");
     if (out) {
         *out = NULL;
     }
@@ -4150,6 +4195,7 @@ static void bind_proj_and_type(sqlite3_stmt *stmt, const void *data) {
 
 int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
                                int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated) {
+    cbm_store_note_local_graph_read(s, "architecture");
     if (out_src) {
         *out_src = NULL;
     }
@@ -5842,6 +5888,7 @@ static char *store_like_dot_suffix(const char *text, const char *tail) {
 
 int cbm_store_find_variant_spans_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                          cbm_node_t **out, int *count) {
+    cbm_store_note_local_graph_read(s, "variant spans");
     *out = NULL;
     *count = 0;
     if (!s || !s->db || !project || !file_path) {
@@ -5876,12 +5923,64 @@ int cbm_store_find_variant_spans_by_file(cbm_store_t *s, const char *project, co
     return store_collect_nodes(s, stmt, NULL, NULL, out, count);
 }
 
+static bool store_ascii_ieq(const char *a, const char *b, size_t n);
+
+/* Remote QN lookups: the backend returns a candidate superset and the exact
+ * SQLite-side predicate (`keep`) decides, so a remote answer is the same set
+ * the local LIKE / base-QN query would return. */
+static int store_remote_qn_candidates(cbm_store_t *s, cbm_remote_node_query_t kind,
+                                      const char *project, const char *text, store_qn_keep_fn keep,
+                                      const void *keep_arg, cbm_node_t **out, int *count) {
+    cbm_node_t *cand = NULL;
+    int n = 0;
+    int rc = remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, kind, project, text, &cand, &n));
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (keep(cand[i].qualified_name, cand[i].name, keep_arg)) {
+            cand[kept++] = cand[i];
+        } else {
+            cbm_node_free_fields(&cand[i]);
+        }
+    }
+    if (kept == 0) {
+        free(cand);
+        cand = NULL;
+    }
+    *out = cand;
+    *count = kept;
+    return CBM_STORE_OK;
+}
+
+/* SQLite: qualified_name LIKE '%.' || suffix (ASCII case-insensitive) OR
+ * qualified_name = suffix. */
+static bool store_qn_suffix_keep(const char *qn, const char *name, const void *argp) {
+    (void)name;
+    const char *suffix = argp;
+    if (!qn) {
+        return false;
+    }
+    if (strcmp(qn, suffix) == 0) {
+        return true;
+    }
+    size_t qn_len = strlen(qn);
+    size_t sx_len = strlen(suffix);
+    return qn_len > sx_len && qn[qn_len - sx_len - SKIP_ONE] == '.' &&
+           store_ascii_ieq(qn + qn_len - sx_len, suffix, sx_len);
+}
+
 int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
                                       cbm_node_t **out, int *count) {
     *out = NULL;
     *count = 0;
     if (!s || !s->db || !suffix) {
         return CBM_STORE_ERR;
+    }
+    if (s->remote_ops) {
+        return store_remote_qn_candidates(s, CBM_REMOTE_NODES_QN_ENDS_CI, project, suffix,
+                                          store_qn_suffix_keep, suffix, out, count);
     }
     /* Match QNs ending with ".suffix" or exactly equal to suffix */
     char *like_pattern = store_like_dot_suffix(suffix, "");
@@ -6000,6 +6099,11 @@ int cbm_store_find_nodes_by_qn_base(cbm_store_t *s, const char *project, const c
     if (!s || !s->db || !base || !base[0]) {
         return CBM_STORE_ERR;
     }
+    if (s->remote_ops) {
+        store_qn_base_arg_t remote_arg = {base, strlen(base), suffix_match};
+        return store_remote_qn_candidates(s, CBM_REMOTE_NODES_QN_CONTAINS_CI, project, base,
+                                          store_qn_base_keep, &remote_arg, out, count);
+    }
     static const char *const sql[2][2] = {
         /* [suffix_match][has project] */
         {"SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, "
@@ -6086,6 +6190,9 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
     *count = 0;
     if (!s || !s->db || !project) {
         return CBM_STORE_ERR;
+    }
+    if (s->remote_ops) {
+        return remote_status(s, s->remote_ops->list_files(s->remote_ctx, project, out, count));
     }
 
     /* A node path can name a graph-only identity such as a Folder,
@@ -6223,6 +6330,15 @@ int cbm_store_node_neighbor_names(cbm_store_t *s, int64_t node_id, int limit, ch
     *caller_count = 0;
     *out_callees = NULL;
     *callee_count = 0;
+
+    if (s->remote_ops) {
+        return remote_status(s, s->remote_ops->neighbor_names(s->remote_ctx, node_id, limit,
+                                                              out_callers, caller_count,
+                                                              out_callees, callee_count)) ==
+                       CBM_STORE_OK
+                   ? 0
+                   : CBM_STORE_ERR;
+    }
 
     query_neighbor_names(
         s->db,
@@ -6650,6 +6766,7 @@ int cbm_store_get_dependent_files(cbm_store_t *s, const char *project,
 int cbm_store_get_variant_partner_files(cbm_store_t *s, const char *project,
                                         const char *const *files, int count, char ***out,
                                         int *out_count) {
+    cbm_store_note_local_graph_read(s, "variant spans");
     static const char *const parts[] = {
         /* A file that writes a variant of a node whose file_path is
          * another file. */
@@ -6687,6 +6804,7 @@ void cbm_store_free_dependent_files(char **files, int count) {
 
 int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const char *keyword,
                                      cbm_edge_t **out, int *count) {
+    cbm_store_note_local_graph_read(s, "route edges");
     *out = NULL;
     *count = 0;
 
@@ -7423,10 +7541,202 @@ static bool search_build_ranged_sql(const char *select_cols, const char *where,
     return true;
 }
 
+/* ── Remote search ─────────────────────────────────────────────────
+ *
+ * The backend narrows and orders (name, id); everything the SQL path decides
+ * with a function the backend does not share -- the name/qn REGEXP (cbm
+ * regex, POSIX ERE, unanchored) and the file LIKE glob -- is decided here
+ * with the very same code, so a remote result equals the local one. */
+
+enum { REMOTE_SEARCH_HINTS = 8 };
+
+typedef struct {
+    char *owned[3 * REMOTE_SEARCH_HINTS];
+    int owned_count;
+    const char *name[REMOTE_SEARCH_HINTS + SKIP_ONE];
+    const char *qn[REMOTE_SEARCH_HINTS + SKIP_ONE];
+    const char *file[REMOTE_SEARCH_HINTS + SKIP_ONE];
+} remote_search_hints_t;
+
+static void remote_hints_from_regex(remote_search_hints_t *h, const char *pattern,
+                                    const char **slot) {
+    char *hints[ST_LIKE_HINT_MAX];
+    int n = cbm_extract_like_hints(pattern, hints, ST_LIKE_HINT_MAX);
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (k < REMOTE_SEARCH_HINTS && h->owned_count < 3 * REMOTE_SEARCH_HINTS) {
+            h->owned[h->owned_count++] = hints[i];
+            slot[k++] = hints[i];
+        } else {
+            free(hints[i]);
+        }
+    }
+    slot[k] = NULL;
+}
+
+/* Literal runs of a LIKE pattern ('%' and '_' are its only wildcards). */
+static void remote_hints_from_like(remote_search_hints_t *h, const char *like, const char **slot) {
+    int k = 0;
+    const char *p = like;
+    while (*p && k < REMOTE_SEARCH_HINTS && h->owned_count < 3 * REMOTE_SEARCH_HINTS) {
+        while (*p == '%' || *p == '_') {
+            p++;
+        }
+        const char *start = p;
+        while (*p && *p != '%' && *p != '_') {
+            p++;
+        }
+        size_t len = (size_t)(p - start);
+        if (len > 0) {
+            char *lit = malloc(len + SKIP_ONE);
+            if (!lit) {
+                break;
+            }
+            memcpy(lit, start, len);
+            lit[len] = '\0';
+            h->owned[h->owned_count++] = lit;
+            slot[k++] = lit;
+        }
+    }
+    slot[k] = NULL;
+}
+
+/* The file LIKE pattern exactly as search_where_basic builds it. */
+static char *remote_search_file_like(const char *file_pattern) {
+    char *lp = cbm_glob_to_like(file_pattern);
+    if (lp && !strchr(file_pattern, '*') && !strchr(file_pattern, '?')) {
+        size_t n = strlen(lp);
+        char *contains = malloc(n + 3);
+        if (contains) {
+            contains[0] = '%';
+            memcpy(contains + SKIP_ONE, lp, n);
+            contains[n + SKIP_ONE] = '%';
+            contains[n + 2] = '\0';
+        }
+        free(lp);
+        lp = contains;
+    }
+    return lp;
+}
+
+static void remote_search_result_free(cbm_search_result_t *r) {
+    cbm_node_free_fields(&r->node);
+    for (int j = 0; j < r->connected_count; j++) {
+        free((void *)r->connected_names[j]);
+    }
+    free(r->connected_names);
+    memset(r, 0, sizeof(*r));
+}
+
+static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params,
+                               cbm_search_output_t *out) {
+    int limit = params->limit > 0 ? params->limit : CBM_DEFAULT_SEARCH_LIMIT;
+    int offset = params->offset > 0 ? params->offset : 0;
+    bool local_filter = params->name_pattern || params->qn_pattern || params->file_pattern;
+
+    remote_search_hints_t hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.name[0] = hints.qn[0] = hints.file[0] = NULL;
+    cbm_regex_t name_re;
+    cbm_regex_t qn_re;
+    bool name_re_ok = false;
+    bool qn_re_ok = false;
+    char *file_like = NULL;
+    int rc = CBM_STORE_OK;
+    int flags = CBM_REG_EXTENDED | CBM_REG_NOSUB | (params->case_sensitive ? 0 : CBM_REG_ICASE);
+    if (params->name_pattern) {
+        if (cbm_regcomp(&name_re, params->name_pattern, flags) != 0) {
+            store_set_error(s, "invalid regex");
+            return CBM_STORE_ERR;
+        }
+        name_re_ok = true;
+        remote_hints_from_regex(&hints, params->name_pattern, hints.name);
+    }
+    if (params->qn_pattern) {
+        if (cbm_regcomp(&qn_re, params->qn_pattern, flags) != 0) {
+            store_set_error(s, "invalid regex");
+            rc = CBM_STORE_ERR;
+            goto done;
+        }
+        qn_re_ok = true;
+        remote_hints_from_regex(&hints, params->qn_pattern, hints.qn);
+    }
+    if (params->file_pattern) {
+        file_like = remote_search_file_like(params->file_pattern);
+        if (file_like) {
+            remote_hints_from_like(&hints, file_like, hints.file);
+        }
+    }
+
+    cbm_remote_search_t q = {
+        .project = params->project,
+        .label = params->label,
+        .exclude_labels = params->exclude_labels,
+        .relationship = params->relationship,
+        .exclude_entry_points = params->exclude_entry_points,
+        .kind = params->kind,
+        .namespace_name = params->namespace_name,
+        .name_contains_ci = hints.name,
+        .qn_contains_ci = hints.qn,
+        .file_contains_ci = hints.file,
+        .min_degree = params->min_degree,
+        .max_degree = params->max_degree,
+        .limit = local_filter ? -1 : limit,
+        .offset = local_filter ? 0 : offset,
+    };
+    cbm_search_result_t *rows = NULL;
+    int n = 0;
+    int total = 0;
+    rc = remote_status(s, s->remote_ops->search(s->remote_ctx, &q, &rows, &n, &total));
+    if (rc != CBM_STORE_OK) {
+        goto done;
+    }
+    if (local_filter) {
+        int matched = 0;
+        int kept = 0;
+        for (int i = 0; i < n; i++) {
+            const cbm_node_t *node = &rows[i].node;
+            bool keep =
+                (!name_re_ok || cbm_regexec(&name_re, node->name ? node->name : "", 0, NULL, 0) == 0) &&
+                (!qn_re_ok ||
+                 cbm_regexec(&qn_re, node->qualified_name ? node->qualified_name : "", 0, NULL, 0) ==
+                     0) &&
+                (!file_like ||
+                 sqlite3_strlike(file_like, node->file_path ? node->file_path : "", 0) == 0);
+            if (keep && matched >= offset && kept < limit) {
+                rows[kept++] = rows[i];
+            } else {
+                remote_search_result_free(&rows[i]);
+            }
+            matched += keep ? 1 : 0;
+        }
+        n = kept;
+        total = matched;
+    }
+    out->results = rows;
+    out->count = n;
+    out->total = total;
+done:
+    if (name_re_ok) {
+        cbm_regfree(&name_re);
+    }
+    if (qn_re_ok) {
+        cbm_regfree(&qn_re);
+    }
+    free(file_like);
+    for (int i = 0; i < hints.owned_count; i++) {
+        free(hints.owned[i]);
+    }
+    return rc;
+}
+
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out) {
     memset(out, 0, sizeof(*out));
     if (!s || !s->db) {
         return CBM_STORE_ERR;
+    }
+    if (s->remote_ops) {
+        return store_remote_search(s, params, out);
     }
 
     char sql[CBM_SZ_4K];
@@ -8408,6 +8718,7 @@ bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm
 }
 
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path) {
+    cbm_store_note_local_graph_read(s, "architecture");
     if (!s || !s->db || !project) {
         return 0;
     }
@@ -8436,6 +8747,7 @@ int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char
 }
 
 int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char *path) {
+    cbm_store_note_local_graph_read(s, "architecture");
     if (!s || !s->db || !project) {
         return 0;
     }
@@ -8645,11 +8957,25 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
     return CBM_STORE_OK;
 }
 
+static int store_remote_schema(cbm_store_t *s, const char *project, cbm_schema_info_t *out,
+                               bool with_props) {
+    memset(out, 0, sizeof(*out));
+    int rc = remote_status(s, s->remote_ops->schema(s->remote_ctx, project, with_props, out));
+    /* Same contract as get_schema_impl: CBM_NOT_FOUND on failure. */
+    return rc == CBM_STORE_OK ? CBM_STORE_OK : CBM_NOT_FOUND;
+}
+
 int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t *out) {
+    if (s && s->remote_ops) {
+        return store_remote_schema(s, project, out, true);
+    }
     return get_schema_impl(s, project, out, true);
 }
 
 int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_info_t *out) {
+    if (s && s->remote_ops) {
+        return store_remote_schema(s, project, out, false);
+    }
     return get_schema_impl(s, project, out, false);
 }
 
@@ -8663,8 +8989,9 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     if (!scoped) {
-        return get_schema_impl(s, project, out, false);
+        return cbm_store_get_schema_counts(s, project, out);
     }
+    cbm_store_note_local_graph_read(s, "architecture");
 
     char sqlbuf[ST_SQL_BUF];
     {
@@ -10951,6 +11278,7 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char *path,
                                const char **aspects, int aspect_count,
                                cbm_architecture_info_t *out) {
+    cbm_store_note_local_graph_read(s, "architecture");
     memset(out, 0, sizeof(*out));
     int rc;
 
@@ -12429,6 +12757,7 @@ static int vs_ranked_result_cmp(const void *lhs, const void *rhs) {
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count) {
+    cbm_store_note_local_graph_read(s, "semantic search");
     *out = NULL;
     *out_count = 0;
     if (!s || !project || !keywords || keyword_count <= 0) {

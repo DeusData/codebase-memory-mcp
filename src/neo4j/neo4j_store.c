@@ -32,6 +32,7 @@ typedef struct {
     char db[CBM_NEO4J_URI_MAX];
     int64_t gen;
     char err[CBM_NEO4J_ERR_MAX];
+    uint64_t queries; /* round trips issued (per-request backend report) */
 } n4s_ctx_t;
 
 /* ── Query plumbing ─────────────────────────────────────────────── */
@@ -85,6 +86,7 @@ static void q_types(n4s_q_t *q, const char *key, const char **types, int n) {
 
 /* Run and keep the result; on failure record the error in the ctx. */
 static int q_run(n4s_ctx_t *x, n4s_q_t *q, cbm_neo4j_result_t *r) {
+    x->queries++;
     int rc = cbm_neo4j_batch_run(x->c, &q->b, r);
     cbm_neo4j_batch_free(&q->b);
     if (rc != 0) {
@@ -222,6 +224,20 @@ static int op_find_nodes(void *ctx, cbm_remote_node_query_t kind, const char *pr
     case CBM_REMOTE_NODES_BY_FILE:
         cypher = "MATCH (n:CbmNode {db: $db, gen: $gen, file_path: $arg}) "
                  "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS(
+                     "n") " ORDER BY n.id";
+        break;
+    /* Candidate supersets: the caller re-applies the exact predicate. */
+    case CBM_REMOTE_NODES_QN_ENDS_CI:
+        cypher = "MATCH (n:CbmNode {db: $db, gen: $gen}) "
+                 "WHERE ($project IS NULL OR n.project = $project) AND "
+                 "(n.qualified_name = $arg OR "
+                 "toLower(n.qualified_name) ENDS WITH toLower('.' + $arg)) RETURN " N4S_NODE_COLS(
+                     "n") " ORDER BY n.id";
+        break;
+    case CBM_REMOTE_NODES_QN_CONTAINS_CI:
+        cypher = "MATCH (n:CbmNode {db: $db, gen: $gen}) "
+                 "WHERE ($project IS NULL OR n.project = $project) AND "
+                 "toLower(n.qualified_name) CONTAINS toLower($arg) RETURN " N4S_NODE_COLS(
                      "n") " ORDER BY n.id";
         break;
     default:
@@ -790,6 +806,348 @@ static int op_bfs(void *ctx, const int64_t *seeds, int seed_count, bool multi,
     return rc;
 }
 
+/* ── Search, names, files, schema ───────────────────────────────── */
+
+static void q_str_list(n4s_q_t *q, const char *key, const char *const *items) {
+    yyjson_mut_val *arr = yyjson_mut_arr(q->b.doc);
+    for (int i = 0; items && items[i]; i++) {
+        yyjson_mut_arr_add_strcpy(q->b.doc, arr, items[i]);
+    }
+    yyjson_mut_obj_add_val(q->b.doc, q->params, key, arr);
+}
+
+static void q_opt_str(n4s_q_t *q, const char *key, const char *val) {
+    q_str(q, key, (val && val[0]) ? val : NULL);
+}
+
+/* The edge types search_graph's in/out degree counts (store.c search). */
+static const char *const k_search_degree_types[] = {"CALLS", "USAGE", "CALL_REFERENCE", "INHERITS",
+                                                    "IMPLEMENTS", NULL};
+
+/* Everything after MATCH (n): the filters of cbm_store_search's WHERE, then
+ * the degree columns its degree filter and rows need. */
+static const char k_search_where[] =
+    "MATCH (n:CbmNode {db: $db, gen: $gen}) "
+    "WHERE ($project IS NULL OR n.project = $project) "
+    "AND ($label IS NULL OR n.label = $label) "
+    "AND NOT n.label IN $exclude_labels "
+    "AND all(h IN $name_hints WHERE toLower(n.name) CONTAINS toLower(h)) "
+    "AND all(h IN $qn_hints WHERE toLower(n.qualified_name) CONTAINS toLower(h)) "
+    "AND all(h IN $file_hints WHERE toLower(coalesce(n.file_path, '')) CONTAINS toLower(h)) "
+    "AND ($kind IS NULL OR n.kind = $kind) "
+    "AND ($ns IS NULL OR (size(split(coalesce(n.obj_key, ''), '/')) >= 4 "
+    "     AND toLower(split(n.obj_key, '/')[2]) = toLower($ns))) "
+    "AND ($rel IS NULL OR size([(n)-[r]-() WHERE r.type = $rel | 1]) > 0) "
+    "AND (NOT $exclude_entry_points OR NOT ("
+    "     size([(n)<-[c]-() WHERE c.type = 'CALLS' | 1]) = 0 AND "
+    "     size([(n)-[c]->() WHERE c.type = 'CALLS' | 1]) > 0)) "
+    "WITH n, size([(n)<-[r]-() WHERE r.type IN $degree_types | 1]) AS in_deg, "
+    "     size([(n)-[r]->() WHERE r.type IN $degree_types | 1]) AS out_deg "
+    "WHERE ($min_degree < 0 OR in_deg + out_deg >= $min_degree) "
+    "AND ($max_degree < 0 OR in_deg + out_deg <= $max_degree) ";
+
+static void q_search_params(n4s_q_t *q, const cbm_remote_search_t *s) {
+    q_opt_str(q, "project", s->project);
+    q_opt_str(q, "label", s->label);
+    q_str_list(q, "exclude_labels", s->exclude_labels);
+    q_str_list(q, "name_hints", s->name_contains_ci);
+    q_str_list(q, "qn_hints", s->qn_contains_ci);
+    q_str_list(q, "file_hints", s->file_contains_ci);
+    q_opt_str(q, "kind", s->kind);
+    q_opt_str(q, "ns", s->namespace_name);
+    q_opt_str(q, "rel", s->relationship);
+    yyjson_mut_obj_add_bool(q->b.doc, q->params, "exclude_entry_points", s->exclude_entry_points);
+    q_str_list(q, "degree_types", k_search_degree_types);
+    q_int(q, "min_degree", s->min_degree);
+    q_int(q, "max_degree", s->max_degree);
+}
+
+static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_t **out,
+                     int *count, int *total) {
+    n4s_ctx_t *x = ctx;
+    *out = NULL;
+    *count = 0;
+    *total = 0;
+    bool paged = s->limit >= 0;
+    char rows_cypher[sizeof(k_search_where) + 256];
+    (void)snprintf(rows_cypher, sizeof(rows_cypher),
+                   "%sRETURN " N4S_NODE_COLS("n") ", in_deg, out_deg ORDER BY n.name, n.id%s",
+                   k_search_where, paged ? " SKIP $offset LIMIT $limit" : "");
+    cbm_neo4j_batch_t b;
+    if (cbm_neo4j_batch_init(&b) != 0) {
+        return CBM_STORE_ERR;
+    }
+    n4s_q_t q = {.b = b};
+    q.params = cbm_neo4j_batch_add(&q.b, rows_cypher);
+    yyjson_mut_obj_add_strcpy(q.b.doc, q.params, "db", x->db);
+    yyjson_mut_obj_add_int(q.b.doc, q.params, "gen", x->gen);
+    q_search_params(&q, s);
+    if (paged) {
+        q_int(&q, "offset", s->offset);
+        q_int(&q, "limit", s->limit);
+        /* Same filters, counted, in the same transaction. */
+        char count_cypher[sizeof(k_search_where) + 32];
+        (void)snprintf(count_cypher, sizeof(count_cypher), "%sRETURN count(n)", k_search_where);
+        yyjson_mut_val *saved = q.params;
+        q.params = cbm_neo4j_batch_add(&q.b, count_cypher);
+        yyjson_mut_obj_add_strcpy(q.b.doc, q.params, "db", x->db);
+        yyjson_mut_obj_add_int(q.b.doc, q.params, "gen", x->gen);
+        q_search_params(&q, s);
+        q.params = saved;
+    }
+    cbm_neo4j_result_t r;
+    if (q_run(x, &q, &r) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    yyjson_val *data = cbm_neo4j_result_data(&r, 0);
+    size_t n = yyjson_arr_size(data);
+    cbm_search_result_t *rows = n ? calloc(n, sizeof(cbm_search_result_t)) : NULL;
+    if (n && !rows) {
+        cbm_neo4j_result_free(&r);
+        return CBM_STORE_ERR;
+    }
+    for (size_t i = 0; i < n; i++) {
+        yyjson_val *e = yyjson_arr_get(data, i);
+        node_from_row(e, 0, &rows[i].node);
+        rows[i].in_degree = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, N4S_NODE_NCOLS), 0);
+        rows[i].out_degree = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, N4S_NODE_NCOLS + 1), 0);
+    }
+    *out = rows;
+    *count = (int)n;
+    *total = paged ? (int)cbm_neo4j_val_int(
+                         cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 1)), 0),
+                         0)
+                   : (int)n;
+    cbm_neo4j_result_free(&r);
+    return CBM_STORE_OK;
+}
+
+/* Column 0 of statement `stmt`, as a malloc'd string array. */
+static int collect_strings(cbm_neo4j_result_t *r, size_t stmt, char ***out, int *count) {
+    yyjson_val *data = cbm_neo4j_result_data(r, stmt);
+    size_t n = yyjson_arr_size(data);
+    *out = NULL;
+    *count = 0;
+    if (n == 0) {
+        return CBM_STORE_OK;
+    }
+    char **arr = calloc(n, sizeof(char *));
+    if (!arr) {
+        return CBM_STORE_ERR;
+    }
+    for (size_t i = 0; i < n; i++) {
+        arr[i] = cbm_neo4j_val_strdup(cbm_neo4j_row_col(yyjson_arr_get(data, i), 0), "");
+    }
+    *out = arr;
+    *count = (int)n;
+    return CBM_STORE_OK;
+}
+
+static int op_neighbor_names(void *ctx, int64_t node_id, int limit, char ***callers,
+                             int *caller_count, char ***callees, int *callee_count) {
+    n4s_ctx_t *x = ctx;
+    static const char *const directions[] = {
+        "MATCH (t:CbmNode {db: $db, gen: $gen, id: $id})<-[r]-(n:CbmNode) "
+        "WHERE r.type IN ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS'] "
+        "RETURN DISTINCT n.name AS name ORDER BY name LIMIT $limit",
+        "MATCH (t:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(n:CbmNode) "
+        "WHERE r.type IN ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS'] "
+        "RETURN DISTINCT n.name AS name ORDER BY name LIMIT $limit"};
+    cbm_neo4j_batch_t b;
+    if (cbm_neo4j_batch_init(&b) != 0) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < 2; i++) {
+        yyjson_mut_val *p = cbm_neo4j_batch_add(&b, directions[i]);
+        yyjson_mut_obj_add_strcpy(b.doc, p, "db", x->db);
+        yyjson_mut_obj_add_int(b.doc, p, "gen", x->gen);
+        yyjson_mut_obj_add_int(b.doc, p, "id", node_id);
+        yyjson_mut_obj_add_int(b.doc, p, "limit", limit > 0 ? limit : 0);
+    }
+    n4s_q_t q = {.b = b};
+    cbm_neo4j_result_t r;
+    if (q_run(x, &q, &r) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    int rc = collect_strings(&r, 0, callers, caller_count);
+    if (rc == CBM_STORE_OK) {
+        rc = collect_strings(&r, 1, callees, callee_count);
+    }
+    cbm_neo4j_result_free(&r);
+    return rc;
+}
+
+static int op_list_files(void *ctx, const char *project, char ***out, int *count) {
+    n4s_ctx_t *x = ctx;
+    /* cbm_store_list_files: canonical File nodes, or -- for a graph without
+     * any -- every non-Folder node path. */
+    n4s_q_t q;
+    if (q_begin(x, &q,
+                "OPTIONAL MATCH (f:CbmNode {db: $db, gen: $gen, label: 'File'}) "
+                "WHERE f.project = $project "
+                "WITH count(f) > 0 AS has_files "
+                "MATCH (n:CbmNode {db: $db, gen: $gen}) "
+                "WHERE n.project = $project AND n.label <> 'Folder' "
+                "AND n.file_path IS NOT NULL AND n.file_path <> '' "
+                "AND (n.label = 'File' OR NOT has_files) "
+                "RETURN DISTINCT n.file_path AS path ORDER BY path") != 0) {
+        return CBM_STORE_ERR;
+    }
+    q_str(&q, "project", project);
+    cbm_neo4j_result_t r;
+    if (q_run(x, &q, &r) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    int rc = collect_strings(&r, 0, out, count);
+    cbm_neo4j_result_free(&r);
+    return rc;
+}
+
+/* Property keys the sync stores itself; never reported as graph properties. */
+static const char *const k_internal_node_keys[] = {
+    "db",        "gen",        "project",  "id",           "label",         "name", "qualified_name",
+    "file_path", "start_line", "end_line", "properties_json", "prop_keys", NULL};
+static const char *const k_internal_edge_keys[] = {"id", "type", "properties_json", "prop_keys",
+                                                   NULL};
+
+/* base columns + up to 50 JSON keys, exactly like schema_discover_props. */
+enum { N4S_SCHEMA_MAX_KEYS = 50 };
+
+static char **schema_props(const char *const *base, int base_count, yyjson_val *keys, int *count) {
+    size_t nkeys = yyjson_arr_size(keys);
+    if (nkeys > N4S_SCHEMA_MAX_KEYS) {
+        nkeys = N4S_SCHEMA_MAX_KEYS;
+    }
+    char **props = calloc((size_t)base_count + nkeys + 1, sizeof(char *));
+    int n = 0;
+    if (!props) {
+        *count = 0;
+        return NULL;
+    }
+    for (int i = 0; i < base_count; i++) {
+        props[n++] = cbm_neo4j_val_strdup(NULL, base[i]);
+    }
+    for (size_t i = 0; i < nkeys; i++) {
+        props[n++] = cbm_neo4j_val_strdup(yyjson_arr_get(keys, i), "");
+    }
+    *count = n;
+    return props;
+}
+
+static int op_schema(void *ctx, const char *project, bool with_props, cbm_schema_info_t *out) {
+    n4s_ctx_t *x = ctx;
+    static const char *const node_base[] = {"name", "qualified_name", "file_path", "start_line",
+                                            "end_line"};
+    static const char *const edge_base[] = {"source_id", "target_id"};
+    /* prop_keys (every top-level properties key, stored by the sync) is the
+     * exact json_each key set; graphs synced before it existed fall back to
+     * the flattened keys. */
+    static const char *const statements[] = {
+        "MATCH (n:CbmNode {db: $db, gen: $gen}) WHERE n.project = $project "
+        "RETURN n.label AS l, count(*) AS c ORDER BY c DESC, l",
+        "MATCH (a:CbmNode {db: $db, gen: $gen})-[r]->() WHERE a.project = $project "
+        "RETURN r.type AS t, count(*) AS c ORDER BY c DESC, t",
+        "MATCH (n:CbmNode {db: $db, gen: $gen}) WHERE n.project = $project "
+        "UNWIND coalesce(n.prop_keys, [k IN keys(n) WHERE NOT k IN $node_internal]) AS k "
+        "WITH n.label AS l, k ORDER BY l, k "
+        "RETURN l, collect(DISTINCT k)",
+        "MATCH (a:CbmNode {db: $db, gen: $gen})-[r]->() WHERE a.project = $project "
+        "UNWIND coalesce(r.prop_keys, [k IN keys(r) WHERE NOT k IN $edge_internal]) AS k "
+        "WITH r.type AS t, k ORDER BY t, k "
+        "RETURN t, collect(DISTINCT k)"};
+    int nstmt = with_props ? 4 : 2;
+    cbm_neo4j_batch_t b;
+    if (cbm_neo4j_batch_init(&b) != 0) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < nstmt; i++) {
+        yyjson_mut_val *p = cbm_neo4j_batch_add(&b, statements[i]);
+        yyjson_mut_obj_add_strcpy(b.doc, p, "db", x->db);
+        yyjson_mut_obj_add_int(b.doc, p, "gen", x->gen);
+        yyjson_mut_obj_add_strcpy(b.doc, p, "project", project ? project : "");
+        if (i == 2) {
+            yyjson_mut_val *arr = yyjson_mut_arr(b.doc);
+            for (int k = 0; k_internal_node_keys[k]; k++) {
+                yyjson_mut_arr_add_str(b.doc, arr, k_internal_node_keys[k]);
+            }
+            yyjson_mut_obj_add_val(b.doc, p, "node_internal", arr);
+        } else if (i == 3) {
+            yyjson_mut_val *arr = yyjson_mut_arr(b.doc);
+            for (int k = 0; k_internal_edge_keys[k]; k++) {
+                yyjson_mut_arr_add_str(b.doc, arr, k_internal_edge_keys[k]);
+            }
+            yyjson_mut_obj_add_val(b.doc, p, "edge_internal", arr);
+        }
+    }
+    n4s_q_t q = {.b = b};
+    cbm_neo4j_result_t r;
+    if (q_run(x, &q, &r) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    yyjson_val *labels = cbm_neo4j_result_data(&r, 0);
+    yyjson_val *types = cbm_neo4j_result_data(&r, 1);
+    size_t nl = yyjson_arr_size(labels);
+    size_t nt = yyjson_arr_size(types);
+    out->node_labels = nl ? calloc(nl, sizeof(cbm_label_count_t)) : NULL;
+    out->edge_types = nt ? calloc(nt, sizeof(cbm_type_count_t)) : NULL;
+    if ((nl && !out->node_labels) || (nt && !out->edge_types)) {
+        cbm_neo4j_result_free(&r);
+        return CBM_STORE_ERR;
+    }
+    for (size_t i = 0; i < nl; i++) {
+        yyjson_val *e = yyjson_arr_get(labels, i);
+        out->node_labels[i].label = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 0), "");
+        out->node_labels[i].count = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, 1), 0);
+    }
+    out->node_label_count = (int)nl;
+    for (size_t i = 0; i < nt; i++) {
+        yyjson_val *e = yyjson_arr_get(types, i);
+        out->edge_types[i].type = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 0), "");
+        out->edge_types[i].count = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, 1), 0);
+    }
+    out->edge_type_count = (int)nt;
+    if (with_props) {
+        yyjson_val *label_keys = cbm_neo4j_result_data(&r, 2);
+        yyjson_val *type_keys = cbm_neo4j_result_data(&r, 3);
+        for (size_t i = 0; i < nl; i++) {
+            yyjson_val *keys = NULL;
+            size_t idx;
+            size_t max;
+            yyjson_val *e;
+            yyjson_arr_foreach(label_keys, idx, max, e) {
+                const char *l = yyjson_get_str(cbm_neo4j_row_col(e, 0));
+                if (l && strcmp(l, out->node_labels[i].label) == 0) {
+                    keys = cbm_neo4j_row_col(e, 1);
+                    break;
+                }
+            }
+            out->node_labels[i].properties =
+                schema_props(node_base, 5, keys, &out->node_labels[i].property_count);
+        }
+        for (size_t i = 0; i < nt; i++) {
+            yyjson_val *keys = NULL;
+            size_t idx;
+            size_t max;
+            yyjson_val *e;
+            yyjson_arr_foreach(type_keys, idx, max, e) {
+                const char *t = yyjson_get_str(cbm_neo4j_row_col(e, 0));
+                if (t && strcmp(t, out->edge_types[i].type) == 0) {
+                    keys = cbm_neo4j_row_col(e, 1);
+                    break;
+                }
+            }
+            out->edge_types[i].properties =
+                schema_props(edge_base, 2, keys, &out->edge_types[i].property_count);
+        }
+    }
+    cbm_neo4j_result_free(&r);
+    return CBM_STORE_OK;
+}
+
+static uint64_t op_queries(void *ctx) {
+    return ((n4s_ctx_t *)ctx)->queries;
+}
+
 static const cbm_store_remote_ops_t k_neo4j_ops = {
     .close = op_close,
     .error = op_error,
@@ -801,6 +1159,11 @@ static const cbm_store_remote_ops_t k_neo4j_ops = {
     .count = op_count,
     .degrees = op_degrees,
     .bfs = op_bfs,
+    .search = op_search,
+    .neighbor_names = op_neighbor_names,
+    .list_files = op_list_files,
+    .schema = op_schema,
+    .queries = op_queries,
 };
 
 /* ── Attach ─────────────────────────────────────────────────────── */
@@ -810,7 +1173,12 @@ static n4s_ctx_t *ctx_open(const char *db_path, const char *project, char *err, 
                            int *status) {
     cbm_neo4j_config_t cfg;
     char synced[N4S_GEN_MAX];
-    int rc = cbm_neo4j_sidecar_read(db_path, &cfg, synced, sizeof(synced), err, err_sz);
+    char marker_db[4096];
+    if (cbm_neo4j_sidecar_locate(db_path, project, marker_db, sizeof(marker_db)) != 0) {
+        *status = CBM_NEO4J_ATTACH_NONE;
+        return NULL;
+    }
+    int rc = cbm_neo4j_sidecar_read(marker_db, &cfg, synced, sizeof(synced), err, err_sz);
     if (rc == 1) {
         *status = CBM_NEO4J_ATTACH_NONE;
         return NULL;

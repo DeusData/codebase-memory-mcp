@@ -34,6 +34,12 @@ int cbm_neo4j_sidecar_write(const char *db_path, const cbm_neo4j_config_t *cfg,
  * so a failed background sync stays visible through index_status. */
 int cbm_neo4j_sidecar_write_status(const char *db_path, const cbm_neo4j_config_t *cfg,
                                    const char *synced_generation, const char *last_sync_error);
+/* The path whose marker governs the database at db_path: db_path itself when
+ * "<db_path>.graph.json" exists, else "<same dir>/<project>.db" when that
+ * project's marker exists (a database found under another file name). 0 and
+ * out filled, or 1 when the project is not Neo4j-backed. */
+int cbm_neo4j_sidecar_locate(const char *db_path, const char *project, char *out, size_t out_sz);
+
 /* One string field of the marker ("" when absent). 0, or -1 without marker. */
 int cbm_neo4j_sidecar_field(const char *db_path, const char *key, char *out, size_t out_sz);
 int cbm_neo4j_sidecar_remove(const char *db_path);
