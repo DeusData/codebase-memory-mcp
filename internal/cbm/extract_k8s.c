@@ -1487,12 +1487,18 @@ static void k8s_container(k8s_walk_t *w, const char *path, TSNode container) {
     const char *cname = k8s_text(w, container, "name");
     cname = cname && cname[0] && !strstr(cname, "{{") ? cname : NULL;
     const char *image = k8s_text(w, container, "image");
-    if (k8s_image_literal(image)) {
+    /* a Helm template's image is its skeleton placeholder: pass_k8s.c renders it */
+    if (k8s_image_literal(image) || (image && strchr(image, '<'))) {
+        TSNode iv = k8s_child(w, container, "image");
         CBMK8sFact f = {.fact = CBM_K8S_FACT_IMAGE,
                         .def_index = w->def_index,
                         .name = image,
                         .container = cname,
-                        .via = "container"};
+                        .via = "container",
+                        .line =
+                            ts_node_is_null(iv) ? 0 : (int)ts_node_start_point(iv).row + SKIP_ONE,
+                        .start_line = (int)ts_node_start_point(container).row + SKIP_ONE,
+                        .end_line = (int)ts_node_end_point(container).row + SKIP_ONE};
         cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
     }
     k8s_iter_t env = k8s_iter(k8s_child(w, container, "env"));

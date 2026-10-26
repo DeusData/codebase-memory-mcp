@@ -1,5 +1,5 @@
 # Reusable: lint only (cppcheck + clang-format).
-# Security-static and CodeQL gate are separate — see _security.yml.
+# Security-static is separate — see _security.yml; CodeQL — see codeql.yml.
 name: Lint & Security
 
 on:

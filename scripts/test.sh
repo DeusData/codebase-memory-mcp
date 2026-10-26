@@ -383,6 +383,8 @@ bash "$ROOT/tests/test_setup_scripts_contract.sh"
 # every September 2026 PR push and real failure against it.
 echo "=== Step 0z: PR lane selector contract ==="
 bash "$ROOT/tests/test_select_lanes.sh"
+echo "=== Step 0z1: CodeQL retraces affected prebuilt objects ==="
+bash "$ROOT/tests/test_codeql_retrace.sh"
 echo "=== Step 0z2: lane selector history replay ==="
 bash "$ROOT/scripts/test-impact/replay-selector.sh"
 echo "=== Step 0z3: lane-aware aggregate gates (ci-ok, shard union) ==="

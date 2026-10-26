@@ -376,10 +376,12 @@ typedef struct {
     const char *ci;   /* static: the CI running the command; NULL: none */
     const char *job;  /* pass-arena: its job; NULL: none */
     bool chart;
-    bool spawn; /* SPAWNS the script `tgt` / the Process `ext`, not DEPLOYS */
-    bool make;  /* SPAWNS the rule of target `ext` that makefile `path` reads */
-    bool build; /* the image `ext` is built from the Dockerfile `path` */
-    bool http;  /* HTTP_CALLS the URL `ext` (scheme://host/path) with method `path` */
+    bool spawn;             /* SPAWNS the script `tgt` / the Process `ext`, not DEPLOYS */
+    bool make;              /* SPAWNS the rule of target `ext` that makefile `path` reads */
+    bool build;             /* the image `ext` is built from the Dockerfile `path` */
+    bool http;              /* HTTP_CALLS the URL `ext` (scheme://host/path) with method `path` */
+    const char *build_args; /* pass-arena, build: --build-arg as a JSON object; NULL: none */
+    const char *default_of; /* pass-arena, build: JSON array of the ${X:-d} defaults naming `ext` */
 } sh_hit_t;
 
 typedef struct {
@@ -413,9 +415,10 @@ typedef struct {
     const char *s;      /* scalar value; NULL: unknown */
     const char **items; /* array items (an item NULL: unknown); NULL: no array */
     int n;
+    const char *dflt_of; /* JSON array: the variables whose ${X:-d} default made it */
 } sh_val_t;
 
-static const sh_val_t SH_UNKNOWN_VAL = {NULL, NULL, 0};
+static const sh_val_t SH_UNKNOWN_VAL = {NULL, NULL, 0, NULL};
 
 typedef enum { SH_FREE, SH_AT, SH_LOST } sh_cwd_mode_t;
 
@@ -464,7 +467,37 @@ typedef struct {
     sh_cwd_t *dirs; /* pushd stack */
     int ndirs;
     int cap_dirs;
+    /* While set, an evaluation adds to dflt_acc (a JSON array) the variables
+     * whose ${X:-d} default supplied its value. */
+    bool dflt_track;
+    const char *dflt_acc;
 } sh_t;
+
+/* JSON array `list` (NULL: empty) with identifier `name` appended once. */
+static const char *sh_names_add(CBMArena *a, const char *list, const char *name, size_t nl) {
+    if (!list) {
+        return cbm_arena_sprintf(a, "[\"%.*s\"]", (int)nl, name);
+    }
+    char quoted[CBM_SZ_256];
+    snprintf(quoted, sizeof(quoted), "\"%.*s\"", (int)nl, name);
+    if (strstr(list, quoted)) {
+        return list;
+    }
+    return cbm_arena_sprintf(a, "%.*s,%s]", (int)(strlen(list) - SKIP_ONE), list, quoted);
+}
+
+/* JSON array `a` with the names of JSON array `b` appended once. */
+static const char *sh_names_union(CBMArena *ar, const char *a, const char *b) {
+    for (const char *p = b ? strchr(b, '"') : NULL; p;) {
+        const char *e = strchr(p + SKIP_ONE, '"');
+        if (!e) {
+            break;
+        }
+        a = sh_names_add(ar, a, p + SKIP_ONE, (size_t)(e - p - SKIP_ONE));
+        p = strchr(e + SKIP_ONE, '"');
+    }
+    return a;
+}
 
 static void sh_set(sh_t *s, const char *name, const sh_val_t *v, bool local) {
     if (!sh_grow((void **)&s->undo, &s->cap_undo, s->nundo, sizeof(*s->undo))) {
@@ -622,14 +655,14 @@ static const sh_val_t *sh_lookup(sh_t *s, const char *name, bool *found) {
         }
         sh_val_t *v = cbm_arena_alloc(s->a, sizeof(*v));
         if (v) {
-            *v = (sh_val_t){s->script, NULL, 0};
+            *v = (sh_val_t){s->script, NULL, 0, NULL};
         }
         return v ? v : &SH_UNKNOWN_VAL;
     }
     if (strcmp(name, "PWD") == 0) {
         sh_val_t *v = cbm_arena_alloc(s->a, sizeof(*v));
         if (v) {
-            *v = (sh_val_t){sh_cwd_value(s), NULL, 0};
+            *v = (sh_val_t){sh_cwd_value(s), NULL, 0, NULL};
         }
         return v ? v : &SH_UNKNOWN_VAL;
     }
@@ -745,20 +778,29 @@ static const char *sh_eval_expansion(sh_t *s, TSNode n) {
         val = v->n > 0 ? v->items[0] : "";
     }
     if (!op) {
+        if (found && s->dflt_track) {
+            s->dflt_acc = sh_names_union(s->a, s->dflt_acc, v->dflt_of);
+        }
         return found ? val : NULL;
     }
     bool colon = op[0] == ':';
     bool use_default = !found || (colon && val && !val[0]);
     if (!use_default) {
+        if (s->dflt_track) {
+            s->dflt_acc = sh_names_union(s->a, s->dflt_acc, v->dflt_of);
+        }
         return val;
     }
     sh_str_t b = {0};
     sh_concat(s, &b, n, op_end, close, true);
     const char *d = sh_str_done(&b);
+    if (s->dflt_track) {
+        s->dflt_acc = sh_names_add(s->a, s->dflt_acc, nm, strlen(nm));
+    }
     if (d && strchr(op, '=')) {
         sh_val_t *nv = cbm_arena_alloc(s->a, sizeof(*nv));
         if (nv) {
-            *nv = (sh_val_t){d, NULL, 0};
+            *nv = (sh_val_t){d, NULL, 0, sh_names_add(s->a, NULL, nm, strlen(nm))};
             sh_set(s, nm, nv, false);
         }
     }
@@ -943,6 +985,9 @@ static const char *sh_eval(sh_t *s, TSNode n) {
         }
         bool found = false;
         const sh_val_t *val = sh_lookup(s, nm, &found);
+        if (found && s->dflt_track) {
+            s->dflt_acc = sh_names_union(s->a, s->dflt_acc, val->dflt_of);
+        }
         return found ? val->s : NULL;
     }
     if (strcmp(t, "expansion") == 0) {
@@ -1319,6 +1364,8 @@ static void sh_hit_push(sh_t *s, TSNode cmd, sh_hit_t x) {
     x.line = (int)ts_node_start_point(cmd).row + SKIP_ONE + s->line_base;
     x.ext = x.ext ? cbm_arena_strdup(&h->arena, x.ext) : NULL;
     x.path = x.path ? cbm_arena_strdup(&h->arena, x.path) : NULL;
+    x.build_args = x.build_args ? cbm_arena_strdup(&h->arena, x.build_args) : NULL;
+    x.default_of = x.default_of ? cbm_arena_strdup(&h->arena, x.default_of) : NULL;
     x.ci = s->ci;
     x.job = s->job ? cbm_arena_strdup(&h->arena, s->job) : NULL;
     h->items[h->count++] = x;
@@ -2268,7 +2315,11 @@ static void sh_assign(sh_t *s, TSNode n, bool local) {
     if (!nm || !v) {
         return;
     }
-    *v = (sh_val_t){"", NULL, 0};
+    *v = (sh_val_t){"", NULL, 0, NULL};
+    bool track = s->dflt_track;
+    const char *acc = s->dflt_acc;
+    s->dflt_track = true;
+    s->dflt_acc = NULL;
     if (sh_type(value, "array")) {
         uint32_t cnt = ts_node_named_child_count(value);
         const char **items = cbm_arena_alloc(s->a, (cnt ? cnt : SKIP_ONE) * sizeof(*items));
@@ -2282,10 +2333,13 @@ static void sh_assign(sh_t *s, TSNode n, bool local) {
                 items[k++] = sh_eval_word(s, c);
             }
         }
-        *v = (sh_val_t){k > 0 ? items[0] : "", items, k};
+        *v = (sh_val_t){k > 0 ? items[0] : "", items, k, NULL};
     } else if (!ts_node_is_null(value)) {
         v->s = sh_eval(s, value);
     }
+    v->dflt_of = s->dflt_acc;
+    s->dflt_track = track;
+    s->dflt_acc = acc;
     bool append = false;
     for (uint32_t i = 0; i < ts_node_child_count(n); i++) {
         TSNode c = ts_node_child(n, i);
@@ -2434,6 +2488,64 @@ static const char *sh_image_repo(sh_t *s, TSNode cmd, const sh_argv_t *a, int i)
     return sh_str_done(&out);
 }
 
+/* JSON object `json` (NULL: none) with build argument `kv` ("K=V") added; a
+ * `K` alone (the environment's value), an unknown word or a secret (by name
+ * or value -- never kept in the graph, never an image) adds nothing. */
+static const char *sh_build_arg(sh_t *s, const char *json, const char *kv) {
+    const char *eq = kv ? strchr(kv, '=') : NULL;
+    if (!eq || eq == kv) {
+        return json;
+    }
+    for (const char *p = kv; p < eq; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '_') {
+            return json;
+        }
+    }
+    const char *key = cbm_arena_strndup(s->a, kv, (size_t)(eq - kv));
+    if (!key || cbm_is_secret_binding(key, eq + SKIP_ONE)) {
+        return json;
+    }
+    /* JSON escaping writes at most 6 bytes a byte: nothing is cut */
+    int vn = (int)(strlen(eq + SKIP_ONE) * 6 + SKIP_ONE);
+    char *ev = cbm_arena_alloc(s->a, (size_t)vn);
+    if (!ev) {
+        return json;
+    }
+    cbm_json_escape(ev, vn, eq + SKIP_ONE);
+    const char *pair = cbm_arena_sprintf(s->a, "\"%.*s\":\"%s\"", (int)(eq - kv), kv, ev);
+    if (!pair) {
+        return json;
+    }
+    return json ? cbm_arena_sprintf(s->a, "%.*s,%s}", (int)(strlen(json) - SKIP_ONE), json, pair)
+                : cbm_arena_sprintf(s->a, "{%s}", pair);
+}
+
+/* The variables whose ${X:-d} default supplied argv word `i` (a JSON array,
+ * NULL: none): the word evaluated once more with the defaults recorded. */
+static const char *sh_word_defaults(sh_t *s, TSNode cmd, const sh_argv_t *a, int i) {
+    uint32_t b = a->span[(size_t)i * PAIR_LEN];
+    uint32_t e = a->span[(size_t)i * PAIR_LEN + SKIP_ONE];
+    if (!memchr(s->src + b, '$', e - b)) {
+        return NULL;
+    }
+    TSNode w = ts_node_descendant_for_byte_range(cmd, b, e);
+    while (!ts_node_is_null(w) && (ts_node_start_byte(w) != b || ts_node_end_byte(w) != e)) {
+        w = ts_node_parent(w);
+    }
+    if (ts_node_is_null(w)) {
+        return NULL;
+    }
+    bool track = s->dflt_track;
+    const char *acc = s->dflt_acc;
+    s->dflt_track = true;
+    s->dflt_acc = NULL;
+    (void)sh_eval_word(s, w);
+    const char *out = s->dflt_acc;
+    s->dflt_track = track;
+    s->dflt_acc = acc;
+    return out;
+}
+
 /* docker / podman / nerdctl [buildx | image | builder] build, buildah bud:
  * each tagged image is built from the Dockerfile -f names (against the cwd),
  * else <context>/Dockerfile -- one file of the repository. */
@@ -2467,17 +2579,20 @@ static void sh_build(sh_t *s, TSNode cmd, const sh_argv_t *a) {
         cbm_ht_set(s->hits->declarers, s->file, (void *)s->file);
     }
     int tags[SH_BUILD_TAGS];
+    int tag_words[SH_BUILD_TAGS];
     const char *tag_vals[SH_BUILD_TAGS];
     int nt = 0;
     const char *dfile = NULL;
     bool dfile_known = true;
     const char *ctx = NULL;
     bool ctx_seen = false;
+    const char *args = NULL;
     for (; i < a->n; i++) {
         const char *w = a->v[i];
         if (w && (sh_eq(w, "-t") || sh_eq(w, "--tag")) && i + SKIP_ONE < a->n) {
             if (nt < SH_BUILD_TAGS) {
                 tags[nt] = i + SKIP_ONE;
+                tag_words[nt] = i + SKIP_ONE;
                 tag_vals[nt++] = a->v[i + SKIP_ONE];
             }
             i++;
@@ -2485,9 +2600,15 @@ static void sh_build(sh_t *s, TSNode cmd, const sh_argv_t *a) {
             dfile = a->v[i + SKIP_ONE];
             dfile_known = dfile != NULL;
             i++;
+        } else if (w && sh_eq(w, "--build-arg") && i + SKIP_ONE < a->n) {
+            args = sh_build_arg(s, args, a->v[i + SKIP_ONE]);
+            i++;
+        } else if (w && strncmp(w, "--build-arg=", strlen("--build-arg=")) == 0) {
+            args = sh_build_arg(s, args, w + strlen("--build-arg="));
         } else if (w && strncmp(w, "--tag=", strlen("--tag=")) == 0) {
             if (nt < SH_BUILD_TAGS && w[strlen("--tag=")]) {
                 tags[nt] = -SKIP_ONE;
+                tag_words[nt] = i;
                 tag_vals[nt++] = w + strlen("--tag=");
             }
         } else if (w && strncmp(w, "--file=", strlen("--file=")) == 0) {
@@ -2513,7 +2634,12 @@ static void sh_build(sh_t *s, TSNode cmd, const sh_argv_t *a) {
         }
         if (img && img[0]) {
             sh_hit_push(s, cmd,
-                        (sh_hit_t){.via = "docker-build", .ext = img, .path = hit, .build = true});
+                        (sh_hit_t){.via = "docker-build",
+                                   .ext = img,
+                                   .path = hit,
+                                   .build = true,
+                                   .build_args = args,
+                                   .default_of = sh_word_defaults(s, cmd, a, tag_words[k])});
         }
     }
 }
@@ -3305,8 +3431,8 @@ static void sh_makefile(sh_pass_t *p, const char *rel, const char *src, size_t l
             sh_val_t *root = cbm_arena_alloc(&a, sizeof(*root));
             sh_val_t *cur = cbm_arena_alloc(&a, sizeof(*cur));
             if (root && cur) {
-                *root = (sh_val_t){SH_ROOT, NULL, 0};
-                *cur = (sh_val_t){sh_anchor(&a, s.sdir), NULL, 0};
+                *root = (sh_val_t){SH_ROOT, NULL, 0, NULL};
+                *cur = (sh_val_t){sh_anchor(&a, s.sdir), NULL, 0, NULL};
                 cbm_ht_set(s.env, "__cbm_root", root);
                 if (m.makefile) {
                     cbm_ht_set(s.env, "__cbm_curdir", cur);
@@ -3647,15 +3773,25 @@ static int sh_link_build(cbm_pipeline_ctx_t *ctx, const sh_hit_t *x, CBMHashTabl
     char esc_file[CBM_SZ_1K];
     char esc_img[CBM_SZ_1K];
     char ci[CBM_SZ_1K];
-    char props[CBM_SZ_4K];
     cbm_json_escape(esc_file, (int)sizeof(esc_file), x->file);
     cbm_json_escape(esc_img, (int)sizeof(esc_img), x->ext);
     sh_ci_props(x, ci, sizeof(ci));
-    snprintf(props, sizeof(props),
+    /* sized to what it holds: default_of and build_args are never cut */
+    size_t pn = strlen(esc_file) + strlen(esc_img) + strlen(ci) +
+                (x->default_of ? strlen(x->default_of) : 0) +
+                (x->build_args ? strlen(x->build_args) : 0) + CBM_SZ_256;
+    char *props = cbm_alloc(CBM_MEM_CLASS_OTHER, pn);
+    if (!props) {
+        return 0;
+    }
+    snprintf(props, pn,
              "{\"via\":\"build\",\"tool\":\"docker-build\",\"file\":\"%s\",\"image\":\"%s\"%s,"
-             "\"line\":%d}",
-             esc_file, esc_img, ci, x->line);
+             "\"line\":%d%s%s%s%s}",
+             esc_file, esc_img, ci, x->line, x->default_of ? ",\"default_of\":" : "",
+             x->default_of ? x->default_of : "", x->build_args ? ",\"build_args\":" : "",
+             x->build_args ? x->build_args : "");
     cbm_gbuf_insert_edge(ctx->gbuf, img, mod, "DEPENDS_ON", props);
+    cbm_free(CBM_MEM_CLASS_OTHER, props);
     return SKIP_ONE;
 }
 
@@ -3852,7 +3988,7 @@ typedef struct {
 static void sh_ci_var(sh_t *s, const char *name, const char *value) {
     sh_val_t *v = value ? cbm_arena_alloc(s->a, sizeof(*v)) : NULL;
     if (v) {
-        *v = (sh_val_t){value, NULL, 0};
+        *v = (sh_val_t){value, NULL, 0, NULL};
     }
     sh_set(s, name, v ? v : &SH_UNKNOWN_VAL, false);
 }
