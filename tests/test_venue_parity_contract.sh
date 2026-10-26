@@ -409,9 +409,9 @@ test-infrastructure/vm/vm-run-tests.sh
 test-infrastructure/vm/win.sh
 "
     for entry in $HELP_ENTRIES; do
-        out=$(cd "$ROOT" && bash "$entry" --help 2>&1) && rc=0 || rc=$?
         case "$entry" in
         *.py) out=$(cd "$ROOT" && python3 "$entry" --help 2>&1) && rc=0 || rc=$? ;;
+        *) out=$(cd "$ROOT" && bash "$entry" --help 2>&1) && rc=0 || rc=$? ;;
         esac
         # Substring test in-shell: piping into `grep -q` is unsafe under
         # `set -o pipefail` because grep exits at the first match and the
