@@ -16,16 +16,18 @@
  * document wrote the path.
  *
  * Unresolved:
- *   missing    the path is not in the graph, but its directory is: the
- *              document names something that is not there (doc rot)
+ *   missing    the path is not in the graph, but its directory is, or a
+ *              directory above it that the reference wrote is: the document
+ *              names something that is not there (doc rot; a moved or
+ *              renamed directory)
  *   ambiguous  a file name alone that is not next to the document but exists
  *              elsewhere in the repository: the document does not say which
  * Not a reference to this repository at all (LOCAL: no edge, no row): a link
  * back into the same document; a path that is neither indexed nor of a type
  * the indexer reads (an image, an archive, an extensionless page); a path
- * whose directory is not in the repository either (a file a tutorial asks
- * the reader to create, a system path, a path above the root); and, in a
- * code span, a rooted single segment without a file extension, which is a
+ * none of whose directories is in the repository either (a file a tutorial
+ * asks the reader to create, a system path, a path above the root); and, in
+ * a code span, a rooted single segment without a file extension, which is a
  * URL route (`/docs`, `/health`), not the directory of that name.
  */
 #include "pipeline/doc_links.h"
@@ -406,6 +408,25 @@ static const cbm_gbuf_node_t *mdr_folder(const mdr_index_t *x, const cbm_gbuf_t 
                                          const char *path) {
     (void)graph;
     return path[0] ? (const cbm_gbuf_node_t *)cbm_ht_get(x->folders, path) : NULL;
+}
+
+/* Whether a directory above `path` that the reference itself wrote, one
+ * longer than the `base_len` bytes it was read from, is a Folder. */
+static bool mdr_written_ancestor(const mdr_index_t *x, const cbm_gbuf_t *graph, const char *path,
+                                 size_t base_len) {
+    char dir[MDR_PATH_CAP];
+    size_t n = strlen(path);
+    if (n >= sizeof(dir)) {
+        return false;
+    }
+    memcpy(dir, path, n + SKIP_ONE);
+    for (char *s = strrchr(dir, '/'); s && (size_t)(s - dir) > base_len; s = strrchr(dir, '/')) {
+        *s = '\0';
+        if (mdr_folder(x, graph, dir)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool mdr_code_label(const char *label) {
@@ -1126,8 +1147,19 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
     char tries[MDR_TRIES][MDR_PATH_CAP];
     int nt = 0;
     int attempted = 0;
+    size_t base_len[MDR_TRIES]; /* the directory each try reads from, before what p wrote */
     if (!rooted) {
         attempted++;
+        char lead[MDR_PATH_CAP]; /* p's leading `./` and `../` segments */
+        char base[MDR_PATH_CAP];
+        size_t ll = 0;
+        while (ll < sizeof(lead) - PAIR_LEN - 1 && (strncmp(p + ll, "./", PAIR_LEN) == 0 ||
+                                                    strncmp(p + ll, "../", PAIR_LEN + 1) == 0)) {
+            ll += p[ll + 1] == '/' ? PAIR_LEN : PAIR_LEN + 1;
+        }
+        memcpy(lead, p, ll);
+        lead[ll] = '\0';
+        base_len[nt] = mdr_join(doc_dir, lead, base, sizeof(base)) ? strlen(base) : 0;
         nt += mdr_join(doc_dir, p, tries[nt], MDR_PATH_CAP);
     }
     if (!relative && !r->name_only) {
@@ -1137,7 +1169,7 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
             q++;
         }
         if (mdr_join("", q, tries[nt], MDR_PATH_CAP) && (nt == 0 || strcmp(tries[0], tries[nt]))) {
-            nt++;
+            base_len[nt++] = 0;
         }
     }
     for (int i = 0; i < nt; i++) {
@@ -1174,7 +1206,8 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
         return;
     }
     /* doc rot when the reference points into the repository: its directory is
-     * there (a bare name in a link: the document's own directory) */
+     * there (a bare name in a link: the document's own directory), or a
+     * directory above it that the reference wrote is (one moved or renamed) */
     for (int i = 0; i < nt; i++) {
         char parent[MDR_PATH_CAP];
         const char *ps = strrchr(tries[i], '/');
@@ -1182,6 +1215,10 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
         memcpy(parent, tries[i], pl);
         parent[pl] = '\0';
         if (pl > 0 && mdr_folder(x, graph, parent) && (strchr(p, '/') || r->link)) {
+            out->reason = CBM_DOCLINK_REASON_MISSING;
+            return;
+        }
+        if (pl > 0 && strchr(p, '/') && mdr_written_ancestor(x, graph, tries[i], base_len[i])) {
             out->reason = CBM_DOCLINK_REASON_MISSING;
             return;
         }

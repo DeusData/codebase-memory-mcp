@@ -1,9 +1,9 @@
-# codebase-memory-mcp: local MCP server for code search, lower token usage and visualization
+# codebase-memory-mcp: local code intelligence for AI agents via MCP
 
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/release.yml?branch=main&label=main%20CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/release.yml)
-[![C tests](https://img.shields.io/badge/C_tests-9388_cases-blue)](#tests)
+[![Native and frontend tests](https://img.shields.io/badge/tests-native_%2B_frontend-blue)](#tests)
 [![MCP tools](https://img.shields.io/badge/MCP_tools-17-blue)](#mcp-tools)
 [![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-type_resolution-blue)](#hybrid-lsp)
@@ -14,33 +14,28 @@
 [![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
 [![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
+[![Join the community on Discord](https://img.shields.io/badge/Discord-Join_the_community-5865F2?logo=discord&logoColor=white)](https://discord.gg/KguGXxg2X)
 
-**Search your code, follow call graphs, and explore software architecture in your browser.** codebase-memory-mcp is a local [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that gives Claude Code, Codex, and other coding agents a persistent code knowledge graph. It indexes functions, classes, imports, HTTP routes, and their relationships across [162 languages](#language-support). [Hybrid LSP](#hybrid-lsp) adds semantic type resolution for **Python, TypeScript, JavaScript, JSX/TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl**.
+**Understand your repository, from source code to the systems around it.** codebase-memory-mcp is an MCP server that connects code, documentation, configuration, and infrastructure in a persistent local knowledge graph. Use it to find an unfamiliar feature, follow a call across services, trace a deployment back to its source, or assess which parts of a project a change could affect.
 
-**About 120× fewer tokens** in the project's reported five-query comparison: ~3,400 vs ~412,000 with file-by-file exploration. Published backend benchmarks also report **Linux kernel indexing in ~3 minutes** (28M lines of code) and **Cypher relationship queries under 1 ms** on an Apple M3 Pro. [Benchmark details](#performance).
+Give your coding agent structural context through [Model Context Protocol](https://modelcontextprotocol.io/) (MCP), or query the graph directly from the CLI. **The MCP server is the core of the project.** Its optional visual companion, **CBM Lens, is in open beta (v0.0.1)**, with a source reader, architecture maps, the Galaxy graph, coverage diagnostics, architecture decisions, and local code chat.
 
-**CBM Lens Beta helps you understand unfamiliar code and stay in control as it grows.** Use it to get up to speed in a new codebase, tackle rescue engineering on an inherited project, or make sense of 50,000 lines of AI-generated code from a single day. Its IDE-style source reader, local code chat, 3D architecture map, and Galaxy graph let you see how the code fits together and follow dependencies and call paths back to the source. Use that context to review changes, investigate fragile areas, and keep code quality high. Architecture decisions stay alongside the project's index.
+The native C backend exposes **17 MCP tools**, parses [languages and file formats](#language-support) with vendored grammars, and adds [Hybrid LSP](#hybrid-lsp) type resolution for supported languages. The installer supports **45 automatic or conditional client integrations**, including client configuration, skills, agent profiles, and applicable hooks. Indexing and graph queries need no hosted service or API key. Focused graph queries can reduce repeated file reads and token use; see the [measured results](#performance).
 
-The native C backend exposes 17 MCP tools and supports 45 automatic or conditional client integrations. Indexing and graph queries need no hosted service or API key.
-
-> **CBM Lens Beta is new on `main`:** it arrived with [PR #2068](https://github.com/DeusData/codebase-memory-mcp/pull/2068) and is not part of the current v0.11.0 release, whose installer still ships the previous graph UI. To run the interface shown below now, [build from source](#build-from-source).
-
-[Quick start](#quick-start) · [Explore CBM Lens](#cbm-lens-beta-code-visualization-and-source-navigation) · [Chat with your codebase locally](#chat-with-your-codebase-locally) · [MCP tools](#mcp-tools) · [Build from source](#build-from-source)
-
-> **Research:** The [preprint](https://arxiv.org/abs/2603.27277) compares agents across 31 repositories, reporting **10× lower token use** and **2.1× fewer tool calls**, with answer-quality scores of 83% for CBM versus 92% for file-by-file exploration. These backend results are separate from the five-query comparison above and from CBM Lens.
+[Quick start](#quick-start) · [Capabilities](#features) · [Documentation](#documentation-connected-to-code) · [Infrastructure](#infrastructure-and-deployment) · [Smart CI](#smart-ci-and-test-impact) · [Explore CBM Lens](#cbm-lens-beta-code-visualization-and-source-navigation) · [Agent setup](#agent-setup-skills-profiles-and-hooks) · [MCP tools](#mcp-tools)
 
 > **Local processing:** Source analysis and graph storage run on your machine. CBM Lens can optionally download a model for browser AI after you enable it; inference stays on the device. The installer writes agent configuration for the clients you select. See [Security](#security) for release verification and [SECURITY.md](SECURITY.md) for reporting issues.
 
-**Architecture overview.** Folders become nested platforms, files and symbols become selectable blocks, and arrows show indexed relationships. The recording zooms into the map of this repository, selects `src/pipeline`, opens the area, selects `artifact.c` and opens its source. Height can show source size; hotspot gravity reflects static fan-in. [Still image](docs/images/lens-architecture.png).
+**See the graph with CBM Lens (open beta v0.0.1).** Folders become nested platforms, files and symbols become selectable blocks, and arrows show indexed relationships. The recording opens `src/foundation` in the map of this repository, selects `arena.c` and opens its source. Height can show source size; hotspot gravity reflects static fan-in. [Still image](docs/images/lens-architecture.png).
 
 <p align="center">
-  <img src="docs/images/lens-overview.gif" alt="CBM Lens Beta architecture walkthrough: zoom into the source folders of this repository, open src/pipeline, select artifact.c and open its source" width="1000">
+  <img src="docs/images/lens-overview.gif" alt="CBM Lens Beta architecture walkthrough: open src/foundation, select arena.c and read its source beside the map" width="1000">
 </p>
 
-**Galaxy.** Explore the code knowledge graph in 3D. The recording searches `cbm_pipeline_run`, follows its outgoing calls one layer further, switches to the hierarchy and shows the path to `cbm_store_check_integrity`. Edge pulses show relationship direction; they do not represent live execution. [Current still: two dependency layers around `cbm_max_file_bytes`](docs/images/lens-galaxy.jpg).
+**Galaxy.** Explore the code knowledge graph in 3D. The recording follows the outgoing relationships of `cbm_arena_alloc` one layer further, switches to the hierarchy and shows the two-hop call path to `cbm_alloc`. Edge pulses show relationship direction; they do not represent live execution. [Still: two dependency layers around `cbm_max_file_bytes`](docs/images/lens-galaxy.jpg).
 
 <p align="center">
-  <img src="docs/images/lens-galaxy.gif" alt="Code knowledge graph in CBM Lens Beta Galaxy: search a function, expand its outgoing calls, switch to the hierarchy and follow a path" width="1000">
+  <img src="docs/images/lens-galaxy.gif" alt="Code knowledge graph in CBM Lens Beta Galaxy: expand cbm_arena_alloc, switch to the hierarchy and follow its call path through arena_grow to cbm_alloc" width="1000">
 </p>
 
 **Explore.** Browse files in an IDE-style workspace, read syntax-highlighted source in Monaco, and keep the code graph alongside it. File impact shows what depends on the open file, and Code details shows the callers and calls of the symbol under the caret. Select code to [ask the local chat about it](#chat-with-your-codebase-locally).
@@ -58,27 +53,27 @@ The native C backend exposes 17 MCP tools and supports 45 automatic or condition
 
 </details>
 
-These captures show CBM Lens Beta on 12–13 October 2026, using public source from this repository. See [capture details](docs/images/README.md) for each capture's build, indexed scope and recording setup.
+The high-resolution GIFs show CBM Lens Beta on 20 October 2026; the still images were captured on 12–13 October. All show public source from this repository. See [capture details](docs/images/README.md) for each capture's build, indexed scope and recording setup.
 
 ## Why codebase-memory-mcp
 
-- **Indexing performance**: Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
-- **Plug and play**: native executable plus authenticated release-owned assets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). The native install needs no Docker, language runtime, or API keys. Download → `install` → restart agent → done.
-- **162 languages**: vendored tree-sitter grammars compiled into the binary. No separate parser installation.
-- **About 120× fewer tokens in the reported five-query comparison**: ~3,400 tokens vs ~412,000 via file-by-file search. See [Performance](#performance) for the scope and sources.
-- **45 supported automatic/conditional client surfaces**: `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
-- **CBM Lens Beta**: read source, chat about selected code with a local model, explore architecture and call graphs, inspect coverage gaps, and edit architecture decision records in your browser.
-- **Infrastructure-as-code indexing**: Dockerfiles, container images, docker compose, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds and compose services, `Image` nodes joining the images that are built and run, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources; a Service walks to the program its container runs.
-- **17 MCP tools**: search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **Find the right code with context**: combine symbol, text, and semantic search with callers, dependencies, source snippets, and file outlines. Targeted queries and compact, paged results can reduce token use and repeated file reads; see [Performance](#performance) for scoped measurements.
+- **Connect documentation to implementation**: index document sections, PDF text pages, architecture decisions, and supported references into code. Find the explanation alongside the symbol.
+- **Follow the system beyond source files**: trace supported relationships through Docker, Kubernetes, Helm, Kustomize, Terraform/OpenTofu, Terragrunt, Ansible, scripts, Make, and CI configuration.
+- **Understand a change before running it**: inspect affected symbols, compare indexed snapshots, and find related tests. [Experimental Smart CI](#smart-ci-and-test-impact) combines static relationships and per-test coverage for supported C/C++ test harnesses, falling back to broader runs when evidence is insufficient.
+- **Explore visually with CBM Lens Beta**: read source, follow call paths, inspect architecture and coverage gaps, manage architecture decisions, and ask a local model about selected code.
+- **Equip your coding agents**: `install` sets up supported client configuration, durable guidance, skills, Scout/Verify/Auditor profiles, and applicable context hooks. Support varies by client; see the [integration matrix](#multi-agent-support).
+- **Keep context local and reusable**: indexes persist between sessions, eligible active MCP sessions can keep them synchronized, and optional graph artifacts let a team share a baseline.
+- **Run a native tool on your machine**: standard releases include CBM Lens for macOS, Linux, and Windows. The native runtime needs no Docker or language runtime; parser grammars are included.
 
 ## Quick Start
 
-**Install the latest release** (macOS / Linux). For CBM Lens Beta shown above, [build from source](#build-from-source) until the next release.
+**Install the latest release** (macOS / Linux):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
 ```
 
-The released graph UI is included in the standard installer.
+The standard native release includes CBM Lens. Start it after installation with `codebase-memory-mcp daemon start --open --port=9749`. The [Nix packages](#nix-flake) and [source builds](#build-from-source) also offer builds without the UI.
 
 **Windows** (PowerShell):
 ```powershell
@@ -136,7 +131,19 @@ Restart your coding agent. Say **"Index this project"**: done.
 The `install` command automatically strips macOS quarantine attributes and ad-hoc signs the binary; no manual `xattr`/`codesign` needed.
 </details>
 
-The `install` command auto-detects installed coding agents and configures their documented MCP entries plus durable instructions, skills, and lifecycle hooks where supported.
+### Agent setup: skills, profiles, and hooks
+
+Installation also equips supported coding agents to use the graph in daily work. The native `install` command detects clients and installs the integration pieces their documented formats support:
+
+| Component | What it adds |
+|-----------|--------------|
+| **MCP configuration** | Connects the client to the local server and its tools. |
+| **Instructions and skills** | Explains graph-first exploration, index freshness, coverage checks, and when to read source. |
+| **Scout, Verify, and Auditor profiles** | Offers fast provisional lookup, task-directed verification, or bounded full verification, where custom agents are supported. |
+| **Session and compaction hooks** | Restores graph context at supported lifecycle events. |
+| **Search and read hooks** | Adds relevant graph context to supported searches and flags recorded coverage gaps after supported file reads. |
+
+Hook augmentation is context-only and fail-open: it does not replace or block the requested tool call. Features vary by client and platform; some clients use durable instructions or a parent-agent handoff instead of hooks or direct subagent MCP access. Codex users review and trust installed hooks through `/hooks`. See [Multi-Agent Support](#multi-agent-support) and [Sessions, compaction, and subagents](#sessions-compaction-and-subagents) for exact support and activation requirements.
 
 ### Session Coordination Daemon
 
@@ -154,18 +161,18 @@ Thin frontends still write immediate startup and session-specific errors to thei
 
 All active CBM processes must run the exact same version, executable build, coordination ABI, and canonical cache root. Equivalent `CBM_CACHE_DIR` aliases resolve to the same root; a genuinely different root is rejected while any CBM process is active. MCP servers, hooks, one-shot CLI commands, temporary index workers, and the daemon share a crash-safe OS admission barrier; starting an ordinary conflicting process fails before doing work and records an explicit conflict in `${CBM_CACHE_DIR}/logs/daemon-conflicts.ndjson`.
 
-The native `install`, `update`, and `uninstall` commands are the deliberate exception to that conflict rule. Download, verification, and private same-filesystem staging happen first so a bad candidate never disrupts active work. Activation then publishes account-wide maintenance intent, asks the daemon and every temporary local operation to cancel, and waits to a finite deadline for all coordinated CBM processes to exit. It holds the admission and lifetime barriers exclusively while changing the active binary, configuration, PATH, or indexes. New CBM work cannot enter during this window. Activation progress and results are recorded in `${CBM_CACHE_DIR}/logs/activation-events.ndjson`, and a successful command tells you to restart open coding-agent sessions so they launch the activated build.
+The native `install` and `uninstall` commands are the deliberate exception to that conflict rule. For installation, download, verification, and private same-filesystem staging finish before activation so a bad candidate never disrupts active work. The native `update` command prints the installer command that performs the update. Activation then publishes account-wide maintenance intent, asks the daemon and every temporary local operation to cancel, and waits to a finite deadline for all coordinated CBM processes to exit. It holds the admission and lifetime barriers exclusively while changing the active binary, configuration, PATH, or indexes. New CBM work cannot enter during this window. Activation progress and results are recorded in `${CBM_CACHE_DIR}/logs/activation-events.ndjson`, and a successful command tells you to restart open coding-agent sessions so they launch the activated build.
 
 Package-manager setup (npm, PyPI, or Go) verifies and caches the native executable for that package. It does not replace the active native installation and therefore does not stop running CBM sessions. When that cached binary is executed, it still enters the same exact-build admission barrier. The shell and PowerShell installers invoke the verified candidate's native `install` command, so they do receive the full account-wide activation guarantee.
 
-The ordinary `cli` mode runs one command locally, but it is not disconnected from the daemon above: it connects to the shared coordination daemon (starting one if none is already running) for that same admission barrier plus per-project locks on graph mutations. Its connection is a `cli_session`: it never registers with the background watcher and never starts a UI, and it holds the admission lease only for the command's lifetime. If the command's own connection is what started the daemon, that daemon exits again once the command closes and no other session is attached; if a daemon was already running, the command simply joins and leaves it exactly as found. While the command is running, a temporary monitor separately lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
+The ordinary `cli` mode runs one command locally, but it is not disconnected from the daemon above: it connects to the shared coordination daemon (starting one if none is already running) for that same admission barrier plus per-project locks on graph mutations. Its connection is a `cli_session`: it does not register a project watcher or open a browser, and it holds the admission lease only for the command's lifetime. The shared daemon may serve Lens according to its UI configuration and available assets. If the command's own connection is what started the daemon, that daemon exits again once the command closes and no other session is attached; if a daemon was already running, the command simply joins and leaves it exactly as found. While the command is running, a temporary monitor separately lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
 
 ### CBM Lens Beta: code visualization and source navigation
 
-CBM Lens Beta is the browser interface built into the binary. It builds on [CodeAtlasWeb](graph-ui/README.md) by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) (design and tracking in #1964). It runs on loopback; the only request that leaves your machine is the optional model download from Hugging Face, and only after you start it. Each panel names where its facts come from, and what the index did not record is shown as a gap. Start the local server:
+**CBM Lens is an optional visual companion to the MCP server, currently in open beta (v0.0.1).** Standard native releases include its browser interface, so you can launch Lens directly after installation; UI-enabled source builds include it too. It builds on [CodeAtlasWeb](graph-ui/README.md) by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) (design and tracking in #1964). Lens is served on loopback. Browser AI downloads its optional model only after you enable it; inference stays on-device. Each panel names where its facts come from, and what the index did not record is shown as a gap. Start the local server:
 
 ```bash
-./build/c/codebase-memory-mcp daemon start --open --port=9749
+codebase-memory-mcp daemon start --open --port=9749
 ```
 
 The browser opens at `http://127.0.0.1:9749`. A permanent daemon keeps the UI available after the command exits. Use `daemon status` to inspect it and `daemon stop` when you are finished. For an MCP session, `--ui=true --port=9749` enables the same shared UI. Active clients must use the same executable build and cache directory.
@@ -209,9 +216,9 @@ Open **Chat** with the panel button at the top right to ask about the code you a
 
 Questions about callers and callees, such as "Who calls cbm_pipeline_run?", are answered from the loaded graph without the model, and the answer says so. When you select a symbol, the chat lists its indexed facts and the lines of its code, and the model adds one sentence; that sentence is left out when it claims something the source does not show. Text written by the model is labelled as such.
 
-The recording shows a question about callers answered from the indexed graph, next to the automatic explanation of the selected symbol. [Still image](docs/images/lens-chat.png).
+The recording asks who calls `arena_grow` and what it calls, with both answers listed directly from the indexed graph beside the selected symbol. [Still image of a model explanation and graph answer](docs/images/lens-chat.png).
 
-<p align="center"><img src="docs/images/lens-chat.gif" alt="Chat with your codebase locally in CBM Lens Beta: a selected symbol, its listed facts and a caller question answered from the indexed graph" width="1000"></p>
+<p align="center"><img src="docs/images/lens-chat.gif" alt="Chat with your codebase locally in CBM Lens Beta: callers and callees of arena_grow answered directly from the indexed graph" width="1000"></p>
 
 The chat history is kept for 24 hours in this browser, per project. Each new message uses the source currently open in the reader; earlier source snapshots are not silently accumulated, and messages about another file or selection are not sent along. If a prompt is too long for the model, older messages are left out first; if it still does not fit, CBM Lens asks you to select less code instead of cutting the code. This chat explains the context you give it; it cannot edit files or run tools. Check its answers against the source. The small default model words things loosely, especially in languages other than English.
 
@@ -232,7 +239,7 @@ The Agents workspace and activity overlays are hidden in normal builds. To inclu
 VITE_EXPERIMENTAL_AGENTS=true scripts/build.sh --with-ui
 ```
 
-Activity comes from explicitly configured tool hooks. The bundled adapter supports Claude Code PostToolUse; other clients need their own adapter. Recorded events go to the local daemon, and the reader must enable activity before the browser polls them. This does not automatically observe every agent. See the [frontend setup guide](graph-ui/README.md#die-agentenebene-was-live-arbeitende-agenten-auf-dem-graphen-zeigen).
+Activity comes from explicitly configured tool hooks. The bundled adapter supports Claude Code PostToolUse; other clients need their own adapter. Recorded events go to the local daemon, and the reader must enable activity before the browser polls them. This does not automatically observe every agent. See the [frontend setup guide](graph-ui/README.md#experimental-agent-activity).
 
 </details>
 
@@ -246,13 +253,13 @@ Enable automatic indexing on MCP session start:
 codebase-memory-mcp config set auto_index true
 ```
 
-When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
+`auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched through `auto_watch` (on by default), subject to its global setting and session ownership.
 
-The watcher follows MCP sessions: it watches the project each open MCP session is rooted in (the client's working directory) and stops when the last session for that project closes. A repository indexed with `cli index_repository`, or indexed from a session rooted somewhere else, is not watched; re-run `index_repository` after changing it. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
+Each initialized, long-lived MCP session can register its root project when it connects and any target from a successful `index_repository` call, including custom project names and roots in another worktree. While `auto_watch` is enabled, these watches belong to the registering sessions and remain while at least one owning session is connected; closing the last owner removes the watch. An async index registers its target only after success and while its requesting session remains connected. CLI indexing and failed MCP indexes do not register watches. Global `auto_watch` controls registration and removes all watches on the next refresh or registration request when set to `false`. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
 
-Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher; useful when working across many projects and you want each session contained to explicit indexing.
+Watcher registration is controlled globally by `auto_watch` (default `true`). On the next refresh or registration request, `true` allows MCP sessions to register their root on connect and their successful `index_repository` targets; `false` removes all watches. CLI indexing and failed MCP indexes do not add watches.
 
-To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which is consulted per session, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
+To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which takes effect on the next refresh or registration request, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
 The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
 
@@ -267,7 +274,7 @@ bash "<install-dir>/install.sh"
 
 ```powershell
 # Windows
-powershell -ExecutionPolicy Bypass -File "<install-dir>\install.ps1"
+powershell -File "<install-dir>\install.ps1"
 ```
 
 The install script is placed next to the binary at install time, so the printed path resolves beside the executable. It is idempotent, so re-running it *is* the update: it stops the daemon, retires the running binary, installs the new one, and cleans up.
@@ -299,9 +306,10 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 
 ### Graph & analysis
 - **Architecture overview**: `get_architecture` returns a compact summary by default. Request specific `aspects` for routes, hotspots, dependencies, clusters, or cycles. `system_structure` provides the projection used by CBM Lens and must be requested on its own.
-- **Architecture Decision Records**: `manage_adr` persists architectural decisions across sessions
+- **Architecture Decision Records**: `manage_adr` persists the project's decision record across sessions; indexing also extracts supported ADR metadata and supersession from documentation files
 - **Louvain community detection**: Discovers functional modules by clustering call edges
-- **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected symbols with risk classification
+- **Change impact**: `detect_changes` maps uncommitted changes to affected symbols with risk classification and can report test impact with `scope: "tests"`; `compare_graphs` compares indexed snapshots
+- **Runtime observations**: `ingest_traces` adds observed call relationships from separately collected traces alongside static analysis; static call paths alone do not show what ran
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
 - **Dead code candidates**: find functions with no indexed callers, excluding entry points. Check dynamic dispatch, coverage gaps, and framework conventions before removing code.
 - **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
@@ -311,6 +319,27 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 - **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware)
 - **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
 - **Code search** (`search_code`): graph-augmented grep over indexed files only
+
+### Documentation connected to code
+
+Find the explanation behind a symbol and follow supported references back to its implementation. Documentation participates in the graph alongside source files:
+
+- **Markdown, reStructuredText, and AsciiDoc** become navigable document sections; **PDFs with text layers** become searchable text pages. PDF extraction does not perform OCR.
+- **Document-to-code references** and supported language doc-comment references create `MENTIONS` relationships when the target can be resolved.
+- **Architecture decision records** contribute metadata such as status, deciders, and supersession, so decisions can be explored with the code they describe.
+- **Supported diagrams and OpenAPI descriptions** contribute structured entities. Extraction and reference resolution differ by format; not every textual mention becomes a graph edge.
+
+Use graph and text search to locate the relevant section, follow its recorded relationships, and open the source evidence. Check `check_index_coverage` before treating a missing result as proof that the repository has no such documentation or reference.
+
+### Infrastructure and deployment
+
+Ask **"What deploys this service?"**, **"Which image runs it?"**, or **"Where does this configuration reach code?"** CBM connects supported infrastructure forms to the source they build, configure, and run:
+
+- **Containers and clusters**: Dockerfiles, Compose services, Kubernetes resources, Helm charts and releases, and Kustomize overlays and patches.
+- **Provisioning and configuration**: Terraform/OpenTofu resources and modules, tfvars overrides, Terragrunt dependencies, Ansible tasks and handlers, and supported configuration keys and environment-variable access.
+- **Build and delivery**: shell commands, Make targets, and supported CI steps that build images, invoke repository scripts, or deploy resources.
+
+For resolvable inputs, a trace can follow **Service → workload → image → Dockerfile → program**, or follow deployment and configuration relationships. Use `trace_path` modes for topology, deployment, and run paths. These are static relationships from supported source forms; dynamic values and unresolved templates can leave gaps. See [Edge types](#edge-types-selected) for the exact relationship rules and limitations.
 
 ### Cross-service linking
 - **HTTP** route ↔ call-site matching with confidence scoring
@@ -323,6 +352,21 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 - **Run status**: `index_status` (and the UI layout next to `linked_projects`) carries a `cross_repo` object, `{"status":"never_run"}` until `index_repository(mode="cross-repo-intelligence")` has run with that project as the source, then `"ran"` with `last_run_at`, `outcome`, `targets`, `projects_scanned`, `total_cross_edges` and `skipped_projects`. That is how you tell "never linked" apart from "linked, nothing matched". The status is stored in the project's own index next to its `CROSS_*` edges, so a reindex that rebuilds the index drops both at once and the status goes back to `never_run`.
 - **Skipped stores**: `target_projects: ["*"]` skips an index built before the #768 schema change rather than failing the whole run. The response lists each one as `skipped_projects: [{"name", "reason": "pre_768_schema", "hint": "reindex this project"}]`.
 
+### Smart CI and test impact
+
+Use the graph to explain which tests a change reaches, and use that evidence to focus supported CI runs. **Smart CI is experimental** and has two layers:
+
+| Layer | What it does | What you supply |
+|-------|--------------|-----------------|
+| **CI job selection** | Chooses jobs from the changed-file list. | Repository-specific path and job rules; this repository's selector is an example. |
+| **Test selection** | Combines static reachability, changed tests, and admitted per-test coverage to select suites or tests. | A supported C/C++ test harness, configuration, a coverage map, and a runner that accepts named selections. |
+
+`codebase-memory-mcp test-impact select` produces a selection with reasons; `test-impact publish` produces the graph-and-coverage bundle used as its baseline. For agent-assisted investigation, `detect_changes` with `scope: "tests"` exposes test impact through MCP.
+
+**Narrowing currently supports C/C++ family code with this repository's test conventions or declared equivalents.** It is not general test selection for every language CBM indexes. Missing, stale, incompatible, or incomplete evidence broadens the selection or returns `run_all`; static reachability without admitted coverage never omits a suite. Begin with report-only shadow mode and validate your harness before enabling gating.
+
+In this repository, test narrowing is wired to the Linux x86_64 test leg when `TEST_IMPACT_MODE=gate`; release and dry-run workflows retain full execution. See the [Smart CI guide](docs/SMART_CI.md) for supported conventions, coverage admission, setup, version requirements, and fallback behavior.
+
 ### Edge types (selected)
 - `CALLS`: a callable is invoked at the source site
 - `CALL_REFERENCE`: a callable is used at a supported reference site (for example, a direct value argument) and resolves to one exact target
@@ -333,6 +377,7 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 - `INFRA_MAPS`: a Kubernetes Service to each workload whose pod labels carry every `key: value` of the Service's selector, within one namespace
 - `CONNECTS_TO`: a Kubernetes workload or compose service to the Service its containers' environment addresses (`PRODUCT_CATALOG_SERVICE_ADDR: productcatalogservice:3550`, a URL's host, `<svc>.<ns>.svc...`, a bare name on an `*_ADDR` / `*_HOST` / `*_URL` / ... key; compose: the project's `.env` interpolated): a Kubernetes Service of the same bundle and namespace, or a compose service of the same file. The edge keeps `via: env`, `key` and `container`, never the value
 - `USAGE` with `ref: image`: a Kubernetes workload (any pod template: containers, initContainers, CronJobs, custom resources) or a docker compose service to the `Image` it runs
+- Helm templates are rendered for their images: with the chart's values (the `Chart` `DEPLOYS` them, `default_of`: the values keys read) and with each release's (a Flux HelmRelease, a kustomize `helmCharts` entry, a Terraform `helm_release`: `override_of`). An image the render cannot know is left out, never guessed: after a change of values it does not run exactly, a `tpl` or include it cannot look into, a release value it cannot read, or a work budget it runs past. Known limit: each template file renders on its own, while Helm renders a chart's files with one shared `.Values` (a subchart's is its parent's `.Values.<alias>`), so a chart that changes `.Values` in one file and reads it in another can still show a wrong image
 - `DEPLOYS`: what puts manifests, kustomizations or charts on a cluster, to what it puts there: a Flux Kustomization or Argo Application to the kustomizations / manifests / chart of its path, a Flux HelmRelease to its chart (`spec.chart` or `chartRef` → OCIRepository), a shell command or Make recipe (`kubectl apply -f/-k`, `kustomize build | kubectl apply`, `helm install/upgrade/template`), a Go installer loading a chart with the Helm SDK, a Terraform `helm_release`, a Terraform `kubernetes_*` resource the object it declares (a `Resource` like a manifest's, `ecosystem: terraform`, when its name is a literal), a kustomization inflating a chart (`helmCharts`; its values file an `IMPORTS`). A chart outside the repository is an external `Chart`, keyed by its publisher when its repository URL is stated (`__chart__<repository>/<name>`, the same node in every project, the URL in `repository`), else one per project and name; the edge says `via` (`flux`, `argo`, `helmrelease`, `kubectl`, `kustomize`, `helm`, `helm-sdk`, `terraform`, `helmcharts`, ...)
 - `DEPENDS_ON`: a Helm chart to the charts it declares (the local chart for a resolvable `file://` repository, otherwise an external `Chart`; the edge keeps `repository`), and a `go.mod` / `requirements.txt` file to an external `Package`; a Dockerfile to the `Image`s it builds on (`via: from`, `copy-from`); an `Image` to the Dockerfile it is built from (`via: build`; `tool`: `skaffold`, `compose`, `docker-build` for `docker` / `podman` / `nerdctl` / `buildah` build commands in scripts, Make and CI); a compose service to the services its `depends_on` / `links` name
 - `CONFIGURES`: code reading an environment variable to the shared `EnvVar` of that name (`strategy: env_access`); a Kubernetes container, compose service or Dockerfile (`ENV` of the image) setting one to that container's own `EnvVar` (`strategy: env_set`, with `source`: `value`, `configMapKeyRef`, `secretKeyRef`, `fieldRef`, ..., `compose`, `dockerfile`; values are never stored); and that container's `EnvVar` to the code reading the name inside the files its image is built from (`strategy: env_read`, with `dockerfile`): the image's files are the sources its Dockerfile's `COPY` / `ADD` put into it, less the context's `.dockerignore`
@@ -357,7 +402,7 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 
 ### Distribution & operation
 - **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes in the project an MCP session is working in and re-indexes it automatically (other indexed repos: re-run `index_repository`)
+- **Auto-sync**: Background watcher detects file changes in projects registered by active MCP sessions, including successful explicit `index_repository` targets, and re-indexes them automatically.
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph --project my-project --name-pattern ".*Handler.*"`
 - **Available on**: npm, PyPI, Homebrew, Scoop, AUR, `go install`
@@ -423,15 +468,15 @@ Published backend benchmarks on Apple M3 Pro. These are separate from the CBM Le
 | Dead code detection | ~150ms | Full graph scan with degree filtering |
 | Trace call path (depth=5) | <10ms | BFS traversal |
 
-**RAM-first pipeline**: All indexing runs in memory (LZ4 HC compressed read, in-memory SQLite, single dump at end). Memory is released back to the OS after indexing completes.
+**Memory-aware pipeline**: Indexing keeps hot data in memory and can spill extraction results to disk when needed. Memory is released back to the OS after indexing completes.
 
-**Token efficiency**: The project's [original README report](https://github.com/DeusData/codebase-memory-mcp/blob/4ff6feeab639c4668da0f491930326ed5ec63093/README.md#performance) lists ~3,400 tokens for five structural queries via codebase-memory-mcp versus ~412,000 via file-by-file exploration. That is approximately **120× fewer tokens**, or a **99.2% reduction**, for that comparison. The separate [31-repository study](https://arxiv.org/html/2603.27277v1#S4.SS1) reports a 10× token reduction. Its [system-performance measurements](https://arxiv.org/html/2603.27277v1#S4.SS3) include Linux kernel indexing in about 3 minutes and Cypher relationship queries under 1 ms on an Apple M3 Pro.
+**More focused context, fewer tokens**: The project's [31-repository preprint](https://arxiv.org/html/2603.27277v1#S4.SS1) reports **10× lower token use** and **2.1× fewer tool calls** compared with file-by-file exploration. These March 2026 backend measurements cover the study's workloads and agent setup; the paper documents the full evaluation. An earlier [five-query comparison](https://github.com/DeusData/codebase-memory-mcp/blob/4ff6feeab639c4668da0f491930326ed5ec63093/README.md#performance) reported ~3,400 versus ~412,000 tokens for structural queries. The study's [system-performance measurements](https://arxiv.org/html/2603.27277v1#S4.SS3) include the Linux indexing and Cypher timings above.
 
-To measure comparable quality, latency, and agent-efficiency metrics on your own workload, see [Measuring quality, latency, and agent savings](docs/MEASURING_SAVINGS.md). Exact reproduction of the figures above requires the original inputs and raw artifacts.
+Explore the [measurement guide](docs/MEASURING_SAVINGS.md) to evaluate quality, latency and token use on your own workload.
 
 ## Troubleshooting & Diagnostics
 
-codebase-memory-mcp runs **100% locally and collects no telemetry**: your code, queries, environment, and usage never leave your machine. That privacy guarantee also means that when you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no data at all unless you choose to send it.** Here is how to capture it yourself.
+codebase-memory-mcp **indexes and queries locally and collects no telemetry**. When you hit something we can't reproduce on our side (a slow memory climb over hours, a performance regression, a leak that only appears after days of real use), **we have no diagnostic data unless you choose to send it.** Here is how to capture it yourself.
 
 ### Capture a diagnostics log
 
@@ -570,7 +615,7 @@ Counts on `main` at `4d9592b5`, where CBM Lens arrived. Native and Go counts use
 | npm package wrapper | 24 tests | Counted in the source |
 | Python package wrapper | 43 tests | Counted in the source |
 
-Run the test suite (9,388 tests across 189 suites):
+Run the native test suite:
 
 ```bash
 scripts/test.sh                     # full: clean sanitizer build + all suites + guards
@@ -626,7 +671,7 @@ Restart your agent. Verify with `/mcp`; you should see `codebase-memory-mcp` wit
 
 ## Multi-Agent Support
 
-`install` configures 45 client surfaces: 39 detected automatically and 6
+`install` configures **45 supported automatic/conditional client surfaces**: 39 detected automatically and 6
 conditional or explicit. “Conditional” means the installer writes only when the
 documented platform or an explicit, already-existing config path proves the
 target is active. It never flips experimental feature flags, enables plugins,
@@ -820,7 +865,7 @@ codebase-memory-mcp cli search_graph --project my-project --label Function --for
 codebase-memory-mcp cli list_projects --format json --detail stats | jq '.projects[].name'
 ```
 
-JSON arguments can also be piped on stdin, for tools that take arguments. A tool whose input schema declares none; `list_projects`; never reads stdin, so it stays responsive when it inherits a pipe the caller never closes (the default for `child_process.spawn` and similar wrappers). Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
+Tools requiring arguments accept JSON piped on stdin. Tools with only optional arguments, such as `list_projects`, accept flags, `--args-file`, or redirected JSON files without waiting on an inherited pipe. Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
 
 ## MCP Tools
 
@@ -828,8 +873,8 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh only while it is the project of an open MCP session; repos indexed from the CLI or from another project's session need a re-run (`index_status` shows `watch`). Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
-| `list_projects` | List all indexed projects with node/edge counts. |
+| `index_repository` | Index a repository into the graph. A successful call from an active MCP session registers the target for auto-sync while that session remains connected, subject to the global `auto_watch` setting; CLI calls do not register watches. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
+| `list_projects` | List indexed projects with paging; use `detail: "stats"` for node/edge counts and database sizes. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
@@ -922,7 +967,7 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
-codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set auto_watch false          # remove/disable all background watches (default: true)
 codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
@@ -945,7 +990,7 @@ is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none`; or their numeric equivalents `0` to `4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1 to 256; invalid values are ignored with a warning. |
-| `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the `ram_fraction × total_RAM` default. Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
+| `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the derived default (`ram_fraction × total_RAM`, adjusted for available memory and daemon worker caps). Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0 to 1; set `0` to disable. Invalid values are ignored with a warning. |
 
 Environment used by daemon-owned components (such as diagnostics, daemon logging, and process-wide indexing resource limits) is captured from the first daemon-backed session that starts the daemon. Later sessions join that process and cannot replace those values. To change them, close all daemon-backed sessions, update the relevant agent configurations consistently, and restart a session. `CBM_ALLOWED_ROOT` remains session-specific, a conflicting `CBM_CACHE_DIR` is rejected, and a one-shot CLI command is not exempt from the rule above: it connects to the coordination daemon like any other session, starting one if none is running. Its own environment becomes the captured daemon-owned environment only when its invocation is the one that starts the daemon; joining an already-running daemon, it inherits that daemon's already-captured values instead.
@@ -975,9 +1020,9 @@ Need the full config-file reference? See [docs/CONFIGURATION.md](docs/CONFIGURAT
 
 Each entry maps an extension (which **must** start with `.`) to a language name. Language names are matched **case-insensitively**. Accepted values (aliases in parentheses) are:
 
-`bash` (`sh`), `c`, `c++` (`cpp`), `c#` (`csharp`), `clojure`, `cmake`, `cobol`, `common lisp` (`commonlisp`, `lisp`), `css`, `cuda`, `dart`, `dockerfile`, `elixir`, `elm`, `emacs lisp` (`emacslisp`), `erlang`, `f#` (`fsharp`), `form`, `fortran`, `glsl`, `go`, `graphql`, `groovy`, `haskell`, `hcl` (`terraform`), `html`, `ini`, `java`, `javascript`, `json`, `julia`, `kotlin`, `lean`, `lua`, `magma`, `makefile`, `markdown`, `matlab`, `meson`, `nix`, `objective-c` (`objc`), `ocaml`, `perl`, `php`, `protobuf`, `python`, `r`, `ruby`, `rust`, `scala`, `scss`, `sql`, `svelte`, `swift`, `toml`, `tsx`, `typescript`, `verilog`, `vimscript`, `vue`, `wolfram`, `xml`, `yaml`, `zig`.
+`arkts`, `asciidoc`, `bash` (`sh`), `c`, `c++` (`cpp`), `c#` (`csharp`), `chialisp`, `clojure`, `cmake`, `cobol`, `common lisp` (`commonlisp`, `lisp`), `css`, `cuda`, `dart`, `diagram`, `dockerfile`, `elixir`, `elm`, `emacs lisp` (`emacslisp`), `erlang`, `f#` (`fsharp`), `form`, `fortran`, `glsl`, `go`, `graphql`, `groovy`, `haskell`, `hcl` (`terraform`), `html`, `ini`, `java`, `javascript`, `jinja2` (`jinja`), `json`, `julia`, `kotlin`, `lean`, `lua`, `magma`, `makefile`, `markdown`, `matlab`, `meson`, `mojo`, `nix`, `objective-c` (`objc`), `ocaml`, `openapi`, `pdf`, `perl`, `php`, `plsql`, `protobuf`, `python`, `r`, `ruby`, `rust`, `scala`, `scss`, `sql`, `svelte`, `swift`, `toml`, `tsx`, `typescript`, `verilog`, `vimscript`, `vue`, `wolfram`, `xml`, `yaml`, `zig`.
 
-Project config overrides global for conflicting extensions. An entry whose language name is unknown, or whose extension does not start with `.`, is skipped and a warning is logged to stderr (shown at the default `info` log level). Missing config files are ignored.
+Project config overrides global for conflicting extensions. An entry whose language name is unknown, or whose extension does not start with `.`, is skipped and logged as a warning. Missing config files are ignored.
 
 ## Persistence
 
@@ -1067,7 +1112,7 @@ Every release is verified through a multi-layer pipeline before publication:
 - **Sigstore cosign**: keyless signatures on all artifacts; bundles included in every release
 - **SHA-256 checksums**: `checksums.txt` published with every release; verified by both install scripts before extraction
 - **CodeQL SAST**: blocks release pipeline if any open alerts remain
-- **No language-runtime dependency chain**: the native backend uses libraries vendored at compile time, and the frontend is embedded by the UI build
+- **No language-runtime dependency chain**: the native backend needs no language-runtime environment; UI builds embed the frontend
 
 ### VirusTotal release scans
 
@@ -1085,6 +1130,10 @@ The [v0.11.0 release notes](https://github.com/DeusData/codebase-memory-mcp/rele
 | `windows-arm64` | `5615aa31e3cdbe6155e7...` | [clean](https://www.virustotal.com/gui/file/5615aa31e3cdbe6155e7096c43d07e62e335fe34d28e489b4cc3ce113e81b4e6/detection) |
 
 The release also publishes [candidate scan results](https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.11.0/virustotal-candidate-results.tsv), [binary provenance](https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.11.0/release-candidates.tsv), and [selection records](https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.11.0/release-selection.tsv). For subsequent versions, use the scan evidence linked from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest).
+
+## Help shape what comes next
+
+The next idea could be yours. We invite the OSS community to bring ideas, tricky integration questions, and feedback to [our Discord community](https://discord.gg/KguGXxg2X). When a direct conversation works better, reach out to **DeusData** or the project's co-developers there. Let's build what comes next together.
 
 ## License
 

@@ -879,6 +879,89 @@ TEST(csharp_interface) {
     PASS();
 }
 
+/* Issue #2071: a C# 14 extension block parses as a constructor_declaration
+ * named `extension` whose body holds the members, and has_error stays 0, so the
+ * members were dropped without any signal. They belong to the enclosing type. */
+TEST(csharp_extension_block_members) {
+    CBMFileResult *r = extract("namespace App;\n"
+                               "public static class NumberExtensions\n"
+                               "{\n"
+                               "    extension(IEnumerable<int> numbers)\n"
+                               "    {\n"
+                               "        public int SumPositive() => 0;\n"
+                               "        public static int Zero() => 0;\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "NumberExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "NumberExtensions"));
+    ASSERT(has_def(r, "Method", "SumPositive"));
+    ASSERT(has_def(r, "Method", "Zero"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same shape is a genuine constructor inside a type actually called
+ * `extension`, and must still be emitted (#2071). */
+TEST(csharp_constructor_of_type_named_extension) {
+    CBMFileResult *r =
+        extract("namespace App { public class extension { public extension() { } } }",
+                CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Escaping a type identifier does not change its constructor's identity. */
+TEST(csharp_constructor_of_escaped_type_named_extension) {
+    const char *src = "namespace App { public class @extension { "
+                      "public extension() { int ConstructorLocal() => 1; } } }";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "ConstructorLocal"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* All conditional branches expose extension members, but method-local
+ * functions must never be promoted to members of the enclosing type. */
+TEST(csharp_extension_block_conditional_members) {
+    const char *src = "public static class TextExtensions\n"
+                      "{\n"
+                      "    extension(string text)\n"
+                      "    {\n"
+                      "#if FIRST\n"
+                      "        public int First() { int Nested() => 1; return Nested(); }\n"
+                      "#elif SECOND\n"
+                      "        public int Second() => 2;\n"
+                      "#else\n"
+                      "#if NESTED\n"
+                      "        public int Third() => 3;\n"
+                      "#else\n"
+                      "        public int Fourth() => 4;\n"
+                      "#endif\n"
+                      "#endif\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "TextExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "First"));
+    ASSERT(has_def(r, "Method", "Second"));
+    ASSERT(has_def(r, "Method", "Third"));
+    ASSERT(has_def(r, "Method", "Fourth"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "Nested"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Swift --- */
 TEST(swift_class) {
     CBMFileResult *r = extract("class Vehicle {\n    var speed: Int = 0\n    func accelerate() { "
@@ -1773,6 +1856,33 @@ TEST(haskell_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "add"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2440: an infix-form definition (`a <+> b = ...`, ``x `plus` y = ...``) has
+ * no `name` field; its first named child is an `infix` node whose first child
+ * is the LEFT OPERAND, so the def was named `a` / `x`. It must be named after
+ * the operator, consistent with the prefix form `(<+>) a b = ...`. */
+TEST(haskell_infix_definition_name) {
+    CBMFileResult *r = extract("module M where\n"
+                               "\n"
+                               "(<+>) :: Int -> Int -> Int\n"
+                               "a <+> b = a + b\n"
+                               "\n"
+                               "plus :: Int -> Int -> Int\n"
+                               "x `plus` y = x + y\n"
+                               "\n"
+                               "f :: Int\n"
+                               "f = 1 <+> 2\n",
+                               CBM_LANG_HASKELL, "t", "M.hs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "f"));
+    ASSERT(has_def(r, "Function", "plus"));
+    ASSERT(has_def(r, "Function", "(<+>)"));
+    ASSERT_FALSE(has_def(r, "Function", "a"));
+    ASSERT_FALSE(has_def(r, "Function", "x"));
     cbm_free_result(r);
     PASS();
 }
@@ -6683,12 +6793,12 @@ TEST(extract_go_no_filename_in_module_qn) {
     ASSERT_NOT_NULL(conn);
     ASSERT_STR_EQ(conn->qualified_name, "proj.myapp.db.Conn");
 
-    /* Go method nodes keep a FLAT QN (module + name) with a separate
-     * parent_class link to the receiver type — the QN must carry the
+    /* Go method nodes carry a receiver-qualified QN (module + receiver type +
+     * name) plus the parent_class link — the QN must carry the
      * directory-based module and NOT the `.conn.` filename segment. */
     const CBMDefinition *query = find_def_by_name(r, "Query");
     ASSERT_NOT_NULL(query);
-    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Query");
+    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Conn.Query");
     ASSERT_EQ(strstr(query->qualified_name, ".conn."), NULL);
     /* The method's parent_class must match the type node QN (for DEFINES_METHOD). */
     ASSERT_NOT_NULL(query->parent_class);
@@ -7353,12 +7463,17 @@ TEST(extract_rust_generic_impl_call_scope_matches_def) {
     PASS();
 }
 
-/* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
- * be unaffected: a Go method call never sets is_method. */
+/* Languages OUTSIDE the is_method flag set (Perl, Python, TS/JS/TSX and Go set
+ * it) must be unaffected: a Rust method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
-    CBMFileResult *r = extract("package m\n"
-                               "func run(o Obj) { o.Commit(); helper() }\n",
-                               CBM_LANG_GO, "t", "x.go");
+    /* Rust is flag-exempt: only Perl, Python, TS/JS and Go set is_method.
+     * Guards the blast radius of the receiver-aware flags for every other
+     * language. */
+    CBMFileResult *r = extract("fn run(o: Obj) {\n"
+                               "    o.commit();\n"
+                               "    helper();\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "x.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     for (int i = 0; i < r->calls.count; i++) {
@@ -7516,6 +7631,33 @@ TEST(extract_python_bare_call_flags_locally_bound_callee) {
     PASS();
 }
 
+TEST(extract_go_selector_call_flags_is_method) {
+    /* Go selector calls are flagged so the weak-match guard can fire when the
+     * Go LSP cannot type the receiver; bare calls stay unflagged. */
+    CBMFileResult *r = extract("package m\n"
+                               "func run(o Obj) { o.Commit(); helper() }\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_selector = false;
+    bool saw_bare = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strstr(c->callee_name, "Commit") != NULL) {
+            ASSERT_TRUE(c->is_method);
+            saw_selector = true;
+        }
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            ASSERT_FALSE(c->is_method);
+            saw_bare = true;
+        }
+    }
+    ASSERT_TRUE(saw_selector);
+    ASSERT_TRUE(saw_bare);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* The bare-call flag is DEPTH-INDEPENDENT, and the binding is UNWOUND when its
  * scope closes.
  *
@@ -7618,6 +7760,91 @@ TEST(extract_python_bare_call_flag_is_depth_independent) {
     ASSERT_EQ(flagged, 2);
     ASSERT_EQ(unflagged, 1);
     cbm_free_result(unwound);
+    PASS();
+}
+
+TEST(extract_go_method_receiver_qualified_qn) {
+    /* A Go method QN carries the receiver type (proj.pkg.Recv.method), same
+     * shape as C++ out-of-line methods and Go interface members — so two
+     * same-name methods on different receivers no longer collide in the
+     * graph upsert. Free functions keep the flat package QN. */
+    CBMFileResult *r = extract("package m\n"
+                               "type Storage struct{}\n"
+                               "type Cache struct{}\n"
+                               "func (s *Storage) Close() {}\n"
+                               "func (c Cache) Close() {}\n"
+                               "func Shutdown() {}\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_storage = false;
+    bool saw_cache = false;
+    bool saw_free = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || !d->qualified_name) {
+            continue;
+        }
+        if (strcmp(d->name, "Close") == 0 && strcmp(d->qualified_name, "t.Storage.Close") == 0) {
+            ASSERT_STR_EQ(d->label, "Method");
+            ASSERT_STR_EQ(d->parent_class, "t.Storage");
+            saw_storage = true;
+        }
+        if (strcmp(d->name, "Close") == 0 && strcmp(d->qualified_name, "t.Cache.Close") == 0) {
+            ASSERT_STR_EQ(d->parent_class, "t.Cache");
+            saw_cache = true;
+        }
+        if (strcmp(d->name, "Shutdown") == 0) {
+            ASSERT_STR_EQ(d->qualified_name, "t.Shutdown");
+            saw_free = true;
+        }
+    }
+    ASSERT_TRUE(saw_storage);
+    ASSERT_TRUE(saw_cache);
+    ASSERT_TRUE(saw_free);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Templ shares Go's method grammar (method_declaration with a receiver), but
+ * only Go method QNs are receiver-qualified (#1913); templ's call-scope QN
+ * stays flat. The method's def QN and the enclosing-function QN of a call
+ * inside it must agree, or the call has no source node and degrades to the
+ * File node. */
+TEST(extract_templ_method_qn_matches_call_scope) {
+    CBMFileResult *r = extract("package views\n"
+                               "\n"
+                               "type Page struct{}\n"
+                               "\n"
+                               "func (p Page) Title() string {\n"
+                               "\treturn helper()\n"
+                               "}\n"
+                               "\n"
+                               "func helper() string { return \"x\" }\n"
+                               "\n"
+                               "templ hello(name string) {\n"
+                               "\t<div>{ name }</div>\n"
+                               "}\n",
+                               CBM_LANG_TEMPL, "t", "x.templ");
+    ASSERT_NOT_NULL(r);
+    const char *title_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->qualified_name && strcmp(d->name, "Title") == 0) {
+            title_qn = d->qualified_name;
+        }
+    }
+    const char *scope = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            scope = c->enclosing_func_qn;
+        }
+    }
+    ASSERT_NOT_NULL(title_qn);
+    ASSERT_NOT_NULL(scope);
+    ASSERT_STR_EQ(scope, title_qn);
+    cbm_free_result(r);
     PASS();
 }
 
@@ -12408,6 +12635,116 @@ TEST(python_namespace_facts_string_statements_and_future_imports) {
     PASS();
 }
 
+/* A top-level call of a same-module function is a namespace effect, unless the
+ * callee provably cannot rebind the caller's names: sqlalchemy's
+ * `sql/__init__.py` ends with `__go(locals())`. Every submodule its body
+ * imports becomes a package attribute, so those names are shadowed at the
+ * call; everything else of the namespace survives. */
+static bool py_facts_has_effect(const CBMFileResult *r) {
+    for (int i = 0; r && i < r->py_namespace.count; i++) {
+        if (r->py_namespace.items[i].kind == CBM_PY_NS_UNKNOWN &&
+            r->py_namespace.items[i].reason == CBM_PY_NS_REASON_EFFECT)
+            return true;
+    }
+    return false;
+}
+
+static int py_facts_count_kind(const CBMFileResult *r, CBMPyNamespaceFactKind kind) {
+    int n = 0;
+    for (int i = 0; r && i < r->py_namespace.count; i++)
+        n += r->py_namespace.items[i].kind == kind;
+    return n;
+}
+
+static bool py_facts_valid_complete(const CBMFileResult *r) {
+    return r && !r->has_error && r->py_namespace.status == CBM_PY_NS_COMPLETE &&
+           cbm_py_namespace_facts_valid(&r->py_namespace);
+}
+
+TEST(python_namespace_facts_init_call_allowlist) {
+    static const char go[] = "from typing import TYPE_CHECKING, Any\n"
+                             "from .impl import base\n"
+                             "from .elements import cast\n"
+                             "def __go(lcls: Any) -> None:\n"
+                             "    from .. import util as _sa_util\n"
+                             "    from . import base\n"
+                             "    from . import coercions, elements as _el\n"
+                             "    if not TYPE_CHECKING:\n"
+                             "        base.coercions = _el.coercions = coercions\n"
+                             "    from .annotation import _prepare_annotations\n"
+                             "    _prepare_annotations(cast, cast)\n"
+                             "    _sa_util.preloaded.import_prefix(\"sqlalchemy.sql\")\n"
+                             "\n"
+                             "__go(locals())\n";
+    CBMFileResult *r = extract(go, CBM_LANG_PYTHON, "t", "sql/__init__.py");
+    bool ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) && r->py_namespace.count == 9;
+    if (ok) {
+        const CBMPyNamespaceFact *f = r->py_namespace.items;
+        static const char *const shadowed[] = {"base", "coercions", "elements", "annotation"};
+        ok = f[2].kind == CBM_PY_NS_IMPORT_NAME && strcmp(f[2].local_name, "base") == 0 &&
+             f[4].kind == CBM_PY_NS_OWN_DEF && strcmp(f[4].local_name, "__go") == 0;
+        for (int i = 0; ok && i < 4; i++) {
+            ok = f[5 + i].kind == CBM_PY_NS_SHADOW && f[5 + i].local_name &&
+                 strcmp(f[5 + i].local_name, shadowed[i]) == 0;
+        }
+    }
+    if (!ok && r) {
+        for (int i = 0; i < r->py_namespace.count; i++) {
+            const CBMPyNamespaceFact *f = &r->py_namespace.items[i];
+            printf("  __go fact %d: kind %d reason %d name %s\n", i, (int)f->kind, (int)f->reason,
+                   f->local_name ? f->local_name : "-");
+        }
+    }
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok); /* RED while every top-level call withdraws the namespace */
+
+    /* A plain module is no package: the body's imports set attributes of its
+     * parent package, never of the module itself. */
+    r = extract("def __go(lcls):\n    from . import base\n\n__go(locals())\n", CBM_LANG_PYTHON, "t",
+                "sql/mod.py");
+    ok = py_facts_valid_complete(r) && !py_facts_has_effect(r) &&
+         py_facts_count_kind(r, CBM_PY_NS_SHADOW) == 0;
+    if (r)
+        cbm_free_result(r);
+    ASSERT_TRUE(ok);
+
+    /* Each of these can rebind a name of the caller's namespace (or is not
+     * provably a same-module function): the call stays a whole-namespace
+     * effect. */
+    static const char *const effects[][2] = {
+        {"param", "def __go(lcls):\n    lcls['base'] = 1\n\n__go(locals())\n"},
+        {"global", "def __go(lcls):\n    global base\n    base = 1\n\n__go(locals())\n"},
+        {"nested global", "def __go(lcls):\n    def inner():\n        global base\n"
+                          "        base = 1\n    inner()\n\n__go(locals())\n"},
+        {"globals()", "def __go(lcls):\n    globals()['base'] = 1\n\n__go(locals())\n"},
+        {"sys.modules", "def __go(lcls):\n    import sys\n    sys.modules[__name__].base = 1\n"
+                        "\n__go(locals())\n"},
+        {"imported callee", "from .setup import __go\n__go(locals())\n"},
+        {"own package name", "def __go(lcls):\n    from .. import sql\n    sql.base = 1\n"
+                             "\n__go(locals())\n"},
+        {"same-module helper", "def helper():\n    pass\n\ndef __go(lcls):\n    helper()\n"
+                               "\n__go(locals())\n"},
+        {"rebound callee", "def __go(lcls):\n    pass\n\n__go = other\n__go(locals())\n"},
+        {"call before def", "__go(locals())\n\ndef __go(lcls):\n    pass\n"},
+        {"argument effect", "def __go(lcls):\n    pass\n\n__go(make())\n"},
+        {"rebound locals", "def locals():\n    return {}\n\ndef __go(lcls):\n    pass\n"
+                           "\n__go(locals())\n"},
+    };
+    for (size_t i = 0; i < sizeof(effects) / sizeof(effects[0]); i++) {
+        char src[512];
+        snprintf(src, sizeof(src), "from .impl import base\n%s", effects[i][1]);
+        r = extract(src, CBM_LANG_PYTHON, "t", "sql/__init__.py");
+        ok = py_facts_valid_complete(r) && py_facts_has_effect(r);
+        if (!ok)
+            printf("  control '%s' is no namespace effect\n", effects[i][0]);
+        if (r)
+            cbm_free_result(r);
+        ASSERT_TRUE(ok);
+    }
+    PASS();
+}
+
 TEST(python_namespace_facts_distinguish_all_operations_and_unknowns) {
     static const char source[] = "__all__ = ['old']; __all__ = []\n"
                                  "__all__ = dynamic\n"
@@ -12798,6 +13135,7 @@ SUITE(extraction) {
     RUN_TEST(python_namespace_facts_parse_errors_are_complete_unknown);
     RUN_TEST(python_namespace_facts_type_checking_alternatives);
     RUN_TEST(python_namespace_facts_string_statements_and_future_imports);
+    RUN_TEST(python_namespace_facts_init_call_allowlist);
     RUN_TEST(python_namespace_facts_capture_and_copy_fail_atomically);
     RUN_TEST(python_namespace_facts_validation_rejects_partial_and_unknown_schema);
     RUN_TEST(python_namespace_facts_compact_spill_and_copy_keep_owned_payload);
@@ -12821,6 +13159,9 @@ SUITE(extraction) {
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
+    RUN_TEST(extract_go_selector_call_flags_is_method);
+    RUN_TEST(extract_go_method_receiver_qualified_qn);
+    RUN_TEST(extract_templ_method_qn_matches_call_scope);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
@@ -12898,6 +13239,10 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
+    RUN_TEST(csharp_extension_block_members);
+    RUN_TEST(csharp_constructor_of_type_named_extension);
+    RUN_TEST(csharp_constructor_of_escaped_type_named_extension);
+    RUN_TEST(csharp_extension_block_conditional_members);
     RUN_TEST(swift_class);
     RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
@@ -12946,6 +13291,7 @@ SUITE(extraction) {
     RUN_TEST(elixir_function);
     RUN_TEST(elixir_call_string_argument);
     RUN_TEST(haskell_function);
+    RUN_TEST(haskell_infix_definition_name);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
 

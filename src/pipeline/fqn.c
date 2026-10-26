@@ -329,6 +329,9 @@ static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_
             continue;
         }
         if (seg_len == FQN_DOTDOT_LEN && seg_start[0] == '.' && seg_start[FQN_SEP_LEN] == '.') {
+            if (!buf[0]) {
+                return NULL;
+            }
             path_pop_segment(buf);
             continue;
         }

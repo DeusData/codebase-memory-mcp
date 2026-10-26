@@ -31,6 +31,8 @@ enum {
     CBM_DAEMON_IPC_RETRY_INTERVAL_MS = 10,
     CBM_DAEMON_IPC_COORDINATION_CLEANUP_MS = 500,
     CBM_DAEMON_IPC_WINDOWS_RENDEZVOUS_RETRY_MS = 250,
+    CBM_DAEMON_IPC_RELEASE_ERROR = -1,
+    CBM_DAEMON_IPC_RELEASE_COMPLETE = 1,
 };
 
 /* Last private-namespace validation refusal, set at the exact failing check.
@@ -3508,6 +3510,94 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     free(listener);
 }
 
+/* Touch results: 1 refreshed, 0 lost (the path no longer names the owned
+ * file), -1 transient (a still-valid file could not be refreshed). Touch
+ * through the held descriptor only after proving the path still names it:
+ * refreshing by path would keep a replacement inode fresh and hide the loss
+ * (#2178). */
+static int posix_touch_fold(int result, int next) {
+    return result == 0 || next == 0 ? 0 : (result < 0 || next < 0 ? -1 : 1);
+}
+
+/* Whether base_name still names the regular file (device, inode): 1 yes,
+ * 0 proven not (absent, another inode, a symlink or other non-regular
+ * entry), -1 undetermined (any other lookup failure, e.g. EIO or ESTALE). */
+static int posix_path_names_inode(int directory_fd, const char *base_name, dev_t device,
+                                  ino_t inode) {
+    struct stat by_path;
+    if (fstatat(directory_fd, base_name, &by_path, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    return S_ISREG(by_path.st_mode) && by_path.st_dev == device && by_path.st_ino == inode ? 1 : 0;
+}
+
+static int posix_held_file_touch(int directory_fd, const char *base_name, int fd) {
+    struct stat by_handle;
+    if (fstat(fd, &by_handle) != 0) {
+        return -1;
+    }
+    int identity =
+        by_handle.st_nlink == 0
+            ? 0
+            : posix_path_names_inode(directory_fd, base_name, by_handle.st_dev, by_handle.st_ino);
+    if (identity <= 0) {
+        return identity;
+    }
+    return futimens(fd, NULL) == 0 ? 1 : -1;
+}
+
+static int posix_held_lock_touch(int directory_fd, const process_lock_entry_t *entry, int fd) {
+    return entry ? posix_held_file_touch(directory_fd, entry->lock_name, fd) : 0;
+}
+
+static int posix_identity_marker_touch(const cbm_daemon_ipc_listener_t *listener) {
+    /* The marker is not held open. Classify by path first, so a symlink or
+     * other replacement is loss; only then reopen it to refresh, where a
+     * failure (EMFILE, EACCES) says nothing about the file and is transient. */
+    int identity = posix_path_names_inode(listener->dir_fd, listener->socket_identity_name,
+                                          listener->identity_device, listener->identity_inode);
+    if (identity <= 0) {
+        return identity;
+    }
+    int marker_fd = openat(listener->dir_fd, listener->socket_identity_name,
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (marker_fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    struct stat marker_status;
+    int result = -1;
+    if (fstat(marker_fd, &marker_status) == 0) {
+        /* Replaced between the lookup and the open. */
+        result = marker_status.st_dev != listener->identity_device ||
+                         marker_status.st_ino != listener->identity_inode
+                     ? 0
+                     : (futimens(marker_fd, NULL) == 0 ? 1 : -1);
+    }
+    (void)close(marker_fd);
+    return result;
+}
+
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard) {
+    if (!listener || listener->dir_fd < 0 || listener->owner_pid != getpid() ||
+        !listener->lifetime_reservation) {
+        return 0;
+    }
+    int result =
+        posix_held_lock_touch(listener->dir_fd, listener->lifetime_reservation->process_entry,
+                              listener->lifetime_reservation->fd);
+    const cbm_daemon_ipc_participant_guard_t *guards[] = {listener->participant_guard,
+                                                          external_guard};
+    for (size_t i = 0; i < sizeof(guards) / sizeof(guards[0]); i++) {
+        if (guards[i]) {
+            result = posix_touch_fold(result, posix_held_lock_touch(listener->dir_fd,
+                                                                    guards[i]->legacy_process_entry,
+                                                                    guards[i]->legacy_fd));
+        }
+    }
+    return posix_touch_fold(result, posix_identity_marker_touch(listener));
+}
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -3891,6 +3981,14 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     return true;
 }
 
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard) {
+    if (!endpoint || !guard || guard->owner_pid != getpid()) {
+        return 0;
+    }
+    return posix_held_lock_touch(endpoint->dir_fd, guard->legacy_process_entry, guard->legacy_fd);
+}
+
 int cbm_daemon_ipc_local_transition_try_acquire(
     const cbm_daemon_ipc_endpoint_t *endpoint, cbm_daemon_ipc_local_transition_t **transition_out) {
     if (transition_out) {
@@ -3988,19 +4086,19 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
     return true;
 }
 
-bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io) {
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io) {
     if (!transition_io) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     cbm_daemon_ipc_local_transition_t *transition = *transition_io;
     if (!transition) {
-        return true;
+        return CBM_DAEMON_IPC_RELEASE_COMPLETE;
     }
     if (transition->legacy_fd < 0 || !transition->legacy_process_entry ||
         transition->owner_pid != getpid() ||
         (!transition->work_begun &&
          (transition->startup_v2_fd < 0 || !transition->startup_v2_process_entry))) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     posix_named_lock_release(transition->legacy_fd, transition->legacy_process_entry);
     if (!transition->work_begun) {
@@ -4008,7 +4106,7 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
     }
     free(transition);
     *transition_io = NULL;
-    return true;
+    return CBM_DAEMON_IPC_RELEASE_COMPLETE;
 }
 
 #else /* _WIN32 */
@@ -6203,35 +6301,39 @@ static void win_participant_group_release_complete(cbm_private_file_lock_t **gro
     }
 }
 
-static bool win_participant_state_release(const cbm_daemon_ipc_endpoint_t *endpoint,
-                                          cbm_private_lock_directory_t *directory,
-                                          cbm_private_file_lock_t **startup_v2_io,
-                                          win_legacy_mutex_guard_t **legacy_guard_io,
-                                          cbm_private_file_lock_t **group_io, HANDLE *sentinel_io) {
+static int win_participant_state_release(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                         cbm_private_lock_directory_t *directory,
+                                         cbm_private_file_lock_t **startup_v2_io,
+                                         win_legacy_mutex_guard_t **legacy_guard_io,
+                                         cbm_private_file_lock_t **group_io, HANDLE *sentinel_io) {
     if (!endpoint || !directory || !startup_v2_io || !legacy_guard_io || !group_io ||
         !sentinel_io) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     if (!*startup_v2_io) {
         int startup = win_startup_v2_try_acquire(directory, startup_v2_io);
         if (startup != 1) {
-            return false;
+            return startup;
         }
     }
     if (!*legacy_guard_io) {
         int legacy = win_legacy_mutex_guard_try_acquire(endpoint, legacy_guard_io);
         if (legacy != 1) {
-            (void)cbm_private_file_lock_release(startup_v2_io);
-            return false;
+            if (cbm_private_file_lock_release(startup_v2_io) != CBM_PRIVATE_FILE_LOCK_OK) {
+                return CBM_DAEMON_IPC_RELEASE_ERROR;
+            }
+            return legacy;
         }
     }
     if (!win_participant_group_release_locked(group_io, sentinel_io)) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     if (!win_legacy_mutex_guard_release(legacy_guard_io)) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
-    return cbm_private_file_lock_release(startup_v2_io) == CBM_PRIVATE_FILE_LOCK_OK;
+    return cbm_private_file_lock_release(startup_v2_io) == CBM_PRIVATE_FILE_LOCK_OK
+               ? CBM_DAEMON_IPC_RELEASE_COMPLETE
+               : CBM_DAEMON_IPC_RELEASE_ERROR;
 }
 
 cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
@@ -7007,9 +7109,9 @@ bool cbm_daemon_ipc_startup_lock_release(cbm_daemon_ipc_startup_lock_t **lock_io
     if (!lock) {
         return true;
     }
-    if (!win_participant_state_release(lock->endpoint, lock->directory, &lock->startup_v2_lock,
-                                       &lock->legacy_guard, &lock->group_lock,
-                                       &lock->legacy_sentinel)) {
+    if (win_participant_state_release(lock->endpoint, lock->directory, &lock->startup_v2_lock,
+                                      &lock->legacy_guard, &lock->group_lock,
+                                      &lock->legacy_sentinel) != CBM_DAEMON_IPC_RELEASE_COMPLETE) {
         return false;
     }
     cbm_private_lock_directory_close(lock->directory);
@@ -7072,15 +7174,29 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     if (!guard) {
         return true;
     }
-    if (!win_participant_state_release(
-            guard->endpoint, guard->directory, &guard->teardown_startup_v2_lock,
-            &guard->teardown_legacy_guard, &guard->group_lock, &guard->legacy_sentinel)) {
+    if (win_participant_state_release(guard->endpoint, guard->directory,
+                                      &guard->teardown_startup_v2_lock,
+                                      &guard->teardown_legacy_guard, &guard->group_lock,
+                                      &guard->legacy_sentinel) != CBM_DAEMON_IPC_RELEASE_COMPLETE) {
         return false;
     }
     cbm_private_lock_directory_close(guard->directory);
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+/* Windows has no age-based cleaner of the private runtime directory, and its
+ * held handles deny deletion; the #2178 heartbeat has nothing to refresh. */
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard) {
+    (void)external_guard;
+    return listener ? 1 : 0;
+}
+
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard) {
+    return endpoint && guard ? 1 : 0;
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(
@@ -7169,38 +7285,44 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
     return true;
 }
 
-bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io) {
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io) {
     if (!transition_io) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     cbm_daemon_ipc_local_transition_t *transition = *transition_io;
     if (!transition) {
-        return true;
+        return CBM_DAEMON_IPC_RELEASE_COMPLETE;
     }
     if (!transition->endpoint || !transition->directory) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     if (transition->group_lock || transition->legacy_sentinel != INVALID_HANDLE_VALUE ||
         transition->teardown_legacy_guard) {
-        if (!win_participant_state_release(transition->endpoint, transition->directory,
-                                           &transition->startup_v2_lock,
-                                           &transition->teardown_legacy_guard,
-                                           &transition->group_lock, &transition->legacy_sentinel)) {
-            return false;
+        int released = win_participant_state_release(
+            transition->endpoint, transition->directory, &transition->startup_v2_lock,
+            &transition->teardown_legacy_guard, &transition->group_lock,
+            &transition->legacy_sentinel);
+        if (released != CBM_DAEMON_IPC_RELEASE_COMPLETE) {
+            return released;
         }
     } else if (transition->startup_v2_lock &&
                cbm_private_file_lock_release(&transition->startup_v2_lock) !=
                    CBM_PRIVATE_FILE_LOCK_OK) {
-        return false;
+        return CBM_DAEMON_IPC_RELEASE_ERROR;
     }
     cbm_private_lock_directory_close(transition->directory);
     transition->directory = NULL;
     free(transition);
     *transition_io = NULL;
-    return true;
+    return CBM_DAEMON_IPC_RELEASE_COMPLETE;
 }
 
 #endif /* _WIN32 */
+
+bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io) {
+    return cbm_daemon_ipc_local_transition_try_release(transition_io) ==
+           CBM_DAEMON_IPC_RELEASE_COMPLETE;
+}
 
 bool cbm_daemon_ipc_send_frame(cbm_daemon_ipc_connection_t *connection,
                                cbm_daemon_frame_type_t type, uint16_t flags, const void *payload,

@@ -266,9 +266,9 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
     }
     /* Resolve the struct's methods two ways and use whichever finds them:
      *   (a) the struct's DEFINES_METHOD edges, matched by method NAME — the real
-     *       pipeline path, where Go receiver methods carry a flat QN (e.g.
-     *       "pkg.Area" rather than "pkg.Circle.Area"), so QN-string
-     *       reconstruction would miss; and
+     *       pipeline path. Go method QNs are receiver-qualified since #1913
+     *       ("pkg.Circle.Area"), so (b) matches them as well, but the edges
+     *       stay the primary join; and
      *   (b) the reconstructed QN "<ClassQN>.<methodName>" — used by tests and any
      *       extractor that does emit class-qualified method QNs without
      *       DEFINES_METHOD edges from the class. */

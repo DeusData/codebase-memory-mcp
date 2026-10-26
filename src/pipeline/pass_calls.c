@@ -1116,7 +1116,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * language gated on only one resolver produces an edge on the sequential
      * path and not the parallel one (or vice versa), breaking MT determinism.
      * ArkTS belongs to the JS/TS family here (#1842); dropping it would
-     * reintroduce the #592/#606 false-edge class for .ets files. */
+     * reintroduce the #592/#606 false-edge class for .ets files.
+     *
+     * Go (#1906) rides the same deferred-drop plumbing through its OWN
+     * predicate: its drop-list differs (field_type_hint is receiver-aware for
+     * Go, and unique_name drops only when import-unreachability-penalized), so
+     * it composes via cbm_go_suppress_weak_method_match instead of widening
+     * the shared gate. Same lockstep rule: mirror pass_parallel.c. */
     bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                 lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                 lang == CBM_LANG_ARKTS ||
@@ -1137,6 +1143,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     /* The member guard's one exemption (Python, self/cls-rooted receiver,
      * unique_name, not a builtin type's method) — see
      * cbm_weak_member_unique_name_exempt. MUST match pass_parallel.c exactly. */
+    /* #1355: `import { eq } from "drizzle-orm"` binds `eq` to a package that is
+     * not in the indexed tree, so a project-wide same-name guess must not turn
+     * `eq(...)` into a CALLS edge to an unrelated project `eq`. Joined to
+     * drop_plain_call for the reason spelled out above: dropping the call here
+     * would also skip route/HTTP/CONFIG classification, and a route
+     * registration reached through a static import (`import static
+     * spark.Spark.get` + `get("/x", handler)`) is exactly a bare call bound by
+     * a package specifier. Suppressing only the plain-CALLS fall-through keeps
+     * every Route node and service edge main-identical. */
     bool drop_plain_call =
         (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
          !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
@@ -1144,13 +1159,21 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                              res.strategy)) ||
         cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
                                              call->callee_is_locally_bound, res.strategy) ||
+        cbm_go_suppress_weak_method_match(lang == CBM_LANG_GO, call->is_method, res.strategy,
+                                          res.confidence) ||
         /* Import-binding suppression (#2127): an external `from m import f`
          * binds `f` for the whole module, so a weak short-name match onto a
          * project `X.f` outside m is fabricated. Python-only (the import
          * paths are module chains) — MUST match pass_parallel.c exactly. */
         (lang == CBM_LANG_PYTHON && cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
          cbm_python_import_binding_contradicts(imports, call->callee_name, res.qualified_name,
-                                               ctx->gbuf, ctx->project_name, rel));
+                                               ctx->gbuf, ctx->project_name, rel)) ||
+        cbm_suppress_external_import_shadow(call->callee_name, res.strategy, imports, imp_keys,
+                                            imp_count, cbm_pipeline_get_pkgmap(),
+                                            cbm_pipeline_get_nsmap()) ||
+        /* MUST match pass_parallel.c exactly. */
+        (lang == CBM_LANG_PHP && cbm_suppress_weak_member_match(true, true, res.strategy) &&
+         cbm_pipeline_php_receiver_type_unindexed(lsp_calls, call, ctx->registry));
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library

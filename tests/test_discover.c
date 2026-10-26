@@ -2122,6 +2122,34 @@ static CBMLanguage discover_lang_of(const cbm_file_info_t *files, int count, con
     return CBM_LANG_COUNT;
 }
 
+/* #1803: a symlink is skipped by policy on every walk. A bounded count must
+ * skip it too, not abort: aborting made auto-index admission refuse every
+ * repository containing any symlink ("unsafe_or_unavailable_path"), while
+ * an explicit index of the same tree succeeded. */
+TEST(discover_count_bounded_survives_a_symlink) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows: symlinks need admin / symlink() unavailable");
+#else
+    char *base = th_mktempdir("cbm_disc_link");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, "main.go"), "package main\n");
+    th_write_file(TH_PATH(base, "sub/helper.go"), "package sub\n");
+    ASSERT_EQ(symlink("sub", TH_PATH(base, "linkdir")), 0);
+
+    cbm_discover_opts_t opts = {0};
+    int count = -1;
+    /* deadline 0 = no deadline: only the symlink can decide this count. */
+    cbm_discover_status_t status = cbm_discover_count_bounded(base, &opts, 50000, 0, &count);
+    ASSERT_EQ(status, CBM_DISCOVER_OK);
+    ASSERT_EQ(count, 2);
+
+    th_cleanup(base);
+    PASS();
+#endif
+}
+
 /* Write raw bytes (may contain embedded NUL) to base/rel. Parent must exist. */
 static int write_bytes_file(const char *path, const void *data, size_t n) {
     FILE *f = cbm_fopen(path, "wb");
@@ -2507,4 +2535,7 @@ SUITE(discover) {
     RUN_TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973);
     RUN_TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern);
     RUN_TEST(discover_nested_gitignore_three_levels_deeper_file_wins);
+
+    /* A symlink must not abort a bounded count (auto-index admission, #1803) */
+    RUN_TEST(discover_count_bounded_survives_a_symlink);
 }

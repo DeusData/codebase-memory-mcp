@@ -32,8 +32,10 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *      Dockerfile.<variant> keeps its suffix in its QNs.
  *   3  Image identity invents no registry: a reference without a host is
  *      __image__<repository as written>, registry "unknown" -- no longer
- *      __image__docker.io/[library/]<repository>. */
-#define CBM_INDEX_FORMAT_VERSION 3
+ *      __image__docker.io/[library/]<repository>.
+ *   4  #1913: Go method QNs are receiver-qualified (pkg.Recv.method, generic
+ *      receivers unwrapped); free functions stay pkg.func. */
+#define CBM_INDEX_FORMAT_VERSION 4
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)

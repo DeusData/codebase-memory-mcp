@@ -377,6 +377,13 @@ static char *ha_build_args(const char *project, const char *token) {
     return out; /* caller frees */
 }
 
+/* Closes every search augmentation that found symbols: cbm's own statement,
+ * outside the untrusted data block, naming the graph tool for the likely next
+ * question at the moment the agent greps. Facts, not commands. */
+static const char HA_SEARCH_FOLLOW_UP[] =
+    "\n[codebase-memory] For these symbols, trace_path lists callers and callees, "
+    "get_code_snippet returns the exact source, and search_graph finds related symbols by name.";
+
 /* Parse the MCP envelope returned by cbm_mcp_handle_tool and, if it is a
  * successful search_graph result with >=1 hit, format a compact
  * additionalContext string. Returns malloc'd text or NULL.
@@ -432,7 +439,7 @@ static char *ha_format_context(const char *envelope, const char *token, bool *is
         return NULL; /* valid project, just no matching symbols */
     }
 
-    char *text = malloc(4096);
+    char *text = malloc(4096 + sizeof(HA_SEARCH_FOLLOW_UP));
     if (!text) {
         yyjson_doc_free(idoc);
         yyjson_doc_free(edoc);
@@ -476,6 +483,10 @@ static char *ha_format_context(const char *envelope, const char *token, bool *is
                             safe_path, safe_label[0] ? "  " : "", safe_label);
         }
     }
+    /* off can run past the list cap when a row is truncated, so append at the
+     * real end; the allocation reserves room for the whole follow-up line. */
+    size_t used = strlen(text);
+    snprintf(text + used, 4096 + sizeof(HA_SEARCH_FOLLOW_UP) - used, "%s", HA_SEARCH_FOLLOW_UP);
 
     yyjson_doc_free(idoc);
     yyjson_doc_free(edoc);

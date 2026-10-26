@@ -791,6 +791,8 @@ static void expr_free(cbm_expr_t *e) {
             safe_str_free(&cur->cond.op);
             safe_str_free(&cur->cond.value);
             safe_str_free(&cur->cond.coalesce_default);
+            safe_str_free(&cur->cond.rhs_variable);
+            safe_str_free(&cur->cond.rhs_property);
             for (int i = 0; i < cur->cond.in_value_count; i++) {
                 safe_str_free(&cur->cond.in_values[i]);
             }
@@ -1081,9 +1083,49 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     return expr_leaf(c);
 }
 
+/* Free what a condition parser owns when it gives up mid-condition. */
+static void cond_parse_fail_free(cbm_condition_t *c) {
+    cond_func_fields_free(c);
+    safe_str_free(&c->variable);
+    safe_str_free(&c->property);
+    safe_str_free(&c->op);
+    safe_str_free(&c->coalesce_default);
+    safe_str_free(&c->rhs_variable);
+    safe_str_free(&c->rhs_property);
+}
+
+enum { COND_RHS_REF = 1 };
+
+/* RHS operand that names a row value instead of a literal: var.prop, or a bare
+ * alias such as a WITH projection (#2591). Returns COND_RHS_REF when one was
+ * parsed, 0 when the next token is not one, CBM_NOT_FOUND with p->error set
+ * when it is malformed or a function call. */
+static int parse_condition_rhs_ref(parser_t *p, cbm_condition_t *c) {
+    if (p->pos + SKIP_ONE < p->count && p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
+        snprintf(p->error, sizeof(p->error),
+                 "unsupported function '%s' on the right side of a WHERE comparison "
+                 "(only literals and var.prop are supported)",
+                 peek(p)->text);
+        return CBM_NOT_FOUND;
+    }
+    if (!check(p, TOK_IDENT)) {
+        return 0;
+    }
+    c->rhs_variable = heap_strdup(advance(p)->text);
+    if (match(p, TOK_DOT)) {
+        const cbm_token_t *prop = expect(p, TOK_IDENT);
+        if (!prop) {
+            return CBM_NOT_FOUND;
+        }
+        c->rhs_property = heap_strdup(prop->text);
+    }
+    return COND_RHS_REF;
+}
+
 /* Parse the operator + value tail shared by every condition subject
  * (var[.prop] and multi-arg functions like coalesce(...)): IS [NOT] NULL,
- * IN [...], or a comparison operator with a literal value. */
+ * IN [...], or a comparison operator with a literal value or a property
+ * reference (a.x = b.y). */
 static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     /* IS NULL / IS NOT NULL */
     if (check(p, TOK_IS)) {
@@ -1111,10 +1153,7 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     c->op = parse_comparison_op(p);
     if (!c->op) {
         snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
-        cond_func_fields_free(c);
-        safe_str_free(&c->variable);
-        safe_str_free(&c->property);
-        safe_str_free(&c->coalesce_default);
+        cond_parse_fail_free(c);
         return NULL;
     }
 
@@ -1127,13 +1166,11 @@ static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
     } else if (check(p, TOK_FALSE)) {
         advance(p);
         c->value = heap_strdup("false");
-    } else {
-        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
-        cond_func_fields_free(c);
-        safe_str_free(&c->variable);
-        safe_str_free(&c->property);
-        safe_str_free(&c->op);
-        safe_str_free(&c->coalesce_default);
+    } else if (parse_condition_rhs_ref(p, c) <= 0) {
+        if (!p->error[0]) {
+            snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
+        }
+        cond_parse_fail_free(c);
         return NULL;
     }
 
@@ -2227,6 +2264,8 @@ static void free_where(cbm_where_clause_t *w) {
         free(w->conditions[i].in_values);
         safe_str_free(&w->conditions[i].func);
         func_args_free(w->conditions[i].args, w->conditions[i].arg_count);
+        safe_str_free(&w->conditions[i].rhs_variable);
+        safe_str_free(&w->conditions[i].rhs_property);
     }
     free(w->conditions);
     safe_str_free(&w->op);
@@ -2732,6 +2771,59 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
     return false;
 }
 
+enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1 };
+
+/* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
+ * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
+static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
+    cbm_node_t *n = binding_get(b, c->variable);
+    bool result = false;
+    if (n && b->store) {
+        cbm_edge_t *edges = NULL;
+        int cnt = 0;
+        if (c->exists_dir != EXISTS_DIR_IN) { /* outbound or any */
+            if (c->value) {
+                cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges, &cnt);
+            } else {
+                cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
+            }
+            result = cnt > 0;
+            cbm_store_free_edges(edges, cnt);
+        }
+        if (!result && c->exists_dir != EXISTS_DIR_OUT) { /* inbound or any */
+            edges = NULL;
+            cnt = 0;
+            if (c->value) {
+                cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges, &cnt);
+            } else {
+                cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
+            }
+            result = cnt > 0;
+            cbm_store_free_edges(edges, cnt);
+        }
+    }
+    return c->negated ? !result : result;
+}
+
+/* a.x <op> b.y (#2591): the RHS operand is read from the same row. An unbound
+ * RHS alias does not filter, like an unbound LHS. A missing (empty) property
+ * on either side is NULL and the comparison is false, so two nodes that both
+ * lack a property do not compare equal. */
+static bool eval_property_comparison(const cbm_condition_t *c, const char *actual, binding_t *b) {
+    cbm_condition_t rhs = {0};
+    rhs.variable = c->rhs_variable;
+    rhs.property = c->rhs_property;
+    const char *expected = resolve_condition_value(&rhs, b);
+    if (!expected) {
+        return true;
+    }
+    if (actual[0] == '\0' || expected[0] == '\0') {
+        return false;
+    }
+    bool result = eval_comparison_op(c->op, actual, expected);
+    return c->negated ? !result : result;
+}
+
 /* Evaluate a WHERE condition against a binding */
 static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     /* Label test: WHERE n:Label (#241) — compare the bound node's label
@@ -2742,36 +2834,8 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
-    /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
-     * given type in the requested direction? (dir 0=out, 1=in, 2=any) */
     if (strcmp(c->op, "EXISTS") == 0) {
-        cbm_node_t *n = binding_get(b, c->variable);
-        bool result = false;
-        if (n && b->store) {
-            cbm_edge_t *edges = NULL;
-            int cnt = 0;
-            if (c->exists_dir != 1) { /* outbound or any */
-                if (c->value) {
-                    cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges, &cnt);
-                } else {
-                    cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
-                }
-                result = cnt > 0;
-                cbm_store_free_edges(edges, cnt);
-            }
-            if (!result && c->exists_dir != 0) { /* inbound or any */
-                edges = NULL;
-                cnt = 0;
-                if (c->value) {
-                    cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges, &cnt);
-                } else {
-                    cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
-                }
-                result = cnt > 0;
-                cbm_store_free_edges(edges, cnt);
-            }
-        }
-        return c->negated ? !result : result;
+        return eval_exists_condition(c, b);
     }
 
     const char *actual = resolve_condition_value(c, b);
@@ -2808,6 +2872,9 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
+    if (c->rhs_variable) {
+        return eval_property_comparison(c, actual, b);
+    }
     result = eval_comparison_op(c->op, actual, c->value);
     return c->negated ? !result : result;
 }
@@ -2899,11 +2966,23 @@ static cyp_partial_t partial_or(cyp_partial_t l, cyp_partial_t r) {
                                                               : CYP_PARTIAL_UNKNOWN;
 }
 
-/* A condition whose alias is not bound yet is UNKNOWN; a literal-only LHS
- * (func condition with no variable arg) has nothing to wait for. */
+static bool partial_alias_unbound(binding_t *b, const char *alias) {
+    return alias && !binding_get(b, alias) && !binding_get_edge(b, alias);
+}
+
+/* A condition is UNKNOWN while any alias it reads is not bound yet: its own
+ * variable, the RHS of a property comparison (the b in a.x = b.y), and every
+ * function argument's -- a func condition is filed under its first argument's
+ * alias, so the b in coalesce(a.x, b.name) is only seen here. A literal-only
+ * LHS has nothing to wait for. */
 static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t *b) {
-    if (c->variable && !binding_get(b, c->variable) && !binding_get_edge(b, c->variable)) {
+    if (partial_alias_unbound(b, c->variable) || partial_alias_unbound(b, c->rhs_variable)) {
         return CYP_PARTIAL_UNKNOWN;
+    }
+    for (int i = 0; i < c->arg_count; i++) {
+        if (partial_alias_unbound(b, c->args[i].variable)) {
+            return CYP_PARTIAL_UNKNOWN;
+        }
     }
     return eval_condition(c, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
 }
@@ -5359,6 +5438,34 @@ static void ret_agg_emit_row(cbm_return_clause_t *ret, ret_agg_entry_t *agg, res
     rb_add_row(rb, row);
 }
 
+/* True when every RETURN item is an aggregate, so the whole input is one group. */
+static bool ret_agg_is_ungrouped(const cbm_return_clause_t *ret) {
+    for (int ci = 0; ci < ret->count; ci++) {
+        if (!is_aggregate_func(ret->items[ci].func)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The one row an ungrouped aggregation answers when no binding reached it
+ * (#2742): count and sum are 0, collect is an empty list, and avg/min/max have
+ * no value, rendered as "" like any other null. */
+static void ret_agg_emit_empty_row(cbm_return_clause_t *ret, result_builder_t *rb) {
+    const char *row[CBM_SZ_32];
+    for (int ci = 0; ci < ret->count && ci < CBM_SZ_32; ci++) {
+        const char *func = ret->items[ci].func;
+        if (strcmp(func, "COUNT") == 0 || strcmp(func, "SUM") == 0) {
+            row[ci] = "0";
+        } else if (strcmp(func, "COLLECT") == 0) {
+            row[ci] = "[]";
+        } else {
+            row[ci] = "";
+        }
+    }
+    rb_add_row(rb, row);
+}
+
 static void ret_sink_feed_agg(ret_sink_t *s, binding_t *bindings, int bind_count) {
     cbm_return_clause_t *ret = s->ret;
     for (int bi = 0; bi < bind_count && !s->done; bi++) {
@@ -5574,6 +5681,11 @@ static void ret_sink_finish(ret_sink_t *s) {
     if (s->kind == RET_SINK_AGG) {
         for (int a = 0; a < s->agg_count; a++) {
             ret_agg_emit_row(ret, &s->aggs[a], rb);
+        }
+        /* Without grouping keys the input is a single group even when it is
+         * empty; a grouped aggregation over no rows has no group to report. */
+        if (s->agg_count == 0 && ret_agg_is_ungrouped(ret)) {
+            ret_agg_emit_empty_row(ret, rb);
         }
     }
     ret_sink_free(s);
@@ -5874,7 +5986,8 @@ static int cypher_cond_selectivity(const cbm_condition_t *c, const char *var) {
     if (!c || !c->variable || !var || strcmp(c->variable, var) != 0 || c->negated) {
         return 0;
     }
-    if (!c->op || strcmp(c->op, "=") != 0 || !c->property) {
+    /* a.x = b.y pins no value on either alias, so it seeds nothing. */
+    if (!c->op || strcmp(c->op, "=") != 0 || !c->property || c->rhs_variable) {
         return 0;
     }
     return (strcmp(c->property, "name") == 0 || strcmp(c->property, "qualified_name") == 0) ? 3 : 2;
