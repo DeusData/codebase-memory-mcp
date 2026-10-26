@@ -52,7 +52,7 @@ Operational authority is stricter than code review authority.
 
 | Operation | Current authority | Project rule |
 | --- | --- | --- |
-| PR validation (`pr.yml`, DCO, CodeQL) | Automatic | Anyone may trigger it by opening or updating a PR. Required checks must pass. |
+| PR validation (`pr.yml`, DCO, PR CodeQL scan) | Automatic | Anyone may trigger it by opening or updating a PR. Required checks must pass. |
 | Dry run (`dry-run.yml`) | `@DeusData` | Delegated release operators may run dry runs after promotion. Dry-run delegation does not imply release authority. |
 | Smoke/soak/repro manual runs | `@DeusData` | Area reviewers may operate these runs when delegated for diagnosis. Results are advisory. |
 | Release workflow (`release.yml`) | `@DeusData` only | Owner-only until a release operator is explicitly promoted. Publishing, replacing releases, and tag movement remain owner-gated. |

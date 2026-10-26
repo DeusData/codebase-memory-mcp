@@ -16,6 +16,18 @@ on:
         description: 'Split each C-suite leg across parallel shard jobs (ubuntu x3, windows x2); off = one job per leg, byte-identical to the pre-shard topology'
         type: boolean
         default: false
+      shard_profile:
+        description: 'Shard counts when shard_suites is on: standard = ubuntu x3, windows x2 (dry run, release); pr = ubuntu x86 x1, ubuntu arm64 x2, windows x1 (fewer jobs re-paying setup)'
+        type: string
+        default: standard
+      lanes:
+        description: 'PR lane selection (scripts/ci/select-lanes.sh JSON list): only those legs and jobs run; "all" = every one (dry run, release)'
+        type: string
+        default: all
+      test_selection:
+        description: 'PR test selection (smart CI): the artifact the select-tests job uploaded; the Linux x86_64 test-unix leg runs only its tests, the arm64, macOS and Windows legs run every test. Empty = every test (dry run, release, and any PR the selection does not narrow)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -30,18 +42,26 @@ jobs:
     outputs:
       unix: ${{ steps.set.outputs.unix }}
       windows: ${{ steps.set.outputs.windows }}
+      tsan: ${{ steps.set.outputs.tsan }}
+      has_unix: ${{ steps.set.outputs.has_unix }}
+      has_windows: ${{ steps.set.outputs.has_windows }}
+      has_tsan: ${{ steps.set.outputs.has_tsan }}
     steps:
       - name: Compute matrices
         id: set
         env:
           BROAD: ${{ inputs.broad_platforms }}
           SHARDS: ${{ inputs.shard_suites }}
+          SHARD_PROFILE: ${{ inputs.shard_profile }}
+          LANES: ${{ inputs.lanes }}
         run: |
+          # Every CORE leg is tagged with the lane (scripts/ci/select-lanes.sh)
+          # it serves; the tag is what lane selection filters on below.
           CORE_UNIX='[
-            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
-            {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-14","cc":"cc","cxx":"c++"},
-            {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
+            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","lane":"unix-x86"},
+            {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++","lane":"unix-arm64"},
+            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"unix-macos14"},
+            {"os":"macos-15-intel","cc":"cc","cxx":"c++","lane":"unix-macos-intel"}
           ]'
           # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
           # escape hatches): the release dry run must be all-green, every platform.
@@ -59,7 +79,7 @@ jobs:
           # interception crashed (interception_win: unhandled instruction). With
           # the native ARM64 toolchain ASan instruments native ARM64 code, so it
           # is a real (non-optional) gate, not a tolerated emulated-flake.
-          CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64"}]'
+          CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64","lane":"windows"}]'
           BROAD_WIN='[{"os":"windows-2025","msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
           if [ "$BROAD" = "true" ]; then
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
@@ -67,6 +87,30 @@ jobs:
           else
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
             WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
+          fi
+          # The ThreadSanitizer legs (test-tsan), tagged the same way.
+          TSAN='[
+            {"os":"ubuntu-latest","cc":"clang","cxx":"clang++","lane":"tsan-x86"},
+            {"os":"ubuntu-24.04-arm","cc":"clang","cxx":"clang++","lane":"tsan-arm"},
+            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"tsan-mac"}
+          ]'
+          # Lane selection. "all" (dry run, release) keeps every leg and drops
+          # the tags, so those matrices -- and their job names -- stay exactly
+          # as before lane selection. A PR keeps only its selected legs, and
+          # the tag stays in the job name, where ci-ok reads it back. An
+          # untagged leg could never be selected: that is a configuration
+          # error here, never a leg silently dropped.
+          if [ "$LANES" = "all" ]; then
+            UNIX=$(jq -c 'map(del(.lane))' <<< "$UNIX")
+            WIN=$(jq -c 'map(del(.lane))' <<< "$WIN")
+            TSAN=$(jq -c 'map(del(.lane))' <<< "$TSAN")
+          else
+            for M in "$UNIX" "$WIN" "$TSAN"; do
+              jq -e 'all(.[]; has("lane"))' <<< "$M" > /dev/null || { echo "::error::untagged test leg in $M"; exit 1; }
+            done
+            UNIX=$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$UNIX")
+            WIN=$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$WIN")
+            TSAN=$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$TSAN")
           fi
           # Suite sharding (opt-in via the shard_suites input): each platform's
           # C-suite run is split across N runner jobs. CBM_TEST_SHARD="i/N"
@@ -78,20 +122,37 @@ jobs:
           # shards); Windows gets 2 (every extra shard re-pays ~5 min of
           # MSYS2 setup); macOS stays at 1 — mac legs are not the critical
           # path and mac runner concurrency ceilings are the tightest.
+          # The pr profile shards less: a PR runs few legs and every shard
+          # re-pays its setup, so x86 and Windows run whole and only arm64,
+          # the slowest leg (~72 min unsharded), splits in two.
+          case "$SHARD_PROFILE" in
+            standard) N_X86=3; N_ARM=3; N_WIN=2 ;;
+            pr) N_X86=1; N_ARM=2; N_WIN=1 ;;
+            *) echo "::error::unknown shard_profile '$SHARD_PROFILE'"; exit 1 ;;
+          esac
           if [ "$SHARDS" = "true" ]; then
-            UNIX=$(jq -c '[.[] | . as $e
-              | (if ($e.os | startswith("ubuntu")) then 3 else 1 end) as $n
+            UNIX=$(jq -c --argjson x86 "$N_X86" --argjson arm "$N_ARM" '[.[] | . as $e
+              | (if ($e.os | startswith("ubuntu")) then
+                   (if ($e.os | endswith("-arm")) then $arm else $x86 end)
+                 else 1 end) as $n
               | range(1; $n + 1) as $i
               | $e + {shard: "\($i)/\($n)"}]' <<< "$UNIX")
-            WIN=$(jq -c '[.[] | . as $e
-              | range(1; 3) as $i
-              | $e + {shard: "\($i)/2"}]' <<< "$WIN")
+            WIN=$(jq -c --argjson n "$N_WIN" '[.[] | . as $e
+              | range(1; $n + 1) as $i
+              | $e + {shard: "\($i)/\($n)"}]' <<< "$WIN")
           fi
           echo "unix={\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
           echo "windows={\"include\":$WIN}" >> "$GITHUB_OUTPUT"
+          echo "tsan={\"include\":$TSAN}" >> "$GITHUB_OUTPUT"
+          # GitHub rejects an empty matrix, so a job whose legs were all
+          # deselected is skipped through these flags instead.
+          echo "has_unix=$(jq 'length > 0' <<< "$UNIX")" >> "$GITHUB_OUTPUT"
+          echo "has_windows=$(jq 'length > 0' <<< "$WIN")" >> "$GITHUB_OUTPUT"
+          echo "has_tsan=$(jq 'length > 0' <<< "$TSAN")" >> "$GITHUB_OUTPUT"
 
   test-unix:
     needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_unix == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
@@ -160,12 +221,24 @@ jobs:
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-
             ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
 
+      - name: Fetch the test selection
+        # Only the Linux x86_64 leg narrows (user decision 2026-10-16): the
+        # coverage that justifies an omission comes from the Linux x86_64
+        # producer, so arm64, macOS and Windows code under #ifdef has static
+        # evidence only and those legs run every test.
+        if: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.test_selection }}
+          path: ${{ runner.temp }}/test-selection
+
       - name: Test
         run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
         env:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.cc }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CBM_TEST_SELECTION_DIR: ${{ inputs.test_selection != '' && runner.os == 'Linux' && runner.arch == 'X64' && format('{0}/test-selection', runner.temp) || '' }}
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -187,6 +260,23 @@ jobs:
           # shard-completeness job still gates the cross-shard union.
           if-no-files-found: warn
 
+      # The job log carries a red suite's SUMMARY; these are the complete logs
+      # behind it, so a failure can be read instead of re-run. The harness
+      # copies the log of every suite that did not end green, plus results.txt,
+      # into test-logs/failed/ (scripts/suite-failure-report.sh) — typically a
+      # few kilobytes for a red suite, not the ~25 MB of a whole run's logs.
+      # Runs only on a failed job. warn, not error: a job that failed OUTSIDE
+      # the suite wave (contract step, build, prod-binary guards) has no such
+      # directory, and a second error would only bury the first.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.cc }}-${{ strategy.job-index }}
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Compiler cache (save)
         if: always() && (matrix.shard == null || startsWith(matrix.shard, '1/'))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -205,6 +295,7 @@ jobs:
   # inode/flock behavior and Windows handle/link behavior are each gating,
   # without adding Node/Go provisioning to every sanitizer/container leg.
   test-package-wrappers:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'pkg-wrappers') }}
     strategy:
       fail-fast: false
       matrix:
@@ -231,6 +322,28 @@ jobs:
         shell: bash
         run: scripts/ci/test-package-wrappers.sh
 
+  # CodeAtlasWeb (graph-ui) leg: the frontend's own vitest suite (2000+
+  # tests; the render tests run under jsdom), its hardcoded-string and
+  # promise scans, its portable frozen acceptance checks, and a production
+  # build with the same npm ci the product build runs. One canonical script
+  # (scripts/ci/test-ui.sh) is the whole leg, here and locally. No browser
+  # is downloaded: the browser proofs (graph-ui/tools/smoke-*.mjs) need a
+  # running server and Playwright browsers, and they stay a local, manually
+  # dispatched venue documented in graph-ui/README.md rather than a hosted
+  # gate.
+  test-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: CodeAtlasWeb leg (install, unit, style, promises, acceptance, build)
+        run: scripts/ci/test-ui.sh
+
   # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
   # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable
   # daemon-coordination paths) plus allocator concurrency all run under TSan
@@ -245,7 +358,10 @@ jobs:
   # parallel suite — catches what an older compiler-rt can miss. Same
   # canonical scripts/test.sh wave as every other leg.
   test-diag:
-    runs-on: ubuntu-latest
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'diag') }}
+    # Pinned for the same reason as the lint jobs: the pinned diagnostic
+    # toolchain below installs from llvm-toolchain-noble-21.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -280,6 +396,17 @@ jobs:
           scripts/test.sh CC=clang-21 CXX=clang++-21 \
             SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
 
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-diag
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Compiler cache (save)
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -297,17 +424,21 @@ jobs:
   # artifact — the local ladder cannot answer that, having no faithful x86-64
   # emulation. It has now answered it, and the answer SPLIT the list:
   #
-  #   - the five deep-recursion suites overflow their thread stacks on x86-64
-  #     too, so that limit is NOT architectural;
+  #   - five suites aborted with "stack-overflow ... nested bug" on both
+  #     architectures. That was not deep recursion: it was MSan crashing while
+  #     it reported real uninitialized reads (reporting with the slow unwinder
+  #     exhausted the main thread's stack). scripts/msan.sh now unwinds with
+  #     frame pointers, the
+  #     reports print, the reads are fixed, and the five suites run again;
   #   - `cli` does not overflow here at all — it fails in the install path for
   #     an unrelated, still-undiagnosed reason;
   #   - `incremental` was a shadow-memory RSS artifact, now fixed in the test
   #     itself rather than skipped, so it stays in the lane.
   #
   # Per-cause detail lives in scripts/msan.sh, which is the single authoritative
-  # list both venues now share. Zero use-of-uninitialized-value findings were
-  # reported across the lane on either architecture.
+  # list both venues now share.
   test-msan:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'msan') }}
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -332,6 +463,7 @@ jobs:
   # so this leg is the ordinary ASan suite built with that toolchain and run
   # with detect_leaks=1. Mirrors the local `make -f Makefile.cbm test-lsan`.
   test-lsan-macos:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'lsan-macos') }}
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -362,6 +494,17 @@ jobs:
           LLVM_PREFIX="$(brew --prefix llvm@22)"
           scripts/test.sh CC="$LLVM_PREFIX/bin/clang" CXX="$LLVM_PREFIX/bin/clang++"
 
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-lsan-macos
+          path: build/c/test-logs/failed/
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Compiler cache (save)
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -370,13 +513,11 @@ jobs:
           key: ccache-lsan-${{ github.ref }}-${{ github.sha }}
 
   test-tsan:
+    needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_tsan == 'true' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, cc: clang, cxx: clang++ }
-          - { os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
-          - { os: macos-14, cc: cc, cxx: c++ }
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.tsan) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
@@ -429,6 +570,7 @@ jobs:
 
   test-windows:
     needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_windows == 'true' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
@@ -506,6 +648,8 @@ jobs:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          # Windows legs run every test: see the Linux x86_64-only fetch in test-unix.
+          CBM_TEST_SELECTION_DIR: ''
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1500M
 
@@ -527,6 +671,17 @@ jobs:
           # (contract step / build) — that failure is already the job's red;
           # warn instead of stacking a second error on top of it. The
           # shard-completeness job still gates the cross-shard union.
+          if-no-files-found: warn
+
+      # Same step as in test-unix: the complete logs of the suites that did
+      # not end green, only when the job failed.
+      - name: Failing suite logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: suite-logs-${{ matrix.os }}-${{ matrix.msystem }}-${{ strategy.job-index }}
+          path: build/c/test-logs/failed/
+          retention-days: 7
           if-no-files-found: warn
 
       # Shard 1 (or the unsharded job) saves the compiler cache; every shard
@@ -562,8 +717,12 @@ jobs:
         with:
           pattern: shard-manifest-*
           path: manifests
+      # A PR with no test leg selected uploads no manifest; the script
+      # accepts that only when the selection really holds no leg.
       - name: Verify cross-shard union per leg
-        run: repo/scripts/ci/verify-shard-union.sh manifests
+        env:
+          LANES: ${{ inputs.lanes }}
+        run: repo/scripts/ci/verify-shard-union.sh manifests --lanes "$LANES"
 
   # Windows product-surface regression guards. Distinct from test-windows above
   # (the sanitizer C suite): these drive a real product binary + external UI pack
@@ -574,6 +733,7 @@ jobs:
   # CLI arguments being mangled by the narrow-argv main() (#423/#20, fixed by the
   # wide-argv entrypoint that reads GetCommandLineW).
   test-windows-guards:
+    if: ${{ inputs.lanes == 'all' || contains(fromJSON(inputs.lanes), 'windows-guards') }}
     runs-on: windows-latest
     timeout-minutes: 60
     steps:

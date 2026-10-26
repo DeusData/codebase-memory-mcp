@@ -2,6 +2,8 @@
 
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/log.h"
+#include "foundation/platform.h"
 #include "foundation/str_util.h"
 
 #include <ctype.h>
@@ -9,7 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 enum {
     GIT_CMD_MAX = 1024,
@@ -43,11 +44,14 @@ static bool git_validate_repo_path(const char *repo_path) {
     return cbm_validate_shell_path_arg(repo_path);
 }
 
-static int git_capture(const char *repo_path, const char *git_args, char **out) {
-    if (!out) {
+/* Run `git -C repo_path git_args` and copy the first output line (newlines
+ * trimmed) into buf. Returns 0 only when git exited 0 with a non-empty line. */
+static int git_capture_into(const char *repo_path, const char *git_args, char *buf,
+                            size_t buf_size) {
+    if (!buf || buf_size == 0) {
         return CBM_NOT_FOUND;
     }
-    *out = NULL;
+    buf[0] = '\0';
     if (!repo_path || !git_args || !git_validate_repo_path(repo_path)) {
         return CBM_NOT_FOUND;
     }
@@ -65,23 +69,44 @@ static int git_capture(const char *repo_path, const char *git_args, char **out) 
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
+    /* Debug-level stage markers: none of these waits has a deadline, so a
+     * stuck git child is named by the last marker printed (spawn, read or
+     * close). Silent at the default level. */
+    cbm_log_debug("git.capture", "stage", "spawn", "args", git_args);
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         return CBM_NOT_FOUND;
     }
 
-    char buf[GIT_OUTPUT_MAX];
-    if (!fgets(buf, sizeof(buf), fp)) {
+    cbm_log_debug("git.capture", "stage", "read", "args", git_args);
+    if (!fgets(buf, (int)buf_size, fp)) {
+        buf[0] = '\0';
+        cbm_log_debug("git.capture", "stage", "close", "args", git_args, "output", "none");
         cbm_pclose(fp);
+        cbm_log_debug("git.capture", "stage", "done", "args", git_args);
         return CBM_NOT_FOUND;
     }
     trim_newlines(buf);
 
+    cbm_log_debug("git.capture", "stage", "close", "args", git_args);
     int rc = cbm_pclose(fp);
+    cbm_log_debug("git.capture", "stage", "done", "args", git_args);
     if (rc != 0 || buf[0] == '\0') {
+        buf[0] = '\0';
         return CBM_NOT_FOUND;
     }
+    return 0;
+}
 
+static int git_capture(const char *repo_path, const char *git_args, char **out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    char buf[GIT_OUTPUT_MAX];
+    if (git_capture_into(repo_path, git_args, buf, sizeof(buf)) != 0) {
+        return CBM_NOT_FOUND;
+    }
     *out = git_strdup(buf);
     return *out ? 0 : CBM_NOT_FOUND;
 }
@@ -254,8 +279,7 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
-    struct stat st;
-    out->root_exists = (stat(path, &st) == 0);
+    out->root_exists = cbm_is_dir(path);
     if (!out->root_exists) {
         return 0;
     }
@@ -301,6 +325,30 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return CBM_NOT_FOUND;
     }
 
+    return 0;
+}
+
+int cbm_git_branch_resolve(const char *path, bool *is_git, char *branch, size_t branch_size) {
+    if (!is_git || !branch || branch_size == 0) {
+        return CBM_NOT_FOUND;
+    }
+    *is_git = false;
+    branch[0] = '\0';
+    if (!path || !path[0]) {
+        return CBM_NOT_FOUND;
+    }
+    if (!cbm_is_dir(path)) {
+        return 0;
+    }
+    char worktree_root[GIT_OUTPUT_MAX];
+    if (git_capture_into(path, "rev-parse --show-toplevel", worktree_root, sizeof(worktree_root)) !=
+        0) {
+        return 0;
+    }
+    *is_git = true;
+    if (git_capture_into(path, "symbolic-ref --quiet --short HEAD", branch, branch_size) != 0) {
+        snprintf(branch, branch_size, "%s", "DETACHED");
+    }
     return 0;
 }
 

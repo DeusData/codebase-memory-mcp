@@ -4,8 +4,10 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_regex.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
+#include "../src/foundation/mem_core.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
@@ -894,6 +896,52 @@ TEST(platform_env_long_refuses_what_it_cannot_read) {
     PASS();
 }
 
+/* cbm_env_dup (#221) gives the same environment view as cbm_safe_getenv: an
+ * installed settings resolver answers first, a handled NULL masks the
+ * variable, and an unhandled name falls through to the process environment. */
+static bool platform_env_dup_test_resolver(const char *name, const char **value) {
+    if (strcmp(name, "CBM_TEST_ENV_DUP_RESOLVED") == 0) {
+        *value = "from-settings";
+        return true;
+    }
+    if (strcmp(name, "CBM_TEST_ENV_DUP_MASKED") == 0) {
+        *value = NULL;
+        return true;
+    }
+    return false;
+}
+
+TEST(platform_env_dup_honours_the_settings_resolver) {
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_RESOLVED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_MASKED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_NATIVE", "from-environment", 1), 0);
+
+    cbm_set_environment_resolver(platform_env_dup_test_resolver);
+    char *resolved = cbm_env_dup("CBM_TEST_ENV_DUP_RESOLVED");
+    char *masked = cbm_env_dup("CBM_TEST_ENV_DUP_MASKED");
+    char *native = cbm_env_dup("CBM_TEST_ENV_DUP_NATIVE");
+    char safe[64];
+    const char *safe_value = cbm_safe_getenv("CBM_TEST_ENV_DUP_RESOLVED", safe, sizeof(safe), NULL);
+    cbm_set_environment_resolver(NULL);
+
+    bool safe_ok = safe_value && strcmp(safe_value, "from-settings") == 0;
+    bool resolved_ok = resolved && strcmp(resolved, "from-settings") == 0;
+    bool masked_ok = masked == NULL;
+    bool native_ok = native && strcmp(native, "from-environment") == 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, resolved);
+    cbm_free(CBM_MEM_CLASS_OTHER, masked);
+    cbm_free(CBM_MEM_CLASS_OTHER, native);
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_RESOLVED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_MASKED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_NATIVE");
+
+    ASSERT_TRUE(safe_ok);
+    ASSERT_TRUE(resolved_ok);
+    ASSERT_TRUE(masked_ok);
+    ASSERT_TRUE(native_ok);
+    PASS();
+}
+
 #ifdef _WIN32
 /* cbm_safe_getenv reads Windows' wide environment as UTF-8. Its matching
  * setter must update that same wide environment; _putenv_s alone interprets
@@ -1158,6 +1206,234 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+/* ── compat_regex: compile-size guard ──────────────────────────── */
+
+static uint64_t regex_units_ere(const char *pattern) {
+    return cbm_regcomp_estimate_units(pattern, CBM_REG_EXTENDED);
+}
+
+static uint64_t regex_units_bre(const char *pattern) {
+    return cbm_regcomp_estimate_units(pattern, 0);
+}
+
+/* Writes "(a|b|c|...)" with `branches` one-letter alternatives into buf, which
+ * must hold 2 * branches + 2 bytes. */
+static void regex_one_letter_alternation(char *buf, int branches) {
+    char *w = buf;
+    *w++ = '(';
+    for (int i = 0; i < branches; i++) {
+        if (i) {
+            *w++ = '|';
+        }
+        *w++ = (char)('a' + i % 26);
+    }
+    *w++ = ')';
+    *w = '\0';
+}
+
+/* Both regex backends expand `X{m,n}` into n copies of X at compile time, so
+ * nested intervals multiply and a 25-byte pattern can ask for millions of
+ * atoms. The wrapper sizes the pattern first and refuses one over the budget
+ * with CBM_REG_ETOOBIG before the platform compiler allocates anything, so
+ * there is nothing to free on refusal. The over-budget shapes here are small
+ * enough that an unguarded compile would still only cost tens of MB. */
+TEST(regex_compile_refuses_oversized_expansion) {
+    cbm_regex_t re;
+    /* 14^4 = 38,416 expanded atoms from 25 bytes: over the 32,768-unit budget. */
+    const char *nested = "((((a){14}){14}){14}){14}";
+    ASSERT_EQ(cbm_regcomp(&re, nested, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    /* Every flag set the call sites use is refused the same way. */
+    ASSERT_EQ(cbm_regcomp(&re, nested, CBM_REG_EXTENDED), CBM_REG_ETOOBIG);
+    ASSERT_EQ(cbm_regcomp(&re, nested, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE),
+              CBM_REG_ETOOBIG);
+    /* A repeated alternation multiplies too: (16 + 16*16/8) x 255 x 3 = 36,720. */
+    ASSERT_EQ(cbm_regcomp(&re, "((a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p){255}){3}",
+                          CBM_REG_EXTENDED | CBM_REG_NOSUB),
+              CBM_REG_ETOOBIG);
+    /* A plain alternation just over the budget: 509 one-letter branches cost
+     * 509 + 509*509/8 = 32,894 units; 508 cost 32,766 and stay accepted. */
+    char alts[2 * 509 + 2];
+    regex_one_letter_alternation(alts, 509);
+    ASSERT_EQ(regex_units_ere(alts), 32894);
+    ASSERT_EQ(cbm_regcomp(&re, alts, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    regex_one_letter_alternation(alts, 508);
+    ASSERT_EQ(regex_units_ere(alts), 32766);
+    ASSERT_LTE(regex_units_ere(alts), (uint64_t)CBM_REGEX_COMPILE_BUDGET_UNITS);
+    /* Bounds too large to represent saturate instead of wrapping around. */
+    ASSERT_EQ(cbm_regcomp(&re, "(a{99999999999999999999}){99999999999999999999}",
+                          CBM_REG_EXTENDED | CBM_REG_NOSUB),
+              CBM_REG_ETOOBIG);
+    /* Nesting deeper than the sizing pass tracks is refused, not recursed into. */
+    char deep[2 * 70 + 2];
+    memset(deep, '(', 70);
+    deep[70] = 'a';
+    memset(deep + 71, ')', 70);
+    deep[141] = '\0';
+    ASSERT_EQ(cbm_regcomp(&re, deep, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    PASS();
+}
+
+/* The same nested shape one step under the budget (13^4 = 28,561 units)
+ * compiles and matches, so the refusal starts only past the budget. */
+TEST(regex_compile_accepts_expansion_under_budget) {
+    cbm_regex_t re;
+    ASSERT_EQ(regex_units_ere("((((a){13}){13}){13}){13}"), 28561);
+    ASSERT_EQ(cbm_regcomp(&re, "((((a){13}){13}){13}){13}", CBM_REG_EXTENDED | CBM_REG_NOSUB),
+              CBM_REG_OK);
+    char *subject = malloc(28561 + 1);
+    ASSERT_NOT_NULL(subject);
+    memset(subject, 'a', 28561);
+    subject[28561] = '\0';
+    ASSERT_EQ(cbm_regexec(&re, subject, 0, NULL, 0), CBM_REG_OK);
+    subject[28560] = '\0'; /* 28,560 a's: one short of 13^4 */
+    ASSERT_EQ(cbm_regexec(&re, subject, 0, NULL, 0), CBM_REG_NOMATCH);
+    free(subject);
+    cbm_regfree(&re);
+    PASS();
+}
+
+/* A pattern longer than CBM_REGEX_PATTERN_MAX_BYTES is refused outright; one
+ * exactly at the cap still compiles (a literal at the cap is exactly the unit
+ * budget, which is accepted). */
+TEST(regex_compile_refuses_overlong_pattern) {
+    cbm_regex_t re;
+    char *pattern = malloc(CBM_REGEX_PATTERN_MAX_BYTES + 2);
+    ASSERT_NOT_NULL(pattern);
+    memset(pattern, 'a', CBM_REGEX_PATTERN_MAX_BYTES + 1);
+    pattern[CBM_REGEX_PATTERN_MAX_BYTES + 1] = '\0';
+    ASSERT_EQ(cbm_regcomp(&re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    pattern[CBM_REGEX_PATTERN_MAX_BYTES] = '\0';
+    ASSERT_EQ(cbm_regcomp(&re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+    cbm_regfree(&re);
+    free(pattern);
+    PASS();
+}
+
+/* Ordinary intervals, the pipeline's fixed patterns and patterns from the
+ * tool-level tests stay well inside the budget. */
+TEST(regex_compile_accepts_ordinary_intervals) {
+    static const char *const patterns[] = {
+        "[a-z]{1,64}",
+        ".{0,255}",
+        "(\\w{1,100}){1,20}",
+        "(foo|bar|baz){2,5}",
+        "^[A-Za-z_][A-Za-z0-9_]{0,255}$",
+        "[0-9]{4}-[0-9]{2}-[0-9]{2}",
+        /* pass_calls.c, and the retired env-URL scanner */
+        "Depends\\(([A-Za-z_][A-Za-z0-9_.]*)",
+        "^(ENV|ARG)[[:space:]]+([A-Za-z0-9_]+)[= ](.*)",
+        "(default|value)[[:space:]]*=[[:space:]]*\"(https?://[^\"]+)\"",
+        "(export[[:space:]]+)?([A-Za-z0-9_]+)=[\"']?(https?://[^ \t\"']+)",
+        /* test_mcp.c and test_cypher.c */
+        ".*Order.*",
+        "^src/",
+        "^no_such_dir/",
+        "/api/.*",
+        "^design/",
+    };
+    cbm_regex_t re;
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        int rc = cbm_regcomp(&re, patterns[i], CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (rc != CBM_REG_OK) {
+            printf("  pattern %zu refused with rc=%d: %s\n", i, rc, patterns[i]);
+        }
+        ASSERT_EQ(rc, CBM_REG_OK);
+        cbm_regfree(&re);
+    }
+
+    /* A long alternation of identifiers, as a search for "any of these names"
+     * sends it: 400 names of up to nine characters is 3,761 bytes and about
+     * 23,400 units (20,000 of them the alternation share). It stays under both
+     * caps and compiles under the search_graph flag set. */
+    static const char *const prefixes[] = {"parse", "emit", "visit", "bind", "scan"};
+    char names[CBM_SZ_4K];
+    char *w = names;
+    *w++ = '(';
+    for (int i = 0; i < 400; i++) {
+        w += snprintf(w, (size_t)(names + sizeof(names) - w), "%s%s_%03d", i ? "|" : "",
+                      prefixes[i % 5], i);
+    }
+    *w++ = ')';
+    *w = '\0';
+    ASSERT_LTE(strlen(names), (size_t)CBM_REGEX_PATTERN_MAX_BYTES);
+    ASSERT_GTE(regex_units_ere(names), (uint64_t)20000);
+    ASSERT_LTE(regex_units_ere(names), (uint64_t)CBM_REGEX_COMPILE_BUDGET_UNITS);
+    ASSERT_EQ(cbm_regcomp(&re, names, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE),
+              CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "Bind_123", 0, NULL, 0), CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "bind_400", 0, NULL, 0), CBM_REG_NOMATCH);
+    cbm_regfree(&re);
+
+    /* The same at realistic identifier length: 400 names of 20 characters is
+     * 8,401 bytes and 28,000 units, inside the budget — the length cap never
+     * decides a name list of this size, the unit budget does. */
+    static const char *const long_prefixes[] = {"compute_checksum", "validate_request",
+                                                "serialize_record", "normalize_header",
+                                                "dispatch_message"};
+    const size_t long_cap = 400 * 21 + 3;
+    char *long_names = malloc(long_cap);
+    ASSERT_NOT_NULL(long_names);
+    w = long_names;
+    *w++ = '(';
+    for (int i = 0; i < 400; i++) {
+        w += snprintf(w, long_cap - (size_t)(w - long_names), "%s%s_%03d", i ? "|" : "",
+                      long_prefixes[i % 5], i);
+    }
+    *w++ = ')';
+    *w = '\0';
+    ASSERT_EQ(strlen(long_names), 8401);
+    ASSERT_EQ(regex_units_ere(long_names), 28000);
+    ASSERT_EQ(cbm_regcomp(&re, long_names, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "normalize_header_123", 0, NULL, 0), CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "normalize_header_400", 0, NULL, 0), CBM_REG_NOMATCH);
+    cbm_regfree(&re);
+    free(long_names);
+
+    /* `.{0,500}` is 500 units, inside the budget. Whether it compiles is the
+     * platform's RE_DUP_MAX (255 on the TRE-derived libcs, 32767 on glibc),
+     * which the guard does not change. */
+    ASSERT_LTE(regex_units_ere(".{0,500}"), (uint64_t)CBM_REGEX_COMPILE_BUDGET_UNITS);
+#ifdef __linux__
+    ASSERT_EQ(cbm_regcomp(&re, ".{0,500}", CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+    cbm_regfree(&re);
+#endif
+    PASS();
+}
+
+/* Sizing must read the syntax the way the compilers do: nothing inside a
+ * bracket expression operates, a backslash escapes one character, braces that
+ * do not form an interval are literals, and only an interval multiplies. */
+TEST(regex_estimate_counts_brackets_and_escapes_literally) {
+    ASSERT_EQ(regex_units_ere("[{]{2}"), 2);
+    ASSERT_EQ(regex_units_ere("\\{"), 1);
+    ASSERT_EQ(regex_units_ere("a\\{2\\}"), 4);
+    ASSERT_EQ(regex_units_ere("[]a]{2}"), 2);
+    ASSERT_EQ(regex_units_ere("[^]a]{3}"), 3);
+    ASSERT_EQ(regex_units_ere("[[:alpha:]]{4}"), 4);
+    ASSERT_EQ(regex_units_ere("[a-z{3}]"), 1);
+    ASSERT_EQ(regex_units_ere("a{"), 2);
+    ASSERT_EQ(regex_units_ere("a{2"), 3);
+    ASSERT_EQ(regex_units_ere("a{x}"), 4);
+    ASSERT_EQ(regex_units_ere("a{2}"), 2);
+    ASSERT_EQ(regex_units_ere("a{2,}"), 2);
+    ASSERT_EQ(regex_units_ere("a{,3}"), 3);
+    ASSERT_EQ(regex_units_ere("a{2,5}"), 5);
+    ASSERT_EQ(regex_units_ere("a*b+c?"), 3);
+    ASSERT_EQ(regex_units_ere("a{3}{3}"), 9);
+    ASSERT_EQ(regex_units_ere("(ab){3}"), 6);
+    ASSERT_EQ(regex_units_ere("((ab){3}){4}"), 24);
+    /* A K-way alternation is charged K*K/8 on top of its branches. */
+    ASSERT_EQ(regex_units_ere("a|b|c|d"), 4 + 2);
+    ASSERT_EQ(regex_units_ere("(a|b|c|d){10}"), 60);
+    /* Basic syntax: bare braces and parens are literals; `\{ \}` and `\( \)`
+     * operate. No call site uses it today, but the guard is shared. */
+    ASSERT_EQ(regex_units_bre("a{2}"), 4);
+    ASSERT_EQ(regex_units_bre("a\\{2\\}"), 2);
+    ASSERT_EQ(regex_units_bre("\\(ab\\)\\{3\\}"), 6);
+    ASSERT_EQ(regex_units_bre("(ab){3}"), 7);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
@@ -1191,7 +1467,13 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_env_long_reads_a_clean_number);
     RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
+    RUN_TEST(platform_env_dup_honours_the_settings_resolver);
     RUN_TEST(platform_system_info);
+    RUN_TEST(regex_compile_refuses_oversized_expansion);
+    RUN_TEST(regex_compile_accepts_expansion_under_budget);
+    RUN_TEST(regex_compile_refuses_overlong_pattern);
+    RUN_TEST(regex_compile_accepts_ordinary_intervals);
+    RUN_TEST(regex_estimate_counts_brackets_and_escapes_literally);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);

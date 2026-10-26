@@ -747,6 +747,20 @@ static void free_children(PageRef *children, int child_count, const PageRef *lea
     }
 }
 
+// Take the most recently placed cell back off an interior page (it is always
+// the lowest one in the content area) and zero its bytes, so the page is
+// byte-identical to one that never held it. Requires cell_count >= 2.
+static void unplace_last_interior_cell(uint8_t *page, int *cell_count, int *content_offset,
+                                       int *ptr_offset) {
+    const uint8_t *prev_ptr = page + *ptr_offset - (2 * CELL_PTR_SIZE);
+    int prev_offset = (prev_ptr[0] << 8) | prev_ptr[1];
+    memset(page + *content_offset, 0, (size_t)(prev_offset - *content_offset));
+    *ptr_offset -= CELL_PTR_SIZE;
+    memset(page + *ptr_offset, 0, CELL_PTR_SIZE);
+    *content_offset = prev_offset;
+    (*cell_count)--;
+}
+
 // Fill an interior page with cells from children[*idx..child_count-2].
 // Updates cell_count, content_offset, ptr_offset, and *idx.
 static void fill_interior_page(uint8_t *page, const PageRef *children, int child_count,
@@ -761,6 +775,17 @@ static void fill_interior_page(uint8_t *page, const PageRef *children, int child
         int available = *content_offset - *ptr_offset - CELL_PTR_SIZE;
         if (clen > available && *cell_count > 0) {
             free(heap_cell);
+            /* Full with children[*idx] as this page's right child. If that
+             * leaves exactly ONE child (the last), the next page would hold
+             * zero cells and only a right-child pointer — SQLite reports
+             * SQLITE_CORRUPT when a cursor descends into such a page (the
+             * rightmost path, which a key sorting after every row takes;
+             * #1783). Give the last cell back so the next page gets one
+             * cell plus the last child as its right child. */
+            if (*idx == child_count - 2 && *cell_count > SKIP_ONE) {
+                unplace_last_interior_cell(page, cell_count, content_offset, ptr_offset);
+                (*idx)--;
+            }
             break;
         }
 

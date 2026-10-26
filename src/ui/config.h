@@ -18,11 +18,13 @@ typedef struct {
     int ui_port;
 } cbm_ui_config_t;
 
-/* Load config from disk. Missing/corrupt file → defaults. */
+/* Load legacy JSON/defaults, then the shared transactional settings override. */
 void cbm_ui_config_load(cbm_ui_config_t *cfg);
+/* Legacy JSON/default baseline, before transactional settings overrides. */
+void cbm_ui_config_load_legacy(cbm_ui_config_t *cfg);
 
-/* Atomically save one complete config generation. Creates the directory if
- * needed and reports write/sync/replace failures. */
+/* Atomically save one complete config generation. Initialized applications use
+ * the shared SQLite settings store; legacy embedders retain JSON persistence. */
 bool cbm_ui_config_save(const cbm_ui_config_t *cfg);
 
 /* Get the config file path. Writes to buf (up to bufsz bytes).
