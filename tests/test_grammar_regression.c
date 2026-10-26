@@ -81,6 +81,21 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      "class A {\n    void Foo() {}\n}\n",
      2,
      {"A", "Foo", NULL}},
+    {"csharp_extension_declaration",
+     CBM_LANG_CSHARP,
+     "Extensions.cs",
+     "using System.Collections.Generic;\n"
+     "using System.Linq;\n"
+     "public static class NumberExtensions\n"
+     "{\n"
+     "    extension(IEnumerable<int> numbers)\n"
+     "    {\n"
+     "        public int SumPositive() =>\n"
+     "            numbers.Where(n => n > 0).Aggregate(0, static (total, n) => total + n);\n"
+     "    }\n"
+     "}\n",
+     2,
+     {"NumberExtensions", "SumPositive", NULL}},
     {"bash",
      CBM_LANG_BASH,
      "a.sh",

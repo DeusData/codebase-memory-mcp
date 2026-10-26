@@ -57,7 +57,8 @@ static int cte_codex_edit_commands_detailed(const char *path, const char *comman
                                             cbm_toml_codex_hook_action_t action, int check_only,
                                             cbm_toml_codex_hook_failure_t *failure) {
     return cbm_toml_reconcile_codex_hooks_detailed(path, CTE_CODEX_BEGIN, CTE_CODEX_END, command,
-                                                   command_windows, action, check_only, failure);
+                                                   command_windows, action, check_only, failure,
+                                                   NULL);
 }
 
 static int cte_codex_edit_detailed(const char *path, cbm_toml_codex_hook_action_t action,
@@ -1456,14 +1457,18 @@ TEST(config_toml_codex_accepts_v0102_managed_windows_crlf) {
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, before);
 
+    /* The v0.10.2 lifecycle-only block is ours: the upsert upgrades it in place to
+     * the current block (which adds PreToolUse Bash) and keeps the BOM, CRLF and
+     * the surrounding tables; a second upsert is then byte-identical. */
     ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
                                                CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
               0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
-    ASSERT_STR_EQ(actual, before);
+    ASSERT_EQ(strncmp(actual, "\xEF\xBB\xBF", 3U), 0);
     ASSERT_EQ(cte_occurrences(actual, CTE_CODEX_BEGIN), 1);
     ASSERT_EQ(cte_occurrences(actual, "[[hooks.SessionStart]]"), 1);
     ASSERT_EQ(cte_occurrences(actual, "[[hooks.SubagentStart]]"), 1);
+    ASSERT_EQ(cte_occurrences(actual, "[[hooks.PreToolUse]]"), 1);
     ASSERT_NOT_NULL(strstr(actual, "[mcp_servers.other]"));
     ASSERT_NOT_NULL(strstr(actual, "keep = true"));
     for (const char *cursor = actual; *cursor; ++cursor) {
@@ -1471,12 +1476,14 @@ TEST(config_toml_codex_accepts_v0102_managed_windows_crlf) {
             ASSERT(cursor > actual && cursor[-1] == '\r');
         }
     }
+    char upgraded[CTE_FILE_CAP];
+    ASSERT_GT(snprintf(upgraded, sizeof(upgraded), "%s", actual), 0);
 
     ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
                                                CBM_TOML_CODEX_HOOK_UPSERT, 0, &failure),
               0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
-    ASSERT_STR_EQ(actual, before);
+    ASSERT_STR_EQ(actual, upgraded);
 
     ASSERT_EQ(cte_codex_edit_commands_detailed(path, command, command_windows,
                                                CBM_TOML_CODEX_HOOK_REMOVE, 0, &failure),
