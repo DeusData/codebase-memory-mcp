@@ -947,6 +947,99 @@ TEST(lang_ext_chialisp) {
     PASS();
 }
 
+TEST(lang_ext_st) {
+    ASSERT_EQ(cbm_language_for_extension(".st"), CBM_LANG_ST);
+    PASS();
+}
+
+/* Content of a .st file as classified by cbm_disambiguate_st. */
+static CBMLanguage st_probe(const char *content) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_probe.st", cbm_tmpdir());
+    if (!write_probe_file(path, content)) {
+        return CBM_LANG_JSON; /* never a valid answer: fails the assert */
+    }
+    CBMLanguage lang = cbm_disambiguate_st(path);
+    remove(path);
+    return lang;
+}
+
+TEST(lang_st_pharo_tonel_not_st) {
+    ASSERT_EQ(st_probe("\"A Foo is a sample class\"\n"
+                       "Class {\n\t#name : #Foo,\n\t#superclass : #Object,\n"
+                       "\t#category : #Sample\n}\n\n"
+                       "{ #category : #accessing }\nFoo >> bar [\n\t^ 42\n]\n"),
+              CBM_LANG_COUNT);
+    /* Without the leading comment the head is "Class {", not a declaration. */
+    ASSERT_EQ(st_probe("Class {\n\t#name : #Foo,\n\t#superclass : #Object\n}\n"), CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe("Extension { #name : #Foo }\n"), CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(lang_st_gnu_smalltalk_not_st) {
+    ASSERT_EQ(st_probe("Object subclass: Animal [\n"
+                       "    | name |\n"
+                       "    speak [ ^ 'generic noise' ]\n"
+                       "]\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe("Object subclass: #Account\n"
+                       "  instanceVariableNames: 'balance'\n"
+                       "  classVariableNames: ''\n"
+                       "  package: 'Bank'\n"),
+              CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(lang_st_stringtemplate_not_st) {
+    ASSERT_EQ(st_probe("program(name, body) ::= <<\n"
+                       "int main() { <body> }\n"
+                       ">>\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe("group simple;\n\nvardef(type,name) ::= \"<type> <name>;\"\n"),
+              CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe("<html><body>$title$</body></html>\n"), CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(lang_st_long_comment_header_is_st) {
+    char content[4096];
+    size_t off = 0;
+    for (int i = 0; i < 40; i++) {
+        off += (size_t)snprintf(content + off, sizeof(content) - off,
+                                "// Line %d of a long license and revision header\n", i);
+    }
+    (void)snprintf(content + off, sizeof(content) - off,
+                   "(* block comment *)\n/* C-style comment */\n"
+                   "{attribute 'qualified_only'}\n"
+                   "FUNCTION_BLOCK FB_Motor\nVAR\n\tbOn : BOOL;\nEND_VAR\nEND_FUNCTION_BLOCK\n");
+    ASSERT_GT(off, 1024);
+    ASSERT_EQ(st_probe(content), CBM_LANG_ST);
+    PASS();
+}
+
+TEST(lang_st_declaration_heads_are_st) {
+    ASSERT_EQ(st_probe("\xEF\xBB\xBFPROGRAM Main\nEND_PROGRAM\n"), CBM_LANG_ST);
+    ASSERT_EQ(st_probe("FUNCTION Add : INT\nEND_FUNCTION\n"), CBM_LANG_ST);
+    ASSERT_EQ(st_probe("TYPE\n\tE_Mode : (Off, On);\nEND_TYPE\n"), CBM_LANG_ST);
+    ASSERT_EQ(st_probe("interface I_Motor\nend_interface\n"), CBM_LANG_ST);
+    ASSERT_EQ(st_probe("ABSTRACT FUNCTION_BLOCK FB_Base\nEND_FUNCTION_BLOCK\n"), CBM_LANG_ST);
+    ASSERT_EQ(st_probe("VAR_GLOBAL\n\t{attribute 'hide'}\n\tn : INT;\nEND_VAR\n"), CBM_LANG_ST);
+    ASSERT_EQ(st_probe("USING Lib.Motion;\nPROGRAM Main\nEND_PROGRAM\n"), CBM_LANG_ST);
+    PASS();
+}
+
+TEST(lang_st_not_st_heads) {
+    /* Keyword prefix of a longer word, an unterminated header comment, and a
+     * keyword that is not followed by a name. */
+    ASSERT_EQ(st_probe("PROGRAMS are listed below\n"), CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe("(* header that never ends\nPROGRAM Main\n"), CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe("TYPE: text\n"), CBM_LANG_COUNT);
+    ASSERT_EQ(st_probe(""), CBM_LANG_COUNT);
+    ASSERT_EQ(cbm_disambiguate_st("/tmp/nonexistent_file_12345.st"), CBM_LANG_COUNT);
+    ASSERT_EQ(cbm_disambiguate_st(NULL), CBM_LANG_COUNT);
+    PASS();
+}
+
 TEST(lang_ext_fennel) {
     ASSERT_EQ(cbm_language_for_extension(".fnl"), CBM_LANG_FENNEL);
     PASS();
@@ -1399,6 +1492,7 @@ TEST(lang_probe_bytes_follow_the_name) {
     ASSERT_EQ(cbm_language_probe_bytes("Form1.frm"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("App.res"), 4096);
     ASSERT_EQ(cbm_language_probe_bytes("Widget.cfc"), 16384);
+    ASSERT_EQ(cbm_language_probe_bytes("Main.st"), 16384);
     ASSERT_EQ(cbm_language_probe_bytes("pom.xml"), 255);
     /* An unknown name falls back to a shebang probe of the first line. */
     ASSERT_EQ(cbm_language_probe_bytes("run-tests"), 255);
@@ -1439,6 +1533,9 @@ TEST(lang_classify_matches_every_content_rule) {
         {"p.frm", "#procedure foo\nLocal F = a;\n", CBM_LANG_FORM, cbm_disambiguate_frm},
         {"q.res", "RSRC\0\0\0\1binary", CBM_LANG_COUNT, cbm_disambiguate_res},
         {"r.res", "let x = 1\n", CBM_LANG_RESCRIPT, cbm_disambiguate_res},
+        {"r2.st", "(* header *)\nFUNCTION_BLOCK FB_Motor\nEND_FUNCTION_BLOCK\n", CBM_LANG_ST,
+         cbm_disambiguate_st},
+        {"r3.st", "Class {\n\t#name : #Foo\n}\n", CBM_LANG_COUNT, cbm_disambiguate_st},
         {"s.xml", "<?xml version=\"1.0\"?>\n<Export generator=\"IRIS\" version=\"26\">\n",
          CBM_LANG_OBJECTSCRIPT_EXPORT, NULL},
         {"t.xml", "<?xml version=\"1.0\"?>\n<project/>\n", CBM_LANG_XML, NULL},
@@ -1486,6 +1583,7 @@ TEST(lang_classify_unreadable_content_keeps_the_name_default) {
     ASSERT_EQ(cbm_language_classify("a.cfc", NULL, 0, false, false), CBM_LANG_CFSCRIPT);
     ASSERT_EQ(cbm_language_classify("a.frm", NULL, 0, false, false), CBM_LANG_FORM);
     ASSERT_EQ(cbm_language_classify("a.res", NULL, 0, false, false), CBM_LANG_RESCRIPT);
+    ASSERT_EQ(cbm_language_classify("a.st", NULL, 0, false, false), CBM_LANG_COUNT);
     ASSERT_EQ(cbm_language_classify("a.xml", NULL, 0, false, false), CBM_LANG_XML);
     ASSERT_EQ(cbm_language_classify("run-tests", NULL, 0, false, false), CBM_LANG_COUNT);
     ASSERT_EQ(cbm_language_classify("main.go", NULL, 0, false, false), CBM_LANG_GO);
@@ -1729,6 +1827,13 @@ SUITE(language) {
     RUN_TEST(lang_ext_nim);
     RUN_TEST(lang_ext_scheme);
     RUN_TEST(lang_ext_chialisp);
+    RUN_TEST(lang_ext_st);
+    RUN_TEST(lang_st_pharo_tonel_not_st);
+    RUN_TEST(lang_st_gnu_smalltalk_not_st);
+    RUN_TEST(lang_st_stringtemplate_not_st);
+    RUN_TEST(lang_st_long_comment_header_is_st);
+    RUN_TEST(lang_st_declaration_heads_are_st);
+    RUN_TEST(lang_st_not_st_heads);
     RUN_TEST(lang_ext_fennel);
     RUN_TEST(lang_ext_fish);
     RUN_TEST(lang_ext_awk);
