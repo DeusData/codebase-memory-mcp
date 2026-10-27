@@ -2444,6 +2444,10 @@ TEST(server_handle_logs_request_without_params) {
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));
     PASS();
@@ -6062,6 +6066,104 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     ASSERT_TRUE(page_truthful);
     ASSERT_TRUE(json_direct);
     ASSERT_TRUE(json_structured);
+    PASS();
+}
+
+/* #1115: with more indexed projects than were resident at once, the
+ * least-recently-used one answered "project not found or not indexed" from
+ * index_status, and list_projects and index_status disagreed in the same
+ * session. The server keeps one project store open and switches it whenever a
+ * call names another project, so twelve projects visited one after another
+ * force a switch on every step and each visit is the first touch of a project
+ * that is not resident. Every project must resolve through index_status and a
+ * query, and list_projects must report all twelve before and after the
+ * switches. */
+TEST(tool_project_discovery_agrees_across_store_switches_issue1115) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-switch-1115-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    enum { PROJECTS = 12 };
+    for (int i = 0; i < PROJECTS; i++) {
+        char project[32];
+        char db_path[512];
+        char root_path[512];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        snprintf(root_path, sizeof(root_path),
+                 "/workspaces/organization/shared/services/lean-project-%02d", i);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, root_path), CBM_STORE_OK);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "entry",
+                           .qualified_name = "shared.module.entry",
+                           .file_path = "src/main.c",
+                           .start_line = 1,
+                           .end_line = 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+        cbm_store_close(store);
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *pre_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *pre_switch = extract_text_content(pre_switch_response);
+    bool list_complete_before_switches = pre_switch && strstr(pre_switch, "total: 12") &&
+                                         strstr(pre_switch, "lean-project-00") &&
+                                         strstr(pre_switch, "lean-project-11");
+    free(pre_switch);
+    free(pre_switch_response);
+
+    bool projects_resolve_after_switches = true;
+    for (int i = PROJECTS - 1; i >= 0; i--) {
+        char project[32];
+        char args[96];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+
+        char *status_response = cbm_mcp_handle_tool(srv, "index_status", args);
+        char *status = extract_text_content(status_response);
+        if (!status || !strstr(status, "ready")) {
+            projects_resolve_after_switches = false;
+        }
+        free(status);
+        free(status_response);
+
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"entry\"}", project);
+        char *search_response = cbm_mcp_handle_tool(srv, "search_graph", args);
+        char *search = extract_text_content(search_response);
+        if (!search || !strstr(search, "entry")) {
+            projects_resolve_after_switches = false;
+        }
+        free(search);
+        free(search_response);
+    }
+    char *post_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *post_switch = extract_text_content(post_switch_response);
+    bool list_complete_after_switches = post_switch && strstr(post_switch, "total: 12") &&
+                                        strstr(post_switch, "lean-project-00") &&
+                                        strstr(post_switch, "lean-project-11");
+    free(post_switch);
+    free(post_switch_response);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    for (int i = 0; i < PROJECTS; i++) {
+        char project[32];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        cleanup_project_db(cache, project);
+    }
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(list_complete_before_switches);
+    ASSERT_TRUE(projects_resolve_after_switches);
+    ASSERT_TRUE(list_complete_after_switches);
     PASS();
 }
 
@@ -12364,14 +12466,27 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     };
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_code",
-                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
-                            "\"file_pattern\":\"*.go\"}");
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\",\"file_pattern\":"
+             "\"*.go\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(probe.cancel_accepted);
     ASSERT_NOT_NULL(strstr(response, "cancelled"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "tool=search_code"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
 
     char logs[640];
     snprintf(logs, sizeof(logs), "%s/logs", cache.path);
@@ -12381,6 +12496,39 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(server_handle_logs_timeout_without_query) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=timeout"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -25126,6 +25274,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
+    RUN_TEST(tool_project_discovery_agrees_across_store_switches_issue1115);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_ingest_traces_stores_observed_calls);
@@ -25224,6 +25373,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);

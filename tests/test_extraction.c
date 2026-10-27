@@ -879,6 +879,89 @@ TEST(csharp_interface) {
     PASS();
 }
 
+/* Issue #2071: a C# 14 extension block parses as a constructor_declaration
+ * named `extension` whose body holds the members, and has_error stays 0, so the
+ * members were dropped without any signal. They belong to the enclosing type. */
+TEST(csharp_extension_block_members) {
+    CBMFileResult *r = extract("namespace App;\n"
+                               "public static class NumberExtensions\n"
+                               "{\n"
+                               "    extension(IEnumerable<int> numbers)\n"
+                               "    {\n"
+                               "        public int SumPositive() => 0;\n"
+                               "        public static int Zero() => 0;\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "NumberExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "NumberExtensions"));
+    ASSERT(has_def(r, "Method", "SumPositive"));
+    ASSERT(has_def(r, "Method", "Zero"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same shape is a genuine constructor inside a type actually called
+ * `extension`, and must still be emitted (#2071). */
+TEST(csharp_constructor_of_type_named_extension) {
+    CBMFileResult *r =
+        extract("namespace App { public class extension { public extension() { } } }",
+                CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Escaping a type identifier does not change its constructor's identity. */
+TEST(csharp_constructor_of_escaped_type_named_extension) {
+    const char *src = "namespace App { public class @extension { "
+                      "public extension() { int ConstructorLocal() => 1; } } }";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "ConstructorLocal"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* All conditional branches expose extension members, but method-local
+ * functions must never be promoted to members of the enclosing type. */
+TEST(csharp_extension_block_conditional_members) {
+    const char *src = "public static class TextExtensions\n"
+                      "{\n"
+                      "    extension(string text)\n"
+                      "    {\n"
+                      "#if FIRST\n"
+                      "        public int First() { int Nested() => 1; return Nested(); }\n"
+                      "#elif SECOND\n"
+                      "        public int Second() => 2;\n"
+                      "#else\n"
+                      "#if NESTED\n"
+                      "        public int Third() => 3;\n"
+                      "#else\n"
+                      "        public int Fourth() => 4;\n"
+                      "#endif\n"
+                      "#endif\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "TextExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "First"));
+    ASSERT(has_def(r, "Method", "Second"));
+    ASSERT(has_def(r, "Method", "Third"));
+    ASSERT(has_def(r, "Method", "Fourth"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "Nested"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Swift --- */
 TEST(swift_class) {
     CBMFileResult *r = extract("class Vehicle {\n    var speed: Int = 0\n    func accelerate() { "
@@ -1761,6 +1844,54 @@ TEST(elixir_call_string_argument) {
         ASSERT_STR_EQ("/wallets", r->calls.items[i].first_string_arg);
     }
     ASSERT_EQ(1, seen);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* True when a channel with this name/transport/direction was extracted. */
+static int has_channel(CBMFileResult *r, const char *name, const char *transport,
+                       CBMChannelDirection dir) {
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *c = &r->channels.items[i];
+        if (c->channel_name && strcmp(c->channel_name, name) == 0 && c->transport &&
+            strcmp(c->transport, transport) == 0 && c->direction == dir)
+            return 1;
+    }
+    return 0;
+}
+
+/* Phoenix pub/sub and channel listeners. Both branches were unreachable: the
+ * emit side looked up an "arguments" FIELD that tree-sitter-elixir does not
+ * define, and the listener side dispatched on a "def" NODE TYPE that does not
+ * exist (Elixir defs are `call` nodes), so a Phoenix app produced no channels
+ * at all. */
+TEST(elixir_channels_pubsub_and_handle_in) {
+    CBMFileResult *r =
+        extract("defmodule Acme.Notifier do\n"
+                "  def announce(p) do\n"
+                "    Phoenix.PubSub.broadcast(Acme.PubSub, \"user:created\", p)\n"
+                "  end\n"
+                "  def watch, do: Phoenix.PubSub.subscribe(Acme.PubSub, \"user:updated\")\n"
+                "end\n"
+                "defmodule AcmeWeb.RoomChannel do\n"
+                "  def handle_in(\"new_msg\", payload, socket) do\n"
+                "    push(socket, \"pong\", %{})\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "  def handle_in(\"ping\", _p, socket) when is_map(socket) do\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "end\n",
+                CBM_LANG_ELIXIR, "t", "chan.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "user:created", "phoenix_pubsub", CBM_CHANNEL_EMIT));
+    ASSERT(has_channel(r, "user:updated", "phoenix_pubsub", CBM_CHANNEL_LISTEN));
+    /* handle_in clauses are listeners — including the guarded one. */
+    ASSERT(has_channel(r, "new_msg", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    ASSERT(has_channel(r, "ping", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    /* A bare push/broadcast inside the channel module is an emit. */
+    ASSERT(has_channel(r, "pong", "phoenix_channel", CBM_CHANNEL_EMIT));
     cbm_free_result(r);
     PASS();
 }
@@ -13156,6 +13287,10 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
+    RUN_TEST(csharp_extension_block_members);
+    RUN_TEST(csharp_constructor_of_type_named_extension);
+    RUN_TEST(csharp_constructor_of_escaped_type_named_extension);
+    RUN_TEST(csharp_extension_block_conditional_members);
     RUN_TEST(swift_class);
     RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
@@ -13203,6 +13338,7 @@ SUITE(extraction) {
     /* Functional */
     RUN_TEST(elixir_function);
     RUN_TEST(elixir_call_string_argument);
+    RUN_TEST(elixir_channels_pubsub_and_handle_in);
     RUN_TEST(haskell_function);
     RUN_TEST(haskell_infix_definition_name);
     RUN_TEST(ocaml_function);

@@ -8467,6 +8467,45 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
     PASS();
 }
 
+#ifndef _WIN32
+/* A nested directory the process cannot open (permission-denied) must not
+ * abort the whole manifest walk: it has no control files to contribute, so
+ * it is skipped, and control files in sibling directories still get found.
+ * Root-not-a-directory (above) is a different, still fail-closed case. */
+TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_locked_dir_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "readable.py", "def Readable():\n    return 1\n");
+    write_temp_file(tmp, "locked/secret.txt", "should never be opened\n");
+    write_temp_file(tmp, "sibling/.gitignore", "*.log\n");
+
+    char locked_path[512];
+    snprintf(locked_path, sizeof(locked_path), "%s/locked", tmp);
+    ASSERT_EQ(chmod(locked_path, 0), 0);
+
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = -1;
+    int rc = cbm_pipeline_build_semantic_manifest("manifest-skip-locked", tmp, NULL, 0, NULL, 0,
+                                                  NULL, NULL, &manifest, &manifest_count);
+
+    bool found_sibling_gitignore = false;
+    for (int i = 0; i < manifest_count; i++) {
+        if (manifest[i].rel_path && strcmp(manifest[i].rel_path, "sibling/.gitignore") == 0) {
+            found_sibling_gitignore = true;
+        }
+    }
+
+    chmod(locked_path, 0755);
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(found_sibling_gitignore);
+    PASS();
+}
+#endif /* !_WIN32 */
+
 /* A fully validated staged graph must be able to recover from a definitely
  * non-SQLite destination without deleting evidence or overwriting an earlier
  * quarantine. The replacement happens only after the corrupt bytes are moved. */
@@ -13668,6 +13707,40 @@ TEST(pipeline_native_fetch_classified_as_http_calls) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_native_fetch_template_base_url_makes_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fetch_template_base_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "const BASE_URL = \"http://payments:8080\";\n"
+                    "export async function createPayment(body: unknown) {\n"
+                    "  return fetch(`${BASE_URL}/v1/payments`, { method: 'POST', body });\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fetch_template_base.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int http_call_count = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
+    int matching_route_count =
+        http_calls_to_route(s, project, "createPayment", "/v1/payments");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_EQ(http_call_count, 1);
+    ASSERT_EQ(matching_route_count, 1);
     PASS();
 }
 
@@ -28206,6 +28279,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
     RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
+    RUN_TEST(pipeline_native_fetch_template_base_url_makes_route);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
@@ -28610,6 +28684,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
     RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
+#ifndef _WIN32
+    RUN_TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory);
+#endif
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
 #endif
