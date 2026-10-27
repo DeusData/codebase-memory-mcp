@@ -2444,6 +2444,10 @@ TEST(server_handle_logs_request_without_params) {
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));
     PASS();
@@ -12462,14 +12466,27 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     };
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_code",
-                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
-                            "\"file_pattern\":\"*.go\"}");
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\",\"file_pattern\":"
+             "\"*.go\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(probe.cancel_accepted);
     ASSERT_NOT_NULL(strstr(response, "cancelled"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "tool=search_code"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
 
     char logs[640];
     snprintf(logs, sizeof(logs), "%s/logs", cache.path);
@@ -12479,6 +12496,39 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(server_handle_logs_timeout_without_query) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=timeout"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -25323,6 +25373,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);
