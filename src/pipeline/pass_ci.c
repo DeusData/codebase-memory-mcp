@@ -725,6 +725,15 @@ static const char *ci_unquote(const char *v, size_t *len) {
 
 static const char *ci_interp(CBMArena *a, const char *s, const ci_env_t *env);
 
+static bool ci_dotenv_value_supported(const char *value, size_t length) {
+    bool quoted = length != 0 && (value[0] == '\'' || value[0] == '"');
+    if (quoted && (length < PAIR_LEN || value[length - SKIP_ONE] != value[0])) {
+        return false;
+    }
+    return !memchr(value, '\\', length) && !memchr(value, '#', length) &&
+           !memchr(value, '`', length);
+}
+
 /* One .env line s[0, n): KEY=VALUE (an `export ` prefix, quotes around the
  * value removed) appended to env, its ${X} references expanded from the lines
  * before it as compose does (`CART_ADDR=cart:${CART_PORT}`; a single-quoted
@@ -758,10 +767,9 @@ static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) 
     }
     size_t vl = n - v;
     bool literal = v < n && s[v] == '\'';
-    bool quoted = v < n && (s[v] == '\'' || s[v] == '"');
-    if ((quoted && (vl < PAIR_LEN || s[n - SKIP_ONE] != s[v])) || memchr(s + v, '\\', vl) ||
-        memchr(s + v, '#', vl) || memchr(s + v, '`', vl))
+    if (!ci_dotenv_value_supported(s + v, vl)) {
         env->unsupported = true;
+    }
     const char *val = ci_unquote(s + v, &vl);
     const char *raw = cbm_arena_strndup(a, val, vl);
     const char *expanded = raw && !literal ? ci_interp(a, raw, env) : NULL;
