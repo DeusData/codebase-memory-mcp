@@ -1,4 +1,5 @@
 #include "snapshot.h"
+#include "foundation/mem_core.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,7 +62,7 @@ bool cbm_resolve_snapshot(const CBMFileResult *r, const char *path, CBMLanguage 
                    (size_t)r->type_assigns.count + (size_t)r->field_types.count;
     if (count > SIZE_MAX / 65)
         return false;
-    char (*digests)[65] = count ? malloc(count * sizeof(*digests)) : NULL;
+    char (*digests)[65] = count ? cbm_alloc(CBM_MEM_CLASS_EXTRACT, count * sizeof(*digests)) : NULL;
     if (count && !digests)
         return false;
     size_t at = 0;
@@ -112,7 +113,7 @@ bool cbm_resolve_snapshot(const CBMFileResult *r, const char *path, CBMLanguage 
         cbm_resolve_hash_text(&summary, digests[i]);
     hash_list(&summary, r->exports);
     cbm_resolve_hash_finish(&summary, extracted);
-    free(digests);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, digests);
     *out = (cbm_resolve_file_t){.file_path = path,
                                 .module = r->module_qn,
                                 .raw_content_identity = r->source_content_id[0],

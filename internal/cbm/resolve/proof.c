@@ -1,4 +1,5 @@
 #include "proof.h"
+#include "foundation/mem_core.h"
 #include "policy.h"
 #include <stdlib.h>
 #include <string.h>
@@ -322,7 +323,7 @@ static bool memo_grow(proof_walk_t *walk) {
     size_t capacity = walk->capacity ? walk->capacity * 2 : 32;
     if (capacity < walk->capacity || capacity > SIZE_MAX / sizeof(*walk->slots))
         return false;
-    proof_memo_slot_t *slots = calloc(capacity, sizeof(*slots));
+    proof_memo_slot_t *slots = cbm_calloc(CBM_MEM_CLASS_EXTRACT, capacity * sizeof(*slots));
     if (!slots)
         return false;
     proof_memo_slot_t *old = walk->slots;
@@ -332,7 +333,7 @@ static bool memo_grow(proof_walk_t *walk) {
     for (size_t i = 0; i < old_capacity; i++)
         if (old[i].source)
             *memo_slot(walk, old[i].source) = old[i];
-    free(old);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, old);
     return true;
 }
 static const cbm_resolve_proof_t *walk_node(proof_walk_t *walk, const cbm_resolve_proof_t *proof,
@@ -369,7 +370,8 @@ static const cbm_resolve_proof_t *walk_node(proof_walk_t *walk, const cbm_resolv
         walk->failure = CBM_RESOLVE_ANALYSIS_LIMITED;
         return NULL;
     }
-    const cbm_resolve_proof_t **premises = count ? malloc(count * sizeof(*premises)) : NULL;
+    const cbm_resolve_proof_t **premises =
+        count ? cbm_alloc(CBM_MEM_CLASS_EXTRACT, count * sizeof(*premises)) : NULL;
     if (count && !premises) {
         walk->failure = CBM_RESOLVE_ANALYSIS_FAILED;
         return NULL;
@@ -390,7 +392,7 @@ static const cbm_resolve_proof_t *walk_node(proof_walk_t *walk, const cbm_resolv
     } else if (ok && walk->visit(proof, walk->context)) {
         result = proof;
     }
-    free(premises);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, premises);
     memo_slot(walk, proof)->destination = result;
     return result;
 }
@@ -401,7 +403,7 @@ bool cbm_resolve_proof_clone_begin(cbm_resolve_proof_clone_session_t *session,
     *session = (cbm_resolve_proof_clone_session_t){.destination = destination};
     if (!proof_step(destination, 1))
         return false;
-    proof_walk_t *walk = calloc(1, sizeof(*walk));
+    proof_walk_t *walk = cbm_calloc(CBM_MEM_CLASS_EXTRACT, sizeof(*walk));
     if (!walk)
         return proof_fail(destination, CBM_RESOLVE_ANALYSIS_FAILED);
     walk->pool = destination;
@@ -426,8 +428,8 @@ void cbm_resolve_proof_clone_end(cbm_resolve_proof_clone_session_t *session) {
         return;
     proof_walk_t *walk = session->state;
     if (walk) {
-        free(walk->slots);
-        free(walk);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, walk->slots);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, walk);
     }
     *session = (cbm_resolve_proof_clone_session_t){0};
 }
@@ -450,7 +452,7 @@ bool cbm_resolve_proof_visit(const cbm_resolve_proof_t *root, size_t node_limit,
     proof_walk_t walk = {
         .visit = visit, .context = context, .limit = node_limit ? node_limit : PROOF_DEFAULT_NODES};
     bool ok = walk_node(&walk, root, 1) != NULL;
-    free(walk.slots);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, walk.slots);
     return ok;
 }
 bool cbm_resolve_proof_visit_roots(const cbm_resolve_proof_t *const *roots, size_t root_count,
@@ -460,7 +462,8 @@ bool cbm_resolve_proof_visit_roots(const cbm_resolve_proof_t *const *roots, size
         return false;
     if (!root_count)
         return true;
-    const cbm_resolve_proof_t **sorted = malloc(root_count * sizeof(*sorted));
+    const cbm_resolve_proof_t **sorted =
+        cbm_alloc(CBM_MEM_CLASS_EXTRACT, root_count * sizeof(*sorted));
     if (!sorted)
         return false;
     memcpy(sorted, roots, root_count * sizeof(*sorted));
@@ -474,8 +477,8 @@ bool cbm_resolve_proof_visit_roots(const cbm_resolve_proof_t *const *roots, size
             break;
         }
     }
-    free(walk.slots);
-    free(sorted);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, walk.slots);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, sorted);
     return ok;
 }
 static unsigned state_rank(cbm_resolve_analysis_t state) {
@@ -514,7 +517,8 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
         proof_fail(pool, CBM_RESOLVE_ANALYSIS_LIMITED);
         return NULL;
     }
-    const cbm_resolve_proof_t **premises = malloc(count * sizeof(*premises));
+    const cbm_resolve_proof_t **premises =
+        cbm_alloc(CBM_MEM_CLASS_EXTRACT, count * sizeof(*premises));
     if (!premises) {
         proof_fail(pool, CBM_RESOLVE_ANALYSIS_FAILED);
         return NULL;
@@ -548,7 +552,7 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
         if (value.depth <= p->depth)
             value.depth = p->depth + 1;
     }
-    free(walk.slots);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, walk.slots);
     if (!ok && pool->failure == CBM_RESOLVE_ANALYSIS_COMPLETE)
         proof_fail(pool, walk.failure == CBM_RESOLVE_ANALYSIS_LIMITED
                              ? CBM_RESOLVE_ANALYSIS_LIMITED
@@ -570,6 +574,6 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
         }
         result = intern(pool, value);
     }
-    free(premises);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, premises);
     return result;
 }

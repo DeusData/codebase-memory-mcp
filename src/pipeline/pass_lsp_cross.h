@@ -74,21 +74,22 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
 
 /* Build the local-name -> semantic import-QN map consumed by cross-file LSPs.
  * Both sequential and parallel drivers use this exact helper so import
- * metadata cannot diverge between pipelines. Values are owned by the returned
+ * metadata cannot diverge between pipelines. The immutable context preserves
+ * path aliases from the admitted configuration. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
  * cbm_pxc_free_import_map(). A complete PHP binding snapshot also permits an
  * allocated empty map. This compatibility projection alone never proves
  * vendor absence: consumers require cbm_pipeline_php_vendor_names_build's
  * separate typed evidence, including completion and full import identities. */
-int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
+int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path, CBMLanguage lang,
+                             const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
 /* As cbm_pxc_build_import_map (which is include_type_only = false, the CALLS
  * map), but with include_type_only also binding annotation-only imports
  * (Python `if TYPE_CHECKING:`), for the consumers that resolve annotations:
  * the Python LSP and the cross-file base/field-type resolution (#1277). */
-int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
-                                const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+int cbm_pxc_build_import_map_ex(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                CBMLanguage lang, const CBMFileResult *result,
                                 bool include_type_only, const char ***out_keys,
                                 const char ***out_vals, int *out_count);
 /* True when the file records an annotation-only import (the LSP map then

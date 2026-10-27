@@ -828,6 +828,28 @@ void cbm_pipeline_set_objectscript_export_extractor_for_tests(
     objectscript_export_test_extractor = extractor;
 }
 
+/* Per-class UDL offsets are not coordinates in the physical XML file.
+ * Keep copied carriers for quality accounting, but provide neither a shared
+ * transformed identity nor stale semantic proof from one generated unit.
+ * CBMImport has no coordinates; its text remains unproved by the XML binding
+ * index. The owned child results and their individual snapshots stay intact. */
+static void objectscript_export_mark_transformed(CBMFileResult *aggregate) {
+    for (int i = 0; i < aggregate->calls.count; i++)
+        aggregate->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->usages.count; i++)
+        aggregate->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->rw.count; i++)
+        aggregate->rw.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->type_refs.count; i++)
+        aggregate->type_refs.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->type_assigns.count; i++)
+        aggregate->type_assigns.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->resolved_calls.count; i++) {
+        aggregate->resolved_calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+        aggregate->resolved_calls.items[i].evidence = (cbm_resolve_evidence_t){0};
+    }
+}
+
 CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     const char *source, int source_len, const char *project_name, const char *rel_path,
     const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table,
@@ -860,6 +882,20 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
         return NULL;
     }
     aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
+    if (!cbm_result_capture_raw_source(aggregate, source, source_len, CBM_LANG_OBJECTSCRIPT_EXPORT,
+                                       NULL, NULL)) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+    aggregate->source_project =
+        project_name ? cbm_arena_strdup(&aggregate->arena, project_name) : NULL;
+    aggregate->source_file = rel_path ? cbm_arena_strdup(&aggregate->arena, rel_path) : NULL;
+    if ((project_name && !aggregate->source_project) || (rel_path && !aggregate->source_file)) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
 
     cbm_objectscript_export_extractor_t extract = objectscript_export_test_extractor
                                                       ? objectscript_export_test_extractor
@@ -913,6 +949,7 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     }
 
     aggregate->imports_count = aggregate->imports.count;
+    objectscript_export_mark_transformed(aggregate);
     cbm_arena_destroy(&export_arena);
     return aggregate;
 }

@@ -1909,12 +1909,20 @@ static bool go_emit_proven(GoLSPContext *ctx, const cbm_resolve_result_t *proof,
                             ts_node_named_child_count(site) == 1;
              depth++)
             site = ts_node_named_child(site, 0);
+        TSNode spelling = site;
         if (!strcmp(ts_node_type(site), "selector_expression")) {
             TSNode leaf = ts_node_child_by_field_name(site, "field", 5);
-            if (!ts_node_is_null(leaf))
-                site = leaf;
+            TSNode parent = ts_node_parent(site);
+            if (!ts_node_is_null(leaf)) {
+                spelling = leaf;
+                /* A direct selector argument keeps the complete selector
+                 * occurrence but the member leaf spelling in extraction.
+                 * Assignment and composite reads retain their leaf site. */
+                if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "argument_list"))
+                    site = leaf;
+            }
         }
-        source_name = lsp_node_text(ctx, site);
+        source_name = lsp_node_text(ctx, spelling);
     }
     cbm_resolve_result_t occurrence = *proof;
     if (accepted) {
@@ -2033,6 +2041,37 @@ static void go_resolve_value_references_at(GoLSPContext *ctx, TSNode call) {
     }
 }
 
+/* Assignments evaluate every RHS before any LHS binding changes. Capture only
+ * direct callable values here; the existing proof lookup rejects unknown
+ * locals, indexed expressions, and ambiguous receivers. */
+static void go_resolve_assignment_references_at(GoLSPContext *ctx, TSNode statement) {
+    const char *kind = ts_node_type(statement);
+    const char *field =
+        !strcmp(kind, "short_var_declaration") || !strcmp(kind, "assignment_statement") ? "right"
+        : !strcmp(kind, "var_spec")                                                     ? "value"
+                                                                                        : NULL;
+    if (!field)
+        return;
+    TSNode values = ts_node_child_by_field_name(statement, field, (uint32_t)strlen(field));
+    if (ts_node_is_null(values))
+        return;
+    if (strcmp(ts_node_type(values), "expression_list")) {
+        cbm_resolve_result_t proof = go_callable_proof(ctx, values);
+        (void)go_emit_proven(ctx, &proof, NULL, CBM_RESOLVED_CALL_REFERENCE, values);
+        return;
+    }
+    TSTreeCursor cursor = ts_tree_cursor_new(values);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            TSNode value = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(value))
+                continue;
+            cbm_resolve_result_t proof = go_callable_proof(ctx, value);
+            (void)go_emit_proven(ctx, &proof, NULL, CBM_RESOLVED_CALL_REFERENCE, value);
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 /* Any assignment that is guarded by a branch/loop makes the post-construct
  * callable identity a join of at least two paths. Clear the outer exact
  * identity before walking the construct; assignments inside its temporary
@@ -2097,7 +2136,8 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
         return;
     const char *kind = ts_node_type(node);
 
-    // Process statements to build scope
+    // Capture RHS values before statements update their lexical bindings.
+    go_resolve_assignment_references_at(ctx, node);
     go_process_statement(ctx, node);
 
     if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "for_statement") == 0 ||

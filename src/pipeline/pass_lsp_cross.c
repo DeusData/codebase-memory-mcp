@@ -84,7 +84,7 @@ static bool pxc_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
 
-/* Slurp a file into a malloc'd, NUL-terminated buffer. Mirrors the
+/* Slurp a file into an EXTRACT-owned, NUL-terminated buffer. Mirrors the
  * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
  * pipeline doesn't grow a public read-file API just for this pass). */
 static char *pxc_read_file(const char *path, int *out_len) {
@@ -100,7 +100,7 @@ static char *pxc_read_file(const char *path, int *out_len) {
     }
     /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
     enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = (char *)malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
+    char *buf = (char *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)size + CBM_TS_LOOKAHEAD_PAD);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -1229,9 +1229,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             bs.gbuf = ctx->gbuf;
             /* Bases and field annotations resolve through annotation-only
              * imports too: `if TYPE_CHECKING:` exists for them (#1277). */
-            if (cbm_pxc_build_import_map_ex(ctx->gbuf, project_name, files[fi].rel_path,
-                                            files[fi].language, fr, true, &bs.imp_keys,
-                                            &bs.imp_vals, &bs.imp_count) != 0) {
+            if (cbm_pxc_build_import_map_ex(ctx, files[fi].rel_path, files[fi].language, fr, true,
+                                            &bs.imp_keys, &bs.imp_vals, &bs.imp_count) != 0) {
                 if (fr_loaded)
                     cbm_free_result(fr);
                 free(defs);
@@ -1318,10 +1317,10 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             else
                 (void)cbm_php_collect_source_facts(arena, source, source_length, fr->module_qn,
                                                    defs + file_start, idx - file_start);
-            free(source_owned);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source_owned);
         }
         cbm_arena_destroy(&binding_arena);
-        free(export_source_owned);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, export_source_owned);
         if (files[fi].language == CBM_LANG_PYTHON) {
             pxc_fold_py_field_types(arena, fr, defs, file_start, idx, &bs, def_modules[fi]);
             /* Package namespace records (re-exports), reserved in the bound
@@ -1513,11 +1512,11 @@ static char *pxc_python_import_from_metadata(const cbm_gbuf_t *gbuf, const char 
 /* Build per-file import map (local_name -> semantic import QN) from gbuf
  * IMPORTS edges. Both pipeline drivers call this implementation. Returns 0
  * with *out_count = 0 when the file has no IMPORTS edges. The CALLS map. */
-int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
+int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path, CBMLanguage lang,
+                             const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count) {
-    return cbm_pxc_build_import_map_ex(gbuf, project_name, rel_path, lang, result, false, out_keys,
-                                       out_vals, out_count);
+    return cbm_pxc_build_import_map_ex(ctx, rel_path, lang, result, false, out_keys, out_vals,
+                                       out_count);
 }
 
 bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result) {
@@ -1528,14 +1527,16 @@ bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result) {
     return false;
 }
 
-int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
-                                const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+int cbm_pxc_build_import_map_ex(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                CBMLanguage lang, const CBMFileResult *result,
                                 bool include_type_only, const char ***out_keys,
                                 const char ***out_vals, int *out_count) {
+    const cbm_gbuf_t *gbuf = ctx->gbuf;
+    const char *project_name = ctx->project_name;
     if (result && (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
                    lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS))
-        return cbm_pipeline_ecma_import_map(gbuf, project_name, rel_path, result, include_type_only,
-                                            out_keys, out_vals, out_count);
+        return cbm_pipeline_ecma_import_map(ctx, rel_path, result, include_type_only, out_keys,
+                                            out_vals, out_count);
     if (result && (lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA))
         return cbm_pipeline_c_include_map(gbuf, project_name, rel_path, result, out_keys, out_vals,
                                           out_count);
@@ -2590,12 +2591,12 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     int toml_len = 0;
     char *toml = pxc_read_file(path, &toml_len);
     if (!toml || toml_len <= 0) {
-        free(toml);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, toml);
         return false;
     }
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
-    free(toml); /* cargo parser copies into marena */
+    cbm_free(CBM_MEM_CLASS_EXTRACT, toml); /* cargo parser copies into marena */
     return true;
 }
 
@@ -2751,7 +2752,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         int source_len = 0;
         char *source = pxc_read_file(files[i].path, &source_len);
         if (!source || source_len <= 0) {
-            free(source);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
             if (cache[i]->has_test_definition_owners) {
                 cbm_pipeline_test_owner_error(cache[i]);
                 (void)cbm_pipeline_test_result_ok(ctx, cache[i]);
@@ -2767,7 +2768,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         }
 
         if (!def_modules[i] && cache[i]->has_test_definition_owners) {
-            free(source);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
             cbm_pipeline_test_owner_error(cache[i]);
             (void)cbm_pipeline_test_result_ok(ctx, cache[i]);
             break;
@@ -2778,10 +2779,10 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         int imp_count = 0;
         /* The LSP map: annotation-only imports bind for annotations (#1277).
          * MUST match the LSP map of pass_parallel.c. */
-        if (cbm_pxc_build_import_map_ex(ctx->gbuf, ctx->project_name, files[i].rel_path, lang,
-                                        cache[i], true, &imp_keys, &imp_vals, &imp_count) != 0) {
+        if (cbm_pxc_build_import_map_ex(ctx, files[i].rel_path, lang, cache[i], true, &imp_keys,
+                                        &imp_vals, &imp_count) != 0) {
             atomic_store(&ctx->resolver_failed, true);
-            free(source);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
             break;
         }
 
@@ -2806,7 +2807,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         processed++;
 
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
-        free(source);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
         if (!cbm_pipeline_test_result_ok(ctx, cache[i])) {
             break;
         }

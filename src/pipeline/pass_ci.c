@@ -56,12 +56,14 @@ typedef struct {
     cbm_build_site_fn site_fn;         /* a build-site walk's callback */
     cbm_compose_service_fn service_fn; /* a compose walk's callback */
     void *ud;
+    bool source_complete; /* one error-free compose document */
 } ci_t;
 
 /* name, value pairs; a value NULL: unknown. */
 typedef struct {
     const char **kv;
     int n;
+    bool unsupported; /* ignored syntax cannot authorize an inline default */
 } ci_env_t;
 
 /* What a step inherits from its job and workflow. */
@@ -331,8 +333,9 @@ static ci_env_t ci_env_add(const ci_t *c, const ci_env_t *base, TSNode m) {
     int n = 0;
     ci_pair_t *pairs = ci_pairs(c, m, &n);
     int bn = base ? base->n : 0;
-    ci_env_t out = {cbm_arena_alloc(c->a, (size_t)(bn + n + SKIP_ONE) * PAIR_LEN * sizeof(char *)),
-                    0};
+    ci_env_t out = {
+        .kv = cbm_arena_alloc(c->a, (size_t)(bn + n + SKIP_ONE) * PAIR_LEN * sizeof(char *)),
+        .unsupported = base && base->unsupported};
     if (!out.kv) {
         return base ? *base : out;
     }
@@ -742,7 +745,11 @@ static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) 
     }
     const char *eq = b < n && s[b] != '#' ? memchr(s + b, '=', n - b) : NULL;
     size_t kl = eq ? (size_t)(eq - (s + b)) : 0;
+    if (b == n || s[b] == '#')
+        return;
     if (!eq || !ci_build_ident(s + b, kl)) {
+        /* Unsupported assignments are unknown, never absent variables. */
+        env->unsupported = true;
         return;
     }
     size_t v = b + kl + SKIP_ONE;
@@ -751,9 +758,15 @@ static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) 
     }
     size_t vl = n - v;
     bool literal = v < n && s[v] == '\'';
+    bool quoted = v < n && (s[v] == '\'' || s[v] == '"');
+    if ((quoted && (vl < PAIR_LEN || s[n - SKIP_ONE] != s[v])) || memchr(s + v, '\\', vl) ||
+        memchr(s + v, '#', vl) || memchr(s + v, '`', vl))
+        env->unsupported = true;
     const char *val = ci_unquote(s + v, &vl);
     const char *raw = cbm_arena_strndup(a, val, vl);
     const char *expanded = raw && !literal ? ci_interp(a, raw, env) : NULL;
+    if (!raw || (!literal && strchr(raw, '$') && !expanded))
+        env->unsupported = true;
     env->kv[PAIR_LEN * env->n] = cbm_arena_strndup(a, s + b, kl);
     env->kv[PAIR_LEN * env->n + SKIP_ONE] = expanded ? expanded : raw;
     env->n++;
@@ -765,7 +778,9 @@ static ci_env_t ci_dotenv(CBMArena *a, const char *text) {
     for (const char *q = text; *q; q++) {
         lines += *q == '\n';
     }
-    ci_env_t env = {cbm_arena_alloc(a, lines * PAIR_LEN * sizeof(char *)), 0};
+    ci_env_t env = {.kv = cbm_arena_alloc(a, lines * PAIR_LEN * sizeof(char *))};
+    if (!env.kv)
+        env.unsupported = true;
     for (const char *p = text; env.kv && p && *p;) {
         const char *e = strchr(p, '\n');
         ci_dotenv_line(a, p, e ? (size_t)(e - p) : strlen(p), &env);
@@ -1129,17 +1144,90 @@ static const char *ci_compose_build_args(const ci_t *c, TSNode build, const ci_e
     return json ? cbm_arena_sprintf(c->a, "%s}", json) : NULL;
 }
 
+/* Closed mappings: first-key-wins and merge aliases cannot prove a unique
+ * service/image binding. Hashing keeps the audit linear in mapping size. */
+static bool ci_mapping_complete(const ci_t *c, TSNode mapping) {
+    mapping = ci_content(mapping);
+    if ((!ci_type(mapping, "block_mapping") && !ci_type(mapping, "flow_mapping")) ||
+        ts_node_has_error(mapping))
+        return false;
+    int count = 0;
+    ci_pair_t *pairs = ci_pairs(c, mapping, &count);
+    CBMHashTable *keys = cbm_ht_create(0);
+    bool complete = keys && pairs;
+    uint32_t actual = 0;
+    for (uint32_t i = 0; i < ts_node_named_child_count(mapping); i++) {
+        TSNode child = ts_node_named_child(mapping, i);
+        if (ci_type(child, "block_mapping_pair") || ci_type(child, "flow_pair"))
+            actual++;
+        else if (!ci_type(child, "comment"))
+            complete = false;
+    }
+    complete = complete && actual == (uint32_t)count;
+    for (int i = 0; complete && i < count; i++) {
+        const char *key = pairs[i].key;
+        if (!strcmp(key, "<<") || cbm_ht_has(keys, key)) {
+            complete = false;
+            break;
+        }
+        cbm_ht_set(keys, key, (void *)1);
+        complete = cbm_ht_has(keys, key);
+    }
+    cbm_ht_free(keys);
+    return complete;
+}
+
+/* A physical scalar, without tags/anchors/aliases hidden by decoding. */
+static TSNode ci_image_scalar(TSNode value) {
+    while (ci_type(value, "flow_node") || ci_type(value, "block_node")) {
+        TSNode next = {0};
+        for (uint32_t i = 0; i < ts_node_named_child_count(value); i++) {
+            TSNode child = ts_node_named_child(value, i);
+            if (ci_type(child, "comment"))
+                continue;
+            if (!ts_node_is_null(next) || ci_type(child, "anchor") || ci_type(child, "tag")) {
+                TSNode none = {0};
+                return none;
+            }
+            next = child;
+        }
+        value = next;
+    }
+    /* The YAML grammar distinguishes string scalars from booleans, numbers,
+     * and null. Compose's image field accepts only strings. */
+    if (ci_type(value, "plain_scalar") &&
+        (ts_node_named_child_count(value) != 1 ||
+         !ci_type(ts_node_named_child(value, 0), "string_scalar"))) {
+        TSNode none = {0};
+        return none;
+    }
+    return value;
+}
+
 static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env_t *env) {
     static const ci_env_t no_env = {0};
     int ns = 0;
     ci_pair_t *svcs = ci_pairs(c, ci_get(c, root, "services"), &ns);
+    bool domain_complete = c->source_complete && ci_mapping_complete(c, root) &&
+                           ci_mapping_complete(c, ci_get(c, root, "services"));
     for (int i = 0; i < ns; i++) {
         TSNode svc = ci_content(svcs[i].value);
         if (!ci_type(svc, "block_mapping") && !ci_type(svc, "flow_mapping")) {
             continue;
         }
         int row = 0;
-        const char *raw = ci_scalar(c, ci_get(c, svc, "image"), &row);
+        TSNode image_node = ci_image_scalar(ci_get(c, svc, "image"));
+        const char *raw = ci_scalar(c, image_node, &row);
+        uint32_t image_start = ts_node_is_null(image_node) ? 0 : ts_node_start_byte(image_node);
+        uint32_t image_end = ts_node_is_null(image_node) ? 0 : ts_node_end_byte(image_node);
+        bool scalar_complete =
+            raw && image_end > image_start &&
+            (ci_type(image_node, "plain_scalar") || ci_type(image_node, "single_quote_scalar") ||
+             ci_type(image_node, "double_quote_scalar")) &&
+            !memchr(c->src + image_start, '\n', image_end - image_start) &&
+            !memchr(c->src + image_start, '\\', image_end - image_start);
+        bool image_complete = domain_complete && ci_mapping_complete(c, svc) && scalar_complete &&
+                              (!strchr(raw, '$') || !env->unsupported);
         const char *dflt_of = NULL;
         const char *ovr_of = NULL;
         const char *image = raw ? ci_interp_marks(c->a, raw, env, &dflt_of, &ovr_of) : NULL;
@@ -1156,14 +1244,22 @@ static void ci_compose(const ci_t *c, TSNode root, const char *dir, const ci_env
             c->site_fn(&site, c->ud);
         }
         if (c->service_fn) {
-            cbm_compose_service_t s = {.name = svcs[i].key,
-                                       .image = image,
-                                       .image_default_of = image ? dflt_of : NULL,
-                                       .image_override_of = image ? ovr_of : NULL,
-                                       .default_image = default_image,
-                                       .dockerfile = df,
-                                       .line = (int)ts_node_start_point(svc).row,
-                                       .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
+            cbm_compose_service_t s = {
+                .name = svcs[i].key,
+                .image = image,
+                .image_default_of = image ? dflt_of : NULL,
+                .image_override_of = image ? ovr_of : NULL,
+                .default_image = default_image,
+                .image_spelling =
+                    image_end > image_start
+                        ? cbm_arena_strndup(c->a, c->src + image_start, image_end - image_start)
+                        : NULL,
+                .image_start_byte = image_start,
+                .image_end_byte = image_end,
+                .image_complete = image_complete,
+                .dockerfile = df,
+                .line = (int)ts_node_start_point(svc).row,
+                .end_line = (int)ts_node_end_point(svc).row + SKIP_ONE};
             s.ndeps = ci_compose_deps(c, svc, &s.deps);
             s.nenv = ci_compose_env(c, svc, env, &s.env, &s.env_lines, &s.env_hosts);
             c->service_fn(&s, c->ud);
@@ -1231,6 +1327,10 @@ static void ci_build_walk(CBMArena *a, const char *rel, const char *src, size_t 
         c.src = src;
         c.rel = rel;
         TSNode stream = ts_tree_root_node(tree);
+        unsigned documents = 0;
+        for (uint32_t i = 0; i < ts_node_named_child_count(stream); i++)
+            documents += ci_type(ts_node_named_child(stream, i), "document");
+        c.source_complete = !ts_node_has_error(stream) && documents == 1;
         for (uint32_t i = 0; i < ts_node_named_child_count(stream); i++) {
             TSNode doc = ts_node_named_child(stream, i);
             if (!ci_type(doc, "document")) {

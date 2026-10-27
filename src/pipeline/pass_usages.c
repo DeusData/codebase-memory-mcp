@@ -121,8 +121,7 @@ static bool is_checked_exception(const char *name) {
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count, CBMLanguage lang) {
-    int rc = cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result,
-                                      out_keys, out_vals, out_count);
+    int rc = cbm_pxc_build_import_map(ctx, rel_path, lang, result, out_keys, out_vals, out_count);
     if (rc != 0)
         atomic_store(&ctx->resolver_failed, true);
     return rc;

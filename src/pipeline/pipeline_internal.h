@@ -371,7 +371,8 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 /* Per-worker manifest collection entry. */
 typedef struct {
     char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
-    char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    char *entry_rel; /* heap: module path, or exact value for a typed Node fact */
+    bool node_fact;  /* only the Node configuration collector may set this */
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -379,6 +380,7 @@ typedef struct {
     cbm_pkg_entry_t *items;
     int count;
     int cap;
+    bool incomplete; /* sticky: a missing configuration fact forbids publication */
 } cbm_pkg_entries_t;
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
@@ -793,11 +795,13 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  * binding the extractor marked as an `axios.create(...)` instance
  * (`http_client` node property), write the request URL to `out` (the
  * instance's literal `http_base_url` joined with a '/'-leading path, the path
- * unchanged when the base is unknown or the URL is absolute) and return true.
+ * unchanged when the URL is absolute) and return true. Default imports use
+ * an exact source audit; an unknown base cannot prove a relative endpoint.
  * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
  * route-registration or registry fallback, so a wrapper client's `api.get`
  * is never mistaken for an Express `app.get` route registration. */
-bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+bool cbm_pipeline_http_client_call_url(const cbm_shared_resolver_t *resolver,
+                                       const cbm_gbuf_t *gbuf, const char *project, const char *rel,
                                        const CBMFileResult *result, const char **imp_keys,
                                        const char **imp_vals, int imp_count, const CBMCall *call,
                                        char *out, size_t out_sz);
@@ -1353,6 +1357,12 @@ typedef struct {
     const char *image_default_of;
     const char *image_override_of;
     const char *default_image;
+    /* Physical image scalar before decoding/interpolation; copied from its
+     * exact YAML node. COMPLETE requires an unambiguous supported surface. */
+    const char *image_spelling;
+    uint32_t image_start_byte;
+    uint32_t image_end_byte;
+    bool image_complete;
     const char *dockerfile;
     const char **deps;
     int ndeps;
@@ -1600,6 +1610,9 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
  * boundary so late additions/deletions cannot escape a frozen file list. */
 int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
+/* Fresh canonical project-path state/hash/length validation; errors fail closed. */
+bool cbm_pipeline_captured_inputs_match(cbm_pipeline_t *p, const cbm_gbuf_captured_input_t *inputs,
+                                        size_t count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe.

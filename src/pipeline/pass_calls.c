@@ -1,5 +1,6 @@
 #include "pipeline/import_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/shared_resolver.h"
 /*
  * pass_calls.c — Resolve function/method calls into CALLS edges.
  *
@@ -134,8 +135,8 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const char ***out_vals, int *out_count, CBMLanguage lang) {
     if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
         lang == CBM_LANG_ARKTS || lang == CBM_LANG_RUST) {
-        int rc = cbm_pxc_build_import_map_ex(ctx->gbuf, ctx->project_name, rel_path, lang, result,
-                                             false, out_keys, out_vals, out_count);
+        int rc = cbm_pxc_build_import_map_ex(ctx, rel_path, lang, result, false, out_keys, out_vals,
+                                             out_count);
         if (rc != 0)
             atomic_store(&ctx->resolver_failed, true);
         return rc;
@@ -312,44 +313,53 @@ static const cbm_gbuf_node_t *pc_module_var(const cbm_gbuf_t *gbuf, const char *
     return (n && n->label && strcmp(n->label, "Variable") == 0) ? n : NULL;
 }
 
-/* Resolve the binding `recv` names in the calling file to a client node:
- * a same-file declaration first, then its ES import (default import → the
- * module's default export; named import → that module's Variable). */
-static bool pc_receiver_client_base(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+/* Default imports require the shared source audit. They never become a
+ * namespace alias in the ordinary import map. Existing local/named clients
+ * retain their independent classifier. */
+static bool pc_receiver_client_base(const cbm_shared_resolver_t *resolver, const cbm_gbuf_t *gbuf,
+                                    const char *project, const char *rel,
                                     const CBMFileResult *result, const char **imp_keys,
                                     const char **imp_vals, int imp_count, const char *recv,
-                                    char *base, size_t base_sz) {
-    if (pc_node_is_http_client(pc_module_var(gbuf, project, rel, recv), base, base_sz)) {
-        return true;
-    }
+                                    const CBMCall *call, char *base, size_t base_sz) {
     const CBMImport *imp = NULL;
     for (int i = 0; result && i < result->imports.count; i++) {
         const CBMImport *it = &result->imports.items[i];
         if (it->local_name && strcmp(it->local_name, recv) == 0) {
+            if (imp)
+                return false;
             imp = it;
-            break;
         }
     }
-    if (!imp) {
+    if (imp && imp->is_default) {
+        const char *proved_base = NULL;
+        if (!cbm_shared_resolver_http_base(resolver, rel, result, call, &proved_base))
+            return false;
+        const char *url = call->first_string_arg;
+        bool absolute = !strncmp(url, "http://", 7) || !strncmp(url, "https://", 8);
+        if ((!proved_base && !absolute) ||
+            (!absolute && (url[0] != '/' || url[1] == '/' || strstr(url, "://"))))
+            return false;
+        int n = snprintf(base, base_sz, "%s", proved_base ? proved_base : "");
+        return n >= 0 && (size_t)n < base_sz;
+    }
+    /* A candidate default singleton also cannot borrow the weaker local or
+     * named-instance classifier after its repository proof was withheld. */
+    if (cbm_shared_resolver_http_candidate_receiver(resolver, rel, call))
         return false;
-    }
+    if (pc_node_is_http_client(pc_module_var(gbuf, project, rel, recv), base, base_sz))
+        return true;
+    if (!imp)
+        return false;
     for (int i = 0; i < imp_count; i++) {
-        if (!imp_keys[i] || strcmp(imp_keys[i], recv) != 0 || !imp_vals[i]) {
+        if (!imp_keys[i] || strcmp(imp_keys[i], recv) != 0 || !imp_vals[i])
             continue;
-        }
         const cbm_gbuf_node_t *t = cbm_gbuf_find_by_qn(gbuf, imp_vals[i]);
-        if (!t || !t->label) {
+        if (!t || !t->label)
             return false;
-        }
-        if (strcmp(t->label, "Variable") == 0) {
+        if (strcmp(t->label, "Variable") == 0)
             return pc_node_is_http_client(t, base, base_sz);
-        }
-        if (strcmp(t->label, "Module") != 0) {
+        if (strcmp(t->label, "Module") != 0)
             return false;
-        }
-        if (imp->is_default) {
-            return pc_node_is_http_client(t, base, base_sz);
-        }
         return pc_node_is_http_client(pc_module_var(gbuf, project, t->file_path, recv), base,
                                       base_sz);
     }
@@ -388,7 +398,8 @@ static bool pc_plain_receiver(const char *callee, const char *dot, char *recv, s
     return true;
 }
 
-bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+bool cbm_pipeline_http_client_call_url(const cbm_shared_resolver_t *resolver,
+                                       const cbm_gbuf_t *gbuf, const char *project, const char *rel,
                                        const CBMFileResult *result, const char **imp_keys,
                                        const char **imp_vals, int imp_count, const CBMCall *call,
                                        char *out, size_t out_sz) {
@@ -404,8 +415,8 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
         return false;
     }
     char base[CBM_SZ_256];
-    if (!pc_receiver_client_base(gbuf, project, rel, result, imp_keys, imp_vals, imp_count, recv,
-                                 base, sizeof(base))) {
+    if (!pc_receiver_client_base(resolver, gbuf, project, rel, result, imp_keys, imp_vals,
+                                 imp_count, recv, call, base, sizeof(base))) {
         return false;
     }
     /* axios combineURLs: an absolute request URL ignores baseURL; otherwise
@@ -983,8 +994,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
      * to a phantom server route), and a receiver spelled `axiosInstance`
      * substring-matches the #523 check and loses its baseURL. */
     char client_url[CBM_SZ_512];
-    if (cbm_pipeline_http_client_call_url(ctx->gbuf, ctx->project_name, rel, result, imp_keys,
-                                          imp_vals, imp_count, call, client_url,
+    if (cbm_pipeline_http_client_call_url(ctx->shared_resolver, ctx->gbuf, ctx->project_name, rel,
+                                          result, imp_keys, imp_vals, imp_count, call, client_url,
                                           sizeof(client_url))) {
         CBMCall routed = *call;
         routed.first_string_arg = client_url;
@@ -995,6 +1006,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         emit_http_async_edge(ctx, &routed, source_node, NULL, &svc_res, CBM_SVC_HTTP, false);
         return SKIP_ONE;
     }
+    if (cbm_shared_resolver_http_candidate_receiver(ctx->shared_resolver, rel, call))
+        return 0;
     /* A PHP call on a proven vendor class is classified by that class
      * (#1186): it skips the registry below, so the route-verb fallback would
      * otherwise mint a route registration for `GuzzleClient::get('/x')`. An

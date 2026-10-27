@@ -129,6 +129,10 @@ struct cbm_gbuf {
     bool proof_session_active;
     CBM_DYN_ARRAY(cbm_resolve_file_t) resolver_files;
     CBM_DYN_ARRAY(cbm_resolve_summary_t) resolver_summaries;
+    cbm_gbuf_captured_input_t *captured_inputs;
+    size_t captured_input_count, captured_input_capacity;
+    CBMHashTable *captured_input_paths;
+    bool captured_inputs_taken;
 
     /* Edge dedup index: "srcID:tgtID:type" → cbm_gbuf_edge_t* */
     edge_key_map_t edge_by_key; /* dedup: 128-bit key hash -> edge */
@@ -180,6 +184,113 @@ static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
     return copy;
 }
 
+static bool captured_relative_path(const char *path) {
+    if (!path || !path[0] || path[0] == '/')
+        return false;
+    const char *segment = path;
+    for (const char *p = path;; p++) {
+        if (*p == '\\' || *p == ':' || (*p && (unsigned char)*p < 32) || *p == 127)
+            return false;
+        if (*p && *p != '/')
+            continue;
+        size_t length = (size_t)(p - segment);
+        if (!length || (length == 1 && segment[0] == '.') ||
+            (length == 2 && segment[0] == '.' && segment[1] == '.') || segment[length - 1] == '.' ||
+            segment[length - 1] == ' ')
+            return false;
+        if (!*p)
+            return true;
+        segment = p + 1;
+    }
+}
+
+static bool captured_digest(bool present, uint64_t length, const char *identity) {
+    if (!present)
+        return length == 0 && (!identity || !identity[0]);
+    if (length > INT64_MAX || !identity || strlen(identity) != CBM_SHA256_HEX_LEN)
+        return false;
+    for (size_t i = 0; i < CBM_SHA256_HEX_LEN; i++)
+        if (!((identity[i] >= '0' && identity[i] <= '9') ||
+              (identity[i] >= 'a' && identity[i] <= 'f')))
+            return false;
+    return true;
+}
+
+void cbm_gbuf_free_captured_inputs(cbm_gbuf_captured_input_t *inputs, size_t count) {
+    for (size_t i = 0; inputs && i < count; i++)
+        cbm_free(CBM_MEM_CLASS_GBUF_STRING, inputs[i].relative_path);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, inputs);
+}
+
+bool cbm_gbuf_capture_input(cbm_gbuf_t *gb, const char *relative_path, bool present,
+                            uint64_t byte_length, const char *identity) {
+    if (!gb || gb->resolution_failed)
+        return false;
+    if (gb->captured_inputs_taken || !captured_relative_path(relative_path) ||
+        !captured_digest(present, byte_length, identity))
+        goto failed;
+    if (!gb->captured_input_paths)
+        gb->captured_input_paths = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, 16);
+    if (!gb->captured_input_paths)
+        goto failed;
+    uintptr_t prior = (uintptr_t)cbm_ht_get(gb->captured_input_paths, relative_path);
+    if (prior) {
+        const cbm_gbuf_captured_input_t *input = &gb->captured_inputs[prior - 1];
+        if (input->present == present && input->byte_length == byte_length &&
+            !strcmp(input->content_identity, identity ? identity : ""))
+            return true;
+        goto failed;
+    }
+    if (gb->captured_input_count == gb->captured_input_capacity) {
+        size_t capacity = gb->captured_input_capacity ? gb->captured_input_capacity * 2 : 16;
+        if (capacity < gb->captured_input_capacity ||
+            capacity > SIZE_MAX / sizeof(*gb->captured_inputs))
+            goto failed;
+        cbm_gbuf_captured_input_t *items =
+            cbm_realloc(CBM_MEM_CLASS_GBUF_INDEX, gb->captured_inputs, capacity * sizeof(*items));
+        if (!items)
+            goto failed;
+        gb->captured_inputs = items;
+        gb->captured_input_capacity = capacity;
+    }
+    char *path = cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, relative_path);
+    if (!path)
+        goto failed;
+    size_t index = gb->captured_input_count;
+    cbm_gbuf_captured_input_t *input = &gb->captured_inputs[index];
+    *input = (cbm_gbuf_captured_input_t){
+        .relative_path = path, .present = present, .byte_length = byte_length};
+    if (present)
+        memcpy(input->content_identity, identity, sizeof(input->content_identity));
+    gb->captured_input_count++;
+    cbm_ht_set(gb->captured_input_paths, path, (void *)(uintptr_t)(index + 1));
+    if ((uintptr_t)cbm_ht_get(gb->captured_input_paths, path) != index + 1)
+        goto failed;
+    return true;
+failed:
+    gb->resolution_failed = true;
+    return false;
+}
+
+bool cbm_gbuf_take_captured_inputs(cbm_gbuf_t *gb, cbm_gbuf_captured_input_t **inputs,
+                                   size_t *count) {
+    if (inputs)
+        *inputs = NULL;
+    if (count)
+        *count = 0;
+    if (!gb || !inputs || !count || gb->resolution_failed || gb->captured_inputs_taken)
+        return false;
+    *inputs = gb->captured_inputs;
+    *count = gb->captured_input_count;
+    gb->captured_inputs = NULL;
+    gb->captured_input_count = 0;
+    gb->captured_input_capacity = 0;
+    cbm_ht_free(gb->captured_input_paths);
+    gb->captured_input_paths = NULL;
+    gb->captured_inputs_taken = true;
+    return true;
+}
+
 bool cbm_gbuf_resolution_begin(cbm_gbuf_t *gb) {
     if (!gb || gb->resolution_failed || gb->proof_session_active)
         return false;
@@ -212,7 +323,8 @@ bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *reco
             gb->resolution_failed = true;
             return false;
         }
-        cbm_resolve_record_t *rows = realloc(gb->resolutions, next * sizeof(*rows));
+        cbm_resolve_record_t *rows =
+            cbm_realloc(CBM_MEM_CLASS_GBUF_INDEX, gb->resolutions, next * sizeof(*rows));
         if (!rows) {
             gb->resolution_failed = true;
             return false;
@@ -938,7 +1050,9 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     cbm_arena_destroy(&gb->proof_arena);
     cbm_da_free(&gb->resolver_files);
     cbm_da_free(&gb->resolver_summaries);
-    free(gb->resolutions);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, gb->resolutions);
+    cbm_gbuf_free_captured_inputs(gb->captured_inputs, gb->captured_input_count);
+    cbm_ht_free(gb->captured_input_paths);
     if (gb->variant_spans) {
         cbm_ht_foreach(gb->variant_spans, gb_free_span_vec, NULL);
         cbm_ht_free(gb->variant_spans);
@@ -2444,8 +2558,18 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     if (!dst || !src) {
         return CBM_NOT_FOUND;
     }
+    if (src->captured_inputs_taken || dst->captured_inputs_taken) {
+        dst->resolution_failed = true;
+        return CBM_NOT_FOUND;
+    }
     if (src->resolution_failed)
         dst->resolution_failed = true;
+    for (size_t i = 0; i < src->captured_input_count; i++) {
+        const cbm_gbuf_captured_input_t *input = &src->captured_inputs[i];
+        if (!cbm_gbuf_capture_input(dst, input->relative_path, input->present, input->byte_length,
+                                    input->content_identity))
+            return CBM_NOT_FOUND;
+    }
     if (!cbm_gbuf_resolution_begin(dst))
         return CBM_NOT_FOUND;
     bool resolver_ok = true;

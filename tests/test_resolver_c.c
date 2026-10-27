@@ -4,8 +4,11 @@
 #include "resolve/policy.h"
 #include "test_framework.h"
 #include "discover/test_conventions.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 extern const TSLanguage *tree_sitter_c(void);
+extern const TSLanguage *tree_sitter_cpp(void);
 
 static bool c_row_admitted(const CBMResolvedCall *row) {
     cbm_resolve_result_t proof = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
@@ -270,6 +273,135 @@ TEST(resolver_c_field_identity_is_not_a_callable_target) {
     PASS();
 }
 
+/* Keep the guarded alpha.h declaration from the pipeline field-owner fixture.
+ * Its exact source owner must survive the quoted include; a same-named field
+ * or an unseen/ambiguous Alpha declaration must not supply receiver authority. */
+TEST(resolver_c_quoted_header_fields_require_exact_source_owner) {
+    static const char guarded[] =
+        "#ifndef ALPHA_H\n#define ALPHA_H\n"
+        "typedef void (*alpha_notify_fn)(int);\nstruct Alpha {\n"
+        "    int count;\n    int alpha_only;\n    alpha_notify_fn notify;\n};\n#endif\n";
+    static const char plain[] =
+        "typedef void (*alpha_notify_fn)(int);\nstruct Alpha {\n"
+        "    int count;\n    int alpha_only;\n    alpha_notify_fn notify;\n};\n";
+    static const char feature[] =
+        "#ifdef ENABLE_ALPHA\n"
+        "typedef void (*alpha_notify_fn)(int);\nstruct Alpha {\n"
+        "    int count;\n    int alpha_only;\n    alpha_notify_fn notify;\n};\n#endif\n";
+    static const char other[] = "struct Alpha { int count; int alpha_only; };\n";
+    static const char beta[] = "struct Beta { int count; int beta_only; };\n";
+    const char *prefixes[] = {"#include \"alpha.h\"\n",
+                              "#include \"alpha.h\"\n",
+                              "#include \"alpha.h\"\n#include \"other.h\"\n",
+                              "",
+                              "#include \"beta.h\"\n",
+                              "#define ALPHA_H\n#include \"alpha.h\"\n",
+                              "#include \"alpha.h\"\n"};
+    const char *paths[] = {"alpha.h", "other.h", "beta.h"};
+    const char *modules[] = {"test.alpha", "test.other", "test.beta"};
+    int exact[7] = {0}, wrong[7] = {0};
+    uint32_t flags[7] = {0};
+    for (int i = 0; i < 7; i++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        const char *source =
+            cbm_arena_sprintf(&arena,
+                              "%s\nint use_alpha(struct Alpha *a) {\n"
+                              "    a->count = 1;\n    return a->count + a->alpha_only;\n}\n",
+                              prefixes[i]);
+        ASSERT_NOT_NULL(source);
+        const char *header = i == 0 || i == 5 ? guarded : i == 6 ? feature : plain;
+        CBMLSPDef defs[] = {{.qualified_name = "test.alpha.Alpha",
+                             .graph_qualified_name = "test.alpha.Alpha",
+                             .short_name = "Alpha",
+                             .label = "Class",
+                             .def_module_qn = "test.alpha",
+                             .source_start_line = i == 0 || i == 5 ? 4
+                                                  : i == 6         ? 3
+                                                                   : 2,
+                             .declaration_identity = "alpha.h:Alpha",
+                             .field_defs = "count:int|alpha_only:int|notify:alpha_notify_fn"},
+                            {.qualified_name = "test.other.Alpha",
+                             .graph_qualified_name = "test.other.Alpha",
+                             .short_name = "Alpha",
+                             .label = "Class",
+                             .def_module_qn = "test.other",
+                             .source_start_line = 1,
+                             .declaration_identity = "other.h:Alpha",
+                             .field_defs = "count:int|alpha_only:int"},
+                            {.qualified_name = "test.beta.Beta",
+                             .graph_qualified_name = "test.beta.Beta",
+                             .short_name = "Beta",
+                             .label = "Class",
+                             .def_module_qn = "test.beta",
+                             .source_start_line = 1,
+                             .declaration_identity = "beta.h:Beta",
+                             .field_defs = "count:int|beta_only:int"}};
+        ASSERT(
+            cbm_c_collect_source_facts(&arena, header, (int)strlen(header), "test.alpha", defs, 1));
+        ASSERT(cbm_c_collect_source_facts(&arena, other, (int)strlen(other), "test.other", defs + 1,
+                                          1));
+        ASSERT(
+            cbm_c_collect_source_facts(&arena, beta, (int)strlen(beta), "test.beta", defs + 2, 1));
+        flags[i] = defs[0].source_flags;
+        CBMResolvedCallArray rows = {0};
+        int imports = i == 2 ? 2 : i == 3 ? 0 : 1;
+        int first = i == 4 ? 2 : 0;
+        c_cross(&arena, source, false, defs, 3, paths + first, modules + first, imports, &rows);
+        const char *sites[] = {strstr(source, "a->count =") + 3, strstr(source, "a->count +") + 3,
+                               strstr(source, "a->alpha_only") + 3};
+        const char *targets[] = {"test.alpha.Alpha.count", "test.alpha.Alpha.count",
+                                 "test.alpha.Alpha.alpha_only"};
+        unsigned seen = 0;
+        for (int j = 0; j < rows.count; j++) {
+            const CBMResolvedCall *row = &rows.items[j];
+            if (!c_row_admitted(row))
+                continue;
+            int matched = -1;
+            for (int k = 0; k < 3; k++) {
+                uint32_t start = (uint32_t)(sites[k] - source);
+                uint32_t length = k == 2 ? 10 : 5;
+                if (row->kind == CBM_RESOLVED_FIELD_REFERENCE && row->evidence.proof &&
+                    row->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+                    !strcmp(row->caller_qn, "test.main.use_alpha") &&
+                    !strcmp(row->callee_qn, targets[k]) && row->site_start_byte == start &&
+                    row->site_end_byte == start + length)
+                    matched = k;
+            }
+            if (matched < 0 || (seen & (1u << matched)))
+                wrong[i]++;
+            else {
+                seen |= 1u << matched;
+                exact[i]++;
+            }
+        }
+        cbm_arena_destroy(&arena);
+    }
+    /* Check negative controls before the guarded positive so its initial RED
+     * cannot conceal an incorrect namesake, missing include, disabled feature,
+     * or a header suppressed by the caller defining its guard first. */
+    for (int i = 0; i < 7; i++)
+        ASSERT_EQ(wrong[i], 0);
+    for (int i = 2; i < 7; i++)
+        ASSERT_EQ(exact[i], 0);
+    ASSERT_EQ(exact[1], 3);
+    /* Quality gap C-GUARD-DECLARATION: all three guarded-header references
+     * genuinely target Alpha's fields. WHY: raw header text alone does not prove
+     * its declarations survived the caller's include-time macro environment.
+     * TRIED: the focused proof test resolves all three plain-header sites, but guarded source facts
+     * have flags=0. The five negative cases include a caller-suppressed guard and
+     * an inactive feature; simply descending through #if would make them wrong.
+     * Keep the independent three-site denominator and require promotion once
+     * configured/preprocessed declaration-presence proof recovers any site. */
+    fprintf(stderr,
+            "[RQ-UNIT] C-GUARD-DECLARATION genuine=6 found=%d missing=%d wrong=0 "
+            "guarded_flags=%u plain_flags=%u\n",
+            exact[0] + exact[1], 6 - exact[0] - exact[1], flags[0], flags[1]);
+    if (exact[0] != 0)
+        FAIL("C-GUARD-DECLARATION recovered: promote the exact recovered sites to required");
+    PASS();
+}
+
 TEST(resolver_c_configured_owners_preserve_exact_body_calls) {
     const char *config = "{\"test_impact\":{\"version\":1,\"tests\":{\"conventions\":["
                          "{\"language\":\"c\",\"role\":\"case\",\"define_macro\":\"CHECK\","
@@ -396,7 +528,87 @@ TEST(resolver_cpp_written_header_type_requires_complete_visible_domain) {
     PASS();
 }
 
+/* Tree-sitter's context-free parse can represent Widget w(n) as a function
+ * declarator. Only an existing value binding may disambiguate that syntax;
+ * an empty parameter list or a type name must never manufacture an object. */
+TEST(resolver_cpp_direct_initializer_preserves_declared_receiver) {
+    static const char library[] = "class Widget {\n    int id;\npublic:\n"
+                                  "    Widget(int id) : id(id) {}\n"
+                                  "    int get_id() const { return id; }\n};\n";
+    const char *sources[] = {
+        "#include \"widget.hpp\"\nint run(int n) {\n"
+        "    Widget w(n);\n    return w.get_id();\n}\n",
+        "#include \"widget.hpp\"\nstruct UnknownType {};\n"
+        "int run() { Widget w(UnknownType); return w.get_id(); }\n",
+        "#include \"widget.hpp\"\nint run() { Widget w(); return w.get_id(); }\n",
+        "#include \"widget.hpp\"\nint run(int n) {\n"
+        "    { using n = int; Widget w(n); return w.get_id(); }\n}\n"};
+    int getters[4] = {0}, constructors[4] = {0};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMLSPDef defs[] = {{.qualified_name = "test.widget.Widget",
+                             .graph_qualified_name = "test.widget.Widget",
+                             .short_name = "Widget",
+                             .label = "Class",
+                             .lang = CBM_LANG_CPP,
+                             .source_start_line = 1,
+                             .declaration_identity = "widget:class"},
+                            {.qualified_name = "test.widget.Widget.Widget",
+                             .graph_qualified_name = "test.widget.Widget.Widget",
+                             .short_name = "Widget",
+                             .label = "Method",
+                             .lang = CBM_LANG_CPP,
+                             .receiver_type = "test.widget.Widget",
+                             .source_start_line = 4,
+                             .declaration_identity = "widget:constructor"},
+                            {.qualified_name = "test.widget.Widget.get_id",
+                             .graph_qualified_name = "test.widget.Widget.get_id",
+                             .short_name = "get_id",
+                             .label = "Method",
+                             .lang = CBM_LANG_CPP,
+                             .receiver_type = "test.widget.Widget",
+                             .source_start_line = 5,
+                             .declaration_identity = "widget:getter"}};
+        ASSERT(cbm_c_collect_source_facts(&arena, library, (int)strlen(library), "test.widget",
+                                          defs, 3));
+        const char *paths[] = {"widget.hpp"}, *modules[] = {"test.widget"};
+        CBMResolvedCallArray rows = {0};
+        c_cross(&arena, sources[i], true, defs, 3, paths, modules, 1, &rows);
+        getters[i] = c_proven_count(&rows, "test.widget.Widget.get_id");
+        constructors[i] = c_proven_count(&rows, "test.widget.Widget.Widget");
+        if (!i && getters[i] != 1) {
+            TSParser *parser = ts_parser_new();
+            ASSERT_NOT_NULL(parser);
+            ts_parser_set_language(parser, tree_sitter_cpp());
+            TSTree *tree =
+                ts_parser_parse_string(parser, NULL, sources[i], (uint32_t)strlen(sources[i]));
+            ASSERT_NOT_NULL(tree);
+            const char *declaration = strstr(sources[i], "Widget w(n);");
+            uint32_t start = (uint32_t)(declaration - sources[i]);
+            TSNode node = ts_node_descendant_for_byte_range(ts_tree_root_node(tree), start,
+                                                            start + strlen("Widget w(n);"));
+            char *shape = ts_node_string(node);
+            fprintf(stderr, "    [resolver_c] direct initialization AST: %s\n",
+                    shape ? shape : "(unavailable)");
+            free(shape);
+            ts_tree_delete(tree);
+            ts_parser_delete(parser);
+        }
+        cbm_arena_destroy(&arena);
+    }
+    ASSERT_EQ(getters[0], 1);
+    ASSERT_EQ(getters[1], 0);
+    ASSERT_EQ(getters[2], 0);
+    ASSERT_EQ(getters[3], 0);
+    for (size_t i = 0; i < sizeof(constructors) / sizeof(constructors[0]); i++)
+        ASSERT_EQ(constructors[i], 0); /* Constructor proof remains a separate quality gap. */
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_quoted_header_fields_require_exact_source_owner);
+    RUN_TEST(resolver_cpp_direct_initializer_preserves_declared_receiver);
     RUN_TEST(resolver_cpp_written_header_type_requires_complete_visible_domain);
     RUN_TEST(resolver_cpp_direct_member_requires_source_class_and_visibility);
     RUN_TEST(resolver_c_configured_owners_preserve_exact_body_calls);

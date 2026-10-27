@@ -1,4 +1,5 @@
 #include "binding.h"
+#include "../helpers.h"
 #include "../lang_specs.h"
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,8 @@ enum {
     BINDING_EXPORT_CONFLICT = 128,
     BINDING_TYPE_EXPORT_MARKER = 256,
     BINDING_TYPE_EXPORTED = 512,
-    BINDING_NAMESPACE_MEMBER = 1024
+    BINDING_NAMESPACE_MEMBER = 1024,
+    BINDING_VALUE_DECLARATION = 2048
 };
 
 typedef struct {
@@ -24,6 +26,10 @@ typedef struct {
     uint32_t at;
     unsigned flags;
     uint32_t scope;
+    uint32_t value_start_line, value_end_line;
+    unsigned value_definitions;
+    bool http_escaped, http_factory_escaped;
+    const char *http_import_path;
 } binding_name_t;
 
 typedef struct binding_pending_declaration {
@@ -38,6 +44,9 @@ typedef struct {
     uint32_t end;
     uint32_t scope;
     const binding_pending_declaration_t *pending;
+    bool invocation;
+    bool http_escape, http_factory_escape;
+    const char *http_scope, *http_url;
 } binding_site_t;
 
 typedef struct {
@@ -71,6 +80,14 @@ struct cbm_resolve_binding_index {
     const char *reason;
     cbm_resolve_analysis_t analysis;
     bool javascript_module;
+    bool python_namespace_closed;
+    const char **python_escapes;
+    size_t python_escape_count, python_escape_capacity;
+    bool python_effects_complete;
+    const char *http_default_target, *http_default_base;
+    cbm_resolve_http_dependency_t *http_dependencies;
+    size_t http_dependency_count, http_dependency_capacity;
+    bool http_domain_unknown;
     binding_scope_t *scopes;
     size_t scope_count, scope_capacity;
     uint32_t current_scope;
@@ -85,10 +102,14 @@ static bool kind_is(TSNode node, const char *kind) {
 }
 
 static TSNode field(TSNode node, const char *name) {
+    if (ts_node_is_null(node))
+        return (TSNode){0};
     return ts_node_child_by_field_name(node, name, (uint32_t)strlen(name));
 }
 
 static const char *node_text(cbm_resolve_binding_index_t *index, TSNode node) {
+    if (ts_node_is_null(node))
+        return NULL;
     uint32_t start = ts_node_start_byte(node);
     uint32_t end = ts_node_end_byte(node);
     if (end <= start || end > index->source_len) {
@@ -138,7 +159,8 @@ static void add_name(cbm_resolve_binding_index_t *index, const char *name, uint3
     }
     index->names = names;
     const char *target = NULL;
-    if (flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION | BINDING_NAMESPACE_MEMBER)) {
+    if (flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION | BINDING_NAMESPACE_MEMBER |
+                 BINDING_VALUE_DECLARATION)) {
         const char *owner = index->current_scope < index->scope_count
                                 ? index->scopes[index->current_scope].qualified_name
                                 : index->result->module_qn;
@@ -148,7 +170,104 @@ static void add_name(cbm_resolve_binding_index_t *index, const char *name, uint3
             return;
         }
     }
-    names[index->name_count++] = (binding_name_t){name, target, at, flags, index->current_scope};
+    names[index->name_count++] = (binding_name_t){
+        .name = name, .target = target, .at = at, .flags = flags, .scope = index->current_scope};
+}
+
+/* A value declaration never establishes callable identity. Mark both the
+ * complete invocation and its identifier, including transparent wrappers;
+ * duplicate site rows therefore retain the same invocation classification. */
+static bool invocation_site(TSNode node) {
+    if (kind_is(node, "call_expression") || kind_is(node, "new_expression"))
+        return true;
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent))
+            return false;
+        if (kind_is(parent, "call_expression"))
+            return ts_node_eq(node, field(parent, "function"));
+        if (kind_is(parent, "new_expression"))
+            return ts_node_eq(node, field(parent, "constructor"));
+        if (!kind_is(parent, "parenthesized_expression") && !kind_is(parent, "as_expression") &&
+            !kind_is(parent, "satisfies_expression") && !kind_is(parent, "non_null_expression") &&
+            !kind_is(parent, "type_assertion"))
+            return false;
+        node = parent;
+    }
+    return true;
+}
+
+static bool javascript_language(CBMLanguage language);
+
+static bool http_method(TSNode member, cbm_resolve_binding_index_t *index) {
+    const char *method = node_text(index, field(member, "property"));
+    return method && (!strcmp(method, "get") || !strcmp(method, "post") || !strcmp(method, "put") ||
+                      !strcmp(method, "delete") || !strcmp(method, "patch") ||
+                      !strcmp(method, "head") || !strcmp(method, "options"));
+}
+
+/* A request is the sole non-escaping use admitted here. Even reading a
+ * mutable subobject, passing the client as an argument, or calling an unknown
+ * method invalidates the HTTP-only claim. Generic binding facts are unchanged. */
+static bool http_escape(TSNode node, cbm_resolve_binding_index_t *index, bool factory) {
+    if (!kind_is(node, "identifier") && !kind_is(node, "shorthand_property_identifier"))
+        return false;
+    TSNode member = ts_node_parent(node), call = ts_node_parent(member);
+    const char *method = factory ? node_text(index, field(member, "property")) : NULL;
+    if (method && !strcmp(method, "create") && kind_is(member, "member_expression") &&
+        ts_node_eq(node, field(member, "object")) && kind_is(call, "call_expression") &&
+        ts_node_eq(member, field(call, "function")))
+        return false;
+    return !kind_is(member, "member_expression") || !ts_node_eq(node, field(member, "object")) ||
+           !http_method(member, index) || !kind_is(call, "call_expression") ||
+           !ts_node_eq(member, field(call, "function")) ||
+           ts_node_is_null(field(call, "arguments")) ||
+           ts_node_named_child_count(field(call, "arguments")) != 1 ||
+           !kind_is(ts_node_named_child(field(call, "arguments"), 0), "string");
+}
+
+static const char *http_call_scope(cbm_resolve_binding_index_t *index, TSNode node) {
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
+        node = ts_node_parent(node);
+        if (ts_node_is_null(node))
+            return NULL;
+        if (kind_is(node, "program"))
+            return index->result->module_qn;
+        if (kind_is(node, "function_declaration")) {
+            TSNode parent = ts_node_parent(node);
+            if (kind_is(parent, "export_statement"))
+                parent = ts_node_parent(parent);
+            TSNode name = field(node, "name");
+            if (!kind_is(parent, "program") || !kind_is(name, "identifier"))
+                return NULL;
+            const char *text = node_text(index, name);
+            return text ? cbm_arena_sprintf(index->arena, "%s.%s", index->result->module_qn, text)
+                        : NULL;
+        }
+        if (kind_is(node, "arrow_function") || kind_is(node, "function_expression") ||
+            kind_is(node, "generator_function") ||
+            kind_is(node, "generator_function_declaration") || kind_is(node, "method_definition") ||
+            kind_is(node, "class_body"))
+            return NULL;
+    }
+    return NULL;
+}
+
+static const char *http_call_url(cbm_resolve_binding_index_t *index, TSNode node) {
+    if (!kind_is(node, "call_expression"))
+        return NULL;
+    TSNode args = field(node, "arguments");
+    /* Additional request options may override baseURL or the HTTP method. */
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) != 1)
+        return NULL;
+    TSNode value = ts_node_named_child(args, 0);
+    if (!kind_is(value, "string"))
+        return NULL;
+    const char *text = node_text(index, value);
+    size_t length = text ? strlen(text) : 0;
+    if (length < 2 || strchr(text, '\\'))
+        return NULL;
+    return cbm_arena_strndup(index->arena, text + 1, length - 2);
 }
 
 static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNode node) {
@@ -161,11 +280,19 @@ static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNod
         return;
     }
     index->sites = sites;
-    sites[index->site_count++] = (binding_site_t){.name = name,
-                                                  .start = ts_node_start_byte(node),
-                                                  .end = ts_node_end_byte(node),
-                                                  .scope = index->current_scope,
-                                                  .pending = index->current_pending};
+    bool ecma = javascript_language(index->language);
+    sites[index->site_count++] = (binding_site_t){
+        .name = name,
+        .start = ts_node_start_byte(node),
+        .end = ts_node_end_byte(node),
+        .scope = index->current_scope,
+        .pending = index->current_pending,
+        .invocation = invocation_site(node),
+        .http_escape = ecma && http_escape(node, index, false),
+        .http_factory_escape = ecma && http_escape(node, index, true),
+        .http_scope =
+            ecma && kind_is(node, "call_expression") ? http_call_scope(index, node) : NULL,
+        .http_url = ecma ? http_call_url(index, node) : NULL};
 }
 
 static bool listed(const char *kind, const char *const *list) {
@@ -691,6 +818,94 @@ static unsigned javascript_declaration_kind(const char *kind) {
     return 0;
 }
 
+static const char *http_module_literal(cbm_resolve_binding_index_t *index, TSNode node) {
+    const char *text = kind_is(node, "string") ? node_text(index, node) : NULL;
+    size_t length = text ? strlen(text) : 0;
+    return length >= 2 && !strchr(text, '\\')
+               ? cbm_arena_strndup(index->arena, text + 1, length - 2)
+               : NULL;
+}
+
+static void http_dependency(cbm_resolve_binding_index_t *index, const char *path, const char *local,
+                            bool side_effect) {
+    if (!path || !*path) {
+        index->http_domain_unknown = true;
+        return;
+    }
+    /* These packages expose loaders/evaluators whose aliases need a separate
+     * capability analysis. They can reach any client in this repository. */
+    if (!strcmp(path, "module") || !strcmp(path, "node:module") || !strcmp(path, "vm") ||
+        !strcmp(path, "node:vm"))
+        index->http_domain_unknown = true;
+    cbm_resolve_http_dependency_t *items =
+        grow_array(index, index->http_dependencies, index->http_dependency_count,
+                   &index->http_dependency_capacity, sizeof(*items));
+    if (!items)
+        return;
+    index->http_dependencies = items;
+    items[index->http_dependency_count++] =
+        (cbm_resolve_http_dependency_t){path, local, side_effect};
+}
+
+static void note_http_dependency(cbm_resolve_binding_index_t *index, TSNode node) {
+    /* Computed/reflection access can hide loader and evaluator aliases.
+     * Until that capability flow is audited, the repository domain is open. */
+    if (kind_is(node, "subscript_expression"))
+        index->http_domain_unknown = true;
+    if (kind_is(node, "identifier") || kind_is(node, "property_identifier")) {
+        const char *capability = node_text(index, node);
+        if (capability &&
+            (!strcmp(capability, "globalThis") || !strcmp(capability, "global") ||
+             !strcmp(capability, "window") || !strcmp(capability, "self") ||
+             !strcmp(capability, "Reflect") || !strcmp(capability, "eval") ||
+             !strcmp(capability, "Function") || !strcmp(capability, "mainModule") ||
+             !strcmp(capability, "setTimeout") || !strcmp(capability, "setInterval") ||
+             (!strcmp(capability, "constructor") &&
+              kind_is(ts_node_parent(node), "member_expression"))))
+            index->http_domain_unknown = true;
+    }
+    if (kind_is(node, "import_statement") || kind_is(node, "export_statement")) {
+        TSNode source = field(node, "source");
+        if (ts_node_is_null(source) || child_token(node, "type"))
+            return;
+        const char *local = NULL;
+        bool side_effect = kind_is(node, "import_statement");
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode clause = ts_node_named_child(node, i);
+            if (!kind_is(clause, "import_clause"))
+                continue;
+            side_effect = false;
+            if (ts_node_named_child_count(clause) == 1 &&
+                kind_is(ts_node_named_child(clause, 0), "identifier"))
+                local = node_text(index, ts_node_named_child(clause, 0));
+        }
+        http_dependency(index, http_module_literal(index, source), local, side_effect);
+    }
+    if (kind_is(node, "call_expression")) {
+        TSNode function = field(node, "function");
+        const char *text = node_text(index, function);
+        bool loader = kind_is(function, "import") ||
+                      (kind_is(function, "identifier") && text && !strcmp(text, "require"));
+        if (loader) {
+            TSNode args = field(node, "arguments");
+            const char *path = !ts_node_is_null(args) && ts_node_named_child_count(args) == 1
+                                   ? http_module_literal(index, ts_node_named_child(args, 0))
+                                   : NULL;
+            http_dependency(index, path, NULL, false);
+        }
+    }
+    if (kind_is(node, "identifier") || kind_is(node, "property_identifier")) {
+        const char *text = node_text(index, node);
+        if (!text || strcmp(text, "require"))
+            return;
+        TSNode parent = ts_node_parent(node);
+        if (!kind_is(node, "identifier") || !kind_is(parent, "call_expression") ||
+            !ts_node_eq(node, field(parent, "function")))
+            index->http_domain_unknown = true;
+    }
+}
+
 static void note_javascript_import(cbm_resolve_binding_index_t *index, TSNode node,
                                    const char *parent_kind, bool type_only) {
     TSNode name = {0};
@@ -712,6 +927,21 @@ static void note_javascript_import(cbm_resolve_binding_index_t *index, TSNode no
             return;
         }
         add_name(index, node_text(index, name), 0, type_only ? BINDING_BLOCKED : BINDING_IMPORT);
+        /* Retain the actual default import's module literal for the HTTP
+         * domain. A mutable extraction carrier cannot replace that spelling. */
+        if (!type_only && kind_is(node, "identifier") && parent_kind &&
+            !strcmp(parent_kind, "import_clause") && index->name_count &&
+            index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE) {
+            TSNode statement = ts_node_parent(ts_node_parent(node));
+            TSNode source = field(statement, "source");
+            const char *text = kind_is(statement, "import_statement") && kind_is(source, "string")
+                                   ? node_text(index, source)
+                                   : NULL;
+            size_t length = text ? strlen(text) : 0;
+            if (length >= 2 && !strchr(text, '\\'))
+                index->names[index->name_count - 1].http_import_path =
+                    cbm_arena_strndup(index->arena, text + 1, length - 2);
+        }
     }
 }
 
@@ -771,6 +1001,38 @@ static bool javascript_binding_child(const char *parent, const char *field_name)
            strcmp(field_name, "parameter") == 0;
 }
 
+static TSNode javascript_module_const(TSNode name) {
+    TSNode declarator = ts_node_parent(name);
+    if (!kind_is(declarator, "variable_declarator") || !ts_node_eq(name, field(declarator, "name")))
+        return (TSNode){0};
+    TSNode declaration = ts_node_parent(declarator);
+    if (!kind_is(declaration, "lexical_declaration") || !child_token(declaration, "const") ||
+        ts_node_is_null(field(declarator, "value")))
+        return (TSNode){0};
+    TSNode owner = ts_node_parent(declaration);
+    if (kind_is(owner, "export_statement")) {
+        if (child_token(owner, "default"))
+            return (TSNode){0};
+        owner = ts_node_parent(owner);
+    }
+    return kind_is(owner, "program") ? declarator : (TSNode){0};
+}
+
+static bool note_javascript_value(cbm_resolve_binding_index_t *index, TSNode node, bool exported) {
+    TSNode declarator = javascript_module_const(node);
+    if (ts_node_is_null(declarator))
+        return false;
+    size_t before = index->name_count;
+    add_name(index, node_text(index, node), ts_node_end_byte(declarator),
+             BINDING_VALUE_DECLARATION | (exported ? BINDING_EXPORTED : 0));
+    if (index->name_count > before) {
+        binding_name_t *value = &index->names[before];
+        value->value_start_line = ts_node_start_point(declarator).row + 1;
+        value->value_end_line = ts_node_end_point(declarator).row + 1;
+    }
+    return true;
+}
+
 static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, TSNode node,
                                            const char *parent_kind, const char *field_name,
                                            unsigned depth, binding_walk_t state) {
@@ -790,6 +1052,7 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "non_module_import_binding");
         }
     }
+    note_http_dependency(index, node);
     if (kind_is(node, "export_statement")) {
         index->javascript_module |= depth == 1;
         state.named_export = depth == 1 && !child_token(node, "default");
@@ -832,7 +1095,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         if (name && (strcmp(name, "eval") == 0 || strcmp(name, "Function") == 0)) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "dynamic_namespace_effect");
         }
-        if (state.blocked && !parent_declaration_name) {
+        if (state.blocked && !parent_declaration_name &&
+            !note_javascript_value(index, node, state.named_export)) {
             add_name(index, name, 0, BINDING_BLOCKED);
         }
         if (!state.import && !state.blocked && !parent_declaration_name && !declaration_name) {
@@ -1532,7 +1796,8 @@ static void apply_export_markers(cbm_resolve_binding_index_t *index) {
                 (BINDING_EXPORT_MARKER | BINDING_EXPORT_CONFLICT | BINDING_TYPE_EXPORT_MARKER)) {
                 continue;
             }
-            if (exported && (name.flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION))) {
+            if (exported && (name.flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION |
+                                           BINDING_VALUE_DECLARATION))) {
                 name.flags |= BINDING_EXPORTED;
             }
             if (type_exported && (name.flags & BINDING_TYPE_DECLARATION)) {
@@ -1546,6 +1811,34 @@ static void apply_export_markers(cbm_resolve_binding_index_t *index) {
         start = end;
     }
     index->name_count = destination;
+}
+
+/* Join source const declarations to the exact extracted graph identity. One
+ * binary lookup per definition avoids a declarations-by-definitions scan. A
+ * callable, absent, duplicate or differently located node cannot back a value.
+ */
+static void audit_javascript_values(cbm_resolve_binding_index_t *index) {
+    for (int d = 0; d < index->result->defs.count; d++) {
+        const CBMDefinition *definition = &index->result->defs.items[d];
+        if (!definition->name || !definition->qualified_name)
+            continue;
+        binding_name_t key = {.name = definition->name};
+        binding_name_t *binding =
+            bsearch(&key, index->names, index->name_count, sizeof(*index->names), compare_name);
+        if (!binding || !(binding->flags & BINDING_VALUE_DECLARATION) || !binding->target ||
+            strcmp(binding->target, definition->qualified_name))
+            continue;
+        binding->value_definitions++;
+        if (!definition->label || strcmp(definition->label, "Variable") ||
+            definition->parent_class || definition->start_line != binding->value_start_line ||
+            definition->end_line != binding->value_end_line)
+            binding->flags |= BINDING_BLOCKED;
+    }
+    for (size_t n = 0; n < index->name_count; n++) {
+        binding_name_t *binding = &index->names[n];
+        if ((binding->flags & BINDING_VALUE_DECLARATION) && binding->value_definitions != 1)
+            binding->flags |= BINDING_BLOCKED;
+    }
 }
 
 static int compare_site(const void *left, const void *right) {
@@ -1672,6 +1965,152 @@ static cbm_resolve_result_t binding_query_finish(const cbm_resolve_binding_index
     return result;
 }
 
+/* A module value escaping to an unknown alias/callee can mutate its namespace.
+ * This independent pass still visits syntax outside the positive-binding
+ * subset. Imported-name queries are binary searches, never source rescans. */
+static bool python_namespace_read(cbm_resolve_binding_index_t *index, TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (kind_is(parent, "attribute") && ts_node_eq(node, field(parent, "attribute")))
+        return true; /* Attribute spelling is not a lexical module reference. */
+    if (kind_is(parent, "call") && ts_node_eq(node, field(parent, "function")))
+        return true; /* Calling a module is an error, not an alias escape. */
+    if (!kind_is(parent, "attribute") || !ts_node_eq(node, field(parent, "object")))
+        return kind_is(parent, "expression_statement");
+    for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
+        const char *member = node_text(index, field(parent, "attribute"));
+        if (!member || !strcmp(member, "__dict__"))
+            return false;
+        node = parent;
+        parent = ts_node_parent(node);
+        if (kind_is(parent, "attribute") && ts_node_eq(node, field(parent, "object")))
+            continue;
+        return kind_is(parent, "expression_statement") ||
+               (kind_is(parent, "call") && ts_node_eq(node, field(parent, "function")));
+    }
+    return false;
+}
+static int python_escape_compare(const void *left, const void *right) {
+    return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+static void python_namespace_effects(cbm_resolve_binding_index_t *index, TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    unsigned depth = 0;
+    size_t visited = 0;
+    index->python_effects_complete = true;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (++visited > BINDING_MAX_NODES || depth > BINDING_MAX_DEPTH) {
+            index->python_effects_complete = false;
+            break;
+        }
+        bool skip = kind_is(node, "import_statement") || kind_is(node, "import_from_statement");
+        if (kind_is(node, "global_statement"))
+            index->python_effects_complete = false;
+        if (kind_is(node, "identifier")) {
+            const char *name = node_text(index, node);
+            if (name && (!strcmp(name, "exec") || !strcmp(name, "eval") ||
+                         !strcmp(name, "__import__") || !strcmp(name, "globals")))
+                index->python_effects_complete = false;
+        }
+        if (kind_is(node, "attribute")) {
+            const char *name = node_text(index, field(node, "attribute"));
+            if (name && (!strcmp(name, "modules") || !strcmp(name, "import_module")))
+                index->python_effects_complete = false;
+        }
+        if (kind_is(node, "identifier") && !python_namespace_read(index, node)) {
+            const char *name = node_text(index, node);
+            const char **names =
+                grow_array(index, index->python_escapes, index->python_escape_count,
+                           &index->python_escape_capacity, sizeof(*names));
+            if (!name || !names) {
+                index->python_effects_complete = false;
+                break;
+            }
+            index->python_escapes = names;
+            names[index->python_escape_count++] = name;
+        }
+        if (!skip && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto finished;
+            depth--;
+        }
+    }
+finished:
+    ts_tree_cursor_delete(&cursor);
+    if (index->python_escape_count > 1)
+        qsort(index->python_escapes, index->python_escape_count, sizeof(*index->python_escapes),
+              python_escape_compare);
+}
+
+/* Absence needs a stronger audit than a positive local binding. Module code
+ * can install arbitrary names or __getattr__, including through imports and
+ * class construction. Only inert statements and plain function declarations
+ * with inert headers are closed here; function bodies are not executed. */
+static bool python_inert_namespace(TSNode root) {
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode node = ts_node_named_child(root, i);
+        if (kind_is(node, "comment") || kind_is(node, "pass_statement"))
+            continue;
+        if (kind_is(node, "expression_statement") && ts_node_named_child_count(node) == 1) {
+            TSNode value = ts_node_named_child(node, 0);
+            if (!kind_is(value, "string"))
+                return false;
+            for (uint32_t j = 0; j < ts_node_named_child_count(value); j++) {
+                TSNode child = ts_node_named_child(value, j);
+                if (!kind_is(child, "string_start") && !kind_is(child, "string_content") &&
+                    !kind_is(child, "string_end"))
+                    return false;
+            }
+            continue;
+        }
+        if (!kind_is(node, "function_definition") || !ts_node_is_null(field(node, "return_type")) ||
+            !ts_node_is_null(field(node, "type_parameters")))
+            return false;
+        TSNode parameters = field(node, "parameters");
+        if (ts_node_is_null(parameters))
+            return false;
+        for (uint32_t j = 0; j < ts_node_named_child_count(parameters); j++)
+            if (!kind_is(ts_node_named_child(parameters, j), "identifier"))
+                return false;
+    }
+    return true;
+}
+
+/* Symbol QNs omit a terminal index filename, while module QNs retain it.
+ * Use the captured path and the same normalization as extraction: trimming
+ * ".index" from a module string would corrupt public.index.ts identities. */
+static const char *javascript_symbol_scope(cbm_resolve_binding_index_t *index) {
+    const CBMFileResult *result = index->result;
+    if (!result->source_project || !result->source_project[0] || !result->source_file ||
+        !result->source_file[0] || !result->source_content_id[CBM_SOURCE_ORIGIN_RAW][0] ||
+        !result->source_configuration_id[0]) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "javascript_source_identity_missing");
+        return NULL;
+    }
+    const char *module = cbm_fqn_module(index->arena, result->source_project, result->source_file);
+    char *scope = cbm_fqn_compute(index->arena, result->source_project, result->source_file,
+                                  "__binding_scope__");
+    if (!module || !scope) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "binding_symbol_scope_allocation");
+        return NULL;
+    }
+    if (strcmp(module, result->module_qn)) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "javascript_source_identity_mismatch");
+        return NULL;
+    }
+    /* The fixed nonempty member above always adds this final separator. */
+    *strrchr(scope, '.') = '\0';
+    return scope;
+}
+
+static void audit_http_default(cbm_resolve_binding_index_t *index, TSNode root);
+static void audit_http_escapes(cbm_resolve_binding_index_t *index);
+
 cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
                                                        CBMLanguage language, const char *source,
                                                        size_t source_len) {
@@ -1733,40 +2172,55 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
     } else {
         index->analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
         index->reason = "binding_complete_supported_subset";
-        if (language == CBM_LANG_PYTHON) {
+        if (language == CBM_LANG_PYTHON || javascript_language(language)) {
             index->scopes =
                 grow_array(index, NULL, 0, &index->scope_capacity, sizeof(*index->scopes));
             if (index->scopes) {
                 const char *scope = result->module_qn;
-                size_t symbol_scope_len = cbm_fqn_symbol_scope_len(scope);
-                if (symbol_scope_len != strlen(scope))
-                    scope = cbm_arena_strndup(arena, scope, symbol_scope_len);
+                if (javascript_language(language)) {
+                    scope = javascript_symbol_scope(index);
+                } else {
+                    size_t symbol_scope_len = cbm_fqn_symbol_scope_len(scope);
+                    if (symbol_scope_len != strlen(scope))
+                        scope = cbm_arena_strndup(arena, scope, symbol_scope_len);
+                }
                 if (!scope) {
-                    fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED,
-                               "python_symbol_scope_allocation");
+                    if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE)
+                        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED,
+                                   "python_symbol_scope_allocation");
                 } else {
                     index->scopes[0] = (binding_scope_t){scope, 0, false};
                     index->scope_count = 1;
                 }
             }
         }
-        if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE)
+        if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE) {
             walk_tree(index, ts_tree_root_node(tree));
+            if (language == CBM_LANG_PYTHON) {
+                index->python_namespace_closed = python_inert_namespace(ts_tree_root_node(tree));
+                python_namespace_effects(index, ts_tree_root_node(tree));
+            }
+        }
         if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE && javascript_language(language) &&
             !index->javascript_module) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "javascript_script_scope_unproven");
         }
     }
-    if (owned_tree) {
-        ts_tree_delete(owned_tree);
-    }
     if (index->name_count) {
         qsort(index->names, index->name_count, sizeof(*index->names), compare_name);
         apply_export_markers(index);
+        if (javascript_language(language))
+            audit_javascript_values(index);
     }
     if (index->site_count) {
         qsort(index->sites, index->site_count, sizeof(*index->sites), compare_site);
     }
+    if (tree && javascript_language(language) && index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE) {
+        audit_http_escapes(index);
+        audit_http_default(index, ts_tree_root_node(tree));
+    }
+    if (owned_tree)
+        ts_tree_delete(owned_tree);
     return index;
 }
 
@@ -1806,6 +2260,200 @@ static const binding_name_t *find_name(const cbm_resolve_binding_index_t *index,
     return find_scoped_name(index, name, length, 0, &present);
 }
 
+static void audit_http_escapes(cbm_resolve_binding_index_t *index) {
+    for (size_t i = 0; i < index->site_count; i++) {
+        binding_site_t *site = &index->sites[i];
+        if (!site->http_escape && !site->http_factory_escape)
+            continue;
+        binding_name_t *binding =
+            (binding_name_t *)find_name(index, site->name, strlen(site->name));
+        if (binding) {
+            binding->http_escaped |= site->http_escape;
+            binding->http_factory_escaped |= site->http_factory_escape;
+        }
+    }
+}
+
+/* HTTP default values are a separate domain from named exports. This
+ * deliberately small source form has no executable module statements other
+ * than const initializers, and cannot certify an arbitrary default object. */
+static bool http_literal(TSNode node) {
+    return kind_is(node, "number") || kind_is(node, "string") || kind_is(node, "true") ||
+           kind_is(node, "false") || kind_is(node, "null");
+}
+
+static TSNode http_default_value(TSNode root) {
+    TSNode value = {0};
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode node = ts_node_named_child(root, i);
+        if (kind_is(node, "comment") || kind_is(node, "import_statement") ||
+            kind_is(node, "lexical_declaration"))
+            continue;
+        if (!kind_is(node, "export_statement") || !child_token(node, "default") ||
+            !ts_node_is_null(value))
+            return (TSNode){0};
+        value = field(node, "value");
+        if (!kind_is(value, "identifier"))
+            return (TSNode){0};
+    }
+    return value;
+}
+
+static TSNode http_default_initializer(cbm_resolve_binding_index_t *index, TSNode root,
+                                       const char *name) {
+    TSNode selected = {0};
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode declaration = ts_node_named_child(root, i);
+        if (!kind_is(declaration, "lexical_declaration"))
+            continue;
+        if (!child_token(declaration, "const"))
+            return (TSNode){0};
+        uint32_t variables = ts_node_named_child_count(declaration);
+        for (uint32_t v = 0; v < variables; v++) {
+            TSNode declarator = ts_node_named_child(declaration, v);
+            if (kind_is(declarator, "comment"))
+                continue;
+            TSNode identifier = field(declarator, "name"), value = field(declarator, "value");
+            if (!kind_is(declarator, "variable_declarator") || !kind_is(identifier, "identifier"))
+                return (TSNode){0};
+            const char *spelling = node_text(index, identifier);
+            if (spelling && !strcmp(spelling, name)) {
+                if (!ts_node_is_null(selected))
+                    return (TSNode){0};
+                selected = value;
+            } else if (!http_literal(value)) {
+                return (TSNode){0};
+            }
+        }
+    }
+    return selected;
+}
+
+bool cbm_resolve_binding_http_domain_complete(const cbm_resolve_binding_index_t *index) {
+    return index && index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE && !index->http_domain_unknown;
+}
+
+size_t cbm_resolve_binding_http_dependency_count(const cbm_resolve_binding_index_t *index) {
+    return index ? index->http_dependency_count : 0;
+}
+
+const cbm_resolve_http_dependency_t *cbm_resolve_binding_http_dependency_at(
+    const cbm_resolve_binding_index_t *index, size_t offset) {
+    return index && offset < index->http_dependency_count ? &index->http_dependencies[offset]
+                                                          : NULL;
+}
+
+bool cbm_resolve_binding_http_import_safe(const cbm_resolve_binding_index_t *index,
+                                          const char *name, bool axios_factory) {
+    if (!name || !cbm_resolve_binding_import(index, name))
+        return false;
+    const binding_name_t *binding = find_name(index, name, strlen(name));
+    return binding && binding->http_import_path &&
+           !(axios_factory ? binding->http_factory_escaped : binding->http_escaped);
+}
+
+const char *cbm_resolve_binding_http_import_path(const cbm_resolve_binding_index_t *index,
+                                                 const char *name) {
+    if (!cbm_resolve_binding_import(index, name))
+        return NULL;
+    const binding_name_t *binding = find_name(index, name, strlen(name));
+    return binding ? binding->http_import_path : NULL;
+}
+
+static bool http_axios_origin(const cbm_resolve_binding_index_t *index, const char *name) {
+    const char *path = cbm_resolve_binding_http_import_path(index, name);
+    return path && !strcmp(path, "axios");
+}
+
+static bool http_client_base(cbm_resolve_binding_index_t *index, TSNode call, const char **base) {
+    TSNode args = field(call, "arguments");
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) != 1)
+        return false;
+    TSNode object = ts_node_named_child(args, 0);
+    if (!kind_is(object, "object"))
+        return false;
+    bool seen = false;
+    uint32_t count = ts_node_named_child_count(object);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode pair = ts_node_named_child(object, i);
+        if (kind_is(pair, "comment"))
+            continue;
+        if (!kind_is(pair, "pair"))
+            return false;
+        const char *key = node_text(index, field(pair, "key"));
+        TSNode value = field(pair, "value");
+        if (key && !strcmp(key, "timeout") && kind_is(value, "number"))
+            continue;
+        if (!key || strcmp(key, "baseURL") || seen)
+            return false;
+        seen = true;
+        if (kind_is(value, "string")) {
+            const char *text = node_text(index, value);
+            size_t length = text ? strlen(text) : 0;
+            if (length >= 2 && !strchr(text, '\\'))
+                *base = cbm_arena_strndup(index->arena, text + 1, length - 2);
+        }
+    }
+    /* An absent/nonliteral base is unknown, not an empty literal base. */
+    return true;
+}
+
+static void audit_http_default(cbm_resolve_binding_index_t *index, TSNode root) {
+    TSNode value = http_default_value(root);
+    const char *name = ts_node_is_null(value) ? NULL : node_text(index, value);
+    const binding_name_t *binding = name ? find_name(index, name, strlen(name)) : NULL;
+    if (!binding || (binding->flags & BINDING_BLOCKED) ||
+        !(binding->flags & BINDING_VALUE_DECLARATION) || !binding->target ||
+        ts_node_start_byte(value) < binding->at)
+        return;
+    TSNode call = http_default_initializer(index, root, name);
+    TSNode function = field(call, "function");
+    TSNode object = field(function, "object"), property = field(function, "property");
+    const char *receiver = kind_is(object, "identifier") ? node_text(index, object) : NULL;
+    const char *method = node_text(index, property);
+    const char *base = NULL;
+    if (!kind_is(call, "call_expression") || !kind_is(function, "member_expression") || !receiver ||
+        !method || strcmp(method, "create") || !http_axios_origin(index, receiver) ||
+        !http_client_base(index, call, &base))
+        return;
+    index->http_default_target = binding->target;
+    index->http_default_base = base;
+}
+
+bool cbm_resolve_binding_http_default(const cbm_resolve_binding_index_t *index, const char **target,
+                                      const char **base) {
+    *target = *base = NULL;
+    if (!index || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !index->http_default_target)
+        return false;
+    *target = index->http_default_target;
+    *base = index->http_default_base;
+    return true;
+}
+
+/* Query the exact AST occurrence. The current ECMAScript lexical auditor is
+ * conservative: any local shadow or write blocks that import across the file.
+ * Thus a positive cannot be borrowed from a different unshadowed scope. */
+bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *index,
+                                           const CBMCall *call, const char *local_name) {
+    if (!index || !call || !local_name || !call->callee_name || !call->enclosing_func_qn ||
+        !call->first_string_arg || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+        call->source_origin != CBM_SOURCE_ORIGIN_RAW ||
+        call->site_end_byte <= call->site_start_byte ||
+        !cbm_resolve_binding_import(index, local_name))
+        return false;
+    binding_site_t key = {
+        .name = call->callee_name, .start = call->site_start_byte, .end = call->site_end_byte};
+    const binding_site_t *site =
+        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    const binding_name_t *binding = find_name(index, local_name, strlen(local_name));
+    return site && site->invocation && binding && !binding->http_escaped &&
+           site->scope == binding->scope && site->http_scope && site->http_url &&
+           !strcmp(site->http_scope, call->enclosing_func_qn) &&
+           !strcmp(site->http_url, call->first_string_arg) && call->site_start_byte >= binding->at;
+}
+
 static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t *index,
                                                const char *name, size_t length, uint32_t scope,
                                                cbm_resolve_lookup_t *query) {
@@ -1817,9 +2465,9 @@ static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t
         const char *key = cbm_arena_strndup(index->arena, name, length);
         (void)cbm_resolve_lookup_observe(
             query, domain, key, found ? (found->target ? found->target : key) : NULL,
-            present && !found ? CBM_RESOLVE_BINDING_AMBIGUOUS
-            : found           ? CBM_RESOLVE_BINDING_UNIQUE
-                              : CBM_RESOLVE_BINDING_UNRESOLVED,
+            found     ? CBM_RESOLVE_BINDING_UNIQUE
+            : present ? CBM_RESOLVE_BINDING_AMBIGUOUS
+                      : CBM_RESOLVE_BINDING_UNRESOLVED,
             CBM_RESOLVE_ANALYSIS_COMPLETE, found ? found->flags : 0, true,
             !present ? "lexical_scope_key_absent"
             : !found ? "lexical_scope_key_ambiguous"
@@ -1883,11 +2531,19 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
             return binding_query_finish(index, &query, candidate);
         }
     }
+    if (binding && (binding->flags & BINDING_VALUE_DECLARATION) &&
+        (located->invocation ||
+         (prior_facts & (CBM_RESOLVE_FACT_CALLABLE_TYPED | CBM_RESOLVE_FACT_RECEIVER_TYPED |
+                         CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_CLASS_CALLABLE)))) {
+        candidate.reason = "value_binding_does_not_prove_callable_or_type";
+        return binding_query_finish(index, &query, candidate);
+    }
     if (dart_import) {
         candidate.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;
     } else if (candidate.rule == CBM_RESOLVE_RULE_SCOPE_BINDING && !dot &&
-               (binding->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE)) && binding->target &&
-               strcmp(binding->target, candidate.target) == 0) {
+               (binding->flags &
+                (BINDING_DECLARATION | BINDING_VALUE_TYPE | BINDING_VALUE_DECLARATION)) &&
+               binding->target && strcmp(binding->target, candidate.target) == 0) {
         candidate.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;
     } else if (candidate.rule == CBM_RESOLVE_RULE_IMPORT_BINDING &&
                (binding->flags & BINDING_IMPORT) && (prior_facts & CBM_RESOLVE_FACT_IMPORT_BOUND) &&
@@ -1957,13 +2613,14 @@ unsigned cbm_resolve_binding_export_kind(const cbm_resolve_binding_index_t *inde
     if (index->language == CBM_LANG_DART && name[0] == '_')
         return 0;
     const binding_name_t *binding = find_name(index, name, strlen(name));
-    if (!binding || !binding->target || strcmp(binding->target, qualified_name) != 0 ||
+    if (!binding || !binding->target || (binding->flags & BINDING_BLOCKED) ||
+        strcmp(binding->target, qualified_name) != 0 ||
         ((javascript_language(index->language) || index->language == CBM_LANG_RUST) &&
          !(binding->flags & (BINDING_EXPORTED | BINDING_TYPE_EXPORTED)))) {
         return 0;
     }
     unsigned kind = 0;
-    if ((binding->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE)) &&
+    if ((binding->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE | BINDING_VALUE_DECLARATION)) &&
         (index->language == CBM_LANG_PYTHON || index->language == CBM_LANG_DART ||
          (binding->flags & BINDING_EXPORTED))) {
         kind |= CBM_RESOLVE_EXPORT_VALUE;
@@ -1998,6 +2655,36 @@ bool cbm_resolve_binding_name_present(const cbm_resolve_binding_index_t *index, 
             high = middle;
     }
     return low < index->name_count && strcmp(index->names[low].name, name) == 0;
+}
+
+bool cbm_resolve_binding_python_effects_complete(const cbm_resolve_binding_index_t *index) {
+    return index && index->language == CBM_LANG_PYTHON && index->python_effects_complete;
+}
+
+bool cbm_resolve_binding_python_import_escaped(const cbm_resolve_binding_index_t *index,
+                                               const char *name) {
+    if (!index || !name || !index->python_effects_complete)
+        return true;
+    return index->python_escape_count &&
+           bsearch(&name, index->python_escapes, index->python_escape_count,
+                   sizeof(*index->python_escapes), python_escape_compare) != NULL;
+}
+
+bool cbm_resolve_binding_python_namespace_closed(const cbm_resolve_binding_index_t *index) {
+    return index && index->language == CBM_LANG_PYTHON &&
+           index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE && index->python_namespace_closed &&
+           !cbm_resolve_binding_name_present(index, "__getattr__") &&
+           !cbm_resolve_binding_name_present(index, "__getattribute__");
+}
+size_t cbm_resolve_binding_python_namespace_size(const cbm_resolve_binding_index_t *index) {
+    return cbm_resolve_binding_python_namespace_closed(index) ? index->name_count : 0;
+}
+const char *cbm_resolve_binding_python_namespace_name(const cbm_resolve_binding_index_t *index,
+                                                      size_t offset) {
+    return cbm_resolve_binding_python_namespace_closed(index) && offset < index->name_count &&
+                   index->names[offset].scope == 0
+               ? index->names[offset].name
+               : NULL;
 }
 
 bool cbm_resolve_binding_namespace_complete(const cbm_resolve_binding_index_t *index) {

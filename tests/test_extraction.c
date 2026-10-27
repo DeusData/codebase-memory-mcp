@@ -5092,6 +5092,49 @@ TEST(extract_python_nested_def_calls_attributed_to_it_issue1548) {
     PASS();
 }
 
+TEST(extract_python_default_values_use_enclosing_execution_owner) {
+    const char *source = "def top(callback=receive(top_target)):\n"
+                         "    top_body()\n"
+                         "def outer():\n"
+                         "    @decorate(marker)\n"
+                         "    def nested(callback: Annotation = receive(nested_target)):\n"
+                         "        nested_body()\n"
+                         "    outer_body()\n";
+    CBMFileResult *result = extract(source, CBM_LANG_PYTHON, "t", "app.py");
+    ASSERT_NOT_NULL(result);
+    ASSERT_FALSE(result->has_error);
+    const char *const names[] = {"top_target", "nested_target", "marker", "Annotation"};
+    const char *const owners[] = {"t.app", "t.app.outer", "t.app.outer", "t.app.outer.nested"};
+    int seen[4] = {0};
+    for (int u = 0; u < result->usages.count; u++) {
+        const CBMUsage *usage = &result->usages.items[u];
+        for (int i = 0; i < 4; i++) {
+            if (!usage->ref_name || strcmp(usage->ref_name, names[i]))
+                continue;
+            const char *at = strstr(source, names[i]);
+            ASSERT_NOT_NULL(at);
+            ASSERT_EQ(usage->site_start_byte, (uint32_t)(at - source));
+            ASSERT_EQ(usage->site_end_byte, (uint32_t)(at - source + strlen(names[i])));
+            ASSERT_STR_EQ(usage->enclosing_func_qn, owners[i]);
+            if (i < 3)
+                ASSERT_TRUE(usage->may_be_call_reference);
+            seen[i]++;
+        }
+    }
+    for (int i = 0; i < 4; i++)
+        ASSERT_EQ(seen[i], 1);
+    ASSERT_EQ(pyn_calls(result, "receive", "t.app"), 1);
+    ASSERT_EQ(pyn_calls(result, "receive", "t.app.outer"), 1);
+    ASSERT_EQ(pyn_calls(result, "receive", "t.app.top"), 0);
+    ASSERT_EQ(pyn_calls(result, "receive", "t.app.outer.nested"), 0);
+    ASSERT_EQ(pyn_calls(result, "decorate", "t.app.outer"), 1);
+    ASSERT_EQ(pyn_calls(result, "top_body", "t.app.top"), 1);
+    ASSERT_EQ(pyn_calls(result, "nested_body", "t.app.outer.nested"), 1);
+    ASSERT_EQ(pyn_calls(result, "outer_body", "t.app.outer"), 1);
+    cbm_free_result(result);
+    PASS();
+}
+
 /* The app-factory shape: route handlers are decorated defs inside
  * create_app. Each is extracted with its QN and carries the route its
  * decorator declares, which is what mints the Route node and its HANDLES
@@ -13519,6 +13562,7 @@ SUITE(extraction) {
     RUN_TEST(python_init_nested_module_qn);
     RUN_TEST(extract_python_nested_def_qualified_by_enclosing_def_issue1548);
     RUN_TEST(extract_python_nested_def_calls_attributed_to_it_issue1548);
+    RUN_TEST(extract_python_default_values_use_enclosing_execution_owner);
     RUN_TEST(extract_python_decorated_nested_route_handler_issue1548);
     RUN_TEST(extract_python_nested_class_issue1548);
     RUN_TEST(extract_python_nested_def_named_like_its_method_issue1548);

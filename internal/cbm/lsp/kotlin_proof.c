@@ -191,9 +191,9 @@ static void kt_proof_function_fact(kt_proof_source_t *source, TSNode node, const
         source->failed = true;
         return;
     }
-    int at = 0;
     TSTreeCursor cursor = ts_tree_cursor_new(parameters);
-    if (ts_tree_cursor_goto_first_child(&cursor))
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        int at = 0;
         do {
             TSNode parameter = ts_tree_cursor_current_node(&cursor);
             if (!kt_proof_is(parameter, "parameter"))
@@ -214,6 +214,7 @@ static void kt_proof_function_fact(kt_proof_source_t *source, TSNode node, const
             if (!types[at - 1])
                 source->declarations[index].arity = -1;
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
     ts_tree_cursor_delete(&cursor);
     source->declarations[index].parameter_types = types;
     /* A block body with no return annotation has the language-defined Unit
@@ -632,6 +633,8 @@ static bool kt_proof_read_syntax(const char *kind) {
                                           "control_structure_body",
                                           "comparison_expression",
                                           "equality_expression",
+                                          "conjunction_expression",
+                                          "disjunction_expression",
                                           "additive_expression",
                                           "multiplicative_expression",
                                           "parenthesized_expression",
@@ -988,6 +991,8 @@ static bool kt_proof_property(kt_proof_context_t *context, TSNode node, const ch
 }
 static cbm_resolve_method_candidate_t kt_proof_property_candidate(
     const cbm_resolve_method_query_t *query, const CBMTypeRegistry *owner,
+    // WHY: The shared classify callback type requires a mutable void * context.
+    // cppcheck-suppress constParameterCallback
     const CBMRegisteredFunc *candidate, void *opaque) {
     (void)query;
     (void)owner;
@@ -1262,8 +1267,13 @@ static void kt_proof_function(kt_proof_context_t *context, TSNode node, bool top
                 if (ts_node_is_null(type_node))
                     type_node = kt_proof_child(parameter, "function_type");
                 const char *spelling = kt_proof_text(&context->source, type_node);
+                /* A direct built-in scalar spelling has its own exact shadow
+                 * checks below. Unrelated function imports do not change it.
+                 * Function-type components still require separate lookup. */
+                bool imported_components =
+                    context->source.imports && !kt_proof_is(type_node, "user_type");
                 const CBMType *source_type =
-                    kt_source_type(context->source.arena, spelling, context->source.imports);
+                    kt_source_type(context->source.arena, spelling, imported_components);
                 /* Imports and local type names can shadow implicit Kotlin
                  * built-ins; only a complete unshadowed type domain is used. */
                 if (spelling && (context->wildcard || cbm_ht_get(context->imports, spelling) ||
@@ -1324,11 +1334,14 @@ void cbm_kotlin_proof_resolve(CBMArena *arena, const char *source, int length, T
         ts_node_has_error(root) || file->has_error || file->parse_incomplete ||
         file->parse_unusable)
         return;
+    /* Append through a private descriptor; publish only after complete analysis.
+     * Arena growth preserves the original buffer and its committed prefix. */
+    CBMResolvedCallArray staged = *out;
     kt_proof_context_t context = {
         .source = {.arena = arena, .source = source, .length = (size_t)length},
         .registry = registry,
         .file = file,
-        .out = out};
+        .out = &staged};
     context.imports = cbm_ht_create(32);
     context.callers = cbm_ht_create(32);
     context.local_types = cbm_ht_create(32);
@@ -1340,14 +1353,13 @@ void cbm_kotlin_proof_resolve(CBMArena *arena, const char *source, int length, T
         cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
     if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
         context.source.failed = true;
-    int first = out->count;
     if (context.imports && context.callers && context.local_types && context.top_callables &&
         context.properties && context.top_types && kt_proof_prepare(&context, root)) {
         kt_proof_top_callables(&context, root);
         kt_proof_walk(&context, root, 0);
     }
-    if (context.source.failed)
-        out->count = first;
+    if (!context.source.failed)
+        *out = staged;
     cbm_ht_free(context.imports);
     cbm_ht_free(context.callers);
     cbm_ht_free(context.local_types);

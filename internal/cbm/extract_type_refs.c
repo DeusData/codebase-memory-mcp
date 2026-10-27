@@ -104,7 +104,7 @@ static const char *extract_type_text(CBMArena *a, TSNode node, const char *sourc
 
 // Add a type reference for a function.
 static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn,
-                          TSNode site) {
+                         TSNode site) {
     if (!type_name || !type_name[0]) {
         return;
     }
@@ -159,7 +159,8 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
 static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
     TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
     if (!ts_node_is_null(type_node)) {
-        add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn, type_node);
+        add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn,
+                     type_node);
     }
 }
 

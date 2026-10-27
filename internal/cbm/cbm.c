@@ -3666,6 +3666,17 @@ static void cbm_source_config_id(CBMFileResult *result, CBMLanguage language, co
     result->source_configuration_id[CBM_SHA256_HEX_LEN] = '\0';
 }
 
+bool cbm_result_capture_raw_source(CBMFileResult *result, const char *source, int source_len,
+                                   CBMLanguage language, const char **extra_defines,
+                                   const char **include_paths) {
+    if (!result || !source || source_len < 0 || result->source_content_id[CBM_SOURCE_ORIGIN_RAW][0])
+        return false;
+    cbm_sha256_hex(source, (size_t)source_len, result->source_content_id[CBM_SOURCE_ORIGIN_RAW]);
+    result->source_content_length[CBM_SOURCE_ORIGIN_RAW] = (uint64_t)source_len;
+    cbm_source_config_id(result, language, extra_defines, include_paths);
+    return true;
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -3680,12 +3691,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         return NULL;
     }
 
-    if (source && source_len >= 0) {
-        cbm_sha256_hex(source, (size_t)source_len,
-                       result->source_content_id[CBM_SOURCE_ORIGIN_RAW]);
-        result->source_content_length[CBM_SOURCE_ORIGIN_RAW] = (uint64_t)source_len;
-        cbm_source_config_id(result, language, extra_defines, include_paths);
-    }
+    (void)cbm_result_capture_raw_source(result, source, source_len, language, extra_defines,
+                                        include_paths);
 
     result->py_namespace.version = CBM_PY_NAMESPACE_FACTS_VERSION;
     result->py_namespace.language = language;

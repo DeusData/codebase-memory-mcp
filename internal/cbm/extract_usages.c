@@ -1607,12 +1607,62 @@ static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent, TST
     return is_direct_argument_value_walk(site, state) ? site : (TSNode){0};
 }
 
+/* A direct Go assignment value is a syntactic candidate, never a target proof.
+ * Keep the terminal identifier's carrier span in lockstep with go_emit_proven;
+ * selectors/parentheses establish context without widening that occurrence. */
+static bool go_assignment_value_leaf(TSNode node, TSTreeCursor *cursor) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "identifier") && strcmp(kind, "field_identifier"))
+        return false;
+    TSNode current = node, parent;
+    const char *field;
+    if (!cursor)
+        usage_slow_parent_fallback_test_note();
+    if (!occurrence_parent(cursor, current, &parent, &field))
+        return false;
+    if (!strcmp(kind, "field_identifier")) {
+        TSNode member = ts_node_child_by_field_name(parent, TS_FIELD("field"));
+        if (strcmp(ts_node_type(parent), "selector_expression") || ts_node_is_null(member) ||
+            !ts_node_eq(member, node))
+            return false;
+        current = parent;
+        if (!occurrence_parent(cursor, current, &parent, &field))
+            return false;
+    }
+    for (unsigned depth = 0; !strcmp(ts_node_type(parent), "parenthesized_expression"); depth++) {
+        if (depth == 32 || ts_node_named_child_count(parent) != 1 ||
+            !ts_node_eq(ts_node_named_child(parent, 0), current))
+            return false;
+        current = parent;
+        if (!occurrence_parent(cursor, current, &parent, &field))
+            return false;
+    }
+    if (!strcmp(ts_node_type(parent), "expression_list")) {
+        current = parent;
+        if (!occurrence_parent(cursor, current, &parent, &field))
+            return false;
+    }
+    const char *parent_kind = ts_node_type(parent);
+    const char *value_field = !strcmp(parent_kind, "short_var_declaration") ||
+                                      !strcmp(parent_kind, "assignment_statement")
+                                  ? "right"
+                              : !strcmp(parent_kind, "var_spec") ? "value"
+                                                                 : NULL;
+    TSNode value = value_field ? ts_node_child_by_field_name(parent, value_field,
+                                                             (uint32_t)strlen(value_field))
+                               : (TSNode){0};
+    return !ts_node_is_null(value) && ts_node_eq(value, current);
+}
+
 static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, const char *name,
                                             WalkState *state) {
     if (!ctx || !name || !language_may_stamp_exact_callable_value_candidate(ctx->language)) {
         return (TSNode){0};
     }
     const char *kind = ts_node_type(node);
+    if (ctx->language == CBM_LANG_GO &&
+        go_assignment_value_leaf(node, reset_occurrence_cursor(state, node)))
+        return node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     TSNode parent = {0};
     const char *parent_field = NULL;

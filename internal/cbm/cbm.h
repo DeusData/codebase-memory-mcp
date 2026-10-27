@@ -339,8 +339,9 @@ typedef struct {
 #define CBM_MACRO_QN_SUFFIX "#macro"
 
 /* Byte offsets are meaningful only within the source buffer that produced
- * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
- * buffers can contain unrelated occurrences at the same numeric span. */
+ * them. PREPROCESSED covers transformed coordinates, including generated UDL
+ * from Studio Export XML. Composite results with distinct generated buffers
+ * have no single transformed identity and cannot attest a mapped occurrence. */
 typedef enum {
     CBM_SOURCE_ORIGIN_RAW = 0,
     CBM_SOURCE_ORIGIN_PREPROCESSED,
@@ -1233,6 +1234,12 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the
 // calling thread's CPU time, with a wall-clock backstop of
 // CBM_PARSE_WALL_CEILING_FACTOR x the budget (0 = no budget).
+/* Capture an uninitialized result's physical source identity and transform
+ * configuration. Does not retain bytes, parse, map spans or authorize edges.
+ * An existing raw identity cannot be replaced through this initializer. */
+bool cbm_result_capture_raw_source(CBMFileResult *result, const char *source, int source_len,
+                                   CBMLanguage language, const char **extra_defines,
+                                   const char **include_paths);
 /* Compare supplied bytes to the immutable analyzed snapshot, never to a
  * freshly reconstructed identity. Missing identities fail closed. */
 bool cbm_result_source_matches(const CBMFileResult *result, const char *source, size_t length,

@@ -507,13 +507,16 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
     if (!tree)
         return;
     TSNode root = ts_tree_root_node(tree);
+    /* Append through a private descriptor; publish only after complete analysis.
+     * Arena growth preserves the original buffer and its committed prefix. */
+    CBMResolvedCallArray staged = *out;
     rsp_context_t context = {.source = {.arena = arena,
                                         .source = source,
                                         .length = (size_t)length,
                                         .failed = ts_node_has_error(root)},
                              .registry = registry,
                              .file = file,
-                             .out = out};
+                             .out = &staged};
     context.bindings =
         cbm_resolve_binding_build(arena, file, CBM_LANG_RUST, source, (size_t)length);
     context.imports = cbm_ht_create(16);
@@ -523,7 +526,6 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
         cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
     if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
         context.source.failed = true;
-    int first = out->count;
     if (context.imports && context.callers && context.bindings) {
         for (int i = 0; i < import_count; i++)
             if (import_names && import_names[i] && import_qns && import_qns[i])
@@ -546,8 +548,8 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
             } while (ts_tree_cursor_goto_next_sibling(&cursor));
         ts_tree_cursor_delete(&cursor);
     }
-    if (context.source.failed)
-        out->count = first;
+    if (!context.source.failed)
+        *out = staged;
     cbm_ht_free(context.imports);
     cbm_ht_free(context.callers);
     ts_tree_delete(tree);

@@ -1436,7 +1436,163 @@ TEST(gbuf_worker_buffer_keeps_no_by_id_array) {
     PASS();
 }
 
+TEST(gbuf_captured_inputs_own_deduplicate_and_transfer_metadata) {
+    static const char empty_digest[] =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    char path[] = "deploy/.env";
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/r");
+    ASSERT_NOT_NULL(gb);
+    ASSERT(cbm_gbuf_capture_input(gb, path, true, 0, empty_digest));
+    ASSERT(cbm_gbuf_capture_input(gb, path, true, 0, empty_digest));
+    ASSERT(cbm_gbuf_capture_input(gb, "other/.env", false, 0, NULL));
+    path[0] = 'x';
+    cbm_gbuf_captured_input_t *inputs = NULL;
+    size_t count = 0;
+    ASSERT(cbm_gbuf_take_captured_inputs(gb, &inputs, &count));
+    ASSERT_EQ(count, 2);
+    ASSERT(!cbm_gbuf_capture_input(gb, "late/.env", false, 0, NULL));
+    cbm_gbuf_free(gb);
+    ASSERT_STR_EQ(inputs[0].relative_path, "deploy/.env");
+    ASSERT(inputs[0].present);
+    ASSERT_EQ(inputs[0].byte_length, 0);
+    ASSERT_STR_EQ(inputs[0].content_identity, empty_digest);
+    ASSERT(!inputs[1].present);
+    ASSERT_EQ(inputs[1].byte_length, 0);
+    ASSERT_STR_EQ(inputs[1].content_identity, "");
+    cbm_gbuf_free_captured_inputs(inputs, count);
+    PASS();
+}
+
+TEST(gbuf_captured_inputs_reject_noncanonical_paths_and_invalid_states) {
+    static const char *const paths[] = {"",         "/.env",   "../.env", "a/../.env",
+                                        "a/./.env", "a//.env", "a/",      "a\\.env",
+                                        "C:.env",   "a./.env", "a /.env", "a\n/.env"};
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        cbm_gbuf_t *gb = cbm_gbuf_new("p", "/r");
+        ASSERT_NOT_NULL(gb);
+        ASSERT(!cbm_gbuf_capture_input(gb, paths[i], false, 0, NULL));
+        ASSERT(!cbm_gbuf_resolutions_complete(gb));
+        ASSERT(!cbm_gbuf_capture_input(gb, "valid/.env", false, 0, NULL));
+        cbm_gbuf_free(gb);
+    }
+    static const struct {
+        bool present;
+        uint64_t length;
+        const char *digest;
+    } invalid[] = {{true, 0, NULL}, {true, 0, "bad"}, {false, 1, NULL}, {false, 0, "digest"}};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        cbm_gbuf_t *gb = cbm_gbuf_new("p", "/r");
+        ASSERT_NOT_NULL(gb);
+        ASSERT(!cbm_gbuf_capture_input(gb, ".env", invalid[i].present, invalid[i].length,
+                                       invalid[i].digest));
+        ASSERT(!cbm_gbuf_resolutions_complete(gb));
+        cbm_gbuf_free(gb);
+    }
+    PASS();
+}
+
+TEST(gbuf_captured_inputs_conflicting_reads_fail_closed) {
+    static const char first[] = "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb";
+    static const char second[] = "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d";
+    for (int variant = 0; variant < 3; variant++) {
+        cbm_gbuf_t *gb = cbm_gbuf_new("p", "/r");
+        ASSERT_NOT_NULL(gb);
+        ASSERT(cbm_gbuf_capture_input(gb, ".env", true, 1, first));
+        bool accepted = variant == 0   ? cbm_gbuf_capture_input(gb, ".env", false, 0, NULL)
+                        : variant == 1 ? cbm_gbuf_capture_input(gb, ".env", true, 1, second)
+                                       : cbm_gbuf_capture_input(gb, ".env", true, 2, first);
+        ASSERT(!accepted);
+        ASSERT(!cbm_gbuf_resolutions_complete(gb));
+        cbm_gbuf_captured_input_t *inputs = NULL;
+        size_t count = 0;
+        ASSERT(!cbm_gbuf_take_captured_inputs(gb, &inputs, &count));
+        ASSERT_NULL(inputs);
+        ASSERT_EQ(count, 0);
+        cbm_gbuf_free(gb);
+    }
+    PASS();
+}
+
+TEST(gbuf_captured_inputs_survive_empty_worker_merge_and_detect_conflicts) {
+    cbm_gbuf_t *main = cbm_gbuf_new("p", "/r");
+    cbm_gbuf_t *worker = cbm_gbuf_new_worker("p", "/r", NULL);
+    ASSERT_NOT_NULL(main);
+    ASSERT_NOT_NULL(worker);
+    ASSERT(cbm_gbuf_capture_input(main, ".env", false, 0, NULL));
+    ASSERT(cbm_gbuf_capture_input(worker, ".env", false, 0, NULL));
+    ASSERT(cbm_gbuf_capture_input(worker, "nested/.env", false, 0, NULL));
+    ASSERT_EQ(cbm_gbuf_merge(main, worker), 0);
+    cbm_gbuf_free(worker);
+    cbm_gbuf_captured_input_t *inputs = NULL;
+    size_t count = 0;
+    ASSERT(cbm_gbuf_take_captured_inputs(main, &inputs, &count));
+    cbm_gbuf_free(main);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(inputs[1].relative_path, "nested/.env");
+    cbm_gbuf_free_captured_inputs(inputs, count);
+
+    main = cbm_gbuf_new("p", "/r");
+    worker = cbm_gbuf_new_worker("p", "/r", NULL);
+    ASSERT_NOT_NULL(main);
+    ASSERT_NOT_NULL(worker);
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex("", 0, digest);
+    ASSERT(cbm_gbuf_capture_input(main, ".env", false, 0, NULL));
+    ASSERT(cbm_gbuf_capture_input(worker, ".env", true, 0, digest));
+    ASSERT_NEQ(cbm_gbuf_merge(main, worker), 0);
+    ASSERT(!cbm_gbuf_resolutions_complete(main));
+    cbm_gbuf_free(worker);
+    cbm_gbuf_free(main);
+    PASS();
+}
+
+TEST(gbuf_captured_inputs_transferred_catalog_rejects_merge) {
+    for (int source_taken = 0; source_taken < 2; source_taken++) {
+        cbm_gbuf_t *dst = cbm_gbuf_new("p", "/r");
+        cbm_gbuf_t *src = cbm_gbuf_new("p", "/r");
+        cbm_gbuf_t *retry = cbm_gbuf_new("p", "/r");
+        ASSERT_NOT_NULL(dst);
+        ASSERT_NOT_NULL(src);
+        ASSERT_NOT_NULL(retry);
+        ASSERT_GT(cbm_gbuf_upsert_node(dst, "Function", "keep", "p.keep", "keep.c", 1, 1, "{}"), 0);
+        ASSERT_GT(
+            cbm_gbuf_upsert_node(src, "Function", "incoming", "p.incoming", "in.c", 1, 1, "{}"), 0);
+        ASSERT_GT(
+            cbm_gbuf_upsert_node(retry, "Function", "later", "p.later", "later.c", 1, 1, "{}"), 0);
+        cbm_gbuf_captured_input_t *inputs = NULL;
+        size_t count = 0;
+        if (source_taken) {
+            ASSERT(cbm_gbuf_capture_input(src, ".env", false, 0, NULL));
+            ASSERT(cbm_gbuf_take_captured_inputs(src, &inputs, &count));
+            ASSERT_EQ(count, 1);
+        } else {
+            /* Empty catalogs also freeze the receiving graph at transfer. */
+            ASSERT(cbm_gbuf_take_captured_inputs(dst, &inputs, &count));
+            ASSERT_EQ(count, 0);
+        }
+        ASSERT_NEQ(cbm_gbuf_merge(dst, src), 0);
+        ASSERT(!cbm_gbuf_resolutions_complete(dst));
+        ASSERT_EQ(cbm_gbuf_node_count(dst), 1);
+        ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(dst, "p.keep"));
+        ASSERT_NULL(cbm_gbuf_find_by_qn(dst, "p.incoming"));
+        /* A different, untaken worker cannot recover the failed destination. */
+        ASSERT_NEQ(cbm_gbuf_merge(dst, retry), 0);
+        ASSERT_EQ(cbm_gbuf_node_count(dst), 1);
+        ASSERT_NULL(cbm_gbuf_find_by_qn(dst, "p.later"));
+        cbm_gbuf_free_captured_inputs(inputs, count);
+        cbm_gbuf_free(retry);
+        cbm_gbuf_free(src);
+        cbm_gbuf_free(dst);
+    }
+    PASS();
+}
+
 SUITE(graph_buffer) {
+    RUN_TEST(gbuf_captured_inputs_own_deduplicate_and_transfer_metadata);
+    RUN_TEST(gbuf_captured_inputs_reject_noncanonical_paths_and_invalid_states);
+    RUN_TEST(gbuf_captured_inputs_conflicting_reads_fail_closed);
+    RUN_TEST(gbuf_captured_inputs_survive_empty_worker_merge_and_detect_conflicts);
+    RUN_TEST(gbuf_captured_inputs_transferred_catalog_rejects_merge);
     RUN_TEST(gbuf_worker_buffer_keeps_no_by_id_array);
     /* Original tests */
     RUN_TEST(gbuf_create_free);

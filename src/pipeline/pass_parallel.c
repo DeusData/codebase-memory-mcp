@@ -100,6 +100,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/shared_resolver.h"
 #include "pipeline/worker_pool.h"
+#include "resolve/policy.h"
+#include "resolve/proof.h"
 #include "result_spill.h"
 #include "semantic/ast_profile.h"
 #include "service_patterns.h"
@@ -3459,9 +3461,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * receiver's binding, before the #523 spelling check and the
          * route-registration suffix fallback. MUST match pass_calls.c. */
         char client_url[CBM_SZ_512];
-        if (cbm_pipeline_http_client_call_url(rc->main_gbuf, rc->project_name, rel, result,
-                                              imp_keys, imp_vals, imp_count, call, client_url,
-                                              sizeof(client_url))) {
+        if (cbm_pipeline_http_client_call_url(
+                rc->pctx ? rc->pctx->shared_resolver : NULL, rc->main_gbuf, rc->project_name, rel,
+                result, imp_keys, imp_vals, imp_count, call, client_url, sizeof(client_url))) {
             cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
                                         .confidence = PP_HALF_CONF,
                                         .strategy = "http_client_instance"};
@@ -3469,6 +3471,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                          CBM_SVC_HTTP, client_url);
             continue;
         }
+        if (cbm_shared_resolver_http_candidate_receiver(rc->pctx ? rc->pctx->shared_resolver : NULL,
+                                                        rel, call))
+            continue;
         /* A PHP call on a proven vendor class is classified by that class
          * (#1186): it skipped the registry above, so the route-verb fallback
          * would otherwise mint a route registration for
@@ -4115,14 +4120,34 @@ static int pp_call_reference_site_count(const CBMFileResult *result, CBMLanguage
     return count;
 }
 
-static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
+/* Python's legacy local pass can fill every site with a high-confidence name
+ * result without running the source proof adapter. Those rows cannot discharge
+ * project-registry work: only an immutable proof for this exact occurrence may
+ * suppress it. This is a constant-time scheduling check, not edge admission. */
+static bool pp_python_has_source_proof(const CBMResolvedCall *resolved) {
+    const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(resolved->evidence.proof);
+    return proof && proof->kind == CBM_PROOF_OCCURRENCE_BINDING && proof->predecessors_closed &&
+           cbm_resolve_admit(&proof->outcome) &&
+           resolved->evidence.analysis == proof->outcome.analysis &&
+           resolved->evidence.rule == proof->outcome.rule &&
+           resolved->evidence.facts == proof->outcome.facts &&
+           resolved->site_end_byte > resolved->site_start_byte &&
+           resolved->site_start_byte == proof->key.start_byte &&
+           resolved->site_end_byte == proof->key.end_byte &&
+           resolved->source_origin == proof->source.source_origin && resolved->callee_qn &&
+           !strcmp(resolved->callee_qn, proof->outcome.target) && resolved->caller_qn &&
+           proof->source.scope && !strcmp(resolved->caller_qn, proof->source.scope);
+}
+
+static int pp_qualified_lsp_site_count(const CBMFileResult *result, CBMLanguage lang) {
     int count = 0;
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
         if ((resolved->kind == CBM_RESOLVED_INVOCATION ||
              resolved->kind == CBM_RESOLVED_CALL_REFERENCE) &&
             resolved->caller_qn && resolved->callee_qn &&
-            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR) {
+            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR &&
+            (lang != CBM_LANG_PYTHON || pp_python_has_source_proof(resolved))) {
             count++;
         }
     }
@@ -4136,7 +4161,7 @@ static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
  * for the project-registry pass, even when the parser-backed site count is
  * zero or already fully qualified. Zero-span generated semantics are excluded:
  * without source provenance they cannot safely join a graph carrier. */
-static bool pp_has_pending_lsp_site(const CBMFileResult *result) {
+static bool pp_has_pending_lsp_site(const CBMFileResult *result, CBMLanguage lang) {
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
         if (resolved->kind != CBM_RESOLVED_INVOCATION &&
@@ -4147,7 +4172,8 @@ static bool pp_has_pending_lsp_site(const CBMFileResult *result) {
             resolved->site_end_byte <= resolved->site_start_byte) {
             continue;
         }
-        if (resolved->reason || resolved->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if (resolved->reason || resolved->confidence < CBM_LSP_CONFIDENCE_FLOOR ||
+            (lang == CBM_LANG_PYTHON && !pp_python_has_source_proof(resolved))) {
             return true;
         }
     }
@@ -4301,8 +4327,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             (lang == CBM_LANG_RUST && rc->rust_manifest && rc->rust_manifest->member_count > 0);
         int call_reference_sites = pp_call_reference_site_count(result, lang);
         int semantic_sites = result->calls.count + call_reference_sites;
-        int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
-        bool pending_lsp_site = pp_has_pending_lsp_site(result);
+        int qualified_lsp_sites = pp_qualified_lsp_site_count(result, lang);
+        bool pending_lsp_site = pp_has_pending_lsp_site(result, lang);
         bool unowned_c_member = pp_has_unowned_c_member(result, lang, rel);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
@@ -4327,8 +4353,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        if (cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
-                                     &imp_vals, &imp_count) != 0)
+        if (cbm_pxc_build_import_map(rc->pctx, rel, lang, result, &imp_keys, &imp_vals,
+                                     &imp_count) != 0)
             atomic_store(&rc->pctx->resolver_failed, true);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
@@ -4410,9 +4436,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 int lsp_count = 0;
                 bool own_lsp_map = cbm_pxc_result_has_type_only_import(result);
                 if (own_lsp_map) {
-                    if (cbm_pxc_build_import_map_ex(rc->main_gbuf, rc->project_name, rel, lang,
-                                                    result, true, &lsp_keys, &lsp_vals,
-                                                    &lsp_count) != 0)
+                    if (cbm_pxc_build_import_map_ex(rc->pctx, rel, lang, result, true, &lsp_keys,
+                                                    &lsp_vals, &lsp_count) != 0)
                         atomic_store(&rc->pctx->resolver_failed, true);
                 }
                 cbm_pxc_dispatch_file_with_php_bindings(

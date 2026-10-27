@@ -259,9 +259,10 @@ TEST(resolver_record_requires_exact_source_occurrence) {
                                    .lookup_key = row.spelling,
                                    .lookup_closed = true,
                                    .declaration_identity = row.result.target,
+                                   .binding_identity = row.result.target,
                                    .start_byte = row.start_byte,
                                    .end_byte = row.end_byte,
-                                   .detail = "audited fixed source scope"};
+                                   .detail = "CALLS"};
     const cbm_resolve_proof_t *audit =
         cbm_resolve_proof_leaf(&pool, CBM_PROOF_ADAPTER_DOMAIN, &captured, &key, &row.result);
     ASSERT_NOT_NULL(audit);

@@ -882,6 +882,81 @@ TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site) {
     PASS();
 }
 
+/* Check independently selected RHS leaves. The producer and extraction carrier
+ * must agree on source identity; a matching target elsewhere is insufficient. */
+static bool go_assignment_reference_at(const CBMFileResult *result, const char *source,
+                                       const char *anchor, const char *leaf, const char *target) {
+    const char *statement = strstr(source, anchor);
+    const char *site = statement ? strstr(statement, leaf) : NULL;
+    if (!site)
+        return false;
+    uint32_t start = (uint32_t)(site - source), end = start + (uint32_t)strlen(leaf);
+    const CBMUsage *carrier = NULL;
+    for (int i = 0; i < result->usages.count; i++) {
+        const CBMUsage *usage = result->usages.items + i;
+        if (usage->site_start_byte == start && usage->site_end_byte == end && usage->ref_name &&
+            !strcmp(usage->ref_name, leaf)) {
+            if (carrier)
+                return false;
+            carrier = usage;
+        }
+    }
+    if (!carrier || !carrier->enclosing_func_qn ||
+        strcmp(carrier->enclosing_func_qn, "test.Register"))
+        return false;
+    const CBMResolvedCall *row =
+        cbm_pipeline_find_lsp_reference(&result->resolved_calls, carrier, false);
+    if (!target)
+        return !row || !go_call_has_project_proof(row);
+    const cbm_resolve_proof_view_t *proof =
+        row ? cbm_resolve_proof_view(row->evidence.proof) : NULL;
+    return carrier->may_be_call_reference && row && go_call_has_project_proof(row) &&
+           row->kind == CBM_RESOLVED_CALL_REFERENCE && row->callee_qn &&
+           !strcmp(row->callee_qn, target) && row->site_start_byte == start &&
+           row->site_end_byte == end && proof->key.detail &&
+           !strcmp(proof->key.detail, "CALL_REFERENCE");
+}
+
+TEST(golsp_assignment_references_have_exact_occurrence_proof) {
+    const char *source = "package main\n"
+                         "func Process(data string) string { return data }\n"
+                         "func Other(data string) string { return data }\n"
+                         "type Worker struct{}\n"
+                         "func (w Worker) Process(data string) string { return data }\n"
+                         "func Register(w Worker, dynamic func(string) string) {\n"
+                         "    handler := Process\n"
+                         "    var declared = (Other)\n"
+                         "    handler, declared = declared, handler\n"
+                         "    handler = dynamic\n"
+                         "    _ = handler\n"
+                         "    _ = w.Process\n"
+                         "}\n";
+    CBMFileResult *result = extract_go(source);
+    ASSERT_NOT_NULL(result);
+    ASSERT(go_assignment_reference_at(result, source, "handler := Process", "Process",
+                                      "test.Process"));
+    ASSERT(go_assignment_reference_at(result, source, "var declared = (Other)", "Other",
+                                      "test.Other"));
+    /* All RHS identities are captured before the simultaneous LHS update. */
+    ASSERT(go_assignment_reference_at(result, source, "= declared, handler", "declared",
+                                      "test.Other"));
+    ASSERT(go_assignment_reference_at(result, source, ", handler\n", "handler", "test.Process"));
+    ASSERT(go_assignment_reference_at(result, source, "_ = w.Process", "Process",
+                                      "test.Worker.Process"));
+    /* A function-typed parameter and a reassigned alias are not declarations. */
+    ASSERT(go_assignment_reference_at(result, source, "handler = dynamic", "dynamic", NULL));
+    ASSERT(go_assignment_reference_at(result, source, "_ = handler", "handler", NULL));
+    cbm_free_result(result);
+    const char *shadowed = "package main\n"
+                           "func Process(data string) string { return data }\n"
+                           "func Register(Process func(string) string) { _ = Process }\n";
+    result = extract_go(shadowed);
+    ASSERT_NOT_NULL(result);
+    ASSERT(go_assignment_reference_at(result, shadowed, "_ = Process", "Process", NULL));
+    cbm_free_result(result);
+    PASS();
+}
+
 /* ── Cross-file tests (use cbm_run_go_lsp_cross directly) ──────── */
 
 /* The production Go Tier-3 path promotes per-file unresolved records through
@@ -1623,6 +1698,7 @@ SUITE(go_lsp) {
     RUN_TEST(golsp_interface_method_single_file);
     RUN_TEST(golsp_interface_method_field_chain);
     RUN_TEST(golsp_ordinary_same_leaf_calls_join_by_exact_site);
+    RUN_TEST(golsp_assignment_references_have_exact_occurrence_proof);
 
     /* Cross-file */
     RUN_TEST(golsp_fast_crossfile_same_leaf_calls_preserve_exact_sites);

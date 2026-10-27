@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include "resolve/record.h"
+#include "foundation/sha256.h"
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -35,6 +36,25 @@ bool cbm_gbuf_record_resolver_file(cbm_gbuf_t *gb, const cbm_resolve_file_t *fil
 const cbm_resolve_file_t *cbm_gbuf_resolver_files(const cbm_gbuf_t *gb, size_t *count);
 bool cbm_gbuf_record_resolver_summary(cbm_gbuf_t *gb, const cbm_resolve_summary_t *summary);
 const cbm_resolve_summary_t *cbm_gbuf_resolver_summaries(const cbm_gbuf_t *gb, size_t *count);
+
+/* Supplemental semantic inputs retain only presence, exact byte length and
+ * SHA-256 of the analyzed buffer. Paths must be canonical project-relative
+ * paths. A confirmed absent input has length zero and no digest. Registration
+ * is single-writer like the rest of the graph buffer; worker merges preserve
+ * inputs and fail closed on conflicting snapshots or allocation failure. */
+typedef struct {
+    char *relative_path;
+    bool present;
+    uint64_t byte_length;
+    char content_identity[CBM_SHA256_HEX_LEN + 1];
+} cbm_gbuf_captured_input_t;
+bool cbm_gbuf_capture_input(cbm_gbuf_t *gb, const char *relative_path, bool present,
+                            uint64_t byte_length, const char *content_identity);
+/* Transfer metadata ownership before the graph buffer is released. Registration
+ * after a successful take is an error. The caller releases it with free below. */
+bool cbm_gbuf_take_captured_inputs(cbm_gbuf_t *gb, cbm_gbuf_captured_input_t **inputs,
+                                   size_t *count);
+void cbm_gbuf_free_captured_inputs(cbm_gbuf_captured_input_t *inputs, size_t count);
 
 /* ── Node / Edge structs (owned by the buffer) ───────────────────── */
 

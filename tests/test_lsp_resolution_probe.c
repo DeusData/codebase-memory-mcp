@@ -652,12 +652,9 @@ static const LRP_Golden LRP_GOLDEN[] = {
     {"lrp_python_s1_crossfile_call", "main.py", "run", "triple(n)", 0, "util.py", "triple", "CALLS",
      1, "def triple(x):", true, false, NULL, NULL},
     {"lrp_python_s2_method_dispatch", "main.py", "run", "Counter()", 0, "counter.py", "Counter",
-     "CALLS", 1, "class Counter:", false, false,
-     "Explicit initializer effects and constructor applicability lack a complete Class-call proof.",
-     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
-     "confidence "
-     "matches "
-     "cannot supply the missing source facts."},
+     "CALLS", 1, "class Counter:", true, false, NULL,
+     "Exact imported Class-call identity with CLASS_CALLABLE and occurrence evidence is supported; "
+     "retain this recovered constructor control independently of later member calls."},
     {"lrp_python_s2_method_dispatch", "main.py", "run", "c.inc()", 0, "counter.py", "Counter.inc",
      "CALLS", 5, "    def inc(self):", false, false,
      "Receiver construction is not established by the strict map; class mutation audit "
@@ -675,13 +672,9 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "matches "
      "cannot supply the missing source facts."},
     {"lrp_python_s3_constructor", "main.py", "make", "Widget(name)", 0, "widget.py", "Widget",
-     "CALLS", 1, "class Widget:", false, false,
-     "Class-call authority for the explicit initializer and its nonempty argument list is "
-     "unsupported; do not substitute an init method by name.",
-     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
-     "confidence "
-     "matches "
-     "cannot supply the missing source facts."},
+     "CALLS", 1, "class Widget:", true, false, NULL,
+     "Exact imported Class-call identity with CLASS_CALLABLE and occurrence evidence is supported; "
+     "retain this recovered constructor control independently of later member calls."},
     {"lrp_python_s4_class_method", "main.py", "run", "Factory.version()", 0, "factory.py",
      "Factory.version", "CALLS", 7, "    def version():", false, false,
      "Decorated descriptor identity and class receiver binding are not established by the source "
@@ -691,13 +684,9 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "matches "
      "cannot supply the missing source facts."},
     {"lrp_python_s5_chained", "main.py", "make", "Builder()", 0, "builder.py", "Builder", "CALLS",
-     1, "class Builder:", false, false,
-     "Constructor, field mutation effects, nonempty arguments and fluent return propagation lack "
-     "complete source derivations.",
-     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
-     "confidence "
-     "matches "
-     "cannot supply the missing source facts."},
+     1, "class Builder:", true, false, NULL,
+     "Exact imported Class-call identity with CLASS_CALLABLE and occurrence evidence is supported; "
+     "retain this recovered constructor control independently of later member calls."},
     {"lrp_python_s5_chained", "main.py", "make", "Builder().add(1)", 0, "builder.py", "Builder.add",
      "CALLS", 5, "    def add(self, x):", false, false,
      "Constructor, field mutation effects, nonempty arguments and fluent return propagation lack "
@@ -755,14 +744,9 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "matches "
      "cannot supply the missing source facts."},
     {"lrp_python_s8_field_type_hint", "service.py", "Service.__init__", "Logger()", 0, "logger.py",
-     "Logger", "CALLS", 1, "class Logger:", false, false,
-     "Imported class construction needs the supported callable-class binding to survive "
-     "source-relative export validation; requires the declared parameter provenance and "
-     "source-relative export proof.",
-     "Reviewed exact fixture and proof guards: no intended admitted call; legacy name and "
-     "confidence "
-     "matches "
-     "cannot supply the missing source facts."},
+     "Logger", "CALLS", 1, "class Logger:", true, false, NULL,
+     "Exact imported Class-call identity with CLASS_CALLABLE and occurrence evidence is supported; "
+     "retain this recovered constructor control independently of later member calls."},
     {"lrp_python_s8_field_type_hint", "service.py", "Service.run", "self.logger.log(msg)", 0,
      "logger.py", "Logger.log", "CALLS", 2, "    def log(self, msg: str) -> None:", false, false,
      "Annotated field provenance, nested receiver identity and nonempty argument applicability are "
@@ -1192,11 +1176,9 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "kt_proof_walk does not publish constructor calls from class property initializers; no Kotlin "
      "class-call authority."},
     {"lrp_python_s6b_constructor", "child.py", "run", "Child()", 0, "child.py", "Child", "CALLS", 4,
-     "class Child(Base):", false, false,
-     "Inherited Python construction requires complete MRO and class-call authority before the "
-     "constructor result can supply the following method receiver.",
-     "Exact constructed S6b fixture has a separate Child() occurrence; outer describe() evidence "
-     "cannot substitute. Existing proof rejects inherited class domains."},
+     "class Child(Base):", true, false, NULL,
+     "Exact imported Class-call identity with CLASS_CALLABLE and occurrence evidence is supported; "
+     "retain this recovered constructor control independently of later member calls."},
 };
 
 /* Callable signatures are normalized by the same QN format contract as nodes;

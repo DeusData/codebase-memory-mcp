@@ -498,7 +498,9 @@ TEST(pipeline_conventions_closure_def_modules_null_preserves_generation) {
     ASSERT_TRUE(setup); ASSERT_TRUE(control); ASSERT_TRUE(changed); ASSERT_TRUE(cleanup);
     ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(rc, CBM_PIPELINE_ABORT_PRESERVE_DB); ASSERT_TRUE(preserved);
-    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL); ASSERT_TRUE(recovery); PASS();
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_TRUE(recovery);
+    PASS();
 }
 
 typedef struct {

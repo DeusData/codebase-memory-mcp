@@ -58,6 +58,30 @@ bool cbm_resolve_binding_import(const cbm_resolve_binding_index_t *index, const 
 bool cbm_resolve_binding_export(const cbm_resolve_binding_index_t *index,
                                 const char *qualified_name);
 
+/* HTTP-only source facts; these do not expose a generic default export or
+ * namespace binding. A true default result has an exact const value identity;
+ * base == NULL means that the composed relative URL remains unknown. */
+/* Runtime module-value access enumerated from the same AST audit. A NULL
+ * local_name is a namespace/re-export/loader escape unless side_effect_only.
+ * All strings are borrowed from the binding index arena. */
+typedef struct {
+    const char *path;
+    const char *local_name;
+    bool side_effect_only;
+} cbm_resolve_http_dependency_t;
+bool cbm_resolve_binding_http_domain_complete(const cbm_resolve_binding_index_t *);
+size_t cbm_resolve_binding_http_dependency_count(const cbm_resolve_binding_index_t *);
+const cbm_resolve_http_dependency_t *cbm_resolve_binding_http_dependency_at(
+    const cbm_resolve_binding_index_t *, size_t);
+bool cbm_resolve_binding_http_import_safe(const cbm_resolve_binding_index_t *, const char *,
+                                          bool axios_factory);
+/* Exact default-import source literal; NULL for blocked or other import forms. */
+const char *cbm_resolve_binding_http_import_path(const cbm_resolve_binding_index_t *, const char *);
+bool cbm_resolve_binding_http_default(const cbm_resolve_binding_index_t *, const char **target,
+                                      const char **base);
+bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *, const CBMCall *,
+                                           const char *local_name);
+
 /* Source-audited library namespace facts. A complete namespace includes every
  * public spelling, including declarations whose edge binding is unsupported.
  * These facts describe one library file only; parts/re-exports fail closed. */
@@ -70,6 +94,19 @@ typedef struct {
     size_t hide_count;
     bool has_show;
 } cbm_resolve_source_import_t;
+
+/* Strong, source-audited Python absence domain. Inert package initialization
+ * only: imports, assignments, classes, decorators, defaults, dynamic attributes
+ * and conditional/effectful statements remain open. Names are sorted and may
+ * include NULL entries for non-module scopes; copy while the index is alive. */
+/* Dynamic execution/module registry access remains an unknown project effect. */
+bool cbm_resolve_binding_python_effects_complete(const cbm_resolve_binding_index_t *);
+/* Conservatively includes writes and unknown alias/callee escapes. */
+bool cbm_resolve_binding_python_import_escaped(const cbm_resolve_binding_index_t *, const char *);
+bool cbm_resolve_binding_python_namespace_closed(const cbm_resolve_binding_index_t *index);
+size_t cbm_resolve_binding_python_namespace_size(const cbm_resolve_binding_index_t *index);
+const char *cbm_resolve_binding_python_namespace_name(const cbm_resolve_binding_index_t *index,
+                                                      size_t offset);
 
 bool cbm_resolve_binding_namespace_complete(const cbm_resolve_binding_index_t *index);
 size_t cbm_resolve_binding_namespace_size(const cbm_resolve_binding_index_t *index);

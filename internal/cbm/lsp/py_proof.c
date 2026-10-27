@@ -16,7 +16,7 @@ typedef struct {
     CBMArena *arena;
     const char *source;
     size_t length, visits;
-    bool failed;
+    bool failed, exhausted;
     pyp_decl_t *defs;
     size_t count, capacity;
 } pyp_source_t;
@@ -46,8 +46,10 @@ static const char *pyp_text(pyp_source_t *source, TSNode node) {
                : NULL;
 }
 static bool pyp_budget(pyp_source_t *source, unsigned depth) {
-    if (++source->visits > 1000000 || depth > 128)
+    if (++source->visits > 1000000 || depth > 128) {
         source->failed = true;
+        source->exhausted = true;
+    }
     return !source->failed;
 }
 static void pyp_add(pyp_source_t *source, const char *qn, TSNode node, uint32_t flags) {
@@ -351,6 +353,17 @@ static const char *pyp_occurrence_spelling(pyp_context_t *context, TSNode site,
     if (pyp_is(expression, "attribute")) {
         const char *receiver = pyp_text(&context->source, pyp_field(expression, "object"));
         const char *member = pyp_text(&context->source, pyp_field(expression, "attribute"));
+        /* The direct argument carrier retains the terminal identifier spelling,
+         * while its occurrence spans the full attribute and any parentheses.
+         * Determine that role from the AST; other member reads keep the full
+         * attribute spelling, as does an invocation. */
+        if (kind != CBM_RESOLVED_INVOCATION) {
+            TSNode parent = ts_node_parent(site);
+            if (pyp_is(parent, "keyword_argument") && ts_node_eq(pyp_field(parent, "value"), site))
+                parent = ts_node_parent(parent);
+            if (pyp_is(parent, "argument_list"))
+                return member;
+        }
         return receiver && member
                    ? cbm_arena_sprintf(context->source.arena, "%s.%s", receiver, member)
                    : NULL;
@@ -669,55 +682,60 @@ static void pyp_expression(pyp_context_t *context, TSNode node, const char *call
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
+static void pyp_statement(pyp_context_t *context, TSNode node, const char *caller,
+                          CBMScope *scope) {
+    if (pyp_is(node, "expression_statement") && ts_node_named_child_count(node) == 1) {
+        TSNode expression = ts_node_named_child(node, 0);
+        if (pyp_is(expression, "assignment")) {
+            TSNode left = pyp_field(expression, "left"), right = pyp_field(expression, "right");
+            const char *name = pyp_text(&context->source, left);
+            pyp_expression(context, right, caller, scope, 0);
+            const CBMRegisteredType *constructed = pyp_constructor(context, right);
+            if (constructed) {
+                cbm_resolve_result_t proof =
+                    pyp_type_evidence(context, constructed, pyp_field(right, "function"));
+                (void)cbm_resolve_types_declare(
+                    &context->types, scope, name, ts_node_end_byte(expression),
+                    cbm_type_named(context->source.arena, constructed->qualified_name),
+                    CBM_RESOLVE_TYPE_CONSTRUCTOR, &proof);
+            } else if (pyp_is(right, "identifier")) {
+                const char *source = pyp_text(&context->source, right);
+                (void)cbm_resolve_types_copy(&context->types, scope, name, scope, source,
+                                             ts_node_end_byte(expression), true);
+            } else {
+                (void)cbm_resolve_types_declare(&context->types, scope, name,
+                                                ts_node_end_byte(expression), NULL,
+                                                CBM_RESOLVE_TYPE_NO_EVIDENCE, NULL);
+            }
+            return;
+        }
+    }
+    pyp_expression(context, node, caller, scope, 0);
+}
 static void pyp_statements(pyp_context_t *context, TSNode body, const char *caller,
                            CBMScope *scope) {
     TSTreeCursor cursor = ts_tree_cursor_new(body);
     if (ts_tree_cursor_goto_first_child(&cursor))
         do {
-            TSNode node = ts_tree_cursor_current_node(&cursor);
-            if (pyp_is(node, "expression_statement") && ts_node_named_child_count(node) == 1) {
-                TSNode expression = ts_node_named_child(node, 0);
-                if (pyp_is(expression, "assignment")) {
-                    TSNode left = pyp_field(expression, "left"),
-                           right = pyp_field(expression, "right");
-                    const char *name = pyp_text(&context->source, left);
-                    pyp_expression(context, right, caller, scope, 0);
-                    const CBMRegisteredType *constructed = pyp_constructor(context, right);
-                    if (constructed) {
-                        cbm_resolve_result_t proof =
-                            pyp_type_evidence(context, constructed, pyp_field(right, "function"));
-                        (void)cbm_resolve_types_declare(
-                            &context->types, scope, name, ts_node_end_byte(expression),
-                            cbm_type_named(context->source.arena, constructed->qualified_name),
-                            CBM_RESOLVE_TYPE_CONSTRUCTOR, &proof);
-                    } else if (pyp_is(right, "identifier")) {
-                        const char *source = pyp_text(&context->source, right);
-                        (void)cbm_resolve_types_copy(&context->types, scope, name, scope, source,
-                                                     ts_node_end_byte(expression), true);
-                    } else {
-                        (void)cbm_resolve_types_declare(&context->types, scope, name,
-                                                        ts_node_end_byte(expression), NULL,
-                                                        CBM_RESOLVE_TYPE_NO_EVIDENCE, NULL);
-                    }
-                    continue;
-                }
-            }
-            pyp_expression(context, node, caller, scope, 0);
+            pyp_statement(context, ts_tree_cursor_current_node(&cursor), caller, scope);
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
-static void pyp_function(pyp_context_t *context, TSNode node) {
+static void pyp_function(pyp_context_t *context, TSNode node, const char *expected_caller) {
     const char *name = pyp_text(&context->source, pyp_field(node, "name"));
     const char *key = name ? cbm_arena_sprintf(context->source.arena, "%u:%s",
                                                ts_node_start_point(node).row + 1, name)
                            : NULL;
     const pyp_name_t *caller = key ? cbm_ht_get(context->callers, key) : NULL;
     TSNode body = pyp_field(node, "body"), parameters = pyp_field(node, "parameters");
-    if (!caller || caller->ambiguous || !caller->target || ts_node_is_null(body) ||
+    if (!caller || caller->ambiguous || !caller->target || !expected_caller ||
+        strcmp(caller->target, expected_caller) || ts_node_is_null(body) ||
         ts_node_is_null(parameters))
         return;
     pyp_audit(context, body, 0);
     bool failed = context->source.failed;
+    if (context->source.exhausted)
+        return;
     context->source.failed = false;
     if (failed)
         return;
@@ -754,6 +772,70 @@ static void pyp_function(pyp_context_t *context, TSNode node) {
     ts_tree_cursor_delete(&cursor);
     pyp_statements(context, body, caller->target, scope);
 }
+/* Build the expected caller from the actual declaration nesting as well as
+ * the extractor map. A line/name collision or mismatched owner must not move
+ * a valid receiver proof into another callable's scope. Decorated declarations
+ * and functions nested inside functions remain outside this source subset. */
+static void pyp_callers(pyp_context_t *context, TSNode body, const char *owner, unsigned depth) {
+    if (ts_node_is_null(body) || !owner || !pyp_budget(&context->source, depth))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            bool function = pyp_is(node, "function_definition");
+            if (!function && !pyp_is(node, "class_definition"))
+                continue;
+            TSNode name_node = pyp_field(node, "name");
+            if (!pyp_is(name_node, "identifier"))
+                continue;
+            const char *name = pyp_text(&context->source, name_node);
+            const char *qn =
+                name ? cbm_arena_sprintf(context->source.arena, "%s.%s", owner, name) : NULL;
+            if (!qn) {
+                context->source.failed = true;
+                break;
+            }
+            if (function)
+                pyp_function(context, node, qn);
+            else
+                pyp_callers(context, pyp_field(node, "body"), qn, depth + 1);
+            if (context->source.failed)
+                break;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* Module statements execute in file-module scope, including __init__. Class
+ * and function bodies are analyzed separately under their declaration scopes.
+ * Imports, definitions and unsupported statements can have runtime effects;
+ * they invalidate existing receiver facts without executing their child bodies
+ * as module expressions. A later explicit construction can establish new facts. */
+static void pyp_module(pyp_context_t *context, TSNode root) {
+    CBMScope *scope = cbm_scope_push(context->source.arena, NULL);
+    if (!scope || !context->file->module_qn)
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            pyp_audit(context, node, 0);
+            bool unsupported = context->source.failed;
+            if (context->source.exhausted)
+                break;
+            context->source.failed = false;
+            if (unsupported) {
+                cbm_resolve_types_invalidate_visible(&context->types, scope, ts_node_end_byte(node),
+                                                     CBM_RESOLVE_TYPE_UNSUPPORTED);
+                continue;
+            }
+            pyp_statement(context, node, context->file->module_qn, scope);
+            if (context->source.failed)
+                break;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
                           const CBMTypeRegistry *registry, const CBMFileResult *file,
                           const char **import_names, const char **import_qns, int import_count,
@@ -771,6 +853,9 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
     if (!tree)
         return;
     TSNode root = ts_tree_root_node(tree);
+    /* Append through a private descriptor; publish only after complete analysis.
+     * Arena growth preserves the original buffer and its committed prefix. */
+    CBMResolvedCallArray staged = *out;
     pyp_context_t context = {.source = {.arena = arena,
                                         .source = source,
                                         .length = (size_t)length,
@@ -778,7 +863,7 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
                              .registry = registry,
                              .file = file,
                              .symbol_scope = pyp_symbol_scope(arena, file->module_qn),
-                             .out = out};
+                             .out = &staged};
     context.bindings =
         cbm_resolve_binding_build(arena, file, CBM_LANG_PYTHON, source, (size_t)length);
     context.imports = cbm_ht_create(16);
@@ -789,7 +874,6 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
         cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
     if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
         context.source.failed = true;
-    int first = out->count;
     if (context.imports && context.callers && context.effects && context.bindings &&
         context.symbol_scope) {
         for (int i = 0; i < import_count; i++)
@@ -798,7 +882,8 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
                     context.source.failed = true;
         for (int i = 0; i < file->defs.count; i++) {
             const CBMDefinition *def = &file->defs.items[i];
-            if (!def->name || !def->qualified_name || !def->label || strcmp(def->label, "Function"))
+            if (!def->name || !def->qualified_name || !def->label ||
+                (strcmp(def->label, "Function") && strcmp(def->label, "Method")))
                 continue;
             const char *key = cbm_arena_sprintf(arena, "%u:%s", def->start_line, def->name);
             if (!key || !pyp_put(&context, context.callers, key, def->qualified_name))
@@ -812,17 +897,13 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
                     pyp_record_effect(&context, child);
             } while (ts_tree_cursor_goto_next_sibling(&effects));
         ts_tree_cursor_delete(&effects);
-        TSTreeCursor cursor = ts_tree_cursor_new(root);
-        if (!context.source.failed && ts_tree_cursor_goto_first_child(&cursor))
-            do {
-                TSNode child = ts_tree_cursor_current_node(&cursor);
-                if (pyp_is(child, "function_definition"))
-                    pyp_function(&context, child);
-            } while (ts_tree_cursor_goto_next_sibling(&cursor));
-        ts_tree_cursor_delete(&cursor);
+        if (!context.source.failed)
+            pyp_callers(&context, root, context.symbol_scope, 0);
+        if (!context.source.failed)
+            pyp_module(&context, root);
     }
-    if (context.source.failed)
-        out->count = first;
+    if (!context.source.failed)
+        *out = staged;
     cbm_ht_free(context.imports);
     cbm_ht_free(context.callers);
     cbm_ht_free(context.effects);

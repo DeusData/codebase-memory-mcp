@@ -2597,23 +2597,28 @@ TEST(ei_strict_namespace_dependency_has_canonical_endpoint) {
     cbm_gbuf_t *gb = cbm_gbuf_new("strictimports", "/tmp");
     ASSERT_NOT_NULL(gb);
     const char *rels[] = {"a.cs", "b.cs", "main.cs"};
-    const char *spaces[] = {"Example.Lib", "Example.Lib", "Consumer"};
+    const char *sources[] = {"namespace Example.Lib { class A {} }\n",
+                             "namespace Example.Lib { class B {} }\n",
+                             "using Example.Lib;\nnamespace Consumer { class Use {} }\n"};
+    CBMFileResult *results[3] = {0};
     for (int i = 0; i < 3; i++) {
+        results[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_CSHARP,
+                                      "strictimports", rels[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(results[i]);
         char *qn = cbm_pipeline_fqn_compute("strictimports", rels[i], "__file__");
         ASSERT_NOT_NULL(qn);
         ASSERT_GT(cbm_gbuf_upsert_node(gb, "File", rels[i], qn, rels[i], 1, 2, "{}"), 0);
         free(qn);
     }
-    CBMHashTable *map = cbm_pipeline_namespace_map_build_names("strictimports", spaces, rels, 3);
+    CBMHashTable *map = cbm_pipeline_namespace_map_build("strictimports", results, rels, 3);
     ASSERT_NOT_NULL(map);
+    ASSERT_EQ(results[2]->imports.count, 1);
+    const CBMImport *imp = &results[2]->imports.items[0];
+    ASSERT_STR_EQ(imp->module_path, "Example.Lib");
     cbm_pipeline_ctx_t ctx = {.project_name = "strictimports", .gbuf = gb};
-    CBMImport imp = {.local_name = "Example.Lib", .module_path = "Example.Lib"};
-    CBMFileResult result = {0};
-    result.imports.items = &imp;
-    result.imports.count = 1;
-    ASSERT_EQ(cbm_pipeline_create_import_edges(&ctx, &result, "main.cs", map), 1);
+    ASSERT_EQ(cbm_pipeline_create_import_edges(&ctx, results[2], "main.cs", map), 1);
     const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
-        &ctx, "main.cs", "strictimports.main.cs.__file__", &imp, map);
+        &ctx, "main.cs", "strictimports.main.cs.__file__", imp, map);
     ASSERT_NOT_NULL(target);
     ASSERT_STR_EQ(target->label, "Module");
     char expected[CBM_SZ_256];
@@ -2621,8 +2626,20 @@ TEST(ei_strict_namespace_dependency_has_canonical_endpoint) {
              CBM_LANG_CSHARP);
     ASSERT_STR_EQ(target->qualified_name, expected);
     ASSERT_STR_EQ(target->file_path, "");
+    ASSERT(cbm_gbuf_resolutions_own_shared(gb));
+    size_t count = 0;
+    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(gb, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT(rows[0].emitted && cbm_resolve_record_admit(&rows[0]));
+    ASSERT_STR_EQ(rows[0].relation, "IMPORTS");
+    ASSERT_STR_EQ(rows[0].file_path, "main.cs");
+    ASSERT_STR_EQ(rows[0].scope, "strictimports.main.cs.__file__");
+    ASSERT_STR_EQ(rows[0].spelling, "Example.Lib");
+    ASSERT_STR_EQ(rows[0].result.target, expected);
     cbm_pipeline_namespace_map_free(map);
     cbm_gbuf_free(gb);
+    for (int i = 0; i < 3; i++)
+        cbm_free_result(results[i]);
     PASS();
 }
 

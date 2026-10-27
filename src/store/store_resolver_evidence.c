@@ -1,4 +1,5 @@
 #include "store_resolver_evidence.h"
+#include "foundation/json_writer.h"
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
 #include <yyjson/yyjson.h>
@@ -54,7 +55,7 @@ static bool grow_ids(evidence_write_t *w) {
     size_t next = w->capacity ? w->capacity * 2 : 64;
     if (next < w->capacity || next > SIZE_MAX / sizeof(*w->ids))
         return false;
-    evidence_id_t *ids = calloc(next, sizeof(*ids));
+    evidence_id_t *ids = cbm_calloc(CBM_MEM_CLASS_STORE, next * sizeof(*ids));
     if (!ids)
         return false;
     evidence_id_t *old = w->ids;
@@ -64,7 +65,7 @@ static bool grow_ids(evidence_write_t *w) {
     for (size_t i = 0; i < old_capacity; i++)
         if (old[i].node)
             *id_slot(w, old[i].node) = old[i];
-    free(old);
+    cbm_free(CBM_MEM_CLASS_STORE, old);
     return true;
 }
 static int compare_files(const void *a, const void *b) {
@@ -136,7 +137,7 @@ static char *fact_json(const cbm_resolve_proof_view_t *v) {
     NUM("predecessors_closed", v->predecessors_closed);
 #undef STR
 #undef NUM
-    char *json = ok ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    char *json = ok ? yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL) : NULL;
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -191,7 +192,7 @@ static bool write_fact(const cbm_resolve_proof_t *node, void *context) {
                                        bind_text(w->lookup, 3, v->key.lookup_domain) &&
                                        bind_text(w->lookup, 4, v->key.lookup_key) &&
                                        bind_text(w->lookup, 5, lookup_status(v)));
-    free(json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
     if (ok) {
         *id_slot(w, node) = entry;
         w->count++;
@@ -384,11 +385,12 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     if (root_capacity > SIZE_MAX / sizeof(void *))
         return false;
     const cbm_resolve_proof_t **roots =
-        root_capacity ? malloc(root_capacity * sizeof(*roots)) : NULL;
+        root_capacity ? cbm_alloc(CBM_MEM_CLASS_STORE, root_capacity * sizeof(*roots)) : NULL;
     const cbm_resolve_file_t **ordered_files =
-        file_count ? malloc(file_count * sizeof(*ordered_files)) : NULL;
+        file_count ? cbm_alloc(CBM_MEM_CLASS_STORE, file_count * sizeof(*ordered_files)) : NULL;
     const cbm_resolve_summary_t **ordered_summaries =
-        summary_count ? malloc(summary_count * sizeof(*ordered_summaries)) : NULL;
+        summary_count ? cbm_alloc(CBM_MEM_CLASS_STORE, summary_count * sizeof(*ordered_summaries))
+                      : NULL;
     bool ok = (!root_capacity || roots) && (!file_count || ordered_files) &&
               (!summary_count || ordered_summaries);
     size_t root_count = 0;
@@ -425,9 +427,9 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     sqlite3_finalize(w.fact);
     sqlite3_finalize(w.support);
     sqlite3_finalize(w.lookup);
-    free(w.ids);
-    free(roots);
-    free(ordered_files);
-    free(ordered_summaries);
+    cbm_free(CBM_MEM_CLASS_STORE, w.ids);
+    cbm_free(CBM_MEM_CLASS_STORE, roots);
+    cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
+    cbm_free(CBM_MEM_CLASS_STORE, ordered_summaries);
     return ok;
 }

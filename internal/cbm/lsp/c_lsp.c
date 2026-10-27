@@ -4130,6 +4130,39 @@ static const CBMType *c_parse_declaration_type(CLSPContext *ctx, TSNode decl_nod
     return cbm_type_unknown();
 }
 
+/* C++ declaration/expression ambiguity is resolved by lexical lookup. The
+ * grammar can parse `Widget w(n)` as an unnamed parameter whose type is `n`;
+ * a visible value binding for n instead makes this object direct-initialization.
+ * This recovers only w's written type, not constructor applicability or a call. */
+static bool c_bind_cpp_direct_initializer(CLSPContext *ctx, TSNode declarator,
+                                          const CBMType *type) {
+    if (!ctx->cpp_mode || !ctx->enclosing_func_qn || ts_node_has_error(declarator) ||
+        ts_node_named_child_count(declarator) != 2)
+        return false;
+    TSNode name = ts_node_child_by_field_name(declarator, "declarator", 10);
+    TSNode parameters = ts_node_child_by_field_name(declarator, "parameters", 10);
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") ||
+        ts_node_is_null(parameters) || ts_node_named_child_count(parameters) != 1)
+        return false;
+    TSNode parameter = ts_node_named_child(parameters, 0);
+    TSNode argument = ts_node_child_by_field_name(parameter, "type", 4);
+    if (strcmp(ts_node_type(parameter), "parameter_declaration") ||
+        ts_node_named_child_count(parameter) != 1 || ts_node_is_null(argument) ||
+        strcmp(ts_node_type(argument), "type_identifier"))
+        return false;
+    const char *argument_name = c_node_text(ctx, argument);
+    const CBMType *value =
+        argument_name ? cbm_scope_lookup(ctx->current_scope, argument_name) : NULL;
+    if (cbm_type_is_unknown(value) || value->kind == CBM_TYPE_ALIAS)
+        return false; /* A type alias, unknown name or prototype is not a value argument. */
+    const char *variable = c_node_text(ctx, name);
+    if (!variable)
+        return false;
+    c_scope_bind(ctx, variable, type);
+    c_observe_declared_binding(ctx, variable, type, declarator);
+    return true;
+}
+
 void c_process_statement(CLSPContext *ctx, TSNode node) {
     if (ctx->eval_failure)
         return;
@@ -4427,6 +4460,9 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                     }
                 }
             } else if (strcmp(ck, "function_declarator") == 0) {
+                if (!has_auto && !has_inferred_type &&
+                    c_bind_cpp_direct_initializer(ctx, child, base_type))
+                    continue;
                 /* Bare function-pointer declaration: `int (*fp)(void);`.
                  * Ordinary function prototypes have no pointer in the nested
                  * declarator and are intentionally ignored here. */

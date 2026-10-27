@@ -6,6 +6,8 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "sqlite3.h"
+#include "resolver_quality.h"
+#include "store/store_resolver.h"
 
 typedef struct {
     const char *language, *main_path, *library_path, *decoy_path;
@@ -288,7 +290,876 @@ TEST(resolver_quality_python_materialization_gaps_are_counted) {
     PASS();
 }
 
+/* Synthetic persisted generations exercise the oracle itself. Deliberate row
+ * corruption bypasses production admission so a faulty writer cannot make the
+ * test oracle certify its own mistake. Production proof tests remain separate. */
+static const RQ_Source RQ_TEST_SOURCES[] = {
+    {.path = "main.c",
+     .text = "void caller(int value) {\n    target(value);\n}\n"
+             "void other(int value) { target(value); }\n"},
+    {.path = "lib.c", .text = "void target(int value) {}\n"},
+    {.path = "decoy.c", .text = "void target(int value) {}\n"}};
+
+typedef struct {
+    cbm_store_t *store;
+    int64_t caller, other, target, decoy;
+    uint32_t start, end;
+} rq_test_store_t;
+
+static RQ_Expected rq_test_expected(RQ_Mode mode) {
+    return (RQ_Expected){.case_id = "c.direct-call",
+                         .site = {.file = "main.c", .caller = "caller", .needle = "target(value)"},
+                         .relation = "CALLS",
+                         .target = {.file = "lib.c",
+                                    .suffix = "lib.target",
+                                    .label = "Function",
+                                    .declaration_line = 1,
+                                    .declaration_text = "void target(int value) {}"},
+                         .mode = mode,
+                         .gap_id = "RQ-C-DIRECT-001",
+                         .why = "synthetic absent binding/materialization for oracle validation",
+                         .tried = "independent caller, source occurrence and declaration anchors"};
+}
+static bool rq_test_open(rq_test_store_t *fixture, bool materialized) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->store = cbm_store_open_memory();
+    if (!fixture->store || cbm_store_upsert_project(fixture->store, "rq", "/fixture") != 0)
+        return false;
+    cbm_node_t nodes[] = {{.project = "rq",
+                           .label = "Function",
+                           .name = "caller",
+                           .qualified_name = "p.main.caller(int)",
+                           .file_path = "main.c",
+                           .start_line = 1,
+                           .end_line = 3},
+                          {.project = "rq",
+                           .label = "Function",
+                           .name = "other",
+                           .qualified_name = "p.main.other(int)",
+                           .file_path = "main.c",
+                           .start_line = 4,
+                           .end_line = 4},
+                          {.project = "rq",
+                           .label = "Function",
+                           .name = "target",
+                           .qualified_name = "p.lib.target(int)",
+                           .file_path = "lib.c",
+                           .start_line = 1,
+                           .end_line = 1},
+                          {.project = "rq",
+                           .label = "Function",
+                           .name = "target",
+                           .qualified_name = "p.decoy.target(int)",
+                           .file_path = "decoy.c",
+                           .start_line = 1,
+                           .end_line = 1}};
+    fixture->caller = cbm_store_upsert_node(fixture->store, nodes);
+    fixture->other = cbm_store_upsert_node(fixture->store, nodes + 1);
+    fixture->target = materialized ? cbm_store_upsert_node(fixture->store, nodes + 2) : 0;
+    fixture->decoy = cbm_store_upsert_node(fixture->store, nodes + 3);
+    cbm_resolve_file_t files[3] = {0};
+    char hashes[3][CBM_SHA256_HEX_LEN + 1];
+    for (int i = 0; i < 3; i++) {
+        cbm_sha256_hex(RQ_TEST_SOURCES[i].text, strlen(RQ_TEST_SOURCES[i].text), hashes[i]);
+        files[i] = (cbm_resolve_file_t){.file_path = RQ_TEST_SOURCES[i].path,
+                                        .module = "p",
+                                        .raw_content_identity = hashes[i],
+                                        .configuration_identity = "fixture",
+                                        .raw_length = strlen(RQ_TEST_SOURCES[i].text),
+                                        .language = CBM_LANG_C,
+                                        .complete = true};
+    }
+    const char *site = strstr(RQ_TEST_SOURCES[0].text, "target(value)");
+    fixture->start = (uint32_t)(site - RQ_TEST_SOURCES[0].text);
+    fixture->end = fixture->start + (uint32_t)strlen("target(value)");
+    return fixture->caller > 0 && fixture->other > 0 && fixture->decoy > 0 &&
+           (!materialized || fixture->target > 0) &&
+           cbm_store_resolver_replace_generation(fixture->store, "rq", NULL, 0, files, 3, NULL,
+                                                 0) == 0;
+}
+
+typedef enum {
+    RQ_TEST_EXACT,
+    RQ_TEST_TARGET,
+    RQ_TEST_SPAN,
+    RQ_TEST_ROLE,
+    RQ_TEST_CALLER,
+    RQ_TEST_ORIGIN,
+    RQ_TEST_NO_EDGE,
+    RQ_TEST_NO_ROW,
+    RQ_TEST_UNRELATED
+} rq_test_mutation_t;
+static bool rq_test_emit(rq_test_store_t *fixture, rq_test_mutation_t mutation) {
+    bool other = mutation == RQ_TEST_CALLER || mutation == RQ_TEST_UNRELATED;
+    const char *scope = other ? "p.main.other(int)" : "p.main.caller(int)";
+    const char *target = mutation == RQ_TEST_TARGET ? "p.decoy.target(int)" : "p.lib.target(int)";
+    const char *relation = mutation == RQ_TEST_ROLE ? "USAGE" : "CALLS";
+    uint32_t start = fixture->start + (mutation == RQ_TEST_SPAN);
+    uint32_t end = fixture->end;
+    if (mutation == RQ_TEST_UNRELATED) {
+        const char *source = RQ_TEST_SOURCES[0].text;
+        start = (uint32_t)(strstr(source + fixture->end, "target(value)") - source);
+        end = start + (uint32_t)strlen("target(value)");
+    }
+    sqlite3_stmt *stmt = NULL;
+    bool ok = true;
+    if (mutation != RQ_TEST_NO_ROW) {
+        const char *sql = "INSERT INTO resolver_occurrences VALUES('rq',"
+                          "(SELECT coalesce(max(ordinal)+1,0) FROM resolver_occurrences),"
+                          "'main.c',?1,?2,'target',?3,?4,?5,1,1,0,0,0,?6,1,'fixture',1,?7,'{}')";
+        ok = sqlite3_prepare_v2(cbm_store_get_db(fixture->store), sql, -1, &stmt, NULL) ==
+                 SQLITE_OK &&
+             sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_STATIC) == SQLITE_OK &&
+             sqlite3_bind_text(stmt, 2, relation, -1, SQLITE_STATIC) == SQLITE_OK &&
+             sqlite3_bind_int64(stmt, 3, start) == SQLITE_OK &&
+             sqlite3_bind_int64(stmt, 4, end) == SQLITE_OK &&
+             sqlite3_bind_int(stmt, 5,
+                              mutation == RQ_TEST_ORIGIN ? CBM_SOURCE_ORIGIN_PREPROCESSED
+                                                         : CBM_SOURCE_ORIGIN_RAW) == SQLITE_OK &&
+             sqlite3_bind_text(stmt, 6, target, -1, SQLITE_STATIC) == SQLITE_OK &&
+             sqlite3_bind_int(stmt, 7, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
+             sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+    }
+    if (ok && mutation != RQ_TEST_NO_EDGE) {
+        cbm_edge_t edge = {.project = "rq",
+                           .source_id = other ? fixture->other : fixture->caller,
+                           .target_id =
+                               mutation == RQ_TEST_TARGET ? fixture->decoy : fixture->target,
+                           .type = relation};
+        ok = cbm_store_insert_edge(fixture->store, &edge) > 0;
+    }
+    return ok;
+}
+static bool rq_test_check(rq_test_store_t *fixture, RQ_Expected *item, RQ_Report *report) {
+    return rq_check(fixture->store, "rq", "oracle-self-test", RQ_TEST_SOURCES, 3, item, 1, NULL, 0,
+                    report, NULL);
+}
+
+/* Independently authored line-preserving transform of RQ_TEST_SOURCES[0].
+ * The synthetic writer below is deliberately separate from the oracle. */
+static const char RQ_TEST_PREPROCESSED[] = "void caller(int value) {\ntarget(value);\n}\n"
+                                           "void other(int value) { target(value); }\n";
+
+static bool rq_test_preprocessed(rq_test_store_t *fixture, RQ_Source sources[3],
+                                 RQ_Expected *item) {
+    memcpy(sources, RQ_TEST_SOURCES, sizeof(RQ_TEST_SOURCES));
+    sources[0].preprocessed_text = RQ_TEST_PREPROCESSED;
+    sources[0].preprocessed_configuration_identity = "rq-preprocessed-fixture-v1";
+    *item = rq_test_expected(RQ_REQUIRED);
+    const char *site = strstr(RQ_TEST_PREPROCESSED, "target(value)");
+    item->site.preprocessed_start_byte = (uint32_t)(site - RQ_TEST_PREPROCESSED);
+    item->site.preprocessed_end_byte =
+        item->site.preprocessed_start_byte + (uint32_t)strlen("target(value)");
+    if (!rq_test_emit(fixture, RQ_TEST_EXACT))
+        return false;
+    sqlite3 *db = cbm_store_get_db(fixture->store);
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(RQ_TEST_PREPROCESSED, strlen(RQ_TEST_PREPROCESSED), digest);
+    sqlite3_stmt *stmt = NULL;
+    bool ok =
+        sqlite3_prepare_v2(db,
+                           "UPDATE resolver_file_summaries SET preprocessed_content_identity=?1,"
+                           "preprocessed_length=?2,configuration_identity=?3 "
+                           "WHERE project='rq' AND file_path='main.c'",
+                           -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 1, digest, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_int64(stmt, 2, (sqlite3_int64)strlen(RQ_TEST_PREPROCESSED)) == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 3, sources[0].preprocessed_configuration_identity, -1,
+                          SQLITE_STATIC) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    ok = ok &&
+         sqlite3_prepare_v2(
+             db,
+             "UPDATE resolver_occurrences SET start_byte=?1,end_byte=?2,source_origin=1 "
+             "WHERE project='rq' AND ordinal=0",
+             -1, &stmt, NULL) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 1, item->site.preprocessed_start_byte) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 2, item->site.preprocessed_end_byte) == SQLITE_OK &&
+         sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    ok = ok &&
+         sqlite3_prepare_v2(db, "INSERT INTO resolver_occurrence_evidence VALUES('rq',0,?1,?2,0,0)",
+                            -1, &stmt, NULL) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 1, digest, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 2, sources[0].preprocessed_configuration_identity, -1,
+                           SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+TEST(resolver_quality_oracle_maps_one_preprocessed_occurrence_once) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    RQ_Source sources[3];
+    RQ_Expected item;
+    ASSERT(rq_test_preprocessed(&fixture, sources, &item));
+    RQ_Report report;
+    ASSERT(rq_check(fixture.store, "rq", "mapped-origin", sources, 3, &item, 1, NULL, 0, &report,
+                    NULL));
+    ASSERT_EQ(report.genuine, 1);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 0);
+    /* The raw and transformed rows represent one golden, never two recoveries. */
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    ASSERT(rq_check(fixture.store, "rq", "mapped-origin", sources, 3, &item, 1, NULL, 0, &report,
+                    NULL));
+    cbm_store_close(fixture.store);
+    ASSERT_EQ(report.genuine, 1);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 0);
+    PASS();
+}
+
+TEST(resolver_quality_oracle_rejects_preprocessed_metadata_and_span_corruption) {
+    static const char *const mutations[] = {
+        "UPDATE resolver_occurrences SET start_byte=start_byte+1",
+        "UPDATE resolver_file_summaries SET preprocessed_content_identity='wrong' "
+        "WHERE file_path='main.c'",
+        "UPDATE resolver_file_summaries SET preprocessed_length=preprocessed_length+1 "
+        "WHERE file_path='main.c'",
+        "UPDATE resolver_file_summaries SET configuration_identity='wrong' "
+        "WHERE file_path='main.c'",
+        "UPDATE resolver_occurrence_evidence SET content_identity='wrong'",
+        "UPDATE resolver_occurrence_evidence SET configuration_identity='wrong'",
+        "UPDATE resolver_occurrences SET source_origin=0",
+        "UPDATE resolver_occurrences SET source_origin=99",
+        "UPDATE resolver_occurrences SET start_byte=start_byte+4,end_byte=end_byte+4",
+        "DELETE FROM resolver_occurrence_evidence"};
+    for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); i++) {
+        rq_test_store_t fixture;
+        ASSERT(rq_test_open(&fixture, true));
+        RQ_Source sources[3];
+        RQ_Expected item;
+        ASSERT(rq_test_preprocessed(&fixture, sources, &item));
+        ASSERT(sqlite3_exec(cbm_store_get_db(fixture.store), mutations[i], NULL, NULL, NULL) ==
+               SQLITE_OK);
+        RQ_Report report;
+        bool ok = rq_check(fixture.store, "rq", "mapped-corruption", sources, 3, &item, 1, NULL, 0,
+                           &report, NULL);
+        cbm_store_close(fixture.store);
+        ASSERT(!ok);
+        ASSERT_EQ(report.genuine, 1);
+        ASSERT_EQ(report.found, 0);
+        ASSERT_EQ(report.missing, 1);
+        ASSERT(report.metadata_errors + report.wrong > 0);
+    }
+    PASS();
+}
+
+TEST(resolver_quality_oracle_requires_explicit_preprocessed_mapping) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    RQ_Source sources[3];
+    RQ_Expected item;
+    ASSERT(rq_test_preprocessed(&fixture, sources, &item));
+    RQ_Report report;
+    RQ_Expected unmapped = item;
+    unmapped.site.preprocessed_start_byte = unmapped.site.preprocessed_end_byte = 0;
+    ASSERT(!rq_check(fixture.store, "rq", "unmapped-origin", sources, 3, &unmapped, 1, NULL, 0,
+                     &report, NULL));
+    ASSERT(report.metadata_errors > 0);
+    ASSERT_EQ(report.found, 0);
+    RQ_Expected bad_span = item;
+    bad_span.site.preprocessed_end_byte++;
+    ASSERT(!rq_check(fixture.store, "rq", "bad-map", sources, 3, &bad_span, 1, NULL, 0, &report,
+                     NULL));
+    ASSERT(report.invalid_oracle > 0);
+    const char *other =
+        strstr(RQ_TEST_PREPROCESSED + item.site.preprocessed_end_byte, "target(value)");
+    bad_span = item;
+    bad_span.site.preprocessed_start_byte = (uint32_t)(other - RQ_TEST_PREPROCESSED);
+    bad_span.site.preprocessed_end_byte = bad_span.site.preprocessed_start_byte + 13;
+    ASSERT(!rq_check(fixture.store, "rq", "wrong-line-map", sources, 3, &bad_span, 1, NULL, 0,
+                     &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    sources[0].preprocessed_configuration_identity = NULL;
+    ASSERT(!rq_check(fixture.store, "rq", "incomplete-map", sources, 3, &item, 1, NULL, 0, &report,
+                     NULL));
+    cbm_store_close(fixture.store);
+    ASSERT(report.invalid_oracle > 0);
+    PASS();
+}
+
+TEST(resolver_quality_oracle_rejects_many_raw_sites_mapped_to_one_occurrence) {
+    RQ_Source sources[3];
+    memcpy(sources, RQ_TEST_SOURCES, sizeof(sources));
+    sources[0].text = "void caller(int value) {\n    target(value); target(value);\n}\n";
+    sources[0].preprocessed_text = "void caller(int value) {\ntarget(value);\n}\n";
+    sources[0].preprocessed_configuration_identity = "rq-preprocessed-fixture-v1";
+    RQ_Expected items[2] = {rq_test_expected(RQ_REQUIRED), rq_test_expected(RQ_REQUIRED)};
+    items[1].case_id = "c.second-direct-call";
+    items[1].site.occurrence_index = 1;
+    for (size_t i = 0; i < 2; i++) {
+        items[i].site.preprocessed_start_byte = 25;
+        items[i].site.preprocessed_end_byte = 38;
+        RQ_State anchor = {.site = &items[i].site};
+        ASSERT(rq_anchor(&anchor, sources, 3));
+    }
+    RQ_State states[2] = {0};
+    RQ_Report report = {.genuine = 2};
+    ASSERT(!rq_prepare(states, items, 2, NULL, 0, sources, 3, &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 0);
+    PASS();
+}
+TEST(resolver_quality_oracle_preserves_exact_occurrence_and_scope) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_UNRELATED));
+    RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+    RQ_Report report;
+    ASSERT(rq_test_check(&fixture, &item, &report));
+    ASSERT_EQ(report.genuine, 1);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 0);
+    ASSERT_EQ(report.wrong, 0);
+    ASSERT_EQ(report.projection_errors, 0);
+    item.target.suffix = "lib.target(int)";
+    ASSERT(rq_test_check(&fixture, &item, &report));
+    item.target.suffix = "lib.target(float)";
+    bool wrong_signature = rq_test_check(&fixture, &item, &report);
+    cbm_store_close(fixture.store);
+    ASSERT(!wrong_signature);
+    ASSERT(report.wrong > 0);
+    PASS();
+}
+TEST(resolver_quality_oracle_rejects_mutated_occurrences_and_projection) {
+    const rq_test_mutation_t mutations[] = {RQ_TEST_TARGET, RQ_TEST_SPAN,    RQ_TEST_ROLE,
+                                            RQ_TEST_CALLER, RQ_TEST_NO_EDGE, RQ_TEST_NO_ROW};
+    for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); i++) {
+        rq_test_store_t fixture;
+        ASSERT(rq_test_open(&fixture, true));
+        ASSERT(rq_test_emit(&fixture, mutations[i]));
+        RQ_Expected item = rq_test_expected(RQ_KNOWN_GAP);
+        RQ_Report report;
+        bool ok = rq_test_check(&fixture, &item, &report);
+        cbm_store_close(fixture.store);
+        ASSERT(!ok);
+        ASSERT_EQ(report.genuine, 1);
+        ASSERT_EQ(report.found, 0);
+        ASSERT_EQ(report.missing, 1);
+        ASSERT(report.wrong + report.projection_errors > 0);
+    }
+    PASS();
+}
+TEST(resolver_quality_oracle_counts_missing_materialization_and_required_miss) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, false));
+    RQ_Expected item = rq_test_expected(RQ_KNOWN_GAP);
+    RQ_Report report;
+    bool known = rq_test_check(&fixture, &item, &report);
+    ASSERT(known);
+    ASSERT_EQ(report.genuine, 1);
+    ASSERT_EQ(report.missing, 1);
+    ASSERT_EQ(report.found, 0);
+    ASSERT_EQ(report.wrong, 0);
+    item.target.suffix = NULL; /* Semantic constructor identity not yet representable. */
+    ASSERT(rq_test_check(&fixture, &item, &report));
+    ASSERT_EQ(report.genuine, 1);
+    ASSERT_EQ(report.missing, 1);
+    item = rq_test_expected(RQ_REQUIRED);
+    bool required = rq_test_check(&fixture, &item, &report);
+    cbm_store_close(fixture.store);
+    ASSERT(!required);
+    ASSERT_EQ(report.required_missing, 1);
+    ASSERT_EQ(report.missing, 1);
+    PASS();
+}
+TEST(resolver_quality_oracle_requires_promotion_of_recovered_gap) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    RQ_Expected item = rq_test_expected(RQ_KNOWN_GAP);
+    RQ_Report report;
+    ASSERT(!rq_test_check(&fixture, &item, &report));
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.recovered_gaps, 1);
+    item.expected_recovered = true;
+    ASSERT(rq_test_check(&fixture, &item, &report));
+    ASSERT_EQ(report.recovered_gaps, 0);
+    ASSERT(sqlite3_exec(cbm_store_get_db(fixture.store),
+                        "DELETE FROM edges; DELETE FROM resolver_occurrences", NULL, NULL,
+                        NULL) == SQLITE_OK);
+    bool regressed = rq_test_check(&fixture, &item, &report);
+    cbm_store_close(fixture.store);
+    ASSERT(!regressed);
+    ASSERT_EQ(report.required_missing, 1);
+    PASS();
+}
+TEST(resolver_quality_oracle_keeps_forbidden_targets_out_of_denominator) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+    RQ_Forbidden forbidden = {.case_id = "c.direct-call.no-decoy",
+                              .site = item.site,
+                              .relation = "CALLS",
+                              .target = {.file = "decoy.c",
+                                         .suffix = "decoy.target",
+                                         .label = "Function",
+                                         .declaration_line = 1,
+                                         .declaration_text = "void target(int value) {}"}};
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    RQ_Report report;
+    ASSERT(rq_check(fixture.store, "rq", "forbidden-control", RQ_TEST_SOURCES, 3, &item, 1,
+                    &forbidden, 1, &report, NULL));
+    ASSERT_EQ(report.genuine, 1);
+    /* A value argument is not another call. The valid call may still project
+     * the same aggregate edge; only this different exact site is forbidden. */
+    RQ_Forbidden argument = {
+        .case_id = "c.direct-call.argument-is-not-call",
+        .site = {.file = "main.c", .caller = "caller", .needle = "value", .occurrence_index = 1},
+        .relation = "CALLS",
+        .target = item.target};
+    ASSERT(rq_check(fixture.store, "rq", "aggregate-negative-control", RQ_TEST_SOURCES, 3, &item, 1,
+                    &argument, 1, &report, NULL));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_TARGET));
+    bool ok = rq_check(fixture.store, "rq", "forbidden-control", RQ_TEST_SOURCES, 3, &item, 1,
+                       &forbidden, 1, &report, NULL);
+    cbm_store_close(fixture.store);
+    ASSERT(!ok);
+    ASSERT(report.wrong > 0);
+    ASSERT_EQ(report.genuine, 1);
+    PASS();
+}
+TEST(resolver_quality_oracle_wildcard_negative_is_relation_scoped) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    /* The wildcard forbids CALLS at the parameter site. A USAGE at another
+     * site in this caller is outside this deliberately narrow audit. */
+    RQ_Forbidden forbidden = {.case_id = "c.parameter-is-not-call",
+                              .site = {.file = "main.c", .caller = "caller", .needle = "value"},
+                              .relation = "CALLS",
+                              .any_target = true};
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_ROLE));
+    RQ_Report report;
+    ASSERT(rq_check(fixture.store, "rq", "wildcard-relation-control", RQ_TEST_SOURCES, 3, NULL, 0,
+                    &forbidden, 1, &report, NULL));
+    ASSERT_EQ(report.genuine, 0);
+    ASSERT_EQ(report.wrong, 0);
+    ASSERT_EQ(report.projection_errors, 0);
+    /* All CALLS from this caller are inside the closed relation domain. */
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    bool ok = rq_check(fixture.store, "rq", "wildcard-relation-control", RQ_TEST_SOURCES, 3, NULL,
+                       0, &forbidden, 1, &report, NULL);
+    cbm_store_close(fixture.store);
+    ASSERT(!ok);
+    ASSERT(report.wrong > 0);
+    PASS();
+}
+/* Synthetic row mechanics for an explicitly declared multicast contract.
+ * Ordinary single-target expectations still reject duplicate sites. */
+TEST(resolver_quality_oracle_multicast_requires_distinct_declared_targets) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    RQ_Source sources[3];
+    memcpy(sources, RQ_TEST_SOURCES, sizeof(sources));
+    sources[1].text = "void target(int value) {\n}\n";
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(sources[1].text, strlen(sources[1].text), digest);
+    sqlite3_stmt *snapshot = NULL;
+    ASSERT(sqlite3_prepare_v2(cbm_store_get_db(fixture.store),
+                              "UPDATE resolver_file_summaries SET "
+                              "raw_content_identity=?1,raw_length=?2 WHERE file_path='lib.c'",
+                              -1, &snapshot, NULL) == SQLITE_OK);
+    ASSERT(sqlite3_bind_text(snapshot, 1, digest, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+    ASSERT(sqlite3_bind_int64(snapshot, 2, (sqlite3_int64)strlen(sources[1].text)) == SQLITE_OK);
+    ASSERT(sqlite3_step(snapshot) == SQLITE_DONE);
+    sqlite3_finalize(snapshot);
+    ASSERT(sqlite3_exec(cbm_store_get_db(fixture.store),
+                        "UPDATE nodes SET end_line=2 WHERE file_path='lib.c'", NULL, NULL,
+                        NULL) == SQLITE_OK);
+    RQ_Expected items[2] = {rq_test_expected(RQ_KNOWN_GAP), rq_test_expected(RQ_KNOWN_GAP)};
+    items[0].target.declaration_text = "void target(int value) {";
+    items[1].case_id = "multicast.second";
+    items[1].target = (RQ_Target){.file = "decoy.c",
+                                  .suffix = "decoy.target",
+                                  .label = "Function",
+                                  .declaration_line = 1,
+                                  .declaration_text = "void target(int value) {}"};
+    RQ_Report report;
+    ASSERT(
+        !rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    items[0].dispatch_group = items[1].dispatch_group = "explicit-notify-topic";
+    ASSERT(
+        rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.missing, 2);
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    ASSERT(
+        !rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT_EQ(report.recovered_gaps, 1);
+    items[0].expected_recovered = true;
+    ASSERT(
+        rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_TARGET));
+    items[1].expected_recovered = true;
+    ASSERT(
+        rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT_EQ(report.found, 2);
+    /* Different anchors inside one multi-line declaration are still one
+     * semantic target. Suffix aliases cannot inflate recovery either. */
+    items[1].target = items[0].target;
+    items[1].target.declaration_line = 2;
+    items[1].target.declaration_text = "}";
+    ASSERT(
+        !rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    items[1].target = items[0].target;
+    items[1].target.suffix = "target";
+    ASSERT(
+        !rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    items[1].target = items[0].target;
+    ASSERT(
+        !rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    items[1].dispatch_group = "different-topic";
+    ASSERT(
+        !rq_check(fixture.store, "rq", "multicast", sources, 3, items, 2, NULL, 0, &report, NULL));
+    ASSERT(report.invalid_oracle > 0);
+    cbm_store_close(fixture.store);
+    PASS();
+}
+TEST(resolver_quality_oracle_nonresolver_relations_are_outside_scope) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    cbm_edge_t edge = {.project = "rq",
+                       .source_id = fixture.caller,
+                       .target_id = fixture.target,
+                       .type = "OVERRIDE"};
+    ASSERT(cbm_store_insert_edge(fixture.store, &edge) > 0);
+    RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+    RQ_Report report;
+    bool ok = rq_test_check(&fixture, &item, &report);
+    cbm_store_close(fixture.store);
+    ASSERT(ok);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.projection_errors, 0);
+    PASS();
+}
+TEST(resolver_quality_oracle_rejects_unmapped_origin_and_stale_source) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_ORIGIN));
+    RQ_Expected item = rq_test_expected(RQ_KNOWN_GAP);
+    RQ_Report report;
+    ASSERT(!rq_test_check(&fixture, &item, &report));
+    ASSERT(report.metadata_errors > 0);
+    RQ_Source stale[3];
+    memcpy(stale, RQ_TEST_SOURCES, sizeof(stale));
+    stale[0].text = "void caller(int value) { target(value); }\n";
+    bool ok =
+        rq_check(fixture.store, "rq", "stale-source", stale, 3, &item, 1, NULL, 0, &report, NULL);
+    cbm_store_close(fixture.store);
+    ASSERT(!ok);
+    ASSERT(report.metadata_errors > 0);
+    ASSERT_EQ(report.genuine, 1);
+    PASS();
+}
+/* Structural nodes have no declaration interval. A zero range is accepted
+ * only for an exact File or explicitly configured Folder, with an independent
+ * source/configuration anchor; it never excuses an ordinary declaration. */
+TEST(resolver_quality_oracle_configured_folder_requires_exact_identity_and_anchor) {
+    const RQ_Source sources[] = {
+        {.path = "Core/Package.swift", .text = ".target(name: \"Core\", dependencies: [])\n"},
+        {.path = "Other/Package.swift", .text = ".target(name: \"Other\", dependencies: [])\n"},
+    };
+    RQ_Target target = {.file = "Core/Sources/Core",
+                        .suffix = "Core.Sources.Core",
+                        .label = "Folder",
+                        .declaration_line = 1,
+                        .declaration_text = ".target(name: \"Core\", dependencies: [])",
+                        .domain = RQ_TARGET_CONFIGURED_FOLDER,
+                        .configuration_file = "Core/Package.swift"};
+    ASSERT(rq_target_anchor(&target, sources, 2));
+    ASSERT(rq_target(&target, "Core/Sources/Core", "p.Core.Sources.Core", "Core", "Folder", 0, 0));
+    ASSERT(
+        !rq_target(&target, "Other/Sources/Core", "p.Core.Sources.Core", "Core", "Folder", 0, 0));
+    ASSERT(!rq_target(&target, "Core/Sources/Core", "p.Other.Core", "Core", "Folder", 0, 0));
+    ASSERT(!rq_target(&target, "Core/Sources/Core", "p.Core.Sources.Core", "Core", "File", 0, 0));
+    ASSERT(!rq_target(&target, "Core/Sources/Core", "p.Core.Sources.Core", "Core", "Folder", 1, 1));
+    target.configuration_file = "Other/Package.swift";
+    ASSERT(!rq_target_anchor(&target, sources, 2));
+    target.configuration_file = "Core/Package.swift";
+    target.declaration_text = ".target(name: \"Other\", dependencies: [])";
+    ASSERT(!rq_target_anchor(&target, sources, 2));
+    target.domain = RQ_TARGET_PROJECT;
+    ASSERT(!rq_target_anchor(&target, sources, 2));
+    PASS();
+}
+
+TEST(resolver_quality_oracle_file_zero_ranges_keep_exact_source_and_label) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, true));
+    ASSERT(rq_test_emit(&fixture, RQ_TEST_EXACT));
+    sqlite3 *db = cbm_store_get_db(fixture.store);
+    ASSERT_EQ(sqlite3_exec(
+                  db,
+                  "UPDATE nodes SET label='File',start_line=0,end_line=0 WHERE qualified_name IN "
+                  "('p.main.caller(int)','p.lib.target(int)')",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+    item.target.label = "File";
+    ASSERT(!rq_target(&item.target, "lib.c", "p.lib.target(int)", "target", "File", 2, 2));
+    ASSERT(!rq_target(&item.target, "lib.c", "p.lib.target(int)", "target", "Function", 0, 0));
+    RQ_Report report;
+    ASSERT(rq_test_check(&fixture, &item, &report));
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(sqlite3_exec(
+                  db, "UPDATE nodes SET label='Function' WHERE qualified_name='p.lib.target(int)'",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT(!rq_test_check(&fixture, &item, &report));
+    ASSERT(report.wrong > 0);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "UPDATE nodes SET label='File',file_path='decoy.c' WHERE "
+                           "qualified_name='p.lib.target(int)'",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT(!rq_test_check(&fixture, &item, &report));
+    ASSERT(report.wrong > 0);
+    ASSERT_EQ(
+        sqlite3_exec(db,
+                     "UPDATE nodes SET file_path='lib.c' WHERE qualified_name='p.lib.target(int)';"
+                     "UPDATE nodes SET label='Function' WHERE qualified_name='p.main.caller(int)'",
+                     NULL, NULL, NULL),
+        SQLITE_OK);
+    ASSERT(!rq_test_check(&fixture, &item, &report));
+    ASSERT(report.wrong > 0);
+    cbm_store_close(fixture.store);
+    PASS();
+}
+
+TEST(resolver_quality_oracle_rejects_unexplained_gap_and_invalid_anchor) {
+    rq_test_store_t fixture;
+    ASSERT(rq_test_open(&fixture, false));
+    RQ_Expected item = rq_test_expected(RQ_KNOWN_GAP);
+    RQ_Report report;
+    item.gap_id = NULL;
+    ASSERT(!rq_test_check(&fixture, &item, &report));
+    ASSERT(report.invalid_oracle > 0);
+    item = rq_test_expected(RQ_KNOWN_GAP);
+    item.site.needle = "not_present(value)";
+    bool ok = rq_test_check(&fixture, &item, &report);
+    cbm_store_close(fixture.store);
+    ASSERT(!ok);
+    ASSERT(report.invalid_oracle > 0);
+    PASS();
+}
+
+/* Builtin identities come from the materialization ontology, not project
+ * fixture declarations. These synthetic rows test only the independent oracle;
+ * production admission remains governed by the resolver's own proof policy. */
+static const RQ_Source RQ_BUILTIN_SOURCES[] = {
+    {.path = "tool.py", .text = "def lookup(xs):\n    return len(xs)\n"},
+    {.path = "decoy.py", .text = "def len(xs):\n    return 0\n"}};
+
+static RQ_Expected rq_builtin_expected(void) {
+    return (RQ_Expected){
+        .case_id = "python.external.len",
+        .site = {.file = "tool.py", .caller = "tool.lookup", .needle = "len(xs)"},
+        .relation = "CALLS",
+        .target = {.file = "<python-builtins>",
+                   .label = "Function",
+                   .domain = RQ_TARGET_EXTERNAL,
+                   .external_identity = "builtins.len"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "RQ-EXTERNAL-BUILTIN-001",
+        .why = "synthetic missing external binding for independent oracle validation",
+        .tried = "literal Python builtin site and independently declared external ontology"};
+}
+static bool rq_builtin_open(rq_test_store_t *fixture) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->store = cbm_store_open_memory();
+    if (!fixture->store || cbm_store_upsert_project(fixture->store, "rq", "/fixture") != 0)
+        return false;
+    cbm_node_t caller = {.project = "rq",
+                         .label = "Function",
+                         .name = "lookup",
+                         .qualified_name = "rq.tool.lookup",
+                         .file_path = "tool.py",
+                         .start_line = 1,
+                         .end_line = 2};
+    fixture->caller = cbm_store_upsert_node(fixture->store, &caller);
+    cbm_resolve_file_t files[2] = {0};
+    char hashes[2][CBM_SHA256_HEX_LEN + 1];
+    for (int i = 0; i < 2; i++) {
+        cbm_sha256_hex(RQ_BUILTIN_SOURCES[i].text, strlen(RQ_BUILTIN_SOURCES[i].text), hashes[i]);
+        files[i] = (cbm_resolve_file_t){.file_path = RQ_BUILTIN_SOURCES[i].path,
+                                        .module = "rq",
+                                        .raw_content_identity = hashes[i],
+                                        .configuration_identity = "fixture",
+                                        .raw_length = strlen(RQ_BUILTIN_SOURCES[i].text),
+                                        .language = CBM_LANG_PYTHON,
+                                        .complete = true};
+    }
+    fixture->start =
+        (uint32_t)(strstr(RQ_BUILTIN_SOURCES[0].text, "len(xs)") - RQ_BUILTIN_SOURCES[0].text);
+    fixture->end = fixture->start + (uint32_t)strlen("len(xs)");
+    return fixture->caller > 0 && cbm_store_resolver_replace_generation(fixture->store, "rq", NULL,
+                                                                        0, files, 2, NULL, 0) == 0;
+}
+static bool rq_builtin_emit(rq_test_store_t *fixture, const char *identity, const char *file,
+                            const char *label, cbm_resolve_domain_t domain) {
+    cbm_node_t target = {.project = "rq",
+                         .label = label,
+                         .name = "len",
+                         .qualified_name = identity,
+                         .file_path = file,
+                         .start_line = 1,
+                         .end_line = 1};
+    fixture->target = cbm_store_upsert_node(fixture->store, &target);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "INSERT INTO resolver_occurrences VALUES('rq',0,'tool.py',"
+                      "'rq.tool.lookup','CALLS','len',?1,?2,0,1,?3,0,0,0,?4,1,'fixture',1,?5,'{}')";
+    bool ok =
+        fixture->target > 0 &&
+        sqlite3_prepare_v2(cbm_store_get_db(fixture->store), sql, -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_bind_int64(stmt, 1, fixture->start) == SQLITE_OK &&
+        sqlite3_bind_int64(stmt, 2, fixture->end) == SQLITE_OK &&
+        sqlite3_bind_int(stmt, 3, domain) == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 4, identity, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_int(stmt, 5, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    cbm_edge_t edge = {.project = "rq",
+                       .source_id = fixture->caller,
+                       .target_id = fixture->target,
+                       .type = "CALLS"};
+    return ok && cbm_store_insert_edge(fixture->store, &edge) > 0;
+}
+static bool rq_builtin_check(rq_test_store_t *fixture, RQ_Expected *item, RQ_Report *report) {
+    return rq_check(fixture->store, "rq", "external-oracle-self-test", RQ_BUILTIN_SOURCES, 2, item,
+                    1, NULL, 0, report, NULL);
+}
+TEST(resolver_quality_oracle_counts_external_misses_and_requires_promotion) {
+    rq_test_store_t fixture;
+    ASSERT(rq_builtin_open(&fixture));
+    RQ_Expected item = rq_builtin_expected();
+    RQ_Report report;
+    ASSERT(rq_builtin_check(&fixture, &item, &report));
+    ASSERT_EQ(report.genuine, 1);
+    ASSERT_EQ(report.missing, 1);
+    ASSERT_EQ(report.found, 0);
+    ASSERT_EQ(report.invalid_oracle, 0);
+    ASSERT(rq_builtin_emit(&fixture, "builtins.len", "<python-builtins>", "Function",
+                           CBM_RESOLVE_DOMAIN_EXTERNAL));
+    ASSERT(!rq_builtin_check(&fixture, &item, &report));
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.recovered_gaps, 1);
+    item.expected_recovered = true;
+    ASSERT(rq_builtin_check(&fixture, &item, &report));
+    ASSERT_EQ(report.recovered_gaps, 0);
+    item.mode = RQ_REQUIRED;
+    ASSERT(rq_builtin_check(&fixture, &item, &report));
+    cbm_store_close(fixture.store);
+    PASS();
+}
+TEST(resolver_quality_oracle_rejects_external_namesakes_and_unknown_domains) {
+    static const struct {
+        const char *identity, *file, *label;
+        cbm_resolve_domain_t domain;
+    } wrong[] = {{"rq.decoy.len", "decoy.py", "Function", CBM_RESOLVE_DOMAIN_PROJECT},
+                 {"rq.builtins.len", "<python-builtins>", "Function", CBM_RESOLVE_DOMAIN_EXTERNAL},
+                 {"builtins.len", "decoy.py", "Function", CBM_RESOLVE_DOMAIN_EXTERNAL},
+                 {"builtins.len", "<python-builtins>", "Method", CBM_RESOLVE_DOMAIN_EXTERNAL},
+                 {"builtins.len", "<python-builtins>", "Function", CBM_RESOLVE_DOMAIN_UNKNOWN},
+                 {"builtins.len", "<python-builtins>", "Function", CBM_RESOLVE_DOMAIN_PROJECT}};
+    for (size_t i = 0; i < sizeof(wrong) / sizeof(wrong[0]); i++) {
+        rq_test_store_t fixture;
+        ASSERT(rq_builtin_open(&fixture));
+        ASSERT(rq_builtin_emit(&fixture, wrong[i].identity, wrong[i].file, wrong[i].label,
+                               wrong[i].domain));
+        RQ_Expected item = rq_builtin_expected();
+        RQ_Report report;
+        bool ok = rq_builtin_check(&fixture, &item, &report);
+        cbm_store_close(fixture.store);
+        ASSERT(!ok);
+        ASSERT_EQ(report.genuine, 1);
+        ASSERT_EQ(report.found, 0);
+        ASSERT(report.wrong > 0);
+    }
+    PASS();
+}
+TEST(resolver_quality_oracle_rejects_malformed_external_expectations) {
+    rq_test_store_t fixture;
+    ASSERT(rq_builtin_open(&fixture));
+    for (int variant = 0; variant < 10; variant++) {
+        RQ_Expected item = rq_builtin_expected();
+        switch (variant) {
+        case 0:
+            item.target.domain = RQ_TARGET_PROJECT;
+            break; /* omitted discriminator */
+        case 1:
+            item.target.domain = (RQ_TargetDomain)99;
+            break;
+        case 2:
+            item.target.external_identity = NULL;
+            break;
+        case 3:
+            item.target.external_identity = "builtins..len";
+            break;
+        case 4:
+            item.target.file = "decoy.py";
+            break;
+        case 5:
+            item.target.label = NULL;
+            break;
+        case 6:
+            item.target.label = "Method";
+            break;
+        case 7:
+            item.target.suffix = "builtins.len";
+            break;
+        case 8:
+            item.target.declaration_line = 1;
+            break;
+        case 9:
+            item.target.declaration_text = "def len(xs):";
+            break;
+        }
+        RQ_Report report;
+        ASSERT(!rq_builtin_check(&fixture, &item, &report));
+        ASSERT(report.invalid_oracle > 0);
+        ASSERT_EQ(report.genuine, 1);
+    }
+    cbm_store_close(fixture.store);
+    PASS();
+}
+
 SUITE(resolver_quality) {
+    RUN_TEST(resolver_quality_oracle_maps_one_preprocessed_occurrence_once);
+    RUN_TEST(resolver_quality_oracle_rejects_preprocessed_metadata_and_span_corruption);
+    RUN_TEST(resolver_quality_oracle_requires_explicit_preprocessed_mapping);
+    RUN_TEST(resolver_quality_oracle_rejects_many_raw_sites_mapped_to_one_occurrence);
+    RUN_TEST(resolver_quality_oracle_multicast_requires_distinct_declared_targets);
+    RUN_TEST(resolver_quality_oracle_nonresolver_relations_are_outside_scope);
+    RUN_TEST(resolver_quality_oracle_counts_external_misses_and_requires_promotion);
+    RUN_TEST(resolver_quality_oracle_rejects_external_namesakes_and_unknown_domains);
+    RUN_TEST(resolver_quality_oracle_rejects_malformed_external_expectations);
+    RUN_TEST(resolver_quality_oracle_preserves_exact_occurrence_and_scope);
+    RUN_TEST(resolver_quality_oracle_rejects_mutated_occurrences_and_projection);
+    RUN_TEST(resolver_quality_oracle_counts_missing_materialization_and_required_miss);
+    RUN_TEST(resolver_quality_oracle_requires_promotion_of_recovered_gap);
+    RUN_TEST(resolver_quality_oracle_keeps_forbidden_targets_out_of_denominator);
+    RUN_TEST(resolver_quality_oracle_wildcard_negative_is_relation_scoped);
+    RUN_TEST(resolver_quality_oracle_rejects_unmapped_origin_and_stale_source);
+    RUN_TEST(resolver_quality_oracle_configured_folder_requires_exact_identity_and_anchor);
+    RUN_TEST(resolver_quality_oracle_file_zero_ranges_keep_exact_source_and_label);
+    RUN_TEST(resolver_quality_oracle_rejects_unexplained_gap_and_invalid_anchor);
+
     RUN_TEST(resolver_quality_python_materialization_gaps_are_counted);
     RUN_TEST(resolver_quality_counts_known_misses_and_forbids_wrong_targets);
 }

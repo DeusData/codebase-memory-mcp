@@ -380,7 +380,152 @@ TEST(resolver_kotlin_imported_signature_keeps_type_shadow_competitors) {
     PASS();
 }
 
+static bool kotlin_package_exact_row(const CBMResolvedCall *row, const char *caller,
+                                     uint32_t start) {
+    cbm_resolve_result_t proof = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                  .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                  .analysis = row->evidence.analysis,
+                                  .rule = row->evidence.rule,
+                                  .facts = row->evidence.facts,
+                                  .target = row->callee_qn,
+                                  .candidate_count = 1,
+                                  .proof = row->evidence.proof};
+    return cbm_resolve_admit(&proof) && row->evidence.proof &&
+           row->source_origin == CBM_SOURCE_ORIGIN_RAW && row->caller_qn &&
+           !strcmp(row->caller_qn, caller) && row->callee_qn &&
+           !strcmp(row->callee_qn, "p.util.Assert.pkgEq") && row->site_start_byte == start &&
+           row->site_end_byte == start + strlen("pkgEq(id, id)");
+}
+
+static bool kotlin_package_call_rows(const char *source, bool shadow_string, int *exact,
+                                     int *wrong) {
+    static const char library[] =
+        "package com.example.util\n\nfun pkgEq(a: String, b: String): Boolean {\n"
+        "    return a == b\n}\n";
+    static const char decoy[] =
+        "package com.example.spec\nfun pkgSpec(label: String): Boolean { return true }\n";
+    static const char homonym[] =
+        "package unrelated\nfun pkgEq(a: String, b: String): Boolean { return false }\n";
+    static const char shadow[] = "package com.example.app\nclass String {}\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {{.qualified_name = "com.example.util.pkgEq",
+                         .graph_qualified_name = "p.util.Assert.pkgEq",
+                         .short_name = "pkgEq",
+                         .label = "Function",
+                         .source_start_line = 3,
+                         .signature_param_count = 2,
+                         .declaration_identity = "util/Assert.kt:3"},
+                        {.qualified_name = "com.example.spec.pkgSpec",
+                         .graph_qualified_name = "p.spec.SpecHelpers.pkgSpec",
+                         .short_name = "pkgSpec",
+                         .label = "Function",
+                         .source_start_line = 2,
+                         .signature_param_count = 1,
+                         .declaration_identity = "spec/SpecHelpers.kt:2"},
+                        {.qualified_name = "unrelated.pkgEq",
+                         .graph_qualified_name = "p.Other.pkgEq",
+                         .short_name = "pkgEq",
+                         .label = "Function",
+                         .source_start_line = 2,
+                         .signature_param_count = 2,
+                         .declaration_identity = "Other.kt:2"},
+                        {.qualified_name = "com.example.app.String",
+                         .graph_qualified_name = "p.Shadow.String",
+                         .short_name = "String",
+                         .label = "Class",
+                         .source_start_line = 2,
+                         .declaration_identity = "Shadow.kt:2"}};
+    bool facts = cbm_kotlin_collect_source_facts(&arena, library, (int)strlen(library),
+                                                 "p.util.Assert", defs, 1) &&
+                 cbm_kotlin_collect_source_facts(&arena, decoy, (int)strlen(decoy),
+                                                 "p.spec.SpecHelpers", defs + 1, 1) &&
+                 cbm_kotlin_collect_source_facts(&arena, homonym, (int)strlen(homonym), "p.Other",
+                                                 defs + 2, 1) &&
+                 cbm_kotlin_collect_source_facts(&arena, shadow, (int)strlen(shadow), "p.Shadow",
+                                                 defs + 3, 1);
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, &arena);
+    cbm_kotlin_register_lsp_defs(&arena, &registry, defs, shadow_string ? 4 : 3, NULL);
+    cbm_registry_finalize(&registry);
+    CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_KOTLIN, "p",
+                                           "app/Query.kt", 0, NULL, NULL);
+    const char *caller = NULL;
+    for (int i = 0; file && i < file->defs.count; i++)
+        if (file->defs.items[i].name && !strcmp(file->defs.items[i].name, "pkgBuild"))
+            caller = file->defs.items[i].qualified_name;
+    TSParser *parser = ts_parser_new();
+    extern const TSLanguage *tree_sitter_kotlin(void);
+    if (parser)
+        ts_parser_set_language(parser, tree_sitter_kotlin());
+    TSTree *tree =
+        parser ? ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source)) : NULL;
+    ts_parser_delete(parser);
+    bool ok = facts && file && tree && caller;
+    CBMResolvedCallArray rows = {0};
+    if (ok)
+        cbm_kotlin_proof_resolve(&arena, source, (int)strlen(source), ts_tree_root_node(tree),
+                                 &registry, file, &rows);
+    const char *site = strstr(source, "pkgEq(id, id)");
+    *exact = *wrong = 0;
+    for (int i = 0; site && i < rows.count; i++) {
+        const CBMResolvedCall *row = &rows.items[i];
+        if (row->kind != CBM_RESOLVED_INVOCATION)
+            continue;
+        if (kotlin_package_exact_row(row, caller, (uint32_t)(site - source)))
+            (*exact)++;
+        else
+            (*wrong)++;
+    }
+    if (tree)
+        ts_tree_delete(tree);
+    cbm_free_result(file);
+    cbm_arena_destroy(&arena);
+    return ok && site;
+}
+
+TEST(resolver_kotlin_imported_call_keeps_builtin_parameter_and_logical_body) {
+    const struct {
+        const char *extra_import, *parameter, *tail;
+        bool shadow;
+        int expected;
+    } cases[] = {{"", "String", "", false, 1},
+                 {"", "kotlin.String", "", false, 1},
+                 {"", "String", " && pkgSpec(id)", false, 1},
+                 {"", "kotlin.String", " && pkgSpec(id)", false, 1},
+                 {"", "String", " || pkgSpec(id)", false, 1},
+                 {"import kotlin.test.pkgEq\n", "String", " && pkgSpec(id)", false, 0},
+                 {"import other.String\n", "String", " && pkgSpec(id)", false, 0},
+                 {"import other.Value as String\n", "String", " && pkgSpec(id)", false, 0},
+                 {"", "String", " && pkgSpec(id)", true, 0},
+                 {"", "Int", " && pkgSpec(id)", false, 0},
+                 {"", "String?", " && pkgSpec(id)", false, 0}};
+    int exact[sizeof(cases) / sizeof(cases[0])] = {0};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source),
+                 "package com.example.app\n\nimport com.example.util.pkgEq\n%s"
+                 "import kotlin.test.pkgSpec\n\nfun pkgBuild(id: %s): Boolean {\n"
+                 "    return pkgEq(id, id)%s\n}\n",
+                 cases[i].extra_import, cases[i].parameter, cases[i].tail);
+        int wrong = 0;
+        ASSERT(kotlin_package_call_rows(source, cases[i].shadow, exact + i, &wrong));
+        ASSERT_EQ(wrong, 0);
+    }
+    /* Check ambiguity and type-shadow controls before positive quality gates. */
+    for (size_t i = 5; i < sizeof(cases) / sizeof(cases[0]); i++)
+        ASSERT_EQ(exact[i], cases[i].expected);
+    for (size_t i = 0; i < 5; i++) {
+        if (exact[i] != cases[i].expected)
+            fprintf(stderr, "Kotlin imported-call scenario %zu: got=%d expected=%d\n", i, exact[i],
+                    cases[i].expected);
+        ASSERT_EQ(exact[i], cases[i].expected);
+    }
+    PASS();
+}
+
 SUITE(resolver_kotlin) {
+    RUN_TEST(resolver_kotlin_imported_call_keeps_builtin_parameter_and_logical_body);
     RUN_TEST(resolver_kotlin_branch_reference_preserves_exact_candidate);
     RUN_TEST(resolver_kotlin_import_alias_receiver_and_free_function);
     RUN_TEST(resolver_kotlin_shadowed_and_unknown_receiver_abstain);

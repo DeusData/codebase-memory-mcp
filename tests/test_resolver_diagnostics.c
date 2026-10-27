@@ -1,6 +1,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "graph_buffer/graph_buffer.h"
+#include "resolve/policy.h"
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
 #include "mcp/mcp.h"
@@ -102,9 +103,10 @@ static int diagnostic_rows(cbm_store_t *store, const char *project) {
                                        .lookup_key = "admitted",
                                        .lookup_closed = true,
                                        .declaration_identity = target,
+                                       .binding_identity = target,
                                        .start_byte = admitted->start_byte,
                                        .end_byte = admitted->end_byte,
-                                       .detail = "audited fixed source scope"};
+                                       .detail = "CALLS"};
         const cbm_resolve_proof_t *audit = cbm_resolve_proof_leaf(
             &pool, CBM_PROOF_ADAPTER_DOMAIN, &captured, &key, &admitted->result);
         admitted->result.proof =
@@ -120,8 +122,12 @@ static int diagnostic_rows(cbm_store_t *store, const char *project) {
     if (ok) {
         size_t count = 0;
         const cbm_resolve_record_t *sealed = cbm_gbuf_resolutions(gb, &count);
-        result =
-            cbm_store_resolver_replace_generation(store, project, sealed, count, &file, 1, NULL, 0);
+        /* This fixture promises one real invocation; a malformed proof must
+         * fail fixture construction, not silently change the paging oracle. */
+        if (count == sizeof(rows) / sizeof(rows[0]) && sealed[count - 1].emitted &&
+            cbm_resolve_record_admit(&sealed[count - 1]))
+            result = cbm_store_resolver_replace_generation(store, project, sealed, count, &file, 1,
+                                                           NULL, 0);
     }
     cbm_gbuf_free(gb);
     cbm_free_result(parsed);

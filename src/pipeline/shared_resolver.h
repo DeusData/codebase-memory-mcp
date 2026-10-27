@@ -28,6 +28,16 @@ bool cbm_shared_resolver_exports_complete(const cbm_shared_resolver_t *resolver)
 bool cbm_shared_resolver_owns_proof(const cbm_shared_resolver_t *resolver,
                                     const cbm_resolve_proof_t *proof);
 
+/* HTTP-only default-client observation. Checks the exact importing occurrence,
+ * caller scope, content and configuration against the immutable shared audit.
+ * A true result with NULL base proves the client, but not a relative endpoint. */
+/* Negative-only annotation candidate: blocks weaker service-name fallback
+ * after the audited HTTP lookup fails. This is never edge authority. */
+bool cbm_shared_resolver_http_candidate_receiver(const cbm_shared_resolver_t *, const char *,
+                                                 const CBMCall *);
+bool cbm_shared_resolver_http_base(const cbm_shared_resolver_t *, const char *file,
+                                   const CBMFileResult *, const CBMCall *, const char **base);
+
 typedef struct {
     const cbm_pipeline_ctx_t *ctx;
     const cbm_registry_t *registry;

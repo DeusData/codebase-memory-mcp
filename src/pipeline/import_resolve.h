@@ -16,10 +16,17 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
                                      const char *rel, CBMHashTable *namespace_map);
 
 /* A module namespace slot is a candidate, never proof that it is exported.
- * FROM retains that slot even for a re-export without a definition node. */
+ * FROM retains that slot even for a re-export without a definition node.
+ * The caller releases the returned string with cbm_free(CBM_MEM_CLASS_SEMANTIC, ...). */
 char *cbm_pipeline_python_import_slot(const cbm_gbuf_t *graph, const char *project,
                                       const char *source_rel, const CBMImport *import,
                                       bool *module);
+
+/* Candidate paths only. Caller must independently prove the parent lacks
+ * the requested attribute before falling back to this exact submodule. */
+bool cbm_pipeline_python_submodule_candidate(const cbm_gbuf_t *, const char *, const char *,
+                                             const CBMImport *, const cbm_gbuf_node_t **,
+                                             const cbm_gbuf_node_t **);
 
 /* Source-local Python bindings, independent of dependency edge endpoints.
  * Dotted module imports retain the exact loaded prefix and block the root's
@@ -31,10 +38,10 @@ int cbm_pipeline_python_import_map(const cbm_gbuf_t *gbuf, const char *project,
                                    const char ***out_vals, int *out_count);
 
 /* ECMAScript named/namespace bindings use the source member and canonical
- * module identity, never the dependency File's extension-bearing QN. */
-int cbm_pipeline_ecma_import_map(const cbm_gbuf_t *, const char *, const char *,
-                                 const CBMFileResult *, bool, const char ***, const char ***,
-                                 int *);
+ * module identity, never the dependency File's extension-bearing QN. The actual
+ * immutable pipeline context retains the admitted path-alias configuration. */
+int cbm_pipeline_ecma_import_map(const cbm_pipeline_ctx_t *, const char *, const CBMFileResult *,
+                                 bool, const char ***, const char ***, int *);
 
 /* Positive PHP class bindings are independent of unresolved sibling imports.
  * Owned arrays/strings use the same release contract as Python bindings. */

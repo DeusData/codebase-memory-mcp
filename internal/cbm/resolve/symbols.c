@@ -1,4 +1,5 @@
 #include "symbols.h"
+#include "foundation/mem_core.h"
 #include "policy.h"
 #include <limits.h>
 #include <stdlib.h>
@@ -66,7 +67,7 @@ static bool symbol_support(symbol_lookup_t *lookup, const cbm_resolve_proof_t *p
         if (capacity < lookup->support_capacity || capacity > SIZE_MAX / sizeof(*lookup->supports))
             return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED, "symbol_support_allocation");
         const cbm_resolve_proof_t **supports =
-            realloc(lookup->supports, capacity * sizeof(*supports));
+            cbm_realloc(CBM_MEM_CLASS_EXTRACT, lookup->supports, capacity * sizeof(*supports));
         if (!supports)
             return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED, "symbol_support_allocation");
         lookup->supports = supports;
@@ -576,7 +577,7 @@ static cbm_resolve_method_result_t symbol_resolve(const cbm_resolve_method_query
         .name_identity = query && (query->adapter_facts & CBM_RESOLVE_METHOD_NAME_IDENTITY)};
     if (symbol_query_proven(&lookup) && symbol_registries(&lookup))
         (void)symbol_finish(&lookup);
-    free(lookup.supports);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, lookup.supports);
     return lookup.output;
 }
 

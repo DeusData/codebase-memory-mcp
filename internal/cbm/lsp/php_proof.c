@@ -216,8 +216,7 @@ bool cbm_php_collect_source_facts(CBMArena *arena, const char *source, int sourc
         return false;
     if (!facts.count)
         return true;
-    if (facts.count)
-        qsort(facts.items, facts.count, sizeof(*facts.items), php_proof_compare);
+    qsort(facts.items, facts.count, sizeof(*facts.items), php_proof_compare);
     for (int i = 0; i < count; i++) {
         CBMLSPDef *def = &defs[i];
         const char *qn =
@@ -456,6 +455,8 @@ static void php_proof_audit_body(php_proof_context_t *context, TSNode node, CBMH
 }
 static cbm_resolve_method_candidate_t php_proof_method_candidate(
     const cbm_resolve_method_query_t *query, const CBMTypeRegistry *owner,
+    // WHY: The shared classify callback type requires a mutable void * context.
+    // cppcheck-suppress constParameterCallback
     const CBMRegisteredFunc *candidate, void *opaque) {
     (void)query;
     (void)owner;
@@ -641,24 +642,28 @@ void cbm_php_proof_resolve_with_source(CBMArena *arena, const char *source, int 
         return;
     /* The per-file import snapshot has no namespace-block key yet. Refuse
      * to project one block's aliases into another lexical namespace. */
-    unsigned namespaces = 0;
     TSTreeCursor namespace_cursor = ts_tree_cursor_new(root);
     bool namespace_complete = true;
-    if (ts_tree_cursor_goto_first_child(&namespace_cursor))
+    if (ts_tree_cursor_goto_first_child(&namespace_cursor)) {
+        unsigned namespaces = 0;
         do {
             TSNode child = ts_tree_cursor_current_node(&namespace_cursor);
             if (php_proof_is(child, "namespace_definition") &&
                 (++namespaces > 1 || !ts_node_is_null(php_proof_field(child, "body"))))
                 namespace_complete = false;
         } while (ts_tree_cursor_goto_next_sibling(&namespace_cursor));
+    }
     ts_tree_cursor_delete(&namespace_cursor);
     if (!namespace_complete)
         return;
+    /* Append through a private descriptor; publish only after complete analysis.
+     * Arena growth preserves the original buffer and its committed prefix. */
+    CBMResolvedCallArray staged = *out;
     php_proof_context_t context = {
         .source = {.arena = arena, .source = source, .length = (size_t)source_len},
         .module = module_qn,
         .registry = registry,
-        .out = out};
+        .out = &staged};
     context.types = cbm_ht_create(64);
     context.file_types = cbm_ht_create(64);
     context.imports = cbm_ht_create(16);
@@ -669,12 +674,11 @@ void cbm_php_proof_resolve_with_source(CBMArena *arena, const char *source, int 
                                                              module_qn, CBM_SOURCE_ORIGIN_RAW);
     if (!context_ok)
         context.source.failed = true;
-    int first = out->count;
     if (context.types && context.file_types && context.imports &&
         php_proof_indexes(&context, bindings, defs, count))
         php_proof_walk(&context, root, module_qn, 0);
-    if (context.source.failed)
-        out->count = first;
+    if (!context.source.failed)
+        *out = staged;
     cbm_ht_free(context.types);
     cbm_ht_free(context.file_types);
     cbm_ht_free(context.imports);

@@ -254,8 +254,8 @@ bool cbm_cs_collect_source_facts(CBMArena *arena, const char *source, int length
             def->graph_qualified_name ? def->graph_qualified_name : def->qualified_name;
         if (!qn || !def->source_start_line)
             continue;
-        size_t length = cbm_qn_callable_base_len_named(qn, def->short_name);
-        const char *base = qn[length] ? cbm_arena_strndup(arena, qn, length) : qn;
+        size_t base_length = cbm_qn_callable_base_len_named(qn, def->short_name);
+        const char *base = qn[base_length] ? cbm_arena_strndup(arena, qn, base_length) : qn;
         if (!base)
             return false;
         cs_source_decl_t key = {.qn = base, .line = def->source_start_line};
@@ -784,10 +784,13 @@ void cbm_cs_proof_resolve(CBMArena *arena, const char *source, int length, TSNod
         ts_node_has_error(root) || file->has_error || file->parse_incomplete ||
         file->parse_unusable)
         return;
+    /* Append through a private descriptor; publish only after complete analysis.
+     * Arena growth preserves the original buffer and its committed prefix. */
+    CBMResolvedCallArray staged = *out;
     csp_context_t context = {.source = {.arena = arena, .source = source, .length = (size_t)length},
                              .registry = registry,
                              .file = file,
-                             .out = out};
+                             .out = &staged};
     context.callers = cbm_ht_create(32);
     context.local_types = cbm_ht_create(32);
     cbm_resolve_types_init(&context.types, arena, 0);
@@ -795,7 +798,6 @@ void cbm_cs_proof_resolve(CBMArena *arena, const char *source, int length, TSNod
         cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
     if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
         context.source.failed = true;
-    int first = out->count;
     csp_scope_t *scope = csp_scope(&context, NULL, "");
     if (context.callers && context.local_types && scope) {
         for (int i = 0; i < file->defs.count; i++) {
@@ -818,8 +820,8 @@ void cbm_cs_proof_resolve(CBMArena *arena, const char *source, int length, TSNod
         if (!context.source.failed)
             csp_walk(&context, root, scope, 0);
     }
-    if (context.source.failed)
-        out->count = first;
+    if (!context.source.failed)
+        *out = staged;
     for (csp_scope_t *s = context.allocated; s; s = s->allocated_next)
         cbm_ht_free(s->aliases);
     cbm_ht_free(context.callers);

@@ -16,6 +16,7 @@
 #include "pipeline/import_resolve.h"
 #include "resolve/policy.h"
 #include "lang_specs.h"
+#include "helpers.h"
 #include "discover/discover.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -45,9 +46,15 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
     if (!f) {
         return NULL;
     }
-    (void)fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
     long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        (void)fclose(f);
+        return NULL;
+    }
     if (size <= 0 || size > (long)CBM_SZ_1K * CBM_SZ_1K) { /* 1MB cap for manifests */
         (void)fclose(f);
         return NULL;
@@ -58,7 +65,12 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
         return NULL;
     }
     size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
-    (void)fclose(f);
+    bool complete = nread == (size_t)size && !ferror(f);
+    int closed = fclose(f);
+    if (!complete || closed != 0) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, buf);
+        return NULL;
+    }
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
@@ -103,21 +115,64 @@ static bool at_prefix(const char *p, const char *end, const char *prefix, int pr
     return p + prefix_len <= end && memcmp(p, prefix, (size_t)prefix_len) == 0;
 }
 
+/* Package collections and their private path/parser strings share SEMANTIC
+ * ownership. Public raw-string APIs retain their caller-owned free() contract. */
+static char *pkgmap_strndup(const char *source, size_t limit) {
+    if (!source)
+        return NULL;
+    size_t length = 0;
+    while (length < limit && source[length])
+        length++;
+    if (length == SIZE_MAX)
+        return NULL;
+    char *copy = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, length + 1);
+    if (copy) {
+        memcpy(copy, source, length);
+        copy[length] = '\0';
+    }
+    return copy;
+}
+
+/* Consume a libc-owned FQN/binding result at the private semantic boundary.
+ * The public producer still serves callers that release its result with free(). */
+static char *pkgmap_take_raw(char *raw) {
+    char *owned = raw ? cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, raw) : NULL;
+    free(raw);
+    return owned;
+}
+
 /* ── Per-worker collection ─────────────────────────────────────── */
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e) {
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
+    e->incomplete = false;
 }
 
 static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_rel) {
+    if (e->incomplete || !pkg_name || !entry_rel || e->count < 0 || e->cap < 0) {
+        e->incomplete = true;
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, pkg_name);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entry_rel);
+        return;
+    }
     if (e->count >= e->cap) {
-        int new_cap = e->cap == 0 ? PKGMAP_INIT_CAP : e->cap * SKIP_ONE * PAIR_LEN;
-        cbm_pkg_entry_t *tmp = realloc(e->items, new_cap * sizeof(cbm_pkg_entry_t));
+        if (e->cap > INT32_MAX / 2) {
+            e->incomplete = true;
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, pkg_name);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, entry_rel);
+            return;
+        }
+        int new_cap = e->cap == 0 ? PKGMAP_INIT_CAP : e->cap * 2;
+        cbm_pkg_entry_t *tmp =
+            (size_t)new_cap <= SIZE_MAX / sizeof(*tmp)
+                ? cbm_realloc(CBM_MEM_CLASS_SEMANTIC, e->items, (size_t)new_cap * sizeof(*tmp))
+                : NULL;
         if (!tmp) {
-            free(pkg_name);
-            free(entry_rel);
+            e->incomplete = true;
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, pkg_name);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, entry_rel);
             return;
         }
         e->items = tmp;
@@ -125,18 +180,20 @@ static void pkg_entries_push(cbm_pkg_entries_t *e, char *pkg_name, char *entry_r
     }
     e->items[e->count].pkg_name = pkg_name;
     e->items[e->count].entry_rel = entry_rel;
+    e->items[e->count].node_fact = false;
     e->count++;
 }
 
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
     for (int i = 0; i < e->count; i++) {
-        free(e->items[i].pkg_name);
-        free(e->items[i].entry_rel);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, e->items[i].pkg_name);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, e->items[i].entry_rel);
     }
-    free(e->items);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, e->items);
     e->items = NULL;
     e->count = 0;
     e->cap = 0;
+    e->incomplete = false;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -152,43 +209,9 @@ static const char *path_basename(const char *rel_path) {
 static char *path_dirname(const char *rel_path) {
     const char *last = strrchr(rel_path, '/');
     if (!last) {
-        return strdup("");
+        return cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "");
     }
-    return cbm_strndup(rel_path, (size_t)(last - rel_path));
-}
-
-/* Strip file extension from a path. Returns heap-allocated string.
- * "src/index.ts" → "src/index", "lib/main" → "lib/main" */
-static char *strip_extension(const char *path) {
-    size_t len = strlen(path);
-    for (size_t i = len; i > 0; i--) {
-        if (path[i - SKIP_ONE] == '.') {
-            return cbm_strndup(path, i - SKIP_ONE);
-        }
-        if (path[i - SKIP_ONE] == '/') {
-            break;
-        }
-    }
-    return strdup(path);
-}
-
-/* Join directory + relative entry path, normalize.
- * "packages/foo" + "src/index.ts" → "packages/foo/src/index" (stripped ext) */
-static char *join_and_strip(const char *dir, const char *entry) {
-    if (!entry || entry[0] == '\0') {
-        return NULL;
-    }
-    /* Skip leading ./ from entry */
-    if (entry[0] == '.' && entry[SKIP_ONE] == '/') {
-        entry += PAIR_LEN;
-    }
-    char buf[PKGMAP_PATH_BUF];
-    if (dir[0] == '\0') {
-        snprintf(buf, sizeof(buf), "%s", entry);
-    } else {
-        snprintf(buf, sizeof(buf), "%s/%s", dir, entry);
-    }
-    return strip_extension(buf);
+    return pkgmap_strndup(rel_path, (size_t)(last - rel_path));
 }
 
 /* Check if a string ends with a suffix. */
@@ -248,83 +271,308 @@ static char *extract_quoted(const char *p, const char *end) {
     if (p >= end || *p != quote) {
         return NULL;
     }
-    return cbm_strndup(start, (size_t)(p - start));
+    return pkgmap_strndup(start, (size_t)(p - start));
 }
 
 /* ── Language-specific manifest parsers ────────────────────────── */
 
-/* Resolve JS/TS entry point from exports["."] object. */
-static const char *resolve_exports_dot(yyjson_val *dot) {
-    if (yyjson_is_str(dot)) {
-        return yyjson_get_str(dot);
-    }
-    if (!yyjson_is_obj(dot)) {
+/* A package map has no per-import condition environment. Only a target
+ * invariant over the possible earlier conditions is authoritative. Preserve
+ * object order: an unconditional default ends the search. */
+static const char *resolve_exports_dot(yyjson_val *value, unsigned depth) {
+    if (depth > 16)
         return NULL;
+    if (yyjson_is_str(value))
+        return yyjson_get_str(value);
+    if (!yyjson_is_obj(value))
+        return NULL;
+    size_t at, count;
+    yyjson_val *key, *branch;
+    yyjson_obj_iter keys = yyjson_obj_iter_with(value);
+    while ((key = yyjson_obj_iter_next(&keys))) {
+        const char *condition = yyjson_get_str(key);
+        if (!condition || !*condition || condition[0] == '.' ||
+            isdigit((unsigned char)condition[0]))
+            return NULL;
     }
-    static const char *keys[] = {"import", "default", "require"};
-    for (int i = 0; i < (int)(sizeof(keys) / sizeof(keys[0])); i++) {
-        yyjson_val *v = yyjson_obj_get(dot, keys[i]);
-        if (yyjson_is_str(v)) {
-            return yyjson_get_str(v);
-        }
+    const char *common = NULL;
+    yyjson_obj_foreach(value, at, count, key, branch) {
+        const char *target = resolve_exports_dot(branch, depth + 1);
+        if (!target || (common && strcmp(common, target)))
+            return NULL;
+        if (!strcmp(yyjson_get_str(key), "default"))
+            return target;
+        common = target;
     }
-    return NULL;
+    return NULL; /* No unconditional branch proves the domain covered. */
 }
 
-/* Resolve JS/TS entry point from package.json root. */
+static bool package_export_path(const char *path) {
+    if (!path || strncmp(path, "./", 2) || !path[2])
+        return false;
+    for (const char *segment = path + 2; *segment;) {
+        const char *end = strchr(segment, '/');
+        size_t length = end ? (size_t)(end - segment) : strlen(segment);
+        if (!length || (length == 1 && segment[0] == '.') ||
+            (length == 2 && !memcmp(segment, "..", 2)) ||
+            (length == 12 && !strncasecmp(segment, "node_modules", 12)))
+            return false;
+        for (size_t i = 0; i < length; i++)
+            if ((unsigned char)segment[i] < 32 || strchr("%\\?#*", segment[i]))
+                return false;
+        if (!end)
+            return true;
+        segment = end + 1;
+    }
+    return false;
+}
+
+/* Node package exports take precedence over main, including blocked or
+ * unsupported exports. Neither absent configuration nor the bundler-specific
+ * module hint authorizes an invented source entry. */
 static const char *resolve_pkg_entry(yyjson_val *root) {
     yyjson_val *exports = yyjson_obj_get(root, "exports");
-    if (yyjson_is_obj(exports)) {
-        const char *e = resolve_exports_dot(yyjson_obj_get(exports, "."));
-        if (e) {
-            return e;
+    if (exports) {
+        yyjson_val *entry = exports;
+        if (yyjson_is_obj(exports)) {
+            bool subpaths = false, conditions = false;
+            yyjson_val *key;
+            yyjson_obj_iter keys = yyjson_obj_iter_with(exports);
+            while ((key = yyjson_obj_iter_next(&keys))) {
+                const char *name = yyjson_get_str(key);
+                subpaths |= name && name[0] == '.';
+                conditions |= !name || name[0] != '.';
+            }
+            if (subpaths && conditions)
+                return NULL;
+            if (subpaths)
+                entry = yyjson_obj_get(exports, ".");
         }
+        const char *target = resolve_exports_dot(entry, 0);
+        return package_export_path(target) ? target : NULL;
     }
-    static const char *fallback_keys[] = {"main", "module"};
-    for (int i = 0; i < (int)(sizeof(fallback_keys) / sizeof(fallback_keys[0])); i++) {
-        yyjson_val *v = yyjson_obj_get(root, fallback_keys[i]);
-        if (yyjson_is_str(v)) {
-            return yyjson_get_str(v);
-        }
-    }
-    return "src/index.ts"; /* last resort default */
+    yyjson_val *main = yyjson_obj_get(root, "main");
+    return yyjson_is_str(main) && yyjson_get_str(main)[0] ? yyjson_get_str(main) : NULL;
 }
 
-/* JS/TS: package.json — name + entry point resolution */
+/* Typed Node facts retain filesystem identities. A package name alone is
+ * only a blocker; workspace ownership or package self-reference must supply
+ * the source lookup domain before any entry is used. */
+static bool node_fact_key(char *out, size_t capacity, const char *kind, const char *directory,
+                          const char *name) {
+    int n = snprintf(out, capacity, "@cbm:node:%s:%s\n%s", kind, directory, name ? name : "");
+    return n > 0 && (size_t)n < capacity;
+}
+
+static void node_collect(cbm_pkg_entries_t *entries, const char *kind, const char *directory,
+                         const char *name, const char *value) {
+    char key[PKGMAP_PATH_BUF];
+    if (entries->incomplete)
+        return;
+    if (!directory || strchr(directory, '\n') || !value ||
+        !node_fact_key(key, sizeof(key), kind, directory, name)) {
+        entries->incomplete = true;
+        return;
+    }
+    char *owned_key = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+         *owned_value = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, value);
+    if (owned_key && owned_value) {
+        int previous_count = entries->count;
+        pkg_entries_push(entries, owned_key, owned_value);
+        if (entries->count > previous_count)
+            entries->items[previous_count].node_fact = true;
+    } else {
+        entries->incomplete = true;
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, owned_key);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, owned_value);
+    }
+}
+
+static bool node_package_name(const char *name) {
+    if (!name || !*name || name[0] == '.' || name[0] == '_')
+        return false;
+    int slash = 0;
+    for (const char *p = name; *p; p++) {
+        if (*p == '/') {
+            if (name[0] != '@' || p == name + 1 || !p[1] || p[1] == '.' || p[1] == '_' ||
+                ++slash != 1)
+                return false;
+        } else if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_' || *p == '.' ||
+                     (p == name && *p == '@')))
+            return false;
+    }
+    return name[0] != '@' || slash == 1;
+}
+
+static bool node_workspace_path(const char *value, const char *directory, char *path,
+                                size_t capacity, bool *glob) {
+    if (!value || !*value || strpbrk(value, "!{}[]"))
+        return false;
+    if (!strncmp(value, "./", 2))
+        value += 2;
+    size_t length = strlen(value);
+    *glob = !strcmp(value, "*") || (length >= 2 && !strcmp(value + length - 2, "/*"));
+    if (!strcmp(value, "*")) {
+        int n = snprintf(path, capacity, "%s", directory);
+        return n >= 0 && (size_t)n < capacity;
+    }
+    char relative[PKGMAP_PATH_BUF];
+    int n = snprintf(relative, sizeof(relative), "./%.*s", (int)(length - (*glob ? 2 : 0)), value);
+    return n > 0 && (size_t)n < sizeof(relative) && package_export_path(relative) &&
+           cbm_repo_rel_join(directory, relative, path, capacity);
+}
+
+static void node_workspace_paths(yyjson_val *root, const char *directory,
+                                 cbm_pkg_entries_t *entries) {
+    yyjson_val *workspaces = yyjson_obj_get(root, "workspaces");
+    if (!yyjson_is_arr(workspaces))
+        return;
+    node_collect(entries, "root", directory, NULL, "1");
+    size_t i, count;
+    yyjson_val *item;
+    char path[PKGMAP_PATH_BUF];
+    bool glob;
+    /* Unknown glob/exclusion semantics cannot preserve only the convenient
+     * positive half of a workspace declaration. */
+    yyjson_arr_foreach(workspaces, i, count, item) {
+        if (!node_workspace_path(yyjson_get_str(item), directory, path, sizeof(path), &glob))
+            return;
+    }
+    yyjson_arr_foreach(workspaces, i, count, item) {
+        if (node_workspace_path(yyjson_get_str(item), directory, path, sizeof(path), &glob))
+            node_collect(entries, glob ? "glob" : "workspace", path, NULL, directory);
+    }
+}
+
+/* JSON duplicate keys and embedded NULs have no authoritative first-value
+ * interpretation. Reject the manifest rather than differ from its runtime. */
+static bool node_manifest_unique(yyjson_val *value, unsigned depth) {
+    if (!value || depth > 32)
+        return false;
+    if (yyjson_is_str(value))
+        return strlen(yyjson_get_str(value)) == yyjson_get_len(value);
+    size_t i, count;
+    yyjson_val *item, *key;
+    if (yyjson_is_arr(value)) {
+        yyjson_arr_foreach(value, i, count, item) {
+            if (!node_manifest_unique(item, depth + 1))
+                return false;
+        }
+    } else if (yyjson_is_obj(value)) {
+        CBMHashTable *seen = cbm_ht_create(PKGMAP_HT_INIT);
+        if (!seen)
+            return false;
+        bool valid = true;
+        yyjson_obj_foreach(value, i, count, key, item) {
+            const char *name = yyjson_get_str(key);
+            if (!name || strlen(name) != yyjson_get_len(key) || cbm_ht_has(seen, name) ||
+                !node_manifest_unique(item, depth + 1)) {
+                valid = false;
+                break;
+            }
+            cbm_ht_set(seen, name, (void *)(uintptr_t)1);
+            if (!cbm_ht_has(seen, name)) {
+                valid = false;
+                break;
+            }
+        }
+        cbm_ht_free(seen);
+        return valid;
+    }
+    return true;
+}
+
+/* A nearer dependency declaration may install a different version or npm
+ * alias ahead of the root workspace link. Without dependency solving it is
+ * a blocking fact, even when a same-named workspace package exists. */
+static void node_dependencies(yyjson_val *root, const char *directory, cbm_pkg_entries_t *entries) {
+    static const char *const kinds[] = {"dependencies", "devDependencies", "optionalDependencies",
+                                        "peerDependencies"};
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        yyjson_val *dependencies = yyjson_obj_get(root, kinds[k]);
+        if (!dependencies)
+            continue;
+        if (!yyjson_is_obj(dependencies)) {
+            node_collect(entries, "dependency", directory, NULL, "1");
+            continue;
+        }
+        yyjson_obj_iter keys = yyjson_obj_iter_with(dependencies);
+        yyjson_val *key;
+        while ((key = yyjson_obj_iter_next(&keys))) {
+            const char *name = yyjson_get_str(key);
+            if (node_package_name(name))
+                node_collect(entries, "dependency", directory, name, "1");
+        }
+    }
+}
+
+static void node_entry(cbm_pkg_entries_t *entries, const char *directory, const char *subpath,
+                       const char *target) {
+    char path[PKGMAP_PATH_BUF];
+    const char *value = target && cbm_repo_rel_join(directory, target, path, sizeof(path))
+                            ? path
+                            : ambiguous_pkgmap_value;
+    node_collect(entries, "entry", directory, subpath, value);
+}
+
+/* JS/TS package manifests declare exact entries, never a guessed src/index. */
 static void parse_package_json(const char *source, int source_len, const char *rel_path,
                                cbm_pkg_entries_t *entries) {
+    char *directory = path_dirname(rel_path);
+    if (!directory) {
+        entries->incomplete = true;
+        return;
+    }
     yyjson_doc *doc = yyjson_read(source, (size_t)source_len, 0);
-    if (!doc) {
-        return;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!yyjson_is_obj(root) || !node_manifest_unique(root, 0)) {
+        entries->incomplete = true;
+        goto done;
     }
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    if (!yyjson_is_obj(root)) {
-        yyjson_doc_free(doc);
-        return;
+    const char *name = yyjson_get_str(yyjson_obj_get(root, "name"));
+    node_collect(entries, "scope", directory, NULL, node_package_name(name) ? name : "");
+    node_workspace_paths(root, directory, entries);
+    node_dependencies(root, directory, entries);
+    if (!node_package_name(name))
+        goto done;
+    /* Legacy consumers may recognize ownership, but cannot convert this
+     * bare name into a global module or directory prefix. */
+    char *owned_name = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
+         *blocked = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, ambiguous_pkgmap_value);
+    if (owned_name && blocked)
+        pkg_entries_push(entries, owned_name, blocked);
+    else {
+        entries->incomplete = true;
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, owned_name);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, blocked);
     }
-
-    yyjson_val *name_val = yyjson_obj_get(root, "name");
-    if (!yyjson_is_str(name_val)) {
-        yyjson_doc_free(doc);
-        return;
-    }
-    const char *name = yyjson_get_str(name_val);
-    if (!name || name[0] == '\0') {
-        yyjson_doc_free(doc);
-        return;
-    }
-
-    const char *entry = resolve_pkg_entry(root);
-    if (entry) {
-        char *dir = path_dirname(rel_path);
-        char *resolved = join_and_strip(dir, entry);
-        if (resolved) {
-            pkg_entries_push(entries, strdup(name), resolved);
+    yyjson_val *exports = yyjson_obj_get(root, "exports");
+    if (exports)
+        node_collect(entries, "self", directory, NULL, "1");
+    node_entry(entries, directory, ".", resolve_pkg_entry(root));
+    if (yyjson_is_obj(exports)) {
+        bool subpaths = true;
+        yyjson_val *key;
+        yyjson_obj_iter keys = yyjson_obj_iter_with(exports);
+        while ((key = yyjson_obj_iter_next(&keys))) {
+            const char *value = yyjson_get_str(key);
+            subpaths = subpaths && value && value[0] == '.';
         }
-        free(dir);
+        if (subpaths) {
+            size_t i, count;
+            yyjson_val *branch;
+            yyjson_obj_foreach(exports, i, count, key, branch) {
+                const char *path = yyjson_get_str(key);
+                if (!package_export_path(path))
+                    continue;
+                const char *target = resolve_exports_dot(branch, 0);
+                node_entry(entries, directory, path, package_export_path(target) ? target : NULL);
+            }
+        }
     }
-
+done:
     yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
 }
 
 /* Go: go.mod — module directive */
@@ -346,13 +594,13 @@ static void parse_go_mod(const char *source, int source_len, const char *rel_pat
     if (val <= start) {
         return;
     }
-    char *module_path = cbm_strndup(start, (size_t)(val - start));
+    char *module_path = pkgmap_strndup(start, (size_t)(val - start));
     char *dir = path_dirname(rel_path);
 
     /* The module path maps to the directory containing go.mod.
      * For "." dir, use empty string. */
-    pkg_entries_push(entries, module_path, strdup(dir));
-    free(dir);
+    pkg_entries_push(entries, module_path, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, dir));
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
 }
 
 /* Extract "name" value from a TOML section. Scans from section_start until
@@ -387,8 +635,8 @@ static char *build_entry_path(const char *rel_path, const char *suffix) {
     char *dir = path_dirname(rel_path);
     char buf[PKGMAP_PATH_BUF];
     snprintf(buf, sizeof(buf), "%s%s%s", dir[0] ? dir : "", dir[0] ? "/" : "", suffix);
-    free(dir);
-    return strdup(buf);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
+    return cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, buf);
 }
 
 /* Rust: Cargo.toml — [package] name */
@@ -432,7 +680,7 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     char suffix[PKGMAP_PATH_BUF];
     snprintf(suffix, sizeof(suffix), "src/%s/__init__", name);
     char *entry = build_entry_path(rel_path, suffix);
-    char *name_copy = strdup(name);
+    char *name_copy = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name);
     pkg_entries_push(entries, name, entry);
 
     /* Also register <name>/__init__ as alternative (no src/ prefix) */
@@ -445,8 +693,8 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     if (name_copy && alt_entry) {
         pkg_entries_push(entries, name_copy, alt_entry);
     } else {
-        free(name_copy);
-        free(alt_entry);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, name_copy);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, alt_entry);
     }
 }
 
@@ -488,7 +736,8 @@ static void extract_psr4(yyjson_val *root, const char *section, const char *dir,
         if (nelen > 0 && ns_entry[nelen - SKIP_ONE] == '/') {
             ns_entry[nelen - SKIP_ONE] = '\0';
         }
-        pkg_entries_push(entries, strdup(ns_prefix), strdup(ns_entry));
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, ns_prefix),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, ns_entry));
     }
 }
 
@@ -512,14 +761,15 @@ static void parse_composer_json(const char *source, int source_len, const char *
     if (yyjson_is_str(name_val)) {
         const char *name = yyjson_get_str(name_val);
         if (name && name[0] != '\0') {
-            pkg_entries_push(entries, strdup(name), strdup(dir));
+            pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
+                             cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, dir));
         }
     }
 
     extract_psr4(root, "autoload", dir, entries);
     extract_psr4(root, "autoload-dev", dir, entries);
 
-    free(dir);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     yyjson_doc_free(doc);
 }
 
@@ -535,8 +785,9 @@ static void parse_pubspec_yaml(const char *source, int source_len, const char *r
         char *dir = path_dirname(rel_path);
         char entry[PKGMAP_PATH_BUF];
         snprintf(entry, sizeof(entry), "%s%slib", dir[0] ? dir : "", dir[0] ? "/" : "");
-        pkg_entries_push(entries, strdup(name), strdup(entry));
-        free(dir);
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     }
     cbm_yaml_free(root);
 }
@@ -551,7 +802,7 @@ static char *xml_tag_content(const char *p, const char *end) {
     if (p <= s) {
         return NULL;
     }
-    return cbm_strndup(s, (size_t)(p - s));
+    return pkgmap_strndup(s, (size_t)(p - s));
 }
 
 /* Java: pom.xml — <groupId> + <artifactId> */
@@ -587,18 +838,20 @@ static void parse_pom_xml(const char *source, int source_len, const char *rel_pa
         char *dir = path_dirname(rel_path);
         char entry[PKGMAP_PATH_BUF];
         snprintf(entry, sizeof(entry), "%s%ssrc/main/java", dir[0] ? dir : "", dir[0] ? "/" : "");
-        pkg_entries_push(entries, strdup(pkg_name), strdup(entry));
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, pkg_name),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
 
         /* Also register just the groupId for package-level imports */
         char grp_entry[PKGMAP_PATH_BUF];
         snprintf(grp_entry, sizeof(grp_entry), "%s%ssrc/main/java", dir[0] ? dir : "",
                  dir[0] ? "/" : "");
-        pkg_entries_push(entries, strdup(group_id), strdup(grp_entry));
-        free(dir);
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, group_id),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, grp_entry));
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     }
 
-    free(group_id);
-    free(artifact_id);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, group_id);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, artifact_id);
 }
 
 /* Gradle: build.gradle / build.gradle.kts — group = '...' */
@@ -618,8 +871,8 @@ static void parse_build_gradle(const char *source, int source_len, const char *r
     /* Check for src/main/java or src/main/kotlin */
     char entry[PKGMAP_PATH_BUF];
     snprintf(entry, sizeof(entry), "%s%ssrc/main/java", dir[0] ? dir : "", dir[0] ? "/" : "");
-    pkg_entries_push(entries, group, strdup(entry));
-    free(dir);
+    pkg_entries_push(entries, group, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
 }
 
 /* Elixir: mix.exs — app: :name */
@@ -645,16 +898,17 @@ static void parse_mix_exs(const char *source, int source_len, const char *rel_pa
     if (val <= start) {
         return;
     }
-    char *app_name = cbm_strndup(start, (size_t)(val - start));
+    char *app_name = pkgmap_strndup(start, (size_t)(val - start));
     char *dir = path_dirname(rel_path);
     char entry[PKGMAP_PATH_BUF];
     snprintf(entry, sizeof(entry), "%s%slib/%s", dir[0] ? dir : "", dir[0] ? "/" : "", app_name);
     /* Register with colon prefix as Elixir uses :atom syntax */
     char atom_name[PKGMAP_PATH_BUF];
     snprintf(atom_name, sizeof(atom_name), "%s", app_name);
-    pkg_entries_push(entries, strdup(atom_name), strdup(entry));
-    free(app_name);
-    free(dir);
+    pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, atom_name),
+                     cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, app_name);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
 }
 
 /* Ruby: *.gemspec — spec.name = '...' */
@@ -676,8 +930,8 @@ static void parse_gemspec(const char *source, int source_len, const char *rel_pa
                 char entry[PKGMAP_PATH_BUF];
                 snprintf(entry, sizeof(entry), "%s%slib/%s", dir[0] ? dir : "", dir[0] ? "/" : "",
                          name);
-                pkg_entries_push(entries, name, strdup(entry));
-                free(dir);
+                pkg_entries_push(entries, name, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
                 return;
             }
             p = found + SKIP_ONE;
@@ -842,7 +1096,7 @@ static char *swift_quoted_literal(const char *p, const char *end) {
     if (p >= end || *p != '"') {
         return NULL;
     }
-    char *value = cbm_strndup(start, (size_t)(p - start));
+    char *value = pkgmap_strndup(start, (size_t)(p - start));
     p++; /* past closing quote */
     while (p < end && (*p == ' ' || *p == '\t')) {
         p++;
@@ -850,7 +1104,7 @@ static char *swift_quoted_literal(const char *p, const char *end) {
     if (p >= end || *p == ',') {
         return value;
     }
-    free(value);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
     return NULL;
 }
 
@@ -898,7 +1152,7 @@ static void swift_register_target(const char *rel_path, const char *target_name,
     }
     char *entry = build_entry_path(rel_path, suffix);
     if (entry) {
-        pkg_entries_push(entries, strdup(target_name), entry);
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, target_name), entry);
     }
 }
 
@@ -934,8 +1188,8 @@ static void swift_scan_targets(const char *source, const char *end, const char *
             if (literal_path || !path_present) {
                 swift_register_target(rel_path, name, literal_path, entries);
             }
-            free(literal_path);
-            free(name);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, literal_path);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, name);
         }
         cursor = close + SKIP_ONE;
     }
@@ -955,6 +1209,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
                           int source_len, cbm_pkg_entries_t *entries) {
     if (!basename || !source || source_len <= 0) {
+        if (entries && basename && !strcmp(basename, "package.json"))
+            entries->incomplete = true;
         return false;
     }
 
@@ -1013,11 +1269,189 @@ static bool pkgmap_is_psr4_prefix(const char *pkg_name) {
     return n > 0 && pkg_name[n - SKIP_ONE] == '\\';
 }
 
+static const char *node_fact(CBMHashTable *map, const char *kind, const char *directory,
+                             const char *name) {
+    char key[PKGMAP_PATH_BUF];
+    if (!map)
+        return NULL;
+    return node_fact_key(key, sizeof(key), kind, directory, name) ? cbm_ht_get(map, key)
+                                                                  : ambiguous_pkgmap_value;
+}
+
+static bool node_bind_workspace(CBMHashTable *map, const char *directory, const char *name) {
+    if (!directory[0] || !node_package_name(name))
+        return true;
+    const char *owner = node_fact(map, "workspace", directory, NULL);
+    char parent[PKGMAP_PATH_BUF];
+    int length = snprintf(parent, sizeof(parent), "%s", directory);
+    if (length < 0 || (size_t)length >= sizeof(parent))
+        return false;
+    char *slash = strrchr(parent, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        parent[0] = '\0';
+    const char *glob =
+        path_basename(directory)[0] == '.' ? NULL : node_fact(map, "glob", parent, NULL);
+    if (owner && glob && strcmp(owner, glob))
+        owner = ambiguous_pkgmap_value;
+    else if (!owner)
+        owner = glob;
+    if (!owner || !strcmp(owner, ambiguous_pkgmap_value) ||
+        node_fact(map, "workspace-incomplete", owner, NULL))
+        return true;
+    char key[PKGMAP_PATH_BUF];
+    if (!node_fact_key(key, sizeof(key), "bound", owner, name))
+        return false;
+    const char *previous = cbm_ht_get(map, key);
+    if (previous && !strcmp(previous, directory))
+        return true;
+    char *value =
+        cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, previous ? ambiguous_pkgmap_value : directory);
+    const char *stored =
+        previous ? cbm_ht_get_key(map, key) : cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key);
+    if (!value || !stored) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
+        if (!previous)
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)stored);
+        return false;
+    }
+    cbm_ht_set(map, stored, value);
+    if (cbm_ht_get(map, stored) != value) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
+        if (!previous)
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)stored);
+        return false;
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)previous);
+    return true;
+}
+
+/* Exclusions are observed without reading their contents. A terminal
+ * wildcard requires the complete immediate directory set, and every explicit
+ * member requires a collected manifest scope. */
+static bool node_block_workspace(CBMHashTable *map, const char *owner) {
+    if (!owner || !strcmp(owner, ambiguous_pkgmap_value) ||
+        node_fact(map, "workspace-incomplete", owner, NULL))
+        return true;
+    char key[PKGMAP_PATH_BUF];
+    if (!node_fact_key(key, sizeof(key), "workspace-incomplete", owner, NULL))
+        return false;
+    char *owned_key = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+         *value = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "1");
+    if (owned_key && value)
+        cbm_ht_set(map, owned_key, value);
+    if (!owned_key || !value || cbm_ht_get(map, owned_key) != value) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, owned_key);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
+        return false;
+    }
+    return true;
+}
+
+static bool node_fact_directory(const char *key, const char *kind, char *out, size_t capacity) {
+    char prefix[64];
+    int n = snprintf(prefix, sizeof(prefix), "@cbm:node:%s:", kind);
+    if (n < 0 || (size_t)n >= sizeof(prefix) || strncmp(key, prefix, (size_t)n))
+        return false;
+    const char *start = key + n, *end = strchr(start, '\n');
+    if (!end || (size_t)(end - start) >= capacity)
+        return false;
+    memcpy(out, start, (size_t)(end - start));
+    out[end - start] = '\0';
+    return true;
+}
+
+static void node_parent_path(char *path) {
+    char *slash = strrchr(path, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        path[0] = '\0';
+}
+
+static bool node_glob_covered(CBMHashTable *map, const char *directory) {
+    if (!node_fact(map, "directory", directory, NULL) ||
+        node_fact(map, "excluded-child", directory, NULL))
+        return false;
+    char parent[PKGMAP_PATH_BUF];
+    int n = snprintf(parent, sizeof(parent), "%s", directory);
+    if (n < 0 || (size_t)n >= sizeof(parent))
+        return false;
+    for (;;) {
+        if (node_fact(map, "excluded", parent, NULL))
+            return false;
+        if (!parent[0])
+            return true;
+        node_parent_path(parent);
+    }
+}
+
+static bool node_workspace_coverage(CBMHashTable *map, cbm_pkg_entries_t *workers, int count) {
+    for (int w = 0; w < count; w++)
+        for (int i = 0; i < workers[w].count; i++) {
+            const cbm_pkg_entry_t *entry = &workers[w].items[i];
+            if (!entry->node_fact)
+                continue;
+            char directory[PKGMAP_PATH_BUF];
+            const char *owner = NULL;
+            bool incomplete = false;
+            if (node_fact_directory(entry->pkg_name, "workspace", directory, sizeof(directory))) {
+                owner = node_fact(map, "workspace", directory, NULL);
+                const char *scope = node_fact(map, "scope", directory, NULL);
+                incomplete = !scope || !scope[0] || !strcmp(scope, ambiguous_pkgmap_value);
+            } else if (node_fact_directory(entry->pkg_name, "glob", directory, sizeof(directory))) {
+                owner = node_fact(map, "glob", directory, NULL);
+                incomplete = !node_glob_covered(map, directory);
+            } else if (node_fact_directory(entry->pkg_name, "directory", directory,
+                                           sizeof(directory)) &&
+                       directory[0]) {
+                const char *leaf = path_basename(directory);
+                if (leaf[0] == '.')
+                    continue; /* A bare terminal star does not match dot folders. */
+                const char *scope = node_fact(map, "scope", directory, NULL);
+                node_parent_path(directory);
+                owner = node_fact(map, "glob", directory, NULL);
+                incomplete = !scope || !scope[0] || !strcmp(scope, ambiguous_pkgmap_value);
+            }
+            if (incomplete && !node_block_workspace(map, owner))
+                return false;
+        }
+    return true;
+}
+
+/* One bounded lookup per manifest; no file/reference × package scan. */
+static bool node_workspaces_finalize(CBMHashTable *map, cbm_pkg_entries_t *workers, int count) {
+    static const char prefix[] = "@cbm:node:scope:";
+    if (!node_workspace_coverage(map, workers, count))
+        return false;
+    for (int w = 0; w < count; w++)
+        for (int i = 0; i < workers[w].count; i++) {
+            const char *key = workers[w].items[i].pkg_name;
+            if (!workers[w].items[i].node_fact || strncmp(key, prefix, sizeof(prefix) - 1))
+                continue;
+            const char *start = key + sizeof(prefix) - 1;
+            const char *end = strchr(start, '\n');
+            char directory[PKGMAP_PATH_BUF];
+            if (!end || (size_t)(end - start) >= sizeof(directory))
+                return false;
+            memcpy(directory, start, (size_t)(end - start));
+            directory[end - start] = '\0';
+            const char *name = node_fact(map, "scope", directory, NULL);
+            if (!node_bind_workspace(map, directory, name))
+                return false;
+        }
+    return true;
+}
+
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name) {
     /* Count total entries */
     int total = 0;
     for (int w = 0; w < worker_count; w++) {
+        if (worker_entries[w].incomplete || worker_entries[w].count < 0 ||
+            worker_entries[w].count > INT32_MAX - total)
+            return NULL;
         total += worker_entries[w].count;
     }
     if (total == 0) {
@@ -1025,6 +1459,8 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
     }
 
     CBMHashTable *map = cbm_ht_create(PKGMAP_HT_INIT);
+    if (!map)
+        return NULL;
     int merged = 0;
 
     for (int w = 0; w < worker_count; w++) {
@@ -1035,11 +1471,18 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
              * instead: its readers map `Prefix\Sub\Class` onto a file path
              * (<dir>/Sub/Class.php), which a dotted QN cannot express (#1186). */
             const char *entry_rel = we->items[i].entry_rel;
-            char *qn = pkgmap_is_psr4_prefix(we->items[i].pkg_name)
-                           ? cbm_strndup(entry_rel, strlen(entry_rel))
-                           : cbm_pipeline_fqn_module(project_name, entry_rel);
+            bool private_key = !strncmp(we->items[i].pkg_name, "@cbm:node:", 10);
+            if (private_key != we->items[i].node_fact) {
+                cbm_pkgmap_free(map);
+                return NULL;
+            }
+            char *qn = we->items[i].node_fact || !strcmp(entry_rel, ambiguous_pkgmap_value) ||
+                               pkgmap_is_psr4_prefix(we->items[i].pkg_name)
+                           ? pkgmap_strndup(entry_rel, strlen(entry_rel))
+                           : pkgmap_take_raw(cbm_pipeline_fqn_module(project_name, entry_rel));
             if (!qn) {
-                continue;
+                cbm_pkgmap_free(map);
+                return NULL;
             }
 
             /* Repeated extraction of the same manifest is harmless. Distinct
@@ -1050,34 +1493,59 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                 char *previous = cbm_ht_get(map, key);
                 if (previous && strcmp(previous, qn) != 0 &&
                     strcmp(previous, ambiguous_pkgmap_value) != 0) {
-                    char *blocked = strdup(ambiguous_pkgmap_value);
+                    char *blocked = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, ambiguous_pkgmap_value);
                     if (!blocked) {
-                        free(qn);
+                        cbm_free(CBM_MEM_CLASS_SEMANTIC, qn);
                         cbm_pkgmap_free(map);
                         return NULL;
                     }
                     cbm_ht_set(map, key, blocked);
                     if (cbm_ht_get(map, key) != blocked) {
-                        free(blocked);
-                        free(qn);
+                        cbm_free(CBM_MEM_CLASS_SEMANTIC, blocked);
+                        cbm_free(CBM_MEM_CLASS_SEMANTIC, qn);
                         cbm_pkgmap_free(map);
                         return NULL;
                     }
-                    free(previous);
+                    cbm_free(CBM_MEM_CLASS_SEMANTIC, previous);
                 }
-                free(qn);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, qn);
                 continue;
             }
 
             /* Transfer ownership: key = strdup'd pkg_name, value = qn */
-            char *key = strdup(we->items[i].pkg_name);
-            cbm_ht_set(map, key, qn);
+            char *key = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, we->items[i].pkg_name);
+            if (key)
+                cbm_ht_set(map, key, qn);
+            if (!key || cbm_ht_get(map, key) != qn) {
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, key);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, qn);
+                cbm_pkgmap_free(map);
+                return NULL;
+            }
             merged++;
         }
     }
 
+    if (!node_workspaces_finalize(map, worker_entries, worker_count)) {
+        cbm_pkgmap_free(map);
+        return NULL;
+    }
     if (merged == 0) {
         cbm_ht_free(map);
+        return NULL;
+    }
+    if (cbm_ht_has(map, "@cbm:node:complete")) {
+        cbm_pkgmap_free(map);
+        return NULL;
+    }
+    char *seal = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "@cbm:node:complete"),
+         *complete = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, "1");
+    if (seal && complete)
+        cbm_ht_set(map, seal, complete);
+    if (!seal || !complete || cbm_ht_get(map, seal) != complete) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, seal);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, complete);
+        cbm_pkgmap_free(map);
         return NULL;
     }
     cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merged));
@@ -1102,59 +1570,19 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
     return ends_with(basename, ".gemspec");
 }
 
-/* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
- * On POSIX, lstat + S_ISLNK avoids following symlink cycles. On Windows
- * we use the UTF-8-safe wide stat (mirroring discover.c's wide_stat);
- * reparse points (junctions/symlinks) are detected separately by
- * pkgmap_is_reparse_point below before we descend. Mirrors discover.c's
- * safe_stat. */
-static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
-#ifdef _WIN32
-    wchar_t *wpath = cbm_path_to_wide(abs_path);
-    if (!wpath) {
-        return CBM_NOT_FOUND;
+static void node_excluded_path(cbm_pkg_entries_t *entries, const char *path) {
+    node_collect(entries, "excluded", path, NULL, "1");
+    if (path_basename(path)[0] == '.')
+        return;
+    char parent[PKGMAP_PATH_BUF];
+    int n = snprintf(parent, sizeof(parent), "%s", path);
+    if (n < 0 || (size_t)n >= sizeof(parent)) {
+        entries->incomplete = true;
+        return;
     }
-    struct _stat64 wst;
-    int ret = _wstat64(wpath, &wst);
-    free(wpath);
-    if (ret != 0) {
-        return CBM_NOT_FOUND;
-    }
-    st->st_mode = wst.st_mode;
-    st->st_size = wst.st_size;
-    st->st_mtime = wst.st_mtime;
-    return 0;
-#else
-    if (lstat(abs_path, st) != 0) {
-        return CBM_NOT_FOUND;
-    }
-    if (S_ISLNK(st->st_mode)) {
-        return CBM_NOT_FOUND;
-    }
-    return 0;
-#endif
+    node_parent_path(parent);
+    node_collect(entries, "excluded-child", parent, NULL, "1");
 }
-
-/* True if abs_path is a Windows reparse point (directory junction or
- * symlink). Following these is the documented cause of the historic CI
- * hang, so we skip them before recursing. On POSIX this is a no-op
- * (symlinks are already filtered by pkgmap_safe_stat's S_ISLNK check).
- * Note: the PKGMAP_WALK_MAX_DEPTH bound below is the hard termination
- * guarantee; this check is a best-effort early skip on top of it. */
-#ifdef _WIN32
-static bool pkgmap_is_reparse_point(const char *abs_path) {
-    wchar_t *wpath = cbm_path_to_wide(abs_path);
-    if (!wpath) {
-        return false;
-    }
-    DWORD attrs = GetFileAttributesW(wpath);
-    free(wpath);
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        return false;
-    }
-    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-}
-#endif
 
 /* Recursive filesystem walker that finds and parses package manifest
  * files independently of the main discovery filter. The main discovery
@@ -1166,21 +1594,23 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * parsed, accumulated across the whole walk.
  *
  * Cross-platform: uses the portable cbm_opendir/cbm_readdir/cbm_closedir
- * API (same as src/discover/discover.c) and the symlink-skipping
- * pkgmap_safe_stat. Termination is guaranteed by the PKGMAP_WALK_MAX_DEPTH
- * recursion bound — even directory junctions / symlink cycles cannot make
- * it hang. On Windows we additionally skip reparse points before
- * descending as a best-effort early-out. */
+ * API (same as src/discover/discover.c), with explicit metadata and
+ * enumeration status. Symlinks/reparse points are not traversed; their
+ * boundaries withhold affected workspace declarations. The depth
+ * bound prevents cycles and excessive traversal from becoming unbounded. */
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
                            int depth, char **excluded_dirs, int excluded_count) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
+        entries->incomplete = true;
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
     }
     cbm_dir_t *dir = cbm_opendir(abs_dir);
     if (!dir) {
+        entries->incomplete = true;
         return 0;
     }
+    node_collect(entries, "directory", rel_dir ? rel_dir : "", NULL, "1");
     int parsed = 0;
     cbm_dirent_t *entry;
     while ((entry = cbm_readdir(dir)) != NULL) {
@@ -1190,43 +1620,53 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         }
         char abs_path[PKGMAP_PATH_BUF];
         char rel_path[PKGMAP_PATH_BUF];
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
-        if (rel_dir && rel_dir[0]) {
-            snprintf(rel_path, sizeof(rel_path), "%s/%s", rel_dir, name);
-        } else {
-            snprintf(rel_path, sizeof(rel_path), "%s", name);
-        }
-        struct stat st;
-        if (pkgmap_safe_stat(abs_path, &st) != 0) {
+        int absolute_length = snprintf(abs_path, sizeof(abs_path), "%s/%s", abs_dir, name);
+        int relative_length = snprintf(rel_path, sizeof(rel_path), "%s%s%s", rel_dir ? rel_dir : "",
+                                       rel_dir && rel_dir[0] ? "/" : "", name);
+        if (absolute_length < 0 || (size_t)absolute_length >= sizeof(abs_path) ||
+            relative_length < 0 || (size_t)relative_length >= sizeof(rel_path)) {
+            entries->incomplete = true;
             continue;
         }
-        if (S_ISDIR(st.st_mode)) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
-                cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
+        /* These exclusions define the indexed project domain. Uninspectable
+         * entries inside that domain must not disappear as absent manifests. */
+        if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+            cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
+            node_excluded_path(entries, rel_path);
+            if (is_pkgmap_manifest_basename(name))
+                entries->incomplete = true;
+            continue;
+        }
+        cbm_path_info_t info = {0};
+        if (cbm_path_info_utf8(abs_path, &info) != CBM_PATH_INFO_OK) {
+            entries->incomplete = true;
+            continue;
+        }
+        if (info.is_symlink) {
+            node_excluded_path(entries, rel_path);
+            if (is_pkgmap_manifest_basename(name))
+                entries->incomplete = true;
+            continue;
+        }
+        if (info.is_directory) {
+            if (is_pkgmap_manifest_basename(name)) {
+                entries->incomplete = true;
                 continue;
             }
-#ifdef _WIN32
-            /* Don't follow Windows directory junctions — they can form
-             * cycles. The depth bound is the hard guarantee; this just
-             * avoids wasted descent. (POSIX symlinks are already skipped by
-             * pkgmap_safe_stat's S_ISLNK check.) */
-            if (pkgmap_is_reparse_point(abs_path)) {
-                continue;
-            }
-#endif
             parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
                                       excluded_count);
             continue;
         }
-        if (!S_ISREG(st.st_mode)) {
+        if (!is_pkgmap_manifest_basename(name))
             continue;
-        }
-        if (!is_pkgmap_manifest_basename(name)) {
+        if (!info.is_regular) {
+            entries->incomplete = true;
             continue;
         }
         int source_len = 0;
         char *source = pkgmap_read_file(abs_path, &source_len);
         if (!source) {
+            entries->incomplete = true;
             continue;
         }
         if (cbm_pkgmap_try_parse(name, rel_path, source, source_len, entries)) {
@@ -1234,6 +1674,8 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
         }
         cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     }
+    if (cbm_dir_failed(dir))
+        entries->incomplete = true;
     cbm_closedir(dir);
     return parsed;
 }
@@ -1245,8 +1687,8 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
  * package.json. NULL-safe; returns 0 entries when repo_path is unset.
  *
  * Cross-platform: the walk runs on every platform via pkgmap_walk_dir,
- * which is depth-bounded (PKGMAP_WALK_MAX_DEPTH) and skips symlinks /
- * Windows reparse points, so it cannot hang on directory junctions.
+ * which is depth-bounded (PKGMAP_WALK_MAX_DEPTH) and rejects incomplete
+ * coverage, including symlinks / Windows reparse points inside the domain.
  * This is what lets bare workspace imports (e.g. "@org/pkg" declared in
  * an ignored package.json) resolve on Windows as well as POSIX. */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
@@ -1275,6 +1717,7 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
         int source_len = 0;
         char *source = pkgmap_read_file(files[i].path, &source_len);
         if (!source) {
+            entries.incomplete = true;
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
@@ -1310,6 +1753,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         int source_len = 0;
         char *source = pkgmap_read_file(files[i].path, &source_len);
         if (!source) {
+            entries.incomplete = true;
             continue;
         }
         cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
@@ -1327,8 +1771,8 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
 
 static void pkgmap_free_entry(const char *key, void *value, void *userdata) {
     (void)userdata;
-    free((void *)key);
-    free(value);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)key);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
 }
 
 void cbm_pkgmap_free(CBMHashTable *pkgmap) {
@@ -1344,7 +1788,7 @@ void cbm_pkgmap_free(CBMHashTable *pkgmap) {
 /* Try slash-based prefix matching (Go: github.com/foo/bar/pkg/utils).
  * Returns heap QN or NULL. */
 static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
-    char *buf = strdup(module_path);
+    char *buf = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, module_path);
     if (!buf) {
         return NULL;
     }
@@ -1358,7 +1802,7 @@ static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
             continue;
         }
         if (strcmp(base_qn, ambiguous_pkgmap_value) == 0) {
-            free(buf);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
             return strdup("");
         }
         const char *subpath = module_path + (size_t)(slash - buf) + SKIP_ONE;
@@ -1370,10 +1814,10 @@ static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
                 *c = '.';
             }
         }
-        free(buf);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
         return strdup(result);
     }
-    free(buf);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
     return NULL;
 }
 
@@ -1381,7 +1825,7 @@ static char *resolve_slash_prefix(CBMHashTable *map, const char *module_path) {
  * Returns heap QN or NULL. */
 static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
                                 const char *project_name) {
-    char *buf = strdup(module_path);
+    char *buf = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, module_path);
     if (!buf) {
         return NULL;
     }
@@ -1395,7 +1839,7 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
             continue;
         }
         if (strcmp(base_qn, ambiguous_pkgmap_value) == 0) {
-            free(buf);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
             return strdup("");
         }
         const char *subpath = module_path + (size_t)(dot - buf) + SKIP_ONE;
@@ -1408,10 +1852,10 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
         }
         char result[PKGMAP_PATH_BUF];
         snprintf(result, sizeof(result), "%s/%s", base_qn, subpath_slashed);
-        free(buf);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
         return cbm_pipeline_fqn_module(project_name, result);
     }
-    free(buf);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
     return NULL;
 }
 
@@ -1420,7 +1864,7 @@ static char *resolve_dot_prefix(CBMHashTable *map, const char *module_path,
  * cbm_pkgmap_build). Returns heap QN or NULL. */
 static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path,
                                       const char *project_name) {
-    char *buf = strdup(module_path);
+    char *buf = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, module_path);
     if (!buf) {
         return NULL;
     }
@@ -1436,7 +1880,7 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
             continue;
         }
         if (strcmp(base_dir, ambiguous_pkgmap_value) == 0) {
-            free(buf);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
             return strdup("");
         }
         const char *subpath = module_path + (size_t)(bs - buf) + SKIP_ONE;
@@ -1448,10 +1892,10 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
                 *c = '/';
             }
         }
-        free(buf);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
         return cbm_pipeline_fqn_module(project_name, path_result);
     }
-    free(buf);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, buf);
     return NULL;
 }
 
@@ -1828,23 +2272,23 @@ static bool import_fact_put(CBMHashTable *map, const char *key, const char *valu
     const char *old = cbm_ht_get(map, key);
     if (old && strcmp(old, value) == 0)
         return true;
-    char *copy = strdup(old ? ambiguous_pkgmap_value : value);
+    char *copy = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, old ? ambiguous_pkgmap_value : value);
     const char *stored_key =
         old ? cbm_ht_get_key(map, key) : cbm_mem_strdup(CBM_MEM_CLASS_OTHER, key);
     if (!copy || !stored_key) {
-        free(copy);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, copy);
         if (!old)
             cbm_free(CBM_MEM_CLASS_OTHER, (void *)stored_key);
         return false;
     }
     cbm_ht_set(map, stored_key, copy);
     if (cbm_ht_get(map, key) != copy) {
-        free(copy);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, copy);
         if (!old)
             cbm_free(CBM_MEM_CLASS_OTHER, (void *)stored_key);
         return false;
     }
-    free((void *)old);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)old);
     return true;
 }
 
@@ -1898,13 +2342,13 @@ static const cbm_gbuf_node_t *resolve_configured_include(const cbm_pipeline_ctx_
                 ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, relative)
                 : NULL;
         if (exact) {
-            free(dir);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
             return exact;
         }
         char absolute[PKGMAP_PATH_BUF];
         bool valid = dir && ctx->repo_path &&
                      import_absolute_path(ctx->repo_path, dir, absolute, sizeof(absolute));
-        free(dir);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
         if (!valid)
             return NULL;
         const cbm_gbuf_node_t *local = include_in_directory(ctx, absolute, imp->module_path, &stop);
@@ -1957,11 +2401,14 @@ static bool compile_drop_user_system_duplicates(char *roots) {
         count += *p == '\n';
     if (count < 2)
         return true;
-    compile_include_root_t *entries = calloc(count, sizeof(*entries));
-    compile_include_root_t **sorted = calloc(count, sizeof(*sorted));
+    /* A root contains pointers, so this also bounds the smaller pointer index. */
+    if (count > SIZE_MAX / sizeof(compile_include_root_t))
+        return false;
+    compile_include_root_t *entries = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, count * sizeof(*entries));
+    compile_include_root_t **sorted = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, count * sizeof(*sorted));
     if (!entries || !sorted) {
-        free(entries);
-        free(sorted);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entries);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, sorted);
         return false;
     }
     bool valid = true;
@@ -1986,9 +2433,10 @@ static bool compile_drop_user_system_duplicates(char *roots) {
                 break;
             }
         }
-        entries[i] = (compile_include_root_t){.start = cursor,
-                                              .length = length + 1,
-                                              .canonical = strdup(resolved ? canonical : path)};
+        entries[i] = (compile_include_root_t){
+            .start = cursor,
+            .length = length + 1,
+            .canonical = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, resolved ? canonical : path)};
         if (!entries[i].canonical) {
             valid = false;
             break;
@@ -2021,9 +2469,9 @@ static bool compile_drop_user_system_duplicates(char *roots) {
         *write = '\0';
     }
     for (size_t i = 0; i < count; i++)
-        free(entries[i].canonical);
-    free(entries);
-    free(sorted);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entries[i].canonical);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, sorted);
     return valid;
 }
 
@@ -2051,9 +2499,12 @@ static char *compile_include_roots(yyjson_val *entry, const char *directory) {
         for (int i = 0; i < count; i++)
             args[i] = owned[i];
     }
-    char *roots = calloc((size_t)(count + 1), PKGMAP_PATH_BUF);
+    size_t capacity = count >= 0 && (size_t)count < SIZE_MAX / PKGMAP_PATH_BUF
+                          ? ((size_t)count + 1) * PKGMAP_PATH_BUF
+                          : 0;
+    char *roots = capacity ? cbm_calloc(CBM_MEM_CLASS_SEMANTIC, capacity) : NULL;
     bool valid = roots && count > 0 && count < CBM_SZ_1K;
-    size_t used = 0, capacity = (size_t)(count + 1) * PKGMAP_PATH_BUF;
+    size_t used = 0;
     static const char *const flags[] = {"-iquote", "-I", "-isystem", "-idirafter"};
     static const char groups[] = {'Q', 'I', 'S', 'A'};
     for (int group = 0; valid && group < 4; group++) {
@@ -2090,7 +2541,7 @@ static char *compile_include_roots(yyjson_val *entry, const char *directory) {
     if (valid)
         valid = compile_drop_user_system_duplicates(roots);
     if (!valid) {
-        free(roots);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, roots);
         return NULL;
     }
     return roots;
@@ -2132,7 +2583,7 @@ static bool build_compile_import_context(const cbm_pipeline_ctx_t *ctx, CBMHashT
         if (length <= 0 || (size_t)length >= sizeof(key) ||
             !import_fact_put(map, key, roots ? roots : ambiguous_pkgmap_value))
             complete = false;
-        free(roots);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, roots);
     }
     yyjson_doc_free(doc);
     return complete;
@@ -2370,7 +2821,7 @@ static bool rust_add_root(rust_import_context_t *context, CBMFileResult **cache,
                     import_fact_put(context->map, key, membership) &&
                     rust_walk_module(context, cache, file, ts_tree_root_node(file->tree), rel, "",
                                      directory, 0);
-    free(directory);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
     rust_release_source(file);
     if (!complete)
         return false;
@@ -2417,7 +2868,7 @@ static bool rust_cargo_roots(rust_import_context_t *context, CBMFileResult **cac
             else
                 success = rust_add_root(context, cache, path) && success;
             custom_lib = custom_lib || section == CARGO_LIB;
-            free(value);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
         }
         line = next;
     }
@@ -2430,7 +2881,7 @@ static bool rust_cargo_roots(rust_import_context_t *context, CBMFileResult **cac
                 success = false;
         }
     }
-    free(directory);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
     cbm_free(CBM_MEM_CLASS_EXTRACT, source);
     return success;
 }
@@ -2445,11 +2896,14 @@ bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_
             context.count++;
     if (!context.count)
         return true;
-    context.files = calloc((size_t)context.count, sizeof(context.files[0]));
+    if ((size_t)context.count > SIZE_MAX / sizeof(context.files[0]))
+        return false;
+    context.files =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)context.count * sizeof(context.files[0]));
     context.parser = ts_parser_new();
     if (!context.files || !context.parser ||
         !ts_parser_set_language(context.parser, cbm_ts_language(CBM_LANG_RUST))) {
-        free(context.files);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, context.files);
         ts_parser_delete(context.parser);
         return false;
     }
@@ -2478,7 +2932,7 @@ bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_
         rust_release_source(&context.files[i]);
     }
     ts_parser_delete(context.parser);
-    free(context.files);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, context.files);
     return success;
 }
 
@@ -2673,7 +3127,7 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     char *dir = path_dirname(source_rel);
     char base[PKGMAP_PATH_BUF];
     bool valid = dir && cbm_repo_rel_join(dir, module_path, base, sizeof(base));
-    free(dir);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     if (!valid)
         return NULL;
     char paths[3][PKGMAP_PATH_BUF];
@@ -2974,9 +3428,9 @@ static bool import_has_configured_root(const cbm_pipeline_ctx_t *ctx, const char
         }
     }
     if (ctx->path_aliases && source_rel) {
-        const cbm_path_alias_map_t *map =
+        const cbm_path_alias_map_t *aliases =
             cbm_path_alias_find_for_file(ctx->path_aliases, source_rel);
-        char *resolved = map ? cbm_path_alias_resolve(map, path) : NULL;
+        char *resolved = aliases ? cbm_path_alias_resolve(aliases, path) : NULL;
         bool found = resolved != NULL;
         free(resolved);
         return found;
@@ -2997,7 +3451,7 @@ static const cbm_gbuf_node_t *namespace_member(const cbm_pipeline_ctx_t *ctx,
     char *module = lang == CBM_LANG_JAVA
                        ? (dir ? cbm_pipeline_fqn_folder(ctx->project_name, dir) : NULL)
                        : cbm_pipeline_fqn_module(ctx->project_name, file->file_path);
-    free(dir);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     if (!module)
         return NULL;
     char qn[PKGMAP_PATH_BUF];
@@ -3262,7 +3716,7 @@ static const cbm_gbuf_node_t *python_configured_module(const cbm_pipeline_ctx_t 
                     *p = '/';
             valid = valid && directory &&
                     cbm_repo_rel_join(directory, child, relative, sizeof(relative));
-            free(directory);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
             return valid ? python_module_at_path(ctx, relative) : NULL;
         }
         char *dot = strrchr(prefix, '.');
@@ -3311,7 +3765,7 @@ static bool python_source_import_kind(CBMImportKind kind) {
 
 static const cbm_gbuf_node_t *python_source_import_target(const cbm_pipeline_ctx_t *ctx,
                                                           const char *source_rel,
-                                                          const CBMImport *imp) {
+                                                          const CBMImport *imp, bool dependency) {
     if (imp->kind != CBM_IMPORT_KIND_PYTHON_FROM)
         return python_exact_module(ctx, source_rel, imp->module_path);
     const char *last = strrchr(imp->module_path, '.');
@@ -3339,7 +3793,9 @@ static const cbm_gbuf_node_t *python_source_import_target(const cbm_pipeline_ctx
             strcmp(member->label, "Module") != 0 && strcmp(member->label, "Folder") != 0)
             return member;
     }
-    return python_exact_module(ctx, source_rel, imp->module_path);
+    /* Dependency on the parent does not prove a local member binding or
+     * load an indexed child. The shared namespace audit proves that separately. */
+    return dependency ? module : NULL;
 }
 
 char *cbm_pipeline_python_import_binding(const cbm_gbuf_t *gbuf, const char *project,
@@ -3348,7 +3804,7 @@ char *cbm_pipeline_python_import_binding(const cbm_gbuf_t *gbuf, const char *pro
         !python_source_import_kind(imp->kind) || strcmp(imp->local_name, "*") == 0)
         return NULL;
     cbm_pipeline_ctx_t ctx = {.project_name = project, .gbuf = (cbm_gbuf_t *)gbuf};
-    const cbm_gbuf_node_t *target = python_source_import_target(&ctx, source_rel, imp);
+    const cbm_gbuf_node_t *target = python_source_import_target(&ctx, source_rel, imp, false);
     if (!target || !target->label || !target->qualified_name)
         return NULL;
     if (strcmp(target->label, "File") != 0 && strcmp(target->label, "Module") != 0)
@@ -3373,6 +3829,7 @@ char *cbm_pipeline_python_import_binding(const cbm_gbuf_t *gbuf, const char *pro
     return binding;
 }
 
+/* Slot results cross into the shared resolver as SEMANTIC-owned strings. */
 char *cbm_pipeline_python_import_slot(const cbm_gbuf_t *graph, const char *project,
                                       const char *source_rel, const CBMImport *import,
                                       bool *module) {
@@ -3383,7 +3840,8 @@ char *cbm_pipeline_python_import_slot(const cbm_gbuf_t *graph, const char *proje
         return NULL;
     if (import->kind != CBM_IMPORT_KIND_PYTHON_FROM) {
         *module = true;
-        return cbm_pipeline_python_import_binding(graph, project, source_rel, import);
+        return pkgmap_take_raw(
+            cbm_pipeline_python_import_binding(graph, project, source_rel, import));
     }
     const char *last = strrchr(import->module_path, '.');
     if (!last || !last[1] || !strcmp(last + 1, "*"))
@@ -3398,8 +3856,47 @@ char *cbm_pipeline_python_import_slot(const cbm_gbuf_t *graph, const char *proje
     parent[length] = '\0';
     cbm_pipeline_ctx_t context = {.project_name = project, .gbuf = (cbm_gbuf_t *)graph};
     const cbm_gbuf_node_t *file = python_exact_module(&context, source_rel, parent);
-    return file && file->file_path ? cbm_pipeline_fqn_compute(project, file->file_path, last + 1)
-                                   : NULL;
+    if (!file || !file->file_path)
+        return NULL;
+    /* This names an exported symbol, including one literally called __file__.
+     * File-node identity has a separate extension-preserving contract. */
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    const char *symbol = cbm_fqn_compute(&arena, project, file->file_path, last + 1);
+    char *slot = symbol ? cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, symbol) : NULL;
+    cbm_arena_destroy(&arena);
+    return slot;
+}
+
+bool cbm_pipeline_python_submodule_candidate(const cbm_gbuf_t *graph, const char *project,
+                                             const char *source_rel, const CBMImport *import,
+                                             const cbm_gbuf_node_t **parent,
+                                             const cbm_gbuf_node_t **child) {
+    *parent = NULL;
+    *child = NULL;
+    if (!graph || !project || !source_rel || !import ||
+        import->kind != CBM_IMPORT_KIND_PYTHON_FROM || !import->module_path)
+        return false;
+    const char *last = strrchr(import->module_path, '.');
+    if (!last || !last[1] || !strcmp(last + 1, "*"))
+        return false;
+    size_t length = (size_t)(last - import->module_path);
+    if (length < strspn(import->module_path, "."))
+        length++;
+    char parent_path[PKGMAP_PATH_BUF];
+    if (length >= sizeof(parent_path))
+        return false;
+    memcpy(parent_path, import->module_path, length);
+    parent_path[length] = '\0';
+    cbm_pipeline_ctx_t ctx = {.project_name = project, .gbuf = (cbm_gbuf_t *)graph};
+    const cbm_gbuf_node_t *package = python_exact_module(&ctx, source_rel, parent_path);
+    const cbm_gbuf_node_t *submodule = python_exact_module(&ctx, source_rel, import->module_path);
+    if (!package || !package->file_path || strcmp(path_leaf(package->file_path), "__init__.py") ||
+        !submodule || !submodule->file_path || !strcmp(package->file_path, submodule->file_path))
+        return false;
+    *parent = package;
+    *child = submodule;
+    return true;
 }
 
 static bool python_map_put(CBMHashTable *by_local, const char **keys, const char **vals, int *count,
@@ -3426,10 +3923,9 @@ static bool python_map_put(CBMHashTable *by_local, const char **keys, const char
     return (uintptr_t)cbm_ht_get(by_local, key) == (uintptr_t)*count;
 }
 
-int cbm_pipeline_ecma_import_map(const cbm_gbuf_t *graph, const char *project,
-                                 const char *source_rel, const CBMFileResult *result,
-                                 bool include_type_only, const char ***out_keys,
-                                 const char ***out_values, int *out_count) {
+int cbm_pipeline_ecma_import_map(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                 const CBMFileResult *result, bool include_type_only,
+                                 const char ***out_keys, const char ***out_values, int *out_count) {
     *out_keys = NULL;
     *out_values = NULL;
     *out_count = 0;
@@ -3442,7 +3938,6 @@ int cbm_pipeline_ecma_import_map(const cbm_gbuf_t *graph, const char *project,
     int count = 0;
     if (!keys || !values || !locals)
         goto failed;
-    cbm_pipeline_ctx_t context = {.project_name = project, .gbuf = (cbm_gbuf_t *)graph};
     for (int i = 0; i < imports; i++) {
         const CBMImport *import = &result->imports.items[i];
         if (!import->local_name || !import->local_name[0] ||
@@ -3452,11 +3947,12 @@ int cbm_pipeline_ecma_import_map(const cbm_gbuf_t *graph, const char *project,
         char *value = NULL;
         if (!result->parse_unusable && !result->walk_truncated && !import->is_default) {
             cbm_resolve_result_t proof = cbm_pipeline_resolve_import_result(
-                &context, source_rel, NULL, import, NULL, &dependency);
+                ctx, source_rel, NULL, import, NULL, &dependency);
             if (cbm_resolve_admit(&proof) && dependency && dependency->file_path &&
                 dependency->label &&
                 (!strcmp(dependency->label, "File") || !strcmp(dependency->label, "Module"))) {
-                value = cbm_pipeline_fqn_compute(project, dependency->file_path, import->member);
+                value = cbm_pipeline_fqn_compute(ctx->project_name, dependency->file_path,
+                                                 import->member);
             }
         }
         /* An unresolved/default binding still shadows project names. Export
@@ -3537,6 +4033,96 @@ failed:
     return -1;
 }
 
+/* Node bare package lookup uses the nearest manifest for self-reference,
+ * then an enclosing declared workspace. Entry paths stay exact through File
+ * materialization; dotted filenames cannot lose a second extension. */
+static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx, const char *source,
+                                                  const char *specifier, CBMLanguage language,
+                                                  bool *covered) {
+    *covered = false;
+    CBMHashTable *map = cbm_pipeline_get_pkgmap();
+    if (!map || !source || specifier[0] == '.' || specifier[0] == '/')
+        return NULL;
+    const char *seal = cbm_ht_get(map, "@cbm:node:complete");
+    if (!seal || strcmp(seal, "1")) {
+        *covered = true;
+        return NULL;
+    }
+    const char *slash = strchr(specifier, '/');
+    if (specifier[0] == '@')
+        slash = slash ? strchr(slash + 1, '/') : NULL;
+    size_t length = slash ? (size_t)(slash - specifier) : strlen(specifier);
+    char package[PKGMAP_PATH_BUF], subpath[PKGMAP_PATH_BUF];
+    if (!length || length >= sizeof(package))
+        return NULL;
+    memcpy(package, specifier, length);
+    package[length] = '\0';
+    if (!node_package_name(package))
+        return NULL;
+    int n = snprintf(subpath, sizeof(subpath), ".%s", slash ? slash : "");
+    if (n <= 0 || (size_t)n >= sizeof(subpath) || (slash && !package_export_path(subpath))) {
+        *covered = true;
+        return NULL;
+    }
+    *covered = cbm_ht_get(map, package) != NULL;
+    char directory[PKGMAP_PATH_BUF];
+    int size = snprintf(directory, sizeof(directory), "%s", source);
+    if (size < 0 || (size_t)size >= sizeof(directory)) {
+        *covered = true;
+        return NULL;
+    }
+    char *parent = strrchr(directory, '/');
+    if (parent)
+        *parent = '\0';
+    else
+        directory[0] = '\0';
+    const char *owner = NULL;
+    bool scope_seen = false;
+    for (;;) {
+        const char *scope = node_fact(map, "scope", directory, NULL);
+        if (!scope_seen && scope) {
+            scope_seen = true;
+            if (!strcmp(scope, ambiguous_pkgmap_value)) {
+                *covered = true;
+                break;
+            }
+            if (!strcmp(scope, package) && node_fact(map, "self", directory, NULL)) {
+                owner = directory;
+                *covered = true;
+                break;
+            }
+        }
+        if (scope && (node_fact(map, "dependency", directory, package) ||
+                      node_fact(map, "dependency", directory, NULL))) {
+            *covered = true;
+            break;
+        }
+        if (node_fact(map, "root", directory, NULL)) {
+            owner = node_fact(map, "bound", directory, package);
+            *covered = *covered || owner != NULL;
+            break;
+        }
+        if (!*directory)
+            break;
+        parent = strrchr(directory, '/');
+        if (parent)
+            *parent = '\0';
+        else
+            directory[0] = '\0';
+    }
+    const char *entry = owner && strcmp(owner, ambiguous_pkgmap_value)
+                            ? node_fact(map, "entry", owner, subpath)
+                            : NULL;
+    const cbm_gbuf_node_t *target =
+        entry && strcmp(entry, ambiguous_pkgmap_value)
+            ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, entry)
+            : NULL;
+    return target && target->file_path && !strcmp(target->file_path, entry) &&
+                   import_language_matches(language, target)
+               ? target
+               : NULL;
+}
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const CBMImport *imp,
     CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only, bool *ambiguous) {
@@ -3550,8 +4136,17 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
     if (file)
         return file;
 
+    if (src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
+        src_lang == CBM_LANG_TSX || src_lang == CBM_LANG_ARKTS) {
+        bool covered = false;
+        const cbm_gbuf_node_t *package =
+            node_package_target(ctx, source_rel, imp->module_path, src_lang, &covered);
+        if (covered)
+            return package;
+    }
+
     if (src_lang == CBM_LANG_PYTHON && python_source_import_kind(imp->kind))
-        return python_source_import_target(ctx, source_rel, imp);
+        return python_source_import_target(ctx, source_rel, imp, true);
     if (src_lang == CBM_LANG_PYTHON) {
         const cbm_gbuf_node_t *module = python_exact_module(ctx, source_rel, imp->module_path);
         if (module)
@@ -3703,7 +4298,7 @@ static const cbm_gbuf_node_t *resolve_import_target(
         char *dir = path_dirname(source_rel ? source_rel : "");
         char path[PKGMAP_PATH_BUF];
         bool valid = dir && cbm_repo_rel_join(dir, imp->module_path, path, sizeof(path));
-        free(dir);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
         *reason = "literal_include_path";
         return valid ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path) : NULL;
     }
@@ -4092,11 +4687,13 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     const cbm_gbuf_node_t **targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
     cbm_resolve_result_t *proofs = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*proofs));
     bool *emitted = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*emitted));
+    const char **edge_properties =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*edge_properties));
     yyjson_doc *old = old_json ? yyjson_read(old_json, strlen(old_json), 0) : NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
     yyjson_mut_val *manifest = doc ? yyjson_mut_arr(doc) : NULL;
-    bool ok = targets && proofs && emitted && root && manifest &&
+    bool ok = targets && proofs && emitted && edge_properties && root && manifest &&
               (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
               yyjson_mut_obj_add_int(doc, root, "php_imports_complete", 1) &&
               yyjson_mut_obj_add_int(doc, root, "php_imports_proven", 1) &&
@@ -4170,16 +4767,19 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
             ok = entry && yyjson_mut_arr_add_val(bindings, entry);
         }
         char *props = ok ? yyjson_mut_val_write(edge, 0, NULL) : NULL;
-        ok = props &&
-             cbm_gbuf_insert_edge(ctx->gbuf, file->id, targets[i]->id, "IMPORTS", props) > 0;
+        const char *retained = props ? cbm_arena_strdup(&proof_arena, props) : NULL;
+        ok = retained &&
+             cbm_gbuf_insert_edge(ctx->gbuf, file->id, targets[i]->id, "IMPORTS", retained) > 0;
         free(props);
         if (ok) {
             written++;
             for (int j = i; j < count; j++)
                 if (targets[j] && targets[j]->id == targets[i]->id &&
                     result->imports.items[j].local_name &&
-                    strcmp(local, result->imports.items[j].local_name) == 0)
+                    strcmp(local, result->imports.items[j].local_name) == 0) {
                     emitted[j] = true;
+                    edge_properties[j] = retained;
+                }
         }
     }
     if (ok) {
@@ -4203,10 +4803,12 @@ done:
         }
         cbm_resolve_record_t row = import_record(result, rel, file_qn, &result->imports.items[i],
                                                  proof, emitted && emitted[i]);
+        row.properties_json = edge_properties ? edge_properties[i] : NULL;
         (void)cbm_gbuf_record_resolution(ctx->gbuf, &row);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, proofs);
     cbm_free(CBM_MEM_CLASS_OTHER, emitted);
+    cbm_free(CBM_MEM_CLASS_OTHER, edge_properties);
     yyjson_doc_free(old);
     yyjson_mut_doc_free(doc);
     cbm_free(CBM_MEM_CLASS_OTHER, targets);
@@ -4313,20 +4915,29 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
             cbm_resolve_result_t proof = resolve_import_observed(
                 ctx, rel, file_qn, imp, namespace_map, &target, &lookup_context);
             cbm_resolve_record_t row = import_record(result, rel, file_qn, imp, proof, false);
-            bool emitted = false;
-            if (source && target && source->id != target->id &&
+            yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+            yyjson_mut_val *properties = doc ? yyjson_mut_obj(doc) : NULL;
+            bool valid =
+                properties && yyjson_mut_obj_add_strcpy(doc, properties, "local_name",
+                                                        imp->local_name ? imp->local_name : "");
+            if (valid)
+                yyjson_mut_doc_set_root(doc, properties);
+            char *props = valid ? yyjson_mut_write(doc, 0, NULL) : NULL;
+            if (!props) {
+                row.result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+                row.result.reason = "import_properties_allocation_failed";
+            }
+            row.properties_json = props;
+            if (props && source && target && source->id != target->id &&
                 cbm_resolve_record_candidate(&row)) {
-                char escaped[CBM_SZ_128];
-                cbm_json_escape(escaped, sizeof(escaped), imp->local_name ? imp->local_name : "");
-                char props[CBM_SZ_256];
-                snprintf(props, sizeof(props), "{\"local_name\":\"%s\"}", escaped);
-                emitted =
+                row.emitted =
                     cbm_gbuf_insert_edge(ctx->gbuf, source->id, target->id, "IMPORTS", props) > 0;
-                if (emitted)
+                if (row.emitted)
                     count++;
             }
-            row.emitted = emitted;
             (void)cbm_gbuf_record_resolution(ctx->gbuf, &row);
+            free(props);
+            yyjson_mut_doc_free(doc);
         }
         cbm_arena_destroy(&proof_arena);
     }
@@ -4544,14 +5155,14 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
             return NULL;
         }
         char *reverse_key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, reverse);
-        char *reverse_value = strdup(namespace_name);
+        char *reverse_value = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, namespace_name);
         if (reverse_value)
             for (char *p = reverse_value; *p; p++)
                 if (*p == '\\' || *p == ':' || *p == '/')
                     *p = '.';
         if (!reverse_key || !reverse_value) {
             cbm_free(CBM_MEM_CLASS_OTHER, reverse_key);
-            free(reverse_value);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, reverse_value);
             cbm_pipeline_namespace_map_free(map);
             return NULL;
         }
@@ -4561,7 +5172,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
             if (cbm_ht_get_key(map, reverse_key) != reverse_key)
                 cbm_free(CBM_MEM_CLASS_OTHER, reverse_key);
             if (cbm_ht_get(map, reverse) != reverse_value)
-                free(reverse_value);
+                cbm_free(CBM_MEM_CLASS_SEMANTIC, reverse_value);
             cbm_pipeline_namespace_map_free(map);
             return NULL;
         }
@@ -4572,7 +5183,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
         bool ok = false;
         if (!rels[i])
             goto item_done;
-        file_qn = cbm_pipeline_fqn_compute(project_name, rels[i], "__file__");
+        file_qn = pkgmap_take_raw(cbm_pipeline_fqn_compute(project_name, rels[i], "__file__"));
         if (!file_qn) {
             goto item_done;
         }
@@ -4590,8 +5201,8 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
         }
         /* Store ALL files declaring a namespace as a '\n'-delimited list so the
          * resolver can pick a non-importer sibling (see resolve loop). The hash
-         * table does not copy keys. The map owns memory-core keys and libc
-         * values from fqn_compute or the combined allocation below. */
+         * table does not copy keys. The map owns OTHER keys and SEMANTIC
+         * values; raw FQN API results are copied into that value class. */
         if (!cbm_ht_has(map, key)) {
             cbm_ht_set(map, key, file_qn); /* map owns key + file_qn */
             /* set returns NULL for both insertion and allocation failure.
@@ -4617,15 +5228,15 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
                     goto item_done;
                 }
                 size_t need = cur_len + 1 + file_len + 1;
-                combined = malloc(need);
+                combined = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, need);
                 if (combined) {
                     snprintf(combined, need, "%s\n%s", cur, file_qn);
                     (void)cbm_ht_set(map, stored_key, combined);
                     if (cbm_ht_get(map, stored_key) != combined) {
-                        free(combined);
+                        cbm_free(CBM_MEM_CLASS_SEMANTIC, combined);
                         combined = NULL;
                     } else {
-                        free((void *)cur); /* replaced value string */
+                        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)cur); /* replaced value string */
                     }
                 }
             }
@@ -4633,7 +5244,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
         }
     item_done:
         cbm_free(CBM_MEM_CLASS_OTHER, key);
-        free(file_qn);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, file_qn);
         if (!ok) {
             cbm_pipeline_namespace_map_free(map);
             return NULL;
@@ -4669,7 +5280,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
 static void ns_map_free_entry(const char *key, void *value, void *ud) {
     (void)ud;
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
-    free(value);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
 }
 
 void cbm_pipeline_namespace_map_free(CBMHashTable *map) {

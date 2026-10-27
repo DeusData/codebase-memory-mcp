@@ -25,6 +25,76 @@ static int go_proven_count(const CBMResolvedCallArray *rows, const char *target)
     return count;
 }
 
+/* Independent source anchors distinguish invocation from reading a callable.
+ * Every admitted row in these fixtures must match exactly one authored site. */
+typedef struct {
+    const char *anchor;
+    size_t offset;
+    const char *text, *spelling, *target;
+    CBMResolvedKind kind;
+} go_expected_site_t;
+
+static bool go_exact_rows(const CBMResolvedCallArray *rows, const char *source,
+                          const go_expected_site_t *expected, size_t count) {
+    bool found[16] = {0};
+    if (count > sizeof(found) / sizeof(found[0]))
+        return false;
+    for (int r = 0; r < rows->count; r++) {
+        const CBMResolvedCall *row = &rows->items[r];
+        if (!go_row_admitted(row))
+            continue;
+        bool matched = false;
+        for (size_t e = 0; e < count; e++) {
+            const go_expected_site_t *want = &expected[e];
+            const char *anchor = strstr(source, want->anchor);
+            if (!anchor || strstr(anchor + 1, want->anchor) ||
+                want->offset > strlen(want->anchor) ||
+                strlen(want->text) > strlen(want->anchor) - want->offset ||
+                strncmp(anchor + want->offset, want->text, strlen(want->text)))
+                return false;
+            size_t start = (size_t)(anchor - source) + want->offset;
+            size_t end = start + strlen(want->text);
+            if (row->site_start_byte != start || row->site_end_byte != end ||
+                row->kind != want->kind || strcmp(row->callee_qn, want->target))
+                continue;
+            const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(row->evidence.proof);
+            const char *role = want->kind == CBM_RESOLVED_INVOCATION ? "CALLS" : "CALL_REFERENCE";
+            if (found[e] || !row->caller_qn || strcmp(row->caller_qn, "test.main.run") ||
+                row->source_origin != CBM_SOURCE_ORIGIN_RAW || !proof ||
+                !cbm_resolve_admit(&proof->outcome) || !proof->predecessors_closed ||
+                proof->outcome.rule != row->evidence.rule ||
+                proof->outcome.facts != row->evidence.facts ||
+                strcmp(proof->outcome.target, want->target) || !proof->source.scope ||
+                strcmp(proof->source.scope, "test.main.run") ||
+                proof->source.source_origin != CBM_SOURCE_ORIGIN_RAW ||
+                proof->key.start_byte != start || proof->key.end_byte != end ||
+                proof->key.origin != CBM_SOURCE_ORIGIN_RAW || !proof->key.lookup_key ||
+                strcmp(proof->key.lookup_key, want->spelling) || !proof->key.binding_identity ||
+                strcmp(proof->key.binding_identity, want->target) || !proof->key.detail ||
+                strcmp(proof->key.detail, role)) {
+                fprintf(stderr, "Go source proof mismatch: %s [%zu,%zu) -> %s\n", want->text, start,
+                        end, want->target);
+                return false;
+            }
+            found[e] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) {
+            fprintf(stderr, "Unexpected Go occurrence: kind=%d [%u,%u) -> %s\n", row->kind,
+                    row->site_start_byte, row->site_end_byte, row->callee_qn);
+            return false;
+        }
+    }
+    for (size_t e = 0; e < count; e++)
+        if (!found[e]) {
+            fprintf(stderr, "Missing Go occurrence: %s kind=%d -> %s\n", expected[e].anchor,
+                    expected[e].kind, expected[e].target);
+            return false;
+        }
+    return true;
+}
+
 static void go_cross(CBMArena *arena, const char *source, CBMLSPDef *defs, int count,
                      const char **names, const char **qns, int imports, CBMResolvedCallArray *out) {
     cbm_run_go_lsp_cross(arena, source, (int)strlen(source), "test.main", defs, count, names, qns,
@@ -60,13 +130,19 @@ TEST(resolver_go_scoped_calls_and_callable_values_have_proof) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 5, names, qns, 1, &out);
-    int work = go_proven_count(&out, "test.main.work");
-    int imported = go_proven_count(&out, "pkg/lib.Export");
-    int decoys = go_proven_count(&out, "other.work") + go_proven_count(&out, "other.Export");
+    const go_expected_site_t expected[] = {
+        {"work()", 0, "work()", "work", "test.main.work", CBM_RESOLVED_INVOCATION},
+        {"lib.Export()", 0, "lib.Export()", "lib.Export", "pkg/lib.Export",
+         CBM_RESOLVED_INVOCATION},
+        {"sink(work)", 0, "sink(work)", "sink", "test.main.sink", CBM_RESOLVED_INVOCATION},
+        {"sink(work)", 5, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE},
+        {"alias := work", 9, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE},
+        {"alias()", 0, "alias()", "alias", "test.main.work", CBM_RESOLVED_INVOCATION},
+        {"sink(alias)", 0, "sink(alias)", "sink", "test.main.sink", CBM_RESOLVED_INVOCATION},
+        {"sink(alias)", 5, "alias", "alias", "test.main.work", CBM_RESOLVED_CALL_REFERENCE}};
+    bool exact = go_exact_rows(&out, source, expected, sizeof(expected) / sizeof(expected[0]));
     cbm_arena_destroy(&arena);
-    ASSERT_EQ(work, 4);
-    ASSERT_EQ(imported, 1);
-    ASSERT_EQ(decoys, 0);
+    ASSERT(exact);
     PASS();
 }
 
@@ -136,13 +212,17 @@ TEST(resolver_go_declared_methods_keep_interface_declaration_target) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 6, NULL, NULL, 0, &out);
-    int method = go_proven_count(&out, "test.main.Conn.Query");
-    int iface = go_proven_count(&out, "test.main.Reader.Read");
-    int impl = go_proven_count(&out, "test.main.Impl.Read");
+    const go_expected_site_t expected[] = {
+        {"c.Query()", 0, "c.Query()", "c.Query", "test.main.Conn.Query", CBM_RESOLVED_INVOCATION},
+        {"r.Read()", 0, "r.Read()", "r.Read", "test.main.Reader.Read", CBM_RESOLVED_INVOCATION},
+        {"sink(c.Query)", 5, "c.Query", "Query", "test.main.Conn.Query",
+         CBM_RESOLVED_CALL_REFERENCE},
+        {"bound := c.Query", 11, "Query", "Query", "test.main.Conn.Query",
+         CBM_RESOLVED_CALL_REFERENCE},
+        {"bound()", 0, "bound()", "bound", "test.main.Conn.Query", CBM_RESOLVED_INVOCATION}};
+    bool exact = go_exact_rows(&out, source, expected, sizeof(expected) / sizeof(expected[0]));
     cbm_arena_destroy(&arena);
-    ASSERT_EQ(method, 3);
-    ASSERT_EQ(iface, 1);
-    ASSERT_EQ(impl, 0);
+    ASSERT(exact);
     PASS();
 }
 
@@ -201,16 +281,26 @@ TEST(resolver_go_alias_reassignment_and_branch_join_clear_identity) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     go_cross(&arena, source, defs, 1, NULL, NULL, 0, &out);
-    int count = go_proven_count(&out, "test.main.work");
+    const go_expected_site_t expected[] = {
+        {"alias := work", 9, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE},
+        {"other := work", 9, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE}};
+    /* Reading work on each RHS is exact even though neither later invocation
+     * can retain that identity after an unknown assignment or branch join. */
+    bool exact = go_exact_rows(&out, source, expected, sizeof(expected) / sizeof(expected[0]));
+    const char *control_source = "package main\nfunc run() { alias := work; alias(); "
+                                 "other := work; other() }\n";
     CBMResolvedCallArray control = {0};
-    go_cross(&arena,
-             "package main\nfunc run() { alias := work; alias(); "
-             "other := work; other() }\n",
-             defs, 1, NULL, NULL, 0, &control);
-    int positive = go_proven_count(&control, "test.main.work");
+    go_cross(&arena, control_source, defs, 1, NULL, NULL, 0, &control);
+    const go_expected_site_t control_expected[] = {
+        {"alias := work", 9, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE},
+        {"other := work", 9, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE},
+        {"alias()", 0, "alias()", "alias", "test.main.work", CBM_RESOLVED_INVOCATION},
+        {"other()", 0, "other()", "other", "test.main.work", CBM_RESOLVED_INVOCATION}};
+    bool positive = go_exact_rows(&control, control_source, control_expected,
+                                  sizeof(control_expected) / sizeof(control_expected[0]));
     cbm_arena_destroy(&arena);
-    ASSERT_EQ(positive, 2);
-    ASSERT_EQ(count, 0);
+    ASSERT(positive);
+    ASSERT(exact);
     PASS();
 }
 

@@ -1,18 +1,37 @@
-#include "test_framework.h"
 #include "cbm.h"
 #include "lsp/py_proof.h"
 #include "resolve/binding.h"
 #include "resolve/policy.h"
+#include "resolve/proof.h"
+#include "test_framework.h"
 static const char PY_SERVICE[] = "class Service:\n    def go(self):\n        pass\n";
-static int py_type_rows_for_paths(const char *source, const char *library, int duplicate,
-                                  CBMResolvedKind kind, const char *library_path,
-                                  const char *source_path, const char *expected_site) {
+typedef struct {
+    const char *site, *caller;
+    int caller_conflict;
+} PyTypeQuery;
+static int py_type_rows_for_context(const char *source, const char *library, int duplicate,
+                                    CBMResolvedKind kind, const char *library_path,
+                                    const char *source_path, const PyTypeQuery *query) {
     CBMArena arena;
     cbm_arena_init(&arena);
     CBMFileResult *lib = cbm_extract_file(library, (int)strlen(library), CBM_LANG_PYTHON, "p",
                                           library_path, 0, NULL, NULL);
     CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "p",
                                            source_path, 0, NULL, NULL);
+    if (file && query && query->caller_conflict) {
+        CBMDefinition *typed = NULL, *decoy = NULL;
+        for (int i = 0; i < file->defs.count; i++) {
+            CBMDefinition *def = &file->defs.items[i];
+            if (def->qualified_name && !strcmp(def->qualified_name, "p.main.Controller.typed"))
+                typed = def;
+            if (def->qualified_name && !strcmp(def->qualified_name, "p.main.Decoy.typed"))
+                decoy = def;
+        }
+        if (typed && decoy && query->caller_conflict == 1)
+            decoy->start_line = typed->start_line;
+        else if (typed && query->caller_conflict == 2)
+            typed->qualified_name = cbm_arena_strdup(&file->arena, "p.main.Impostor.typed");
+    }
     CBMLSPDef defs[3] = {{.qualified_name = "p.lib.Service",
                           .graph_qualified_name = "p.lib.Service",
                           .short_name = "Service",
@@ -71,19 +90,37 @@ static int py_type_rows_for_paths(const char *source, const char *library, int d
                                       .facts = row->evidence.facts,
                                       .target = row->callee_qn,
                                       .candidate_count = 1};
+        const char *expected_site = query ? query->site : NULL;
+        const char *expected_caller = query ? query->caller : NULL;
+        const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(row->evidence.proof);
+        bool matching_caller =
+            !expected_caller ||
+            (row->caller_qn && !strcmp(row->caller_qn, expected_caller) && row->callee_qn &&
+             !strcmp(row->callee_qn, "p.lib.Service.go") && view && view->source.scope &&
+             !strcmp(view->source.scope, expected_caller) &&
+             view->key.start_byte == row->site_start_byte &&
+             view->key.end_byte == row->site_end_byte && view->outcome.target &&
+             !strcmp(view->outcome.target, row->callee_qn));
         bool matching_site =
             !expected_site ||
             (row->site_end_byte <= strlen(source) && row->site_start_byte < row->site_end_byte &&
              row->site_end_byte - row->site_start_byte == strlen(expected_site) &&
              !strncmp(source + row->site_start_byte, expected_site, strlen(expected_site)));
         if (row->kind == kind && cbm_resolve_admit(&proof) &&
-            row->site_end_byte > row->site_start_byte && matching_site)
+            row->site_end_byte > row->site_start_byte && matching_site && matching_caller)
             found++;
     }
     cbm_free_result(lib);
     cbm_free_result(file);
     cbm_arena_destroy(&arena);
     return found;
+}
+static int py_type_rows_for_paths(const char *source, const char *library, int duplicate,
+                                  CBMResolvedKind kind, const char *library_path,
+                                  const char *source_path, const char *expected_site) {
+    PyTypeQuery query = {.site = expected_site};
+    return py_type_rows_for_context(source, library, duplicate, kind, library_path, source_path,
+                                    &query);
 }
 static int py_type_rows(const char *source, const char *library, int duplicate,
                         CBMResolvedKind kind) {
@@ -261,7 +298,79 @@ TEST(resolver_python_value_domain_does_not_widen_callable_class_domain) {
     PASS();
 }
 
+static int py_caller_rows(const char *source, const char *path, const char *caller, int conflict) {
+    PyTypeQuery query = {.site = "value.go()", .caller = caller, .caller_conflict = conflict};
+    return py_type_rows_for_context(source, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION, "lib.py", path,
+                                    &query);
+}
+
+TEST(resolver_python_module_and_method_callers_keep_exact_scope) {
+    const char *source = "from lib import Service as Svc\n"
+                         "class Controller:\n"
+                         "    def typed(self, value: Svc):\n        value.go()\n"
+                         "    def made(self):\n        value=Svc()\n        value.go()\n"
+                         "def plain(value: Svc):\n    value.go()\n"
+                         "value=Svc()\nvalue.go()\n";
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Controller.typed", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Controller.made", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.plain", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Controller", 0), 0);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.__module__", 0), 0);
+    ASSERT_EQ(py_type_rows(source, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION), 4);
+    ASSERT_EQ(py_caller_rows(source, "pkg/__init__.py", "p.pkg.__init__", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "pkg/__init__.py", "p.pkg.Controller.typed", 0), 1);
+    PASS();
+}
+
+TEST(resolver_python_caller_proof_does_not_execute_nested_bodies) {
+    const char *source = "from lib import Service as Svc\n"
+                         "class Outer:\n"
+                         "    class Inner:\n"
+                         "        def typed(self, value: Svc):\n            value.go()\n"
+                         "def delayed(value: Svc):\n    value.go()\n";
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main", 0), 0);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Outer", 0), 0);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Outer.Inner", 0), 0);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Outer.Inner.typed", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.delayed", 0), 1);
+    ASSERT_EQ(py_type_rows(source, PY_SERVICE, 0, CBM_RESOLVED_INVOCATION), 2);
+    PASS();
+}
+
+TEST(resolver_python_conflicting_or_wrong_caller_identity_abstains) {
+    const char *source = "from lib import Service as Svc\n"
+                         "class Controller:\n"
+                         "    def typed(self, value: Svc):\n        value.go()\n"
+                         "class Decoy:\n    def typed(self):\n        pass\n";
+    ASSERT_EQ(py_caller_rows(source, "main.py", "p.main.Controller.typed", 0), 1);
+    ASSERT_EQ(py_caller_rows(source, "main.py", NULL, 1), 0);
+    ASSERT_EQ(py_caller_rows(source, "main.py", NULL, 2), 0);
+    PASS();
+}
+
+TEST(resolver_python_new_caller_scopes_keep_unknown_receivers_unproven) {
+    const char *sources[] = {"from lib import Service as Svc\nclass Controller:\n"
+                             "    def typed(self, value):\n        value.go()\n",
+                             "from lib import Service as Svc\nclass Controller(Svc):\n"
+                             "    def typed(self):\n        self.go()\n",
+                             "from lib import Service as Svc\nclass Controller:\n"
+                             "    @unknown\n    def typed(self, value: Svc):\n        value.go()\n",
+                             "from lib import Service as Svc\nvalue=Svc()\nunknown()\nvalue.go()\n",
+                             "from lib import Service as Svc\nvalue=Svc()\n"
+                             "if condition:\n    value=other\nvalue.go()\n",
+                             "from lib import Service as Svc\nvalue=Svc()\nclass Controller:\n"
+                             "    def typed(self):\n        value.go()\n"};
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ASSERT_EQ(py_type_rows(sources[i], PY_SERVICE, 0, CBM_RESOLVED_INVOCATION), 0);
+    PASS();
+}
+
 SUITE(resolver_py_types) {
+    RUN_TEST(resolver_python_module_and_method_callers_keep_exact_scope);
+    RUN_TEST(resolver_python_caller_proof_does_not_execute_nested_bodies);
+    RUN_TEST(resolver_python_conflicting_or_wrong_caller_identity_abstains);
+    RUN_TEST(resolver_python_new_caller_scopes_keep_unknown_receivers_unproven);
     RUN_TEST(resolver_python_value_domain_does_not_widen_callable_class_domain);
     RUN_TEST(resolver_python_decorated_values_do_not_donate_callable_identity);
     RUN_TEST(resolver_python_parenthesized_reference_matches_exact_argument_site);
