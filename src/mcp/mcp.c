@@ -20936,6 +20936,11 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
     return true;
 }
 
+static long long mcp_elapsed_us(struct timespec start, struct timespec end) {
+    return ((long long)(end.tv_sec - start.tv_sec) * MCP_S_TO_US) +
+           ((long long)(end.tv_nsec - start.tv_nsec) / MCP_MS_TO_US);
+}
+
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_jsonrpc_request_t req = {0};
     if (cbm_jsonrpc_parse(line, &req) < 0) {
@@ -20966,7 +20971,11 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &req_t0);
     char *result_json = NULL;
     char *request_error_json = NULL;
-    bool request_logged = false;
+    char *request_tool_name = NULL;
+    long long handler_duration_us = 0;
+    bool request_is_error = false;
+    bool request_cancelled = false;
+    bool request_timed_out = false;
 
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
@@ -20993,6 +21002,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+        request_tool_name = tool_name;
         srv->active_request_id = req.id;
         free(srv->active_request_id_str);
         srv->active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
@@ -21005,16 +21015,15 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         srv->active_request_id_str = NULL;
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - t0.tv_nsec) / MCP_MS_TO_US);
+        long long dur_us = mcp_elapsed_us(t0, t1);
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
-        long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                                   ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
-        request_logged = true;
+        handler_duration_us = mcp_elapsed_us(req_t0, t1);
+        request_is_error = is_err;
+        request_cancelled = mcp_request_cancelled(srv);
+        request_timed_out =
+            result_json && strstr(result_json, "\"code\":\"request_timeout\"") != NULL;
 
-        free(tool_name);
         free(tool_args);
     } else {
         /* Echo the original id (string or numeric, issue #253) on the error. */
@@ -21026,14 +21035,20 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .id_str = req.id_str,
             .error_json = err_obj,
         };
-        char *err = cbm_jsonrpc_format_response(&err_resp);
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+        long long handler_us = mcp_elapsed_us(req_t0, t1);
+        struct timespec serialize_t0;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
+        char *err = cbm_jsonrpc_format_response(&err_resp);
+        struct timespec serialize_t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+        long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+        long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
         /* server/discover is the modern connect probe. -32601 stays so the
          * client falls back to initialize; that miss is not an error (#2433). */
-        cbm_log_mcp_request(req.method, NULL, strcmp(req.method, "server/discover") != 0, dur_us);
+        cbm_log_mcp_request(req.method, NULL, strcmp(req.method, "server/discover") != 0,
+                            duration_us, handler_us, serialization_us, false, false);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
@@ -21045,24 +21060,20 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .id_str = req.id_str,
             .error_json = request_error_json,
         };
+        struct timespec serialize_t0;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
         char *err = cbm_jsonrpc_format_response(&err_resp);
-        struct timespec t1;
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        struct timespec serialize_t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+        long long handler_us = mcp_elapsed_us(req_t0, serialize_t0);
+        long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+        long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+        cbm_log_mcp_request(req.method, NULL, true, duration_us, handler_us, serialization_us,
+                            false, false);
         free(request_error_json);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
-    }
-
-    if (!request_logged) {
-        struct timespec t1;
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, false, dur_us);
     }
 
     cbm_jsonrpc_response_t resp = {
@@ -21070,7 +21081,21 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         .id_str = req.id_str,
         .result_json = result_json,
     };
+    struct timespec serialize_t0;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
     char *out = cbm_jsonrpc_format_response(&resp);
+    struct timespec serialize_t1;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+    long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+    long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+    request_is_error = request_is_error || out == NULL;
+    if (!request_tool_name) {
+        handler_duration_us = duration_us - serialization_us;
+    }
+    cbm_log_mcp_request(req.method, request_tool_name, request_is_error, duration_us,
+                        handler_duration_us, serialization_us, request_cancelled,
+                        request_timed_out);
+    free(request_tool_name);
     free(result_json);
     cbm_mcp_server_request_scope_end(srv);
     cbm_jsonrpc_request_free(&req);
