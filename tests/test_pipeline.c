@@ -8750,7 +8750,7 @@ TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
 
     cbm_file_hash_t *manifest = NULL;
     int manifest_count = -1;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-skip-locked", tmp, NULL, 0, NULL, 0,
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-skip-locked", tmp, NULL, 0, NULL, 0,
                                                   NULL, NULL, &manifest, &manifest_count);
 
     bool found_sibling_gitignore = false;
