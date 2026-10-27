@@ -1,0 +1,95 @@
+# Local code-graph stack: Neo4j plus the codebase-memory-mcp indexer and MCP
+# server, all reading the same login from docker/graph/.env (copy
+# .env.example). Every container loads that file itself (env_file), so a
+# NEO4J_PASSWORD left in the shell or the Windows user environment is ignored:
+# Neo4j and the tools can never disagree on the password.
+#
+#   docker compose -f docker/graph/compose.yaml up -d neo4j      # start Neo4j
+#   docker compose -f docker/graph/compose.yaml build cbm         # build the tools
+#
+# Index a repository (cbm-graph.ps1 / cbm-graph.cmd wrap this):
+#   docker compose -f docker/graph/compose.yaml run --rm \
+#     -v "D:\repo:/input/repo:ro" -e CBM_NAME=repo cbm
+#
+# MCP server over stdio (register it in your MCP client, see README.md):
+#   docker compose -f docker/graph/compose.yaml run --rm -i -T mcp
+name: cbm
+
+# NEO4J_PASSWORD is deliberately not listed under environment: anywhere. It
+# comes only from env_file, which the shell environment cannot override.
+x-neo4j-client: &neo4j-client
+  NEO4J_URI: http://neo4j:7474
+  NEO4J_USER: neo4j
+  NEO4J_DATABASE: neo4j
+
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: cbm-neo4j
+    restart: unless-stopped
+    env_file: [.env]
+    # The initial password (applied only when the data volume is created; to
+    # change it later see "Changing the password" in README.md).
+    entrypoint:
+      - sh
+      - -c
+      - '[ -n "$$NEO4J_PASSWORD" ] || { echo "set NEO4J_PASSWORD in docker/graph/.env" >&2; exit 1; };
+        export NEO4J_AUTH="neo4j/$$NEO4J_PASSWORD"; unset NEO4J_PASSWORD;
+        exec tini -g -- /startup/docker-entrypoint.sh neo4j'
+    environment:
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-2g}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-2g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1g}
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      # Also proves the password in .env is the one Neo4j holds.
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$$NEO4J_PASSWORD\" 'RETURN 1' >/dev/null"]
+      interval: 10s
+      timeout: 15s
+      retries: 30
+      start_period: 20s
+
+  # Indexer: syncs the repository mounted at /input/repo and builds its graph
+  # into Neo4j (docker/graph/cbm-graph.sh).
+  cbm:
+    image: cbm-graph:local
+    build:
+      context: ../..
+      dockerfile: docker/graph/Dockerfile
+    profiles: [tools]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    env_file: [.env]
+    environment:
+      <<: *neo4j-client
+      CBM_NAME: ${CBM_NAME:-}
+      CBM_FRESH: ${CBM_FRESH:-0}
+      CBM_NO_COPY: ${CBM_NO_COPY:-0}
+    volumes:
+      - cbm-data:/data
+
+  # MCP server on stdio, answering from the graphs the indexer built.
+  mcp:
+    image: cbm-graph:local
+    profiles: [tools]
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    entrypoint: ["codebase-memory-mcp"]
+    stdin_open: true
+    env_file: [.env]
+    environment:
+      <<: *neo4j-client
+    volumes:
+      - cbm-data:/data
+
+volumes:
+  neo4j-data:
+  neo4j-logs:
+  cbm-data:

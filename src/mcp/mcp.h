@@ -56,11 +56,10 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
-/* Mark a tool reply as answered from the local index although its project is
- * Neo4j-backed (graph_backend sqlite_fallback): appends a text notice to
- * content and a graph_backend object to structuredContent. Takes ownership of
- * result; returns it unchanged when it is not an MCP tool-result object. */
-char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason);
+/* The error reply for a graph read of a Neo4j-backed project that Neo4j cannot
+ * serve (unreachable, login rejected, or holding another generation). Graph
+ * reads never fall back to the local index. Returns heap-allocated JSON. */
+char *cbm_mcp_graph_unavailable_result(const char *tool_name, const char *reason);
 
 /* "neo4j", "neo4j+local" or "local" for a request that read graph data with
  * that mix of remote queries / local graph reads; NULL when it read none. */

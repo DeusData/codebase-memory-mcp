@@ -475,10 +475,11 @@ codebase-memory-mcp cli index_repository --repo-path /path/to/repo \
   - `served_by: neo4j`: all graph data came from Neo4j.
   - `neo4j+local`: the reply also lists what came from the local copy.
   - `local`
-  - `sqlite_fallback`: with the reason.
+
+  If Neo4j cannot serve the project, graph tools return an error (`graph_backend.status: unavailable`, with the reason) instead of answering from the local copy. `index_status`, `list_projects`, `index_repository` and `delete_project` keep working, so the cause can be seen and fixed.
 
   The daemon log (`<cache>/logs/cbm-daemon.log`) records the same per call (`graph.backend tool=… served_by=… remote_queries=N`). With `CBM_LOG_LEVEL=debug` it also logs each Cypher round trip (`neo4j.query`).
-- **Consistency**: each sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. If Neo4j is down, rejects the login, or holds an older generation (a failed sync), reads fall back to the identical local copy and the reply says so. `index_status` reports `graph_backend.status` as `serving` or as `sqlite_fallback` with the reason, plus `in_sync` and `last_sync_error` for background syncs.
+- **Consistency**: each sync writes a new generation, flips `(:CbmProject {name}).gen`, then deletes the old one, so readers never see a half-written graph. There is no fallback: if Neo4j is down, rejects the login, or holds an older generation (a failed sync), graph reads fail with the reason, and an index run that cannot sync to Neo4j fails too, including a plain re-index or the watcher's auto-refresh of a Neo4j-backed project. `index_status` reports `graph_backend.status` as `serving` or `unavailable` with the reason, plus `in_sync` and `last_sync_error`.
 - **Login safety**: an indexed project first uses the login it was last synced with, then `NEO4J_PASSWORD`. After Neo4j rejects a login, the same credentials are not retried for 60 s, because every rejected attempt counts toward Neo4j's lockout, which would then refuse the correct password too.
 - **Renamed databases**: a project's database found under another file name still uses Neo4j. Its marker is also looked up by project name.
 - **Native Cypher**: `query_graph` with `native: true` runs the query in Neo4j itself (read-only; write clauses and `CALL` are refused), with `$project`, `$db` and `$gen` bound:

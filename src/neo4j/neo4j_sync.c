@@ -679,7 +679,7 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
         }
         if (rc != 0) {
             cbm_log_error("neo4j.sync", "project", project, "err", err);
-            return 0;
+            return -1;
         }
     }
 
@@ -741,7 +741,8 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
         }
     }
     cbm_neo4j_config_wipe(&cfg);
-    /* An inherited (watcher / plain re-index) sync failure must not fail the
-     * SQLite index itself; it is logged and reported through err. */
-    return explicit_req ? result : 0;
+    /* A Neo4j-backed project is indexed into Neo4j or not at all: an inherited
+     * (watcher / plain re-index) sync failure fails the run like an explicit
+     * one. Reads stay refused until a sync succeeds (no local fallback). */
+    return result;
 }

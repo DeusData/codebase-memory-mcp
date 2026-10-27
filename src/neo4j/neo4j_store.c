@@ -1269,7 +1269,7 @@ cbm_neo4j_attach_t cbm_neo4j_store_attach(cbm_store_t *s, const char *db_path, c
     n4s_ctx_t *x = ctx_open(db_path, project, err, err_sz, &status);
     if (!x) {
         if (status == CBM_NEO4J_ATTACH_FALLBACK) {
-            cbm_log_warn("neo4j.attach", "project", project, "result", "sqlite_fallback", "err",
+            cbm_log_warn("neo4j.attach", "project", project, "result", "unavailable", "err",
                          err ? err : "");
         }
         return (cbm_neo4j_attach_t)status;

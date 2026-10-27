@@ -60,9 +60,8 @@ int cbm_neo4j_drop_project(cbm_neo4j_t *c, const char *project, char *err, size_
 /* Post-publish hook used by the pipeline. explicit_cfg != NULL means the
  * caller asked for Neo4j on this run (index_repository graph_db); NULL means
  * inherit the project's marker, if any. disable == true removes the marker
- * (graph_db "sqlite"/"none"). Returns 0, or -1 with err when an explicit
- * request could not be honored (inherited sync failures are logged and
- * reported through err but still return 0). */
+ * (graph_db "sqlite"/"none"). Returns 0, or -1 with err when the graph could
+ * not be synced -- explicit or inherited alike (a malformed marker too). */
 int cbm_neo4j_after_publish(const char *db_path, const char *project,
                             const cbm_neo4j_config_t *explicit_cfg, bool disable, char *err,
                             size_t err_sz);

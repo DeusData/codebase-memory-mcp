@@ -93,3 +93,6 @@ soak-results-query-leak/
 # Nix build symlinks (nix build → ./result, ./result-1, …)
 /result
 /result-*
+
+# Local secrets for the docker/graph stack
+docker/graph/.env

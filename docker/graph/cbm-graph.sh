@@ -3,11 +3,15 @@
 #
 # Mounts:
 #   /input/repo        the repository (read-only is fine; it is never modified)
-#   /input/cbmignore   optional extra .cbmignore (e.g. a fleet-wide one)
+#   /repos/<CBM_NAME>  where CBM_NO_COPY=1 looks first (/input/repo otherwise)
+#   /input/cbmignore   optional extra .cbmignore (e.g. a fleet-wide one);
+#                      ignored with CBM_NO_COPY=1
 #   /data              named volume: index cache + working copies (incremental)
 # Environment:
 #   CBM_NAME           project name (required)
 #   CBM_FRESH=1        drop the project first and rebuild from scratch
+#   CBM_NO_COPY=1      index the mounted repository in place instead of a synced
+#                      copy; only the repository's own .cbmignore applies
 #   NEO4J_URI          default http://host.docker.internal:7474
 #   NEO4J_USER         default neo4j
 #   NEO4J_PASSWORD     required
@@ -19,16 +23,36 @@ die() { echo "cbm-graph: $*" >&2; exit 2; }
 NAME=${CBM_NAME:-}
 [ -n "$NAME" ] || die "CBM_NAME is required"
 [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "CBM_NAME may contain only letters, digits, '.', '_' and '-'"
-[ -d /input/repo ] || die "mount the repository at /input/repo"
+[ -d /input/repo ] || { [ "${CBM_NO_COPY:-0}" = 1 ] && [ -d "/repos/$NAME" ]; } ||
+    die "mount the repository at /input/repo (or /repos/$NAME with CBM_NO_COPY=1)"
 [ -n "${NEO4J_PASSWORD:-}" ] || die "NEO4J_PASSWORD is required"
 NEO4J_URI=${NEO4J_URI:-http://host.docker.internal:7474}
 NEO4J_USER=${NEO4J_USER:-neo4j}
 NEO4J_DATABASE=${NEO4J_DATABASE:-neo4j}
 
 WORK=/data/work/$NAME
-mkdir -p "$HOME" "$WORK"
+mkdir -p "$HOME"
 
+if [ "${CBM_NO_COPY:-0}" = 1 ]; then
+# ── In place ─────────────────────────────────────────────────────────
+# The indexer only reads the repository, so a read-only mount is enough. The
+# extra ignore file cannot be merged in: that needs a writable repo root.
+    REPO=/repos/$NAME
+    [ -d "$REPO" ] || REPO=/input/repo
+    [ -f /input/cbmignore ] &&
+        echo "cbm-graph: CBM_NO_COPY=1 ignores /input/cbmignore; only $REPO/.cbmignore applies" >&2
+    [ -f "$REPO/.cbmignore" ] ||
+        echo "cbm-graph: no .cbmignore at the repository root; only the built-in skips apply" >&2
+    [ -d "$WORK" ] &&
+        echo "cbm-graph: an old working copy of $NAME is no longer used; free it with: rm -rf $WORK" >&2
+    # The mount is owned by another user, and a fleet folder holds many repos.
+    git config --global --get-all safe.directory 2>/dev/null | grep -qx '\*' ||
+        git config --global --add safe.directory '*'
+    echo "== indexing in place (no copy): $REPO"
+else
 # ── Working copy ─────────────────────────────────────────────────────
+mkdir -p "$WORK"
+REPO=$WORK
 # The indexer reads .cbmignore only from the repo root, and the source must
 # stay untouched, so index a synced copy with the extra rules merged in.
 # Paths an ignore rule excludes are also skipped by the copy (a jar-heavy
@@ -58,6 +82,7 @@ if [ -d "$WORK/.git" ]; then
     grep -qx '.cbmignore' "$WORK/.git/info/exclude" 2>/dev/null ||
         { mkdir -p "$WORK/.git/info"; echo '.cbmignore' >> "$WORK/.git/info/exclude"; }
 fi
+fi
 
 # ── Index ────────────────────────────────────────────────────────────
 if [ "${CBM_FRESH:-0}" = 1 ]; then
@@ -66,7 +91,7 @@ if [ "${CBM_FRESH:-0}" = 1 ]; then
 fi
 
 echo "== indexing $NAME into $NEO4J_URI (database $NEO4J_DATABASE)"
-OUT=$(codebase-memory-mcp cli index_repository --repo-path "$WORK" --name "$NAME" \
+OUT=$(codebase-memory-mcp cli index_repository --repo-path "$REPO" --name "$NAME" \
       --graph-db "$NEO4J_URI" --graph-user "$NEO4J_USER" --graph-database "$NEO4J_DATABASE" 2>&1) || true
 STATUS=$(printf '%s' "$OUT" | grep -o '"status":"[^"]*"' | tail -1 | cut -d'"' -f4)
 if [ "$STATUS" != "indexed" ] && [ "$STATUS" != "degraded" ]; then

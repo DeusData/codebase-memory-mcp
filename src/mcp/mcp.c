@@ -2528,8 +2528,9 @@ typedef enum {
 } store_recovery_status_t;
 
 /* A Neo4j-backed project answers graph reads from Neo4j; the SQLite file keeps
- * serving everything else (and the graph too when Neo4j is unusable -- named
- * in the reply by cbm_mcp_handle_tool). Called on both resolve paths, the
+ * serving everything else. When Neo4j is unusable the reason is kept and
+ * cbm_mcp_handle_tool refuses the graph read instead of answering from the
+ * local index. Called on both resolve paths, the
  * direct <project>.db open and the internal-name scan (#704), so a database
  * found under another file name is no silent exception. */
 static void mcp_attach_graph_backend(cbm_mcp_server_t *srv, const char *db_path,
@@ -7460,8 +7461,8 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
 }
 
 /* graph_backend: where graph reads come from. For a Neo4j-backed project
- * whose Neo4j copy cannot serve right now, status says sqlite_fallback and
- * names why (reads stay correct: the local copy is the same graph). */
+ * whose Neo4j copy cannot serve right now, status says unavailable and names
+ * why; graph reads are refused until it can (no local fallback). */
 static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
                                      const char *project) {
     char path[CBM_SZ_1K];
@@ -7494,7 +7495,7 @@ static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root, 
             }
         }
         bool attached = cbm_store_is_remote(store);
-        yyjson_mut_obj_add_str(doc, gb, "status", attached ? "serving" : "sqlite_fallback");
+        yyjson_mut_obj_add_str(doc, gb, "status", attached ? "serving" : "unavailable");
         if (!attached) {
             /* Re-run the attach checks on a throwaway store to name the cause. */
             cbm_store_t *probe = cbm_store_open_path_query(path);
@@ -12801,9 +12802,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     } else if (rc == CBM_PIPELINE_GRAPH_SYNC_FAILED) {
         char hint[CBM_SZ_2K];
         (void)snprintf(hint, sizeof(hint),
-                       "The local index was published, but mirroring it into Neo4j failed: %s. "
-                       "Graph tools keep serving the previous Neo4j generation (if any). Fix "
-                       "the Neo4j connection and re-run index_repository with graph_db.",
+                       "Indexing into Neo4j failed: %s. Graph tools refuse to answer for this "
+                       "project until Neo4j holds the current graph (they never fall back to "
+                       "the local index). Fix the Neo4j connection or login and re-run "
+                       "index_repository.",
                        cbm_pipeline_graph_error(p));
         yyjson_mut_obj_add_str(doc, root, "status", "graph_sync_failed");
         yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
@@ -20795,16 +20797,10 @@ static bool mcp_tool_reads_in_batch(const char *tool_name) {
     return false;
 }
 
-/* A Neo4j-backed project whose graph reads fell back to the local index
- * (Neo4j unreachable, credentials rejected, or holding another generation):
- * the answer is still correct -- the local index is the newest published
- * generation and Neo4j only mirrors it -- but the caller must be able to see
- * that Neo4j did not serve it. Appends a text notice to content and, for a
- * structured reply, a graph_backend object. Takes ownership of result; on any
- * failure the original reply is returned unchanged. */
-/* Append a graph_backend report to an MCP tool result: `notice` as a text
- * content item, and {kind: neo4j, status, served_by, remote_queries, local,
- * reason} as structuredContent.graph_backend when the reply is structured and
+/* Append a graph_backend report to an MCP tool result: `notice` (when not
+ * NULL) as a text content item, and {kind: neo4j, status, served_by,
+ * remote_queries, local, reason} as structuredContent.graph_backend when the
+ * reply is structured and
  * does not already carry one (index_status). Takes ownership of result; on
  * any failure the original reply is returned unchanged. */
 static char *mcp_result_append_backend(char *result, const char *notice, const char *status,
@@ -20822,10 +20818,12 @@ static char *mcp_result_append_backend(char *result, const char *notice, const c
         yyjson_mut_doc_free(doc);
         return result;
     }
-    yyjson_mut_val *item = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, item, "type", "text");
-    yyjson_mut_obj_add_strcpy(doc, item, "text", notice);
-    yyjson_mut_arr_append(content, item);
+    if (notice) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "type", "text");
+        yyjson_mut_obj_add_strcpy(doc, item, "text", notice);
+        yyjson_mut_arr_append(content, item);
+    }
     yyjson_mut_val *structured = yyjson_mut_obj_get(root, "structuredContent");
     if (yyjson_mut_is_obj(structured) && !yyjson_mut_obj_get(structured, "graph_backend")) {
         yyjson_mut_val *gb = yyjson_mut_obj(doc);
@@ -20854,14 +20852,15 @@ static char *mcp_result_append_backend(char *result, const char *notice, const c
     return out;
 }
 
-char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
-    char notice[CBM_SZ_1K];
-    (void)snprintf(notice, sizeof(notice),
-                   "graph_backend: sqlite_fallback -- this Neo4j-backed project was answered from "
-                   "the local index, not Neo4j (%s). The answer is current; Neo4j is not. Re-run "
-                   "index_repository with graph_db to resync, and see index_status.",
-                   reason);
-    return mcp_result_append_backend(result, notice, "sqlite_fallback", "local", -1, NULL, reason);
+char *cbm_mcp_graph_unavailable_result(const char *tool_name, const char *reason) {
+    char msg[CBM_SZ_1K];
+    (void)snprintf(msg, sizeof(msg),
+                   "%s: this project is Neo4j-backed and Neo4j cannot serve it (%s). Graph reads "
+                   "never fall back to the local index. Fix the Neo4j connection or login, or "
+                   "re-run index_repository with graph_db to resync; index_status shows the cause.",
+                   tool_name && tool_name[0] ? tool_name : "graph read", reason);
+    return mcp_result_append_backend(cbm_mcp_text_result(msg, true), NULL, "unavailable", NULL, -1,
+                                     NULL, reason);
 }
 
 const char *cbm_mcp_graph_served_by(uint64_t remote_queries, int local_reads) {
@@ -20900,15 +20899,35 @@ char *cbm_mcp_result_add_graph_served(char *result, uint64_t remote_queries, int
                                      (int64_t)remote_queries, local_reads > 0 ? what : NULL, NULL);
 }
 
+/* Tools that manage a project rather than read its graph: they keep working
+ * while Neo4j is down, so the cause can be seen (index_status) and repaired
+ * (index_repository, delete_project). */
+static bool mcp_tool_works_without_graph(const char *tool_name) {
+    static const char *const tools[] = {"index_repository", "index_status", "list_projects",
+                                        "delete_project",   "manage_adr",   "ingest_traces"};
+    for (size_t i = 0; tool_name && i < sizeof(tools) / sizeof(tools[0]); i++) {
+        if (strcmp(tool_name, tools[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Name the graph backend in every reply of a Neo4j-backed project, and log it
- * (info, so the daemon log answers "did this come from Neo4j?" afterwards). */
+ * (info, so the daemon log answers "did this come from Neo4j?" afterwards).
+ * A graph read that Neo4j could not serve is refused: its local-index answer
+ * is discarded, never returned in Neo4j's place. */
 static char *mcp_report_graph_backend(cbm_mcp_server_t *srv, const char *tool_name,
                                       char *result) {
     const char *project = srv->current_project ? srv->current_project : "";
     if (srv->graph_fallback_reason[0]) {
-        cbm_log_info("graph.backend", "tool", tool_name, "project", project, "served_by",
-                     "sqlite_fallback", "reason", srv->graph_fallback_reason);
-        return cbm_mcp_result_add_graph_fallback(result, srv->graph_fallback_reason);
+        if (mcp_tool_works_without_graph(tool_name)) {
+            return result;
+        }
+        cbm_log_warn("graph.backend", "tool", tool_name, "project", project, "served_by",
+                     "refused", "reason", srv->graph_fallback_reason);
+        free(result);
+        return cbm_mcp_graph_unavailable_result(tool_name, srv->graph_fallback_reason);
     }
     if (!srv->store || !cbm_store_is_remote(srv->store)) {
         return result;

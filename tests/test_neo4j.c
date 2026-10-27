@@ -586,7 +586,7 @@ TEST(neo4j_native_query_is_read_only) {
     PASS();
 }
 
-/* ── Response validation and fallback visibility ─────────────────── */
+/* ── Response validation and no-fallback behavior ─────────────────── */
 
 static const char *shape_of(const char *json, int statements) {
     static char verdict[128];
@@ -644,42 +644,73 @@ TEST(neo4j_sidecar_records_last_sync_error) {
     PASS();
 }
 
-TEST(neo4j_fallback_is_visible_in_tool_replies) {
-    /* Structured reply: a text notice plus structuredContent.graph_backend. */
-    char *reply = cbm_mcp_result_add_graph_fallback(cbm_mcp_text_result("{\"rows\":3}", false),
-                                                    "Neo4j unreachable");
+TEST(neo4j_unavailable_graph_read_is_an_error) {
+    /* A graph read Neo4j cannot serve is refused, never answered locally. */
+    char *reply = cbm_mcp_graph_unavailable_result("trace_path", "Neo4j unreachable");
     ASSERT_NOT_NULL(reply);
     yyjson_doc *d = yyjson_read(reply, strlen(reply), 0);
+    ASSERT_NOT_NULL(d);
     yyjson_val *root = yyjson_doc_get_root(d);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "isError")));
     yyjson_val *content = yyjson_obj_get(root, "content");
-    ASSERT_EQ((int)yyjson_arr_size(content), 2);
-    const char *notice = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(content, 1), "text"));
-    ASSERT_NOT_NULL(notice);
-    ASSERT_NOT_NULL(strstr(notice, "sqlite_fallback"));
-    ASSERT_NOT_NULL(strstr(notice, "Neo4j unreachable"));
+    ASSERT_EQ((int)yyjson_arr_size(content), 1);
+    const char *text = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(content, 0), "text"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "trace_path"));
+    ASSERT_NOT_NULL(strstr(text, "Neo4j unreachable"));
+    ASSERT_NOT_NULL(strstr(text, "never fall back"));
     yyjson_val *gb = yyjson_obj_get(yyjson_obj_get(root, "structuredContent"), "graph_backend");
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "status")), "sqlite_fallback");
-    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "reason")), "Neo4j unreachable");
-    /* The original payload is untouched. */
-    ASSERT_EQ(
-        (int)yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "structuredContent"), "rows")), 3);
+    if (gb) {
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "status")), "unavailable");
+        ASSERT_NULL(yyjson_obj_get(gb, "served_by"));
+    }
     yyjson_doc_free(d);
     free(reply);
+    PASS();
+}
 
-    /* Text-shaped reply: the notice still lands in content. */
-    reply = cbm_mcp_result_add_graph_fallback(cbm_mcp_text_result("rows: 3", false), "stale");
-    d = yyjson_read(reply, strlen(reply), 0);
-    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(d), "content")), 2);
-    yyjson_doc_free(d);
-    free(reply);
+TEST(neo4j_inherited_sync_failure_fails_the_run) {
+    clear_neo4j_env();
+    char *dir = th_mktempdir("cbm_n4_inherit");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/proj.db", dir);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "proj", dir);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    cbm_store_close(s);
 
-    /* Not a tool-result object: returned unchanged. */
-    char *plain = malloc(8);
-    memcpy(plain, "garbage", 8);
-    reply = cbm_mcp_result_add_graph_fallback(plain, "x");
-    ASSERT_STR_EQ(reply, "garbage");
-    free(reply);
-    ASSERT_NULL(cbm_mcp_result_add_graph_fallback(NULL, "x"));
+    char err[512];
+    /* A plain SQLite project has nothing to sync. */
+    ASSERT_EQ(cbm_neo4j_after_publish(db, "proj", NULL, false, err, sizeof(err)), 0);
+
+    /* Neo4j-backed (marker present) but Neo4j unreachable: a re-index that
+     * inherits the backend fails instead of publishing a local-only graph. */
+    cbm_neo4j_config_t c;
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://127.0.0.1:1", "neo4j", "pw", NULL, &c, err,
+                                       sizeof(err)),
+              0);
+    ASSERT_EQ(cbm_neo4j_sidecar_write(db, &c, ""), 0);
+    cbm_neo4j_config_wipe(&c);
+    cbm_setenv("NEO4J_PASSWORD", "pw", 1);
+    ASSERT_EQ(cbm_neo4j_after_publish(db, "proj", NULL, false, err, sizeof(err)), -1);
+    ASSERT_TRUE(err[0] != '\0');
+    char field[256];
+    ASSERT_EQ(cbm_neo4j_sidecar_field(db, "last_sync_error", field, sizeof(field)), 0);
+    ASSERT_TRUE(field[0] != '\0');
+
+    /* A malformed marker fails too, rather than silently going local. */
+    char marker[600];
+    ASSERT_EQ(cbm_neo4j_sidecar_path(db, marker, sizeof(marker)), 0);
+    FILE *f = fopen(marker, "wb");
+    ASSERT_NOT_NULL(f);
+    fputs("{not json", f);
+    fclose(f);
+    ASSERT_EQ(cbm_neo4j_after_publish(db, "proj", NULL, false, err, sizeof(err)), -1);
+
+    clear_neo4j_env();
+    th_rmtree(dir);
     PASS();
 }
 
@@ -952,7 +983,8 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_native_query_is_read_only);
     RUN_TEST(neo4j_rejects_malformed_2xx_bodies);
     RUN_TEST(neo4j_sidecar_records_last_sync_error);
-    RUN_TEST(neo4j_fallback_is_visible_in_tool_replies);
+    RUN_TEST(neo4j_unavailable_graph_read_is_an_error);
+    RUN_TEST(neo4j_inherited_sync_failure_fails_the_run);
     RUN_TEST(neo4j_routed_lookups_apply_local_predicates);
     RUN_TEST(neo4j_marker_found_for_renamed_database);
     RUN_TEST(neo4j_served_by_is_named_in_replies);
