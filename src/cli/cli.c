@@ -22,6 +22,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/sha256.h"
@@ -4112,13 +4113,14 @@ static int cbm_reconcile_codex_hooks_command_detailed(const char *config_path, c
                                                       const char *command_windows,
                                                       cbm_toml_codex_hook_action_t action,
                                                       bool check_only,
-                                                      cbm_toml_codex_hook_failure_t *failure) {
+                                                      cbm_toml_codex_hook_failure_t *failure,
+                                                      int *pretool_written) {
     if (!config_path || !command || !command_windows) {
         return CLI_ERR;
     }
-    return cbm_toml_reconcile_codex_hooks_detailed(config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END,
-                                                   command, command_windows, action,
-                                                   check_only ? 1 : 0, failure) == 0
+    return cbm_toml_reconcile_codex_hooks_detailed(
+               config_path, CODEX_HOOK_BEGIN, CODEX_HOOK_END, command, command_windows, action,
+               check_only ? 1 : 0, failure, pretool_written) == 0
                ? CLI_OK
                : CLI_ERR;
 }
@@ -4126,7 +4128,7 @@ static int cbm_reconcile_codex_hooks_command(const char *config_path, const char
                                              const char *command_windows,
                                              cbm_toml_codex_hook_action_t action, bool check_only) {
     return cbm_reconcile_codex_hooks_command_detailed(config_path, command, command_windows, action,
-                                                      check_only, NULL);
+                                                      check_only, NULL, NULL);
 }
 static int cbm_upsert_codex_hooks_command(const char *config_path, const char *command,
                                           const char *command_windows) {
@@ -4197,7 +4199,8 @@ enum { COPILOT_HOOK_TIMEOUT_SEC = 5 };
 static int cbm_build_copilot_hook_command(const char *binary_path, const char *event,
                                           bool powershell, char *out, size_t out_size) {
     if (!binary_path || !event || !out ||
-        (strcmp(event, "SessionStart") != 0 && strcmp(event, "SubagentStart") != 0)) {
+        (strcmp(event, "SessionStart") != 0 && strcmp(event, "SubagentStart") != 0 &&
+         strcmp(event, "PostToolUse") != 0)) {
         return CLI_ERR;
     }
     char quoted[CLI_BUF_8K];
@@ -4214,11 +4217,12 @@ static int cbm_build_copilot_hook_command(const char *binary_path, const char *e
 }
 
 static bool cbm_copilot_add_hook_event(yyjson_mut_doc *doc, yyjson_mut_val *hooks,
-                                       const char *event_key, const char *bash_command,
-                                       const char *powershell_command) {
+                                       const char *event_key, const char *matcher,
+                                       const char *bash_command, const char *powershell_command) {
     yyjson_mut_val *entries = yyjson_mut_arr(doc);
     yyjson_mut_val *entry = yyjson_mut_obj(doc);
     if (!entries || !entry || !yyjson_mut_obj_add_str(doc, entry, "type", "command") ||
+        (matcher && !yyjson_mut_obj_add_str(doc, entry, "matcher", matcher)) ||
         !yyjson_mut_obj_add_str(doc, entry, "bash", bash_command) ||
         !yyjson_mut_obj_add_str(doc, entry, "powershell", powershell_command) ||
         !yyjson_mut_obj_add_int(doc, entry, "timeoutSec", COPILOT_HOOK_TIMEOUT_SEC) ||
@@ -4229,11 +4233,25 @@ static bool cbm_copilot_add_hook_event(yyjson_mut_doc *doc, yyjson_mut_val *hook
     return true;
 }
 
-static char *cbm_build_copilot_hook_manifest(const char *binary_path) {
+/* Copilot CLI's preToolUse cannot add model context (its output is only a
+ * permission decision) and fails closed on hook errors, so searches are
+ * augmented after they run: postToolUse additionalContext is appended to the
+ * tool result the model sees. The PascalCase event name selects the
+ * Claude-format payload (tool_name Bash/Grep/Glob, tool_input), and the matcher
+ * names the Claude and the runtime tool names so either matcher reading fires. */
+#define COPILOT_SEARCH_MATCHER "Bash|Grep|Glob|bash|powershell|grep|rg|glob"
+
+/* include_posttool renders the current manifest; without it the function
+ * renders the previous lifecycle-only manifest, which installs up to v0.12 wrote
+ * and which upgrades and uninstalls must still recognize as owned. The result is
+ * released with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
+static char *cbm_build_copilot_hook_manifest(const char *binary_path, bool include_posttool) {
     char session_bash[CLI_BUF_8K];
     char session_powershell[CLI_BUF_8K];
     char subagent_bash[CLI_BUF_8K];
     char subagent_powershell[CLI_BUF_8K];
+    char post_bash[CLI_BUF_8K];
+    char post_powershell[CLI_BUF_8K];
     if (cbm_build_copilot_hook_command(binary_path, "SessionStart", false, session_bash,
                                        sizeof(session_bash)) != CLI_OK ||
         cbm_build_copilot_hook_command(binary_path, "SessionStart", true, session_powershell,
@@ -4241,7 +4259,11 @@ static char *cbm_build_copilot_hook_manifest(const char *binary_path) {
         cbm_build_copilot_hook_command(binary_path, "SubagentStart", false, subagent_bash,
                                        sizeof(subagent_bash)) != CLI_OK ||
         cbm_build_copilot_hook_command(binary_path, "SubagentStart", true, subagent_powershell,
-                                       sizeof(subagent_powershell)) != CLI_OK) {
+                                       sizeof(subagent_powershell)) != CLI_OK ||
+        cbm_build_copilot_hook_command(binary_path, "PostToolUse", false, post_bash,
+                                       sizeof(post_bash)) != CLI_OK ||
+        cbm_build_copilot_hook_command(binary_path, "PostToolUse", true, post_powershell,
+                                       sizeof(post_powershell)) != CLI_OK) {
         return NULL;
     }
 
@@ -4255,39 +4277,59 @@ static char *cbm_build_copilot_hook_manifest(const char *binary_path) {
         return NULL;
     }
     yyjson_mut_doc_set_root(doc, root);
-    bool ok =
-        yyjson_mut_obj_add_int(doc, root, "version", 1) &&
-        cbm_copilot_add_hook_event(doc, hooks, "sessionStart", session_bash, session_powershell) &&
-        cbm_copilot_add_hook_event(doc, hooks, "subagentStart", subagent_bash,
-                                   subagent_powershell) &&
-        yyjson_mut_obj_add_val(doc, root, "hooks", hooks);
-    char *manifest = ok ? yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL) : NULL;
+    bool ok = yyjson_mut_obj_add_int(doc, root, "version", 1) &&
+              cbm_copilot_add_hook_event(doc, hooks, "sessionStart", NULL, session_bash,
+                                         session_powershell) &&
+              cbm_copilot_add_hook_event(doc, hooks, "subagentStart", NULL, subagent_bash,
+                                         subagent_powershell) &&
+              (!include_posttool ||
+               cbm_copilot_add_hook_event(doc, hooks, "PostToolUse", COPILOT_SEARCH_MATCHER,
+                                          post_bash, post_powershell)) &&
+              yyjson_mut_obj_add_val(doc, root, "hooks", hooks);
+    char *manifest = ok ? yyjson_mut_write_opts(doc, YYJSON_WRITE_PRETTY,
+                                                cbm_json_writer_allocator(), NULL, NULL)
+                        : NULL;
     yyjson_mut_doc_free(doc);
     return manifest;
 }
 
+#ifdef CBM_CLI_ENABLE_TEST_API
+char *cbm_build_copilot_hook_manifest_for_testing(const char *binary_path, bool include_posttool) {
+    return cbm_build_copilot_hook_manifest(binary_path, include_posttool);
+}
+#endif
+
 /* Copilot loads every manifest in $COPILOT_HOME/hooks. Treat our dedicated
- * filename as an exact-owned document: a foreign collision fails closed, and
- * uninstall accepts only the complete generated lifecycle schema. */
+ * filename as an exact-owned document: a foreign collision fails closed. The
+ * current manifest or the exact previous one is ours, so install upgrades the
+ * previous one in place and uninstall removes either. */
 static int cbm_upsert_copilot_hooks(const char *binary_path, const char *manifest_path) {
-    char *manifest = cbm_build_copilot_hook_manifest(binary_path);
-    if (!manifest || !manifest_path) {
-        free(manifest);
+    char *manifest = cbm_build_copilot_hook_manifest(binary_path, true);
+    char *previous = cbm_build_copilot_hook_manifest(binary_path, false);
+    if (!manifest || !previous || !manifest_path) {
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
         return CLI_ERR;
     }
-    int rc = cbm_text_ensure_owned_document(manifest_path, manifest);
-    free(manifest);
+    const char *const released[] = {previous};
+    int rc = cbm_text_migrate_owned_document(manifest_path, manifest, released, 1U);
+    cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     return rc == 0 ? CLI_OK : CLI_ERR;
 }
 
 static int cbm_remove_copilot_hooks(const char *manifest_path, const char *binary_path) {
-    char *manifest = cbm_build_copilot_hook_manifest(binary_path);
-    if (!manifest || !manifest_path) {
-        free(manifest);
+    char *manifest = cbm_build_copilot_hook_manifest(binary_path, true);
+    char *previous = cbm_build_copilot_hook_manifest(binary_path, false);
+    if (!manifest || !previous || !manifest_path) {
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
         return CLI_ERR;
     }
-    int rc = cbm_text_remove_owned_document(manifest_path, manifest);
-    free(manifest);
+    const char *const released[] = {previous};
+    int rc = cbm_text_remove_owned_document_any(manifest_path, manifest, released, 1U);
+    cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     return rc >= 0 ? CLI_OK : CLI_ERR;
 }
 
@@ -6566,6 +6608,35 @@ static int cbm_remove_paired_lifecycle_hooks_json(const char *settings_path,
         .match_command_exact = canonical_command,
     });
     return session_result == CLI_OK && subagent_result == CLI_OK ? CLI_OK : CLI_ERR;
+}
+
+/* Codex names its shell tool Bash and passes {"command": "..."} as tool_input,
+ * the payload hook-augment already augments for Claude Code. Only the entry whose
+ * command is exactly ours is touched; the user's own PreToolUse hooks stay. */
+static int cbm_upsert_codex_pretool_hooks_json(const char *settings_path, const char *command,
+                                               const char *command_windows) {
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PreToolUse",
+        .matcher_str = "Bash",
+        .command_str = command,
+        .command_windows = command_windows,
+        .timeout_value = CMM_HOOK_TIMEOUT_SEC,
+        .match_command_exact = command,
+    });
+}
+
+static int cbm_remove_codex_pretool_hooks_json(const char *settings_path,
+                                               const char *canonical_command) {
+    if (!canonical_command) {
+        return CLI_ERR;
+    }
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PreToolUse",
+        .matcher_str = "Bash",
+        .match_command_exact = canonical_command,
+    });
 }
 
 static int cbm_remove_qwen_lifecycle_hooks(const char *settings_path, const char *binary_path,
@@ -9163,7 +9234,8 @@ static void install_copilot_durable_context(const char *home, const char *binary
         record_agent_config_error(false, "Copilot", "lifecycle_hook_install", hook_path);
     }
     if (hook_ok) {
-        printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+        printf("  hooks: SessionStart + SubagentStart + PostToolUse searches (dynamic graph "
+               "context)\n");
     }
 }
 
@@ -9804,7 +9876,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
         int preflight_result = commands_ok ? cbm_reconcile_codex_hooks_command_detailed(
                                                  cp, command, command_windows, preflight_action,
-                                                 true, &preflight_failure)
+                                                 true, &preflight_failure, NULL)
                                            : CLI_ERR;
         if (preflight_result != CLI_OK) {
             if (!g_install_plan) {
@@ -9847,19 +9919,29 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             plan_record("Codex CLI", "hook", hook_target);
         } else {
             bool hook_ok = true;
+            int pretool_written = 1;
             if (!dry_run && use_hooks_json) {
                 hook_ok =
                     cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
                                                            NULL, CMM_HOOK_TIMEOUT_SEC) == CLI_OK &&
+                    cbm_upsert_codex_pretool_hooks_json(hooks_json, command, command_windows) ==
+                        CLI_OK &&
                     cbm_reconcile_codex_hooks_command(cp, command, command_windows,
                                                       CBM_TOML_CODEX_HOOK_REMOVE, false) == CLI_OK;
             } else if (!dry_run) {
-                hook_ok = cbm_upsert_codex_hooks_command(cp, command, command_windows) == CLI_OK;
+                hook_ok = cbm_reconcile_codex_hooks_command_detailed(
+                              cp, command, command_windows, CBM_TOML_CODEX_HOOK_UPSERT, false, NULL,
+                              &pretool_written) == CLI_OK;
             }
             if (!hook_ok) {
                 record_agent_config_error(false, "Codex CLI", "hook_install", hook_target);
             } else {
-                printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+                printf(pretool_written
+                           ? "  hooks: SessionStart + SubagentStart + PreToolUse Bash (dynamic "
+                             "graph context)\n"
+                           : "  hooks: SessionStart + SubagentStart (dynamic graph context); "
+                             "PreToolUse skipped: config.toml already has an inline "
+                             "hooks.PreToolUse\n");
                 printf("  note: non-managed hooks require /hooks trust; definition changes "
                        "require re-trust\n");
             }
@@ -12285,10 +12367,10 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                                                        installed_binary, hook_command_windows,
                                                        sizeof(hook_command_windows)) == CLI_OK;
         cbm_toml_codex_hook_failure_t preflight_failure = CBM_TOML_CODEX_HOOK_FAILURE_NONE;
-        bool hook_preflight_ok =
-            hook_commands_ok && cbm_reconcile_codex_hooks_command_detailed(
-                                    cp, hook_command, hook_command_windows,
-                                    CBM_TOML_CODEX_HOOK_REMOVE, true, &preflight_failure) == CLI_OK;
+        bool hook_preflight_ok = hook_commands_ok && cbm_reconcile_codex_hooks_command_detailed(
+                                                         cp, hook_command, hook_command_windows,
+                                                         CBM_TOML_CODEX_HOOK_REMOVE, true,
+                                                         &preflight_failure, NULL) == CLI_OK;
         if (!hook_preflight_ok) {
             printf("Codex CLI:\n");
             fflush(stdout);
@@ -12323,7 +12405,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             snprintf(hooks_json, sizeof(hooks_json), "%s/hooks.json", config_dir);
             if (cbm_file_exists(hooks_json) &&
                 (!hook_command_ok ||
-                 cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK)) {
+                 cbm_remove_paired_lifecycle_hooks_json(hooks_json, hook_command) != CLI_OK ||
+                 cbm_remove_codex_pretool_hooks_json(hooks_json, hook_command) != CLI_OK)) {
                 record_agent_config_error(true, "Codex CLI", "json_hook_uninstall", hooks_json);
             }
         }
