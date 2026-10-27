@@ -363,6 +363,51 @@ TEST(ei_relative_astro_css_imports_issue2558) {
     PASS();
 }
 
+/* #2797: an explicit `../` path names one file. A same-named file beside the
+ * importer (checks/values.nix) must not stand in for it, whether the named
+ * file exists (lib/values.nix) or not (gone/values.nix). */
+TEST(ei_nix_parent_relative_import_issue2797) {
+    static const EILangFile f[] = {
+        {"lib/values.nix", "{ port = 1; }\n"},
+        {"lib/helper.nix", "{ x }: { id = x; }\n"},
+        {"checks/values.nix", "{ unrelated = true; }\n"},
+        {"checks/user.nix", "let\n"
+                            "  inherit (import ../lib/helper.nix { x = 1; }) id;\n"
+                            "  port = (import ../lib/values.nix).port;\n"
+                            "  gone = import ../gone/values.nix;\n"
+                            "in\n"
+                            "{ inherit id port; }\n"},
+        {"top.nix", "{ v = (import ./lib/values.nix).port; }\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"checks/user.nix", "lib/helper.nix"},
+        {"checks/user.nix", "lib/values.nix"},
+        {"top.nix", "lib/values.nix"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 3));
+    PASS();
+}
+
+/* #2797: the same basename guess applies to any grammar whose import is a
+ * file path, not only Nix. */
+TEST(ei_thrift_parent_relative_import_issue2797) {
+    static const EILangFile f[] = {
+        {"shared/base.thrift", "struct Base { 1: i32 id }\n"},
+        {"service/base.thrift", "struct Unrelated { 1: bool flag }\n"},
+        {"service/api.thrift", "include \"../shared/base.thrift\"\n"
+                               "service Api { base.Base get() }\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"service/api.thrift", "shared/base.thrift"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 1));
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * GREEN GUARD — Python
  *
@@ -2396,6 +2441,8 @@ TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown) {
 
 SUITE(edge_imports) {
     RUN_TEST(ei_relative_astro_css_imports_issue2558);
+    RUN_TEST(ei_nix_parent_relative_import_issue2797);
+    RUN_TEST(ei_thrift_parent_relative_import_issue2797);
 
     /* ── GREEN GUARDS — Python (must stay passing) ── */
     RUN_TEST(ei_python_relative_from_import);
