@@ -23,6 +23,7 @@
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
 #include <foundation/log.h>
+#include <foundation/mem_core.h>
 #include <foundation/platform.h>
 #include <foundation/private_file_lock.h>
 #include <foundation/sha256.h>
@@ -12763,6 +12764,11 @@ TEST(cli_copilot_install_preserves_foreign_named_manifest) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/.copilot/hooks", tmpdir);
     snprintf(manifest_path, sizeof(manifest_path), "%s/codebase-memory-mcp.json", hooks_dir);
     test_mkdirp(hooks_dir);
+    /* Copilot CLI must be detected, or install and uninstall never reach the
+     * manifest and this test cannot fail. */
+    char copilot_mcp[640];
+    snprintf(copilot_mcp, sizeof(copilot_mcp), "%s/.copilot/mcp-config.json", tmpdir);
+    write_test_file(copilot_mcp, "{}\n");
     const char *foreign = "{\"version\":1,\"hooks\":{\"sessionStart\":[{\"type\":\"command\","
                           "\"bash\":\"user-hook\"}]},\"owner\":\"user\"}\n";
     write_test_file(manifest_path, foreign);
@@ -12795,6 +12801,11 @@ TEST(cli_copilot_uninstall_preserves_foreign_named_manifest) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/.copilot/hooks", tmpdir);
     snprintf(manifest_path, sizeof(manifest_path), "%s/codebase-memory-mcp.json", hooks_dir);
     test_mkdirp(hooks_dir);
+    /* Copilot CLI must be detected, or install and uninstall never reach the
+     * manifest and this test cannot fail. */
+    char copilot_mcp[640];
+    snprintf(copilot_mcp, sizeof(copilot_mcp), "%s/.copilot/mcp-config.json", tmpdir);
+    write_test_file(copilot_mcp, "{}\n");
     const char *foreign = "{\"version\":1,\"hooks\":{\"sessionStart\":[{\"type\":\"command\","
                           "\"bash\":\"user-hook\"}]},\"owner\":\"user\"}\n";
     write_test_file(manifest_path, foreign);
@@ -12831,6 +12842,11 @@ TEST(cli_copilot_uninstall_preserves_canonical_shaped_foreign_manifest) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/.copilot/hooks", tmpdir);
     snprintf(manifest_path, sizeof(manifest_path), "%s/codebase-memory-mcp.json", hooks_dir);
     test_mkdirp(hooks_dir);
+    /* Copilot CLI must be detected, or install and uninstall never reach the
+     * manifest and this test cannot fail. */
+    char copilot_mcp[640];
+    snprintf(copilot_mcp, sizeof(copilot_mcp), "%s/.copilot/mcp-config.json", tmpdir);
+    write_test_file(copilot_mcp, "{}\n");
     const char *foreign =
         "{\"version\":1,\"hooks\":{"
         "\"sessionStart\":[{\"type\":\"command\","
@@ -12861,6 +12877,111 @@ TEST(cli_copilot_uninstall_preserves_canonical_shaped_foreign_manifest) {
     test_rmdir_r(tmpdir);
     if (rc != 0 || !preserved)
         FAIL("Copilot uninstall must not claim a canonical-shaped manifest for another binary");
+    PASS();
+}
+
+/* Copilot's preToolUse can only decide permissions, so the managed manifest
+ * augments searches through a PascalCase PostToolUse entry whose matcher names
+ * the Claude and the runtime tool names. The previous lifecycle-only manifest
+ * is still rendered so upgrades and uninstalls recognize it. */
+TEST(cli_copilot_manifest_adds_posttooluse_search_hook) {
+    const char *binary = "/usr/local/bin/codebase-memory-mcp";
+    char *current = cbm_build_copilot_hook_manifest_for_testing(binary, true);
+    char *previous = cbm_build_copilot_hook_manifest_for_testing(binary, false);
+    ASSERT_NOT_NULL(current);
+    ASSERT_NOT_NULL(previous);
+    yyjson_doc *doc = yyjson_read(current, strlen(current), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *hooks = yyjson_obj_get(yyjson_doc_get_root(doc), "hooks");
+    yyjson_val *post = yyjson_obj_get(hooks, "PostToolUse");
+    yyjson_val *entry = yyjson_arr_get(post, 0U);
+    const char *matcher = yyjson_get_str(yyjson_obj_get(entry, "matcher"));
+    const char *bash = yyjson_get_str(yyjson_obj_get(entry, "bash"));
+    const char *powershell = yyjson_get_str(yyjson_obj_get(entry, "powershell"));
+    bool shaped = yyjson_obj_get(hooks, "sessionStart") && yyjson_obj_get(hooks, "subagentStart") &&
+                  yyjson_arr_size(post) == 1U && matcher &&
+                  strcmp(matcher, "Bash|Grep|Glob|bash|powershell|grep|rg|glob") == 0 && bash &&
+                  strstr(bash, "hook-augment --event PostToolUse --dialect copilot") &&
+                  powershell && strncmp(powershell, "& ", 2) == 0 &&
+                  strstr(powershell, "hook-augment --event PostToolUse --dialect copilot") &&
+                  yyjson_get_int(yyjson_obj_get(entry, "timeoutSec")) == 5;
+    bool previous_shape = strstr(previous, "sessionStart") && strstr(previous, "subagentStart") &&
+                          !strstr(previous, "PostToolUse");
+    yyjson_doc_free(doc);
+    cbm_free(CBM_MEM_CLASS_OTHER, current);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
+    if (!shaped || !previous_shape)
+        FAIL("Copilot manifest must add one PostToolUse search hook beside the lifecycle pair");
+    PASS();
+}
+
+/* An install that finds the previous lifecycle-only manifest upgrades it in
+ * place to the current manifest, and an uninstall removes the previous one. */
+TEST(cli_copilot_install_upgrades_previous_manifest) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-copilot-upgrade-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    char manifest_path[640];
+    char copilot_mcp[640];
+    char binary[640];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.copilot/hooks", tmpdir);
+    snprintf(manifest_path, sizeof(manifest_path), "%s/codebase-memory-mcp.json", hooks_dir);
+    snprintf(copilot_mcp, sizeof(copilot_mcp), "%s/.copilot/mcp-config.json", tmpdir);
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    test_mkdirp(hooks_dir);
+    write_test_file(copilot_mcp, "{}\n");
+    char *previous = cbm_build_copilot_hook_manifest_for_testing(binary, false);
+    char *current = cbm_build_copilot_hook_manifest_for_testing(binary, true);
+    if (!previous || !current) {
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
+        cbm_free(CBM_MEM_CLASS_OTHER, current);
+        test_rmdir_r(tmpdir);
+        FAIL("Copilot manifest rendering failed");
+    }
+    write_test_file(manifest_path, previous);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_copilot = save_test_env("COPILOT_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("COPILOT_HOME");
+    int install_rc = cbm_install_agent_configs(tmpdir, binary, false, false);
+    char *upgraded = read_test_file_alloc(manifest_path);
+    bool is_current = upgraded && strcmp(upgraded, current) == 0;
+    int second_rc = cbm_install_agent_configs(tmpdir, binary, false, false);
+    char *again = read_test_file_alloc(manifest_path);
+    bool stable = again && strcmp(again, current) == 0;
+
+    write_test_file(manifest_path, previous);
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    struct stat removed;
+    bool previous_removed = stat(manifest_path, &removed) != 0;
+
+    free(upgraded);
+    free(again);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
+    cbm_free(CBM_MEM_CLASS_OTHER, current);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("COPILOT_HOME", saved_copilot);
+    test_rmdir_r(tmpdir);
+    if (install_rc != 0 || !is_current || second_rc != 0 || !stable || uninstall_rc != 0 ||
+        !previous_removed) {
+        fprintf(stderr,
+                "Copilot upgrade diag install_rc=%d current=%d second_rc=%d stable=%d "
+                "uninstall_rc=%d previous_removed=%d\n",
+                install_rc, is_current, second_rc, stable, uninstall_rc, previous_removed);
+        FAIL("Copilot install must upgrade, and uninstall must remove, the previous manifest");
+    }
     PASS();
 }
 
@@ -13908,6 +14029,105 @@ TEST(cli_hook_augment_codex_pretooluse_payload) {
 
     if (!reached)
         FAIL("a Codex-shaped PreToolUse Bash payload must reach graph search augmentation");
+    PASS();
+}
+
+/* Copilot runs the managed hook as `--event PostToolUse --dialect copilot`.
+ * Its payload may name the runtime tool (rg, bash) or the Claude tool, may use
+ * camelCase fields, and may carry the arguments as a JSON string; each form
+ * reaches the graph lookup, and the answer is Copilot's top-level
+ * additionalContext, which Copilot appends after the tool result, so the text
+ * must not place the search results below it. */
+TEST(cli_hook_augment_copilot_posttooluse_search) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *inputs[] = {
+        "{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"rg\",\"cwd\":\"/tmp/hookproj\","
+        "\"tool_input\":{\"pattern\":\"someIndexedSymbol\"},"
+        "\"tool_result\":{\"result_type\":\"success\",\"text_result_for_llm\":\"mod.py:1\"}}",
+        "{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"Bash\",\"cwd\":\"/tmp/hookproj\","
+        "\"tool_input\":{\"command\":\"rg -n someIndexedSymbol .\"}}",
+        "{\"cwd\":\"/tmp/hookproj\",\"toolName\":\"bash\","
+        "\"toolArgs\":\"{\\\"command\\\":\\\"grep -rn someIndexedSymbol .\\\"}\"}",
+    };
+    bool reached[3] = {false, false, false};
+    for (size_t i = 0U; i < 3U; i++) {
+        char *output = cbm_hook_augment_process_for(srv, inputs[i], "PostToolUse", "copilot");
+        yyjson_doc *doc = output ? yyjson_read(output, strlen(output), 0) : NULL;
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        const char *context = yyjson_get_str(yyjson_obj_get(root, "additionalContext"));
+        reached[i] = context && strstr(context, "someIndexedSymbol") && strstr(context, "mod.py") &&
+                     !strstr(context, "below") && !yyjson_obj_get(root, "hookSpecificOutput");
+        yyjson_doc_free(doc);
+        free(output);
+    }
+    char *view = cbm_hook_augment_process_for(
+        srv,
+        "{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"view\",\"cwd\":\"/tmp/hookproj\","
+        "\"tool_input\":{\"path\":\"mod.py\"}}",
+        "PostToolUse", "copilot");
+    bool supported = cbm_hook_augment_invocation_supported("PostToolUse", "copilot") &&
+                     !cbm_hook_augment_invocation_supported("PreToolUse", "copilot");
+    bool view_silent = view == NULL;
+    free(view);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    if (!reached[0] || !reached[1] || !reached[2] || !view_silent || !supported) {
+        fprintf(stderr,
+                "Copilot PostToolUse diag rg=%d bash=%d camel=%d view_silent=%d "
+                "supported=%d\n",
+                reached[0], reached[1], reached[2], view_silent, supported);
+        FAIL("Copilot PostToolUse searches must reach graph augmentation");
+    }
+    PASS();
+}
+
+/* The hook-client fast path answers Copilot's PostToolUse before identity
+ * hashing when the augmenter could never respond: a shell command that is not
+ * a search, or a tool the augmenter does not read (VS Code's local hook parser
+ * ignores matchers). Searches still pay full fare. */
+TEST(cli_hook_augment_copilot_posttooluse_noop_gate) {
+    const char *ls = "{\"tool_name\":\"bash\",\"tool_input\":{\"command\":\"ls -la\"}}";
+    const char *search =
+        "{\"tool_name\":\"bash\",\"tool_input\":{\"command\":\"rg -n FooService .\"}}";
+    const char *string_ls = "{\"toolName\":\"powershell\",\"toolArgs\":\"{\\\"command\\\":"
+                            "\\\"Get-ChildItem\\\"}\"}";
+    const char *edit = "{\"tool_name\":\"edit\",\"tool_input\":{\"path\":\"a.c\"}}";
+    const char *grep = "{\"tool_name\":\"grep\",\"tool_input\":{\"pattern\":\"FooService\"}}";
+    bool ok = cbm_hook_augment_input_is_noop_for(ls, "PostToolUse", "copilot") &&
+              !cbm_hook_augment_input_is_noop_for(search, "PostToolUse", "copilot") &&
+              cbm_hook_augment_input_is_noop_for(string_ls, "PostToolUse", "copilot") &&
+              cbm_hook_augment_input_is_noop_for(edit, "PostToolUse", "copilot") &&
+              !cbm_hook_augment_input_is_noop_for(grep, "PostToolUse", "copilot") &&
+              !cbm_hook_augment_input_is_noop_for(ls, "SessionStart", "copilot") &&
+              !cbm_hook_augment_input_is_noop_for(ls, NULL, "copilot");
+    /* The Claude dialect keeps its un-forced PreToolUse Bash gate. */
+    const char *claude_ls =
+        "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_input\":{"
+        "\"command\":\"ls -la\"}}";
+    ok = ok && cbm_hook_augment_input_is_noop_for(claude_ls, NULL, NULL) &&
+         cbm_hook_augment_input_is_noop_for(claude_ls, NULL, "gemini") &&
+         !cbm_hook_augment_input_is_noop_for(edit, NULL, NULL);
+    if (!ok)
+        FAIL("Copilot PostToolUse no-op gate must skip non-searches and keep searches");
     PASS();
 }
 
@@ -18843,6 +19063,8 @@ SUITE(cli) {
     RUN_TEST(cli_copilot_install_preserves_foreign_named_manifest);
     RUN_TEST(cli_copilot_uninstall_preserves_foreign_named_manifest);
     RUN_TEST(cli_copilot_uninstall_preserves_canonical_shaped_foreign_manifest);
+    RUN_TEST(cli_copilot_manifest_adds_posttooluse_search_hook);
+    RUN_TEST(cli_copilot_install_upgrades_previous_manifest);
     RUN_TEST(cli_vscode_only_installs_copilot_durable_context);
     RUN_TEST(cli_lifecycle_hooks_preserve_foreign_substring_commands);
     RUN_TEST(cli_read_only_agents_do_not_receive_mutating_mcp_server);
@@ -18860,6 +19082,8 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_context_names_graph_follow_ups);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
     RUN_TEST(cli_hook_augment_codex_pretooluse_payload);
+    RUN_TEST(cli_hook_augment_copilot_posttooluse_search);
+    RUN_TEST(cli_hook_augment_copilot_posttooluse_noop_gate);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);

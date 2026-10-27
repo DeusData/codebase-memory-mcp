@@ -283,6 +283,9 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
+/* include_posttool false renders the previous lifecycle-only manifest. Release
+ * the result with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
+char *cbm_build_copilot_hook_manifest_for_testing(const char *binary_path, bool include_posttool);
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
 int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
@@ -591,8 +594,11 @@ void cbm_hook_augment_arm_deadline(void);
 int cbm_hook_augment_deadline_ms_for_testing(void);
 #endif
 char *cbm_hook_augment_read_stdin(void);
-/* Pure no-op gate for the hook-client fast path (see hook_augment.c). */
-bool cbm_hook_augment_input_is_noop_bash(const char *input);
+/* Pure no-op gate for the hook-client fast path (see hook_augment.c). It also
+ * covers a forced search event, such as Copilot's PostToolUse; forced_event and
+ * dialect_name are borrowed and may be NULL. */
+bool cbm_hook_augment_input_is_noop_for(const char *input, const char *forced_event,
+                                        const char *dialect_name);
 /* Hand back stdin bytes main() consumed early; the next read returns them. */
 void cbm_hook_augment_prefetch_stdin(char *owned);
 
