@@ -102,7 +102,9 @@ static bool cif_directory_reason(cif_context *c, size_t parent, cbm_inventory_pa
     if (!cif_poll(c)) {
         return false;
     }
-    bool builtin = cbm_should_skip_dir(name, CBM_MODE_FULL);
+    bool builtin = cbm_should_skip_dir(name, CBM_MODE_FULL) &&
+                   (cbm_discover_is_safety_core_directory(name) ||
+                    !cbm_discover_path_in_jvm_package((const char *)path.data));
     bool suffix = !builtin && cbm_discover_path_has_skip_suffix((const char *)path.data);
     bool safety =
         (builtin || suffix) && c->owner->cbm_program && cbm_discover_is_safety_core_directory(name);
