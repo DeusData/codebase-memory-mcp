@@ -6921,6 +6921,81 @@ TEST(extract_py_url_fold_no_fabrication_issue706) {
     PASS();
 }
 
+/* Issue #523 follow-up: a Python string whose opening token is more than one
+ * quote -- a prefix (r"", u"", b"", Rb"", an f"" with no field) or a triple
+ * quote -- kept the prefix and the extra quotes in the URL (`f"http://..."`,
+ * `""http://...""`), so the HTTP_CALLS edge never matched a route. Each must
+ * yield the bare URL, positional or as `url=`. */
+TEST(extract_py_prefixed_string_url_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def f_plain():\n"
+                               "    return requests.get(f\"http://svc/v2/health\")\n"
+                               "def raw():\n"
+                               "    return requests.get(r\"http://svc/v2/health\")\n"
+                               "def uni():\n"
+                               "    return requests.get(u\"http://svc/v2/health\")\n"
+                               "def byt():\n"
+                               "    return requests.get(b\"http://svc/v2/health\")\n"
+                               "def raw_bytes():\n"
+                               "    return requests.get(Rb\"http://svc/v2/health\")\n"
+                               "def triple():\n"
+                               "    return requests.get(\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def triple_single():\n"
+                               "    return requests.get('''http://svc/v2/health''')\n"
+                               "def f_triple():\n"
+                               "    return requests.get(f\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def kw():\n"
+                               "    return requests.get(url=r\"http://svc/v2/health\")\n",
+                               CBM_LANG_PYTHON, "t", "client.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "uni"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "byt"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_bytes"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "kw"), "http://svc/v2/health");
+
+    /* A wrapped literal is still a fully known value, so it is exact. */
+    const CBMCall *raw = find_call_in_func(r, "requests.get", "raw");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_GTE(raw->arg_count, 1);
+    ASSERT_NOT_NULL(raw->args[0].value);
+    ASSERT_STR_EQ(raw->args[0].value, "http://svc/v2/health");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a plain one-quote literal keeps the literal path
+ * unchanged, and an interpolating f-string still folds its field to "{}". */
+TEST(extract_py_prefixed_string_url_controls_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def plain():\n"
+                               "    return requests.get(\"http://svc/v2/health\")\n"
+                               "def plain_single():\n"
+                               "    return requests.get('http://svc/v2/health')\n"
+                               "def field(order_id):\n"
+                               "    return requests.get(f\"http://svc/v2/orders/{order_id}\")\n"
+                               "def raw_field(order_id):\n"
+                               "    return requests.get(rf\"http://svc/v2/orders/{order_id}\")\n",
+                               CBM_LANG_PYTHON, "t", "ctl.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "field"), "http://svc/v2/orders/{}");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_field"), "http://svc/v2/orders/{}");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1147: a frontend that composes every endpoint from module constants
  * -- a base constant, template literals over it, and an object-literal map of
  * endpoints -- extracted none of its API calls. Each template / concatenation
@@ -13963,6 +14038,8 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
     RUN_TEST(extract_py_concat_const_url_issue706);
     RUN_TEST(extract_py_url_fold_no_fabrication_issue706);
+    RUN_TEST(extract_py_prefixed_string_url_issue523);
+    RUN_TEST(extract_py_prefixed_string_url_controls_issue523);
     RUN_TEST(extract_ts_const_template_url_issue1147);
     RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
     RUN_TEST(extract_ts_folded_topics_keep_raw_identity);
