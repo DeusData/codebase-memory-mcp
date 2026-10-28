@@ -1,6 +1,7 @@
 #include "extract_unified.h"
 #include "arena.h" // cbm_arena_sprintf
 #include "cbm.h"   // CBMExtractCtx
+#include "callable_sig.h"
 #include "helpers.h"
 #include "extract_url_fold.h" // cbm_url_fold_record_constant (#706, #1147)
 #include "lang_specs.h"       // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
@@ -324,6 +325,7 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
      * CBMWalkScope comment for the quadratic recompute this replaces. */
     f->prev_enclosing_func_qn = state->enclosing_func_qn;
     f->prev_enclosing_class_qn = state->enclosing_class_qn;
+    f->prev_enclosing_class_node = state->enclosing_class_node;
     f->prev_invocation_kind = state->invocation_kind;
     f->prev_callee_expr = state->callee_expr;
     f->prev_callee_leaf = state->callee_leaf;
@@ -337,6 +339,8 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     case SCOPE_CLASS:
     case SCOPE_NAMESPACE:
         state->enclosing_class_qn = qn;
+        /* push_lexical_scope records the node; a node-less push has none. */
+        state->enclosing_class_node = (TSNode){0};
         break;
     case SCOPE_CALL:
         /* The invocation triple is applied by push_call_scope once the caller
@@ -363,6 +367,9 @@ static bool push_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t dep
     if (!push_scope(state, walk_kind, depth, qn)) {
         state->lexical_binding_tracking_failed = true;
         return false;
+    }
+    if (walk_kind == SCOPE_CLASS || walk_kind == SCOPE_NAMESPACE) {
+        state->enclosing_class_node = node;
     }
     state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id =
         add_lexical_scope(state, node, lexical_kind);
@@ -442,6 +449,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         const CBMWalkScope *f = &state->scopes[--state->scope_top];
         state->enclosing_func_qn = f->prev_enclosing_func_qn;
         state->enclosing_class_qn = f->prev_enclosing_class_qn;
+        state->enclosing_class_node = f->prev_enclosing_class_node;
         state->invocation_kind = f->prev_invocation_kind;
         state->callee_expr = f->prev_callee_expr;
         state->callee_leaf = f->prev_callee_leaf;
@@ -1138,6 +1146,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * an in-body call sources to a QN one or more segments short of the def, and
      * the edge is dropped at write. */
     const char *qn_name = name;
+    if (ctx->language == CBM_LANG_SWIFT) {
+        const char *sig = cbm_callable_sig(ctx->arena, node, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(ctx->arena, "%s%s", name, sig) : NULL;
+        if (qualified) {
+            qn_name = qualified;
+        }
+    }
     if (ctx->language == CBM_LANG_NIX) {
         qn_name = cbm_nix_qn_name(ctx->arena, node, ctx->source, name);
         if (!qn_name || !qn_name[0]) {
@@ -2671,6 +2686,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
      * recompute_state call): module scope, nothing else active. */
     state.enclosing_func_qn = ctx->module_qn;
     state.enclosing_class_qn = NULL;
+    state.enclosing_class_node = (TSNode){0};
     state.invocation_kind = CBM_INVOCATION_NONE;
     state.callee_expr = (TSNode){0};
     state.callee_leaf = (TSNode){0};

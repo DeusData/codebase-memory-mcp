@@ -1693,7 +1693,8 @@ TEST(pipeline_incremental_drops_terraform_reads_of_a_moved_module) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
     }
-    write_temp_file(g_tmpdir, "infra/main.tf", "module \"net\" {\n  source = \"./modules/net\"\n}\n");
+    write_temp_file(g_tmpdir, "infra/main.tf",
+                    "module \"net\" {\n  source = \"./modules/net\"\n}\n");
     write_temp_file(g_tmpdir, "infra/outputs.tf",
                     "output \"net_vpc\" {\n  value = module.net.vpc_id\n}\n");
     write_temp_file(g_tmpdir, "infra/modules/net/main.tf",
@@ -3850,8 +3851,9 @@ TEST(incremental_shell_deploy_edit_keeps_its_edges) {
     }
     write_temp_file(tmp, "manifests/app.yaml",
                     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n");
-    write_temp_file(tmp, "hack/deploy.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
+    write_temp_file(
+        tmp, "hack/deploy.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")/..\"\nkubectl apply -f manifests/app.yaml\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/shinc.db", tmp);
     static const char deploys[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS'";
@@ -3905,8 +3907,7 @@ static int incremental_spawner_delete(bool legacy, cbm_incremental_route_t *rout
     snprintf(path, sizeof(path), "%s/hack/a.sh", tmp);
     (void)remove(path);
     if (!legacy) {
-        *after_script =
-            k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
+        *after_script = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, processes) : -1;
         *route = cbm_pipeline_incremental_test_last_route();
     }
     snprintf(path, sizeof(path), "%s/app.py", tmp);
@@ -4152,7 +4153,8 @@ static char *incremental_env_edit(bool legacy, bool dockerfile, cbm_incremental_
         return NULL;
     }
     write_temp_file(tmp, "Dockerfile",
-                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n" : "FROM alpine:3.20\nENV KEEP_D=1\n");
+                    dockerfile ? "FROM alpine:3.20\nENV OLD_D=1\n"
+                               : "FROM alpine:3.20\nENV KEEP_D=1\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web\n    environment:\n      OLD_C: x\n");
     write_temp_file(tmp, "compose.other.yaml",
@@ -4364,10 +4366,11 @@ TEST(incremental_release_values_edit_rebuilds) {
     write_temp_file(tmp, "kz/charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n");
     write_temp_file(tmp, "kz/charts/app/values.yaml",
                     "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n");
-    write_temp_file(tmp, "kz/charts/app/templates/deploy.yaml",
-                    "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n"
-                    "  template:\n    spec:\n      containers:\n        - name: app\n"
-                    "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n");
+    write_temp_file(
+        tmp, "kz/charts/app/templates/deploy.yaml",
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n"
+        "  template:\n    spec:\n      containers:\n        - name: app\n"
+        "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/relvalues.db", tmp);
     static const char v2[] = "SELECT COUNT(*) FROM edges WHERE type='DEPLOYS' AND "
@@ -4616,7 +4619,8 @@ TEST(helm_render_long_key_mark_whole) {
  * assign is UNKNOWN after it: `$tag = .Values.image.tagNew` under a
  * .Capabilities test leaves no image naming the old tag. */
 TEST(helm_unknown_branch_spoils_what_it_assigns) {
-    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\", tagNew: \"2.0\"}\n";
+    static const char vals[] =
+        "image: {repository: ghcr.io/acme/app, tag: \"1.0\", tagNew: \"2.0\"}\n";
     static const char tpl[] =
         "{{- $tag := .Values.image.tag -}}\n"
         "{{- if semverCompare \">=1.29-0\" .Capabilities.KubeVersion.Version }}"
@@ -4741,9 +4745,10 @@ TEST(helm_skipped_set_of_a_call_result) {
  * through it (`set $img ...` of `index $d "image"`) reaches .Values. */
 TEST(helm_own_map_given_a_shared_one) {
     static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n";
-    static const char tpl[] = "{{- $d := dict -}}{{- $_ := set $d \"image\" .Values.image -}}\n"
-                              "{{- $img := index $d \"image\" -}}{{- $_ := set $img \"tag\" \"2.0\" -}}\n"
-                              "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    static const char tpl[] =
+        "{{- $d := dict -}}{{- $_ := set $d \"image\" .Values.image -}}\n"
+        "{{- $img := index $d \"image\" -}}{{- $_ := set $img \"tag\" \"2.0\" -}}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 3);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4753,10 +4758,10 @@ TEST(helm_own_map_given_a_shared_one) {
 /* A set whose target is an UNKNOWN call result (index by .Release.Name) may
  * change any map of the values: every image after it is UNKNOWN. */
 TEST(helm_set_of_an_unknown_call_result) {
-    static const char vals[] =
-        "apps: {web: {repository: ghcr.io/acme/web, tag: \"1.0\"}}\n";
-    static const char tpl[] = "{{- $_ := set (index .Values.apps .Release.Name) \"tag\" \"2.0\" }}\n"
-                              "image: \"{{ .Values.apps.web.repository }}:{{ .Values.apps.web.tag }}\"\n";
+    static const char vals[] = "apps: {web: {repository: ghcr.io/acme/web, tag: \"1.0\"}}\n";
+    static const char tpl[] =
+        "{{- $_ := set (index .Values.apps .Release.Name) \"tag\" \"2.0\" }}\n"
+        "image: \"{{ .Values.apps.web.repository }}:{{ .Values.apps.web.tag }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4794,9 +4799,10 @@ TEST(helm_skipped_set_after_redefinition) {
         "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
         "{{- $cfg = .Values.image }}{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
         "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
-    static const char kept[] = "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
-                               "{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
-                               "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
+    static const char kept[] =
+        "{{- $cfg := dict }}{{- if .Capabilities.APIVersions }}"
+        "{{- $_ := set $cfg \"tag\" \"2.0\" }}{{- end }}\n"
+        "image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n";
     char *got = helm_capture(vals, redefined, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4828,7 +4834,8 @@ TEST(helm_many_changed_maps_keep_reads_right) {
  * what reads it. */
 TEST(helm_define_memo_under_mutual_recursion) {
     static const char defs_src[] =
-        "{{- define \"A\" -}}{{- include \"B\" . -}}{{- $_ := set . \"tag\" \"2.0\" -}}{{- end -}}\n"
+        "{{- define \"A\" -}}{{- include \"B\" . -}}{{- $_ := set . \"tag\" \"2.0\" -}}{{- end "
+        "-}}\n"
         "{{- define \"B\" -}}{{- if false }}{{ include \"A\" . }}{{ end -}}{{- end -}}\n";
     cbm_helm_defines_t *d = cbm_helm_defines_new();
     ASSERT_NOT_NULL(d);
@@ -4919,8 +4926,8 @@ TEST(helm_render_keeps_only_its_results) {
     size_t before = cbm_arena_total(&a);
     bool ok = cbm_helm_render(&a, "t.yaml", tpl, strlen(tpl), v, NULL, NULL, &probe, 1);
     size_t kept = cbm_arena_total(&a) - before;
-    bool image = ok && probe.n == 1 && probe.image[0] &&
-                 strcmp(probe.image[0], "ghcr.io/acme/app:1") == 0;
+    bool image =
+        ok && probe.n == 1 && probe.image[0] && strcmp(probe.image[0], "ghcr.io/acme/app:1") == 0;
     cbm_arena_destroy(&a);
     if (doc) {
         yyjson_mut_doc_free(doc);
@@ -4968,10 +4975,9 @@ TEST(helm_render_budget_logs_its_reason) {
  * ($img) was taken of before: every image after it is UNKNOWN. */
 TEST(helm_merge_into_values_root) {
     static const char vals[] = "image: {repository: ghcr.io/acme/app}\n";
-    static const char tpl[] =
-        "{{- $img := .Values.image }}\n"
-        "{{- $_ := merge .Values (dict \"image\" (dict \"tag\" \"2.0\")) }}\n"
-        "image: \"{{ $img.repository }}:{{ $img.tag | default \"1.0\" }}\"\n";
+    static const char tpl[] = "{{- $img := .Values.image }}\n"
+                              "{{- $_ := merge .Values (dict \"image\" (dict \"tag\" \"2.0\")) }}\n"
+                              "image: \"{{ $img.repository }}:{{ $img.tag | default \"1.0\" }}\"\n";
     char *got = helm_capture(vals, tpl, NULL, 3);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -4982,8 +4988,7 @@ TEST(helm_merge_into_values_root) {
  * the outer $vals (.Values.image), a nested range's own $vals aside --
  * leaves every image after it UNKNOWN. */
 TEST(helm_skipped_set_beside_a_nested_scope) {
-    static const char vals[] =
-        "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\njobs: [a]\n";
+    static const char vals[] = "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\njobs: [a]\n";
     static const char tpl[] = "{{- $vals := .Values.image }}\n"
                               "{{- if .Capabilities.APIVersions.Has \"batch/v1\" }}\n"
                               "{{- range .Values.jobs }}{{- $vals := dict }}{{- end }}\n"
@@ -5169,10 +5174,9 @@ static const char HELM_IMAGE_VALUES[] =
  * the map above it (.Values.cfg) reaches .Values.image there: the image after
  * it is UNKNOWN. */
 TEST(helm_deep_merge_over_a_change_below) {
-    static const char tpl[] =
-        "{{- $_ := set .Values.cfg.a \"d\" .Values.image }}\n"
-        "{{- $_ := mergeOverwrite .Values.cfg (dict \"a\" (dict \"d\" (dict \"tag\" \"2.0\"))) }}\n"
-        HELM_IMAGE_LINE;
+    static const char tpl[] = "{{- $_ := set .Values.cfg.a \"d\" .Values.image }}\n"
+                              "{{- $_ := mergeOverwrite .Values.cfg (dict \"a\" (dict \"d\" (dict "
+                              "\"tag\" \"2.0\"))) }}\n" HELM_IMAGE_LINE;
     char *got = helm_capture(HELM_IMAGE_VALUES, tpl, NULL, 3);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -5207,9 +5211,9 @@ TEST(helm_and_or_with_an_unknown_operand) {
  * conditions after it -- a set there, or an assignment ($tag = ...), may run:
  * the image after it is UNKNOWN. */
 TEST(helm_later_condition_of_a_skipped_if) {
-    static const char set[] =
-        "{{- if regexMatch \"^v\" .Values.image.tag }}{{- else if set .Values.image \"tag\" \"2.0\" }}"
-        "{{- end }}\n" HELM_IMAGE_LINE;
+    static const char set[] = "{{- if regexMatch \"^v\" .Values.image.tag }}{{- else if set "
+                              ".Values.image \"tag\" \"2.0\" }}"
+                              "{{- end }}\n" HELM_IMAGE_LINE;
     char *got = helm_capture(HELM_IMAGE_VALUES, set, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
@@ -5243,9 +5247,8 @@ TEST(helm_parse_error_spoils) {
     char *got = helm_capture(HELM_IMAGE_VALUES, bad, NULL, 2);
     ASSERT_STR_EQ(got, "<UNKNOWN>");
     free(got);
-    static const char defs_src[] =
-        "{{- define \"bad\" -}}{{- $x := }}{{- end -}}\n"
-        "{{- define \"good\" -}}ok{{- end -}}\n";
+    static const char defs_src[] = "{{- define \"bad\" -}}{{- $x := }}{{- end -}}\n"
+                                   "{{- define \"good\" -}}ok{{- end -}}\n";
     cbm_helm_defines_t *d = cbm_helm_defines_new();
     ASSERT_NOT_NULL(d);
     cbm_helm_defines_add(d, "charts/app/templates/_bad.tpl", defs_src, strlen(defs_src));
@@ -5253,8 +5256,8 @@ TEST(helm_parse_error_spoils) {
     cbm_helm_defines_add(d, "charts/app/templates/bad.yaml", bad_file, strlen(bad_file));
     static const char good[] = "x: {{ include \"good\" . }}\n" HELM_IMAGE_LINE;
     static const char via_define[] = "x: {{ include \"bad\" . }}\n" HELM_IMAGE_LINE;
-    static const char via_file[] =
-        "x: {{ include (print $.Template.BasePath \"/bad.yaml\") . | sha256sum }}\n" HELM_IMAGE_LINE;
+    static const char via_file[] = "x: {{ include (print $.Template.BasePath \"/bad.yaml\") . | "
+                                   "sha256sum }}\n" HELM_IMAGE_LINE;
     char *ok = helm_capture_chart(HELM_IMAGE_VALUES, good, d, &HELM_APP, 2);
     char *by_define = helm_capture_chart(HELM_IMAGE_VALUES, via_define, d, &HELM_APP, 2);
     char *by_file = helm_capture_chart(HELM_IMAGE_VALUES, via_file, d, &HELM_APP, 2);
@@ -5276,8 +5279,9 @@ TEST(helm_captures_after_a_huge_capture) {
     size_t cap = (size_t)ITEMS * 8 + CBM_SZ_256;
     char *vals = malloc(cap);
     ASSERT_NOT_NULL(vals);
-    size_t o = (size_t)snprintf(vals, cap, "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n"
-                                            "big: [");
+    size_t o = (size_t)snprintf(vals, cap,
+                                "image: {repository: ghcr.io/acme/app, tag: \"1.0\"}\n"
+                                "big: [");
     for (int i = 0; i < ITEMS; i++) {
         o += (size_t)snprintf(vals + o, cap - o, "%s{x: a}", i ? "," : "");
     }
@@ -5375,8 +5379,9 @@ static char *incremental_docker_build_keep(bool legacy, cbm_incremental_route_t 
         return NULL;
     }
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "build.sh",
-                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(
+        tmp, "build.sh",
+        "#!/bin/sh\ncd \"$(dirname \"$0\")\"\ndocker build -t ghcr.io/acme/svc:1 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/dockerbuild.db", tmp);
     static const char builds[] =
@@ -5427,10 +5432,12 @@ TEST(incremental_second_build_declarer_keeps_the_edge) {
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_twodecl_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "svc/Dockerfile", "FROM golang:1.22\n");
-    write_temp_file(tmp, "a.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:1 svc\n");
-    write_temp_file(tmp, "b.sh", "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
-                                 "docker build -t ghcr.io/acme/svc:2 svc\n");
+    write_temp_file(tmp, "a.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:1 svc\n");
+    write_temp_file(tmp, "b.sh",
+                    "#!/bin/sh\ncd \"$(dirname \"$0\")\"\n"
+                    "docker build -t ghcr.io/acme/svc:2 svc\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/twodecl.db", tmp);
     static const char builds[] =
@@ -6070,10 +6077,12 @@ static void stem_repo(const char *tmp, int fillers) {
     write_temp_file(tmp, "rs/foo.rs", "pub mod bar;\npub fn top() {}\n");
     write_temp_file(tmp, "rs/foo/bar.rs", "pub fn inner() {}\n");
     write_temp_file(tmp, "c/foo.h", "int foo_add(int a, int b);\n");
-    write_temp_file(tmp, "c/foo.c", "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    write_temp_file(tmp, "c/foo.c",
+                    "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
     write_temp_file(tmp, "c/foo/x.c", "int foo_x(void) { return 1; }\n");
     write_temp_file(tmp, "ts/foo.test.ts", "export function stemProbeA(): number { return 1; }\n");
-    write_temp_file(tmp, "ts/foo/test/a.ts", "export function stemProbeB(): number { return 2; }\n");
+    write_temp_file(tmp, "ts/foo/test/a.ts",
+                    "export function stemProbeB(): number { return 2; }\n");
     write_temp_file(tmp, "go.mod", "module example.com/stem\n\ngo 1.21\n");
     write_temp_file(tmp, "goapi/api.sh", "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
     write_temp_file(tmp, "goapi/api/server.go", "package api\n\nfunc Serve() {}\n");
@@ -6126,7 +6135,8 @@ TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
          "C stem pair Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.c.foo/'",
          "c/foo/ Folder marked"},
-        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' AND "
+        {"SELECT COUNT(*) FROM nodes WHERE label='Module' AND qualified_name='stem.ts.foo.test' "
+         "AND "
          "file_path='ts/foo.test.ts'",
          "dotted foo.test.ts Module"},
         {"SELECT COUNT(*) FROM nodes WHERE label='Folder' AND qualified_name='stem.ts.foo.test/'",
@@ -6305,8 +6315,9 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
                     "              value: prod\n");
     write_temp_file(tmp, "compose.yaml",
                     "services:\n  web:\n    image: acme/web:1\n    build: ./web\n");
-    write_temp_file(tmp, "web/Dockerfile",
-                    "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
+    write_temp_file(
+        tmp, "web/Dockerfile",
+        "FROM node:20\nCOPY src ./src\nCOPY lib ./lib\nCMD [\"node\", \"src/server.js\"]\n");
     write_temp_file(tmp, "web/src/server.js",
                     "const port = process.env.PORT;\nconst mode = process.env.MODE;\n");
     write_temp_file(tmp, "web/lib/conf.js", "module.exports = process.env.MODE;\n");
@@ -6316,9 +6327,9 @@ TEST(incremental_env_join_repair_keeps_unchanged_pairs) {
     snprintf(db, sizeof(db), "%s/envjoin.db", tmp);
     static const char joins[] = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
                                 "WHERE e.type='CONFIGURES' AND s.label='EnvVar'";
-#define ENVJOIN_PAIR(key, file)                                                                    \
-    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "               \
-    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE "   \
+#define ENVJOIN_PAIR(key, file)                                                                  \
+    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "             \
+    "t.id=e.target_id WHERE e.type='CONFIGURES' AND s.label='EnvVar' AND s.qualified_name LIKE " \
     "'%#env/web/" key "' AND t.file_path='" file "'"
     static const char mode_server[] = ENVJOIN_PAIR("MODE", "web/src/server.js");
     static const char mode_conf[] = ENVJOIN_PAIR("MODE", "web/lib/conf.js");
@@ -11264,9 +11275,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field) {
 
     /* Both namesakes must exist for the probe to mean anything. */
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     /* A bare C call never names the struct member. */
@@ -11300,9 +11311,9 @@ TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
     ASSERT_NOT_NULL(s);
 
     ASSERT_GTE(fixture_node_count(s, project, "include/linux/mm.h", "put_page", "Function"), 1);
-    ASSERT_GTE(fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page",
-                                  "Field"),
-               1);
+    ASSERT_GTE(
+        fixture_node_count(s, project, "arch/arm64/include/asm/kvm_pgtable.h", "put_page", "Field"),
+        1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
@@ -14049,6 +14060,917 @@ TEST(pipeline_swift_http_call_makes_route_issue1892) {
     PASS();
 }
 
+static int pipeline_has_calls_edge(cbm_store_t *s, int64_t source_id, int64_t target_id) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_source_type(s, source_id, "CALLS", &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return -1;
+    }
+
+    int found = 0;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == target_id) {
+            found = 1;
+            break;
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    return found;
+}
+
+/* #2061: distinct signature QNs keep each overload's CALLS edges separate. */
+TEST(pipeline_swift_overloads_keep_argument_labels_issue2061) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swiftoverload_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "Sources/Sink.swift",
+                    "class Sink {\n"
+                    "    func target() {}\n"
+                    "}\n");
+    write_temp_file(
+        tmp, "Sources/Service.swift",
+        "class Service {\n"
+        "    let sink = Sink()\n"
+        "\n"
+        "    // Overload A: DOES call target()\n"
+        "    func work(flag: Bool) {\n"
+        "        self.sink.target()\n"
+        "    }\n"
+        "\n"
+        "    // Overload B: does NOT call target()\n"
+        "    func work(name: String) {\n"
+        "        print(name)\n"
+        "    }\n"
+        "    func upload(_ data: Data, to url: URL) { sink.target() }\n"
+        "    func upload(_ fileURL: URL, to url: URL) { print(fileURL) }\n"
+        "    func record(path: String, session: URLSession) {}\n"
+        "    func withDefault(message: String, flag: Bool = true) { sink.target() }\n"
+        "    func withCallback(completion: () -> Void) { sink.target() }\n"
+        "    func many(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) {}\n"
+        "    func handle(completion: () -> Void) { sink.target() }\n"
+        "    func handle(completion: () -> Void, onError: () -> Void) { sink.target() }\n"
+        "}\n");
+    write_temp_file(
+        tmp, "Sources/Caller.swift",
+        "class Caller {\n"
+        "    let service = Service()\n"
+        "\n"
+        "    // Calls ONLY overload B, which never reaches target()\n"
+        "    func onlyCallsOverloadB() {\n"
+        "        self.service.work(name: \"x\")\n"
+        "    }\n"
+        "    func callAmbiguousUpload() {\n"
+        "        self.service.upload(Data(), to: URL(string: \"/x\")!)\n"
+        "    }\n"
+        "    func callWithDefault() { self.service.withDefault(message: \"x\") }\n"
+        "    func callWithClosure() { self.service.withCallback { } }\n"
+        "    func callRecord() { self.service.record(path: \"/audit\", session: URLSession.shared) "
+        "}\n"
+        "    func callManyWithComment() {\n"
+        "        self.service.many(a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 // trailing "
+        "comment\n"
+        "        )\n"
+        "    }\n"
+        "    func callHandle() { self.service.handle { } onError: { } }\n"
+        "    func callHandleWrongLabel() { self.service.handle { } bogus: { } }\n"
+        "    func callHandleIncomplete() { self.service.handle { } onError: { recover( } }\n"
+        "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/swiftoverload.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    cbm_node_t *works = NULL;
+    int work_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "work", &works, &work_count), CBM_STORE_OK);
+    ASSERT_EQ(work_count, 2);
+    cbm_store_free_nodes(works, work_count);
+    cbm_node_t *uploads = NULL;
+    int upload_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "upload", &uploads, &upload_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(upload_count, 2);
+    cbm_store_free_nodes(uploads, upload_count);
+
+    char flag_qn[512];
+    char name_qn[512];
+    char target_qn[512];
+    char caller_qn[512];
+    snprintf(flag_qn, sizeof(flag_qn), "%s.Sources.Service.Service.work(flag:Bool)", project);
+    snprintf(name_qn, sizeof(name_qn), "%s.Sources.Service.Service.work(name:String)", project);
+    snprintf(target_qn, sizeof(target_qn), "%s.Sources.Sink.Sink.target()", project);
+    snprintf(caller_qn, sizeof(caller_qn), "%s.Sources.Caller.Caller.onlyCallsOverloadB()",
+             project);
+
+    cbm_node_t flag = {0};
+    cbm_node_t name = {0};
+    cbm_node_t target = {0};
+    cbm_node_t caller = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, flag_qn, &flag), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, name_qn, &name), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, target_qn, &target), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, caller_qn, &caller), CBM_STORE_OK);
+    ASSERT_EQ(flag.start_line, 5);
+    ASSERT_EQ(flag.end_line, 7);
+    ASSERT_EQ(name.start_line, 10);
+    ASSERT_EQ(name.end_line, 12);
+
+    ASSERT_EQ(pipeline_has_calls_edge(s, flag.id, target.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, name.id, target.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, caller.id, name.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, caller.id, flag.id), 0);
+
+    char data_qn[512], url_qn[512], upload_caller_qn[512];
+    char default_qn[512], default_caller_qn[512], closure_qn[512], closure_caller_qn[512];
+    snprintf(data_qn, sizeof(data_qn), "%s.Sources.Service.Service.upload(_:Data,to:URL)", project);
+    snprintf(url_qn, sizeof(url_qn), "%s.Sources.Service.Service.upload(_:URL,to:URL)", project);
+    snprintf(upload_caller_qn, sizeof(upload_caller_qn),
+             "%s.Sources.Caller.Caller.callAmbiguousUpload()", project);
+    snprintf(default_qn, sizeof(default_qn),
+             "%s.Sources.Service.Service.withDefault(message:String,flag:Bool)", project);
+    snprintf(default_caller_qn, sizeof(default_caller_qn),
+             "%s.Sources.Caller.Caller.callWithDefault()", project);
+    snprintf(closure_qn, sizeof(closure_qn),
+             "%s.Sources.Service.Service.withCallback(completion:()=>Void)", project);
+    snprintf(closure_caller_qn, sizeof(closure_caller_qn),
+             "%s.Sources.Caller.Caller.callWithClosure()", project);
+    char record_qn[512], record_caller_qn[512], many_qn[512], many_caller_qn[512];
+    snprintf(record_qn, sizeof(record_qn),
+             "%s.Sources.Service.Service.record(path:String,session:URLSession)", project);
+    snprintf(record_caller_qn, sizeof(record_caller_qn), "%s.Sources.Caller.Caller.callRecord()",
+             project);
+    snprintf(many_qn, sizeof(many_qn),
+             "%s.Sources.Service.Service.many(a:Int,b:Int,c:Int,d:Int,e:Int,f:Int,g:Int,h:Int)",
+             project);
+    snprintf(many_caller_qn, sizeof(many_caller_qn),
+             "%s.Sources.Caller.Caller.callManyWithComment()", project);
+    cbm_node_t record = {0}, record_caller = {0}, many = {0}, many_caller = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, record_qn, &record), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, record_caller_qn, &record_caller),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, many_qn, &many), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, many_caller_qn, &many_caller), CBM_STORE_OK);
+    cbm_node_t data = {0}, url = {0}, upload_caller = {0};
+    cbm_node_t with_default = {0}, default_caller = {0}, with_closure = {0}, closure_caller = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, data_qn, &data), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, url_qn, &url), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, upload_caller_qn, &upload_caller),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, default_qn, &with_default), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, default_caller_qn, &default_caller),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, closure_qn, &with_closure), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, closure_caller_qn, &closure_caller),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_has_calls_edge(s, upload_caller.id, data.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, upload_caller.id, url.id), 1);
+    cbm_edge_t *upload_edges = NULL;
+    int upload_edges_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, upload_caller.id, "CALLS", &upload_edges,
+                                                  &upload_edges_count),
+              CBM_STORE_OK);
+    int ambiguous_edges = 0;
+    for (int i = 0; i < upload_edges_count; i++) {
+        if ((upload_edges[i].target_id == data.id || upload_edges[i].target_id == url.id) &&
+            upload_edges[i].properties_json &&
+            strstr(upload_edges[i].properties_json, "\"candidates\":2")) {
+            ambiguous_edges++;
+        }
+    }
+    ASSERT_EQ(ambiguous_edges, 2);
+    cbm_store_free_edges(upload_edges, upload_edges_count);
+    ASSERT_EQ(pipeline_has_calls_edge(s, default_caller.id, with_default.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, closure_caller.id, with_closure.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, record_caller.id, record.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, many_caller.id, many.id), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 0);
+
+    /* #2061: two trailing closures select only the overload that can take
+     * them; a second closure whose label matches no parameter binds neither. */
+    char handle_one_qn[512], handle_two_qn[512], handle_caller_qn[512], handle_wrong_qn[512],
+        handle_incomplete_qn[512];
+    snprintf(handle_one_qn, sizeof(handle_one_qn),
+             "%s.Sources.Service.Service.handle(completion:()=>Void)", project);
+    snprintf(handle_two_qn, sizeof(handle_two_qn),
+             "%s.Sources.Service.Service.handle(completion:()=>Void,onError:()=>Void)", project);
+    snprintf(handle_caller_qn, sizeof(handle_caller_qn), "%s.Sources.Caller.Caller.callHandle()",
+             project);
+    snprintf(handle_wrong_qn, sizeof(handle_wrong_qn),
+             "%s.Sources.Caller.Caller.callHandleWrongLabel()", project);
+    snprintf(handle_incomplete_qn, sizeof(handle_incomplete_qn),
+             "%s.Sources.Caller.Caller.callHandleIncomplete()", project);
+    cbm_node_t handle_one = {0}, handle_two = {0}, handle_caller = {0};
+    cbm_node_t handle_wrong_caller = {0}, handle_incomplete_caller = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_one_qn, &handle_one), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_two_qn, &handle_two), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_caller_qn, &handle_caller),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_wrong_qn, &handle_wrong_caller),
+              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_store_find_node_by_qn(s, project, handle_incomplete_qn, &handle_incomplete_caller),
+        CBM_STORE_OK);
+    /* `handle { } onError: { }`: only the two-closure overload can take both. */
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_caller.id, handle_two.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_caller.id, handle_one.id), 0);
+    /* A second closure whose label matches no parameter binds neither. */
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_wrong_caller.id, handle_two.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_wrong_caller.id, handle_one.id), 0);
+    /* An incomplete second closure marks candidate input unknown; resolver must not emit a
+     * bare-name edge. */
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_incomplete_caller.id, handle_two.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_incomplete_caller.id, handle_one.id), 0);
+    cbm_node_free_fields(&handle_incomplete_caller);
+    cbm_node_free_fields(&handle_wrong_caller);
+    cbm_node_free_fields(&handle_one);
+    cbm_node_free_fields(&handle_two);
+    cbm_node_free_fields(&handle_caller);
+    cbm_node_free_fields(&record);
+    cbm_node_free_fields(&record_caller);
+    cbm_node_free_fields(&many);
+    cbm_node_free_fields(&many_caller);
+    cbm_node_free_fields(&data);
+    cbm_node_free_fields(&url);
+    cbm_node_free_fields(&upload_caller);
+    cbm_node_free_fields(&with_default);
+    cbm_node_free_fields(&default_caller);
+    cbm_node_free_fields(&with_closure);
+    cbm_node_free_fields(&closure_caller);
+
+    cbm_node_free_fields(&flag);
+    cbm_node_free_fields(&name);
+    cbm_node_free_fields(&target);
+    cbm_node_free_fields(&caller);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Distinct declarations retain their own source ranges and outgoing edges;
+ * labels/arity alone cannot choose generic constraints or sync vs async. */
+static int swift_declaration_identity_case(const char **suffixes, int total,
+                                           const char *service_source, const char *caller_source) {
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_generic_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "Sources/Service.swift", service_source);
+        write_temp_file(tmp, "Sources/Caller.swift", caller_source);
+        for (int i = 0; mode && i < 50; i++) {
+            char path[64], source[80];
+            snprintf(path, sizeof(path), "Sources/Filler%d.swift", i);
+            snprintf(source, sizeof(source), "func filler%d() {}\n", i);
+            write_temp_file(tmp, path, source);
+        }
+        const char *previous = getenv("CBM_WORKERS");
+        char *saved = previous ? strdup(previous) : NULL;
+        cbm_setenv("CBM_WORKERS", mode ? "4" : "1", 1);
+        char db[512], project[512];
+        snprintf(db, sizeof(db), "%s/generic.db", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/Sources/Caller.swift", tmp);
+                char changed[1024];
+                snprintf(changed, sizeof(changed), "%s// changed\n", caller_source);
+                write_temp_file(tmp, "Sources/Caller.swift", changed);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            cbm_node_t *overloads = NULL;
+            int count = 0;
+            ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "pick", &overloads, &count),
+                      CBM_STORE_OK);
+            ASSERT_EQ(count, total);
+            cbm_store_free_nodes(overloads, count);
+            char qn[512];
+            snprintf(qn, sizeof(qn), "%s.Sources.Caller.Caller.invoke()", project);
+            cbm_node_t caller = {0};
+            ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &caller), CBM_STORE_OK);
+            for (int i = 0; i < total; i++) {
+                cbm_node_t target = {0}, marker = {0};
+                snprintf(qn, sizeof(qn), "%s.Sources.Service.Service.%s", project, suffixes[i]);
+                ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &target), CBM_STORE_OK);
+                ASSERT_STR_EQ(target.name, "pick");
+                ASSERT_EQ(target.start_line, i + 2);
+                ASSERT_EQ(target.end_line, i + 2);
+                snprintf(qn, sizeof(qn), "%s.Sources.Service.mark%d()", project, i);
+                ASSERT_EQ(cbm_store_find_node_by_qn(s, project, qn, &marker), CBM_STORE_OK);
+                cbm_edge_t *edges = NULL;
+                int n = 0;
+                ASSERT_EQ(cbm_store_find_edges_by_source_type(s, target.id, "CALLS", &edges, &n),
+                          CBM_STORE_OK);
+                ASSERT_EQ(n, 1);
+                ASSERT_EQ(edges[0].target_id, marker.id);
+                cbm_store_free_edges(edges, n);
+                ASSERT_EQ(cbm_store_find_edges_by_source_type(s, caller.id, "CALLS", &edges, &n),
+                          CBM_STORE_OK);
+                ASSERT_EQ(n, total);
+                int compatible = 0;
+                for (int e = 0; e < n; e++) {
+                    if (edges[e].target_id == target.id) {
+                        char candidates[64];
+                        snprintf(candidates, sizeof(candidates), "\"candidates\":%d", total);
+                        ASSERT_NOT_NULL(strstr(edges[e].properties_json, candidates));
+                        compatible++;
+                    }
+                }
+                ASSERT_EQ(compatible, 1);
+                cbm_store_free_edges(edges, n);
+                cbm_node_free_fields(&target);
+                cbm_node_free_fields(&marker);
+            }
+            cbm_node_free_fields(&caller);
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        free(saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+TEST(pipeline_swift_generic_async_identity_issue2061) {
+    const char *suffixes[] = {"pick<T>(_:T)",
+                              "pick<T:Equatable>(_:T)",
+                              "pick<T;where T:Hashable>(_:T)",
+                              "pick<T;where T:Comparable>(_:T)",
+                              "pick(_:Int)",
+                              "pick(_:Int)async"};
+    return swift_declaration_identity_case(suffixes, 6,
+                                           "class Service {\n"
+                                           "func pick<T>(_ x: T) { mark0() }\n"
+                                           "func pick<T: Equatable>(_ x: T) { mark1() }\n"
+                                           "func pick<T>(_ x: T) where T: Hashable { mark2() }\n"
+                                           "func pick<T>(_ x: T) where T: Comparable { mark3() }\n"
+                                           "func pick(_ x: Int) { mark4() }\n"
+                                           "func pick(_ x: Int) async { mark5() }\n}\n"
+                                           "func mark0() {}\nfunc mark1() {}\nfunc mark2() {}\n"
+                                           "func mark3() {}\nfunc mark4() {}\nfunc mark5() {}\n",
+                                           "class Caller {\nlet service = Service()\n"
+                                           "func invoke() { self.service.pick(value) }\n}\n");
+}
+
+TEST(pipeline_swift_static_instance_identity_issue2061) {
+    const char *suffixes[] = {"pick(_:Int)static", "pick(_:Int)"};
+    return swift_declaration_identity_case(
+        suffixes, 2,
+        "class Service {\nstatic func pick(_ x: Int) { mark0() }\n"
+        "func pick(_ x: Int) { mark1() }\n}\n"
+        "func mark0() {}\nfunc mark1() {}\n",
+        "class Caller {\nlet service = Service()\n"
+        "func invoke() { self.service.pick(1) }\n}\n");
+}
+
+TEST(pipeline_swift_extension_constraints_identity_issue2061) {
+    const char *suffixes[] = {"pick<;where T:P>(_:Int)", "pick<;where T:Q>(_:Int)"};
+    return swift_declaration_identity_case(
+        suffixes, 2,
+        "class Service<T> {}\n"
+        "extension Service where T: P { func pick(_ x: Int) { mark0() } }\n"
+        "extension Service where T: Q { func pick(_ x: Int) { mark1() } }\n"
+        "func mark0() {}\nfunc mark1() {}\nprotocol P {}\nprotocol Q {}\nstruct OnlyP: P {}\n",
+        "class Caller {\nlet service = Service<OnlyP>()\n"
+        "func invoke() { self.service.pick(1) }\n}\n");
+}
+
+TEST(pipeline_swift_capped_selector_survives_incremental_issue2061) {
+    char type[2049], service[4608], caller[2304];
+    memset(type, 'T', sizeof(type) - 1);
+    type[sizeof(type) - 1] = '\0';
+    snprintf(service, sizeof(service),
+             "struct %s {}\nclass Service {\nfunc pick(value: %s) { marker() }\n}\n"
+             "func marker() {}\n",
+             type, type);
+    snprintf(caller, sizeof(caller),
+             "class Caller {\nlet service = Service()\n"
+             "func invokeLong(_ value: %s) { service.pick(value: value) }\n}\n",
+             type);
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_swift_capped_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "Sources/Service.swift", service);
+        write_temp_file(tmp, "Sources/Caller.swift", caller);
+        for (int i = 0; mode && i < 50; i++) {
+            char path[64], filler[64];
+            snprintf(path, sizeof(path), "Sources/Filler%d.swift", i);
+            snprintf(filler, sizeof(filler), "func filler%d() {}\n", i);
+            write_temp_file(tmp, path, filler);
+        }
+        XlangEnvSave saved = xlang_env_select(mode != 0);
+        char db[512], path[512];
+        snprintf(db, sizeof(db), "%s/capped.db", tmp);
+        snprintf(path, sizeof(path), "%s/Sources/Caller.swift", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[2400];
+                snprintf(changed, sizeof(changed), "%s// changed\n", caller);
+                write_temp_file(tmp, "Sources/Caller.swift", changed);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            cbm_store_t *s = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(s);
+            const char *project = cbm_pipeline_project_name(p);
+            cbm_node_t *picks = NULL, *calls = NULL;
+            int pick_count = 0, call_count = 0;
+            ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "pick", &picks, &pick_count),
+                      CBM_STORE_OK);
+            ASSERT_EQ(pick_count, 1);
+            ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "invokeLong", &calls, &call_count),
+                      CBM_STORE_OK);
+            ASSERT_EQ(call_count, 1);
+            ASSERT_NOT_NULL(strchr(picks[0].qualified_name, '#'));
+            ASSERT_NOT_NULL(strstr(picks[0].properties_json, "\"call_selector\":\"(value:"));
+            ASSERT_NOT_NULL(strstr(picks[0].properties_json, type));
+            ASSERT_EQ(pipeline_has_calls_edge(s, calls[0].id, picks[0].id), 1);
+            cbm_store_free_nodes(picks, pick_count);
+            cbm_store_free_nodes(calls, call_count);
+            cbm_store_close(s);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+TEST(pipeline_swift_qualified_and_return_identity_issue2061) {
+    char tmp[256] = "/tmp/cbm_swift_qualified_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Types.swift",
+                    "enum A { struct Item {} }\n"
+                    "enum B { struct Item {} }\nclass Service {\n"
+                    "func pick(_ value: A.Item) { first() }\n"
+                    "func pick(_ value: B.Item) { second() }\n}\n"
+                    "func first() {}\nfunc second() {}\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/graph.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(
+        cbm_store_find_nodes_by_name(store, cbm_pipeline_project_name(p), "pick", &nodes, &count),
+        CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_NOT_NULL(strstr(nodes[0].qualified_name, ".Service.pick(_:Item)"));
+    cbm_edge_t *edges = NULL;
+    int edges_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, nodes[0].id, "CALLS", &edges, &edges_count),
+        CBM_STORE_OK);
+    ASSERT_EQ(edges_count, 2);
+    cbm_store_free_edges(edges, edges_count);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_swift_receiver_and_chained_closures_issue2061) {
+    const char *types =
+        "class Parent { func inherited() {} }\n"
+        "class Session: Parent {\n"
+        "func request(_ value: Int) -> Request { Request() }\n"
+        "func streamRequest(_ value: Int) -> Stream { Stream() }\n}\n"
+        "class Request { func responseDecodable(of type: Any.Type, completion: () -> Void) {} }\n"
+        "class Stream { func responseStream(completion: () -> Void) {} }\n"
+        "class Unrelated { func request(_ value: Int) {}\nfunc sorted() {}\n"
+        "func inherited() {} }\n";
+    const char *source =
+        "class Caller { let session: Session = Session()\n"
+        "func typed(_ value: Session) { value.request(1) }\n"
+        "func inherited(_ value: Session) { value.inherited() }\n"
+        "func external(_ output: [String]) { output.sorted() }\n"
+        "func literal() { let output = [\"x\"]; output.sorted() }\n"
+        "func shadowed() { let session = Unrelated(); session.request(1) }\n"
+        "func chained() { session.request(1).responseDecodable(of: String.self) { } }\n"
+        "func streamed() { session.streamRequest(1).responseStream { } }\n}\n";
+    const struct {
+        const char *caller;
+        const char *target;
+        int expected;
+    } pairs[] = {
+        {"Caller.typed(_:Session)", "Session.request(_:Int)=>Request", 1},
+        {"Caller.typed(_:Session)", "Unrelated.request(_:Int)", 0},
+        {"Caller.inherited(_:Session)", "Parent.inherited()", 1},
+        {"Caller.inherited(_:Session)", "Unrelated.inherited()", 0},
+        {"Caller.external(_:[String])", "Unrelated.sorted()", 0},
+        {"Caller.literal()", "Unrelated.sorted()", 0},
+        {"Caller.shadowed()", "Unrelated.request(_:Int)", 1},
+        {"Caller.shadowed()", "Session.request(_:Int)=>Request", 0},
+        {"Caller.chained()", "Request.responseDecodable(of:Type,completion:()=>Void)", 1},
+        {"Caller.streamed()", "Stream.responseStream(completion:()=>Void)", 1},
+    };
+    for (int parallel = 0; parallel < 2; parallel++) {
+        char tmp[256] = "/tmp/cbm_swift_receiver_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "Types.swift", types);
+        write_temp_file(tmp, "Calls.swift", source);
+        for (int i = 0; parallel && i < 55; i++) {
+            char name[64], body[64];
+            snprintf(name, sizeof(name), "Pad%d.swift", i);
+            snprintf(body, sizeof(body), "func pad%d() {}\n", i);
+            write_temp_file(tmp, name, body);
+        }
+        XlangEnvSave saved = xlang_env_select(parallel != 0);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/graph.db", tmp);
+        for (int phase = 0; phase < 2; phase++) {
+            if (phase) {
+                char changed[2048], path[512];
+                snprintf(changed, sizeof(changed), "%s// changed\n", source);
+                write_temp_file(tmp, "Calls.swift", changed);
+                snprintf(path, sizeof(path), "%s/Calls.swift", tmp);
+                ASSERT_EQ(pipeline_test_set_mtime(path, 2000000000, 0), 0);
+            }
+            cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+            ASSERT_NOT_NULL(p);
+            ASSERT_EQ(cbm_pipeline_run(p), 0);
+            if (phase) {
+                ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
+                          CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+            }
+            cbm_store_t *store = cbm_store_open_path(db);
+            ASSERT_NOT_NULL(store);
+            for (unsigned i = 0; i < sizeof(pairs) / sizeof(pairs[0]); i++) {
+                char qn[1024];
+                cbm_node_t caller = {0}, target = {0};
+                snprintf(qn, sizeof(qn), "%s.Calls.%s", cbm_pipeline_project_name(p),
+                         pairs[i].caller);
+                ASSERT_EQ(
+                    cbm_store_find_node_by_qn(store, cbm_pipeline_project_name(p), qn, &caller),
+                    CBM_STORE_OK);
+                snprintf(qn, sizeof(qn), "%s.Types.%s", cbm_pipeline_project_name(p),
+                         pairs[i].target);
+                ASSERT_EQ(
+                    cbm_store_find_node_by_qn(store, cbm_pipeline_project_name(p), qn, &target),
+                    CBM_STORE_OK);
+                ASSERT_EQ(pipeline_has_calls_edge(store, caller.id, target.id), pairs[i].expected);
+                cbm_node_free_fields(&caller);
+                cbm_node_free_fields(&target);
+            }
+            cbm_store_close(store);
+            cbm_pipeline_free(p);
+        }
+        xlang_env_restore(&saved);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+TEST(pipeline_swift_return_identity_issue2061) {
+    const char *returns[] = {"pick()=>Int", "pick()=>String"};
+    return swift_declaration_identity_case(
+        returns, 2,
+        "class Service {\nfunc pick() -> Int { mark0(); return 1 }\n"
+        "func pick() -> String { mark1(); return \"x\" }\n}\n"
+        "func mark0() {}\nfunc mark1() {}\n",
+        "class Caller {\nlet service = Service()\n"
+        "func invoke() { let _: Int = self.service.pick() }\n}\n");
+}
+
+/* The parallel call pass must retain both type-only overload candidates. */
+TEST(pipeline_swift_overloads_parallel_candidates_issue2061) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swiftoverload_par_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Sources/Service.swift",
+                    "class Service {\n"
+                    "    func upload(_ data: Data, to url: URL) {}\n"
+                    "    func upload(_ file: URL, to url: URL) {}\n"
+                    "    func record(path: String, session: URLSession) {}\n"
+                    "    func handle(completion: () -> Void) {}\n"
+                    "    func handle(completion: () -> Void, onError: () -> Void) {}\n"
+                    "}\n");
+    write_temp_file(
+        tmp, "Sources/Caller.swift",
+        "class Caller {\n"
+        "    let service = Service()\n"
+        "    func invoke() {\n"
+        "        self.service.upload(Data(), to: URL(string: \"/x\")!)\n"
+        "        self.service.record(path: \"/audit\", session: URLSession.shared)\n"
+        "    }\n"
+        "    func callHandle() { self.service.handle { } onError: { } }\n"
+        "    func callHandleWrongLabel() { self.service.handle { } bogus: { } }\n"
+        "    func callHandleIncomplete() { self.service.handle { } onError: { recover( } }\n"
+        "}\n");
+    for (int i = 0; i < 50; i++) {
+        char path[64], source[80];
+        snprintf(path, sizeof(path), "Sources/Filler%d.swift", i);
+        snprintf(source, sizeof(source), "func filler%d() {}\n", i);
+        write_temp_file(tmp, path, source);
+    }
+
+    char *previous_workers = getenv("CBM_WORKERS");
+    char *saved_workers = previous_workers ? strdup(previous_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/swiftoverload.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_result = p ? cbm_pipeline_run(p) : -1;
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    free(saved_workers);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(run_result, 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    char caller_qn[512], data_qn[512], url_qn[512];
+    snprintf(caller_qn, sizeof(caller_qn), "%s.Sources.Caller.Caller.invoke()", project);
+    snprintf(data_qn, sizeof(data_qn), "%s.Sources.Service.Service.upload(_:Data,to:URL)", project);
+    snprintf(url_qn, sizeof(url_qn), "%s.Sources.Service.Service.upload(_:URL,to:URL)", project);
+    char record_qn[512];
+    snprintf(record_qn, sizeof(record_qn),
+             "%s.Sources.Service.Service.record(path:String,session:URLSession)", project);
+    cbm_node_t caller = {0}, data = {0}, url = {0}, record = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, caller_qn, &caller), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, data_qn, &data), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, url_qn, &url), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, record_qn, &record), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_has_calls_edge(s, caller.id, data.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, caller.id, url.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, caller.id, record.id), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 0);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, caller.id, "CALLS", &edges, &edge_count),
+              CBM_STORE_OK);
+    int ambiguous = 0;
+    for (int i = 0; i < edge_count; i++) {
+        if ((edges[i].target_id == data.id || edges[i].target_id == url.id) &&
+            edges[i].properties_json && strstr(edges[i].properties_json, "\"candidates\":2")) {
+            ambiguous++;
+        }
+    }
+    ASSERT_EQ(ambiguous, 2);
+    cbm_store_free_edges(edges, edge_count);
+
+    /* #2061: the parallel resolver must reach the same trailing-closure
+     * verdicts as the serial one. */
+    char handle_one_qn[512], handle_two_qn[512], handle_qn[512], handle_wrong_qn[512],
+        handle_incomplete_qn[512];
+    snprintf(handle_one_qn, sizeof(handle_one_qn),
+             "%s.Sources.Service.Service.handle(completion:()=>Void)", project);
+    snprintf(handle_two_qn, sizeof(handle_two_qn),
+             "%s.Sources.Service.Service.handle(completion:()=>Void,onError:()=>Void)", project);
+    snprintf(handle_qn, sizeof(handle_qn), "%s.Sources.Caller.Caller.callHandle()", project);
+    snprintf(handle_wrong_qn, sizeof(handle_wrong_qn),
+             "%s.Sources.Caller.Caller.callHandleWrongLabel()", project);
+    snprintf(handle_incomplete_qn, sizeof(handle_incomplete_qn),
+             "%s.Sources.Caller.Caller.callHandleIncomplete()", project);
+    cbm_node_t handle_one = {0}, handle_two = {0}, handle = {0};
+    cbm_node_t handle_wrong = {0}, handle_incomplete = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_one_qn, &handle_one), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_two_qn, &handle_two), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_qn, &handle), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_wrong_qn, &handle_wrong), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, handle_incomplete_qn, &handle_incomplete),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle.id, handle_two.id), 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle.id, handle_one.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_wrong.id, handle_two.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_wrong.id, handle_one.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_incomplete.id, handle_two.id), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, handle_incomplete.id, handle_one.id), 0);
+    cbm_node_free_fields(&handle_incomplete);
+    cbm_node_free_fields(&handle_wrong);
+    cbm_node_free_fields(&handle_one);
+    cbm_node_free_fields(&handle_two);
+    cbm_node_free_fields(&handle);
+    cbm_node_free_fields(&caller);
+    cbm_node_free_fields(&data);
+    cbm_node_free_fields(&url);
+    cbm_node_free_fields(&record);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_swift_default_before_required_candidates_issue2061) {
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_default_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        write_temp_file(tmp, "Sources/Service.swift",
+                        "class Service {\n"
+                        "    func choose(x first: Int = 0, x second: Int) {}\n"
+                        "    func choose(x first: String = \"\", x second: String) {}\n"
+                        "    func consume(_ first: Int = 0, _ second: Int) {}\n"
+                        "}\n");
+        write_temp_file(tmp, "Sources/Caller.swift",
+                        "class Caller {\n"
+                        "    let service = Service()\n"
+                        "    func labeled() { self.service.choose(x: 1) }\n"
+                        "    func unlabeled() { self.service.consume(1) }\n"
+                        "    func wrong() { self.service.choose(y: 1) }\n"
+                        "}\n");
+        for (int i = 0; mode && i < 50; i++) {
+            char path[64], source[80];
+            snprintf(path, sizeof(path), "Sources/Filler%d.swift", i);
+            snprintf(source, sizeof(source), "func filler%d() {}\n", i);
+            write_temp_file(tmp, path, source);
+        }
+        const char *previous = getenv("CBM_WORKERS");
+        char *saved = previous ? strdup(previous) : NULL;
+        cbm_setenv("CBM_WORKERS", mode ? "4" : "1", 1);
+        char db[512];
+        snprintf(db, sizeof(db), "%s/defaults.db", tmp);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+        int result = p ? cbm_pipeline_run(p) : -1;
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+        free(saved);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(result, 0);
+        const char *project = cbm_pipeline_project_name(p);
+        cbm_store_t *store = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(store);
+        const char *targets[] = {"choose(x:Int,x:Int)", "choose(x:String,x:String)",
+                                 "consume(_:Int,_:Int)"};
+        for (int i = 0; i < 3; i++) {
+            char caller_qn[512], target_qn[512], wrong_qn[512];
+            snprintf(caller_qn, sizeof(caller_qn), "%s.Sources.Caller.Caller.%s()", project,
+                     i < 2 ? "labeled" : "unlabeled");
+            snprintf(target_qn, sizeof(target_qn), "%s.Sources.Service.Service.%s", project,
+                     targets[i]);
+            snprintf(wrong_qn, sizeof(wrong_qn), "%s.Sources.Caller.Caller.wrong()", project);
+            cbm_node_t caller = {0}, target = {0}, wrong = {0};
+            ASSERT_EQ(cbm_store_find_node_by_qn(store, project, caller_qn, &caller), CBM_STORE_OK);
+            ASSERT_EQ(cbm_store_find_node_by_qn(store, project, target_qn, &target), CBM_STORE_OK);
+            ASSERT_EQ(cbm_store_find_node_by_qn(store, project, wrong_qn, &wrong), CBM_STORE_OK);
+            ASSERT_EQ(pipeline_has_calls_edge(store, caller.id, target.id), 1);
+            ASSERT_EQ(pipeline_has_calls_edge(store, wrong.id, target.id), 0);
+            cbm_edge_t *edges = NULL;
+            int count = 0, compatible = 0;
+            ASSERT_EQ(
+                cbm_store_find_edges_by_source_type(store, caller.id, "CALLS", &edges, &count),
+                CBM_STORE_OK);
+            for (int e = 0; e < count; e++) {
+                if (edges[e].target_id == target.id && edges[e].properties_json &&
+                    strstr(edges[e].properties_json,
+                           i < 2 ? "\"candidates\":2" : "\"candidates\":1")) {
+                    compatible++;
+                }
+            }
+            ASSERT_EQ(compatible, 1);
+            cbm_store_free_edges(edges, count);
+            cbm_node_free_fields(&caller);
+            cbm_node_free_fields(&target);
+            cbm_node_free_fields(&wrong);
+        }
+        cbm_store_close(store);
+        cbm_pipeline_free(p);
+        th_rmtree(tmp);
+    }
+    PASS();
+}
+
+/* #2061: a Swift call matching NONE of a same-named project symbol's
+ * overloads must not bind to it (a bare-name match would bind a wrong
+ * overload), while the empty-resolution service fallbacks still apply —
+ * the contract both resolver paths share (Swift blocks in pass_calls.c
+ * and pass_parallel.c). Local `fetch(id:)` cannot take a one-argument
+ * unlabeled URL call, so the call stays unresolved and classifies as the
+ * global API (#856). */
+static int swift_incompatible_overload_fixture(bool parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swiftincompat_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "Sources/Api.swift",
+                    "func fetch(id: Int) -> Int {\n"
+                    "    return id\n"
+                    "}\n"
+                    "func get(id: Int) {}\n");
+    write_temp_file(tmp, "Sources/Caller.swift",
+                    "class Caller {\n"
+                    "    func run() -> Int {\n"
+                    "        return fetch(\"https://api.example.com/data\")\n"
+                    "    }\n"
+                    "    func wrongLabel() { get(key: 1) }\n"
+                    "}\n");
+    for (int i = 0; parallel && i < 52; i++) {
+        char path[64], source[80];
+        snprintf(path, sizeof(path), "Sources/Filler%d.swift", i);
+        snprintf(source, sizeof(source), "func filler%d() {}\n", i);
+        write_temp_file(tmp, path, source);
+    }
+
+    char *previous_workers = getenv("CBM_WORKERS");
+    char *saved_workers = previous_workers ? strdup(previous_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/swiftincompat.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run_result = p ? cbm_pipeline_run(p) : -1;
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    free(saved_workers);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(run_result, 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    cbm_node_t *fetches = NULL;
+    int fetch_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "fetch", &fetches, &fetch_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(fetch_count, 1);
+    cbm_node_t *runs = NULL;
+    int run_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "run", &runs, &run_count), CBM_STORE_OK);
+    ASSERT_EQ(run_count, 1);
+    char wrong_qn[512];
+    snprintf(wrong_qn, sizeof(wrong_qn), "%s.Sources.Caller.Caller.wrongLabel()", project);
+    cbm_node_t wrong = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, project, wrong_qn, &wrong), CBM_STORE_OK);
+    cbm_node_t *gets = NULL;
+    int get_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s, project, "get", &gets, &get_count), CBM_STORE_OK);
+    ASSERT_EQ(get_count, 1);
+    ASSERT_EQ(pipeline_has_calls_edge(s, wrong.id, gets[0].id), 0);
+    /* Fault injection: the same checker must detect an incompatible edge,
+     * which would make the preceding negative assertion fail in either path. */
+    cbm_edge_t injected = {
+        .project = project, .source_id = wrong.id, .target_id = gets[0].id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &injected), 0);
+    ASSERT_EQ(pipeline_has_calls_edge(s, wrong.id, gets[0].id), 1);
+    cbm_store_free_nodes(gets, get_count);
+    cbm_node_free_fields(&wrong);
+    ASSERT_EQ(pipeline_has_calls_edge(s, runs[0].id, fetches[0].id), 0);
+    cbm_store_free_nodes(fetches, fetch_count);
+    cbm_store_free_nodes(runs, run_count);
+
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_swift_incompatible_overload_unresolved_issue2061) {
+    return swift_incompatible_overload_fixture(false);
+}
+
+/* >=50 files exercise the separate parallel resolver with identical assertions. */
+TEST(pipeline_swift_incompatible_overload_parallel_fallback_issue2061) {
+    return swift_incompatible_overload_fixture(true);
+}
+
 /* Native `fetch()` (#856), parallel path (>= 50 files -> pass_parallel.c's
  * resolve_file_calls). Mirrors pipeline_native_fetch_classified_as_http_calls
  * but forces the parallel resolver, since the empty-resolution fallback is a
@@ -16005,8 +16927,8 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
                              : body);
     }
     if (written && cross_walk_stage) {
-        written = python_module_write_fixture_file(root, "memo_def.py",
-                                                    "class S:\n    def m(self):\n        return 1\n");
+        written = python_module_write_fixture_file(
+            root, "memo_def.py", "class S:\n    def m(self):\n        return 1\n");
     }
     if (written && !failure_stage) {
         written = python_module_write_fixture_file(root, "plain.py", body) &&
@@ -16071,8 +16993,10 @@ static int python_init_scope_pipeline_case(bool parallel, const char *failure_st
         correct = project &&
                   cbm_store_find_nodes_by_label(store, project, "File", &files, &file_count) ==
                       CBM_STORE_OK &&
-                  file_count ==
-                      (cross_walk_stage ? 2 : failure_stage ? 1 : 5) + (parallel ? 52 : 0);
+                  file_count == (cross_walk_stage ? 2
+                                 : failure_stage  ? 1
+                                                  : 5) +
+                                    (parallel ? 52 : 0);
         cbm_store_free_nodes(files, file_count);
         if (project && !failure_stage) {
             const char *modules[] = {"plain", "pkg"};
@@ -18086,14 +19010,13 @@ static int pyn_assert_shadowing(cbm_store_t *s, const char *project) {
         snprintf(local_def, sizeof(local_def), "%s.uses_local.helper", files[f]);
         snprintf(module_caller, sizeof(module_caller), "%s.uses_module", files[f]);
         snprintf(module_def, sizeof(module_def), "%s.helper", files[f]);
-        ASSERT_TRUE(
-            pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
+        ASSERT_TRUE(pyn_edge_with(s, project, local_caller, local_def, "CALLS", local_strategy[f]));
         ASSERT_FALSE(pyn_edge(s, project, local_caller, module_def, "CALLS"));
         ASSERT_TRUE(pyn_edge(s, project, module_caller, module_def, "CALLS"));
         ASSERT_FALSE(pyn_edge(s, project, module_caller, local_def, "CALLS"));
     }
-    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper",
-                              "CALLS", "\"strategy\":\"lexical_scope\""));
+    ASSERT_TRUE(pyn_edge_with(s, project, "sa.uses_decorated", "sa.uses_decorated.helper", "CALLS",
+                              "\"strategy\":\"lexical_scope\""));
     ASSERT_FALSE(pyn_edge(s, project, "sa.uses_decorated", "sa.helper", "CALLS"));
     return 0;
 }
@@ -18406,9 +19329,8 @@ static int pyn_run_init_collision(int fillers) {
             const char *project = cbm_pipeline_project_name(p);
             imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
                                     "src.rowpkg.layout.Layout", "IMPORTS");
-            calls[run] =
-                pyn_edge(s, project, "tests.test_app.test_build", "src.rowpkg.layout.Layout",
-                         "CALLS");
+            calls[run] = pyn_edge(s, project, "tests.test_app.test_build",
+                                  "src.rowpkg.layout.Layout", "CALLS");
             method[run] = pyn_edge(s, project, "tests.test_app.test_build",
                                    "src.rowpkg.layout.Layout.create", "CALLS");
             cbm_store_close(s);
@@ -19756,6 +20678,266 @@ TEST(pipeline_swift_cross_package_import) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
+    PASS();
+}
+
+/* #2379 at graph level, as a SwiftPM package. Sources/Kit/Inits.swift is the
+ * issue's reproduction. Sources/App/Sub.swift imports the Kit target -- which
+ * sends name resolution down the import-aware path -- and calls initializers
+ * the way real code does: `super.init` to a project superclass in another
+ * target, `super.init` to a superclass outside the project, an explicit
+ * `T.init(...)` on a project type and on a type outside the project, `self.init`
+ * from an extension of a type outside the project, and an implicit `.init(...)`.
+ * Each of those can attract a false CALLS edge now that initializers are nodes. */
+static const char *const SWIFT_INIT_PACKAGE_SRC =
+    "let package = Package(\n"
+    "    name: \"Kit\",\n"
+    "    products: [.library(name: \"Kit\", targets: [\"Kit\"])],\n"
+    "    targets: [\n"
+    "        .target(name: \"Kit\", dependencies: []),\n"
+    "        .target(name: \"App\", dependencies: [\"Kit\"])\n"
+    "    ]\n"
+    ")\n";
+
+static const char *const SWIFT_INIT_INITS_SRC = "func helper() -> Int { 1 }\n"
+                                                "func other() -> Int { 2 }\n"
+                                                "\n"
+                                                "struct Box {\n"
+                                                "    let value: Int\n"
+                                                "    init() {\n"
+                                                "        value = helper()\n"
+                                                "    }\n"
+                                                "    func read() -> Int {\n"
+                                                "        other()\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "final class Holder {\n"
+                                                "    let value: Int\n"
+                                                "    init(seed: Int) {\n"
+                                                "        value = helper() + seed\n"
+                                                "    }\n"
+                                                "    convenience init() {\n"
+                                                "        self.init(seed: other())\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "enum Mode {\n"
+                                                "    case on\n"
+                                                "    init?(flag: Bool) {\n"
+                                                "        if helper() > 0 { self = .on } else { "
+                                                "return nil }\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "extension Box {\n"
+                                                "    init(raw: Int) {\n"
+                                                "        value = other()\n"
+                                                "    }\n"
+                                                "    init(nibName: String?, bundle: Bundle?) {\n"
+                                                "        value = 0\n"
+                                                "    }\n"
+                                                "}\n";
+
+static const char *const SWIFT_INIT_BASE_SRC = "open class Base {\n"
+                                               "    public init(name: String) {}\n"
+                                               "    public init(seed: Int) {}\n"
+                                               "}\n";
+
+static const char *const SWIFT_INIT_SUB_SRC = "import Kit\n"
+                                              "import UIKit\n"
+                                              "\n"
+                                              "class Sub: Base {\n"
+                                              "    override init(name: String) {\n"
+                                              "        super.init(name: name)\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "class Screen: UIViewController {\n"
+                                              "    init() {\n"
+                                              "        super.init(nibName: nil, bundle: nil)\n"
+                                              "    }\n"
+                                              "    func alert() -> UIAlertAction {\n"
+                                              "        UIAlertAction.init(title: nil, style: "
+                                              ".default)\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "extension Notification {\n"
+                                              "    init(tag: String) {\n"
+                                              "        self.init(name: Notification.Name(tag))\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "func make() -> Box {\n"
+                                              "    .init(raw: 1)\n"
+                                              "}\n"
+                                              "func explicit() -> Box {\n"
+                                              "    Box.init(raw: 2)\n"
+                                              "}\n";
+
+enum { SWIFT_INIT_EDGE_CAP = 32, SWIFT_INIT_EDGE_LEN = 192 };
+
+typedef struct {
+    int run_rc;
+    int calls;       /* CALLS edges seen; -1 if the store was not read */
+    int init_usages; /* USAGE edges into a node named init/deinit */
+    bool compatible_init_present;
+    char edges[SWIFT_INIT_EDGE_CAP][SWIFT_INIT_EDGE_LEN]; /* "src -> tgt", sorted */
+} SwiftInitObservation;
+
+static int swift_init_edge_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* Qualified name relative to the project ("Inits.Box.init"). */
+static const char *swift_init_rel_qn(const char *qn, const char *project) {
+    size_t plen = strlen(project);
+    return strncmp(qn, project, plen) == 0 && qn[plen] == '.' ? qn + plen + 1 : qn;
+}
+
+static void swift_init_observe(cbm_store_t *s, const char *project, SwiftInitObservation *o) {
+    char compatible_qn[512];
+    snprintf(compatible_qn, sizeof(compatible_qn),
+             "%s.Sources.Kit.Inits.Box.init(nibName:String?,bundle:Bundle?)", project);
+    cbm_node_t compatible = {0};
+    o->compatible_init_present =
+        cbm_store_find_node_by_qn(s, project, compatible_qn, &compatible) == CBM_STORE_OK;
+    cbm_node_free_fields(&compatible);
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    o->calls = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src = {0};
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                o->calls < SWIFT_INIT_EDGE_CAP) {
+                snprintf(o->edges[o->calls], SWIFT_INIT_EDGE_LEN, "%s -> %s",
+                         swift_init_rel_qn(src.qualified_name, project),
+                         swift_init_rel_qn(tgt.qualified_name, project));
+            }
+            o->calls++;
+            cbm_node_free_fields(&src);
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+    int kept = o->calls < SWIFT_INIT_EDGE_CAP ? o->calls : SWIFT_INIT_EDGE_CAP;
+    qsort(o->edges, (size_t)kept, sizeof(o->edges[0]), swift_init_edge_cmp);
+
+    edges = NULL;
+    count = 0;
+    o->init_usages = 0;
+    if (cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                tgt.name && (strcmp(tgt.name, "init") == 0 || strcmp(tgt.name, "deinit") == 0)) {
+                o->init_usages++;
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+}
+
+/* `pad` filler files push the run past MIN_FILES_FOR_PARALLEL so that, with
+ * `parallel`, it goes through pass_parallel.c rather than pass_calls.c. */
+static void swift_init_case(bool parallel, int pad, SwiftInitObservation *o) {
+    memset(o, 0, sizeof(*o));
+    o->run_rc = -1;
+    o->calls = -1;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return;
+    }
+    char path[512];
+    bool written = true;
+    const char *names[] = {"Package.swift", "Sources/Kit/Inits.swift", "Sources/Kit/Base.swift",
+                           "Sources/App/Sub.swift"};
+    const char *sources[] = {SWIFT_INIT_PACKAGE_SRC, SWIFT_INIT_INITS_SRC, SWIFT_INIT_BASE_SRC,
+                             SWIFT_INIT_SUB_SRC};
+    for (int i = 0; i < 4 && written; i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp, names[i]);
+        written = th_write_file(path, sources[i]) == 0;
+    }
+    for (int i = 0; i < pad && written; i++) {
+        char source[96];
+        snprintf(path, sizeof(path), "%s/Pad%02d.swift", tmp, i);
+        snprintf(source, sizeof(source), "func pad%02d() -> Int { %d }\n", i, i);
+        written = th_write_file(path, source) == 0;
+    }
+    if (written) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/swift_init.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o->run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            if (store && project) {
+                swift_init_observe(store, project, o);
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+}
+
+/* The exact CALLS set. Every initializer's own calls come from that
+ * initializer (the repro's file-level collapse is gone); Sub.init reaches
+ * Base.init in the other target and `Box.init(raw:)` reaches Box.init.
+ * UIViewController's and UIAlertAction's initializers, Notification's own and
+ * the implicit `.init(...)` are outside the project and form no edge -- in
+ * particular none to a project `init` that merely shares the name. Holder's
+ * convenience `self.init` is not a self-loop. */
+static int swift_init_assert_exact(const SwiftInitObservation *o) {
+    static const char *const expected[] = {
+        "Sources.App.Sub.Sub.init(name:String) -> Sources.Kit.Base.Base.init(name:String)",
+        "Sources.App.Sub.explicit()=>Box -> Sources.Kit.Inits.Box.init(raw:Int)",
+        "Sources.Kit.Inits.Box.init() -> Sources.Kit.Inits.helper()=>Int",
+        "Sources.Kit.Inits.Box.init(raw:Int) -> Sources.Kit.Inits.other()=>Int",
+        "Sources.Kit.Inits.Box.read()=>Int -> Sources.Kit.Inits.other()=>Int",
+        "Sources.Kit.Inits.Holder.init() -> Sources.Kit.Inits.other()=>Int",
+        "Sources.Kit.Inits.Holder.init(seed:Int) -> Sources.Kit.Inits.helper()=>Int",
+        "Sources.Kit.Inits.Mode.init(flag:Bool) -> Sources.Kit.Inits.helper()=>Int",
+    };
+    enum { EXPECTED_CALLS = sizeof(expected) / sizeof(expected[0]) };
+    ASSERT_EQ(o->run_rc, 0);
+    ASSERT_TRUE(o->compatible_init_present);
+    ASSERT_EQ(o->init_usages, 0);
+    ASSERT_EQ(o->calls, (int)EXPECTED_CALLS);
+    for (int i = 0; i < (int)EXPECTED_CALLS; i++) {
+        ASSERT_STR_EQ(o->edges[i], expected[i]);
+    }
+    return 0;
+}
+
+TEST(pipeline_swift_init_exact_calls_sequential_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(false, 0, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
+/* Same input through pass_parallel.c: 55 fillers exceed MIN_FILES_FOR_PARALLEL. */
+TEST(pipeline_swift_init_exact_calls_parallel_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(true, 55, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
     PASS();
 }
 
@@ -27702,6 +28884,124 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 }
 #endif
 
+static bool swift_default_restore_graph_is_valid(cbm_store_t *store, const char *project,
+                                                 bool has_default) {
+    char service_qn[512], good_qn[512], bad_qn[512];
+    snprintf(service_qn, sizeof(service_qn), "%s.Sources.Service.Service.ping(a:Int,c:Int)",
+             project);
+    snprintf(good_qn, sizeof(good_qn), "%s.Sources.Caller.Caller.good()", project);
+    snprintf(bad_qn, sizeof(bad_qn), "%s.Sources.Caller.Caller.bad()", project);
+    cbm_node_t service = {0}, good = {0}, bad = {0};
+    bool valid = cbm_store_find_node_by_qn(store, project, service_qn, &service) == CBM_STORE_OK &&
+                 cbm_store_find_node_by_qn(store, project, good_qn, &good) == CBM_STORE_OK &&
+                 cbm_store_find_node_by_qn(store, project, bad_qn, &bad) == CBM_STORE_OK;
+    if (valid) {
+        valid = service.name && strcmp(service.name, "ping") == 0 && service.properties_json &&
+                strstr(service.properties_json,
+                       has_default ? "\"param_default_mask\":\"0000000000000002\""
+                                   : "\"param_default_mask\":\"0000000000000000\"") &&
+                strstr(service.properties_json, "\"selector_param_count\":2") &&
+                pipeline_has_calls_edge(store, good.id, service.id) == has_default &&
+                pipeline_has_calls_edge(store, bad.id, service.id) == 0;
+    }
+    cbm_node_free_fields(&service);
+    cbm_node_free_fields(&good);
+    cbm_node_free_fields(&bad);
+    return valid;
+}
+
+TEST(pipeline_swift_incremental_restores_default_signature_issue2061) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_restore_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Sources/Service.swift",
+                    "class Service {\n"
+                    "    func ping(a: Int, c: Int = 0) {}\n"
+                    "    func other(a: Int, b: Int = 0) {}\n"
+                    "}\n");
+    write_temp_file(tmp, "Sources/Caller.swift",
+                    "class Caller {\n"
+                    "    let service = Service()\n"
+                    "    func good() { self.service.ping(a: 1) }\n"
+                    "    func bad() { self.service.ping(x: 1) }\n"
+                    "}\n");
+    char db_path[512], closure_db_path[512], caller_path[512], project[512], service_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/swift-restore.db", tmp);
+    snprintf(closure_db_path, sizeof(closure_db_path), "%s/swift-closure.db", tmp);
+    snprintf(caller_path, sizeof(caller_path), "%s/Sources/Caller.swift", tmp);
+    snprintf(service_path, sizeof(service_path), "%s/Sources/Service.swift", tmp);
+
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    const char *project_name = cbm_pipeline_project_name(first);
+    ASSERT_NOT_NULL(project_name);
+    snprintf(project, sizeof(project), "%s", project_name);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(swift_default_restore_graph_is_valid(store, project, true));
+    cbm_store_close(store);
+    cbm_pipeline_free(first);
+
+    FILE *caller = fopen(caller_path, "ab");
+    ASSERT_NOT_NULL(caller);
+    ASSERT_TRUE(fputs("// incremental marker\n", caller) >= 0);
+    ASSERT_EQ(fclose(caller), 0);
+    ASSERT_EQ(pipeline_test_set_mtime(caller_path, 2000000000, 0), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_t *legacy = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(legacy);
+    ASSERT_EQ(cbm_pipeline_run(legacy), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(swift_default_restore_graph_is_valid(store, project, true));
+    cbm_store_close(store);
+    cbm_pipeline_free(legacy);
+    cbm_pipeline_incremental_test_reset_faults();
+    /* The test-only legacy partial route predates persisted LSP surfaces.
+     * Seed a separate full generation for closure-repair assertions. */
+    cbm_pipeline_t *closure_seed = cbm_pipeline_new(tmp, closure_db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(closure_seed);
+    ASSERT_EQ(cbm_pipeline_run(closure_seed), 0);
+    cbm_pipeline_free(closure_seed);
+
+    caller = fopen(caller_path, "ab");
+    ASSERT_NOT_NULL(caller);
+    ASSERT_TRUE(fputs("// closure marker\n", caller) >= 0);
+    ASSERT_EQ(fclose(caller), 0);
+    ASSERT_EQ(pipeline_test_set_mtime(caller_path, 2000000001, 0), 0);
+    cbm_pipeline_t *closure = cbm_pipeline_new(tmp, closure_db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(closure);
+    ASSERT_EQ(cbm_pipeline_run(closure), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    store = cbm_store_open_path(closure_db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(swift_default_restore_graph_is_valid(store, project, true));
+    cbm_store_close(store);
+    cbm_pipeline_free(closure);
+
+    write_temp_file(tmp, "Sources/Service.swift",
+                    "class Service {\n"
+                    "    func ping(a: Int, c: Int) {}\n"
+                    "    func other(a: Int, b: Int = 0) {}\n"
+                    "}\n");
+    ASSERT_EQ(pipeline_test_set_mtime(service_path, 2000000002, 0), 0);
+    cbm_pipeline_t *defaults_removed = cbm_pipeline_new(tmp, closure_db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(defaults_removed);
+    ASSERT_EQ(cbm_pipeline_run(defaults_removed), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    store = cbm_store_open_path(closure_db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(swift_default_restore_graph_is_valid(store, project, false));
+    cbm_store_close(store);
+    cbm_pipeline_free(defaults_removed);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* #1153: a C++ method called on the object a static factory returns
  * (`SecdManager::getInstance()->m()`, `Registry::instance().m()`,
  * `auto w = Widget::create(); w->m()`) got no CALLS edge when the class lives
@@ -28352,6 +29652,19 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_native_fetch_template_base_url_makes_route);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
+    RUN_TEST(pipeline_swift_overloads_keep_argument_labels_issue2061);
+    RUN_TEST(pipeline_swift_overloads_parallel_candidates_issue2061);
+    RUN_TEST(pipeline_swift_generic_async_identity_issue2061);
+    RUN_TEST(pipeline_swift_static_instance_identity_issue2061);
+    RUN_TEST(pipeline_swift_extension_constraints_identity_issue2061);
+    RUN_TEST(pipeline_swift_capped_selector_survives_incremental_issue2061);
+    RUN_TEST(pipeline_swift_qualified_and_return_identity_issue2061);
+    RUN_TEST(pipeline_swift_return_identity_issue2061);
+    RUN_TEST(pipeline_swift_receiver_and_chained_closures_issue2061);
+    RUN_TEST(pipeline_swift_default_before_required_candidates_issue2061);
+    RUN_TEST(pipeline_swift_incompatible_overload_unresolved_issue2061);
+    RUN_TEST(pipeline_swift_incompatible_overload_parallel_fallback_issue2061);
+    RUN_TEST(pipeline_swift_incremental_restores_default_signature_issue2061);
     RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
@@ -28425,6 +29738,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_swift_cross_package_import);
+    RUN_TEST(pipeline_swift_init_exact_calls_sequential_issue2379);
+    RUN_TEST(pipeline_swift_init_exact_calls_parallel_issue2379);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
     RUN_TEST(pipeline_go_type_classification);

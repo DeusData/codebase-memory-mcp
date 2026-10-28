@@ -3221,6 +3221,75 @@ static yyjson_val *trace_grouped_row_named(yyjson_val *leg, const char *name,
     return NULL;
 }
 
+TEST(tool_swift_overload_presentation_issue2061) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "swift-overloads";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/swift-overloads"), CBM_STORE_OK);
+    const char *names[] = {"work", "work", "target", "onlyCallsOverloadB"};
+    const char *qns[] = {
+        "swift-overloads.Service.work(flag:Bool)", "swift-overloads.Service.work(name:String)",
+        "swift-overloads.Sink.target()", "swift-overloads.Caller.onlyCallsOverloadB()"};
+    int64_t ids[4];
+    for (int i = 0; i < 4; i++) {
+        cbm_node_t node = {.project = project,
+                           .label = "Method",
+                           .name = names[i],
+                           .qualified_name = qns[i],
+                           .file_path = "Sources/Service.swift",
+                           .start_line = i == 0 ? 5 : 10,
+                           .end_line = i == 0 ? 7 : 12};
+        ids[i] = cbm_store_upsert_node(store, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    cbm_edge_t flag = {
+        .project = project, .source_id = ids[0], .target_id = ids[2], .type = "CALLS"};
+    cbm_edge_t name = {
+        .project = project, .source_id = ids[3], .target_id = ids[1], .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &flag), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &name), 0);
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"swift-overloads\",\"name_pattern\":\"^work$\","
+                            "\"format\":\"json\"}");
+    char *text = extract_text_content(response);
+    ASSERT_NOT_NULL(text);
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total")), 2);
+    const char *prefix = NULL;
+    yyjson_val *row = trace_grouped_row_named(root, "work(flag:Bool)", &prefix);
+    ASSERT_NOT_NULL(row);
+    ASSERT_STR_EQ(prefix, "swift-overloads.Service");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 2)), "5-7");
+    row = trace_grouped_row_named(root, "work(name:String)", NULL);
+    ASSERT_NOT_NULL(row);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_arr_get(row, 2)), "10-12");
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    response = cbm_mcp_handle_tool(srv, "trace_path",
+                                   "{\"project\":\"swift-overloads\",\"function_name\":\"target\","
+                                   "\"direction\":\"inbound\",\"depth\":3,\"format\":\"json\"}");
+    text = extract_text_content(response);
+    ASSERT_NOT_NULL(text);
+    doc = yyjson_read(text, strlen(text), 0);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "callers_total")), 1);
+    row = trace_grouped_row_named(yyjson_obj_get(root, "callers"), "work(flag:Bool)", NULL);
+    ASSERT_NOT_NULL(row);
+    ASSERT_EQ(yyjson_get_int(yyjson_arr_get(row, 1)), 1);
+    yyjson_doc_free(doc);
+    free(text);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* callers_total/callees_total must count what the caller can enumerate: with
  * include_tests=false (default) test-file rows are hidden from the table, so
  * the totals must apply the same filter — a raw visited_count overstated the
@@ -25518,6 +25587,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_empty_hint_describes_combined_filters_issue1366);
     RUN_TEST(tool_search_graph_semantic_only_skips_structural_results_issue1295);
     RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
+    RUN_TEST(tool_swift_overload_presentation_issue2061);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);

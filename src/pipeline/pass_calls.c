@@ -12,6 +12,8 @@
 #include "foundation/constants.h"
 
 enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
+static const double PC_SWIFT_SINGLE_CONF = 0.90;
+static const double PC_SWIFT_AMBIGUOUS_CONF = 0.55;
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
  * resolution is empty (external, unindexed client library) — see #523. */
 #define PC_SVC_PATTERN_CONF 0.5
@@ -814,7 +816,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls, const char *route_mount,
                                  CBMLanguage lang) {
-    cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
+    cbm_svc_kind_t svc =
+        cbm_service_pattern_match_named(res->qualified_name, target ? target->name : NULL);
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
         handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count,
                                   route_mount, lang);
@@ -980,15 +983,46 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         }
     }
 
-    /* #2053: a Rust call the LSP placed on an EXTERNAL symbol (std's
-     * Path::join, a seeded crate API) is resolved — it just has no graph node.
-     * The textual registry would bind it to a same-named project method
-     * instead, so skip it and let the empty-resolution service fallbacks below
-     * classify the call. MUST match pass_parallel.c. */
+    /* Swift label-compatible overload selection (#2061). count > 0: emit an
+     * edge to every compatible candidate and stop. count < 0: project symbols
+     * share this name but none matches the call's labels — a bare-name
+     * registry match would bind a WRONG overload, so resolution is skipped
+     * and the call falls through as unresolved; the empty-resolution service
+     * fallbacks below still run, mirroring the Swift block in pass_parallel.c
+     * (service edges survive overload suppression, per #523/#606/#856).
+     * count == 0: no overload metadata for this name — resolve normally. */
+    int swift_candidates = 0;
+    if (lang == CBM_LANG_SWIFT) {
+        const char *candidates[CBM_SZ_256];
+        swift_candidates =
+            cbm_registry_swift_candidates_in_file(ctx->registry, call, result, ctx->gbuf, module_qn,
+                                                  imp_vals, imp_count, candidates, CBM_SZ_256);
+        if (swift_candidates > 0) {
+            int emitted = 0;
+            for (int i = 0; i < swift_candidates; i++) {
+                const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, candidates[i]);
+                if (target && target->id != source_node->id) {
+                    cbm_resolution_t selected = {.qualified_name = candidates[i],
+                                                 .strategy = "swift_labels",
+                                                 .confidence = swift_candidates == SKIP_ONE
+                                                                   ? PC_SWIFT_SINGLE_CONF
+                                                                   : PC_SWIFT_AMBIGUOUS_CONF,
+                                                 .candidate_count = swift_candidates};
+                    emit_classified_edge(ctx, call, source_node, target, &selected, module_qn,
+                                         imp_keys, imp_vals, imp_count, false, route_mount, lang);
+                    emitted++;
+                }
+            }
+            return emitted > 0 ? SKIP_ONE : 0;
+        }
+    }
+
+    /* A Rust call the LSP placed on an EXTERNAL symbol has no graph node. The
+     * textual registry must not bind it to a same-named project method. */
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
-    if (!rust_external && !php_vendor_call) {
+    if (swift_candidates >= 0 && !rust_external && !php_vendor_call) {
         /* Python LEGB fallback first (MUST match pass_parallel.c). */
         res =
             cbm_registry_resolve_call_scoped(ctx->registry, call->callee_name, module_qn, imp_keys,
@@ -1133,7 +1167,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
                                  * to a docs bundle (2026-09-16 probe: 4,207 junk
                                  * edges on JetBrains/Exposed). */
                                 lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                /* Swift flags only initializer calls `T.init(...)`
+                                 * (#2379, extract_calls.c); every other Swift call
+                                 * keeps is_method=false and is unaffected. */
+                                lang == CBM_LANG_SWIFT;
     /* Bare-call local-binding suppression. A member call has a receiver the
      * guard above can reason about; a bare `run()` has none, so that guard
      * cannot see this class at all. Python-only today because the extraction

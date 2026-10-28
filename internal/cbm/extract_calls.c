@@ -2486,6 +2486,7 @@ static void process_keyword_arg(CBMExtractCtx *ctx, TSNode arg_node, CBMCallArg 
     }
 }
 
+static TSNode swift_argument_value(TSNode arg);
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node, bool url_context);
 
 /* Whether a call's callee is an HTTP client or a global fetch, which selects
@@ -2584,6 +2585,26 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
         }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
+
+        if (ctx->language == CBM_LANG_SWIFT && strcmp(ak, "value_argument") == 0) {
+            TSNode first = ts_node_named_child(arg_node, 0);
+            if (!ts_node_is_null(first) &&
+                strcmp(ts_node_type(first), "value_argument_label") == 0) {
+                TSNode label = ts_node_named_child(first, 0);
+                if (ts_node_is_null(label)) {
+                    label = first;
+                }
+                ca->keyword = cbm_node_text(ctx->arena, label, ctx->source);
+                if (ca->keyword) {
+                    size_t n = strlen(ca->keyword);
+                    if (n > 0 && ca->keyword[n - SKIP_ONE] == ':') {
+                        ca->keyword = cbm_arena_strndup(ctx->arena, ca->keyword, n - SKIP_ONE);
+                    }
+                }
+            }
+            arg_node = swift_argument_value(arg_node);
+            ak = ts_node_type(arg_node);
+        }
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
             process_keyword_arg(ctx, arg_node, ca);
@@ -3897,6 +3918,79 @@ static TSNode swift_call_args(TSNode node) {
     return cbm_find_child_by_kind(suffix, "value_arguments");
 }
 
+/* Store one bounded trailing-closure label; closure zero is unlabelled. */
+static void swift_store_trailing_label(CBMExtractCtx *ctx, CBMCall *call, uint32_t index,
+                                       const char *label, bool has_label) {
+    if (index == 0) {
+        call->has_trailing_closure = true;
+        return;
+    }
+    if (index >= CBM_MAX_TRAILING_CLOSURES) {
+        call->trailing_closure_truncated = true;
+        return;
+    }
+    if (!call->trailing_closure_labels) {
+        size_t bytes = CBM_MAX_TRAILING_CLOSURES * sizeof(char *);
+        call->trailing_closure_labels = cbm_arena_calloc(ctx->arena, bytes);
+    }
+    if (!call->trailing_closure_labels) {
+        call->trailing_closure_truncated = true;
+        return;
+    }
+    call->trailing_closure_labels[index] = label;
+    if (has_label && !label) {
+        call->trailing_closure_truncated = true;
+    }
+}
+
+/* Swift records trailing closures on the call_suffix: the hidden
+ * _fn_call_lambda_arguments rule inlines to
+ * `lambda_literal (simple_identifier ':')*`, so every closure literal, and the
+ * label that precedes all but the first, sit flat among the suffix's children
+ * (after an optional value_arguments). Each lambda_literal is a trailing
+ * closure; a simple_identifier directly before a closure is that closure's
+ * label. Closure 0 is always unlabelled. More closures than the bounded
+ * storage marks the call truncated so the overload matcher fails closed. */
+static void swift_capture_trailing_closures(CBMExtractCtx *ctx, TSNode call_node, TSNode suffix,
+                                            CBMCall *call) {
+    if (ts_node_has_error(call_node)) {
+        call->trailing_closure_truncated = true;
+    }
+    uint32_t children = ts_node_child_count(suffix) + ts_node_child_count(call_node);
+    uint32_t closures = 0;
+    const char *pending_label = NULL;
+    bool has_pending_label = false;
+    for (uint32_t i = 0; i < children; i++) {
+        uint32_t suffix_children = ts_node_child_count(suffix);
+        TSNode child = i < suffix_children ? ts_node_child(suffix, i)
+                                           : ts_node_child(call_node, i - suffix_children);
+        if (i >= suffix_children && ts_node_start_byte(child) < ts_node_end_byte(suffix)) {
+            continue;
+        }
+        const char *kind = ts_node_type(child);
+        if (ts_node_is_missing(child) || ts_node_has_error(child)) {
+            call->trailing_closure_truncated = true;
+        }
+        if (strcmp(kind, "lambda_literal") == 0) {
+            swift_store_trailing_label(ctx, call, closures, pending_label, has_pending_label);
+            closures++;
+            pending_label = NULL;
+            has_pending_label = false;
+        } else if (strcmp(kind, "simple_identifier") == 0) {
+            if (has_pending_label) {
+                call->trailing_closure_truncated = true;
+            }
+            pending_label = cbm_node_text(ctx->arena, child, ctx->source);
+            has_pending_label = true;
+        }
+    }
+    if (has_pending_label) {
+        call->trailing_closure_truncated = true;
+    }
+    call->trailing_closure_count =
+        (uint8_t)(closures > CBM_MAX_TRAILING_CLOSURES ? CBM_MAX_TRAILING_CLOSURES : closures);
+}
+
 static bool node_has_token(TSNode node, const char *token) {
     uint32_t count = ts_node_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
@@ -4278,6 +4372,70 @@ static TSNode language_specific_callee_leaf(CBMLanguage language, TSNode expr,
     return terminal_callee_leaf(ctx, expr);
 }
 
+/* `Base.init` for a `super.init(...)` call: Base is the first entry of the
+ * enclosing class's inheritance clause, where Swift requires the superclass to
+ * stand. The class node is carried by the walk, so no ancestor climb. NULL (no
+ * call) outside a class, without a clause, or when the entry does not read as
+ * a plain type name -- a lower-case or attributed root would pass the
+ * registry's receiver-chain check and bind by short name, which is the false
+ * edge this exists to prevent. */
+static const char *swift_superclass_init_callee(CBMExtractCtx *ctx, const WalkState *state) {
+    TSNode cls = state ? state->enclosing_class_node : (TSNode){0};
+    if (ts_node_is_null(cls) || strcmp(ts_node_type(cls), "class_declaration") != 0) {
+        return NULL;
+    }
+    TSNode spec = cbm_find_child_by_kind(cls, "inheritance_specifier");
+    char *base = ts_node_is_null(spec) ? NULL : cbm_node_text(ctx->arena, spec, ctx->source);
+    if (!base || base[0] < 'A' || base[0] > 'Z') {
+        return NULL;
+    }
+    size_t len = strcspn(base, "<"); /* Base<T> names Base */
+    for (size_t i = 0; i < len; i++) {
+        if (!isalnum((unsigned char)base[i]) && base[i] != '_' && base[i] != '.') {
+            return NULL;
+        }
+    }
+    base[len] = '\0';
+    return cbm_arena_sprintf(ctx->arena, "%s.init", base);
+}
+
+/* True for a Swift initializer callee `T.init` (T non-empty). */
+static bool swift_callee_is_initializer(const char *callee) {
+    static const char suffix[] = ".init";
+    size_t n = callee ? strlen(callee) : 0;
+    return n > sizeof(suffix) - SKIP_ONE &&
+           strcmp(callee + n - (sizeof(suffix) - SKIP_ONE), suffix) == 0;
+}
+
+/* Swift initializer delegation (#2379). `super.init(...)` and `self.init(...)`
+ * name no type, and a lower-case receiver passes the registry's receiver-chain
+ * check, so a short-name match binds them to whichever project `init` is
+ * nearest: a nested type's, a sibling type's, or the caller's own. On
+ * Alamofire all 8 such edges were false.
+ *
+ * `super.init` is rewritten to name the superclass (`Base.init`), so the
+ * qualified strategies place it on the project's Base.init. When Base is not
+ * in the project (UIViewController, NSObject) nothing places it, and the
+ * initializer guard in handle_calls keeps a short-name guess from doing so.
+ *
+ * `self.init` delegates to another initializer of the caller's own type.
+ * Keep #2395's no-edge policy until overload-aware delegation is addressed
+ * separately; the delegated initializer can live outside the project
+ * (`extension Notification { init(...) { self.init(...) } }` calls Foundation's). */
+static const char *resolve_swift_delegating_init(CBMExtractCtx *ctx, const WalkState *state,
+                                                 const char *callee) {
+    if (ctx->language != CBM_LANG_SWIFT || !callee) {
+        return callee;
+    }
+    if (strcmp(callee, "self.init") == 0) {
+        return NULL;
+    }
+    if (strcmp(callee, "super.init") == 0) {
+        return swift_superclass_init_callee(ctx, state);
+    }
+    return callee;
+}
+
 // Produce the textual callee and the AST occurrence from one operation. The
 // generic fallback retains the former field/terminal behavior, while grammars
 // whose extractor uses a sibling, a special field, or a synthetic literal are
@@ -4288,6 +4446,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     CBMPrimaryCalleeSelection selection = {0};
     selection.name = extract_callee_name(ctx->arena, node, ctx->source, ctx->language);
     selection.name = resolve_objectscript_callee(ctx, node, state, selection.name);
+    selection.name = resolve_swift_delegating_init(ctx, state, selection.name);
     if (!selection.name || !selection.name[0]) {
         return selection;
     }
@@ -4511,6 +4670,16 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     call.is_method = true;
                 }
             }
+            // Swift initializer guard (#2379; same direction). Flag `T.init(...)`,
+            // as written or as a rewritten super.init. Nearly every type has an
+            // `init`, so a short-name match onto one is a guess: with a project
+            // module imported, `UIViewController.init` bound an unrelated
+            // project initializer. The registry's qualified / same-module /
+            // import strategies still place T.init when T is a project type.
+            // No other Swift call carries the flag.
+            if (ctx->language == CBM_LANG_SWIFT && swift_callee_is_initializer(call.callee_name)) {
+                call.is_method = true;
+            }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             /* tree-sitter-elixir attaches NO field name to a call's arguments
@@ -4536,6 +4705,23 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // Swift has no "arguments" field either; its args hang off call_suffix.
             if (ts_node_is_null(args) && ctx->language == CBM_LANG_SWIFT) {
                 args = swift_call_args(node);
+            }
+            if (ctx->language == CBM_LANG_SWIFT) {
+                TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+                if (!ts_node_is_null(suffix)) {
+                    swift_capture_trailing_closures(ctx, node, suffix, &call);
+                }
+                uint32_t value_arg_count = 0;
+                if (!ts_node_is_null(args)) {
+                    uint32_t named_count = ts_node_named_child_count(args);
+                    for (uint32_t ai = 0; ai < named_count; ai++) {
+                        TSNode arg = ts_node_named_child(args, ai);
+                        value_arg_count += strcmp(ts_node_type(arg), "value_argument") == 0;
+                    }
+                }
+                if (value_arg_count > CBM_MAX_CALL_ARGS) {
+                    call.args_truncated = true;
+                }
             }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args, call.callee_name);

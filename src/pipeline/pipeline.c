@@ -2134,7 +2134,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
                              census_len(def->label) + census_len(def->file_path) +
                              census_len(def->parent_class);
             str_def_sig += census_len(def->signature) + census_len(def->return_type) +
-                           census_len(def->receiver);
+                           census_len(def->receiver) + census_len(def->call_selector);
             str_def_doc += census_len(def->docstring);
             str_def_tokens += census_len(def->body_tokens);
             str_def_profile += census_len(def->structural_profile);

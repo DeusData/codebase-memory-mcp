@@ -21,6 +21,7 @@ enum {
     /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
      * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
     PP_JSON_FIELD_OVERHEAD = 6,
+    PP_SWIFT_PROPS_MARGIN = 80,
     PP_ARGS_MARGIN = 20,
     /* ,"line":<int> -> comma + key (7) + colon + up to 10 digits + NUL. */
     PP_LINE_MARGIN = 24,
@@ -39,6 +40,8 @@ enum {
 #define PP_NSEC_PER_SEC 1000000000ULL
 #define PP_USEC_PER_MS 1000000ULL
 #define PP_HALF_CONF 0.5
+static const double PP_SWIFT_SINGLE_CONF = 0.90;
+static const double PP_SWIFT_AMBIGUOUS_CONF = 0.55;
 #define PP_FIELD_HINT_CONF 0.85
 enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 
@@ -538,6 +541,13 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    if (def->qn_sig_off && bufsize - pos > PP_SWIFT_PROPS_MARGIN) {
+        pos += (size_t)snprintf(buf + pos, bufsize - pos,
+                                ",\"param_default_mask\":\"%016llx\",\"selector_param_count\":%u",
+                                (unsigned long long)def->param_default_mask,
+                                (unsigned)def->selector_param_count);
+    }
+    append_json_string(buf, bufsize, &pos, "call_selector", def->call_selector);
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     /* The buffer is sized for every field below (pp_props_buf), so none can be
      * squeezed out. */
@@ -767,6 +777,7 @@ static size_t pp_arr_field_len(const char *key, const char **arr) {
  * allocated. Twin of pass_definitions.c -- keep both in sync. */
 static char *pp_props_buf(const CBMDefinition *def, char *stack, size_t *size) {
     size_t need = PP_PROPS_PREFIX_MAX + pp_str_field_len("docstring", def->docstring);
+    need += pp_str_field_len("call_selector", def->call_selector);
     if (def->variants && def->variants[0]) {
         need += strlen("variants") + strlen(def->variants) + PP_JSON_FIELD_OVERHEAD;
     }
@@ -1815,6 +1826,11 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     if (cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add_lang_in_module(ctx->registry, def->name, def->qualified_name, def->label,
                                         lang, module_prefix_len);
+        if (def->qn_sig_off) {
+            cbm_registry_set_swift_signature(ctx->registry, def->qualified_name,
+                                             def->param_default_mask, def->selector_param_count,
+                                             def->call_selector);
+        }
         (*reg_entries)++;
     }
     char marked[CBM_SZ_4K];
@@ -2794,7 +2810,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const char **imp_keys, const char **imp_vals, int imp_count,
                               bool suppress_plain_calls, const char *route_mount,
                               CBMLanguage lang) {
-    cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
+    cbm_svc_kind_t svc =
+        cbm_service_pattern_match_named(res->qualified_name, target ? target->name : NULL);
     const char *arg = call->first_string_arg;
 
     /* Also detect route registration by callee name suffix alone (handles unresolved
@@ -3317,8 +3334,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                (lsp && !lsp_target && cbm_pipeline_lsp_external_receiver(lsp));
         bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                         lang, lsp->strategy, lsp->callee_qn, rc->project_name);
+        /* Typed Swift calls must not scan the global name bucket first. */
+        const char *candidates[CBM_SZ_256];
+        int count = 0;
+        if (lang == CBM_LANG_SWIFT && !lsp_target && !call->requires_lsp_resolution) {
+            count = cbm_registry_swift_candidates_in_file(rc->registry, call, result, rc->main_gbuf,
+                                                          module_qn, imp_vals, imp_count,
+                                                          candidates, CBM_SZ_256);
+        }
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
-            !rust_external && !php_vendor_call) {
+            !rust_external && !php_vendor_call && count == 0) {
             /* Python LEGB fallback first (MUST match pass_calls.c). */
             res = cbm_registry_resolve_call_scoped(rc->registry, call->callee_name, module_qn,
                                                    imp_keys, imp_vals, imp_count, lang,
@@ -3405,7 +3430,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     lang == CBM_LANG_ARKTS ||
                                     /* embedded-script hosts — see pass_calls.c */
                                     lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                    /* Swift initializer calls only — see pass_calls.c */
+                                    lang == CBM_LANG_SWIFT;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
@@ -3480,6 +3507,36 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
                                   imp_count, false, route_mount, lang);
                 continue;
+            }
+        }
+
+        if (lang == CBM_LANG_SWIFT && !lsp_target) {
+            if (count > 0) {
+                for (int i = 0; i < count; i++) {
+                    const cbm_gbuf_node_t *target =
+                        cbm_gbuf_find_by_qn(rc->main_gbuf, candidates[i]);
+                    if (!target || target->id == source_node->id) {
+                        continue;
+                    }
+                    cbm_resolution_t selected = {.qualified_name = candidates[i],
+                                                 .strategy = "swift_labels",
+                                                 .confidence = count == SKIP_ONE
+                                                                   ? PP_SWIFT_SINGLE_CONF
+                                                                   : PP_SWIFT_AMBIGUOUS_CONF,
+                                                 .candidate_count = count};
+                    emit_service_edge(ws->local_edge_buf, source_node, target, call, &selected,
+                                      module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                      imp_count, false, route_mount, lang);
+                    ws->calls_resolved++;
+                }
+                continue;
+            }
+            if (count < 0) {
+                /* Same-named Swift symbols exist but none is label-compatible:
+                 * clear the bare-name match (it would bind a wrong overload)
+                 * and fall through as unresolved — the empty-resolution
+                 * fallbacks below still run. Mirrors pass_calls.c. */
+                res = (cbm_resolution_t){0};
             }
         }
 

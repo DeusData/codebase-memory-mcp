@@ -1,4 +1,5 @@
 #include "cbm.h"
+#include "callable_sig.h"
 #include "arena.h"   // CBMArena, cbm_arena_alloc/strdup/sprintf
 #include "doclink.h" // cbm_doclink_note_doc_line
 #include "helpers.h"
@@ -797,6 +798,15 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         }
         if (lang == CBM_LANG_OBJECTSCRIPT_UDL && strcmp(kind, "query") == 0) {
             return cbm_find_child_by_kind(node, "query_name");
+        }
+
+        /* Swift init/deinit (#2379) have no name node at all. The declaration
+         * itself stands in for it, and cbm_func_name_node_text maps that
+         * node kind to "init" / "deinit". Gated on Swift: Slang's grammar
+         * also has an init_declaration node. */
+        if (lang == CBM_LANG_SWIFT &&
+            (strcmp(kind, "init_declaration") == 0 || strcmp(kind, "deinit_declaration") == 0)) {
+            return node;
         }
 
         TSNode name = func_name_node(node);
@@ -7122,6 +7132,21 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_test = rust_def_is_test(def.decorators);
     }
 
+    if (ctx->language == CBM_LANG_SWIFT) {
+        if (!def.qualified_name) {
+            return;
+        }
+        const char *sig = cbm_callable_sig(a, func_node, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(a, "%s%s", def.qualified_name, sig) : NULL;
+        if (qualified) {
+            def.qn_sig_off = (uint32_t)strlen(def.qualified_name);
+            def.qualified_name = qualified;
+        }
+        def.param_default_mask =
+            cbm_swift_default_mask(func_node, ctx->source, &def.selector_param_count);
+        def.call_selector = cbm_swift_selector(ctx->arena, func_node, ctx->source);
+    }
+
     // C++/CUDA: GoogleTest macros are test functions (#1266).
     if (is_gtest || def.test_role == CBM_TEST_ROLE_CASE) {
         def.is_test = true;
@@ -8699,6 +8724,12 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
         return cbm_find_child_by_kind(child, "simple_identifier");
     }
 
+    // Swift init/deinit: named in one place, cbm_resolve_func_name (#2379).
+    if (lang == CBM_LANG_SWIFT &&
+        (strcmp(ck, "init_declaration") == 0 || strcmp(ck, "deinit_declaration") == 0)) {
+        return cbm_resolve_func_name(child, lang);
+    }
+
     // Squirrel: function_declaration's name is a plain `identifier` child.
     if (lang == CBM_LANG_SQUIRREL && strcmp(ck, "function_declaration") == 0) {
         return cbm_find_child_by_kind(child, "identifier");
@@ -8744,6 +8775,20 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     memset(&def, 0, sizeof(def));
     def.name = name;
     def.qualified_name = method_qn;
+    if (ctx->language == CBM_LANG_SWIFT) {
+        if (!method_qn) {
+            return;
+        }
+        const char *sig = cbm_callable_sig(a, child, ctx->source, ctx->language);
+        const char *qualified = sig ? cbm_arena_sprintf(a, "%s%s", method_qn, sig) : NULL;
+        if (qualified) {
+            def.qn_sig_off = (uint32_t)strlen(method_qn);
+            def.qualified_name = qualified;
+        }
+        def.param_default_mask =
+            cbm_swift_default_mask(child, ctx->source, &def.selector_param_count);
+        def.call_selector = cbm_swift_selector(ctx->arena, child, ctx->source);
+    }
     def.label = "Method";
     def.file_path = ctx->rel_path;
     def.parent_class = class_qn;

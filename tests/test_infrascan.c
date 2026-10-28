@@ -176,6 +176,13 @@ TEST(infrascan_service_pattern_match_rejects_ids_inside_words) {
         {NULL, CBM_SVC_NONE},
     };
     ASSERT_EQ(svc_case_mismatches(cases), 0);
+    ASSERT_EQ(cbm_service_pattern_match_named("proj.worker.run(_:Alamofire)", "run"), CBM_SVC_NONE);
+    ASSERT_EQ(cbm_service_pattern_match_named("proj.Alamofire.request(_:String)", "request"),
+              CBM_SVC_HTTP);
+    /* A field whose name contains a call keeps its complete QN. */
+    ASSERT_EQ(cbm_service_pattern_match_named("proj.worker.field = make(Alamofire)",
+                                              "field = make(Alamofire)"),
+              cbm_service_pattern_match("proj.worker.field = make(Alamofire)"));
     PASS();
 }
 
@@ -737,10 +744,10 @@ TEST(infrascan_data_flows_reach_every_infra_handler) {
     PASS();
 }
 
-/* R1 + R2 (user decision, 2026-10-18): a caller in a test file pairs only with handlers in that same
- * file, and a handler in a test file pairs only with callers in that same file. A test's request to
- * the application, a production caller matched to a test's mock server, and the private mock servers
- * of two tests pairing across files are not data flows of the application. */
+/* R1 + R2 (user decision, 2026-10-18): a caller in a test file pairs only with handlers in that
+ * same file, and a handler in a test file pairs only with callers in that same file. A test's
+ * request to the application, a production caller matched to a test's mock server, and the private
+ * mock servers of two tests pairing across files are not data flows of the application. */
 static int64_t r12_fn(cbm_gbuf_t *gb, const char *name, const char *file) {
     char qn[96];
     snprintf(qn, sizeof(qn), "test.%s", name);
@@ -766,7 +773,8 @@ TEST(infrascan_data_flows_test_callers_pair_only_within_their_file) {
     int64_t route = r12_route(gb, "/api/orders");
     int64_t handler = r12_fn(gb, "list_orders", "app/views.py");
     cbm_gbuf_insert_edge(gb, handler, route, "HANDLES", "{}");
-    /* Test files by each language's own rule: a tests/ directory, a Java *Test.java, a TS .spec.ts. */
+    /* Test files by each language's own rule: a tests/ directory, a Java *Test.java, a TS .spec.ts.
+     */
     int64_t py_test = r12_fn(gb, "test_list_orders", "tests/test_orders.py");
     int64_t java_test = r12_fn(gb, "listsOrders", "app/OrderServiceTest.java");
     int64_t ts_spec = r12_fn(gb, "fetchesOrders", "web/orders.spec.ts");
