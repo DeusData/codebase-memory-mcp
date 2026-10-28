@@ -759,7 +759,8 @@ static cbm_resolve_method_candidate_t kt_proof_candidate(const cbm_resolve_metho
                                                          const CBMRegisteredFunc *candidate,
                                                          void *context) {
     (void)owner;
-    const CBMRegisteredType *lexical = context;
+    (void)context;
+    const CBMRegisteredType *lexical = query->context;
     bool same_class = lexical && query->receiver_qn && candidate->receiver_type &&
                       !strcmp(lexical->qualified_name, query->receiver_qn) &&
                       !strcmp(lexical->qualified_name, candidate->receiver_type);

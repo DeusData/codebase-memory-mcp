@@ -175,7 +175,7 @@ void cbm_semantic_bindings_free(cbm_semantic_bindings_t *bindings) {
     cbm_ht_free(bindings->classes);
     cbm_ht_free(bindings->packages);
     cbm_arena_destroy(&bindings->arena);
-    free(bindings);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, bindings);
 }
 
 /* Keep exact AST heritage spelling; extractor names alone can strip generic
@@ -1010,7 +1010,7 @@ cbm_semantic_bindings_t *cbm_semantic_bindings_build(cbm_pipeline_ctx_t *ctx,
         relevant |= files[i].language == CBM_LANG_KOTLIN || files[i].language == CBM_LANG_PHP ||
                     semantic_ecma(files[i].language) || semantic_typed_language(files[i].language);
     }
-    cbm_semantic_bindings_t *bindings = calloc(1, sizeof(*bindings));
+    cbm_semantic_bindings_t *bindings = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*bindings));
     if (!bindings)
         return NULL;
     cbm_arena_init(&bindings->arena);

@@ -287,7 +287,7 @@ static bool an_record(an_t *a, const cbm_resolve_proof_t *occurrence, int64_t ow
         atomic_store(&a->ctx->resolver_failed, true);
         return false;
     }
-    bool exact = target && supported && !ambiguous;
+    const cbm_gbuf_node_t *exact = supported && !ambiguous ? target : NULL;
     cbm_resolve_result_t result = {
         .binding = exact       ? CBM_RESOLVE_BINDING_UNIQUE
                    : ambiguous ? CBM_RESOLVE_BINDING_AMBIGUOUS
@@ -298,7 +298,7 @@ static bool an_record(an_t *a, const cbm_resolve_proof_t *occurrence, int64_t ow
         .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
                              CBM_RESOLVE_FACT_LANGUAGE_BOUND
                        : 0,
-        .target = exact ? target->qualified_name : "",
+        .target = exact ? exact->qualified_name : "",
         .candidate_count = exact       ? 1
                            : ambiguous ? 2
                                        : 0,
@@ -310,7 +310,7 @@ static bool an_record(an_t *a, const cbm_resolve_proof_t *occurrence, int64_t ow
     const cbm_resolve_proof_t *lookup = cbm_resolve_proof_leaf(
         &a->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN, &site->source, &key, &result);
     return cbm_shared_resolver_adapter_record_proofs(&a->adapter, occurrence, owner,
-                                                     exact ? target->id : 0, properties, lookup);
+                                                     exact ? exact->id : 0, properties, lookup);
 }
 
 static void an_edge(an_t *a, const cbm_gbuf_node_t *target, const char *kind, TSNode pair,

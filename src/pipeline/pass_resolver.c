@@ -2927,14 +2927,15 @@ bool cbm_shared_resolver_capture_sources(const cbm_pipeline_ctx_t *ctx,
     for (int i = 0; ok && i < file_count; i++) {
         bool loaded = false;
         bool parked = ctx->spill && cbm_result_spill_has(ctx->spill, i);
-        bool force_missing = false;
+        CBMFileResult *result;
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
         /* Deterministic acquisition failure at a real populated spill slot. */
-        force_missing = parked && !cache[i] &&
-                        (ctx->test_fault_mask & CBM_PIPELINE_TEST_FAULT_RESOLVER_SPILL_NULL);
+        bool force_missing = parked && !cache[i] &&
+                             (ctx->test_fault_mask & CBM_PIPELINE_TEST_FAULT_RESOLVER_SPILL_NULL);
+        result = force_missing ? NULL : cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+#else
+        result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
 #endif
-        CBMFileResult *result =
-            force_missing ? NULL : cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
         if (!result) {
             if (parked) {
                 cbm_log_error("resolver.sources.error", "file", files[i].rel_path, "reason",

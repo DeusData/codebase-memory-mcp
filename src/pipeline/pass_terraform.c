@@ -1399,7 +1399,7 @@ static bool tf_record(cbm_shared_resolver_adapter_t *adapter, const cbm_resolve_
     }
     const cbm_gbuf_node_t *target =
         target_id > 0 ? cbm_gbuf_find_by_id(adapter->ctx->gbuf, target_id) : NULL;
-    bool exact = target && supported && !ambiguous;
+    const cbm_gbuf_node_t *exact = supported && !ambiguous ? target : NULL;
     cbm_resolve_result_t result = {
         .binding = exact       ? CBM_RESOLVE_BINDING_UNIQUE
                    : ambiguous ? CBM_RESOLVE_BINDING_AMBIGUOUS
@@ -1410,7 +1410,7 @@ static bool tf_record(cbm_shared_resolver_adapter_t *adapter, const cbm_resolve_
         .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
                              CBM_RESOLVE_FACT_LANGUAGE_BOUND
                        : 0,
-        .target = exact ? target->qualified_name : "",
+        .target = exact ? exact->qualified_name : "",
         .candidate_count = exact       ? 1
                            : ambiguous ? 2
                                        : 0,
