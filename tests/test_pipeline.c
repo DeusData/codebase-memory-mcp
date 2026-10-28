@@ -19081,7 +19081,8 @@ static int setup_usages_repo(const char *filename, const char *content, const ch
         th_mkdir_p(dir_path);
     }
 
-    FILE *f = fopen(path, "w");
+    /* Preserve the supplied bytes for exact resolver snapshot checks. */
+    FILE *f = cbm_fopen(path, "wb");
     if (!f)
         return -1;
     fprintf(f, "%s", content);
@@ -19089,7 +19090,7 @@ static int setup_usages_repo(const char *filename, const char *content, const ch
 
     if (extra_file && extra_content) {
         snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, extra_file);
-        f = fopen(path, "w");
+        f = cbm_fopen(path, "wb");
         if (!f)
             return -1;
         fprintf(f, "%s", extra_content);
