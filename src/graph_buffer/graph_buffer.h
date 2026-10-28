@@ -27,6 +27,8 @@ typedef struct cbm_store cbm_store_t;
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record);
 const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count);
 bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
+/* Deterministic proof clone/intern work, including repeated existing facts. */
+uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb);
 /* Begin/end bound memo lifetime to immutable source arenas (one file or merged
  * worker buffer). Borrowed shared roots are sealed together before teardown. */
 bool cbm_gbuf_resolution_begin(cbm_gbuf_t *gb);

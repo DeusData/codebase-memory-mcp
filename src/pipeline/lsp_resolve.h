@@ -245,52 +245,24 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
     const cbm_gbuf_t *gbuf, const char *project_name, const char *callee_qn, bool allow_tail_match,
     bool allow_unique_callable_fallback);
 
-/* Local and cross passes may spell one exact invocation target with and without
- * the project prefix. Collapse that cross-language case only when exact graph
- * lookup maps both spellings to one materialized node. JVM passes additionally
- * reconcile file/project and declared-package QNs below; Class.method-tail
- * equality alone is insufficient because two packages can declare the same
- * class and method. */
+/* Local and cross passes may spell one target with and without the project
+ * prefix. Equality requires both spellings to identify the same graph node;
+ * suffix coincidence never establishes declaration identity. */
 static inline bool cbm_pipeline_invocation_targets_equal(const char *left_qn, const char *right_qn,
                                                          const cbm_gbuf_t *gbuf,
                                                          const char *project_name,
                                                          bool allow_tail_match) {
-    if (!left_qn || !right_qn) {
+    (void)allow_tail_match;
+    if (!left_qn || !right_qn)
         return false;
-    }
-    if (strcmp(left_qn, right_qn) == 0) {
+    if (strcmp(left_qn, right_qn) == 0)
         return true;
-    }
-    if (!gbuf || !project_name) {
+    if (!gbuf || !project_name)
         return false;
-    }
-    const cbm_gbuf_node_t *left_exact =
-        cbm_pipeline_lsp_target_node_policy(gbuf, project_name, left_qn, false, false);
-    const cbm_gbuf_node_t *right_exact =
-        cbm_pipeline_lsp_target_node_policy(gbuf, project_name, right_qn, false, false);
-    if (left_exact && right_exact) {
-        return left_exact->id == right_exact->id;
-    }
-    if (!allow_tail_match) {
-        return false;
-    }
-    const char *left_tail = cbm_pipeline_qn_class_method_tail(left_qn);
-    const char *right_tail = cbm_pipeline_qn_class_method_tail(right_qn);
-    if (!left_tail || !right_tail || strcmp(left_tail, right_tail) != 0) {
-        return false;
-    }
-    /* Two package-shaped rows that both reach a node only through the tail
-     * fallback are still distinct semantic claims. Require at least one row
-     * to name the materialized node exactly (or by project-prefix retry). */
-    if (!left_exact && !right_exact) {
-        return false;
-    }
     const cbm_gbuf_node_t *left =
-        left_exact ? left_exact
-                   : cbm_pipeline_lsp_target_node_policy(gbuf, project_name, left_qn, true, true);
+        cbm_pipeline_lsp_target_node_policy(gbuf, project_name, left_qn, false, false);
     const cbm_gbuf_node_t *right =
-        right_exact ? right_exact
-                    : cbm_pipeline_lsp_target_node_policy(gbuf, project_name, right_qn, true, true);
+        cbm_pipeline_lsp_target_node_policy(gbuf, project_name, right_qn, false, false);
     return left && right && left->id == right->id;
 }
 
@@ -461,26 +433,11 @@ static inline bool cbm_pipeline_php_receiver_type_unindexed(const CBMResolvedCal
     return false;
 }
 
-/* Look up the highest-confidence LSP-resolved call entry whose caller QN
- * matches the textual call's enclosing function and whose callee QN
- * short-name matches the textual callee. Returns a pointer into `arr`
- * or NULL if no qualifying entry exists.
- *
- * Match rule:
- *   1. exact caller_qn + callee short-name match wins first;
- *   2. if no exact caller match exists AND allow_tail_match is set
- *      (JVM callers only, see cbm_pipeline_lsp_allow_tail_match), a
- *      unique Class.method tail match may win; an occurrence-exact row may
- *      also reconcile Kotlin's package-vs-file top-level owner QNs when their
- *      bare caller leaves agree;
- *   3. ambiguous tails return NULL so the registry fallback stays in
- *      control.
- *
- * Qualified static callees (e.g. Perl `Pkg::sub`) are reduced to their
- * bare last segment by cbm_lsp_bare_segment before matching.
- *
- * The pointer returned aliases into `arr` and stays valid as long as the
- * underlying CBMFileResult is alive. */
+/* Select a candidate only within the exact enclosing function. Exact source
+ * occurrences outrank legacy spanless rows; competing targets abstain. The
+ * compatibility flag cannot authorize caller suffix matching. Edge admission
+ * separately requires immutable evidence for the selected occurrence.
+ * The returned pointer aliases `arr` while its CBMFileResult remains alive. */
 static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
     const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
     const cbm_gbuf_t *gbuf, const char *project_name) {
@@ -530,65 +487,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
             best_exact_caller = rc;
         }
     }
-    if (best_exact_caller) {
-        return exact_caller_ambiguous ? NULL : best_exact_caller;
-    }
-    if (!allow_tail_match) {
-        return NULL;
-    }
-
-    const char *call_tail = cbm_pipeline_qn_class_method_tail(call->enclosing_func_qn);
-
-    const CBMResolvedCall *best_tail_exact = NULL;
-    const CBMResolvedCall *best_tail_legacy = NULL;
-    bool tail_exact_ambiguous = false;
-    bool tail_legacy_ambiguous = false;
-    for (int i = 0; i < arr->count; i++) {
-        const CBMResolvedCall *rc = &arr->items[i];
-        if (rc->kind != CBM_RESOLVED_INVOCATION) {
-            continue;
-        }
-        if (!rc->caller_qn || !rc->callee_qn) {
-            continue;
-        }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
-            continue;
-        }
-        int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
-        if (site_rank == 0) {
-            continue;
-        }
-        bool caller_matches =
-            call_tail && cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, call_tail);
-        if (!caller_matches && site_rank == 2) {
-            const char *resolved_caller = cbm_lsp_bare_segment(rc->caller_qn);
-            const char *source_caller = cbm_lsp_bare_segment(call->enclosing_func_qn);
-            caller_matches =
-                resolved_caller && source_caller && strcmp(resolved_caller, source_caller) == 0;
-        }
-        if (!caller_matches || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
-            continue;
-        }
-
-        const CBMResolvedCall **best = site_rank == 2 ? &best_tail_exact : &best_tail_legacy;
-        bool *ambiguous = site_rank == 2 ? &tail_exact_ambiguous : &tail_legacy_ambiguous;
-        if (!*best) {
-            *best = rc;
-            continue;
-        }
-        if (!cbm_pipeline_invocation_targets_equal((*best)->callee_qn, rc->callee_qn, gbuf,
-                                                   project_name, allow_tail_match)) {
-            *ambiguous = true;
-            continue;
-        }
-        if (rc->confidence > (*best)->confidence) {
-            *best = rc;
-        }
-    }
-    if (best_tail_exact) {
-        return tail_exact_ambiguous ? NULL : best_tail_exact;
-    }
-    return tail_legacy_ambiguous ? NULL : best_tail_legacy;
+    return exact_caller_ambiguous ? NULL : best_exact_caller;
 }
 
 /* Graph-free compatibility entry point for resolver unit tests. Raw distinct
@@ -833,10 +732,9 @@ static inline const CBMResolvedCall *cbm_pipeline_lsp_reference_view_row(
  * TS function-value argument denotes a function value and must never enter
  * the CALLS pipeline.
  *
- * Exact enclosing-function matches win. The unique Class.method caller-tail
- * fallback is admitted only when the caller opted into the existing JVM-only
- * rule via `allow_tail_match`; ambiguity returns NULL so the usage pipeline can
- * fall back to the textual registry without fabricating a semantic match.
+ * Only exact enclosing-function identities and source occurrences can match.
+ * The compatibility flag cannot authorize a Class.method caller-tail join.
+ * Competing target identities return NULL.
  *
  * `entries` is either NULL for the original full-array fallback or a sorted
  * occurrence slice. The matching body is deliberately shared so indexing
@@ -888,49 +786,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_reference_view_in_gra
             best_exact = rc;
         }
     }
-    if (best_exact || !allow_tail_match) {
-        return exact_ambiguous ? NULL : best_exact;
-    }
-
-    const char *caller_tail = cbm_pipeline_qn_class_method_tail(usage->enclosing_func_qn);
-    if (!caller_tail) {
-        return NULL;
-    }
-
-    const CBMResolvedCall *best_tail = NULL;
-    bool tail_ambiguous = false;
-    for (int i = 0; i < row_count; i++) {
-        cbm_pipeline_lsp_reference_lookup_test_note_row();
-        const CBMResolvedCall *rc = cbm_pipeline_lsp_reference_view_row(arr, entries, first, i);
-        if (rc->kind != CBM_RESOLVED_CALL_REFERENCE || !rc->caller_qn || !rc->callee_qn ||
-            rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
-            continue;
-        }
-        if (!cbm_pipeline_qn_class_method_tail_eq(rc->caller_qn, caller_tail) ||
-            !cbm_pipeline_source_occurrence_eq(usage->site_start_byte, usage->site_end_byte,
-                                               usage->source_origin, rc->site_start_byte,
-                                               rc->site_end_byte, rc->source_origin)) {
-            continue;
-        }
-        bool name_matches = strcmp(cbm_lsp_bare_segment(rc->callee_qn), ref_leaf) == 0;
-        bool semantic_reason_matches = cbm_pipeline_reference_reason_matches(rc, ref_leaf);
-        if (!name_matches && !semantic_reason_matches) {
-            continue;
-        }
-        if (!best_tail) {
-            best_tail = rc;
-            continue;
-        }
-        if (!cbm_pipeline_reference_targets_equal(best_tail->callee_qn, rc->callee_qn, gbuf,
-                                                  project_name, allow_tail_match)) {
-            tail_ambiguous = true;
-            continue;
-        }
-        if (rc->confidence > best_tail->confidence) {
-            best_tail = rc;
-        }
-    }
-    return tail_ambiguous ? NULL : best_tail;
+    return exact_ambiguous ? NULL : best_exact;
 }
 
 /* Full-array compatibility/fallback path. Allocation failure in either

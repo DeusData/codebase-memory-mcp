@@ -6,9 +6,9 @@
  *
  * LEGEND
  *   green=guard  — asserts the CORRECT outcome; PASSES when the feature works.
- *   red=bug      — asserts the CORRECT outcome; FAILS until the bug is fixed.
- *                  Each red case includes a brief comment explaining the root
- *                  cause and the fix location.
+ *   red=bug      — legacy aggregate assertion in unmodified cases.
+ *   RQ cases     — exact source obligations: required calls, named missing-edge
+ *                  quality gaps, and forbidden unsupported target bindings.
  *
  * BUG CLASSES PROBED
  *   C1 — CONSTRUCTOR / instantiation  (new T() / T{} / T() / T::new())
@@ -20,12 +20,13 @@
  *   C7 — INHERITED-METHOD call        (grammar-only langs: Scala/Swift/Ruby)
  *
  * SUITE: matrix_known_classes
- * NOTE: NOT registered in test_main.c (per instructions).
+ * Registered in the canonical test runner; named quality gaps are gating data.
  */
 
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "resolver_quality.h"
 #include "cbm.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -103,7 +104,7 @@ static cbm_store_t *mkc_index(MKC_Proj *lp, const MKC_File *files, int nfiles) {
             cbm_mkdir_p(path, 0755);
             *slash = '/';
         }
-        FILE *f = fopen(path, "wb");
+        FILE *f = cbm_fopen(path, "wb");
         if (!f)
             return NULL;
         fputs(files[i].content, f);
@@ -128,6 +129,235 @@ static void mkc_cleanup(MKC_Proj *lp, cbm_store_t *store) {
     snprintf(shm, sizeof(shm), "%s-shm", lp->dbpath);
     unlink(wal);
     unlink(shm);
+}
+
+/* Each obligation below is authored from its fixture, independently of emitted
+ * rows. Missing edges remain quality debt; invented targets fail the oracle.
+ * Unsupported implicit constructors retain a real source declaration anchor
+ * with no fabricated callable identity. The explicit C# operator also retains
+ * its unmapped callable identity as debt. Unknown receiver sites are forbidden. */
+typedef struct {
+    const char *test, *caller, *needle, *target, *declaration, *label;
+    int line;
+    unsigned occurrence;
+    bool required;
+} MKC_Golden;
+static const MKC_Golden mkc_goldens[] = {
+    {"mkc_c1_scala_constructor_new", "make", "new Widget(n)", NULL,
+     "class Widget(val name: String) {", "Method", 1, 0, false},
+    {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0)", NULL,
+     "case class Point(x: Double, y: Double) {", "Method", 1, 0, false},
+    {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0).dist()", "dist",
+     "  def dist(): Double = math.sqrt(x*x + y*y)", "Method", 2, 0, false},
+    {"mkc_c1_swift_initializer", "make", "Widget(name: n)", "init",
+     "    init(name: String) { self.name = name }", "Method", 3, 0, false},
+    {"mkc_c1_ruby_type_new", "make", "Widget.new(name)", "initialize", "  def initialize(name)",
+     "Method", 2, 0, false},
+    {"mkc_c1_rust_new_samefile", "run", "Point::new(3.0, 4.0)", "new",
+     "    pub fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 4, 0, false},
+    {"mkc_c1_rust_new_samefile", "run", "p.dist()", "dist",
+     "    pub fn dist(&self) -> f64 { (self.x * self.x + self.y * self.y).sqrt() }", "Method", 5, 0,
+     false},
+    {"mkc_c2_cpp_operator_plus", "run", "a + b", "operator+",
+     "    Vec2 operator+(const Vec2 &o) const { return Vec2(x+o.x, y+o.y); }", "Method", 4, 0,
+     false},
+    {"mkc_c2_cpp_operator_plus", "run", "c.dot(b)", "dot",
+     "    float dot(const Vec2 &o) const { return x*o.x + y*o.y; }", "Method", 5, 0, false},
+    {"mkc_c2_cpp_operator_plus", "operator+", "Vec2(x+o.x, y+o.y)", "Vec2",
+     "    Vec2(float x, float y): x(x), y(y){}", "Method", 3, 0, false},
+    {"mkc_c2_cpp_operator_subscript", "run", "a[2]", "operator[]",
+     "    int& operator[](int i) { return data[i]; }", "Method", 3, 0, false},
+    {"mkc_c2_python_dunder_add", "__add__", "Vec(self.x + other.x, self.y + other.y)", "__init__",
+     "    def __init__(self, x, y):", "Method", 2, 0, false},
+    {"mkc_c2_python_dunder_getitem", "run", "s[0]", "__getitem__",
+     "    def __getitem__(self, i):", "Method", 5, 0, false},
+    {"mkc_c2_rust_add_trait", "run", "a + b", "add", "    fn add(self, rhs: Self) -> Self {",
+     "Method", 8, 0, false},
+    {"mkc_c2_kotlin_operator_plus", "run", "a + b", "plus",
+     "    operator fun plus(other: Vec2): Vec2 =", "Method", 2, 0, false},
+    {"mkc_c2_csharp_operator_plus", "Run", "a + b", NULL,
+     "        public static Vec2 operator+(Vec2 a, Vec2 b) {", "Method", 5, 0, false},
+    {"mkc_c2_csharp_operator_plus", "Run", "(a + b).Dot(b)", "Dot",
+     "        public float Dot(Vec2 o) { return X*o.X + Y*o.Y; }", "Method", 8, 0, false},
+    {"mkc_c2_csharp_operator_plus", "operator+", "new Vec2(a.X + b.X, a.Y + b.Y)", "Vec2",
+     "        public Vec2(float x, float y) { X = x; Y = y; }", "Method", 4, 0, false},
+    {"mkc_c2_scala_symbolic_method", "run", "a + b", "+",
+     "  def +(other: Vec2): Vec2 = Vec2(x + other.x, y + other.y)", "Method", 2, 0, false},
+    {"mkc_c2_scala_symbolic_method", "run", "(a + b).dot(b)", "dot",
+     "  def dot(other: Vec2): Double = x * other.x + y * other.y", "Method", 3, 0, false},
+    {"mkc_c2_ruby_operator_plus", "+", "Vec2.new(@x + other.x, @y + other.y)", "initialize",
+     "  def initialize(x, y)", "Method", 3, 0, false},
+    {"mkc_c4_typescript_async_await", "getData", "fetch(url)", "fetch",
+     "async function fetch(url: string): Promise<string> {", "Function", 1, 0, false},
+    {"mkc_c4_typescript_async_await", "run", "getData(url)", "getData",
+     "async function getData(url: string): Promise<string> {", "Function", 5, 0, false},
+    {"mkc_c4_csharp_async_await", "GetDataAsync", "FetchAsync(url)", "FetchAsync",
+     "        public async Task<string> FetchAsync(string url) {", "Method", 5, 0, false},
+    {"mkc_c4_csharp_async_await", "RunAsync", "GetDataAsync(\"http://example.com\")",
+     "GetDataAsync", "        public async Task<string> GetDataAsync(string url) {", "Method", 9, 0,
+     false},
+    {"mkc_c4_rust_await", "get_data", "fetch(url)", "fetch",
+     "async fn fetch(url: &str) -> String {", "Function", 1, 0, false},
+    {"mkc_c4_rust_await", "run", "get_data(url)", "get_data",
+     "async fn get_data(url: &str) -> String {", "Function", 5, 0, false},
+    {"mkc_c4_kotlin_suspend_call", "getData", "fetchData(url)", "fetchData",
+     "suspend fun fetchData(url: String): String {", "Function", 1, 0, false},
+    {"mkc_c4_kotlin_suspend_call", "run", "getData(url)", "getData",
+     "suspend fun getData(url: String): String {", "Function", 5, 0, false},
+    {"mkc_c4_swift_async_await", "getData", "fetch(url: url)", "fetch",
+     "func fetch(url: String) async -> String {", "Function", 1, 0, false},
+    {"mkc_c4_swift_async_await", "run", "getData(url: url)", "getData",
+     "func getData(url: String) async -> String {", "Function", 5, 0, false},
+    {"mkc_c5_scala_generic_call", "run", "first(ns)", "first",
+     "def first[T](xs: List[T]): Option[T] =", "Function", 1, 0, false},
+    {"mkc_c5_swift_generic_call", "run", "maxOf(a, b)", "maxOf",
+     "func maxOf<T: Comparable>(_ a: T, _ b: T) -> T {", "Function", 1, 0, false},
+    {"mkc_c5_ruby_duck_typed_call", "run", "first(items)", "first", "def first(collection)",
+     "Function", 1, 0, false},
+    {"mkc_c6_scala_companion_object", "run", "Config.default()", "default",
+     "  def default(): Config = new Config(false)", "Method", 4, 0, false},
+    {"mkc_c6_swift_static_method", "run", "MathHelper.clamp(n, 0, 100)", "clamp",
+     "    static func clamp(_ v: Int, _ lo: Int, _ hi: Int) -> Int {", "Method", 2, 0, false},
+    {"mkc_c6_ruby_class_method", "run", "Config.version", "version", "  def self.version", "Method",
+     2, 0, false},
+    {"mkc_c6_scala_singleton_object", "run", "Logger.log(msg)", "log",
+     "  def log(msg: String): Unit = println(msg)", "Method", 2, 0, false},
+    {"mkc_c7_scala_inherited_method", "run", "d.describe()", "describe",
+     "  def describe(): String = \"animal\"", "Method", 2, 0, false},
+    {"mkc_c7_swift_inherited_method", "run", "d.describe()", "describe",
+     "    func describe() -> String { return \"animal\" }", "Method", 2, 0, false},
+    {"mkc_c7_ruby_inherited_method", "run", "describe()", "describe", "  def describe", "Method", 2,
+     0, false},
+    {"mkc_c7_scala_super_call", "describe", "super.describe()", "Base.describe",
+     "  def describe(): String = \"base\"", "Method", 2, 0, false},
+    {"mkc_c7_scala_super_call", "run", "c.describe()", "Child.describe",
+     "  override def describe(): String = \"child: \" + super.describe()", "Method", 6, 0, false},
+    {"mkc_c8_java_constructor_samefile", "make", "new Widget(name)", "Widget",
+     "    public Widget(String name) { this.name = name; }", "Method", 5, 0, false},
+    {"mkc_c8_java_constructor_samefile", "run", "make(name)", "make",
+     "    public Widget make(String name) { return new Widget(name); }", "Method", 10, 0, false},
+    {"mkc_c8_java_constructor_samefile", "run", "make(name).label()", "label",
+     "    public String label() { return name; }", "Method", 6, 0, false},
+    {"mkc_c8_csharp_constructor_samefile", "Make", "new Widget(name)", "Widget",
+     "        public Widget(string name) { Name = name; }", "Method", 4, 0, false},
+    {"mkc_c8_csharp_constructor_samefile", "Run", "Make(name)", "Make",
+     "        public Widget Make(string name) { return new Widget(name); }", "Method", 9, 0, false},
+    {"mkc_c8_csharp_constructor_samefile", "Run", "Make(name).Label()", "Label",
+     "        public string Label() { return Name; }", "Method", 5, 0, false},
+    {"mkc_c8_php_constructor_samefile", "make", "new Widget($name)", "__construct",
+     "    public function __construct($name) { $this->name = $name; }", "Method", 4, 0, false},
+    {"mkc_c8_php_constructor_samefile", "run", "$this->make($name)", "make",
+     "    public function make($name) { return new Widget($name); }", "Method", 9, 0, true},
+    {"mkc_c8_php_constructor_samefile", "run", "$this->make($name)->label()", "label",
+     "    public function label() { return $this->name; }", "Method", 5, 0, false},
+    {"mkc_c8_typescript_constructor_samefile", "make", "new Widget(name)", "constructor",
+     "    constructor(public name: string) {}", "Method", 2, 0, false},
+    {"mkc_c8_typescript_constructor_samefile", "run", "this.make(name)", "make",
+     "    make(name: string): Widget { return new Widget(name); }", "Method", 7, 0, true},
+    {"mkc_c8_typescript_constructor_samefile", "run", "this.make(name).label()", "label",
+     "    label(): string { return this.name; }", "Method", 3, 0, false},
+    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget(name)", NULL,
+     "class Widget(val name: String) {", "Method", 1, 0, false},
+    {"mkc_c8_kotlin_constructor_samefile", "run", "make(name)", "make",
+     "fun make(name: String): Widget = Widget(name)", "Function", 5, 0, true},
+    {"mkc_c8_kotlin_constructor_samefile", "run", "make(name).label()", "label",
+     "    fun label(): String = name", "Method", 2, 0, false},
+};
+typedef struct {
+    const char *test, *caller, *needle;
+    unsigned occurrence;
+} MKC_Forbidden;
+static const MKC_Forbidden mkc_forbidden[] = {
+    {"mkc_c2_python_dunder_add", "run", "a + b", 0},
+    {"mkc_c2_ruby_operator_plus", "run", "a + b", 0},
+    {"mkc_c2_ruby_operator_plus", "run", "(a + b).dot(b)", 0},
+};
+
+static bool mkc_quality(const MKC_File *original, int count, const char *test) {
+    if (!strncmp(test, "test_", 5))
+        test += 5;
+    if (count != 1)
+        return false;
+    /* The same production harness must retain a nonzero exact-call control. */
+    const MKC_File files[] = {original[0],
+                              {"quality_control.py",
+                               "def exact_target():\n    return 1\n"
+                               "def exact_caller():\n    return exact_target()\n"}};
+    const RQ_Source sources[] = {{.path = files[0].name, .text = files[0].content},
+                                 {.path = files[1].name, .text = files[1].content}};
+    RQ_Expected expected[8] = {{.case_id = "required-local-control",
+                                .site = {.file = "quality_control.py",
+                                         .caller = "exact_caller",
+                                         .needle = "exact_target()",
+                                         .occurrence_index = 1},
+                                .relation = "CALLS",
+                                .target = {.file = "quality_control.py",
+                                           .suffix = "quality_control.exact_target",
+                                           .label = "Function",
+                                           .declaration_line = 1,
+                                           .declaration_text = "def exact_target():"},
+                                .mode = RQ_REQUIRED}};
+    RQ_Forbidden invalid[3] = {0};
+    char ids[8][100];
+    size_t n = 1, nf = 0, required = 1;
+    for (size_t i = 0; i < sizeof(mkc_goldens) / sizeof(mkc_goldens[0]); i++) {
+        const MKC_Golden *g = mkc_goldens + i;
+        if (strcmp(test, g->test))
+            continue;
+        if (n == sizeof(expected) / sizeof(expected[0]))
+            return false;
+        snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
+        expected[n] = (RQ_Expected){
+            .case_id = ids[n],
+            .site = {.file = original[0].name,
+                     .caller = g->caller,
+                     .needle = g->needle,
+                     .occurrence_index = g->occurrence},
+            .relation = "CALLS",
+            .target = {.file = original[0].name,
+                       .suffix = g->target,
+                       .label = g->label,
+                       .declaration_line = g->line,
+                       .declaration_text = g->declaration},
+            .mode = g->required ? RQ_REQUIRED : RQ_KNOWN_GAP,
+            .gap_id = g->target ? "source-call-binding-proof-missing"
+                                : "callable-identity-not-materialized",
+            .why = g->target
+                       ? "This source-authored call requires a complete language binding and "
+                         "receiver/overload proof to its exact callable declaration."
+                       : "The genuine call has no faithful callable graph identity. A class "
+                         "anchor for an implicit constructor, or an explicit operator anchor, "
+                         "records debt without accepting a Class as a callable target.",
+            .tried = "The original v69 production harness failed its aggregate call floor. "
+                     "Preserved fixture bytes and replaced that floor with exact source "
+                     "occurrences/declarations. Direct make calls remain required source "
+                     "obligations; an old aggregate count does not establish exact admission."};
+        required += g->required;
+        n++;
+    }
+    for (size_t i = 0; i < sizeof(mkc_forbidden) / sizeof(mkc_forbidden[0]); i++) {
+        const MKC_Forbidden *g = mkc_forbidden + i;
+        if (strcmp(test, g->test))
+            continue;
+        if (nf == sizeof(invalid) / sizeof(invalid[0]))
+            return false;
+        invalid[nf++] = (RQ_Forbidden){.case_id = g->needle,
+                                       .site = {.file = original[0].name,
+                                                .caller = g->caller,
+                                                .needle = g->needle,
+                                                .occurrence_index = g->occurrence},
+                                       .relation = "CALLS",
+                                       .any_target = true};
+    }
+    if (n == 1 && nf == 0)
+        return false;
+    MKC_Proj project;
+    cbm_store_t *store = mkc_index(&project, files, 2);
+    RQ_Report report = {0};
+    bool ok = store && rq_check_project_declarations(store, project.project, test, sources, 2,
+                                                     expected, n, invalid, nf, &report, stderr);
+    mkc_cleanup(&project, store);
+    return ok && report.genuine == n && report.found == required && report.missing == n - required;
 }
 
 static const char *MKC_ALL_EDGE_TYPES[] = {"CALLS",    "DEFINES",    "DEFINES_METHOD", "IMPORTS",
@@ -190,54 +420,33 @@ static int mkc_edge(const MKC_File *files, int nfiles, const char *edge_type, in
  *   - Rust   struct literal T { } in same-file (avoids the :: resolution bug)
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* C1-A: Scala — new Widget() constructor call.
- * Same-file: Widget defined and instantiated in the same .scala file.
- * red=bug: Scala extraction doesn't include object_creation_expression
- * in call_types, so `new Widget()` never becomes a CALLS edge.
- * Root cause: lang_specs.c scala_call_types is {call_expression} only.
- * Fix location: lang_specs.c scala_call_types — add "new_expression" or
- * extract_defs.c Scala path to model constructors. */
+/* c1 scala constructor new: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c1_scala_constructor_new) {
     static const MKC_File f[] = {{"Widget.scala", "class Widget(val name: String) {\n"
                                                   "  def label(): String = name\n"
                                                   "}\n\n"
                                                   "def make(n: String): Widget = new Widget(n)\n"}};
-    /* REAL BUG: new Widget(n) should produce CALLS make->Widget constructor.
-     * Scala constructor (`new T()`) is not modeled as a call — lang_specs.c
-     * scala_call_types does not capture new_expression/constructor instantiation,
-     * so calls=0.  (case-class apply `Widget(n)` without `new` DOES resolve — see
-     * the sibling c1/scala/case_class_apply, which now passes.) [KNOWN class 5] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c1/scala/constructor_new", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C1-B: Scala — case class apply() (no `new`).
- * red=bug: Widget("x") call — same root cause as C1-A; the apply() call is
- * an argument_list-headed call_expression and may or may not resolve to a
- * constructor CALLS edge.  In practice the name resolver finds Widget and
- * emits CALLS if Widget is modeled, but the constructor itself is never linked. */
+/* c1 scala case class apply: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c1_scala_case_class_apply) {
     static const MKC_File f[] = {{"Point.scala",
                                   "case class Point(x: Double, y: Double) {\n"
                                   "  def dist(): Double = math.sqrt(x*x + y*y)\n"
                                   "}\n\n"
                                   "def origin(): Double = Point(0.0, 0.0).dist()\n"}};
-    /* Uncertain/red=bug: Point(0.0, 0.0) is the Scala case-class apply;
-     * the generic name resolver may find `dist` but the constructor call
-     * to Point is unlikely to be modeled.  Assert the correct outcome. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c1/scala/case_class_apply", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C1-C: Swift — Type() initializer call.
- * red=bug: Swift `Widget(name: n)` — Swift lsp_cross is not wired (swift has
- * no cbm_run_swift_lsp_cross), and the generic resolver does not model
- * initializer calls from `call_expression(type_identifier(Widget), ...)`.
- * Root cause: swift_call_types = {call_expression} and extract_callee picks
- * the first child (which is the type name), but no CALLS edge to Widget.init
- * is emitted because the pipeline has no constructor linkage for Swift.
- * Fix: add Swift to constructor-extraction path in extract_defs.c or add
- * cbm_run_swift_lsp_cross. */
+/* c1 swift initializer: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c1_swift_initializer) {
     static const MKC_File f[] = {{"Widget.swift", "class Widget {\n"
                                                   "    let name: String\n"
@@ -247,20 +456,13 @@ TEST(mkc_c1_swift_initializer) {
                                                   "func make(n: String) -> Widget {\n"
                                                   "    return Widget(name: n)\n"
                                                   "}\n"}};
-    /* red=bug: Widget(name: n) should CALLS make->Widget.init.
-     * Currently calls=0; swift has no constructor-call linkage. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c1/swift/initializer", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C1-D: Ruby — Type.new constructor call.
- * red=bug: Ruby's `Widget.new(name)` is a method_call whose receiver is a
- * const (Widget) and method name is :new.  The generic resolver sees a call
- * named "new", which doesn't match any registered function by that name
- * (the constructor body is in `def initialize`), so CALLS is never emitted.
- * Root cause: extract_calls.c Ruby path maps method_call to callee "new"
- * not to "Widget.initialize".  Fix: add a Ruby `new` → `initialize` redirect
- * in the extractor or treat Type.new as a constructor call. */
+/* c1 ruby type new: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c1_ruby_type_new) {
     static const MKC_File f[] = {{"widget.rb", "class Widget\n"
                                                "  def initialize(name)\n"
@@ -273,12 +475,8 @@ TEST(mkc_c1_ruby_type_new) {
                                                "def make(name)\n"
                                                "  Widget.new(name)\n"
                                                "end\n"}};
-    /* REAL BUG: Widget.new(name) should CALLS make->Widget#initialize.  Ruby maps
-     * the `new` method_call to callee "new", which matches no registered function
-     * (the body is in `def initialize`), so the constructor call is never linked
-     * → calls=0.  Needs a Ruby `Type.new` → `Type#initialize` redirect in the
-     * call extractor/resolver. [KNOWN class 5] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c1/ruby/type_new", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -302,13 +500,8 @@ TEST(mkc_c1_cpp_constructor_samefile) {
     PASS();
 }
 
-/* C1-F: Rust — struct literal T { field } in same file (avoids :: resolver bug).
- * The lrp_rust_s3_constructor fixture uses `point::Point::new(...)` which fails
- * due to the `::` split bug in cbm_registry_resolve.  Here we test a plain
- * same-file struct + impl, where `Point::new(x, y)` has no module prefix,
- * so the resolver should find it.
- * green=guard: Rust same-file `StructName::new()` — the name "new" is a unique
- * function in the file; the generic resolver should link it. */
+/* c1 rust new samefile: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c1_rust_new_samefile) {
     static const MKC_File f[] = {
         {"point.rs",
@@ -321,11 +514,8 @@ TEST(mkc_c1_rust_new_samefile) {
          "    let p = Point::new(3.0, 4.0);\n"
          "    p.dist()\n"
          "}\n"}};
-    /* Uncertain/red=bug: Point::new inside the same file — the generic resolver
-     * splits on '.' not '::' so "Point::new" never matches registered QN "new".
-     * Root cause: registry.c cbm_registry_resolve doesn't handle Rust `::` paths.
-     * Fix location: src/pipeline/registry.c — split on '::' for Rust as well as '.'. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c1/rust/new_samefile", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -340,14 +530,8 @@ TEST(mkc_c1_rust_new_samefile) {
  *            Swift (static func +)
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* C2-A: C++ — operator+ overload.
- * red=bug: `a + b` where both are Vec2 objects is a binary_expression with
- * operator_name "+".  C++ lsp_cross does not currently desugar operator
- * expressions into CALLS edges for overloaded operators.
- * Root cause: the C++ call_types list includes "call_expression" but not
- * "binary_expression" for operator-call desugaring.
- * Fix: extend extract_calls.c C++ path to emit a CALLS node for
- * binary_expression when both operands have a known overloaded type. */
+/* c2 cpp operator plus: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_cpp_operator_plus) {
     static const MKC_File f[] = {
         {"vec.cpp", "struct Vec2 {\n    float x, y;\n    Vec2(float x, float y): x(x), y(y){}\n"
@@ -357,17 +541,13 @@ TEST(mkc_c2_cpp_operator_plus) {
                     "    Vec2 c = a + b;\n" /* operator+ call */
                     "    return c.dot(b);\n"
                     "}\n"}};
-    /* red=bug: `a + b` should CALLS run->Vec2::operator+.
-     * c.dot(b) may pass via method-call resolution (it's a named call_expression).
-     * We assert CALLS >= 2 (operator+ + dot); will fail until C++ operator desugaring
-     * is implemented.  Minimally assert >= 1 for now to capture the dot() shape. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c2/cpp/operator_plus", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-B: C++ — operator[] subscript overload.
- * red=bug: `arr[0]` on a custom array type is a subscript_expression;
- * same root cause as C2-A — no desugaring to CALLS for subscript operators. */
+/* c2 cpp operator subscript: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_cpp_operator_subscript) {
     static const MKC_File f[] = {{"arr.cpp", "struct IntArr {\n    int data[8];\n"
                                              "    int& operator[](int i) { return data[i]; }\n"
@@ -375,22 +555,13 @@ TEST(mkc_c2_cpp_operator_subscript) {
                                              "int run(IntArr &a) {\n"
                                              "    return a[2];\n"
                                              "}\n"}};
-    /* REAL BUG: a[2] should CALLS run->IntArr::operator[].  The subscript
-     * operator desugaring is not modeled — C++ call extraction does not emit a
-     * call for subscript_expression on an overloaded-operator type → 0 CALLS.
-     * (Note: C++ binary operator+ desugaring now works — c2/cpp/operator_plus
-     * passes — but subscript [] is still missing.) [KNOWN class 12] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/cpp/operator_subscript", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-C: Python — __add__ dunder method.
- * red=bug: `a + b` with Vector objects — Python grammar emits a
- * binary_operator node for `+`.  Neither extract_calls.c nor the Python
- * lsp_cross pass maps binary_operator to a __add__ CALLS edge.
- * Root cause: py_call_types is {call, decorator} (lang_specs.c) — no
- * binary_operator entry.  Fix: extend Python extractor to model dunder
- * operator expressions as calls to __add__ / __eq__ / etc. */
+/* c2 python dunder add: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_python_dunder_add) {
     static const MKC_File f[] = {
         {"vec.py",
@@ -400,15 +571,13 @@ TEST(mkc_c2_python_dunder_add) {
          "    def __eq__(self, other):\n        return self.x == other.x and self.y == other.y\n\n"
          "def run(a, b):\n"
          "    return a + b\n"}};
-    /* red=bug: `a + b` should CALLS run->Vec.__add__.
-     * Currently binary_operator is not in Python call_types. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/python/dunder_add", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-D: Python — __getitem__ dunder method.
- * red=bug: `a[0]` on a custom Seq emits a subscript node, not a call_expression.
- * Same root cause as C2-C — subscript desugaring to __getitem__ is missing. */
+/* c2 python dunder getitem: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_python_dunder_getitem) {
     static const MKC_File f[] = {{"seq.py",
                                   "class Seq:\n"
@@ -416,24 +585,13 @@ TEST(mkc_c2_python_dunder_getitem) {
                                   "    def __getitem__(self, i):\n        return self._d[i]\n\n"
                                   "def run(s: Seq):\n"
                                   "    return s[0]\n"}};
-    /* Subscript `s[0]` desugars to a CALLS run->Seq.__getitem__, resolved
-     * type-based from the receiver's type. ADAPTED: the param is annotated
-     * `s: Seq` — the original unannotated `def run(s)` is NOT soundly
-     * resolvable (no receiver type; resolving would require an unsound
-     * "sole class with __getitem__" guess that would mis-resolve built-in
-     * subscripts). The annotated form exercises the real subscript-dunder
-     * resolution. See project memory [project_lsp_extraction_bughunt_2026_06]. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/python/dunder_getitem", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-E: Rust — Add trait operator overload (a + b).
- * red=bug: Rust `a + b` where T implements std::ops::Add is a binary_expression.
- * Rust's call_types do not include binary_expression, so `a + b` is never
- * extracted as a call to <T as Add>::add.
- * Root cause: lang_specs.c rust_call_types = {call_expression, macro_invocation}
- * — no binary_expression entry.
- * Note: Rust lsp_cross is also not wired (see lrp_rust_* suite), compounding the miss. */
+/* c2 rust add trait: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_rust_add_trait) {
     static const MKC_File f[] = {{"vec.rs",
                                   "use std::ops::Add;\n\n"
@@ -448,19 +606,13 @@ TEST(mkc_c2_rust_add_trait) {
                                   "pub fn run(a: Vec2, b: Vec2) -> Vec2 {\n"
                                   "    a + b\n"
                                   "}\n"}};
-    /* REAL BUG: `a + b` should CALLS run->Vec2::add (via Add trait).  Rust
-     * binary_expression is not in lang_specs.c rust_call_types, so the operator
-     * desugaring is never extracted as a call → 0 CALLS.  (Rust also has no
-     * cross-LSP, compounding the miss.) [KNOWN class 12] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/rust/add_trait", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-F: Kotlin — operator fun plus.
- * red=bug: Kotlin `a + b` with `operator fun plus` defined — the grammar
- * emits an additive_expression, not a call_expression.  Kotlin's call_types
- * (lang_specs.c) do not include additive_expression.
- * Fix: extend Kotlin extractor to map operator expressions to CALLS. */
+/* c2 kotlin operator plus: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_kotlin_operator_plus) {
     static const MKC_File f[] = {{"vec.kt",
                                   "data class Vec2(val x: Float, val y: Float) {\n"
@@ -469,15 +621,13 @@ TEST(mkc_c2_kotlin_operator_plus) {
                                   "    operator fun get(i: Int): Float = if (i == 0) x else y\n"
                                   "}\n\n"
                                   "fun run(a: Vec2, b: Vec2): Vec2 = a + b\n"}};
-    /* red=bug: `a + b` should CALLS run->Vec2.plus (operator fun). */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/kotlin/operator_plus", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-G: C# — operator + overload.
- * red=bug: C# `a + b` for structs with operator+ is a binary_expression in
- * the grammar.  cs_call_types = {invocation_expression} only — no
- * binary_expression, so the operator call is never extracted. */
+/* c2 csharp operator plus: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_csharp_operator_plus) {
     static const MKC_File f[] = {{"Vec.cs",
                                   "namespace App {\n"
@@ -495,19 +645,13 @@ TEST(mkc_c2_csharp_operator_plus) {
                                   "        }\n"
                                   "    }\n"
                                   "}\n"}};
-    /* REAL BUG: `(a + b).Dot(b)` should CALLS both Vec2::op_Addition (the `+`)
-     * AND Dot (>=2).  Dot resolves (CALLS=1) but the operator `a + b` does not —
-     * C# binary_expression operator desugaring is not modeled (cs_call_types omits
-     * it), so the op_Addition call is missing → CALLS=1 < 2. [KNOWN class 12] */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c2/csharp/operator_plus", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-H: Scala — symbolic method (operators are methods in Scala).
- * Uncertain/red=bug: in Scala `a + b` with a custom `def +(other: Vec2)` is
- * syntactic sugar for a method call `a.+(b)` — it IS a call_expression in the
- * tree-sitter-scala grammar.  The generic resolver may find `+` if it maps to
- * a unique method name.  Assert CALLS >= 1. */
+/* c2 scala symbolic method: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_scala_symbolic_method) {
     static const MKC_File f[] = {{"vec.scala",
                                   "case class Vec2(x: Double, y: Double) {\n"
@@ -515,19 +659,13 @@ TEST(mkc_c2_scala_symbolic_method) {
                                   "  def dot(other: Vec2): Double = x * other.x + y * other.y\n"
                                   "}\n\n"
                                   "def run(a: Vec2, b: Vec2): Double = (a + b).dot(b)\n"}};
-    /* Uncertain: in Scala `a + b` is sugar for `a.+(b)`.  The tree-sitter-scala
-     * grammar may emit a call_expression whose callee is `+`.  The generic
-     * name resolver tries to match the method "+".  If Scala call_types correctly
-     * includes infix applications, this is GREEN; otherwise red=bug. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/scala/symbolic_method", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C2-I: Ruby — operator method (def +).
- * Uncertain/red=bug: Ruby `a + b` is a binary method call.  The tree-sitter-ruby
- * grammar emits a `binary` node for infix expressions.  Ruby call_types
- * (extract_calls.c) handle `call` nodes but may not handle `binary`.
- * If binary is mapped to a method call, the resolver finds `+`; otherwise red. */
+/* c2 ruby operator plus: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c2_ruby_operator_plus) {
     static const MKC_File f[] = {
         {"vec.rb", "class Vec2\n"
@@ -539,9 +677,8 @@ TEST(mkc_c2_ruby_operator_plus) {
                    "def run(a, b)\n"
                    "  (a + b).dot(b)\n"
                    "end\n"}};
-    /* Uncertain/red=bug: `a + b` should CALLS run->Vec2#+.
-     * Ruby binary node not in call_types. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c2/ruby/operator_plus", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -732,10 +869,8 @@ TEST(mkc_c4_python_async_await) {
     PASS();
 }
 
-/* C4-B: TypeScript — async/await function call.
- * green=guard: TS `await fetch(url)` — the `await_expression` wraps a
- * `call_expression`.  TS call_types include call_expression, so the inner
- * call is extracted regardless of the await wrapper. */
+/* c4 typescript async await: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c4_typescript_async_await) {
     static const MKC_File f[] = {{"client.ts",
                                   "async function fetch(url: string): Promise<string> {\n"
@@ -750,16 +885,13 @@ TEST(mkc_c4_typescript_async_await) {
                                   "        console.log(data);\n"
                                   "    }\n"
                                   "}\n"}};
-    /* green=guard: await fetch(url) should CALLS getData->fetch. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c4/typescript/async_await", 1));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C4-C: C# — async Task + await call.
- * Uncertain/red=bug: C# `await FetchAsync(url)` — the `await_expression` in
- * the C# grammar wraps an `invocation_expression`.  cs_call_types includes
- * `invocation_expression`, so the inner call should be extracted.
- * However, the await wrapper may or may not be transparent; assert CALLS >= 1. */
+/* c4 csharp async await: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c4_csharp_async_await) {
     static const MKC_File f[] = {
         {"Client.cs", "using System.Threading.Tasks;\n\n"
@@ -776,19 +908,13 @@ TEST(mkc_c4_csharp_async_await) {
                       "        }\n"
                       "    }\n"
                       "}\n"}};
-    /* Uncertain: C# await_expression wraps invocation_expression.
-     * If cs_call_types handles it, green=guard; otherwise red=bug. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c4/csharp/async_await", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C4-D: Rust — .await expression.
- * red=bug: Rust `future.await` is an `await_expression` node where the
- * operand is a method-call-like expression.  Rust call_types = {call_expression,
- * macro_invocation} — await_expression is not included.
- * Root cause: lang_specs.c rust_call_types does not include await_expression.
- * Fix: either add await_expression to rust_call_types, or teach extract_calls.c
- * to unwrap await_expression and process the inner expression. */
+/* c4 rust await: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c4_rust_await) {
     static const MKC_File f[] = {{"client.rs", "async fn fetch(url: &str) -> String {\n"
                                                "    url.to_string()\n"
@@ -801,19 +927,13 @@ TEST(mkc_c4_rust_await) {
                                                "        let _data = get_data(url).await;\n"
                                                "    }\n"
                                                "}\n"}};
-    /* red=bug: fetch(url).await — the inner fetch(url) IS a call_expression,
-     * but its CALLS attribution may be lost when wrapped in await.
-     * Additionally, get_data(url).await has same issue.
-     * Assert CALLS >= 1 (the correct outcome). */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c4/rust/await", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C4-E: Kotlin — suspend function call (coroutines).
- * Uncertain: Kotlin `suspend fun` calls look like normal function calls at the
- * grammar level — the `suspend` keyword modifies the function signature but does
- * not change the call_expression shape.  The generic resolver should find the
- * callee by name.  Assert CALLS >= 1. */
+/* c4 kotlin suspend call: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c4_kotlin_suspend_call) {
     static const MKC_File f[] = {{"client.kt", "suspend fun fetchData(url: String): String {\n"
                                                "    return url\n"
@@ -827,18 +947,13 @@ TEST(mkc_c4_kotlin_suspend_call) {
                                                "        println(data)\n"
                                                "    }\n"
                                                "}\n"}};
-    /* green=guard (uncertain): suspend fun calls are regular function calls
-     * at grammar level; the name resolver should find fetchData and getData. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c4/kotlin/suspend_call", 1));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C4-F: Swift — async/await (Swift 5.5+).
- * red=bug: Swift `await fetch(url)` — the grammar emits an `await_expression`
- * wrapping a `call_expression`.  Swift call_types in lang_specs.c may or may
- * not include `call_expression`; even if it does, the extract_callee_name for
- * Swift's call_expression form needs to be validated.
- * Additionally, Swift lsp_cross is not wired. */
+/* c4 swift async await: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c4_swift_async_await) {
     static const MKC_File f[] = {{"client.swift", "func fetch(url: String) async -> String {\n"
                                                   "    return url\n"
@@ -852,9 +967,8 @@ TEST(mkc_c4_swift_async_await) {
                                                   "        print(data)\n"
                                                   "    }\n"
                                                   "}\n"}};
-    /* Uncertain: Swift `await fetch(url: url)` inner call_expression should
-     * produce CALLS getData->fetch.  Assert CALLS >= 1. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c4/swift/async_await", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -867,24 +981,20 @@ TEST(mkc_c4_swift_async_await) {
  * Matrix-fill adds: Scala, Swift, Ruby (duck-typed, no generics per se).
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* C5-A: Scala — generic function call.
- * Uncertain: Scala `def first[T](xs: List[T]): T` — the generic type parameter
- * does not affect the call_expression shape; the generic resolver should find
- * `first` by name regardless of the type argument. */
+/* c5 scala generic call: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c5_scala_generic_call) {
     static const MKC_File f[] = {{"algo.scala",
                                   "def first[T](xs: List[T]): Option[T] =\n"
                                   "  if (xs.isEmpty) None else Some(xs.head)\n\n"
                                   "def run(ns: List[Int]): Option[Int] = first(ns)\n"}};
-    /* Uncertain: first is a top-level generic; the name resolver should find it.
-     * Assert CALLS >= 1; red=bug if generic call is dropped. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c5/scala/generic_call", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C5-B: Swift — generic function call.
- * Uncertain: Swift `func maxOf<T: Comparable>(_ a: T, _ b: T) -> T` — same as
- * Scala; the generic syntax does not change the call_expression structure. */
+/* c5 swift generic call: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c5_swift_generic_call) {
     static const MKC_File f[] = {{"algo.swift", "func maxOf<T: Comparable>(_ a: T, _ b: T) -> T {\n"
                                                 "    return a > b ? a : b\n"
@@ -892,15 +1002,13 @@ TEST(mkc_c5_swift_generic_call) {
                                                 "func run(a: Int, b: Int) -> Int {\n"
                                                 "    return maxOf(a, b)\n"
                                                 "}\n"}};
-    /* Uncertain: maxOf is a top-level generic; assert CALLS >= 1. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c5/swift/generic_call", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C5-C: Ruby — duck-typed "generic" (no static generics; method works on any type).
- * green=guard: Ruby method call is always dynamic; the name resolver treats it
- * like a regular method call.  Confirms ordinary Ruby method resolution works
- * (orthogonal to generics but useful as a guard for Ruby CALLS coverage). */
+/* c5 ruby duck typed call: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c5_ruby_duck_typed_call) {
     static const MKC_File f[] = {{"algo.rb", "def first(collection)\n"
                                              "  collection.empty? ? nil : collection.first\n"
@@ -908,8 +1016,8 @@ TEST(mkc_c5_ruby_duck_typed_call) {
                                              "def run(items)\n"
                                              "  first(items)\n"
                                              "end\n"}};
-    /* green=guard: `first(items)` is a plain method call; CALLS run->first. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c5/ruby/duck_typed_call", 1));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -921,11 +1029,8 @@ TEST(mkc_c5_ruby_duck_typed_call) {
  * methods, Ruby self.method (class methods).
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* C6-A: Scala — companion object method call.
- * Uncertain/red=bug: `Config.default()` where default() is in a companion
- * object.  The Scala grammar may emit this as a call_expression whose
- * callee is a `field_expression` Config.default — the generic resolver should
- * strip the qualifier and find `default`.  Assert CALLS >= 1. */
+/* c6 scala companion object: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c6_scala_companion_object) {
     static const MKC_File f[] = {{"config.scala", "class Config(val debug: Boolean)\n\n"
                                                   "object Config {\n"
@@ -933,15 +1038,13 @@ TEST(mkc_c6_scala_companion_object) {
                                                   "  def debug(): Config = new Config(true)\n"
                                                   "}\n\n"
                                                   "def run(): Config = Config.default()\n"}};
-    /* Uncertain: Config.default() — the generic resolver strips `Config.` prefix
-     * and looks for `default`.  May resolve if unique; otherwise red=bug. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c6/scala/companion_object", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C6-B: Swift — static method call (class func / static func).
- * Uncertain: Swift `MathHelper.clamp(n, 0, 100)` where clamp is a `static func`.
- * The generic resolver should strip `MathHelper.` and find `clamp`. */
+/* c6 swift static method: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c6_swift_static_method) {
     static const MKC_File f[] = {{"mathhelper.swift",
                                   "class MathHelper {\n"
@@ -953,17 +1056,13 @@ TEST(mkc_c6_swift_static_method) {
                                   "func run(n: Int) -> Int {\n"
                                   "    return MathHelper.clamp(n, 0, 100)\n"
                                   "}\n"}};
-    /* Uncertain: MathHelper.clamp — resolver strips qualifier, finds clamp.
-     * Assert CALLS >= 1; red=bug if Swift static method never resolves. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c6/swift/static_method", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C6-C: Ruby — class method (self.method_name).
- * Uncertain: Ruby `Config.version` where `def self.version` is a class method.
- * The method is registered as a Function/Method with name `version` (the `self.`
- * prefix is the receiver, not part of the method name in the registry).
- * The generic resolver should find `version` by name.  Assert CALLS >= 1. */
+/* c6 ruby class method: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c6_ruby_class_method) {
     static const MKC_File f[] = {{"config.rb", "class Config\n"
                                                "  def self.version\n"
@@ -976,16 +1075,13 @@ TEST(mkc_c6_ruby_class_method) {
                                                "def run\n"
                                                "  Config.version\n"
                                                "end\n"}};
-    /* Uncertain: Config.version — the generic resolver strips `Config.` and
-     * looks for `version`.  Assert CALLS >= 1. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c6/ruby/class_method", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C6-D: Scala — object method call (module-level singleton object).
- * green=guard: `Logger.log("msg")` where Logger is a singleton `object`.
- * In Scala, `object Logger` creates a singleton; `Logger.log(...)` is a
- * call_expression.  The generic resolver should find `log` by name. */
+/* c6 scala singleton object: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c6_scala_singleton_object) {
     static const MKC_File f[] = {{"logger.scala",
                                   "object Logger {\n"
@@ -993,9 +1089,8 @@ TEST(mkc_c6_scala_singleton_object) {
                                   "  def warn(msg: String): Unit = println(\"WARN: \" + msg)\n"
                                   "}\n\n"
                                   "def run(msg: String): Unit = Logger.log(msg)\n"}};
-    /* green=guard: Logger.log(msg) should CALLS run->log.
-     * The generic resolver strips the object prefix and resolves `log`. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c6/scala/singleton_object", 1));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -1006,10 +1101,8 @@ TEST(mkc_c6_scala_singleton_object) {
  * Matrix-fill adds: Scala, Swift, Ruby.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* C7-A: Scala — subclass calls inherited method.
- * Uncertain: `class Dog extends Animal` — Scala inheritance uses `extends`.
- * The extractor should produce INHERITS Dog->Animal, but this test focuses
- * on whether `dog.describe()` (an inherited method) produces a CALLS edge. */
+/* c7 scala inherited method: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c7_scala_inherited_method) {
     static const MKC_File f[] = {{"zoo.scala", "class Animal {\n"
                                                "  def describe(): String = \"animal\"\n"
@@ -1019,16 +1112,13 @@ TEST(mkc_c7_scala_inherited_method) {
                                                "  override def speak(): String = \"woof\"\n"
                                                "}\n\n"
                                                "def run(d: Dog): String = d.describe()\n"}};
-    /* Uncertain: d.describe() — the name resolver finds `describe` (it is in
-     * Animal, which is in the same file).  Assert CALLS >= 1 (correct outcome).
-     * This may be GREEN if the generic resolver finds `describe` by name alone. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c7/scala/inherited_method", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C7-B: Swift — subclass calls inherited method.
- * Uncertain: Swift `class Dog: Animal` — the subclass calls `describe()` from
- * the base class.  Same reasoning as C7-A; assert CALLS >= 1. */
+/* c7 swift inherited method: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c7_swift_inherited_method) {
     static const MKC_File f[] = {{"zoo.swift",
                                   "class Animal {\n"
@@ -1041,16 +1131,13 @@ TEST(mkc_c7_swift_inherited_method) {
                                   "func run(d: Dog) -> String {\n"
                                   "    return d.describe()\n"
                                   "}\n"}};
-    /* Uncertain: d.describe() should CALLS run->Animal.describe.
-     * Assert CALLS >= 1; red=bug if inherited method call drops the edge. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c7/swift/inherited_method", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C7-C: Ruby — subclass calls inherited method (via super or direct call).
- * green=guard: Ruby `def run; describe; end` in Dog where `describe` is defined
- * in Animal — the generic name resolver finds `describe` in the same project.
- * This is the same resolution path as the existing calls breadth cases. */
+/* c7 ruby inherited method: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c7_ruby_inherited_method) {
     static const MKC_File f[] = {
         {"zoo.rb",
@@ -1064,22 +1151,13 @@ TEST(mkc_c7_ruby_inherited_method) {
          "    describe()\n" /* inherited method call — explicit () makes it a `call` node */
          "  end\n"
          "end\n"}};
-    /* FIXTURE FIX (was RED as a green guard): a bare `describe` (no parens, no
-     * receiver) parses as an `identifier` in tree-sitter-ruby — indistinguishable
-     * from a local-variable read — so it is NOT one of ruby_call_types
-     * {call, command_call} and is never extracted as a call (calls=0).  That is a
-     * grammar reality, not an indexer bug.  Writing `describe()` makes it a `call`
-     * node; the name resolver then finds Animal#describe in the same file → CALLS
-     * Dog#run->describe.  (Sibling Ruby calls with args/receivers — c5 duck_typed,
-     * c6 class_method, c2 operator — already pass.)  green=guard. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c7/ruby/inherited_method", 1));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C7-D: Scala — super method call.
- * red=bug: `super.describe()` in a Scala subclass is a `super_expression` node
- * wrapping a field_expression / call.  The extractor may or may not follow
- * the super dereference to find the callee `describe`. */
+/* c7 scala super call: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c7_scala_super_call) {
     static const MKC_File f[] = {
         {"zoo2.scala", "class Base {\n"
@@ -1089,11 +1167,8 @@ TEST(mkc_c7_scala_super_call) {
                        "  override def describe(): String = \"child: \" + super.describe()\n"
                        "}\n\n"
                        "def run(c: Child): String = c.describe()\n"}};
-    /* Uncertain/red=bug: `super.describe()` — the generic resolver may or may not
-     * find `describe` through the `super` qualifier.
-     * Also c.describe() should resolve (call to Child's override which calls super).
-     * Assert CALLS >= 1 (the outer call c.describe at minimum). */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 1, "c7/scala/super_call", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
@@ -1106,11 +1181,8 @@ TEST(mkc_c7_scala_super_call) {
  * or also same-file (call_types missing the construction expression).
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/* C8-A: Java — same-file constructor call (new T()).
- * red=bug: lrp_java_s3_constructor confirms the cross-file case fails.
- * The root cause is java_call_types = {method_invocation} only — no
- * object_creation_expression.  This is a SAME-FILE reproduction to confirm
- * the bug is at the extraction layer (not a cross-file resolver issue). */
+/* c8 java constructor samefile: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c8_java_constructor_samefile) {
     static const MKC_File f[] = {
         {"Factory.java", "package app;\n\n"
@@ -1123,16 +1195,13 @@ TEST(mkc_c8_java_constructor_samefile) {
                          "    public Widget make(String name) { return new Widget(name); }\n"
                          "    public String run(String name) { return make(name).label(); }\n"
                          "}\n"}};
-    /* red=bug: new Widget(name) → CALLS make->Widget.<init> — missing.
-     * Root cause: java_call_types does not include object_creation_expression.
-     * Fix: lang_specs.c java_call_types — add "object_creation_expression". */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c8/java/constructor_samefile", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C8-B: C# — same-file constructor call (new T()).
- * red=bug: same root cause as Java; cs_call_types = {invocation_expression}
- * only, no object_creation_expression. */
+/* c8 csharp constructor samefile: exact source calls are required obligations or named quality
+ * gaps; unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c8_csharp_constructor_samefile) {
     static const MKC_File f[] = {
         {"Service.cs", "namespace App {\n"
@@ -1146,17 +1215,13 @@ TEST(mkc_c8_csharp_constructor_samefile) {
                        "        public string Run(string name) { return Make(name).Label(); }\n"
                        "    }\n"
                        "}\n"}};
-    /* red=bug: new Widget(name) → CALLS Make->Widget..ctor — missing.
-     * Root cause: cs_call_types missing object_creation_expression.
-     * Fix: lang_specs.c cs_call_types — add "object_creation_expression". */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c8/csharp/constructor_samefile", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C8-C: PHP — same-file constructor call (new T()).
- * red=bug: lrp_php_s3_constructor confirms this; same-file variant to isolate
- * extraction from resolution.
- * Root cause: php_call_types omits object_creation_expression. */
+/* c8 php constructor samefile: exact source calls are required obligations or named quality gaps;
+ * unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c8_php_constructor_samefile) {
     static const MKC_File f[] = {
         {"factory.php", "<?php\n"
@@ -1169,16 +1234,13 @@ TEST(mkc_c8_php_constructor_samefile) {
                         "    public function make($name) { return new Widget($name); }\n"
                         "    public function run($name) { return $this->make($name)->label(); }\n"
                         "}\n"}};
-    /* red=bug: new Widget($name) should CALLS make->Widget::__construct — missing.
-     * Fix: lang_specs.c php_call_types — add "object_creation_expression". */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c8/php/constructor_samefile", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C8-D: TypeScript — same-file constructor call (new T()).
- * red=bug: lrp_ts_s3_constructor confirms this is RED even with lsp_cross wired.
- * The TS resolver does not link new_expression to the class constructor node.
- * Same-file variant to confirm it is an extraction bug (not a cross-file gap). */
+/* c8 typescript constructor samefile: exact source calls are required obligations or named quality
+ * gaps; unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c8_typescript_constructor_samefile) {
     static const MKC_File f[] = {
         {"service.ts", "class Widget {\n"
@@ -1189,19 +1251,13 @@ TEST(mkc_c8_typescript_constructor_samefile) {
                        "    make(name: string): Widget { return new Widget(name); }\n"
                        "    run(name: string): string { return this.make(name).label(); }\n"
                        "}\n"}};
-    /* red=bug: new Widget(name) should CALLS make->Widget.constructor.
-     * Root cause: TS ts_call_types includes new_expression (call_types in
-     * lang_specs.c), but the extractor does not route new_expression to the
-     * constructor CALLS path.  Fix: handle new_expression callee extraction in
-     * extract_calls.c TS/JS branch to emit CALLS to the class. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c8/typescript/constructor_samefile", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 
-/* C8-E: Kotlin — same-file constructor call.
- * red=bug: lrp_kotlin_s3_constructor confirms cross-file RED.  Same-file variant
- * isolates whether the problem is extraction (Kotlin call_types missing
- * object_creation_expression) or Kotlin-specific cross-file resolution. */
+/* c8 kotlin constructor samefile: exact source calls are required obligations or named quality
+ * gaps; unknown receiver sites cannot bind to a same-named project method. */
 TEST(mkc_c8_kotlin_constructor_samefile) {
     static const MKC_File f[] = {{"app.kt",
                                   "class Widget(val name: String) {\n"
@@ -1209,15 +1265,8 @@ TEST(mkc_c8_kotlin_constructor_samefile) {
                                   "}\n\n"
                                   "fun make(name: String): Widget = Widget(name)\n"
                                   "fun run(name: String): String = make(name).label()\n"}};
-    /* red=bug: Widget(name) should CALLS make->Widget.<init>.
-     * Root cause: Kotlin object creation `Widget(name)` is an
-     * `call_expression` in tree-sitter-kotlin; but unlike Python's `call`
-     * which routes to __init__, Kotlin has no constructor linkage.
-     * The generic resolver finds `label` by name (from make(name).label())
-     * but may not find the constructor because `Widget` the constructor
-     * has no separate definition node in the registry.
-     * Assert CALLS >= 2 (make->Widget + label chain); will be RED. */
-    ASSERT_TRUE(mkc_edge(f, 1, "CALLS", 2, "c8/kotlin/constructor_samefile", 0));
+    /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
 

@@ -209,7 +209,13 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
 // may sit on either side of the operator token, so scan named children for the
 // first identifier / member-style operand.  Returns a null node when no simple
 // target is found.
-static TSNode resolve_write_lhs_node(TSNode node) {
+static TSNode resolve_write_lhs_node(CBMLanguage language, TSNode node) {
+    /* Python annotations without a value do not write the target. Keep this
+     * guard shared by the iterative and unified extraction paths. */
+    if (language == CBM_LANG_PYTHON && !strcmp(ts_node_type(node), "assignment") &&
+        !ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("type"))) &&
+        ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("right"))))
+        return (TSNode){0};
     TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
     if (!ts_node_is_null(left)) {
         return left;
@@ -258,7 +264,7 @@ static TSNode resolve_write_lhs_node(TSNode node) {
 
 // Try to emit a write for an assignment node.
 static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
-    TSNode left = resolve_write_lhs_node(node);
+    TSNode left = resolve_write_lhs_node(ctx->language, node);
     if (ts_node_is_null(left)) {
         return;
     }
@@ -342,7 +348,7 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
     }
 
     if (cbm_kind_in_set(node, spec->assignment_node_types)) {
-        TSNode left = resolve_write_lhs_node(node);
+        TSNode left = resolve_write_lhs_node(ctx->language, node);
 
         if (!ts_node_is_null(left)) {
             bool is_member = false;

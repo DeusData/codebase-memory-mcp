@@ -31,6 +31,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "resolver_quality.h"
 #include "cbm.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -150,6 +151,51 @@ static int pb_type_nodes(cbm_store_t *store, const char *project) {
         if (n > 0) total += n;
     }
     return total;
+}
+
+/* Import quality covers project declarations, with exact source occurrences.
+ * External runtime libraries are outside this denominator. Every indexed fixture
+ * also contains a required supported call, so an empty graph cannot pass. */
+static bool pb_import_quality(const ProbeLangFile *files, size_t file_count,
+                              const RQ_Source *inputs, size_t source_count, const char *suite,
+                              const RQ_Expected *gap, const RQ_Forbidden *forbidden,
+                              RQ_Report *report) {
+    if (file_count > 7 || source_count > 7)
+        return false;
+    const ProbeLangFile control = {
+        "quality_control.js",
+        "export function target() { return 1; }\nexport function caller() { return target(); }\n"};
+    ProbeLangFile indexed[8];
+    RQ_Source sources[8];
+    memcpy(indexed, files, file_count * sizeof(*files));
+    memcpy(sources, inputs, source_count * sizeof(*inputs));
+    indexed[file_count++] = control;
+    sources[source_count++] = (RQ_Source){.path = control.name, .text = control.content};
+    const RQ_Expected expected[] = {
+        *gap,
+        {.case_id = "required-esm-local-call",
+         .site = {.file = "quality_control.js",
+                  .caller = "quality_control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "quality_control.js",
+                    .suffix = "quality_control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 1; }"},
+         .mode = RQ_REQUIRED}};
+    ProbeLangProj lp;
+    cbm_store_t *store = pb_index_files(&lp, indexed, (int)file_count);
+    if (!store) {
+        pb_cleanup(&lp, store);
+        return false;
+    }
+    bool ok =
+        rq_check_project_declarations(store, lp.project, suite, sources, source_count, expected, 2,
+                                      forbidden, forbidden ? 1 : 0, report, stderr);
+    pb_cleanup(&lp, store);
+    return ok;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════════
@@ -1033,7 +1079,7 @@ TEST(racket_require_import_extracted) {
     PASS();
 }
 
-/* Racket: graph-level IMPORTS edge from two-file project with require. */
+/* Racket: the exact source-relative require remains a counted quality gap. */
 TEST(racket_imports_edge) {
     static const ProbeLangFile files[] = {
         {"math.rkt",
@@ -1045,11 +1091,35 @@ TEST(racket_imports_edge) {
          "#lang racket\n"
          "(require \"math.rkt\")\n"
          "(define (run n) (+ (square n) (cube n)))\n"}};
-    ProbeLangProj lp;
-    cbm_store_t *store = pb_index_files(&lp, files, 2);
-    int imports = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : -1;
-    pb_cleanup(&lp, store);
-    ASSERT_TRUE(imports >= 1); /* main.rkt requires math.rkt → BUG if 0 */
+
+    const RQ_Source sources[] = {
+        {.path = "math.rkt", .text = files[0].content},
+        {.path = "main.rkt", .text = files[1].content},
+    };
+    const RQ_Expected gap = {
+        .case_id = "racket_imports_edge-exact-source-import",
+        .site = {.file = "main.rkt",
+                 .caller = "main.rkt.__file__",
+                 .needle = "(require \"math.rkt\")"},
+        .relation = "IMPORTS",
+        .target = {.file = "math.rkt",
+                   .suffix = "math.rkt.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "#lang racket"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "racket_imports_edge_binding_unproven",
+        .why = "Racket string module paths resolve relative to the containing file; the exact "
+               "sibling math.rkt import has no admitted adapter.",
+        .tried = "Retained the literal relative path and provided definitions. The external racket "
+                 "language module is outside this project-declaration denominator."};
+    RQ_Report report;
+    ASSERT_TRUE(pb_import_quality(files, sizeof(files) / sizeof(files[0]), sources,
+                                  sizeof(sources) / sizeof(sources[0]), "racket_imports_edge", &gap,
+                                  NULL, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -1113,7 +1183,7 @@ TEST(rescript_open_import_extracted) {
     PASS();
 }
 
-/* ReScript: graph-level IMPORTS edge from two-file project. */
+/* ReScript: exact source configuration is required before open selects a file. */
 TEST(rescript_imports_edge) {
     static const ProbeLangFile files[] = {
         {"Utils.res",
@@ -1122,11 +1192,57 @@ TEST(rescript_imports_edge) {
         {"Main.res",
          "open Utils\n\n"
          "let run = (n: float) => square(n) +. cube(n)\n"}};
-    ProbeLangProj lp;
-    cbm_store_t *store = pb_index_files(&lp, files, 2);
-    int imports = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : -1;
-    pb_cleanup(&lp, store);
-    ASSERT_TRUE(imports >= 1); /* Main opens Utils → BUG if 0 */
+
+    const ProbeLangFile quality_files[] = {
+        files[0],
+        files[1],
+        {"rescript.json",
+         "{\"name\":\"quality-import\",\"sources\":[\"quality\"],\"namespace\":false}\n"},
+        {"quality/QualityUtils.res", "let twice = (x: int) => x * 2\n"},
+        {"quality/QualityMain.res", "open QualityUtils\nlet run = (x: int) => twice(x)\n"},
+    };
+    const RQ_Source sources[] = {
+        {.path = "Utils.res", .text = quality_files[0].content},
+        {.path = "Main.res", .text = quality_files[1].content},
+        {.path = "quality/QualityUtils.res", .text = quality_files[3].content},
+        {.path = "quality/QualityMain.res", .text = quality_files[4].content},
+    };
+    /* The original pair has no ReScript configuration declaring these files as source modules. The
+     * filename Utils.res alone cannot authorize the open. */
+    const RQ_Forbidden forbidden = {
+        .case_id = "rescript_imports_edge-unconfigured-target",
+        .site = {.file = "Main.res", .caller = "Main.res.__file__", .needle = "open Utils"},
+        .relation = "IMPORTS",
+        .target = {.file = "Utils.res",
+                   .suffix = "Utils.res.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "let square = (x: float) => x *. x"}};
+    const RQ_Expected gap = {
+        .case_id = "rescript_imports_edge-exact-source-import",
+        .site = {.file = "quality/QualityMain.res",
+                 .caller = "quality.QualityMain.res.__file__",
+                 .needle = "open QualityUtils"},
+        .relation = "IMPORTS",
+        .target = {.file = "quality/QualityUtils.res",
+                   .suffix = "quality.QualityUtils.res.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "let twice = (x: int) => x * 2"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "rescript_imports_edge_binding_unproven",
+        .why = "ReScript configuration explicitly includes quality and gives QualityUtils.res its "
+               "module identity, but ReScript open proof is unsupported.",
+        .tried =
+            "Preserved the original unconfigured source pair, added an explicit sources directory "
+            "and a separate module pair, and excluded arbitrary global basename joins."};
+    RQ_Report report;
+    ASSERT_TRUE(pb_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                  sources, sizeof(sources) / sizeof(sources[0]),
+                                  "rescript_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 

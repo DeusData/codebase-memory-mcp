@@ -4318,6 +4318,15 @@ static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
         cbm_is_resolvable_builtin(callee->name, ctx->language)) {
         return true;
     }
+    /* Contextual words such as get/set are legal ECMAScript identifiers in
+     * this grammar-proven invocation role. Retain the raw occurrence; exact
+     * source binding, including shadowing, still decides whether it emits. */
+    if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
+        !ts_node_is_null(callee->expr) &&
+        strcmp(ts_node_type(callee->expr), "identifier") == 0) {
+        return true;
+    }
     /* CSS function names occupy a grammar-proven callable role. Generic keyword
      * vocabulary includes `var`, but that must not erase `var(...)`. */
     return ctx->language == CBM_LANG_CSS && !ts_node_is_null(callee->expr) &&

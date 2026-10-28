@@ -2,6 +2,7 @@
 #include "../helpers.h"
 #include "../lang_specs.h"
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 enum { BINDING_MAX_DEPTH = 512, BINDING_MAX_NODES = 1000000, BINDING_INITIAL_CAP = 32 };
@@ -45,6 +46,7 @@ typedef struct {
     uint32_t scope;
     const binding_pending_declaration_t *pending;
     bool invocation;
+    bool jsx_component;
     bool http_escape, http_factory_escape;
     const char *http_scope, *http_url;
 } binding_site_t;
@@ -81,6 +83,8 @@ struct cbm_resolve_binding_index {
     cbm_resolve_analysis_t analysis;
     bool javascript_module;
     bool python_namespace_closed;
+    bool python_annotation_binding_preserved;
+    bool python_annotation_storage_bound;
     const char **python_escapes;
     size_t python_escape_count, python_escape_capacity;
     bool python_effects_complete;
@@ -152,6 +156,9 @@ static void add_name(cbm_resolve_binding_index_t *index, const char *name, uint3
         fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "binding_name_missing");
         return;
     }
+    if (index->language == CBM_LANG_PYTHON && index->current_scope == 0 &&
+        !strcmp(name, "__annotations__"))
+        index->python_annotation_storage_bound = true;
     binding_name_t *names =
         grow_array(index, index->names, index->name_count, &index->name_capacity, sizeof(*names));
     if (!names) {
@@ -270,6 +277,20 @@ static const char *http_call_url(cbm_resolve_binding_index_t *index, TSNode node
     return cbm_arena_strndup(index->arena, text + 1, length - 2);
 }
 
+/* The extractor's invocation span is the whole opening tag. Only an exact
+ * simple component identifier may use ordinary lexical binding proof;
+ * member, namespace and intrinsic tag syntax needs a separate contract. */
+static bool jsx_component_site(const cbm_resolve_binding_index_t *index, TSNode node) {
+    if (!kind_is(node, "jsx_opening_element") && !kind_is(node, "jsx_self_closing_element"))
+        return false;
+    TSNode name = field(node, "name");
+    if (!kind_is(name, "identifier"))
+        return false;
+    uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+    return end > start && end <= index->source_len && index->source[start] >= 'A' &&
+           index->source[start] <= 'Z';
+}
+
 static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNode node) {
     if (!name || !*name) {
         return;
@@ -281,18 +302,48 @@ static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNod
     }
     index->sites = sites;
     bool ecma = javascript_language(index->language);
+    bool jsx = ecma && jsx_component_site(index, node);
     sites[index->site_count++] = (binding_site_t){
         .name = name,
         .start = ts_node_start_byte(node),
         .end = ts_node_end_byte(node),
         .scope = index->current_scope,
         .pending = index->current_pending,
-        .invocation = invocation_site(node),
+        .invocation = jsx || invocation_site(node),
+        .jsx_component = jsx,
         .http_escape = ecma && http_escape(node, index, false),
         .http_factory_escape = ecma && http_escape(node, index, true),
         .http_scope =
             ecma && kind_is(node, "call_expression") ? http_call_scope(index, node) : NULL,
         .http_url = ecma ? http_call_url(index, node) : NULL};
+}
+
+/* Python's direct-argument carrier retains transparent parentheses. Record
+ * only those exact AST sites, with the identifier's lexical context. A tuple,
+ * invocation result, attribute or other expression cannot borrow its name. */
+static void note_python_argument_wrappers(cbm_resolve_binding_index_t *index, const char *name,
+                                          TSNode identifier) {
+    TSNode value = identifier;
+    TSNode parent = ts_node_parent(value);
+    unsigned wrappers = 0;
+    while (kind_is(parent, "parenthesized_expression") && wrappers < BINDING_MAX_DEPTH) {
+        if (ts_node_named_child_count(parent) != 1 ||
+            !ts_node_eq(ts_node_named_child(parent, 0), value))
+            return;
+        wrappers++;
+        value = parent;
+        parent = ts_node_parent(value);
+    }
+    if (!wrappers || wrappers == BINDING_MAX_DEPTH || !kind_is(parent, "argument_list"))
+        return;
+    TSNode call = ts_node_parent(parent);
+    if (!kind_is(call, "call") || !ts_node_eq(parent, field(call, "arguments")))
+        return;
+    value = identifier;
+    for (unsigned i = 0; i < wrappers; i++) {
+        value = ts_node_parent(value);
+        add_site(index, name, value);
+    }
 }
 
 static bool listed(const char *kind, const char *const *list) {
@@ -333,6 +384,11 @@ static bool supported_node(CBMLanguage language, const char *kind) {
                                          "string_content",
                                          "string_end",
                                          "escape_sequence",
+                                         "escape_interpolation",
+                                         "interpolation",
+                                         "type_conversion",
+                                         "format_specifier",
+                                         "format_expression",
                                          "comment",
                                          "attribute",
                                          "comparison_operator",
@@ -359,6 +415,9 @@ static bool supported_node(CBMLanguage language, const char *kind) {
                                          "break_statement",
                                          "continue_statement",
                                          "while_statement",
+                                         "try_statement",
+                                         "except_clause",
+                                         "finally_clause",
                                          "assert_statement",
                                          "raise_statement",
                                          "yield",
@@ -441,6 +500,28 @@ static bool supported_node(CBMLanguage language, const char *kind) {
     return listed(kind, language == CBM_LANG_PYTHON ? python : lua);
 }
 
+/* Formatting arbitrary values can invoke user-defined __format__, __str__
+ * or __repr__. Only literal builtin values are effect-free here. The normal
+ * tree walk still audits every nested interpolation and format expression;
+ * no subtree is skipped and no identifier gains a type fact by spelling. */
+static bool python_literal_format_value(TSNode node, unsigned depth) {
+    if (ts_node_is_null(node) || depth > 16)
+        return false;
+    const char *kind = ts_node_type(node);
+    if (!strcmp(kind, "integer") || !strcmp(kind, "float") || !strcmp(kind, "true") ||
+        !strcmp(kind, "false") || !strcmp(kind, "none") || !strcmp(kind, "string") ||
+        !strcmp(kind, "concatenated_string"))
+        return true;
+    if (!strcmp(kind, "parenthesized_expression") && ts_node_named_child_count(node) == 1)
+        return python_literal_format_value(ts_node_named_child(node, 0), depth + 1);
+    if (!strcmp(kind, "unary_operator") && ts_node_named_child_count(node) == 1) {
+        TSNode value = ts_node_named_child(node, 0), operation = field(node, "operator");
+        return (kind_is(operation, "+") || kind_is(operation, "-")) &&
+               (kind_is(value, "integer") || kind_is(value, "float"));
+    }
+    return false;
+}
+
 static bool blocks_identifiers(const char *kind) {
     return strstr(kind, "parameter") || strstr(kind, "assignment") || strstr(kind, "pattern") ||
            strcmp(kind, "named_expression") == 0 || strcmp(kind, "for_statement") == 0 ||
@@ -478,12 +559,32 @@ static bool python_target_role(const char *kind, const char *parent, const char 
     return target;
 }
 
-static bool dynamic_name(const char *name) {
-    static const char *const names[] = {"exec",     "eval",    "globals",    "locals",   "vars",
-                                        "setattr",  "delattr", "__import__", "__dict__", "load",
-                                        "loadfile", "dofile",  "loadstring", "setfenv",  "getfenv",
-                                        "debug",    "_ENV",    "_G",         "rawset",   NULL};
-    return listed(name, names);
+/* A no-value annotation has a lexical target but no runtime target read or
+ * write. Only module simple names preserve a preceding runtime binding here;
+ * function locals remain shadowing declarations and class scope stays closed. */
+static bool python_annotation_only(TSNode node) {
+    return kind_is(node, "assignment") && !ts_node_is_null(field(node, "type")) &&
+           ts_node_is_null(field(node, "right"));
+}
+
+static bool python_inert_annotation(TSNode node) {
+    if (kind_is(node, "type") && ts_node_named_child_count(node) == 1)
+        node = ts_node_named_child(node, 0);
+    /* A bare name is a value read. Calls, descriptors, subscriptions and
+     * postponed/deferred expression semantics need separate effect proofs. */
+    return kind_is(node, "identifier");
+}
+
+static bool dynamic_name(CBMLanguage language, const char *name) {
+    static const char *const python[] = {"exec",    "eval",    "globals",    "locals",   "vars",
+                                         "setattr", "delattr", "__import__", "__dict__", NULL};
+    static const char *const lua[] = {"load",    "loadfile", "dofile", "loadstring",
+                                      "setfenv", "getfenv",  "debug",  "_ENV",
+                                      "_G",      "rawset",   NULL};
+    /* Lua environment operations have no special meaning in Python. Keep
+     * Python's existing dynamic mechanisms and the full conservative Lua
+     * barrier; this change does not expand the Lua proof domain. */
+    return listed(name, python) || (language == CBM_LANG_LUA && listed(name, lua));
 }
 
 static bool lua_local_function(TSNode node) {
@@ -1033,10 +1134,71 @@ static bool note_javascript_value(cbm_resolve_binding_index_t *index, TSNode nod
     return true;
 }
 
+/* Only simple runtime parameters acquire local binding domains here. Other
+ * binders and writes retain the existing module-wide veto: this is not a
+ * var/let/closure-write or default-parameter evaluation model. */
+static bool javascript_runtime_function(TSNode node) {
+    const char *kind = ts_node_type(node);
+    return javascript_function_kind(kind) || !strcmp(kind, "function_expression") ||
+           !strcmp(kind, "generator_function") || !strcmp(kind, "arrow_function") ||
+           !strcmp(kind, "method_definition");
+}
+
+static uint32_t javascript_parameter_scope(cbm_resolve_binding_index_t *index, TSNode node,
+                                           uint32_t parent) {
+    const char *owner = parent < index->scope_count ? index->scopes[parent].qualified_name : NULL;
+    const char *qn =
+        owner ? cbm_arena_sprintf(index->arena, "%s.<function@%u>", owner, ts_node_start_byte(node))
+              : NULL;
+    binding_scope_t *scopes = grow_array(index, index->scopes, index->scope_count,
+                                         &index->scope_capacity, sizeof(*scopes));
+    if (!scopes || !qn) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "javascript_parameter_scope_allocation");
+        return parent;
+    }
+    index->scopes = scopes;
+    uint32_t scope = (uint32_t)index->scope_count++;
+    scopes[scope] = (binding_scope_t){qn, parent, false};
+    return scope;
+}
+
+static bool javascript_simple_parameter(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    if (kind_is(parent, "arrow_function"))
+        return ts_node_eq(node, field(parent, "parameter"));
+    if (kind_is(parent, "required_parameter") || kind_is(parent, "optional_parameter")) {
+        TSNode pattern = field(parent, "pattern");
+        if (ts_node_is_null(pattern))
+            pattern = field(parent, "name");
+        if (!ts_node_eq(node, pattern) || !ts_node_is_null(field(parent, "value")))
+            return false;
+        for (uint32_t i = 0; i < ts_node_named_child_count(parent); i++) {
+            TSNode child = ts_node_named_child(parent, i);
+            if (!ts_node_eq(child, node) && !kind_is(child, "type_annotation"))
+                return false;
+        }
+        parent = ts_node_parent(parent);
+    }
+    if (!kind_is(parent, "formal_parameters"))
+        return false;
+    TSNode owner = ts_node_parent(parent);
+    return !ts_node_is_null(owner) && javascript_runtime_function(owner) &&
+           ts_node_eq(parent, field(owner, "parameters"));
+}
+
+static void javascript_global_name(cbm_resolve_binding_index_t *index, const char *name,
+                                   uint32_t at, unsigned flags) {
+    uint32_t scope = index->current_scope;
+    index->current_scope = 0;
+    add_name(index, name, at, flags);
+    index->current_scope = scope;
+}
+
 static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, TSNode node,
                                            const char *parent_kind, const char *field_name,
                                            unsigned depth, binding_walk_t state) {
     const char *kind = ts_node_type(node);
+    index->current_scope = state.scope;
     if (!ts_node_is_named(node)) {
         return state;
     }
@@ -1073,14 +1235,18 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         if (!ts_node_is_null(name)) {
             /* Module function declarations are hoisted, including exported
              * declarations. Other binding forms block same-name references. */
-            add_name(index, node_text(index, name), 0, flags);
+            javascript_global_name(index, node_text(index, name), 0, flags);
         }
     } else if (strcmp(kind, "function_expression") == 0 ||
                strcmp(kind, "generator_function") == 0 || strcmp(kind, "class") == 0) {
         TSNode name = field(node, "name");
         if (!ts_node_is_null(name)) {
-            add_name(index, node_text(index, name), 0, BINDING_BLOCKED);
+            javascript_global_name(index, node_text(index, name), 0, BINDING_BLOCKED);
         }
+    }
+    if (javascript_runtime_function(node)) {
+        state.scope = javascript_parameter_scope(index, node, state.scope);
+        index->current_scope = state.scope;
     }
     if (strcmp(kind, "formal_parameters") == 0 ||
         javascript_binding_child(parent_kind, field_name)) {
@@ -1097,7 +1263,10 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         }
         if (state.blocked && !parent_declaration_name &&
             !note_javascript_value(index, node, state.named_export)) {
-            add_name(index, name, 0, BINDING_BLOCKED);
+            if (state.scope && javascript_simple_parameter(node))
+                add_name(index, name, 0, BINDING_BLOCKED);
+            else
+                javascript_global_name(index, name, 0, BINDING_BLOCKED);
         }
         if (!state.import && !state.blocked && !parent_declaration_name && !declaration_name) {
             add_site(index, name, node);
@@ -1105,6 +1274,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
     }
     if (strcmp(kind, "call_expression") == 0 || strcmp(kind, "new_expression") == 0) {
         note_call(index, node);
+    } else if (jsx_component_site(index, node)) {
+        add_site(index, node_text(index, field(node, "name")), node);
     }
     return state;
 }
@@ -1549,6 +1720,8 @@ static bool supported_rust_node(const char *kind) {
                                          "const_item",
                                          "static_item",
                                          "struct_item",
+                                         "impl_item",
+                                         "declaration_list",
                                          "field_declaration_list",
                                          "field_declaration",
                                          "field_identifier",
@@ -1684,6 +1857,30 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
         fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "unsupported_binding_syntax");
         return state;
     }
+    if (index->language == CBM_LANG_PYTHON && state.scope == 0 && python_annotation_only(node) &&
+        kind_is(field(node, "left"), "identifier")) {
+        index->python_annotation_binding_preserved = true;
+        if (!python_inert_annotation(field(node, "type")))
+            fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                       "python_annotation_effects_unproven");
+        /* Continue the ordinary walk: annotations cannot hide dynamic names,
+         * nested writes or unsupported syntax from the source audit. */
+    }
+    if (index->language == CBM_LANG_PYTHON &&
+        ((!strcmp(kind, "interpolation") || !strcmp(kind, "format_expression")) &&
+         !python_literal_format_value(field(node, "expression"), 0))) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "python_format_value_effects_unproven");
+        return state;
+    }
+    if (index->language == CBM_LANG_PYTHON && !strcmp(kind, "type_conversion")) {
+        const char *conversion = node_text(index, node);
+        if (!conversion ||
+            (strcmp(conversion, "!s") && strcmp(conversion, "!r") && strcmp(conversion, "!a"))) {
+            fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                       "python_format_conversion_unproven");
+            return state;
+        }
+    }
     if (index->language == CBM_LANG_PYTHON && !strcmp(kind, "wildcard_import") &&
         (inherited.scope || inherited.conditional)) {
         fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "conditional_wildcard_import");
@@ -1738,8 +1935,13 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
         (strcmp(parent_kind, "typed_parameter") == 0 ||
          strcmp(parent_kind, "typed_default_parameter") == 0))
         state.blocked = false;
+    bool annotation_target = index->language == CBM_LANG_PYTHON && !strcmp(kind, "identifier") &&
+                             field_name && !strcmp(field_name, "left") &&
+                             python_annotation_only(ts_node_parent(node));
     if (index->language == CBM_LANG_PYTHON) {
-        state.blocked = python_target_role(kind, parent_kind, field_name, state.blocked);
+        state.blocked = annotation_target
+                            ? state.scope != 0
+                            : python_target_role(kind, parent_kind, field_name, state.blocked);
     } else if (blocks_identifiers(kind)) {
         state.blocked = true;
     }
@@ -1749,7 +1951,7 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
             fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "identifier_unavailable");
             return state;
         }
-        if (dynamic_name(name)) {
+        if (dynamic_name(index->language, name)) {
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "dynamic_namespace_effect");
         }
         bool function_name = field_name && strcmp(field_name, "name") == 0 && parent_kind &&
@@ -1758,8 +1960,10 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
         if (state.blocked && !function_name) {
             add_name(index, name, ts_node_start_byte(node), BINDING_BLOCKED);
         }
-        if (!state.import && !function_name) {
+        if (!state.import && !function_name && !annotation_target) {
             add_site(index, name, node);
+            if (index->language == CBM_LANG_PYTHON)
+                note_python_argument_wrappers(index, name, node);
         }
     }
     if (strcmp(kind, "call") == 0 || strcmp(kind, "function_call") == 0) {
@@ -2143,8 +2347,9 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
         index->reason = "binding_source_snapshot_mismatch";
         return index;
     }
+    bool component = language == CBM_LANG_VUE || language == CBM_LANG_SVELTE;
     if (language != CBM_LANG_PYTHON && language != CBM_LANG_LUA && language != CBM_LANG_DART &&
-        language != CBM_LANG_RUST && !javascript_language(language)) {
+        language != CBM_LANG_RUST && !javascript_language(language) && !component) {
         if (language == CBM_LANG_SWIFT)
             index->reason = "swift_build_module_membership_required";
         return index;
@@ -2166,8 +2371,26 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
         }
         tree = owned_tree;
     }
+    uint32_t tree_end = (uint32_t)source_len;
+    if (component && tree) {
+        TSRange range = {0};
+        CBMExtractCtx host = {.arena = arena, .result = (CBMFileResult *)result,
+                              .source = source,
+                              .source_len = source_len <= INT_MAX ? (int)source_len : -1,
+                              .language = language, .module_qn = result->module_qn,
+                              .root = ts_tree_root_node(tree)};
+        TSTree *script = cbm_component_binding_tree(&host, &language, &range);
+        if (owned_tree)
+            ts_tree_delete(owned_tree);
+        tree = owned_tree = script;
+        tree_end = range.end_byte;
+        if (script) {
+            index->language = language;
+            index->javascript_module = true;
+        }
+    }
     if (!tree || ts_node_has_error(ts_tree_root_node(tree)) ||
-        ts_node_end_byte(ts_tree_root_node(tree)) != source_len) {
+        ts_node_end_byte(ts_tree_root_node(tree)) != tree_end) {
         index->reason = "incomplete_binding_tree";
     } else {
         index->analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
@@ -2212,6 +2435,11 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
         if (javascript_language(language))
             audit_javascript_values(index);
     }
+    /* An explicit replacement of annotation storage can invoke user code
+     * even when the annotation itself is a bare name. Do not infer the
+     * builtin mapping contract for a source-defined __annotations__. */
+    if (index->python_annotation_binding_preserved && index->python_annotation_storage_bound)
+        fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "python_annotation_storage_unproven");
     if (index->site_count) {
         qsort(index->sites, index->site_count, sizeof(*index->sites), compare_site);
     }
@@ -2432,28 +2660,6 @@ bool cbm_resolve_binding_http_default(const cbm_resolve_binding_index_t *index, 
     return true;
 }
 
-/* Query the exact AST occurrence. The current ECMAScript lexical auditor is
- * conservative: any local shadow or write blocks that import across the file.
- * Thus a positive cannot be borrowed from a different unshadowed scope. */
-bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *index,
-                                           const CBMCall *call, const char *local_name) {
-    if (!index || !call || !local_name || !call->callee_name || !call->enclosing_func_qn ||
-        !call->first_string_arg || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
-        call->source_origin != CBM_SOURCE_ORIGIN_RAW ||
-        call->site_end_byte <= call->site_start_byte ||
-        !cbm_resolve_binding_import(index, local_name))
-        return false;
-    binding_site_t key = {
-        .name = call->callee_name, .start = call->site_start_byte, .end = call->site_end_byte};
-    const binding_site_t *site =
-        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
-    const binding_name_t *binding = find_name(index, local_name, strlen(local_name));
-    return site && site->invocation && binding && !binding->http_escaped &&
-           site->scope == binding->scope && site->http_scope && site->http_url &&
-           !strcmp(site->http_scope, call->enclosing_func_qn) &&
-           !strcmp(site->http_url, call->first_string_arg) && call->site_start_byte >= binding->at;
-}
-
 static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t *index,
                                                const char *name, size_t length, uint32_t scope,
                                                cbm_resolve_lookup_t *query) {
@@ -2479,6 +2685,42 @@ static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t
         scope = index->scopes[scope].parent;
     }
     return NULL;
+}
+
+/* Query the exact AST occurrence and require its first visible binding to be
+ * the unique module import. Parameter shadows stop lexical lookup; other
+ * binders, writes and escapes retain the conservative module-wide veto. */
+bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *index,
+                                           const CBMCall *call, const char *local_name) {
+    if (!index || !call || !local_name || !call->callee_name || !call->enclosing_func_qn ||
+        !call->first_string_arg || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+        call->source_origin != CBM_SOURCE_ORIGIN_RAW ||
+        call->site_end_byte <= call->site_start_byte ||
+        !cbm_resolve_binding_import(index, local_name))
+        return false;
+    binding_site_t key = {
+        .name = call->callee_name, .start = call->site_start_byte, .end = call->site_end_byte};
+    const binding_site_t *site =
+        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    const binding_name_t *binding = find_name(index, local_name, strlen(local_name));
+    const binding_name_t *visible =
+        site ? find_lexical_name(index, local_name, strlen(local_name), site->scope, NULL) : NULL;
+    return site && site->invocation && binding && visible == binding && !binding->http_escaped &&
+           site->http_scope && site->http_url &&
+           !strcmp(site->http_scope, call->enclosing_func_qn) &&
+           !strcmp(site->http_url, call->first_string_arg) && call->site_start_byte >= binding->at;
+}
+
+bool cbm_resolve_binding_jsx_occurrence(const cbm_resolve_binding_index_t *index, const char *name,
+                                        uint32_t start, uint32_t end, CBMSourceOrigin origin) {
+    if (!index || !name || !*name || !javascript_language(index->language) ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || origin != CBM_SOURCE_ORIGIN_RAW ||
+        !index->sites || !index->site_count || end <= start)
+        return false;
+    binding_site_t key = {.name = name, .start = start, .end = end};
+    const binding_site_t *site =
+        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    return site && site->jsx_component && site->invocation;
 }
 
 cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_index_t *index,

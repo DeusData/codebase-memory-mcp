@@ -92,6 +92,7 @@ static void py_memo_test_stage(PyLSPContext *ctx, const char *stage) {
 }
 
 void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
+    result->lsp_failed = true;
     result->has_error = true;
     result->lsp_skipped = true;
     /* Static lifetime also works when the result arena cannot allocate. */

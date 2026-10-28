@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CBM_STORE_GRAPH_DIGEST_VERSION 1u
+#define CBM_STORE_GRAPH_DIGEST_VERSION 2u
 #define CBM_STORE_GRAPH_DIGEST_BYTES 32u
 
 typedef enum {
@@ -32,9 +32,10 @@ typedef struct {
     uint64_t framed_bytes;
 } cbm_store_graph_digest_t;
 
-/* Borrow a live, exclusive D5 scope. Hash the version-1 canonical stream of
- * all nine known tables, including their exact CREATE SQL and explicit project
- * identity. The database must use UTF-8. No new handler or transaction is used.
+/* Borrow a live, exclusive D5 scope. Hash the version-2 canonical stream of
+ * all seventeen known tables, including resolver diagnostics, evidence, exact
+ * CREATE SQL and explicit project identity. The eight resolver tables must be
+ * all present or all absent; absence is explicitly bound for legacy stores. The database must use UTF-8. No new handler or transaction is used.
  * Independent scopes/connections may run concurrently; no mutable state is
  * shared. The callback/connection restrictions of D5 continue to apply.
  *

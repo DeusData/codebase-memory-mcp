@@ -398,6 +398,8 @@ typedef enum {
     CBM_IMPORT_KIND_PYTHON_MODULE_ROOT,  // `import a.b`: binds root a
     CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS, // `import a.b as x`: binds module a.b
     CBM_IMPORT_KIND_PYTHON_FROM,         // `from a import b`: binds member/submodule b
+    CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH, // audited complete literal, relative to source file
+    CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN, // runtime include lookup has no captured path authority
 } CBMImportKind;
 
 typedef struct {
@@ -409,6 +411,9 @@ typedef struct {
     bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
                              // binds the name for annotations, never at runtime (#1277)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
+    /* Exact syntax coordinates where an adapter captures them. Legacy import
+     * adapters leave zero spans; consumers must opt into a proven adapter. */
+    uint32_t site_start_byte, site_end_byte, source_origin;
 } CBMImport;
 
 /* True when an import binds its local name at runtime. A Python import under
@@ -789,7 +794,12 @@ typedef enum {
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
     CBM_K8S_FACT_ENV,
-    CBM_K8S_FACT_PATCH
+    CBM_K8S_FACT_PATCH,
+    /* Raw declaration/document census and flat Kustomize configuration inputs. */
+    CBM_K8S_FACT_DECLARATION,
+    CBM_K8S_FACT_FILE,
+    CBM_K8S_FACT_CONFIGURATION,
+    CBM_K8S_FACT_MEMBER
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -809,8 +819,11 @@ typedef struct {
     const char *url;      /* DEPLOY (kustomize): the chart repository */
     const char *release;  /* DEPLOY (kustomize): the release name */
     int line;
-    int start_line; /* IMAGE: the container mapping's first line */
-    int end_line;   /* IMAGE: its last line */
+    int start_line;           /* IMAGE: the container mapping's first line */
+    int end_line;             /* IMAGE: its last line */
+    uint32_t site_start_byte; /* exact raw scalar syntax, including quotes */
+    uint32_t site_end_byte;
+    bool proof_supported; /* validated literal syntax and unique mapping keys */
 } CBMK8sFact;
 
 typedef struct {
@@ -879,6 +892,16 @@ typedef struct {
     bool failed;
 } CBMDocLinkArray;
 
+/* Frozen at the extraction-to-resolver handoff. Cross-LSP failures belong
+ * to the later semantic analysis and must not rewrite extraction quality. */
+typedef struct {
+    bool captured;
+    bool has_error;
+    bool parse_unusable;
+    bool parse_incomplete;
+    bool walk_truncated;
+} CBMResolverExtractionState;
+
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -944,6 +967,10 @@ typedef struct CBMFileResult {
      * unified-extractor defs stay). Set by cbm_extract_file_ex, honoured by
      * cbm_pxc_dispatch_file -- one site for every language. */
     bool lsp_skipped;
+    /* Explicit evaluator failure, unlike lsp_skipped's budget-only skips.
+     * has_error remains set so semantic proof consumers still abstain. */
+    bool lsp_failed;
+    CBMResolverExtractionState resolver_extraction_state;
     /* The unified walk stopped at its CPU budget: defs/calls/usages found up
      * to that point are kept, the rest of the file is not walked. Implies
      * lsp_skipped. */
@@ -1418,6 +1445,9 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
+/* Owned inner tree for one fully audited Vue/Svelte inline script. Absolute
+ * source coordinates are preserved; NULL means the host domain is unproved. */
+TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TSRange *range);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);

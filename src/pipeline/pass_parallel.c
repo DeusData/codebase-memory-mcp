@@ -2104,6 +2104,7 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+    const cbm_semantic_bindings_t *structural_bindings;
 
     /* Parsed once on the coordinator thread and borrowed read-only by resolve
      * workers.  The pointer is installed into each worker's TLS slot so Rust's
@@ -3943,6 +3944,12 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             rc->registry, rc->main_gbuf, def->qualified_name, def->base_classes[b], fs->lang);
         if (!bqn) {
             bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
+            if ((fs->lang == CBM_LANG_TYPESCRIPT || fs->lang == CBM_LANG_TSX ||
+                 fs->lang == CBM_LANG_KOTLIN || fs->lang == CBM_LANG_PHP ||
+                 fs->lang == CBM_LANG_CSHARP || fs->lang == CBM_LANG_CPP) &&
+                def->label && !strcmp(def->label, "Class"))
+                bqn = cbm_semantic_class_base(rc->structural_bindings, def, def->base_classes[b],
+                                              bqn ? cbm_gbuf_find_by_qn(rc->main_gbuf, bqn) : NULL);
             if (!bqn || cbm_python_external_base_contradicts(
                             fs->lang, fs->imports, def->base_classes[b], bqn, rc->main_gbuf,
                             rc->project_name, fs->rel)) {
@@ -4054,17 +4061,10 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count, lang);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
-        CBMImplTrait *it = &result->impl_traits.items[t];
-        if (!it->trait_name || !it->struct_name) {
+        const char *tqn = NULL, *sqn = NULL;
+        if (!cbm_semantic_rust_implementation(rc->structural_bindings, rel,
+                                              &result->impl_traits.items[t], &sqn, &tqn))
             continue;
-        }
-        const char *tqn = resolve_as_class(rc->registry, it->trait_name, module_qn, imp_keys,
-                                           imp_vals, imp_count, lang);
-        const char *sqn = resolve_as_class(rc->registry, it->struct_name, module_qn, imp_keys,
-                                           imp_vals, imp_count, lang);
-        if (!tqn || !sqn) {
-            continue;
-        }
         const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(rc->main_gbuf, tqn);
         const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(rc->main_gbuf, sqn);
         if (tn && sn && tn->id != sn->id) {
@@ -4120,11 +4120,12 @@ static int pp_call_reference_site_count(const CBMFileResult *result, CBMLanguage
     return count;
 }
 
-/* Python's legacy local pass can fill every site with a high-confidence name
- * result without running the source proof adapter. Those rows cannot discharge
- * project-registry work: only an immutable proof for this exact occurrence may
- * suppress it. This is a constant-time scheduling check, not edge admission. */
-static bool pp_python_has_source_proof(const CBMResolvedCall *resolved) {
+/* Legacy local passes can fill every site with high-confidence name results
+ * without running source proof adapters. No language may discharge project-
+ * registry work with those rows: only an immutable proof for this exact
+ * occurrence may suppress it. This is a constant-time scheduling check, not
+ * edge admission. */
+static bool pp_has_source_proof(const CBMResolvedCall *resolved) {
     const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(resolved->evidence.proof);
     return proof && proof->kind == CBM_PROOF_OCCURRENCE_BINDING && proof->predecessors_closed &&
            cbm_resolve_admit(&proof->outcome) &&
@@ -4139,15 +4140,14 @@ static bool pp_python_has_source_proof(const CBMResolvedCall *resolved) {
            proof->source.scope && !strcmp(resolved->caller_qn, proof->source.scope);
 }
 
-static int pp_qualified_lsp_site_count(const CBMFileResult *result, CBMLanguage lang) {
+static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
     int count = 0;
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
         if ((resolved->kind == CBM_RESOLVED_INVOCATION ||
              resolved->kind == CBM_RESOLVED_CALL_REFERENCE) &&
             resolved->caller_qn && resolved->callee_qn &&
-            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR &&
-            (lang != CBM_LANG_PYTHON || pp_python_has_source_proof(resolved))) {
+            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR && pp_has_source_proof(resolved)) {
             count++;
         }
     }
@@ -4161,7 +4161,7 @@ static int pp_qualified_lsp_site_count(const CBMFileResult *result, CBMLanguage 
  * for the project-registry pass, even when the parser-backed site count is
  * zero or already fully qualified. Zero-span generated semantics are excluded:
  * without source provenance they cannot safely join a graph carrier. */
-static bool pp_has_pending_lsp_site(const CBMFileResult *result, CBMLanguage lang) {
+static bool pp_has_pending_lsp_site(const CBMFileResult *result) {
     for (int i = 0; i < result->resolved_calls.count; i++) {
         const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
         if (resolved->kind != CBM_RESOLVED_INVOCATION &&
@@ -4173,7 +4173,7 @@ static bool pp_has_pending_lsp_site(const CBMFileResult *result, CBMLanguage lan
             continue;
         }
         if (resolved->reason || resolved->confidence < CBM_LSP_CONFIDENCE_FLOOR ||
-            (lang == CBM_LANG_PYTHON && !pp_python_has_source_proof(resolved))) {
+            !pp_has_source_proof(resolved)) {
             return true;
         }
     }
@@ -4327,8 +4327,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
             (lang == CBM_LANG_RUST && rc->rust_manifest && rc->rust_manifest->member_count > 0);
         int call_reference_sites = pp_call_reference_site_count(result, lang);
         int semantic_sites = result->calls.count + call_reference_sites;
-        int qualified_lsp_sites = pp_qualified_lsp_site_count(result, lang);
-        bool pending_lsp_site = pp_has_pending_lsp_site(result, lang);
+        int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
+        bool pending_lsp_site = pp_has_pending_lsp_site(result);
         bool unowned_c_member = pp_has_unowned_c_member(result, lang, rel);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
@@ -4626,6 +4626,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
 
+    cbm_semantic_bindings_t *structural_bindings =
+        cbm_semantic_bindings_build(ctx, files, file_count, result_cache);
+    if (!structural_bindings) {
+        cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
+        cbm_aligned_free(workers);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+
     bool have_rust = false;
     for (int i = 0; i < file_count; i++) {
         if (files[i].language == CBM_LANG_RUST &&
@@ -4664,6 +4672,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
+        .structural_bindings = structural_bindings,
         .rust_manifest = rust_manifest_ptr,
         .lsp_failures = lsp_failures,
     };
@@ -4690,6 +4699,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                                         "lsp_skipped");
     }
     cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
+    cbm_semantic_bindings_free(structural_bindings);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
      * Free its dedicated arena + the lock (registry was self-contained: it
      * strdup'd all QNs, so freeing all_defs afterward is safe). */

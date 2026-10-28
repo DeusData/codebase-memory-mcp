@@ -13,6 +13,8 @@
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
+#include "resolve/proof.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
@@ -1237,8 +1239,62 @@ static void k8s_apply_effective_namespaces(cbm_pipeline_ctx_t *ctx, k8s_bundles_
 
 /* Candidates examined by the resolvers below (pipeline_internal.h). */
 _Atomic uint64_t g_k8s_candidates = 0;
+/* Count actual graph-buffer proof work, not the deduplicated stored fact count. */
+_Atomic uint64_t g_k8s_proof_clone_work = 0;
 
 /* ── Object references (PHASE1.md) ───────────────────────────────── */
+
+/* Raw configuration domains are independent of graph edges and inferred
+ * directory bundles. Lists preserve every declaration occurrence, including
+ * duplicates coalesced by graph node identity. */
+typedef struct k8s_raw_decl k8s_raw_decl_t;
+typedef struct k8s_raw_file k8s_raw_file_t;
+typedef struct k8s_raw_config k8s_raw_config_t;
+typedef struct k8s_raw_member k8s_raw_member_t;
+struct k8s_raw_decl {
+    int64_t node;
+    const char *identity;
+    const char *name;
+    const char *kind;
+    const char *group;
+    const char *api;
+    const char *ns;
+    const char *key;
+    const cbm_resolve_proof_t *proof;
+    k8s_raw_file_t *file;
+    k8s_raw_decl_t *next;
+    bool supported;
+};
+struct k8s_raw_member {
+    const char *path;
+    const cbm_resolve_proof_t *proof;
+    k8s_raw_config_t *config;
+    k8s_raw_file_t *file;
+    k8s_raw_member_t *next;
+    k8s_raw_member_t *file_next;
+};
+struct k8s_raw_file {
+    const char *path;
+    const cbm_resolve_proof_t *proof;
+    k8s_raw_decl_t *declarations;
+    k8s_raw_member_t *memberships;
+    bool supported;
+};
+struct k8s_raw_config {
+    const char *path;
+    const cbm_resolve_proof_t *proof;
+    const cbm_resolve_proof_t *domain;
+    k8s_raw_member_t *members;
+    k8s_raw_member_t *dependencies; /* exclusion only: raw bases/components paths */
+    CBMHashTable *objects;
+    k8s_raw_config_t *next;
+    bool supported;
+    bool memberships_complete;
+};
+typedef struct {
+    k8s_raw_decl_t *first;
+    size_t count;
+} k8s_raw_bucket_t;
 
 /* A reference fact of a manifest, kept past its file's extraction. */
 typedef struct {
@@ -1251,6 +1307,9 @@ typedef struct {
     char *route;      /* an exposed route "<host><path>" the edge leaves from, NULL = src */
     char *key;        /* CONNECTS_TO: the environment variable addressing the target */
     char *container;  /* CONNECTS_TO: its container, NULL = unnamed */
+    const cbm_resolve_proof_t *site;
+    k8s_raw_decl_t *declaration;
+    bool proof_supported;
 } k8s_ref_t;
 
 /* A CRD and the group/kind it declares. */
@@ -1294,6 +1353,9 @@ typedef struct {
     int line;        /* the image's line */
     int start_line;  /* the container's lines */
     int end_line;
+    const cbm_resolve_proof_t *site;
+    bool proof_supported;
+    k8s_raw_decl_t *declaration;
 } k8s_img_t;
 
 /* A patch a kustomization states (extract_k8s.c PATCH fact): what it names
@@ -1323,6 +1385,12 @@ typedef struct {
 } k8s_kchart_t;
 
 typedef struct {
+    CBMArena proof_arena;
+    cbm_shared_resolver_adapter_t adapter;
+    CBMHashTable *raw_files;
+    CBMHashTable *raw_config_paths;
+    k8s_raw_config_t *raw_configs;
+    bool raw_memberships_unknown;
     k8s_ref_t *refs;
     int ref_n;
     int ref_cap;
@@ -1414,6 +1482,12 @@ static void k8s_facts_free(k8s_facts_t *f) {
     cbm_free(CBM_MEM_CLASS_OTHER, f->refs);
     cbm_free(CBM_MEM_CLASS_OTHER, f->crds);
     cbm_free(CBM_MEM_CLASS_OTHER, f->deploys);
+    for (k8s_raw_config_t *config = f->raw_configs; config; config = config->next)
+        cbm_ht_free(config->objects);
+    cbm_ht_free(f->raw_files);
+    cbm_ht_free(f->raw_config_paths);
+    cbm_shared_resolver_adapter_dispose(&f->adapter);
+    cbm_arena_destroy(&f->proof_arena);
     *f = (k8s_facts_t){0};
 }
 
@@ -1461,14 +1535,233 @@ static bool k8s_norm_dir(const char *in, char *out, size_t out_sz) {
     return true;
 }
 
+/* Capture while the original file buffer is alive. The proof owns spelling
+ * and source identities; project lookup does not retain full file contents. */
+static const cbm_resolve_proof_t *k8s_image_site(k8s_facts_t *facts, const CBMK8sFact *fact,
+                                                 int64_t owner_id,
+                                                 const cbm_resolve_proof_source_t *captured,
+                                                 const char *bytes, size_t length) {
+    if (!captured || fact->site_end_byte <= fact->site_start_byte || fact->site_end_byte > length)
+        return NULL;
+    const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(facts->adapter.ctx->gbuf, owner_id);
+    if (!owner || !owner->qualified_name)
+        return NULL;
+    cbm_resolve_proof_source_t source = *captured;
+    source.scope = owner->qualified_name;
+    const char *spelling = cbm_arena_strndup(&facts->proof_arena, bytes + fact->site_start_byte,
+                                             fact->site_end_byte - fact->site_start_byte);
+    const cbm_resolve_proof_t *site =
+        spelling ? cbm_shared_resolver_adapter_occurrence(&facts->adapter, &source, bytes, length,
+                                                          fact->site_start_byte,
+                                                          fact->site_end_byte, spelling, "USAGE")
+                 : NULL;
+    if (!site)
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    return site;
+}
+
+static void *k8s_raw_alloc(k8s_facts_t *facts, size_t size) {
+    void *value = cbm_arena_alloc(&facts->proof_arena, size);
+    if (value)
+        memset(value, 0, size);
+    else
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    return value;
+}
+
+static const char *k8s_raw_copy(k8s_facts_t *facts, const char *text) {
+    const char *copy = cbm_arena_strdup(&facts->proof_arena, text ? text : "");
+    if (!copy)
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    return copy;
+}
+
+static bool k8s_raw_index(k8s_facts_t *facts, CBMHashTable *index, const char *key, void *value) {
+    if (index && key && value) {
+        cbm_ht_set(index, key, value);
+        if (cbm_ht_get(index, key) == value)
+            return true;
+    }
+    atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    return false;
+}
+
+/* Captured bytes establish the span; decoded identities are separately
+ * audited by extraction. A source fact does not confer binding authority. */
+static const cbm_resolve_proof_t *k8s_raw_input(k8s_facts_t *facts,
+                                                const cbm_resolve_proof_source_t *captured,
+                                                const CBMK8sFact *fact, size_t length,
+                                                const char *scope, const char *identity,
+                                                cbm_resolve_proof_kind_t kind) {
+    if (!captured || !scope || !identity || fact->site_end_byte <= fact->site_start_byte ||
+        fact->site_end_byte > length)
+        return NULL;
+    cbm_resolve_proof_source_t source = *captured;
+    source.scope = scope;
+    cbm_resolve_proof_key_t key = {.lookup_domain = "kubernetes.raw.input",
+                                   .lookup_key = identity,
+                                   .declaration_identity =
+                                       kind == CBM_PROOF_REGISTERED_DECLARATION ? identity : "",
+                                   .detail = "raw_syntax",
+                                   .start_byte = fact->site_start_byte,
+                                   .end_byte = fact->site_end_byte,
+                                   .origin = source.source_origin};
+    cbm_resolve_result_t parsed = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                   .reason = "k8s_captured_raw_syntax"};
+    const cbm_resolve_proof_t *proof =
+        cbm_resolve_proof_leaf(&facts->adapter.proofs, kind, &source, &key, &parsed);
+    if (!proof)
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    return proof;
+}
+
+static k8s_raw_decl_t **k8s_raw_manifest(k8s_facts_t *facts, const CBMFileResult *result,
+                                         const int64_t *nodes,
+                                         const cbm_resolve_proof_source_t *captured,
+                                         size_t length) {
+    if (!captured)
+        return NULL;
+    const cbm_gbuf_node_t *owner = cbm_pipeline_file_node(
+        facts->adapter.ctx->gbuf, facts->adapter.ctx->project_name, captured->file);
+    if (!owner)
+        return NULL;
+    k8s_raw_file_t *file = k8s_raw_alloc(facts, sizeof(*file));
+    k8s_raw_decl_t **declarations = k8s_raw_alloc(
+        facts, (size_t)(result->defs.count ? result->defs.count : 1) * sizeof(*declarations));
+    if (!file || !declarations)
+        return NULL;
+    file->path = k8s_raw_copy(facts, captured->file);
+    if (cbm_ht_get(facts->raw_files, captured->file) ||
+        !k8s_raw_index(facts, facts->raw_files, file->path, file)) {
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+        return NULL;
+    }
+    for (int i = 0; i < result->k8s_facts.count; i++) {
+        const CBMK8sFact *fact = &result->k8s_facts.items[i];
+        if (fact->fact == CBM_K8S_FACT_FILE) {
+            file->proof = k8s_raw_input(facts, captured, fact, length, owner->qualified_name,
+                                        file->path, CBM_PROOF_SOURCE_FACT);
+            file->supported = fact->proof_supported && file->proof;
+        } else if (fact->fact == CBM_K8S_FACT_DECLARATION && fact->def_index >= 0 &&
+                   fact->def_index < result->defs.count) {
+            const cbm_gbuf_node_t *node =
+                cbm_gbuf_find_by_id(facts->adapter.ctx->gbuf, nodes[fact->def_index]);
+            k8s_raw_decl_t *declaration = k8s_raw_alloc(facts, sizeof(*declaration));
+            if (!node || !declaration || !node->qualified_name)
+                continue;
+            declaration->node = node->id;
+            declaration->identity = k8s_raw_copy(facts, node->qualified_name);
+            declaration->name = k8s_raw_copy(facts, fact->name);
+            declaration->kind = k8s_raw_copy(facts, fact->kind);
+            declaration->group = k8s_raw_copy(facts, fact->group);
+            declaration->api = k8s_raw_copy(facts, fact->version);
+            declaration->ns = k8s_raw_copy(facts, fact->ns);
+            if (!declaration->identity || !declaration->name || !declaration->kind ||
+                !declaration->group || !declaration->api || !declaration->ns)
+                continue;
+            declaration->key =
+                cbm_arena_sprintf(&facts->proof_arena, "%s/%s/%s/%s", declaration->group,
+                                  declaration->kind, declaration->ns, declaration->name);
+            if (!declaration->key)
+                atomic_store(&facts->adapter.ctx->resolver_failed, true);
+            declaration->file = file;
+            declaration->proof =
+                k8s_raw_input(facts, captured, fact, length, node->qualified_name,
+                              node->qualified_name, CBM_PROOF_REGISTERED_DECLARATION);
+            declaration->supported = fact->proof_supported && declaration->proof &&
+                                     declaration->key && node->label &&
+                                     !strcmp(node->label, "Resource") && node->file_path &&
+                                     !strcmp(node->file_path, captured->file);
+            declaration->next = file->declarations;
+            file->declarations = declaration;
+            declarations[fact->def_index] = declaration;
+        }
+    }
+    return declarations;
+}
+
+/* Paths are exact repository-local file paths, relative to the configuration.
+ * The normalized path is only an index key; existence never proves membership. */
+static const char *k8s_raw_member_path(k8s_facts_t *facts, const char *config, const char *path) {
+    if (!path || !path[0] || path[0] == '/' || strpbrk(path, "\\:$*?<>\r\n\t") ||
+        strstr(path, "{{"))
+        return NULL;
+    const char *slash = strrchr(config, '/');
+    size_t directory = slash ? (size_t)(slash - config + 1) : 0;
+    if (directory + strlen(path) >= CBM_SZ_2K)
+        return NULL;
+    char joined[CBM_SZ_2K], normalized[CBM_SZ_2K];
+    snprintf(joined, sizeof(joined), "%.*s%s", (int)directory, config, path);
+    return k8s_norm_dir(joined, normalized, sizeof(normalized)) && normalized[0]
+               ? k8s_raw_copy(facts, normalized)
+               : NULL;
+}
+
+static void k8s_raw_configuration(k8s_facts_t *facts, const char *path, CBMLanguage language,
+                                  const CBMFileResult *result, const char *bytes, size_t length) {
+    if (!result) {
+        facts->raw_memberships_unknown = true;
+        return;
+    }
+    cbm_resolve_proof_source_t captured = {0};
+    if (!cbm_shared_resolver_adapter_capture(&facts->adapter, path, language, bytes, length,
+                                             &captured))
+        return;
+    const cbm_gbuf_node_t *owner =
+        cbm_pipeline_file_node(facts->adapter.ctx->gbuf, facts->adapter.ctx->project_name, path);
+    k8s_raw_config_t *config = k8s_raw_alloc(facts, sizeof(*config));
+    if (!owner || !config)
+        return;
+    config->path = k8s_raw_copy(facts, path);
+    config->next = facts->raw_configs;
+    facts->raw_configs = config;
+    if (!k8s_raw_index(facts, facts->raw_config_paths, config->path, config))
+        return;
+    for (int i = 0; i < result->k8s_facts.count; i++) {
+        const CBMK8sFact *fact = &result->k8s_facts.items[i];
+        if (fact->fact == CBM_K8S_FACT_CONFIGURATION) {
+            config->proof = k8s_raw_input(facts, &captured, fact, length, owner->qualified_name,
+                                          path, CBM_PROOF_SOURCE_FACT);
+            config->supported = fact->proof_supported && config->proof;
+            config->memberships_complete =
+                fact->via && !strcmp(fact->via, "resource_membership_complete");
+        } else if (fact->fact == CBM_K8S_FACT_MEMBER) {
+            k8s_raw_member_t *member = k8s_raw_alloc(facts, sizeof(*member));
+            if (!member)
+                continue;
+            member->config = config;
+            member->path = k8s_raw_member_path(facts, path, fact->name);
+            member->proof = k8s_raw_input(facts, &captured, fact, length, owner->qualified_name,
+                                          fact->name ? fact->name : "", CBM_PROOF_SOURCE_FACT);
+            member->next = config->members;
+            config->members = member;
+        }
+    }
+    /* Negative evidence only: any config used as a nested resource, base,
+     * component or patch is outside this raw-build adapter's closed domain. */
+    for (int i = 0; i < result->imports.count; i++) {
+        k8s_raw_member_t *dependency = k8s_raw_alloc(facts, sizeof(*dependency));
+        if (!dependency)
+            continue;
+        dependency->path = k8s_raw_member_path(facts, path, result->imports.items[i].module_path);
+        dependency->next = config->dependencies;
+        config->dependencies = dependency;
+    }
+}
+
 /* Keep a file's facts, its def indices mapped to the Resource nodes. */
-static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64_t *node_of) {
+static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64_t *node_of,
+                           const cbm_resolve_proof_source_t *captured, const char *bytes,
+                           size_t length) {
+    k8s_raw_decl_t **declarations = k8s_raw_manifest(f, res, node_of, captured, length);
     for (int i = 0; i < res->k8s_facts.count; i++) {
         const CBMK8sFact *x = &res->k8s_facts.items[i];
         if (x->def_index < 0 || x->def_index >= res->defs.count || node_of[x->def_index] <= 0) {
             continue;
         }
         int64_t node = node_of[x->def_index];
+        if (x->fact == CBM_K8S_FACT_DECLARATION)
+            continue;
         if (x->fact == CBM_K8S_FACT_DEPLOY && x->via && strcmp(x->via, "helmrelease") == 0) {
             if (x->name && k8s_grow((void **)&f->hrs, &f->hr_cap, f->hr_n, sizeof(*f->hrs))) {
                 f->hrs[f->hr_n++] =
@@ -1496,7 +1789,10 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
                     x->container ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->container) : NULL,
                     x->line,
                     x->start_line,
-                    x->end_line};
+                    x->end_line,
+                    k8s_image_site(f, x, node, captured, bytes, length),
+                    x->proof_supported,
+                    declarations ? declarations[x->def_index] : NULL};
             }
         } else if (x->fact == CBM_K8S_FACT_ENV) {
             if (x->name && k8s_grow((void **)&f->envs, &f->env_cap, f->env_n, sizeof(*f->envs))) {
@@ -1520,6 +1816,11 @@ static void k8s_facts_keep(k8s_facts_t *f, const CBMFileResult *res, const int64
                             .name = x->name ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->name) : NULL,
                             .via = x->via,
                             .edge = x->edge,
+                            .site = x->edge && !strcmp(x->edge, "USAGE")
+                                        ? k8s_image_site(f, x, node, captured, bytes, length)
+                                        : NULL,
+                            .declaration = declarations ? declarations[x->def_index] : NULL,
+                            .proof_supported = x->proof_supported,
                             .route = route ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->route) : NULL,
                             .key = x->key ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, x->key) : NULL,
                             .container = x->key && x->container
@@ -2048,6 +2349,289 @@ static int64_t k8s_route_node(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *sr
     return id;
 }
 
+/* Build each explicit deployment's table once. No IMPORTS edge, directory
+ * proximity, own-file preference or materialized-node deduplication enters
+ * this index. Work is proportional to authored configuration memberships. */
+static bool k8s_raw_mark_nested(k8s_facts_t *facts, const char *member) {
+    static const char *const names[] = {"kustomization.yaml", "kustomization.yml", "Kustomization"};
+    if (!member)
+        return false;
+    bool found = false;
+    k8s_raw_config_t *nested = cbm_ht_get(facts->raw_config_paths, member);
+    if (nested) {
+        nested->supported = false;
+        found = true;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[CBM_SZ_2K];
+        int length = snprintf(path, sizeof(path), "%s/%s", member, names[i]);
+        if (length > 0 && (size_t)length < sizeof(path)) {
+            nested = cbm_ht_get(facts->raw_config_paths, path);
+            if (nested) {
+                nested->supported = false;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+/* All configurations are negative lookup inputs: an omitted alias/list/key
+ * could hide another deployment of any source file. Unknown membership must
+ * therefore disable raw object admission project-wide, while images remain
+ * independent of deployment membership. Literal nested builds are rejected
+ * locally only when every nested configuration's membership is enumerable. */
+static const cbm_resolve_proof_t *k8s_raw_scope_census(k8s_facts_t *facts) {
+    size_t count = 0;
+    bool complete = !facts->raw_memberships_unknown;
+    for (k8s_raw_config_t *config = facts->raw_configs; config; config = config->next) {
+        count++;
+        complete &= config->memberships_complete && config->proof;
+        for (k8s_raw_member_t *dep = config->dependencies; dep; dep = dep->next)
+            (void)k8s_raw_mark_nested(facts, dep->path);
+        for (k8s_raw_member_t *member = config->members; member; member = member->next) {
+            bool nested = k8s_raw_mark_nested(facts, member->path);
+            complete &= member->path && member->proof &&
+                        (nested || cbm_ht_get(facts->raw_files, member->path));
+        }
+    }
+    if (!complete || !count)
+        return NULL;
+    const cbm_resolve_proof_t **inputs = k8s_raw_alloc(facts, (count + 1) * sizeof(*inputs));
+    if (!inputs)
+        return NULL;
+    const cbm_resolve_proof_view_t *first = cbm_resolve_proof_view(facts->raw_configs->proof);
+    cbm_resolve_proof_key_t key = first->key;
+    key.lookup_domain = "kubernetes.all.configuration.memberships";
+    key.lookup_closed = true;
+    cbm_resolve_result_t outcome = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                    .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+                                    .reason = "k8s_all_configuration_memberships_enumerated"};
+    inputs[0] = cbm_resolve_proof_leaf(&facts->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN,
+                                       &first->source, &key, &outcome);
+    size_t index = 1;
+    for (k8s_raw_config_t *config = facts->raw_configs; config; config = config->next)
+        inputs[index++] = config->proof;
+    const cbm_resolve_proof_t *census =
+        inputs[0] ? cbm_resolve_proof_derive(&facts->adapter.proofs, CBM_PROOF_NAMED_JOIN,
+                                             &first->source, &key, &outcome, inputs, index, true)
+                  : NULL;
+    if (!census)
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    return census;
+}
+
+static void k8s_raw_domains(k8s_facts_t *facts) {
+    const cbm_resolve_proof_t *census = k8s_raw_scope_census(facts);
+    for (k8s_raw_config_t *config = facts->raw_configs; config; config = config->next) {
+        config->supported &= census != NULL;
+        config->objects = cbm_ht_create(0);
+        CBMHashTable *paths = cbm_ht_create(0);
+        if (!config->objects || !paths) {
+            cbm_ht_free(paths);
+            atomic_store(&facts->adapter.ctx->resolver_failed, true);
+            return;
+        }
+        size_t input_count = 2;
+        for (k8s_raw_member_t *member = config->members; member; member = member->next) {
+            input_count += 2;
+            member->file = member->path ? cbm_ht_get(facts->raw_files, member->path) : NULL;
+            bool duplicate = member->path && cbm_ht_get(paths, member->path);
+            if (!member->path || !member->proof || !member->file || duplicate) {
+                config->supported = false;
+                continue;
+            }
+            if (!k8s_raw_index(facts, paths, member->path, member))
+                config->supported = false;
+            k8s_raw_file_t *file = member->file;
+            member->file_next = file->memberships;
+            file->memberships = member;
+            config->supported &= file->supported;
+            for (k8s_raw_decl_t *decl = file->declarations; decl; decl = decl->next) {
+                config->supported &= decl->supported;
+                if (!decl->key)
+                    continue;
+                k8s_raw_bucket_t *bucket = cbm_ht_get(config->objects, decl->key);
+                if (!bucket) {
+                    bucket = k8s_raw_alloc(facts, sizeof(*bucket));
+                    if (!bucket || !k8s_raw_index(facts, config->objects, decl->key, bucket))
+                        continue;
+                    bucket->first = decl;
+                }
+                bucket->count++;
+            }
+        }
+        cbm_ht_free(paths);
+        if (!config->supported || !config->proof)
+            continue;
+        const cbm_resolve_proof_t **inputs = k8s_raw_alloc(facts, input_count * sizeof(*inputs));
+        if (!inputs)
+            continue;
+        size_t count = 0;
+        inputs[count++] = config->proof;
+        inputs[count++] = census;
+        for (k8s_raw_member_t *member = config->members; member; member = member->next) {
+            inputs[count++] = member->proof;
+            inputs[count++] = member->file->proof;
+        }
+        const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(config->proof);
+        cbm_resolve_proof_key_t key = view->key;
+        key.lookup_domain = config->path;
+        key.lookup_closed = true;
+        cbm_resolve_result_t outcome = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                        .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+                                        .reason = "k8s_flat_resource_list_complete"};
+        const cbm_resolve_proof_t *rule = cbm_resolve_proof_leaf(
+            &facts->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN, &view->source, &key, &outcome);
+        const cbm_resolve_proof_t *members =
+            count == 1
+                ? inputs[0]
+                : cbm_resolve_proof_derive(&facts->adapter.proofs, CBM_PROOF_NAMED_JOIN,
+                                           &view->source, &key, &outcome, inputs, count, true);
+        const cbm_resolve_proof_t *premises[] = {rule, members};
+        config->domain =
+            rule && members
+                ? cbm_resolve_proof_derive(&facts->adapter.proofs, CBM_PROOF_NAMED_JOIN,
+                                           &view->source, &key, &outcome, premises, 2, true)
+                : NULL;
+        if (!config->domain)
+            atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    }
+}
+
+static bool k8s_raw_target_kind(const char *kind) {
+    return kind && (!strcmp(kind, "Secret") || !strcmp(kind, "ConfigMap") ||
+                    !strcmp(kind, "ServiceAccount") || !strcmp(kind, "PersistentVolumeClaim"));
+}
+
+/* Only built-in PodSpec owners and core ServiceAccount have a closed schema
+ * in this adapter. A custom resource merely named Pod/Deployment is not one. */
+static bool k8s_raw_source_kind(const k8s_raw_decl_t *owner) {
+    if (!owner || !owner->group || !owner->kind || !owner->api)
+        return false;
+    if (!strcmp(owner->group, "core") && !strcmp(owner->api, "v1"))
+        return !strcmp(owner->kind, "Pod") || !strcmp(owner->kind, "ServiceAccount") ||
+               !strcmp(owner->kind, "ReplicationController");
+    if (!strcmp(owner->group, "apps") && !strcmp(owner->api, "apps/v1"))
+        return !strcmp(owner->kind, "Deployment") || !strcmp(owner->kind, "StatefulSet") ||
+               !strcmp(owner->kind, "DaemonSet") || !strcmp(owner->kind, "ReplicaSet");
+    return !strcmp(owner->group, "batch") && !strcmp(owner->api, "batch/v1") &&
+           (!strcmp(owner->kind, "Job") || !strcmp(owner->kind, "CronJob"));
+}
+
+static bool k8s_raw_reference(k8s_facts_t *facts, const k8s_ref_t *reference) {
+    if (!reference->site)
+        return true; /* no fabricated occurrence for rendered templates */
+    const cbm_resolve_proof_view_t *site = cbm_resolve_proof_view(reference->site);
+    k8s_raw_decl_t *owner = reference->declaration;
+    bool supported = reference->proof_supported && owner && owner->supported &&
+                     owner->file->supported && k8s_raw_source_kind(owner) &&
+                     k8s_raw_target_kind(reference->kind);
+    const char *ns = reference->ns ? reference->ns : owner ? owner->ns : "";
+    const char *identity = cbm_arena_sprintf(&facts->proof_arena, "core/%s/%s/%s",
+                                             reference->kind ? reference->kind : "", ns,
+                                             reference->name ? reference->name : "");
+    if (!identity)
+        return false;
+    size_t scope_count = 0;
+    for (k8s_raw_member_t *member = owner ? owner->file->memberships : NULL; member;
+         member = member->file_next)
+        scope_count++;
+    supported &= scope_count > 0;
+    const cbm_resolve_proof_t **inputs = k8s_raw_alloc(facts, (scope_count + 3) * sizeof(*inputs));
+    if (!inputs)
+        return false;
+    size_t count = 0, candidates = 0;
+    k8s_raw_decl_t *target = NULL;
+    bool missing = false, ambiguous = false;
+    if (owner && owner->proof)
+        inputs[count++] = owner->proof;
+    for (k8s_raw_member_t *member = owner ? owner->file->memberships : NULL; member;
+         member = member->file_next) {
+        k8s_raw_config_t *config = member->config;
+        if (!config->supported || !config->domain) {
+            supported = false;
+            continue;
+        }
+        inputs[count++] = config->domain;
+        k8s_raw_bucket_t *source = cbm_ht_get(config->objects, owner->key);
+        k8s_raw_bucket_t *bucket = cbm_ht_get(config->objects, identity);
+        supported &= source && source->count == 1 && source->first == owner;
+        size_t local = bucket ? bucket->count : 0;
+        atomic_fetch_add_explicit(&g_k8s_candidates, local, memory_order_relaxed);
+        candidates = local > candidates ? local : candidates;
+        missing |= local == 0;
+        ambiguous |= local > 1;
+        if (local == 1) {
+            if (target && target != bucket->first) {
+                ambiguous = true;
+                candidates = candidates > 2 ? candidates : 2;
+            }
+            target = bucket->first;
+        }
+    }
+    bool exact = supported && target && !missing && !ambiguous;
+    cbm_resolve_result_t outcome = {
+        .binding = exact                    ? CBM_RESOLVE_BINDING_UNIQUE
+                   : supported && ambiguous ? CBM_RESOLVE_BINDING_AMBIGUOUS
+                                            : CBM_RESOLVE_BINDING_UNRESOLVED,
+        .domain = scope_count ? CBM_RESOLVE_DOMAIN_PROJECT : CBM_RESOLVE_DOMAIN_UNKNOWN,
+        .analysis = supported ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+        .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+        .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                             CBM_RESOLVE_FACT_LANGUAGE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT
+                       : 0,
+        .target = exact ? target->identity : "",
+        .candidate_count = (uint32_t)(exact ? 1 : candidates),
+        .reason = exact        ? "k8s_explicit_flat_build_unique_object"
+                  : !supported ? "k8s_object_domain_unsupported"
+                  : ambiguous  ? "k8s_object_declarations_ambiguous"
+                               : "k8s_object_not_found"};
+    cbm_resolve_proof_key_t key = site->key;
+    key.lookup_domain = "kubernetes.explicit.flat.resource.builds";
+    key.binding_identity = outcome.target;
+    key.declaration_identity = outcome.target;
+    key.type_identity = identity;
+    key.lookup_closed = supported;
+    const cbm_resolve_proof_t *rule = cbm_resolve_proof_leaf(
+        &facts->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN, &site->source, &key, &outcome);
+    if (!rule)
+        return false;
+    inputs[count++] = rule;
+    if (exact)
+        inputs[count++] = target->proof;
+    const cbm_resolve_proof_t *semantic =
+        count == 1 ? rule
+                   : cbm_resolve_proof_derive(&facts->adapter.proofs, CBM_PROOF_NAMED_JOIN,
+                                              &site->source, &key, &outcome, inputs, count, true);
+    char properties[CBM_SZ_1K];
+    snprintf(properties, sizeof(properties), "{\"ref\":\"%s\"}", reference->via);
+    return semantic && cbm_shared_resolver_adapter_record_proofs(
+                           &facts->adapter, reference->site, reference->src,
+                           exact ? target->node : 0, properties, semantic);
+}
+
+static void k8s_raw_resolve(k8s_facts_t *facts) {
+    cbm_gbuf_t *gbuf = facts->adapter.ctx->gbuf;
+    uint64_t before = cbm_gbuf_resolution_proof_work(gbuf);
+    /* Every domain shares the all-configuration census. Retain one clone memo
+     * across the batch while all source proofs remain in facts->proof_arena. */
+    if (!cbm_gbuf_resolution_begin(gbuf)) {
+        atomic_store(&facts->adapter.ctx->resolver_failed, true);
+        return;
+    }
+    k8s_raw_domains(facts);
+    for (int i = 0; i < facts->ref_n; i++) {
+        const k8s_ref_t *reference = &facts->refs[i];
+        if (reference->edge && !strcmp(reference->edge, "USAGE") &&
+            !k8s_raw_reference(facts, reference))
+            atomic_store(&facts->adapter.ctx->resolver_failed, true);
+    }
+    cbm_gbuf_resolution_end(gbuf); /* before facts->proof_arena can be destroyed */
+    atomic_fetch_add_explicit(&g_k8s_proof_clone_work,
+                              cbm_gbuf_resolution_proof_work(gbuf) - before, memory_order_relaxed);
+}
+
 /* Draw every reference to the object(s) it names inside its bundle;
  * an unresolved reference draws nothing. An exposed route's reference
  * leaves from its Route node. */
@@ -2060,6 +2644,8 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
     int cand_cap = 0;
     for (int i = 0; ix && i < f->ref_n; i++) {
         const k8s_ref_t *ref = &f->refs[i];
+        if (ref->edge && !strcmp(ref->edge, "USAGE"))
+            continue; /* controlled relation: only k8s_raw_resolve may publish it */
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, ref->src);
         int64_t from = src ? src->id : 0;
         if (ref->route) {
@@ -2454,7 +3040,8 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
  * recorded in `recs` for cross-manifest selector matching. */
 static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, const char *source,
                                 const CBMFileResult *res, k8s_record_array_t *recs,
-                                k8s_facts_t *facts) {
+                                k8s_facts_t *facts, CBMLanguage language, bool transformed,
+                                size_t source_length) {
     int resource_count = 0;
 
     if (!res) {
@@ -2509,7 +3096,11 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
         resource_count++;
     }
     if (node_of) {
-        k8s_facts_keep(facts, res, node_of);
+        cbm_resolve_proof_source_t captured = {0};
+        bool raw =
+            !transformed && cbm_shared_resolver_adapter_capture(&facts->adapter, rel_path, language,
+                                                                source, source_length, &captured);
+        k8s_facts_keep(facts, res, node_of, raw ? &captured : NULL, source, source_length);
         cbm_free(CBM_MEM_CLASS_OTHER, node_of);
     }
 
@@ -3099,6 +3690,7 @@ typedef struct {
     k8s_kind_t kind;
     char *source; /* DEP, HELM, MANIFEST */
     int src_len;
+    bool transformed;   /* skeleton coordinates cannot claim raw occurrence identity */
     CBMFileResult *res; /* MANIFEST */
 } k8s_prep_t;
 
@@ -3285,6 +3877,7 @@ static void k8s_prep_file(const k8s_prep_job_t *job, int i, k8s_prep_t *out) {
              * pass and contain no "Resource" definitions. */
             out->kind = K8S_MANIFEST;
             if (strstr(out->source, "{{")) {
+                out->transformed = true;
                 int sk_len = 0;
                 char *sk = k8s_skeleton(out->source, out->src_len, &sk_len);
                 if (sk) {
@@ -5207,16 +5800,50 @@ static void k8s_link_kcharts(k8s_dep_link_t *l, k8s_bundles_t *b, const k8s_fact
     }
 }
 
+/* An image literal denotes the canonical repository Image abstraction.
+ * No build-tag pattern or component proximity participates in this proof. */
+static bool k8s_image_record(k8s_facts_t *facts, const k8s_img_t *image, int64_t target_id,
+                             const char *properties) {
+    if (!image->site)
+        return true; /* transformed-source mapping remains an explicit quality gap */
+    const cbm_resolve_proof_view_t *site = cbm_resolve_proof_view(image->site);
+    const cbm_gbuf_node_t *target =
+        target_id > 0 ? cbm_gbuf_find_by_id(facts->adapter.ctx->gbuf, target_id) : NULL;
+    bool exact = image->proof_supported && image->declaration && image->declaration->supported &&
+                 k8s_raw_source_kind(image->declaration) && target && target->label &&
+                 !strcmp(target->label, "Image") && image->image &&
+                 strlen(image->image) < CBM_SZ_256 && cbm_image_ref_valid(image->image);
+    cbm_resolve_result_t outcome = {
+        .binding = exact ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        .domain = exact ? CBM_RESOLVE_DOMAIN_PROJECT : CBM_RESOLVE_DOMAIN_UNKNOWN,
+        .analysis = exact ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+        .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+        .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                             CBM_RESOLVE_FACT_LANGUAGE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT
+                       : 0,
+        .target = exact ? target->qualified_name : "",
+        .candidate_count = exact ? 1 : 0,
+        .reason = exact ? "k8s_literal_repository_image" : "k8s_image_syntax_unsupported"};
+    cbm_resolve_proof_key_t key = site->key;
+    key.lookup_domain = "kubernetes.container.image.repository";
+    key.binding_identity = outcome.target;
+    key.declaration_identity = outcome.target;
+    key.type_identity = image->image;
+    key.lookup_closed = exact;
+    const cbm_resolve_proof_t *semantic = cbm_resolve_proof_leaf(
+        &facts->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN, &site->source, &key, &outcome);
+    return semantic &&
+           cbm_shared_resolver_adapter_record_proofs(&facts->adapter, image->site, image->node,
+                                                     exact ? target_id : 0, properties, semantic);
+}
+
 /* A container image an object runs: USAGE {ref:image, container} to its
  * Image node -- the node a Dockerfile building or building on that image
  * joins; the container names whose environment runs it. */
-static void k8s_link_images(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
+static void k8s_link_images(cbm_pipeline_ctx_t *ctx, k8s_facts_t *f) {
     for (int i = 0; i < f->img_n; i++) {
         const k8s_img_t *im = &f->imgs[i];
         int64_t img = cbm_pipeline_image_node(ctx, im->image);
-        if (img <= 0) {
-            continue;
-        }
         char esc[CBM_SZ_1K];
         cbm_json_escape(esc, (int)sizeof(esc), im->image);
         char cesc[CBM_SZ_512];
@@ -5224,7 +5851,8 @@ static void k8s_link_images(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f) {
         char props[CBM_SZ_2K];
         snprintf(props, sizeof(props), "{\"ref\":\"image\",\"image\":\"%s\",\"container\":\"%s\"}",
                  esc, cesc);
-        cbm_gbuf_insert_edge(ctx->gbuf, im->node, img, "USAGE", props);
+        if (!k8s_image_record(f, im, img, props))
+            atomic_store(&ctx->resolver_failed, true);
     }
 }
 
@@ -5911,9 +6539,19 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_kusts_t kusts = {0};
     k8s_bundles_t bundles = {.charts = cbm_ht_create(0)};
     k8s_facts_t facts = {0};
+    cbm_arena_init(&facts.proof_arena);
+    facts.raw_files = cbm_ht_create(0);
+    facts.raw_config_paths = cbm_ht_create(0);
+    if (!facts.raw_files || !facts.raw_config_paths ||
+        !cbm_shared_resolver_adapter_init(&facts.adapter, ctx, &facts.proof_arena)) {
+        k8s_facts_free(&facts);
+        k8s_bundles_free(&bundles);
+        return CBM_NOT_FOUND;
+    }
 
     k8s_prep_t *prep = cbm_calloc(CBM_MEM_CLASS_OTHER, K8S_CHUNK * sizeof(*prep));
     if (!prep) {
+        k8s_facts_free(&facts);
         k8s_bundles_free(&bundles);
         return CBM_NOT_FOUND;
     }
@@ -5965,11 +6603,14 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     break;
                 }
                 case K8S_KUSTOMIZE:
+                    k8s_raw_configuration(&facts, rel, files[i].language, p->res, p->source,
+                                          (size_t)p->src_len);
                     k8s_kusts_push(&kusts, rel, p->source);
                     k8s_kustomize_keep(&facts, rel, p->res);
                     break;
                 case K8S_MANIFEST:
-                    handle_k8s_manifest(ctx, rel, p->source, p->res, &recs, &facts);
+                    handle_k8s_manifest(ctx, rel, p->source, p->res, &recs, &facts,
+                                        files[i].language, p->transformed, (size_t)p->src_len);
                     manifest_count++;
                     break;
                 case K8S_SKIP:
@@ -6004,6 +6645,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_deploys_build(ctx, &kusts, &bundles, &facts);
     k8s_apply_effective_namespaces(ctx, &bundles);
     k8s_link_selectors(ctx, &recs, &bundles);
+    k8s_raw_resolve(&facts);
     k8s_resolve_refs(ctx, &bundles, &facts);
     k8s_link_crds(ctx, &bundles, &facts);
     k8s_link_deploys(ctx, &kusts, &bundles, &facts);

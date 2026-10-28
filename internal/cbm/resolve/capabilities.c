@@ -38,6 +38,12 @@ static const edge_row_t edge_rows[] = {
      "Exact relative modules and configured package roots; runtime module paths abstain."},
     {CBM_LANG_ARKTS, SOURCE_EDGES,
      "Source JavaScript-style imports only; containing-language typed dispatch is unsupported."},
+    {CBM_LANG_VUE, CALLABLE_EDGES,
+     "One inline script with audited lexical bindings and an inert template; multiple script "
+     "contexts, template effects and external script sources abstain."},
+    {CBM_LANG_SVELTE, CALLABLE_EDGES,
+     "One inline script with audited lexical bindings; only static markup and bare-identifier "
+     "event references are supported. Multiple contexts and template effects abstain."},
     {CBM_LANG_PYTHON, SOURCE_EDGES | EDGE(USES_TYPE),
      "Static project imports and bounded reexports; dynamic imports and unknown package roots "
      "abstain."},
@@ -54,8 +60,23 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
      "Direct URI imports with prefix and show/hide bindings; parts and reexports are unsupported."},
     {CBM_LANG_LUA, EDGE(CALLS), NULL},
+    {CBM_LANG_CSS, EDGE(IMPORTS),
+     "Top-level quoted literal imports before style rules, relative to the source stylesheet; "
+     "URL functions, escaping, layer ordering and remote paths abstain."},
+    {CBM_LANG_BICEP, EDGE(IMPORTS),
+     "Complete literal local module paths relative to the declaring file; interpolation, "
+     "registries and template specifications abstain."},
+    {CBM_LANG_CAPNP, EDGE(IMPORTS),
+     "Complete literal relative import paths; absolute search paths, escaped and concatenated "
+     "strings abstain."},
     {CBM_LANG_SCALA, EDGE(IMPORTS),
      "Exact declared namespace members only; no semantic binding proof bridge advertised."},
+    {CBM_LANG_HCL, EDGE(IMPORTS) | EDGE(USAGE),
+     "Terraform/OpenTofu literal local module sources and Terragrunt literal paths with audited "
+     "parent-directory evaluation; remote, dynamic and ambiguous inputs abstain."},
+    {CBM_LANG_YAML, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
+     "Ansible literal task/playbook paths and repository role paths only; dynamic directives "
+     "and unsupported YAML values abstain."},
     {CBM_LANG_KUSTOMIZE, EDGE(IMPORTS),
      "Literal relative resource paths only; transformed or generated resources are unsupported."},
 };
@@ -108,6 +129,22 @@ static void edge_capabilities(cbm_resolve_capabilities_t *out) {
         out->edges[CBM_RESOLVE_EDGE_READS].limitation = fields;
         out->edges[CBM_RESOLVE_EDGE_WRITES].limitation = fields;
     }
+    if (out->language == CBM_LANG_HCL)
+        out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
+            "Terraform/OpenTofu exact declarations within a module directory and declared outputs "
+            "of a literal local module source; duplicate declarations and unsupported inputs "
+            "abstain.";
+    if (out->language == CBM_LANG_YAML) {
+        out->edges[CBM_RESOLVE_EDGE_CALLS].limitation =
+            "Ansible exact handlers in the current play or default role handlers/main.yml or "
+            "handlers/main.yaml, and literal listener-topic membership; duplicate named handlers "
+            "and dynamic names abstain.";
+        out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
+            "Kubernetes raw literal image repositories and core Secret, ConfigMap, ServiceAccount "
+            "and PersistentVolumeClaim references in explicit flat Kustomize resource lists; exact "
+            "namespaces and unique raw declarations are required. Aliases, duplicate keys, nested "
+            "builds and transformed manifests abstain.";
+    }
     if (out->language == CBM_LANG_GO)
         out->edges[CBM_RESOLVE_EDGE_WRITES].limitation =
             "No admitted Go field/write bridge; assignment extraction remains a resolver quality "
@@ -131,6 +168,18 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->syntax_writes = syntax(spec->assignment_node_types);
     }
     switch (language) {
+    case CBM_LANG_HCL:
+        out->adapter = "hcl_infrastructure";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "Audited Terraform and Terragrunt occurrences only; dynamic evaluation "
+                          "and unsupported or ambiguous declarations abstain.";
+        break;
+    case CBM_LANG_YAML:
+        out->adapter = "yaml_infrastructure";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "Audited infrastructure occurrences only; dynamic values and "
+                          "unsupported source mappings abstain.";
+        break;
     case CBM_LANG_GO:
         out->adapter = "go";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |

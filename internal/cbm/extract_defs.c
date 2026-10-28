@@ -6859,6 +6859,28 @@ static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDef
     }
 }
 
+/* Dart stores a callable signature and its body as siblings. Only the next
+ * body belongs to this declaration: a semicolon or another declaration must
+ * stop the association, while comments are harmless syntax trivia. */
+static TSNode function_definition_end(const CBMExtractCtx *ctx, TSNode node) {
+    if (ctx->language != CBM_LANG_DART)
+        return node;
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "function_signature") && strcmp(kind, "method_signature") &&
+        strcmp(kind, "getter_signature") && strcmp(kind, "setter_signature"))
+        return node;
+    TSNode signature = node;
+    TSNode parent = ts_node_parent(signature);
+    if (!ts_node_is_null(parent) && !strcmp(ts_node_type(parent), "method_signature"))
+        signature = parent;
+    TSNode body = ts_node_next_sibling(signature);
+    while (!ts_node_is_null(body) && is_comment_node(ts_node_type(body)))
+        body = ts_node_next_sibling(body);
+    if (!ts_node_is_null(body) && !strcmp(ts_node_type(body), "function_body"))
+        return body;
+    return node;
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -6990,7 +7012,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.start_line =
         ts_node_start_point(configured && ctx->language == CBM_LANG_C ? name_node : node).row +
         TS_LINE_OFFSET;
-    def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(function_definition_end(ctx, node)).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     if (ctx->language == CBM_LANG_RUST &&
@@ -8748,7 +8770,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.file_path = ctx->rel_path;
     def.parent_class = class_qn;
     def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
-    def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(function_definition_end(ctx, child)).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     if (ctx->language == CBM_LANG_RUST &&
@@ -9866,6 +9888,13 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     (void)kind;
     switch (ctx->language) {
     case CBM_LANG_PYTHON: {
+        /* A no-value module annotation does not create or replace a runtime
+         * binding. A synthetic Variable here would conflict with a function
+         * or imported export. Keep separately owned class-field declarations. */
+        if (!ctx->var_parent_class &&
+            !ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("type"))) &&
+            ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("right"))))
+            break;
         TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
         if (ts_node_is_null(left)) {
             break;

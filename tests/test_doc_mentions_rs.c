@@ -1589,14 +1589,14 @@ TEST(doc_mentions_rs_incremental_equals_full) {
     ASSERT_TRUE(rs_row_is(inc_db, user_rs, "Missing", "missing"));
     ASSERT_TRUE(rs_row_is(inc_db, "src/rows.rs", "crate::a::Target::twin", "ambiguous"));
 
-    /* a doc edit re-extracts the file alone */
+    /* A doc edit rebuilds the resolver generation. */
     th_write_file(TH_PATH(repo, "src/user.rs"), RS_INC_USER_DOC);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(rs_edge_is(inc_db, "user.User", "b.Other", RS_UNIQUE));
 
     /* a reference in the FILE's own doc, added by an edit of that doc alone */
     th_write_file(TH_PATH(repo, "src/lib.rs"), RS_INC_LIB_DOC);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "file doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "file doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
               0);
     ASSERT_TRUE(rs_edge_is(inc_db, file, "b.Other", RS_EXACT));
     ASSERT_TRUE(rs_edge_is(inc_db, file, "a.Target", RS_EXACT));
@@ -1604,24 +1604,22 @@ TEST(doc_mentions_rs_incremental_equals_full) {
     /* a body edit in a file others point into: its scope is unchanged, the
      * edges into it stand (from an item and from a file's own doc) */
     th_write_file(TH_PATH(repo, "src/a.rs"), RS_INC_A_BODY);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "target body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-        0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "target body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_TRUE(rs_edge_is(inc_db, "user.User", "a.Target.go", RS_EXACT));
     ASSERT_TRUE(rs_edge_is(inc_db, file, "a.Target", RS_EXACT));
 
     /* a removed member: the file with an edge to it gets a row instead */
     th_write_file(TH_PATH(repo, "src/a.rs"), RS_INC_A_NO_STOP);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "member removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "member removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_TRUE(rs_no_edge(inc_db, "user.User", "a.Target.stop"));
     ASSERT_TRUE(rs_row_is(inc_db, user_rs, "Target::stop", "missing"));
 
     /* ... and a file with NO edge into the changed one, whose row names the
      * removed member, is resolved again: two candidates shrink to one */
     th_write_file(TH_PATH(repo, "src/a.rs"), RS_INC_A_ONE_TWIN);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "twin removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-              0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "twin removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(rs_edge_is(inc_db, "rows.Rows", "a.Target.twin", RS_EXACT));
 
     /* a removed item is not repaired file by file: one of two ambiguous

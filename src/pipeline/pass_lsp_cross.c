@@ -2160,6 +2160,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[n].graph_qualified_name = defs[i].graph_qualified_name;
         out[n].sig = defs[i].sig;
         out[n].source_flags = defs[i].source_flags;
+        out[n].source_signature = defs[i].source_signature;
         n++;
     }
     *out_count = n;

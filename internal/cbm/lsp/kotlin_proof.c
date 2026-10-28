@@ -272,6 +272,11 @@ static void kt_proof_class_fact(kt_proof_source_t *source, TSNode node, const ch
                 complete = false;
         } while (ts_tree_cursor_goto_next_sibling(&declaration));
     ts_tree_cursor_delete(&declaration);
+    TSNode modifiers = kt_proof_child(node, "modifiers");
+    for (uint32_t i = 0; !ts_node_is_null(modifiers) && i < ts_node_named_child_count(modifiers);
+         i++)
+        if (!kt_proof_is(ts_node_named_child(modifiers, i), "visibility_modifier"))
+            complete = false;
     uint32_t flags = kt_proof_modifiers(source, node);
     if (depth == 0)
         flags |= CBM_SOURCE_DECL_TOP_LEVEL;
@@ -414,8 +419,10 @@ typedef struct {
     const CBMFileResult *file;
     CBMResolvedCallArray *out;
     CBMResolveTypeMap types;
-    CBMHashTable *imports, *callers, *local_types, *top_callables, *properties;
+    CBMHashTable *imports, *callers, *local_types, *top_callables, *properties, *classes;
     CBMHashTable *value_types, *local_callables, *assignments, *top_types;
+    const CBMRegisteredType *enclosing_type;
+    TSNode enclosing_node;
     bool wildcard, bare_calls;
 } kt_proof_context_t;
 static bool kt_proof_put(kt_proof_context_t *context, CBMHashTable *table, const char *name,
@@ -472,7 +479,7 @@ static bool kt_proof_prepare(kt_proof_context_t *context, TSNode root) {
         } else if (cbm_label_is_type_like(def->label)) {
             const char *key =
                 cbm_arena_sprintf(context->source.arena, "%u:%s", def->start_line, def->name);
-            if (!key ||
+            if (!key || !kt_proof_put(context, context->classes, key, def->qualified_name) ||
                 (!cbm_ht_get(context->top_types, key) &&
                  !kt_proof_put(context, context->local_types, def->name, def->qualified_name)))
                 return false;
@@ -558,6 +565,48 @@ static const CBMRegisteredType *kt_proof_type_name(kt_proof_context_t *context, 
         dot ? cbm_arena_strndup(context->source.arena, target, (size_t)(dot - target)) : "";
     return package ? kt_proof_namespace_type(context, package, dot ? dot + 1 : target) : NULL;
 }
+/* Exact owner domains contain ordinary final classes with no type parameters,
+ * nested declarations, inherited members or extension-receiver scope. Complete
+ * iterators keep duplicate declarations visible even for lexical receivers. */
+static const CBMRegisteredType *kt_proof_exact_owner(kt_proof_context_t *context, const char *qn) {
+    if (!qn)
+        return NULL;
+    CBMTypeQNIter iterator;
+    cbm_registry_types_with_qn(context->registry, qn, &iterator);
+    const CBMRegisteredType *chosen = NULL, *candidate;
+    uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+    while ((candidate = cbm_type_qn_next(&iterator, NULL))) {
+        if (!candidate->project_source || !candidate->declaration_identity ||
+            !candidate->graph_qualified_name || candidate->is_interface || candidate->is_object ||
+            candidate->type_param_names || candidate->embedded_types ||
+            (candidate->source_flags & required) != required ||
+            (chosen && !kt_proof_same_type(chosen, candidate)))
+            return NULL;
+        chosen = candidate;
+    }
+    return iterator.complete ? chosen : NULL;
+}
+static const CBMRegisteredType *kt_proof_lexical_owner(kt_proof_context_t *context, TSNode node) {
+    const char *name = kt_proof_text(&context->source, kt_proof_child(node, "type_identifier"));
+    const char *key = name ? cbm_arena_sprintf(context->source.arena, "%u:%s",
+                                               ts_node_start_point(node).row + 1, name)
+                           : NULL;
+    const kt_proof_name_t *declaration = key ? cbm_ht_get(context->classes, key) : NULL;
+    if (!declaration || declaration->ambiguous || !cbm_ht_get(context->top_types, key))
+        return NULL;
+    CBMNamespaceTypeIter iterator;
+    cbm_registry_types_in_namespace(context->registry, context->source.package, name, &iterator);
+    const CBMRegisteredType *chosen = NULL, *candidate;
+    while ((candidate = cbm_namespace_type_next(&iterator, NULL))) {
+        if (!candidate->graph_qualified_name ||
+            strcmp(candidate->graph_qualified_name, declaration->target) ||
+            !kt_proof_exact_owner(context, candidate->qualified_name) ||
+            (chosen && !kt_proof_same_type(chosen, candidate)))
+            return NULL;
+        chosen = candidate;
+    }
+    return iterator.complete ? chosen : NULL;
+}
 static cbm_resolve_result_t kt_proof_type_evidence(kt_proof_context_t *context,
                                                    const CBMRegisteredType *type, TSNode site) {
     if (!type)
@@ -617,6 +666,7 @@ static bool kt_proof_read_syntax(const char *kind) {
                                           "navigation_expression",
                                           "navigation_suffix",
                                           "simple_identifier",
+                                          "this_expression",
                                           "call_suffix",
                                           "value_arguments",
                                           "value_argument",
@@ -708,12 +758,15 @@ static cbm_resolve_method_candidate_t kt_proof_candidate(const cbm_resolve_metho
                                                          const CBMTypeRegistry *owner,
                                                          const CBMRegisteredFunc *candidate,
                                                          void *context) {
-    (void)query;
     (void)owner;
-    (void)context;
+    const CBMRegisteredType *lexical = context;
+    bool same_class = lexical && query->receiver_qn && candidate->receiver_type &&
+                      !strcmp(lexical->qualified_name, query->receiver_qn) &&
+                      !strcmp(lexical->qualified_name, candidate->receiver_type);
     cbm_resolve_method_candidate_t proof = {.exposed = CBM_RESOLVE_METHOD_YES};
-    uint32_t required =
-        CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC | CBM_SOURCE_DECL_FIXED_ARITY;
+    uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_FIXED_ARITY;
+    if (!same_class)
+        required |= CBM_SOURCE_DECL_PUBLIC;
     if ((candidate->source_flags & required) != required || candidate->min_params < 0 ||
         candidate->type_param_names || !(candidate->flags & CBM_FUNC_FLAG_PROJECT_SOURCE))
         return proof;
@@ -790,9 +843,14 @@ static const CBMType *kt_proof_signature(kt_proof_context_t *context,
     if (!function || function->min_params < 0 || function->min_params >= 64 ||
         !(function->source_flags & CBM_SOURCE_DECL_FIXED_ARITY))
         return cbm_type_unknown();
-    const CBMType *signature =
-        kt_proof_canonical_type(context, function->source_signature, function->source_namespace,
-                                (function->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) != 0, 0);
+    bool complete_type_scope = (function->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) != 0;
+    if (function->receiver_type) {
+        if (!kt_proof_exact_owner(context, function->receiver_type))
+            return cbm_type_unknown();
+        complete_type_scope = true;
+    }
+    const CBMType *signature = kt_proof_canonical_type(
+        context, function->source_signature, function->source_namespace, complete_type_scope, 0);
     if (!signature || signature->kind != CBM_TYPE_FUNC)
         return cbm_type_unknown();
     /* The shared factory can return a FUNC after an array allocation fails.
@@ -953,6 +1011,90 @@ static bool kt_proof_arguments(kt_proof_context_t *context, TSNode args,
     }
     return !parameters || !parameters[target->min_params];
 }
+static cbm_resolve_result_t kt_proof_scalar_evidence(kt_proof_context_t *context,
+                                                     const CBMType *type, TSNode node,
+                                                     const char *decision) {
+    if (!type || type->kind != CBM_TYPE_NAMED ||
+        cbm_type_is_unknown(
+            kt_proof_scalar_type(context->source.arena, type->data.named.qualified_name)))
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
+    cbm_resolve_result_t result = {
+        .binding = CBM_RESOLVE_BINDING_UNIQUE,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
+        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+        .target = type->data.named.qualified_name,
+        .candidate_count = 1,
+        .reason = decision};
+    cbm_resolve_proof_key_t key = {.lookup_domain = "kotlin-builtin-type-domain",
+                                   .lookup_key = kt_proof_text(&context->source, node),
+                                   .type_identity = type->data.named.qualified_name,
+                                   .start_byte = ts_node_start_byte(node),
+                                   .end_byte = ts_node_end_byte(node),
+                                   .detail = decision};
+    result.proof = cbm_resolve_proof_leaf(&context->types.proofs, CBM_PROOF_SOURCE_FACT,
+                                          &context->types.proof_source, &key, &result);
+    if (!result.proof)
+        result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+    return result;
+}
+static cbm_resolve_result_t kt_proof_member_arguments(kt_proof_context_t *context, TSNode args,
+                                                      cbm_resolve_method_result_t selected,
+                                                      CBMScope *scope, CBMHashTable *blocked) {
+    cbm_resolve_result_t result = selected.result;
+    const CBMRegisteredFunc *target = selected.method;
+    const CBMType *signature = kt_proof_signature(context, target);
+    if (!cbm_resolve_admit(&result) || !target || !signature || signature->kind != CBM_TYPE_FUNC ||
+        target->min_params < 0 || (uint32_t)target->min_params != ts_node_named_child_count(args))
+        goto unsupported;
+    const CBMType *const *parameters = signature->data.func.param_types;
+    for (int i = 0; i < target->min_params; i++) {
+        TSNode argument = ts_node_named_child(args, (uint32_t)i);
+        if (!kt_proof_is(argument, "value_argument") || ts_node_child_count(argument) != 1 ||
+            !parameters || !parameters[i])
+            goto unsupported;
+        TSNode value = kt_proof_unwrap(ts_node_named_child(argument, 0));
+        const CBMType *type = NULL;
+        cbm_resolve_result_t evidence = {0};
+        if (kt_proof_is(value, "simple_identifier")) {
+            const char *name = kt_proof_text(&context->source, value);
+            if (!name || cbm_ht_get(blocked, name))
+                goto unsupported;
+            cbm_resolve_type_fact_t fact =
+                cbm_resolve_types_lookup(&context->types, scope, name, ts_node_start_byte(value));
+            if (cbm_resolve_types_fact_status(&fact) != CBM_RESOLVE_TYPE_KNOWN)
+                goto unsupported;
+            type = fact.type;
+            evidence = fact.evidence;
+        } else if (kt_proof_is(value, "integer_literal") || kt_proof_is(value, "boolean_literal") ||
+                   kt_proof_is(value, "string_literal")) {
+            type = kt_proof_argument_type(context, value, NULL, NULL);
+            evidence =
+                kt_proof_scalar_evidence(context, type, value, "kotlin-source-primitive-literal");
+        }
+        /* Kotlin has no implicit primitive widening. Context-dependent
+         * integer literal conversion remains an explicit quality gap. */
+        if (!type || type->kind != CBM_TYPE_NAMED ||
+            cbm_type_is_unknown(
+                kt_proof_scalar_type(context->source.arena, type->data.named.qualified_name)) ||
+            !kt_proof_equal_type(type, parameters[i], 0) || !cbm_resolve_admit(&evidence) ||
+            !evidence.proof)
+            goto unsupported;
+        result = cbm_lsp_proof_rule(&context->types, result, argument, target->qualified_name,
+                                    target->short_name, "kotlin-exact-primitive-argument",
+                                    evidence.proof);
+        if (!cbm_resolve_admit(&result))
+            return result;
+    }
+    if (parameters && parameters[target->min_params])
+        goto unsupported;
+    return result;
+unsupported:
+    return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                                  .reason = "kotlin_member_argument_applicability_unproven"};
+}
 static bool kt_proof_property(kt_proof_context_t *context, TSNode node, const char **name,
                               TSNode *initializer, TSNode *annotation) {
     TSNode variable = kt_proof_child(node, "variable_declaration");
@@ -1106,19 +1248,49 @@ static void kt_proof_call(kt_proof_context_t *context, TSNode node, const char *
     cbm_resolve_method_result_t resolved = {0};
     uint32_t domain = CBM_RESOLVE_METHOD_DIRECT_DOMAIN_COMPLETE |
                       CBM_RESOLVE_METHOD_OCCURRENCE_EXACT | CBM_RESOLVE_METHOD_NAME_IDENTITY;
+    bool member_call = false;
+    const char *member_name = NULL, *variable = NULL;
+    bool lexical = false;
     if (kt_proof_is(target, "navigation_expression")) {
         TSNode receiver = ts_node_named_child(target, 0),
                member = kt_proof_child(target, "navigation_suffix");
         TSNode name_node = kt_proof_child(member, "simple_identifier");
-        if (!kt_proof_is(receiver, "simple_identifier") || ts_node_named_child_count(target) != 2 ||
-            ts_node_is_null(name_node))
+        if (ts_node_named_child_count(target) != 2 || ts_node_is_null(name_node))
             return;
-        const char *variable = kt_proof_text(&context->source, receiver);
-        const char *name = kt_proof_text(&context->source, name_node);
+        variable = kt_proof_text(&context->source, receiver);
+        lexical = kt_proof_is(receiver, "this_expression") && variable &&
+                  !strcmp(variable, "this") && context->enclosing_type;
+        if (!lexical && !kt_proof_is(receiver, "simple_identifier"))
+            return;
+        member_name = kt_proof_text(&context->source, name_node);
+        member_call = true;
+    } else if (kt_proof_is(target, "simple_identifier")) {
+        const char *name = kt_proof_text(&context->source, target);
+        if (context->enclosing_type) {
+            /* Parameters and local bindings take precedence over an implicit
+             * receiver. Do not fall back to an imported free function after a
+             * member-domain failure. */
+            if (!name || cbm_ht_get(bound, name) || cbm_ht_get(blocked, name))
+                return;
+            member_name = name;
+            variable = "this";
+            lexical = member_call = true;
+        } else {
+            const kt_callable_fact_t *fact =
+                kt_proof_callable(context, name, ts_node_start_byte(node), bound, blocked);
+            resolved =
+                fact ? fact->identity : kt_proof_function_identity(context, name, bound, blocked);
+            if (fact) {
+                resolved.result.rule = CBM_RESOLVE_RULE_CALLABLE_BINDING;
+                resolved.result.facts |= CBM_RESOLVE_FACT_CALLABLE_TYPED;
+            }
+        }
+    }
+    if (member_call) {
         cbm_resolve_type_fact_t fact =
             cbm_resolve_types_lookup(&context->types, scope, variable, ts_node_start_byte(node));
-        if (fact.status != CBM_RESOLVE_TYPE_KNOWN || !fact.type ||
-            fact.type->kind != CBM_TYPE_NAMED)
+        if (cbm_resolve_types_fact_status(&fact) != CBM_RESOLVE_TYPE_KNOWN || !fact.type ||
+            fact.type->kind != CBM_TYPE_NAMED || !member_name)
             return;
         cbm_resolve_method_query_t query = {.proof_pool = &context->types.proofs,
                                             .proof_source = &context->types.proof_source,
@@ -1126,26 +1298,19 @@ static void kt_proof_call(kt_proof_context_t *context, TSNode node, const char *
                                             .registry = context->registry,
                                             .receiver = &fact,
                                             .receiver_qn = fact.type->data.named.qualified_name,
-                                            .method_name = name,
-                                            .argument_count = 0,
+                                            .method_name = member_name,
+                                            .argument_count = -1,
                                             .adapter_facts = domain,
-                                            .classify = kt_proof_candidate};
+                                            .classify = kt_proof_candidate,
+                                            .context =
+                                                lexical ? (void *)context->enclosing_type : NULL};
         resolved = cbm_resolve_method(&query);
-    } else if (kt_proof_is(target, "simple_identifier")) {
-        const char *name = kt_proof_text(&context->source, target);
-        const kt_callable_fact_t *fact =
-            kt_proof_callable(context, name, ts_node_start_byte(node), bound, blocked);
-        resolved =
-            fact ? fact->identity : kt_proof_function_identity(context, name, bound, blocked);
-        if (fact) {
-            resolved.result.rule = CBM_RESOLVE_RULE_CALLABLE_BINDING;
-            resolved.result.facts |= CBM_RESOLVE_FACT_CALLABLE_TYPED;
-        }
+        resolved.result = kt_proof_member_arguments(context, args, resolved, scope, blocked);
     }
     /* Name identity is settled over all declarations before applicability;
      * argument types never select a convenient overload. */
     if (cbm_resolve_admit(&resolved.result) &&
-        kt_proof_arguments(context, args, resolved.function, bound, blocked)) {
+        (member_call || kt_proof_arguments(context, args, resolved.function, bound, blocked))) {
         resolved.result = cbm_lsp_proof_rule(
             &context->types, resolved.result, args, "kotlin-fixed-positional-arguments",
             kt_proof_text(&context->source, args),
@@ -1154,6 +1319,29 @@ static void kt_proof_call(kt_proof_context_t *context, TSNode node, const char *
     }
 }
 
+/* A reference leaf inside a larger argument proves that the function is
+ * mentioned, not that the argument has this one callable identity. Parentheses
+ * preserve directness. A separate initializer/body starts its own value role. */
+static CBMResolvedKind kt_proof_reference_kind(kt_proof_context_t *context, TSNode reference) {
+    TSNode current = reference;
+    for (unsigned depth = 0; kt_proof_budget(&context->source, depth); depth++) {
+        TSNode parent = ts_node_parent(current);
+        if (ts_node_is_null(parent) || kt_proof_is(parent, "function_body") ||
+            kt_proof_is(parent, "property_declaration") || kt_proof_is(parent, "assignment"))
+            return CBM_RESOLVED_CALL_REFERENCE;
+        if (kt_proof_is(parent, "value_argument")) {
+            TSNode value = ts_node_named_child_count(parent) == 1
+                               ? kt_proof_unwrap(ts_node_named_child(parent, 0))
+                               : (TSNode){0};
+            return !ts_node_is_null(value) && ts_node_eq(value, reference)
+                       ? CBM_RESOLVED_CALL_REFERENCE
+                       : CBM_RESOLVED_VALUE_REFERENCE;
+        }
+        current = parent;
+    }
+    /* Exhausted source budget prevents the staged result from publishing. */
+    return CBM_RESOLVED_VALUE_REFERENCE;
+}
 static void kt_proof_body_calls(kt_proof_context_t *context, TSNode node, const char *caller,
                                 CBMScope *scope, CBMHashTable *bound, CBMHashTable *blocked,
                                 unsigned depth) {
@@ -1167,8 +1355,8 @@ static void kt_proof_body_calls(kt_proof_context_t *context, TSNode node, const 
         cbm_resolve_method_result_t reference = kt_proof_reference(context, node, bound, blocked);
         /* Extraction records the identifier leaf of explicit ::name syntax,
          * so semantic proof must use that same exact occurrence span. */
-        kt_proof_emit(context, caller, ts_node_named_child(node, 0), CBM_RESOLVED_CALL_REFERENCE,
-                      reference.result);
+        CBMResolvedKind kind = kt_proof_reference_kind(context, node);
+        kt_proof_emit(context, caller, ts_node_named_child(node, 0), kind, reference.result);
     }
     if (kt_proof_is(node, "value_argument") && ts_node_named_child_count(node) == 1) {
         TSNode value = kt_proof_unwrap(ts_node_named_child(node, 0));
@@ -1217,6 +1405,11 @@ static void kt_proof_function(kt_proof_context_t *context, TSNode node, bool top
                 ordinary = false;
         } while (ts_tree_cursor_goto_next_sibling(&header));
     ts_tree_cursor_delete(&header);
+    TSNode modifiers = kt_proof_child(node, "modifiers");
+    for (uint32_t i = 0; !ts_node_is_null(modifiers) && i < ts_node_named_child_count(modifiers);
+         i++)
+        if (!kt_proof_is(ts_node_named_child(modifiers, i), "visibility_modifier"))
+            ordinary = false;
     if (!ordinary)
         return;
     context->bare_calls = top_level;
@@ -1240,6 +1433,15 @@ static void kt_proof_function(kt_proof_context_t *context, TSNode node, bool top
     context->source.failed = false;
     CBMScope *scope = cbm_scope_push(context->source.arena, NULL);
     if (!failed && scope) {
+        if (context->enclosing_type) {
+            const CBMRegisteredType *type = context->enclosing_type;
+            cbm_resolve_result_t proof = kt_proof_type_evidence(
+                context, type, kt_proof_child(context->enclosing_node, "type_identifier"));
+            failed = !cbm_resolve_types_declare(
+                &context->types, scope, "this", ts_node_start_byte(node),
+                cbm_type_named(context->source.arena, type->qualified_name),
+                CBM_RESOLVE_TYPE_ANNOTATION, &proof);
+        }
         TSTreeCursor cursor = ts_tree_cursor_new(params);
         if (ts_tree_cursor_goto_first_child(&cursor))
             do {
@@ -1279,10 +1481,21 @@ static void kt_proof_function(kt_proof_context_t *context, TSNode node, bool top
                 if (spelling && (context->wildcard || cbm_ht_get(context->imports, spelling) ||
                                  cbm_ht_get(context->local_types, spelling)))
                     source_type = cbm_type_unknown();
-                const CBMType *value_type = kt_proof_canonical_type(
-                    context, source_type, context->source.package, top_level, 0);
-                if (!cbm_type_is_unknown(value_type))
+                const CBMType *value_type =
+                    kt_proof_canonical_type(context, source_type, context->source.package,
+                                            top_level || context->enclosing_type != NULL, 0);
+                if (!cbm_type_is_unknown(value_type)) {
                     cbm_ht_set(context->value_types, variable, (void *)value_type);
+                    if (value_type->kind == CBM_TYPE_NAMED) {
+                        cbm_resolve_result_t proof = kt_proof_scalar_evidence(
+                            context, value_type, type_node,
+                            "kotlin-source-primitive-annotation;complete-unshadowed-type-domain");
+                        if (!cbm_resolve_types_declare(&context->types, scope, variable,
+                                                       ts_node_start_byte(parameter), value_type,
+                                                       CBM_RESOLVE_TYPE_ANNOTATION, &proof))
+                            failed = true;
+                    }
+                }
                 const CBMRegisteredType *type = kt_proof_type_name(context, spelling);
                 if (!type)
                     continue;
@@ -1320,12 +1533,20 @@ static void kt_proof_walk(kt_proof_context_t *context, TSNode node, unsigned dep
     if (kt_proof_is(node, "class_declaration") &&
         !ts_node_is_null(kt_proof_child(node, "type_parameters")))
         return;
+    const CBMRegisteredType *previous = context->enclosing_type;
+    TSNode previous_node = context->enclosing_node;
+    if (kt_proof_is(node, "class_declaration")) {
+        context->enclosing_type = kt_proof_lexical_owner(context, node);
+        context->enclosing_node = node;
+    }
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor))
         do {
             kt_proof_walk(context, ts_tree_cursor_current_node(&cursor), depth + 1);
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+    context->enclosing_type = previous;
+    context->enclosing_node = previous_node;
 }
 void cbm_kotlin_proof_resolve(CBMArena *arena, const char *source, int length, TSNode root,
                               const CBMTypeRegistry *registry, const CBMFileResult *file,
@@ -1348,13 +1569,15 @@ void cbm_kotlin_proof_resolve(CBMArena *arena, const char *source, int length, T
     context.top_callables = cbm_ht_create(32);
     context.properties = cbm_ht_create(32);
     context.top_types = cbm_ht_create(32);
+    context.classes = cbm_ht_create(32);
     cbm_resolve_types_init(&context.types, arena, 0);
     cbm_resolve_proof_source_t proof_source =
         cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
     if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
         context.source.failed = true;
     if (context.imports && context.callers && context.local_types && context.top_callables &&
-        context.properties && context.top_types && kt_proof_prepare(&context, root)) {
+        context.properties && context.top_types && context.classes &&
+        kt_proof_prepare(&context, root)) {
         kt_proof_top_callables(&context, root);
         kt_proof_walk(&context, root, 0);
     }
@@ -1366,4 +1589,5 @@ void cbm_kotlin_proof_resolve(CBMArena *arena, const char *source, int length, T
     cbm_ht_free(context.top_callables);
     cbm_ht_free(context.properties);
     cbm_ht_free(context.top_types);
+    cbm_ht_free(context.classes);
 }

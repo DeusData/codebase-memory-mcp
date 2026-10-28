@@ -2,9 +2,19 @@
 #define CBM_PIPELINE_SHARED_RESOLVER_H
 
 #include "pipeline_internal.h"
+#include "foundation/hash_table.h"
 #include "resolve/solver.h"
 
 typedef struct cbm_shared_resolver cbm_shared_resolver_t;
+
+/* Register immutable extraction snapshots before infrastructure adapters run.
+ * Reusing the same rows is idempotent; changed extraction identities fail closed.
+ * Freezes original extraction quality separately from later LSP failure.
+ * Reads the original in-memory/spilled results, never replacement file bytes;
+ * an existing spill slot that cannot be read is a fatal capture failure. */
+bool cbm_shared_resolver_capture_sources(const cbm_pipeline_ctx_t *ctx,
+                                         const cbm_file_info_t *files, int file_count,
+                                         CBMFileResult **cache);
 
 /* Immutable after build, shared by every file worker. Cache access includes
  * spilled results; exported binding proofs are computed once per file. */
@@ -66,5 +76,47 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *resolver,
  * USES_TYPE/IMPORTS. Removes legacy bypasses and rebuilds in deterministic
  * occurrence order. Invalid emitted claims fail closed. */
 bool cbm_shared_resolver_project(cbm_gbuf_t *graph);
+
+/* One sequential adapter pass: O(1) extraction-snapshot lookups and owned
+ * immutable proof storage. Initialize once after extraction summaries exist;
+ * the caller's arena outlives the adapter and all pending occurrences. */
+typedef struct {
+    cbm_pipeline_ctx_t *ctx;
+    CBMArena *arena;
+    cbm_resolve_proof_pool_t proofs;
+    CBMHashTable *source_files;
+} cbm_shared_resolver_adapter_t;
+
+bool cbm_shared_resolver_adapter_init(cbm_shared_resolver_adapter_t *adapter,
+                                      cbm_pipeline_ctx_t *ctx, CBMArena *arena);
+void cbm_shared_resolver_adapter_dispose(cbm_shared_resolver_adapter_t *adapter);
+/* Verify the analyzed raw bytes against the original extraction summary and
+ * retain that summary's configuration identity. Register publication-time
+ * revalidation; never manufacture a replacement extraction identity. */
+bool cbm_shared_resolver_adapter_capture(cbm_shared_resolver_adapter_t *adapter, const char *file,
+                                         CBMLanguage language, const char *bytes, size_t length,
+                                         cbm_resolve_proof_source_t *source);
+/* Capture exact original spelling while its buffer is alive. Set source.scope
+ * to the graph owner and relation to the audited AST role. The returned proof
+ * owns its strings; source bytes can be released before lookup completes. */
+const cbm_resolve_proof_t *cbm_shared_resolver_adapter_occurrence(
+    cbm_shared_resolver_adapter_t *adapter, const cbm_resolve_proof_source_t *source,
+    const char *bytes, size_t length, uint32_t start, uint32_t end, const char *spelling,
+    const char *relation);
+/* semantic is the adapter's independent closed lookup proof, with the same
+ * source/span/spelling/role and exact target identity. Unsupported, ambiguous
+ * and unresolved outcomes are recorded too. No raw graph edge is authority.
+ * Any malformed proof or allocation failure makes publication fail closed. */
+bool cbm_shared_resolver_adapter_record_proofs(cbm_shared_resolver_adapter_t *adapter,
+                                               const cbm_resolve_proof_t *occurrence, int64_t owner,
+                                               int64_t target, const char *properties,
+                                               const cbm_resolve_proof_t *semantic);
+/* Convenience for lookups completed while the original buffer is retained. */
+bool cbm_shared_resolver_adapter_record(cbm_shared_resolver_adapter_t *adapter,
+                                        const cbm_resolve_proof_source_t *source, const char *bytes,
+                                        size_t length, uint32_t start, uint32_t end,
+                                        const char *spelling, int64_t owner, int64_t target,
+                                        const char *relation, const char *properties,
+                                        const cbm_resolve_proof_t *semantic);
 
 #endif

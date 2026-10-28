@@ -53,10 +53,46 @@ static void definition_hash(const CBMDefinition *d, char digest[65]) {
     hash_list(&h, d->return_types);
     cbm_resolve_hash_finish(&h, digest);
 }
+static CBMResolverExtractionState snapshot_current_state(const CBMFileResult *result) {
+    return (CBMResolverExtractionState){.captured = true,
+                                        .has_error = result->has_error,
+                                        .parse_unusable = result->parse_unusable,
+                                        .parse_incomplete = result->parse_incomplete,
+                                        .walk_truncated = result->walk_truncated};
+}
+
+static bool snapshot_state_valid(const CBMFileResult *result,
+                                 CBMResolverExtractionState extraction) {
+    if ((result->lsp_failed && !result->has_error) ||
+        result->parse_unusable != extraction.parse_unusable ||
+        result->parse_incomplete != extraction.parse_incomplete ||
+        result->walk_truncated != extraction.walk_truncated)
+        return false;
+    return result->has_error == extraction.has_error ||
+           (!extraction.has_error && result->has_error && result->lsp_failed);
+}
+
+bool cbm_resolve_capture_extraction_state(CBMFileResult *result) {
+    if (!result)
+        return false;
+    CBMResolverExtractionState extraction = result->resolver_extraction_state.captured
+                                                ? result->resolver_extraction_state
+                                                : snapshot_current_state(result);
+    if (!snapshot_state_valid(result, extraction))
+        return false;
+    result->resolver_extraction_state = extraction;
+    return true;
+}
+
 bool cbm_resolve_snapshot(const CBMFileResult *r, const char *path, CBMLanguage language,
                           cbm_resolve_file_t *out, char extracted[65]) {
     if (!r || !path || !out || !extracted || r->defs.count < 0 || r->imports.count < 0 ||
         r->type_assigns.count < 0 || r->field_types.count < 0)
+        return false;
+    CBMResolverExtractionState extraction = r->resolver_extraction_state.captured
+                                                ? r->resolver_extraction_state
+                                                : snapshot_current_state(r);
+    if (!snapshot_state_valid(r, extraction))
         return false;
     size_t count = (size_t)r->defs.count + (size_t)r->imports.count +
                    (size_t)r->type_assigns.count + (size_t)r->field_types.count;
@@ -105,10 +141,10 @@ bool cbm_resolve_snapshot(const CBMFileResult *r, const char *path, CBMLanguage 
     cbm_resolve_hash_text(&summary, "extracted-bindings-v1");
     cbm_resolve_hash_number(&summary, language);
     cbm_resolve_hash_number(&summary, count);
-    cbm_resolve_hash_number(&summary, r->has_error);
-    cbm_resolve_hash_number(&summary, r->parse_unusable);
-    cbm_resolve_hash_number(&summary, r->parse_incomplete);
-    cbm_resolve_hash_number(&summary, r->walk_truncated);
+    cbm_resolve_hash_number(&summary, extraction.has_error);
+    cbm_resolve_hash_number(&summary, extraction.parse_unusable);
+    cbm_resolve_hash_number(&summary, extraction.parse_incomplete);
+    cbm_resolve_hash_number(&summary, extraction.walk_truncated);
     for (size_t i = 0; i < count; i++)
         cbm_resolve_hash_text(&summary, digests[i]);
     hash_list(&summary, r->exports);
@@ -123,8 +159,9 @@ bool cbm_resolve_snapshot(const CBMFileResult *r, const char *path, CBMLanguage 
                                 .raw_length = r->source_content_length[0],
                                 .preprocessed_length = r->source_content_length[1],
                                 .language = (uint32_t)language,
-                                .complete = !r->has_error && !r->parse_unusable &&
-                                            !r->parse_incomplete && !r->walk_truncated};
+                                .complete = !extraction.has_error && !extraction.parse_unusable &&
+                                            !extraction.parse_incomplete &&
+                                            !extraction.walk_truncated};
     return true;
 }
 

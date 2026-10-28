@@ -377,6 +377,10 @@ bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb) {
     return gb && !gb->resolution_failed;
 }
 
+uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb) {
+    return gb ? gb->proof_pool.work : 0;
+}
+
 bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
     if (!cbm_gbuf_resolution_begin(gb))
         return false;

@@ -1,8 +1,10 @@
 #include "foundation/compat_fs.h"
 #include "foundation/hash_table.h"
 #include "foundation/limits.h"
+#include "foundation/log.h"
 #include "foundation/json_writer.h"
 #include "helpers.h"
+#include "lang_specs.h"
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/shared_resolver.h"
@@ -11,6 +13,7 @@
 #include "resolve/policy.h"
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
+#include "result_spill.h"
 #include "service_patterns.h"
 
 #include <limits.h>
@@ -47,10 +50,27 @@ typedef struct {
     cbm_resolve_solver_result_t result;
 } python_query_t;
 
+/* Conditional equivalence is separate from target selection. A two-branch
+ * Python owner is proved from the raw AST, never inferred from same-QN graph
+ * collisions. Incoming references still require an unambiguous declaration. */
+typedef struct {
+    uint32_t start_line, end_line, start_byte, end_byte, body_start, body_end;
+    uint32_t group_start, group_end;
+    unsigned branch;
+} owner_variant_t;
+
+typedef struct {
+    owner_variant_t members[2];
+    const char *content, *configuration;
+    bool invalid;
+} conditional_owner_t;
+
 typedef struct {
     const char *file;
     const char *label;
-    uint32_t start_line, end_line;
+    uint32_t start_line, end_line, second_start_line, second_end_line;
+    unsigned declarations;
+    conditional_owner_t *conditional;
     bool ambiguous;
 } target_proof_t;
 
@@ -191,15 +211,45 @@ static char *file_source(const cbm_resolver_file_t *file, size_t *length) {
     return source;
 }
 
+/* Parallel extraction and spill release the cached syntax tree. Rebuild the
+ * Python owner audit from the exact raw snapshot, and let the binding index
+ * borrow the same tree so a released tree is parsed only once per phase.
+ * The view borrows every other result field and is never freed as a result. */
+static const CBMFileResult *owner_source_view(const CBMFileResult *result, CBMLanguage language,
+                                              const char *source, size_t length,
+                                              CBMFileResult *view, TSTree **owned) {
+    *owned = NULL;
+    if (language != CBM_LANG_PYTHON || result->cached_tree || !source || length > UINT32_MAX ||
+        !cbm_result_source_matches(result, source, length, CBM_SOURCE_ORIGIN_RAW))
+        return result;
+    TSParser *parser = ts_parser_new();
+    if (parser && ts_parser_set_language(parser, cbm_ts_language(language)))
+        *owned = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    if (parser)
+        ts_parser_delete(parser);
+    if (!*owned)
+        return result;
+    *view = *result;
+    view->cached_tree = *owned;
+    view->cached_lang = language;
+    return view;
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
-                       const char *file) {
+                       const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
         return true;
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
     if (prior) {
-        prior->ambiguous |=
-            strcmp(prior->file, file) != 0 || strcmp(prior->label, definition->label) != 0 ||
-            prior->start_line != definition->start_line || prior->end_line != definition->end_line;
+        bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
+        prior->ambiguous |= !same_owner || prior->start_line != definition->start_line ||
+                            prior->end_line != definition->end_line || language == CBM_LANG_PYTHON;
+        if (prior->declarations == 1 && same_owner) {
+            prior->second_start_line = definition->start_line;
+            prior->second_end_line = definition->end_line;
+        }
+        if (prior->declarations < 3)
+            prior->declarations++;
         return true;
     }
     target_proof_t *entry = cbm_arena_calloc(&resolver->arena, sizeof(*entry));
@@ -210,10 +260,109 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     entry->label = cbm_arena_strdup(&resolver->arena, definition->label);
     entry->start_line = definition->start_line;
     entry->end_line = definition->end_line;
+    entry->declarations = 1;
     if (!entry->file || !entry->label)
         return false;
     cbm_ht_set(resolver->targets, key, entry);
     return cbm_ht_get(resolver->targets, key) == entry;
+}
+
+static TSNode owner_field(TSNode node, const char *name) {
+    return ts_node_is_null(node) ? (TSNode){0}
+                                 : ts_node_child_by_field_name(node, name, (uint32_t)strlen(name));
+}
+
+static bool owner_kind(TSNode node, const char *kind) {
+    return !ts_node_is_null(node) && !strcmp(ts_node_type(node), kind);
+}
+
+static bool note_owner_branch(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
+                              const char *file, const char *source, size_t length, TSNode group,
+                              TSNode block, unsigned branch) {
+    uint32_t count = ts_node_named_child_count(block);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode function = ts_node_named_child(block, i);
+        TSNode name = owner_field(function, "name"), body = owner_field(function, "body");
+        if (!owner_kind(function, "function_definition") || !owner_kind(name, "identifier") ||
+            !owner_kind(body, "block"))
+            continue;
+        uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+        if (end <= start || end > length || end - start > INT_MAX)
+            continue;
+        const char *qn = cbm_arena_sprintf(&resolver->arena, "%s.%.*s", result->module_qn,
+                                           (int)(end - start), source + start);
+        if (!qn)
+            return false;
+        target_proof_t *target = cbm_ht_get(resolver->targets, qn);
+        if (!target || !target->ambiguous || target->declarations != 2 ||
+            strcmp(target->file, file) || strcmp(target->label, "Function") ||
+            target->start_line == target->second_start_line)
+            continue;
+        uint32_t first = ts_node_start_point(function).row + 1;
+        uint32_t last = ts_node_end_point(function).row + 1;
+        unsigned member;
+        if (first == target->start_line && last == target->end_line)
+            member = 0;
+        else if (first == target->second_start_line && last == target->second_end_line)
+            member = 1;
+        else
+            continue;
+        if (!target->conditional) {
+            conditional_owner_t *owner = cbm_arena_calloc(&resolver->arena, sizeof(*owner));
+            if (!owner)
+                return false;
+            owner->content = cbm_arena_strdup(&resolver->arena,
+                                              result->source_content_id[CBM_SOURCE_ORIGIN_RAW]);
+            owner->configuration =
+                cbm_arena_strdup(&resolver->arena, result->source_configuration_id);
+            if (!owner->content || !owner->configuration)
+                return false;
+            target->conditional = owner;
+        }
+        conditional_owner_t *owner = target->conditional;
+        owner->invalid |= owner->members[member].branch != 0;
+        owner->members[member] = (owner_variant_t){.start_line = first,
+                                                   .end_line = last,
+                                                   .start_byte = ts_node_start_byte(function),
+                                                   .end_byte = ts_node_end_byte(function),
+                                                   .body_start = ts_node_start_byte(body),
+                                                   .body_end = ts_node_end_byte(body),
+                                                   .group_start = ts_node_start_byte(group),
+                                                   .group_end = ts_node_end_byte(group),
+                                                   .branch = branch};
+    }
+    return true;
+}
+
+/* Audit one raw syntax tree in linear time. This deliberately supports only
+ * direct module-level if/else bodies. elif, nested groups, decorated functions,
+ * other languages and cross-file build variants remain quality gaps. */
+static bool note_conditional_owners(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
+                                    const char *file, CBMLanguage language, const char *source,
+                                    size_t length) {
+    if (language != CBM_LANG_PYTHON || !result->cached_tree || !source ||
+        result->cached_lang != language || !result->module_qn ||
+        !cbm_result_source_matches(result, source, length, CBM_SOURCE_ORIGIN_RAW))
+        return true;
+    TSNode root = ts_tree_root_node(result->cached_tree);
+    if (!owner_kind(root, "module") || ts_node_has_error(root))
+        return true;
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode group = ts_node_named_child(root, i);
+        if (!owner_kind(group, "if_statement"))
+            continue;
+        TSNode first = owner_field(group, "consequence");
+        TSNode alternative = owner_field(group, "alternative");
+        TSNode second = owner_field(alternative, "body");
+        if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
+            !owner_kind(second, "block"))
+            continue;
+        if (!note_owner_branch(resolver, result, file, source, length, group, first, 1) ||
+            !note_owner_branch(resolver, result, file, source, length, group, second, 2))
+            return false;
+    }
+    return true;
 }
 
 static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_node_t *node) {
@@ -230,6 +379,144 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
            !strcmp(proof->label, node->label) && node->start_line >= 0 && node->end_line >= 0 &&
            proof->start_line == (uint32_t)node->start_line &&
            proof->end_line == (uint32_t)node->end_line;
+}
+
+typedef struct {
+    const target_proof_t *target;
+    unsigned seen;
+    bool invalid;
+} owner_span_audit_t;
+
+static void owner_span(const char *file, int start, int end, void *user) {
+    owner_span_audit_t *audit = user;
+    const target_proof_t *target = audit->target;
+    if (!file || strcmp(file, target->file) || start <= 0 || end < start) {
+        audit->invalid = true;
+        return;
+    }
+    if ((uint32_t)start == target->start_line && (uint32_t)end == target->end_line)
+        audit->seen |= 1;
+    else if ((uint32_t)start == target->second_start_line &&
+             (uint32_t)end == target->second_end_line)
+        audit->seen |= 2;
+    else
+        audit->invalid = true;
+}
+
+/* foreach_span can read unsettled worker spans, but deliberately tolerates
+ * malformed JSON entries. Projection authority cannot inherit that tolerance. */
+static bool owner_properties_valid(const cbm_gbuf_node_t *node, const target_proof_t *target) {
+    const char *text = node->properties_json;
+    if (!text)
+        return false;
+    yyjson_doc *doc = yyjson_read(text, strlen(text), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *variants = yyjson_obj_get(root, "variants");
+    bool valid = yyjson_is_obj(root) && (!variants || yyjson_is_arr(variants));
+    owner_span_audit_t audit = {.target = target};
+    if (valid && variants) {
+        size_t index, count;
+        yyjson_val *entry;
+        yyjson_arr_foreach(variants, index, count, entry) {
+            yyjson_val *first = yyjson_obj_get(entry, "start_line");
+            yyjson_val *last = yyjson_obj_get(entry, "end_line");
+            int64_t start = yyjson_get_sint(first), end = yyjson_get_sint(last);
+            if (!yyjson_is_int(first) || !yyjson_is_int(last) || start <= 0 || end < start ||
+                start > INT_MAX || end > INT_MAX) {
+                audit.invalid = true;
+                break;
+            }
+            owner_span(yyjson_get_str(yyjson_obj_get(entry, "file_path")), (int)start, (int)end,
+                       &audit);
+        }
+        valid = !audit.invalid && audit.seen == 3;
+    }
+    yyjson_doc_free(doc);
+    return valid;
+}
+
+static const owner_variant_t *conditional_source_owner(const file_resolver_t *resolver,
+                                                       const cbm_gbuf_node_t *node, uint32_t start,
+                                                       uint32_t end, CBMSourceOrigin origin) {
+    const CBMFileResult *result = resolver->file->result;
+    if (!resolver->shared || !resolver->shared->complete || !resolver->source_matches || !node ||
+        !node->qualified_name || !node->file_path || !node->label ||
+        origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !result->cached_tree ||
+        resolver->file->language != CBM_LANG_PYTHON || result->cached_lang != CBM_LANG_PYTHON)
+        return NULL;
+    const target_proof_t *target = cbm_ht_get(resolver->shared->targets, node->qualified_name);
+    const conditional_owner_t *owner = target ? target->conditional : NULL;
+    if (!target || !owner || !target->ambiguous || target->declarations != 2 || owner->invalid ||
+        strcmp(target->file, resolver->file->rel_path) || strcmp(target->file, node->file_path) ||
+        strcmp(target->label, node->label) ||
+        strcmp(owner->content, result->source_content_id[CBM_SOURCE_ORIGIN_RAW]) ||
+        strcmp(owner->configuration, result->source_configuration_id))
+        return NULL;
+    const owner_variant_t *a = &owner->members[0], *b = &owner->members[1];
+    if (!a->branch || !b->branch || a->branch == b->branch || a->group_start != b->group_start ||
+        a->group_end != b->group_end || !owner_properties_valid(node, target))
+        return NULL;
+    owner_span_audit_t spans = {.target = target};
+    owner_span(node->file_path, node->start_line, node->end_line, &spans);
+    if (spans.invalid)
+        return NULL;
+    spans.seen = 0;
+    cbm_gbuf_foreach_span(resolver->file->graph, node, owner_span, &spans);
+    if (spans.invalid || spans.seen != 3)
+        return NULL;
+    const owner_variant_t *selected = start >= a->body_start && end <= a->body_end   ? a
+                                      : start >= b->body_start && end <= b->body_end ? b
+                                                                                     : NULL;
+    if (!selected)
+        return NULL;
+    /* Exact containment alone could lend an outer declaration to a nested
+     * function/lambda. Confirm the nearest callable syntax owner as well. */
+    TSNode syntax =
+        ts_node_named_descendant_for_byte_range(ts_tree_root_node(result->cached_tree), start, end);
+    for (unsigned depth = 0; !ts_node_is_null(syntax) && depth < 64; depth++) {
+        if (owner_kind(syntax, "lambda") || owner_kind(syntax, "class_definition"))
+            return NULL;
+        if (owner_kind(syntax, "function_definition"))
+            return ts_node_start_byte(syntax) == selected->start_byte &&
+                           ts_node_end_byte(syntax) == selected->end_byte
+                       ? selected
+                       : NULL;
+        syntax = ts_node_parent(syntax);
+    }
+    return NULL;
+}
+
+static const cbm_resolve_proof_t *conditional_owner_proof(const file_resolver_t *resolver,
+                                                          const cbm_gbuf_node_t *node,
+                                                          const owner_variant_t *owner,
+                                                          const cbm_resolve_proof_t *existing) {
+    const cbm_resolve_proof_view_t *semantic = cbm_resolve_proof_view(existing);
+    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(resolver->bindings);
+    if (!semantic || !context)
+        return NULL;
+    cbm_resolve_proof_source_t source = cbm_result_proof_source(
+        resolver->file->result, CBM_SOURCE_ORIGIN_RAW, node->qualified_name);
+    cbm_resolve_proof_key_t key = {.lookup_domain = resolver->file->module_qn,
+                                   .lookup_key = node->name,
+                                   .binding_identity = node->qualified_name,
+                                   .declaration_identity = node->qualified_name,
+                                   .start_byte = owner->start_byte,
+                                   .end_byte = owner->end_byte,
+                                   .origin = CBM_SOURCE_ORIGIN_RAW,
+                                   .flags = owner->branch,
+                                   .detail = "raw_python_if_else_canonical_owner"};
+    cbm_resolve_result_t identity = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                     .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                     .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                     .target = node->qualified_name,
+                                     .candidate_count = 1,
+                                     .facts = CBM_RESOLVE_FACT_EXACT_TARGET,
+                                     .reason = "raw_python_if_else_canonical_owner"};
+    const cbm_resolve_proof_t *premises[] = {
+        existing,
+        cbm_resolve_proof_leaf(context->pool, CBM_PROOF_SOURCE_FACT, &source, &key, &identity)};
+    return cbm_resolve_proof_derive(context->pool, CBM_PROOF_NAMED_JOIN, &semantic->source,
+                                    &semantic->key, &semantic->outcome, premises, 2, true);
 }
 
 static const char *export_solver_key(CBMArena *arena, const char *qn) {
@@ -767,9 +1054,16 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
         cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
         return true;
     }
+    CBMFileResult source_view;
+    TSTree *owner_tree = NULL;
+    result = owner_source_view(result, file->language, source, length, &source_view, &owner_tree);
     cbm_resolve_binding_index_t *index =
         cbm_resolve_binding_build(&arena, result, file->language, source, length);
-    bool ok = index != NULL;
+    /* Sequential extraction releases raw buffers. Audit the same verified
+     * bytes used for exports instead of requiring parallel source retention.
+     * The owner summary copies identities and stores spans, never this buffer. */
+    bool ok = index && note_conditional_owners(resolver, result, file->rel_path, file->language,
+                                               source, length);
     if (ok && file->language == CBM_LANG_PYTHON)
         ok = capture_python_namespace(resolver, result, file->rel_path, index);
     if (ok && (file->language == CBM_LANG_JAVASCRIPT || file->language == CBM_LANG_TYPESCRIPT ||
@@ -891,6 +1185,8 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
         }
         cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
     }
+    if (owner_tree)
+        ts_tree_delete(owner_tree);
     cbm_arena_destroy(&arena);
     cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
     return ok;
@@ -1371,7 +1667,7 @@ static bool prepare_python_queries(cbm_shared_resolver_t *resolver, const cbm_pi
 cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
                                                  const cbm_file_info_t *files, int file_count,
                                                  CBMFileResult **cache) {
-    if (!ctx || file_count < 0 || (file_count && (!files || !cache)))
+    if (!cbm_shared_resolver_capture_sources(ctx, files, file_count, cache))
         return NULL;
     cbm_shared_resolver_t *resolver = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*resolver));
     if (!resolver)
@@ -1414,18 +1710,15 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
             resolver->complete = false;
             continue;
         }
-        char extracted_summary[65];
-        cbm_resolve_file_t snapshot;
-        bool ok = cbm_resolve_snapshot(result, files[f].rel_path, files[f].language, &snapshot,
-                                       extracted_summary) &&
-                  cbm_gbuf_record_resolver_file(ctx->gbuf, &snapshot);
+        bool ok = true;
         for (int d = 0; ok && d < result->defs.count; d++) {
             const CBMDefinition *definition = &result->defs.items[d];
             /* Synthetic namespaces have their own file-keyed census; their
              * QNs may equal an initializer's genuine callable declaration. */
             bool namespace = files[f].language == CBM_LANG_PYTHON && definition->label &&
                              !strcmp(definition->label, "Module");
-            ok = namespace || add_target(resolver, definition, files[f].rel_path);
+            ok =
+                namespace || add_target(resolver, definition, files[f].rel_path, files[f].language);
             if (ok)
                 ok = http_candidate_definition(resolver, definition, files[f].rel_path);
         }
@@ -1652,6 +1945,9 @@ static cbm_resolve_result_t unresolved(const char *reason) {
 
 static cbm_resolve_result_t semantic_result(const file_resolver_t *resolver,
                                             const semantic_site_t *site, CBMArena *arena) {
+    if (resolver->file->result->lsp_failed)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_FAILED,
+                                      .reason = "lsp_analysis_failed_prior_proof_untrusted"};
     if (site->ambiguous)
         return (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_AMBIGUOUS,
                                       .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
@@ -2235,10 +2531,12 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
         if (result.binding == CBM_RESOLVE_BINDING_UNIQUE)
             result.reason = source ? "target_not_materialized" : "source_not_materialized";
     }
+    const owner_variant_t *conditional =
+        conditional_source_owner(resolver, source, start, end, origin);
     if (source &&
         (!source->file_path || strcmp(source->file_path, resolver->file->rel_path) ||
          (source != resolver->file_node && (!source->label || strcmp(source->label, "Module")) &&
-          !target_materialized(resolver, source)))) {
+          !target_materialized(resolver, source) && !conditional))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "source_declaration_identity_conflict";
     }
@@ -2262,6 +2560,26 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
         result.facts = 0;
         result.reason = "source_snapshot_mismatch";
     }
+    const cbm_resolve_proof_t *binding =
+        local_occurrence_proof(resolver, source ? source->qualified_name : scope, name, relation,
+                               start, end, origin, &result);
+    if (conditional && result.proof && cbm_resolve_admit(&result)) {
+        /* Extend local authority rather than cloning shared export ancestors
+         * into every worker. An export summary cannot attest a local site. */
+        if (!binding && cbm_shared_resolver_owns_proof(resolver->shared, result.proof)) {
+            result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
+            result.reason = "conditional_owner_occurrence_proof_missing";
+        } else {
+            const cbm_resolve_proof_t *joined = conditional_owner_proof(
+                resolver, source, conditional, binding ? binding : result.proof);
+            if (!joined)
+                return false;
+            if (binding)
+                binding = joined;
+            else
+                result.proof = joined;
+        }
+    }
     char *properties = record_properties(name, relation, start, end, origin, &result, call);
     if (!properties)
         return false;
@@ -2274,8 +2592,7 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
         .end_byte = end,
         .source_origin = origin,
         .result = result,
-        .binding_proof = local_occurrence_proof(resolver, source ? source->qualified_name : scope,
-                                                name, relation, start, end, origin, &result),
+        .binding_proof = binding,
         .content_identity =
             origin >= CBM_SOURCE_ORIGIN_RAW && origin <= CBM_SOURCE_ORIGIN_PREPROCESSED
                 ? resolver->file->result->source_content_id[origin]
@@ -2299,9 +2616,15 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
         const semantic_site_t *site =
             find_semantic(resolver, call->enclosing_func_qn, call->site_start_byte,
                           call->site_end_byte, call->source_origin, CBM_RESOLVED_INVOCATION);
+        /* Exact simple JSX tags can obtain an independent lexical proof. An
+         * existing semantic result, including ambiguity, remains authoritative. */
+        bool lexical_jsx = call->requires_lsp_resolution &&
+                           cbm_resolve_binding_jsx_occurrence(
+                               resolver->bindings, call->callee_name, call->site_start_byte,
+                               call->site_end_byte, call->source_origin);
         cbm_resolve_result_t outcome =
             site ? semantic_result(resolver, site, arena)
-            : call->requires_lsp_resolution
+            : call->requires_lsp_resolution && !lexical_jsx
                 ? unresolved("semantic_resolution_required")
                 : generic_result(resolver, call->callee_name, call->enclosing_func_qn,
                                  call->site_start_byte, call->site_end_byte, call->source_origin,
@@ -2418,6 +2741,12 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     char *owned = source ? NULL : file_source(file, &length);
     if (!source)
         source = owned;
+    CBMFileResult source_view;
+    TSTree *owner_tree = NULL;
+    cbm_resolver_file_t source_file = *file;
+    source_file.result =
+        owner_source_view(file->result, file->language, source, length, &source_view, &owner_tree);
+    file = &source_file;
     file_resolver_t resolver = {.shared = shared,
                                 .file = file,
                                 .arena = &arena,
@@ -2439,6 +2768,8 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     cbm_ht_free(resolver.import_names);
     cbm_ht_free(resolver.python_imports);
     cbm_free(CBM_MEM_CLASS_EXTRACT, resolver.sites);
+    if (owner_tree)
+        ts_tree_delete(owner_tree);
     cbm_arena_destroy(&arena);
     cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
     return ok;
@@ -2528,4 +2859,323 @@ bool cbm_shared_resolver_project(cbm_gbuf_t *graph) {
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, ordered);
     return ok;
+}
+
+/* Adapter bridges share source capture and occurrence sealing; the adapter
+ * retains responsibility for its language's closed lookup semantics. */
+typedef struct {
+    cbm_resolve_file_t file;
+    const char *captured_bytes;
+    size_t captured_length;
+    bool captured;
+} adapter_source_t;
+
+static bool adapter_fail(cbm_shared_resolver_adapter_t *adapter) {
+    if (adapter && adapter->ctx)
+        atomic_store(&adapter->ctx->resolver_failed, true);
+    return false;
+}
+
+static bool adapter_text_equal(const char *left, const char *right) {
+    return strcmp(left ? left : "", right ? right : "") == 0;
+}
+
+static bool adapter_snapshot_equal(const cbm_resolve_file_t *left,
+                                   const cbm_resolve_file_t *right) {
+    return left->raw_length == right->raw_length &&
+           left->preprocessed_length == right->preprocessed_length &&
+           left->language == right->language && left->complete == right->complete &&
+           adapter_text_equal(left->file_path, right->file_path) &&
+           adapter_text_equal(left->module, right->module) &&
+           adapter_text_equal(left->raw_content_identity, right->raw_content_identity) &&
+           adapter_text_equal(left->preprocessed_content_identity,
+                              right->preprocessed_content_identity) &&
+           adapter_text_equal(left->configuration_identity, right->configuration_identity) &&
+           adapter_text_equal(left->extracted_summary, right->extracted_summary);
+}
+
+/* Copy the row because recording another file may relocate the gbuf array.
+ * Its interned strings remain owned by the generation. */
+static bool adapter_index_snapshot(CBMHashTable *index, CBMArena *arena,
+                                   const cbm_resolve_file_t *file) {
+    if (!file->file_path || !file->file_path[0])
+        return false;
+    cbm_resolve_file_t *old = cbm_ht_get(index, file->file_path);
+    if (old)
+        return adapter_snapshot_equal(old, file);
+    cbm_resolve_file_t *copy = cbm_arena_alloc(arena, sizeof(*copy));
+    if (!copy)
+        return false;
+    *copy = *file;
+    cbm_ht_set(index, file->file_path, copy);
+    return cbm_ht_get(index, file->file_path) == copy;
+}
+
+bool cbm_shared_resolver_capture_sources(const cbm_pipeline_ctx_t *ctx,
+                                         const cbm_file_info_t *files, int file_count,
+                                         CBMFileResult **cache) {
+    if (!ctx || !ctx->gbuf || file_count < 0 || (file_count && (!files || !cache)))
+        return false;
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+    CBMHashTable *index = cbm_ht_create(0);
+    bool ok = index != NULL;
+    size_t count = 0;
+    const cbm_resolve_file_t *recorded = cbm_gbuf_resolver_files(ctx->gbuf, &count);
+    for (size_t i = 0; ok && i < count; i++)
+        ok = adapter_index_snapshot(index, &arena, &recorded[i]);
+    for (int i = 0; ok && i < file_count; i++) {
+        bool loaded = false;
+        bool parked = ctx->spill && cbm_result_spill_has(ctx->spill, i);
+        bool force_missing = false;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+        /* Deterministic acquisition failure at a real populated spill slot. */
+        force_missing = parked && !cache[i] &&
+                        (ctx->test_fault_mask & CBM_PIPELINE_TEST_FAULT_RESOLVER_SPILL_NULL);
+#endif
+        CBMFileResult *result =
+            force_missing ? NULL : cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+        if (!result) {
+            if (parked) {
+                cbm_log_error("resolver.sources.error", "file", files[i].rel_path, "reason",
+                              "spill_load_failed");
+                ok = false;
+            }
+            continue; /* An intentional extraction skip owns no spill slot. */
+        }
+        char extracted_summary[65];
+        cbm_resolve_file_t snapshot;
+        ok = cbm_resolve_capture_extraction_state(result) &&
+             cbm_resolve_snapshot(result, files[i].rel_path, files[i].language, &snapshot,
+                                  extracted_summary);
+        const cbm_resolve_file_t *old =
+            ok && snapshot.file_path ? cbm_ht_get(index, snapshot.file_path) : NULL;
+        if (ok && old) {
+            ok = adapter_snapshot_equal(old, &snapshot);
+        } else if (ok) {
+            ok = cbm_gbuf_record_resolver_file(ctx->gbuf, &snapshot);
+            if (ok) {
+                recorded = cbm_gbuf_resolver_files(ctx->gbuf, &count);
+                ok = count && adapter_index_snapshot(index, &arena, &recorded[count - 1]);
+            }
+        }
+        cbm_pipeline_result_release(result, loaded);
+    }
+    if (index)
+        cbm_ht_free(index);
+    cbm_arena_destroy(&arena);
+    return ok;
+}
+
+bool cbm_shared_resolver_adapter_init(cbm_shared_resolver_adapter_t *adapter,
+                                      cbm_pipeline_ctx_t *ctx, CBMArena *arena) {
+    if (!adapter)
+        return false;
+    *adapter = (cbm_shared_resolver_adapter_t){.ctx = ctx, .arena = arena};
+    if (!ctx || !ctx->gbuf || !arena)
+        return adapter_fail(adapter);
+    adapter->source_files = cbm_ht_create(0);
+    if (!adapter->source_files)
+        return adapter_fail(adapter);
+    cbm_resolve_proof_pool_init(&adapter->proofs, arena, 0, 0, 0);
+    size_t count = 0;
+    const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(ctx->gbuf, &count);
+    for (size_t i = 0; i < count; i++) {
+        const cbm_resolve_file_t *file = &files[i];
+        if (!file->file_path || !file->file_path[0])
+            return adapter_fail(adapter);
+        adapter_source_t *old = cbm_ht_get(adapter->source_files, file->file_path);
+        if (old) {
+            if (old->file.raw_length != file->raw_length || old->file.language != file->language ||
+                !adapter_text_equal(old->file.module, file->module) ||
+                !adapter_text_equal(old->file.raw_content_identity, file->raw_content_identity) ||
+                !adapter_text_equal(old->file.configuration_identity, file->configuration_identity))
+                return adapter_fail(adapter);
+            continue;
+        }
+        adapter_source_t *entry = cbm_arena_alloc(arena, sizeof(*entry));
+        if (!entry)
+            return adapter_fail(adapter);
+        *entry = (adapter_source_t){.file = *file};
+        cbm_ht_set(adapter->source_files, file->file_path, entry);
+        if (cbm_ht_get(adapter->source_files, file->file_path) != entry)
+            return adapter_fail(adapter);
+    }
+    return true;
+}
+
+void cbm_shared_resolver_adapter_dispose(cbm_shared_resolver_adapter_t *adapter) {
+    if (adapter && adapter->source_files) {
+        cbm_ht_free(adapter->source_files);
+        adapter->source_files = NULL;
+    }
+}
+
+bool cbm_shared_resolver_adapter_capture(cbm_shared_resolver_adapter_t *adapter, const char *file,
+                                         CBMLanguage language, const char *bytes, size_t length,
+                                         cbm_resolve_proof_source_t *source) {
+    adapter_source_t *entry =
+        adapter && adapter->source_files && file ? cbm_ht_get(adapter->source_files, file) : NULL;
+    if (!entry || !source || !bytes || entry->file.raw_length != length ||
+        entry->file.language != (uint32_t)language || !entry->file.raw_content_identity ||
+        !entry->file.raw_content_identity[0] || !entry->file.configuration_identity ||
+        !entry->file.configuration_identity[0] || memchr(bytes, '\0', length))
+        return adapter_fail(adapter);
+    char identity[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(bytes, length, identity);
+    if (strcmp(identity, entry->file.raw_content_identity) ||
+        !cbm_gbuf_capture_input(adapter->ctx->gbuf, file, true, length, identity))
+        return adapter_fail(adapter);
+    entry->captured = true;
+    entry->captured_bytes = bytes;
+    entry->captured_length = length;
+    *source =
+        (cbm_resolve_proof_source_t){.project = adapter->ctx->project_name,
+                                     .file = entry->file.file_path,
+                                     .module = entry->file.module,
+                                     .content_identity = entry->file.raw_content_identity,
+                                     .configuration_identity = entry->file.configuration_identity,
+                                     .source_origin = CBM_SOURCE_ORIGIN_RAW};
+    return true;
+}
+
+static bool adapter_source_matches(cbm_shared_resolver_adapter_t *adapter,
+                                   const cbm_resolve_proof_source_t *source) {
+    adapter_source_t *entry = adapter && adapter->source_files && source && source->file
+                                  ? cbm_ht_get(adapter->source_files, source->file)
+                                  : NULL;
+    return entry && entry->captured && source->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+           source->scope && source->scope[0] &&
+           adapter_text_equal(source->project, adapter->ctx->project_name) &&
+           adapter_text_equal(source->module, entry->file.module) &&
+           adapter_text_equal(source->content_identity, entry->file.raw_content_identity) &&
+           adapter_text_equal(source->configuration_identity, entry->file.configuration_identity);
+}
+
+const cbm_resolve_proof_t *cbm_shared_resolver_adapter_occurrence(
+    cbm_shared_resolver_adapter_t *adapter, const cbm_resolve_proof_source_t *source,
+    const char *bytes, size_t length, uint32_t start, uint32_t end, const char *spelling,
+    const char *relation) {
+    adapter_source_t *entry = adapter && adapter->source_files && source && source->file
+                                  ? cbm_ht_get(adapter->source_files, source->file)
+                                  : NULL;
+    if (!adapter_source_matches(adapter, source) || !entry || !bytes ||
+        entry->captured_bytes != bytes || entry->captured_length != length || end <= start ||
+        end > length || !spelling || strlen(spelling) != end - start ||
+        memcmp(bytes + start, spelling, end - start) || !controlled_relation(relation)) {
+        (void)adapter_fail(adapter);
+        return NULL;
+    }
+    cbm_resolve_proof_key_t key = {.lookup_domain = source->scope,
+                                   .lookup_key = spelling,
+                                   .detail = relation,
+                                   .start_byte = start,
+                                   .end_byte = end,
+                                   .origin = source->source_origin};
+    cbm_resolve_result_t parsed = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                   .facts = CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+                                   .reason = "adapter_original_source_occurrence"};
+    const cbm_resolve_proof_t *proof =
+        cbm_resolve_proof_leaf(&adapter->proofs, CBM_PROOF_SOURCE_FACT, source, &key, &parsed);
+    if (!proof)
+        (void)adapter_fail(adapter);
+    return proof;
+}
+
+static bool adapter_semantic_matches(const cbm_resolve_proof_view_t *site,
+                                     const cbm_resolve_proof_view_t *semantic) {
+    return semantic && semantic->kind != CBM_PROOF_SOURCE_FACT &&
+           semantic->kind != CBM_PROOF_OCCURRENCE_BINDING &&
+           adapter_text_equal(site->source.project, semantic->source.project) &&
+           adapter_text_equal(site->source.file, semantic->source.file) &&
+           adapter_text_equal(site->source.module, semantic->source.module) &&
+           adapter_text_equal(site->source.scope, semantic->source.scope) &&
+           adapter_text_equal(site->source.content_identity, semantic->source.content_identity) &&
+           adapter_text_equal(site->source.configuration_identity,
+                              semantic->source.configuration_identity) &&
+           site->source.source_origin == semantic->source.source_origin &&
+           site->key.start_byte == semantic->key.start_byte &&
+           site->key.end_byte == semantic->key.end_byte &&
+           site->key.origin == semantic->key.origin &&
+           adapter_text_equal(site->key.lookup_key, semantic->key.lookup_key) &&
+           adapter_text_equal(site->key.detail, semantic->key.detail) &&
+           (semantic->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+            adapter_text_equal(semantic->key.binding_identity, semantic->outcome.target));
+}
+
+bool cbm_shared_resolver_adapter_record_proofs(cbm_shared_resolver_adapter_t *adapter,
+                                               const cbm_resolve_proof_t *occurrence,
+                                               int64_t owner_id, int64_t target_id,
+                                               const char *properties,
+                                               const cbm_resolve_proof_t *semantic) {
+    const cbm_resolve_proof_view_t *site = cbm_resolve_proof_view(occurrence);
+    const cbm_resolve_proof_view_t *lookup = cbm_resolve_proof_view(semantic);
+    if (!adapter || !site || site->kind != CBM_PROOF_SOURCE_FACT ||
+        !cbm_resolve_proof_pool_owns(&adapter->proofs, occurrence) ||
+        !adapter_source_matches(adapter, &site->source) ||
+        !adapter_semantic_matches(site, lookup) || !controlled_relation(site->key.detail))
+        return adapter_fail(adapter);
+    const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(adapter->ctx->gbuf, owner_id);
+    const cbm_gbuf_node_t *target =
+        target_id > 0 ? cbm_gbuf_find_by_id(adapter->ctx->gbuf, target_id) : NULL;
+    cbm_resolve_result_t outcome = lookup->outcome;
+    bool exact = cbm_resolve_admit(&outcome);
+    if (!owner || !adapter_text_equal(owner->qualified_name, site->source.scope) ||
+        !adapter_text_equal(owner->file_path, site->source.file) ||
+        (exact && (!lookup->key.lookup_closed || !lookup->predecessors_closed || !target ||
+                   !adapter_text_equal(target->qualified_name, outcome.target))) ||
+        (!exact && target_id > 0))
+        return adapter_fail(adapter);
+    if (exact &&
+        (!strcmp(site->key.detail, "CALLS") || !strcmp(site->key.detail, "CALL_REFERENCE")) &&
+        !callable_node(target))
+        return adapter_fail(adapter);
+    if (exact && !strcmp(site->key.detail, "USES_TYPE") && !cbm_label_is_type_like(target->label))
+        return adapter_fail(adapter);
+    cbm_resolve_proof_key_t key = site->key;
+    key.binding_identity = outcome.target;
+    key.lookup_closed = lookup->key.lookup_closed;
+    if (exact)
+        outcome.facts |= CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
+    const cbm_resolve_proof_t *premises[] = {occurrence, semantic};
+    const cbm_resolve_proof_t *joined = cbm_resolve_proof_derive(
+        &adapter->proofs, CBM_PROOF_NAMED_JOIN, &site->source, &key, &outcome, premises, 2, true);
+    outcome.proof = joined
+                        ? cbm_resolve_proof_derive(&adapter->proofs, CBM_PROOF_OCCURRENCE_BINDING,
+                                                   &site->source, &key, &outcome, &joined, 1, true)
+                        : NULL;
+    if (!outcome.proof)
+        return adapter_fail(adapter);
+    const cbm_resolve_proof_t *root = outcome.proof;
+    outcome = root->value.outcome;
+    outcome.proof = root;
+    cbm_resolve_record_t record = {.file_path = site->source.file,
+                                   .scope = site->source.scope,
+                                   .relation = site->key.detail,
+                                   .spelling = site->key.lookup_key,
+                                   .properties_json = properties,
+                                   .start_byte = site->key.start_byte,
+                                   .end_byte = site->key.end_byte,
+                                   .source_origin = site->key.origin,
+                                   .result = outcome,
+                                   .content_identity = site->source.content_identity,
+                                   .configuration_identity = site->source.configuration_identity};
+    record.emitted = cbm_resolve_record_admit(&record);
+    if ((exact && !record.emitted) || !cbm_gbuf_record_resolution(adapter->ctx->gbuf, &record) ||
+        (record.emitted && !cbm_gbuf_insert_edge(adapter->ctx->gbuf, owner_id, target_id,
+                                                 record.relation, properties)))
+        return adapter_fail(adapter);
+    return true;
+}
+
+bool cbm_shared_resolver_adapter_record(cbm_shared_resolver_adapter_t *adapter,
+                                        const cbm_resolve_proof_source_t *source, const char *bytes,
+                                        size_t length, uint32_t start, uint32_t end,
+                                        const char *spelling, int64_t owner, int64_t target,
+                                        const char *relation, const char *properties,
+                                        const cbm_resolve_proof_t *semantic) {
+    const cbm_resolve_proof_t *site = cbm_shared_resolver_adapter_occurrence(
+        adapter, source, bytes, length, start, end, spelling, relation);
+    return site && cbm_shared_resolver_adapter_record_proofs(adapter, site, owner, target,
+                                                             properties, semantic);
 }

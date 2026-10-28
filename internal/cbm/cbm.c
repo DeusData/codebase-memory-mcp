@@ -4152,7 +4152,11 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
                     // block). Runs in every mode.
-                    if (!result->lsp_skipped) {
+                    /* Best-effort extraction may guess export macros or skip
+                     * headers. Such a transform cannot manufacture proof even
+                     * when its expanded tree parses cleanly. Raw/direct proof
+                     * paths remain independent of this second-pass boundary. */
+                    if (!result->lsp_skipped && preprocessed->proof_issues == 0) {
                         cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
                                       language != CBM_LANG_C, CBM_SOURCE_ORIGIN_PREPROCESSED);
                     }

@@ -7522,6 +7522,7 @@ static void mutate_semantic_input_before_final_manifest(void *userdata) {
  * than borrowing a declaration range or expectations from resolver output. */
 typedef struct {
     const char *id, *file, *source, *dotenv, *scalar, *repository;
+    const char *owner_suffix, *owner_name; /* explicit non-Compose owner, when supplied */
     bool required;
     const char *why, *tried;
 } ComposeImageGolden;
@@ -7571,7 +7572,10 @@ static bool compose_image_quality(cbm_store_t *store, const ComposeImageGolden *
             metadata++;
         char digest[CBM_SHA256_HEX_LEN + 1], scope[512], target[512];
         cbm_sha256_hex(g->source, strlen(g->source), digest);
-        snprintf(scope, sizeof(scope), "composeproof.%s.compose::compose/Service/-/web", g->id);
+        if (g->owner_suffix)
+            snprintf(scope, sizeof(scope), "composeproof.%s", g->owner_suffix);
+        else
+            snprintf(scope, sizeof(scope), "composeproof.%s.compose::compose/Service/-/web", g->id);
         snprintf(target, sizeof(target), "__image__%s", g->repository ? g->repository : "");
         const char *site = strstr(g->source, g->scalar);
         if (!site) {
@@ -7594,7 +7598,8 @@ static bool compose_image_quality(cbm_store_t *store, const ComposeImageGolden *
                          rq_equal((const char *)sqlite3_column_text(stmt, 4), scope) &&
                          rq_equal((const char *)sqlite3_column_text(stmt, 5), target) &&
                          rq_equal((const char *)sqlite3_column_text(stmt, 9), g->file) &&
-                         rq_equal((const char *)sqlite3_column_text(stmt, 10), "Service/web") &&
+                         rq_equal((const char *)sqlite3_column_text(stmt, 10),
+                                  g->owner_name ? g->owner_name : "Service/web") &&
                          rq_equal((const char *)sqlite3_column_text(stmt, 11), "Resource") &&
                          rq_equal((const char *)sqlite3_column_text(stmt, 12), g->repository) &&
                          rq_equal((const char *)sqlite3_column_text(stmt, 13), "Image") &&
@@ -7765,6 +7770,85 @@ TEST(pipeline_compose_repository_quality_sequential_and_parallel) {
             quality[mode] =
                 compose_image_quality(store, goldens, sizeof(goldens) / sizeof(goldens[0]),
                                       mode ? "parallel" : "sequential");
+        if (store)
+            cbm_store_close(store);
+        xlang_env_restore(&env);
+        th_rmtree(tmp);
+        ASSERT_EQ(rc, 0);
+    }
+    ASSERT_TRUE(quality[0]);
+    ASSERT_TRUE(quality[1]);
+    PASS();
+}
+
+/* Kubernetes images use the same repository ontology, but an independently
+ * authored Resource owner and exact original YAML scalar. No emitted row can
+ * create a golden or turn the unsupported alias into a successful lookup. */
+TEST(pipeline_k8s_repository_quality_sequential_and_parallel) {
+    static const char prefix[] = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n"
+                                 "spec:\n  containers:\n  - name: app\n";
+    static const struct {
+        const char *id, *image_lines, *scalar, *repository;
+        bool required;
+        const char *why, *tried;
+    } cases[] = {{"literal", "    image: acme/literal:1\n", "acme/literal:1", "acme/literal", true,
+                  NULL, NULL},
+                 {"quoted", "    image: 'acme/quoted:2'\n", "'acme/quoted:2'", "acme/quoted", true,
+                  NULL, NULL},
+                 {"quoted_bool", "    image: \"true\"\n", "\"true\"", "true", true, NULL, NULL},
+                 {"typed_bool", "    image: true\n", "true", NULL, false, NULL, NULL},
+                 {"typed_number", "    image: 123\n", "123", NULL, false, NULL, NULL},
+                 {"duplicate", "    image: acme/one:1\n    image: acme/two:1\n", "acme/one:1", NULL,
+                  false, NULL, NULL},
+                 {"alias", "    image: *image\n", "*image", "acme/alias", false,
+                  "Kubernetes image aliases need an audited YAML alias expansion and source map.",
+                  "The fixture supplies a unique string anchor; extraction must count this genuine "
+                  "missing reference without substituting a nearby image scalar."}};
+    enum { COUNT = sizeof(cases) / sizeof(cases[0]) };
+    ComposeImageGolden goldens[COUNT];
+    char paths[COUNT][96], owners[COUNT][128], sources[COUNT][512];
+    for (size_t i = 0; i < COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/pod.yaml", cases[i].id);
+        snprintf(owners[i], sizeof(owners[i]), "%s.pod.yaml::core/Pod/-/web", cases[i].id);
+        /* An annotation is a string-valued, legitimate anchor declaration. */
+        if (!strcmp(cases[i].id, "alias"))
+            snprintf(sources[i], sizeof(sources[i]),
+                     "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n  annotations:\n"
+                     "    image: &image acme/alias:1\nspec:\n  containers:\n  - name: app\n%s",
+                     cases[i].image_lines);
+        else
+            snprintf(sources[i], sizeof(sources[i]), "%s%s", prefix, cases[i].image_lines);
+        goldens[i] = (ComposeImageGolden){.id = cases[i].id,
+                                          .file = paths[i],
+                                          .source = sources[i],
+                                          .scalar = cases[i].scalar,
+                                          .repository = cases[i].repository,
+                                          .owner_suffix = owners[i],
+                                          .owner_name = "Pod/web",
+                                          .required = cases[i].required,
+                                          .why = cases[i].why,
+                                          .tried = cases[i].tried};
+    }
+    bool quality[2] = {false, false};
+    for (int mode = 0; mode < 2; mode++) {
+        char tmp[256] = "/tmp/cbm_k8s_image_proof_XXXXXX";
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        for (size_t i = 0; i < COUNT; i++)
+            write_temp_file(tmp, goldens[i].file, goldens[i].source);
+        for (int i = 0; i < 55; i++) {
+            char name[64], source[96];
+            snprintf(name, sizeof(name), "filler_%02d.py", i);
+            snprintf(source, sizeof(source), "def filler_%02d():\n    return %d\n", i, i);
+            write_temp_file(tmp, name, source);
+        }
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/k8s.db", tmp);
+        XlangEnvSave env = xlang_env_select(mode != 0);
+        int rc = compose_proof_index(tmp, db_path);
+        cbm_store_t *store = rc == 0 ? cbm_store_open_path_query(db_path) : NULL;
+        if (store)
+            quality[mode] = compose_image_quality(store, goldens, COUNT,
+                                                  mode ? "k8s-parallel" : "k8s-sequential");
         if (store)
             cbm_store_close(store);
         xlang_env_restore(&env);
@@ -34974,6 +35058,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     RUN_TEST(pipeline_compose_repository_quality_sequential_and_parallel);
+    RUN_TEST(pipeline_k8s_repository_quality_sequential_and_parallel);
     RUN_TEST(pipeline_compose_typed_image_scalars_are_not_references);
     RUN_TEST(pipeline_compose_ignored_dotenv_mutation_preserves_publication);
     RUN_TEST(pipeline_compose_ignored_dotenv_changes_force_full);

@@ -25,6 +25,26 @@ static int go_proven_count(const CBMResolvedCallArray *rows, const char *target)
     return count;
 }
 
+/* Count exactly the authored occurrence, including any unadmitted row on a
+ * forbidden site. A required target additionally needs an admission proof. */
+static int go_anchored_rows(const CBMResolvedCallArray *rows, const char *source,
+                            const char *anchor, size_t offset, size_t length, CBMResolvedKind kind,
+                            const char *target) {
+    const char *site = strstr(source, anchor);
+    if (!site || strstr(site + 1, anchor) || offset + length > strlen(anchor))
+        return -1;
+    size_t start = (size_t)(site - source) + offset;
+    int count = 0;
+    for (int i = 0; i < rows->count; i++) {
+        const CBMResolvedCall *row = &rows->items[i];
+        if (row->site_start_byte == start && row->site_end_byte == start + length &&
+            row->kind == kind &&
+            (!target || (go_row_admitted(row) && (!target[0] || !strcmp(row->callee_qn, target)))))
+            count++;
+    }
+    return count;
+}
+
 /* Independent source anchors distinguish invocation from reading a callable.
  * Every admitted row in these fixtures must match exactly one authored site. */
 typedef struct {
@@ -300,6 +320,115 @@ TEST(resolver_go_alias_reassignment_and_branch_join_clear_identity) {
                                   sizeof(control_expected) / sizeof(control_expected[0]));
     cbm_arena_destroy(&arena);
     ASSERT(positive);
+    ASSERT(exact);
+    PASS();
+}
+
+TEST(resolver_go_known_target_control_flow_aliases_do_not_escape) {
+    const char *constructs[] = {
+        "if cond { callback = alternate; /* branch */ sink(callback); callback() }",
+        "if cond { callback = alternate; /* branch */ sink(callback); callback() } "
+        "else { /* sibling */ sink(callback); callback() }",
+        "for cond { callback = alternate; /* branch */ sink(callback); callback() }",
+        "switch { case cond: callback = alternate; /* branch */ sink(callback); callback(); "
+        "case !cond: /* sibling */ sink(callback); callback() }",
+        "switch value.(type) { case int: callback = alternate; "
+        "/* branch */ sink(callback); callback(); "
+        "case string: /* sibling */ sink(callback); callback() }",
+        "select { case <-ch: callback = alternate; /* branch */ sink(callback); callback(); "
+        "default: /* sibling */ sink(callback); callback() }"};
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .short_name = "work",
+                         .label = "Function",
+                         .declaration_identity = "guarded:1"},
+                        {.qualified_name = "test.main.alternate",
+                         .short_name = "alternate",
+                         .label = "Function",
+                         .declaration_identity = "guarded:2"},
+                        {.qualified_name = "test.main.sink",
+                         .short_name = "sink",
+                         .label = "Function",
+                         .declaration_identity = "guarded:3"}};
+    for (size_t i = 0; i < sizeof(constructs) / sizeof(constructs[0]); i++) {
+        char source[1024];
+        int written =
+            snprintf(source, sizeof(source),
+                     "package main\nfunc run(cond bool, value interface{}, ch chan bool) { "
+                     "callback := work; %s; /* joined */ sink(callback); callback() }\n",
+                     constructs[i]);
+        ASSERT(written > 0 && (size_t)written < sizeof(source));
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        CBMResolvedCallArray rows = {0};
+        go_cross(&arena, source, defs, 3, NULL, NULL, 0, &rows);
+        int initial = go_anchored_rows(&rows, source, "callback := work", 12, 4,
+                                       CBM_RESOLVED_CALL_REFERENCE, "test.main.work");
+        int branch_reference =
+            go_anchored_rows(&rows, source, "/* branch */ sink(callback); callback()", 18, 8,
+                             CBM_RESOLVED_CALL_REFERENCE, "test.main.alternate");
+        int branch_call = go_anchored_rows(&rows, source, "/* branch */ sink(callback); callback()",
+                                           29, 10, CBM_RESOLVED_INVOCATION, "test.main.alternate");
+        int joined_reference =
+            go_anchored_rows(&rows, source, "/* joined */ sink(callback); callback()", 18, 8,
+                             CBM_RESOLVED_CALL_REFERENCE, NULL);
+        int joined_call = go_anchored_rows(&rows, source, "/* joined */ sink(callback); callback()",
+                                           29, 10, CBM_RESOLVED_INVOCATION, "");
+        int joined_sink = go_anchored_rows(&rows, source, "/* joined */ sink(callback); callback()",
+                                           13, 14, CBM_RESOLVED_INVOCATION, "test.main.sink");
+        int sibling_reference = 0, sibling_call = 0;
+        if (strstr(constructs[i], "/* sibling */")) {
+            sibling_reference =
+                go_anchored_rows(&rows, source, "/* sibling */ sink(callback); callback()", 19, 8,
+                                 CBM_RESOLVED_CALL_REFERENCE, NULL);
+            sibling_call =
+                go_anchored_rows(&rows, source, "/* sibling */ sink(callback); callback()", 30, 10,
+                                 CBM_RESOLVED_INVOCATION, "");
+        }
+        cbm_arena_destroy(&arena);
+        ASSERT_EQ(initial, 1);
+        ASSERT_EQ(branch_reference, 1);
+        ASSERT_EQ(branch_call, 1);
+        ASSERT_EQ(joined_sink, 1);
+        ASSERT_EQ(joined_reference, 0);
+        /* Unresolved invocation diagnostics are retained; only exact target
+         * rows are forbidden at a control-flow join. */
+        ASSERT_EQ(joined_call, 0);
+        ASSERT_EQ(sibling_reference, 0);
+        ASSERT_EQ(sibling_call, 0);
+    }
+    PASS();
+}
+
+TEST(resolver_go_unconditional_known_target_reassignment_stays_exact) {
+    const char *source = "package main\nfunc run() { callback := work; "
+                         "callback = alternate; sink(callback); callback() }\n";
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .short_name = "work",
+                         .label = "Function",
+                         .declaration_identity = "unconditional:1"},
+                        {.qualified_name = "test.main.alternate",
+                         .short_name = "alternate",
+                         .label = "Function",
+                         .declaration_identity = "unconditional:2"},
+                        {.qualified_name = "test.main.sink",
+                         .short_name = "sink",
+                         .label = "Function",
+                         .declaration_identity = "unconditional:3"}};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray rows = {0};
+    go_cross(&arena, source, defs, 3, NULL, NULL, 0, &rows);
+    const go_expected_site_t expected[] = {
+        {"callback := work", 12, "work", "work", "test.main.work", CBM_RESOLVED_CALL_REFERENCE},
+        {"callback = alternate", 11, "alternate", "alternate", "test.main.alternate",
+         CBM_RESOLVED_CALL_REFERENCE},
+        {"sink(callback)", 0, "sink(callback)", "sink", "test.main.sink", CBM_RESOLVED_INVOCATION},
+        {"sink(callback)", 5, "callback", "callback", "test.main.alternate",
+         CBM_RESOLVED_CALL_REFERENCE},
+        {"callback()", 0, "callback()", "callback", "test.main.alternate",
+         CBM_RESOLVED_INVOCATION}};
+    bool exact = go_exact_rows(&rows, source, expected, sizeof(expected) / sizeof(expected[0]));
+    cbm_arena_destroy(&arena);
     ASSERT(exact);
     PASS();
 }
@@ -648,6 +777,8 @@ SUITE(resolver_go) {
     RUN_TEST(resolver_go_declared_methods_keep_interface_declaration_target);
     RUN_TEST(resolver_go_promoted_or_unknown_receiver_does_not_guess);
     RUN_TEST(resolver_go_alias_reassignment_and_branch_join_clear_identity);
+    RUN_TEST(resolver_go_known_target_control_flow_aliases_do_not_escape);
+    RUN_TEST(resolver_go_unconditional_known_target_reassignment_stays_exact);
     RUN_TEST(resolver_go_fast_crossfile_requires_ast_binding_evidence);
     RUN_TEST(resolver_go_fast_crossfile_rejects_pending_metadata_changes);
     RUN_TEST(resolver_go_fast_crossfile_preserves_pending_receiver_proof);

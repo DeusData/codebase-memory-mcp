@@ -3750,7 +3750,7 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
  * type is not reachable by its simple name through a namespace). */
 static const char *cs_top_level_namespace(const char *type_qn, const char *short_name,
                                           const char *module_qn, const char *namespace_name) {
-    if (!type_qn || !short_name || !module_qn || !namespace_name || !namespace_name[0])
+    if (!type_qn || !short_name || !module_qn || !namespace_name)
         return NULL;
     size_t mlen = strlen(module_qn);
     if (strncmp(type_qn, module_qn, mlen) != 0 || type_qn[mlen] != '.' ||
@@ -3819,6 +3819,7 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
                 (d->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) ? d->signature_param_count : -1;
             rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
             rf.source_flags = d->source_flags;
+            rf.source_signature = d->source_signature;
             rf.declaration_identity = d->declaration_identity;
             rf.graph_qualified_name = d->graph_qualified_name;
             rf.sig = d->sig;

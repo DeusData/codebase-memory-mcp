@@ -470,6 +470,44 @@ static bool build_line_map(const std::string &expanded, const std::string &main_
     return true;
 }
 
+// Keep this authority check narrower than permissive extraction. The token
+// stream has already applied comments and line splicing, so a textual search
+// cannot mistake a string/comment for a directive or overlook a continued one.
+// Compiler-reserved identifiers and sizeof may depend on an unrecorded target
+// ABI, compiler, clock, or filesystem. Stringizing/pasting can manufacture those
+// names, and pragma operators can mutate state outside ordinary macro rules.
+static uint32_t preprocessing_proof_issues(const simplecpp::TokenList &tokens) {
+    uint32_t issues = 0;
+    for (const simplecpp::Token *tok = tokens.cfront(); tok; tok = tok->next) {
+        if (tok->comment)
+            continue;
+        const std::string &name = tok->str();
+        if (tok->name &&
+            (name == "sizeof" || (name.size() > 1 && name[0] == '_' &&
+                                  (name[1] == '_' || (name[1] >= 'A' && name[1] <= 'Z'))))) {
+            issues |= CBM_PREPROCESS_PROOF_UNSUPPORTED_SYNTAX;
+        }
+        if (tok->op != '#')
+            continue;
+        const simplecpp::Token *previous = tok->previousSkipComments();
+        if (previous && previous->location.sameline(tok->location)) {
+            issues |= CBM_PREPROCESS_PROOF_UNSUPPORTED_SYNTAX;
+            continue;
+        }
+        const simplecpp::Token *directive = tok->nextSkipComments();
+        if (!directive || !directive->location.sameline(tok->location))
+            continue; // A null directive has no effect.
+        const std::string &kind = directive->str();
+        if (kind == "include") {
+            issues |= CBM_PREPROCESS_PROOF_HEADER_DEPENDENCY;
+        } else if (kind != "define" && kind != "undef" && kind != "if" && kind != "ifdef" &&
+                   kind != "ifndef" && kind != "elif" && kind != "else" && kind != "endif") {
+            issues |= CBM_PREPROCESS_PROOF_UNSUPPORTED_SYNTAX;
+        }
+    }
+    return issues;
+}
+
 CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_len,
                                                const char *filename, const char **extra_defines,
                                                const char **include_paths, int cpp_mode) {
@@ -483,6 +521,8 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
 
     try {
         simplecpp::DUI dui;
+        uint32_t proof_issues = 0;
+        simplecpp::OutputList diagnostics;
         if (extra_defines) {
             for (int i = 0; extra_defines[i]; i++)
                 dui.defines.push_back(extra_defines[i]);
@@ -506,6 +546,7 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
                 }
             }
             if (!provided) {
+                proof_issues |= CBM_PREPROCESS_PROOF_GUESSED_CONFIG;
                 dui.defines.push_back(std::string(export_cands[i]) + "=");
             }
         }
@@ -520,11 +561,26 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
         std::vector<std::string> files;
         files.push_back(filename ? filename : "<input>");
 
-        simplecpp::TokenList rawtokens(istr, files, files[0]);
+        simplecpp::TokenList rawtokens(istr, files, files[0], &diagnostics);
+        proof_issues |= preprocessing_proof_issues(rawtokens);
+        // Explicit definitions have the same syntax boundary as source macros.
+        // Audit them separately without adding synthetic files to the map.
+        for (int i = 0; extra_defines && extra_defines[i]; i++) {
+            std::vector<std::string> define_files;
+            std::istringstream define_input(extra_defines[i]);
+            simplecpp::TokenList define_tokens(define_input, define_files, "<define>",
+                                               &diagnostics);
+            proof_issues |= preprocessing_proof_issues(define_tokens);
+        }
         simplecpp::TokenList output(files);
-        simplecpp::FileDataCache filedata = simplecpp::load(rawtokens, files, dui);
+        simplecpp::FileDataCache filedata = simplecpp::load(rawtokens, files, dui, &diagnostics);
 
-        simplecpp::preprocess(output, rawtokens, files, filedata, dui);
+        simplecpp::preprocess(output, rawtokens, files, filedata, dui, &diagnostics);
+        if (!diagnostics.empty())
+            proof_issues |= CBM_PREPROCESS_PROOF_DIAGNOSTIC;
+        if (filedata.size() || files.size() != 1)
+            proof_issues |= CBM_PREPROCESS_PROOF_HEADER_DEPENDENCY;
+        proof_issues |= preprocessing_proof_issues(output);
 
         std::string result = stringify_source_spacing(output);
 
@@ -541,6 +597,7 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
             (uint32_t *)calloc((size_t)line_count + 1u, sizeof(uint32_t));
         pp->belongs_to_main_file = (uint8_t *)calloc((size_t)line_count + 1u, sizeof(uint8_t));
         pp->expanded_line_count = line_count;
+        pp->proof_issues = proof_issues;
         if (!pp->source || !pp->original_line_by_expanded_line || !pp->belongs_to_main_file) {
             cbm_preprocessed_source_free(pp);
             return NULL;

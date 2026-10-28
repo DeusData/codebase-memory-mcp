@@ -10,6 +10,10 @@ cbm_resolve_proof_source_t cbm_result_proof_source(const CBMFileResult *result,
 void cbm_resolve_hash_text(cbm_sha256_ctx *hash, const char *value);
 void cbm_resolve_hash_number(cbm_sha256_ctx *hash, uint64_t value);
 void cbm_resolve_hash_finish(cbm_sha256_ctx *hash, char output[65]);
+/* Freeze the original extraction quality once. Recapture validates parser
+ * state and permits only an explicitly reported later LSP error transition. */
+bool cbm_resolve_capture_extraction_state(CBMFileResult *result);
+
 /* Summary of extracted declarations/imports/type assignments, separately from
  * stabilized exported bindings and type derivations. Borrows result strings. */
 bool cbm_resolve_snapshot(const CBMFileResult *result, const char *path, CBMLanguage language,

@@ -101,6 +101,39 @@ static int imp_check_label(cbm_store_t *s, const char *project, const char *labe
     return bad == 0 ? count : -1;
 }
 
+/* Check the authored two-file fixture independently of the synthetic Python
+ * builtins that the pipeline also scores. Every Function, including builtins,
+ * must carry one key; the source declarations must retain their exact identity. */
+static bool imp_check_two_file_fixture(cbm_store_t *store, const char *project) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, "Function", &nodes, &count) != CBM_STORE_OK)
+        return false;
+    char helper[320], caller[320];
+    snprintf(helper, sizeof(helper), "%s.a.helper", project);
+    snprintf(caller, sizeof(caller), "%s.b.caller", project);
+    unsigned found = 0;
+    bool ok = true;
+    for (int i = 0; i < count; i++) {
+        const cbm_node_t *node = nodes + i;
+        ok = ok && imp_key_count(node->properties_json) == 1;
+        if (node->file_path && !strcmp(node->file_path, "<python-builtins>"))
+            continue;
+        unsigned bit =
+            node->qualified_name && node->file_path && !strcmp(node->qualified_name, helper) &&
+                    !strcmp(node->file_path, "a.py") && node->start_line == 1 && node->end_line == 2
+                ? 1
+            : node->qualified_name && node->file_path && !strcmp(node->qualified_name, caller) &&
+                    !strcmp(node->file_path, "b.py") && node->start_line == 3 && node->end_line == 4
+                ? 2
+                : 0;
+        ok = ok && bit && !(found & bit);
+        found |= bit;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return ok && found == 3;
+}
+
 /* ── Store-level score readout (for the closure-delta tests) ──────────── */
 
 typedef struct {
@@ -595,12 +628,11 @@ static void imp_pass_sink(const char *line) {
     }
 }
 
-/* End-to-end, on the incremental route that actually rehydrates the stored
- * graph (LEGACY_PARTIAL — production's other incremental route, closure
- * repair, works on a delta buffer and never sees pre-scored nodes). Index,
- * edit a file, index again: the run must be observed on that route, the pass
- * must have run on it, and every stored symbol must carry exactly one key. An
- * append-only write-back produces two here. */
+/* The test-only legacy route still exercises re-scoring rehydrated nodes, but
+ * cannot publish without a complete resolver generation. Its rejection must
+ * preserve the old graph; a normal retry rebuilds and keeps one score key.
+ * importance_rehydrated_node_keeps_exactly_one_key directly guards the
+ * duplicate-key trap on a successful rehydrated buffer. */
 TEST(importance_second_index_run_keeps_exactly_one_key) {
     char *tmp = th_mktempdir("cbm_imp_incr");
     if (!tmp) {
@@ -627,8 +659,18 @@ TEST(importance_second_index_run_keeps_exactly_one_key) {
     char project[256];
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
     cbm_pipeline_free(p1);
+    cbm_log_set_sink(NULL);
 
-    /* Edit one file so the second run has real work but stays incremental. */
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(s);
+    unsigned char before_digest[32];
+    char before_generation[CBM_GRAPH_COMPARE_GENERATION_SIZE];
+    ASSERT_EQ(cbm_store_graph_content_digest(s, project, before_digest), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(s, before_generation, sizeof(before_generation)), CBM_STORE_OK);
+    ASSERT(imp_check_two_file_fixture(s, project));
+    cbm_store_close(s);
+
+    /* Edit one file so both the rejected attempt and recovery have real work. */
     ASSERT_EQ(th_write_file(TH_PATH(root, "b.py"),
                             "import a\n\ndef caller():\n    return a.helper() + a.helper()\n"),
               0);
@@ -636,46 +678,61 @@ TEST(importance_second_index_run_keeps_exactly_one_key) {
     cbm_pipeline_incremental_test_force_legacy_partial_once();
     cbm_pipeline_t *p2 = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
-    ASSERT_EQ(cbm_pipeline_run(p2), 0);
-    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_log_set_sink_ex(imp_pass_sink, CBM_LOG_SINK_TEE);
+    int rejected_rc = cbm_pipeline_run(p2);
+    cbm_incremental_route_t rejected_route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(p2);
     cbm_log_set_sink(NULL);
 
-    /* Route proof: without it a silent fall-back to a full reindex would make
-     * the duplicate-key assertion below vacuous. */
-    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(rejected_rc, CBM_PIPELINE_PERSIST_FAILED);
+    ASSERT_EQ((int)rejected_route, (int)CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    s = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(s);
+    unsigned char after_digest[32];
+    char after_generation[CBM_GRAPH_COMPARE_GENERATION_SIZE];
+    ASSERT_EQ(cbm_store_graph_content_digest(s, project, after_digest), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(s, after_generation, sizeof(after_generation)), CBM_STORE_OK);
+    ASSERT_EQ(memcmp(before_digest, after_digest, sizeof(before_digest)), 0);
+    ASSERT_STR_EQ(before_generation, after_generation);
+    ASSERT(imp_check_two_file_fixture(s, project));
+    cbm_store_close(s);
 
     int incr = atomic_load(&g_saw_incr_importance);
     int full = atomic_load(&g_saw_full_importance);
     printf("    importance pass runs: full=%d incremental=%d\n", full, incr);
     ASSERT_GT(full, 0); /* first run scored via the predump table */
-    /* The second run must have re-scored too — through whichever path it took.
-     * If it was NOT incremental the duplicate-key trap is untested, so say so
-     * rather than passing quietly. */
+    /* The rejected route must still reach the rehydrated scoring pass. */
     if (incr == 0) {
         th_rmtree(root);
         FAIL("second run did not re-score on the incremental path — trap untested");
     }
 
-    cbm_store_t *s = cbm_store_open_path(db_path);
+    atomic_store(&g_saw_full_importance, 0);
+    cbm_log_set_sink_ex(imp_pass_sink, CBM_LOG_SINK_TEE);
+    cbm_pipeline_t *p3 = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    int recovery_rc = p3 ? cbm_pipeline_run(p3) : CBM_NOT_FOUND;
+    cbm_incremental_route_t recovery_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(p3);
+    cbm_log_set_sink(NULL);
+    ASSERT_EQ(recovery_rc, 0);
+    ASSERT_EQ((int)recovery_route, (int)CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(atomic_load(&g_saw_full_importance), 1);
+
+    s = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(s);
-    int fc = imp_check_label(s, project, "Function", 1);
-    printf("    functions with exactly one importance key: %d\n", fc);
-    ASSERT_GT(fc, 0);
+    ASSERT(imp_check_two_file_fixture(s, project));
     cbm_store_close(s);
 
     th_rmtree(root);
     PASS();
 }
 
-/* ── Closure-delta route: the graph is only complete in the store ─────── */
+/* ── Re-indexing: importance uses the complete reference graph ───────── */
 
-/* REGRESSION. `helper` lives in hot.py and is called from 25 other files. Edit
- * hot.py and re-index: the closure-delta route purges hot.py's rows, rebuilds
- * them from a PROXY buffer that holds no project-wide edges, and persists what
- * it computed. Scoring off that buffer sees in-degree 0 and stores 0.0 for a
- * symbol with 25 real callers. The fix rescores in SQL after cbm_delta_patch
- * has re-linked the snapshotted inbound edges. */
+/* REGRESSION. `helper` lives in hot.py and is called from 25 other files. An
+ * earlier closure-delta implementation scored a proxy buffer with no inbound
+ * edges and stored 0.0. The resolver now requires a full generation rebuild
+ * after an input change; the 25 callers must still give helper a score of 5. */
 TEST(importance_closure_delta_keeps_referenced_symbol_sane) {
     enum { CALLERS = 25 };
     char *tmp = th_mktempdir("cbm_imp_delta");
@@ -710,30 +767,38 @@ TEST(importance_closure_delta_keeps_referenced_symbol_sane) {
            sqrt((double)CALLERS));
     /* Non-vacuous: the callers really produced edges. If this is 0 the fixture
      * stopped exercising the bug and the test below would prove nothing. */
-    ASSERT_TRUE(full_score > 1.0);
-    imp_scores_free(&before);
+    ASSERT_FLOAT_EQ(full_score, sqrt((double)CALLERS), 1e-6);
+    for (int i = 0; i < CALLERS; i++) {
+        char suffix[64];
+        snprintf(suffix, sizeof(suffix), ".c%d.use%d", i, i);
+        ASSERT_FLOAT_EQ(imp_score_of(&before, suffix), 0.0, 1e-6);
+    }
+    int expected_scored = before.count;
 
-    /* Touch hot.py so the delta route has exactly one file to repair. */
+    /* Only hot.py changes; its callers still belong to the new generation. */
     ASSERT_EQ(imp_write_hot_fixture(root, CALLERS, "# touched\n"), 0);
 
-    uint64_t sql0 = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed);
+    uint64_t scored0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
     cbm_pipeline_t *p2 = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
     ASSERT_EQ(cbm_pipeline_run(p2), 0);
     cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(p2);
-    uint64_t sql_rows = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed) - sql0;
+    uint64_t scored = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed) - scored0;
 
-    /* Route proof — without it a fall-back to a full reindex would repair the
-     * score for the wrong reason and the test would pass vacuously. */
-    printf("    route=%d (closure_repair=%d)  sql_rescored_rows=%llu\n", (int)route,
-           (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, (unsigned long long)sql_rows);
-    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    printf("    route=%d (forced_full=%d)  scored_symbols=%llu\n", (int)route,
+           (int)CBM_INCREMENTAL_ROUTE_FORCED_FULL, (unsigned long long)scored);
+    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 
     ImpScoreSet after = {0};
     ASSERT_EQ(imp_collect_scores(db_path, project, &after), 0);
     double delta_score = imp_score_of(&after, "helper");
-    printf("    after closure-delta helper score %.6f\n", delta_score);
+    printf("    after generation rebuild helper score %.6f\n", delta_score);
+    int score_mismatches = after.count != before.count;
+    for (int i = 0; i < before.count; i++)
+        if (!(fabs(imp_score_of(&after, before.qns[i]) - before.scores[i]) < 1e-6))
+            score_mismatches++;
+    imp_scores_free(&before);
     imp_scores_free(&after);
 
     th_rmtree(root);
@@ -741,9 +806,10 @@ TEST(importance_closure_delta_keeps_referenced_symbol_sane) {
     /* THE SYMPTOM, asserted before any mechanism guard: the graph is unchanged,
      * so the score must be unchanged. Scoring off the proxy buffer yields 0.0. */
     ASSERT_FLOAT_EQ(delta_score, full_score, 1e-6);
-    /* Mechanism guard second, so a regression fails on the wrong score rather
-     * than on bookkeeping. */
-    ASSERT_GT((long long)sql_rows, 0);
+    ASSERT_EQ(score_mismatches, 0);
+    /* Mechanism guard second: the complete generation scores each persisted
+     * Function/Method/Class once, including synthetic Python builtin nodes. */
+    ASSERT_EQ((long long)scored, (long long)expected_scored);
     PASS();
 }
 
@@ -784,25 +850,23 @@ TEST(importance_full_and_incremental_converge_on_same_scores) {
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
     cbm_pipeline_free(p1);
 
-    /* v2: c0's BODY starts calling helper. Body-only, so c0's surface is
-     * unchanged and the closure planner accepts the delta — but the in-degree
-     * of `helper`, which lives in the UNCHANGED hot.py, goes up by one. That
-     * is the case a changed-files-only rescore gets wrong: the symbol whose
-     * score moved is not in the changed set at all. */
+    /* v2: c0's body starts calling helper. The unchanged hot.py gains one
+     * inbound edge. A changed-files-only rescore would miss that score change;
+     * a complete new generation must agree with a cold index of the same tree. */
     ASSERT_EQ(th_write_file(TH_PATH(root, "c0.py"),
                             "import hot\n\ndef use0():\n    return hot.helper()\n"),
               0);
 
-    uint64_t sql0 = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed);
+    uint64_t scored0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
     cbm_pipeline_t *p2 = cbm_pipeline_new(root, db_incr, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
     ASSERT_EQ(cbm_pipeline_run(p2), 0);
     cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(p2);
-    uint64_t sql_rows = atomic_load_explicit(&g_importance_store_rows, memory_order_relaxed) - sql0;
-    printf("    route=%d (closure_repair=%d)  sql_rescored_rows=%llu\n", (int)route,
-           (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR, (unsigned long long)sql_rows);
-    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    uint64_t scored = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed) - scored0;
+    printf("    route=%d (forced_full=%d)  scored_symbols=%llu\n", (int)route,
+           (int)CBM_INCREMENTAL_ROUTE_FORCED_FULL, (unsigned long long)scored);
+    ASSERT_EQ((int)route, (int)CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 
     /* Same tree, indexed cold into a separate database. */
     char db_full[600];
@@ -838,8 +902,8 @@ TEST(importance_full_and_incremental_converge_on_same_scores) {
 
     ASSERT_GT(count_full, 5); /* non-vacuous: there really are symbols to compare */
     ASSERT_EQ(count_incr, count_full);
-    ASSERT_EQ(mismatches, 0);          /* the symptom */
-    ASSERT_GT((long long)sql_rows, 0); /* mechanism guard, asserted second */
+    ASSERT_EQ(mismatches, 0); /* the symptom */
+    ASSERT_EQ((long long)scored, (long long)count_full);
     PASS();
 }
 
@@ -902,7 +966,7 @@ SUITE(importance) {
     RUN_TEST(importance_rehydrated_node_keeps_exactly_one_key);
     RUN_TEST(importance_second_index_run_keeps_exactly_one_key);
 
-    /* Closure-delta route — the store-level recompute. */
+    /* Changed-input generation rebuild — complete-graph score recompute. */
     RUN_TEST(importance_closure_delta_keeps_referenced_symbol_sane);
     RUN_TEST(importance_full_and_incremental_converge_on_same_scores);
 

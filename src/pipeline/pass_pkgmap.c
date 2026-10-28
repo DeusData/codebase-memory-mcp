@@ -4238,12 +4238,12 @@ static php_use_shape_t php_use_shape(const char *source_rel, const CBMImport *im
 
 static const cbm_gbuf_node_t *resolve_import_target(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
-    const CBMImport *imp, CBMHashTable *namespace_map, bool *ambiguous, const char **reason) {
+    const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage lang, bool *ambiguous,
+    const char **reason) {
     if (!ctx || !ctx->gbuf || !imp || !imp->module_path || !imp->module_path[0]) {
         *reason = "invalid_import";
         return NULL;
     }
-    CBMLanguage lang = cbm_language_for_filename(path_leaf(source_rel ? source_rel : ""));
     if (lang == CBM_LANG_PYTHON && imp->module_path[0] == '.') {
         int dots = 0;
         while (imp->module_path[dots] == '.')
@@ -4256,6 +4256,18 @@ static const cbm_gbuf_node_t *resolve_import_target(
             *reason = "relative_import_above_root";
             return NULL;
         }
+    }
+    if (lang == CBM_LANG_CSS || lang == CBM_LANG_BICEP || lang == CBM_LANG_CAPNP) {
+        *reason = "literal_relative_path_unproven";
+        if (imp->kind != CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH)
+            return NULL;
+        char *directory = path_dirname(source_rel);
+        char path[PKGMAP_PATH_BUF];
+        bool valid =
+            directory && cbm_repo_rel_join(directory, imp->module_path, path, sizeof(path));
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+        *reason = valid ? "audited_literal_relative_path" : "relative_import_above_root";
+        return valid ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path) : NULL;
     }
     if (lang == CBM_LANG_KUSTOMIZE) {
         *reason = "relative_resource_path";
@@ -4272,6 +4284,19 @@ static const cbm_gbuf_node_t *resolve_import_target(
         return resolve_rust_import(ctx, source_rel, imp, namespace_map, ambiguous, NULL);
     }
     if (lang == CBM_LANG_PHP) {
+        if (imp->kind == CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN) {
+            *reason = "php_runtime_include_context_unknown";
+            return NULL;
+        }
+        if (imp->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH) {
+            char *directory = path_dirname(source_rel ? source_rel : "");
+            char path[PKGMAP_PATH_BUF];
+            bool valid =
+                directory && cbm_repo_rel_join(directory, imp->module_path, path, sizeof(path));
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+            *reason = valid ? "php_dir_anchored_include" : "relative_import_above_root";
+            return valid ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path) : NULL;
+        }
         const cbm_gbuf_node_t *psr4_target = NULL;
         switch (resolve_php_psr4_class(ctx->gbuf, source_file_qn, imp, &psr4_target)) {
         case PSR4_RESOLVED:
@@ -4294,29 +4319,39 @@ static const cbm_gbuf_node_t *resolve_import_target(
                 imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
             return namespace_member_target(ctx, namespace_map, "", name, lang, ambiguous);
         }
-        /* require/include with a literal path names that exact file. */
-        char *dir = path_dirname(source_rel ? source_rel : "");
-        char path[PKGMAP_PATH_BUF];
-        bool valid = dir && cbm_repo_rel_join(dir, imp->module_path, path, sizeof(path));
-        cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
-        *reason = "literal_include_path";
-        return valid ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path) : NULL;
+        *reason = "php_include_path_authority_missing";
+        return NULL;
     }
     *reason = "supported_import_path";
     return resolve_import_strategies(ctx, source_rel, imp, namespace_map, lang, false, ambiguous);
 }
 
+/* Only this audited adapter currently captures import occurrence spans. Do
+ * not consume new struct fields from legacy producers or invent coordinates. */
+static bool php_include_occurrence(CBMLanguage language, const CBMImport *import) {
+    return language == CBM_LANG_PHP && import &&
+           import->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH;
+}
+
+static bool php_include_occurrence_valid(const CBMFileResult *result, const CBMImport *import) {
+    return result && import->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+           import->site_end_byte > import->site_start_byte &&
+           import->site_end_byte <= result->source_content_length[CBM_SOURCE_ORIGIN_RAW];
+}
+
 static cbm_resolve_result_t resolve_import_observed(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
     const CBMImport *imp, CBMHashTable *namespace_map, const cbm_gbuf_node_t **out,
-    cbm_resolve_lookup_context_t *context) {
+    cbm_resolve_lookup_context_t *context, CBMLanguage language) {
     cbm_resolve_lookup_t query;
+    bool site = php_include_occurrence(language, imp);
     cbm_resolve_lookup_begin(&query, context, "import.path_resolution",
-                             imp ? imp->module_path : NULL, 0, 0, CBM_SOURCE_ORIGIN_RAW);
+                             imp ? imp->module_path : NULL, site ? imp->site_start_byte : 0,
+                             site ? imp->site_end_byte : 0, CBM_SOURCE_ORIGIN_RAW);
     const char *reason = "unsupported_import_rule";
     bool ambiguous = false;
     const cbm_gbuf_node_t *target = resolve_import_target(ctx, source_rel, source_file_qn, imp,
-                                                          namespace_map, &ambiguous, &reason);
+                                                          namespace_map, language, &ambiguous, &reason);
     /* Capture the path adapter's actual observation before making an edge
      * admission result. Failure remains an open/unknown search unless the
      * adapter supplied a target or explicit competing targets. */
@@ -4370,7 +4405,9 @@ static cbm_resolve_result_t resolve_import_observed(
 cbm_resolve_result_t cbm_pipeline_resolve_import_result(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
     const CBMImport *imp, CBMHashTable *namespace_map, const cbm_gbuf_node_t **out) {
-    return resolve_import_observed(ctx, source_rel, source_file_qn, imp, namespace_map, out, NULL);
+    return resolve_import_observed(
+        ctx, source_rel, source_file_qn, imp, namespace_map, out, NULL,
+        cbm_language_for_filename(path_leaf(source_rel ? source_rel : "")));
 }
 
 static void import_lookup_context(const cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
@@ -4393,9 +4430,12 @@ static void import_lookup_context(const cbm_pipeline_ctx_t *ctx, const CBMFileRe
 static cbm_resolve_record_t import_record(const CBMFileResult *result, const char *file,
                                           const char *scope, const CBMImport *import,
                                           cbm_resolve_result_t proof, bool emitted) {
+    bool site = php_include_occurrence(result->cached_lang, import);
     return (cbm_resolve_record_t){.file_path = file,
                                   .scope = scope,
                                   .relation = "IMPORTS",
+                                  .start_byte = site ? import->site_start_byte : 0,
+                                  .end_byte = site ? import->site_end_byte : 0,
                                   .spelling = import->module_path,
                                   .source_origin = CBM_SOURCE_ORIGIN_RAW,
                                   .content_identity =
@@ -4720,8 +4760,15 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     }
     for (int i = 0; i < count; i++) {
         const CBMImport *imp = &result->imports.items[i];
-        proofs[i] = resolve_import_observed(ctx, rel, file_qn, imp, namespace_map, &targets[i],
-                                            &lookup_context);
+        if (php_include_occurrence(result->cached_lang, imp) &&
+            !php_include_occurrence_valid(result, imp)) {
+            proofs[i] = (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                                               .rule = CBM_RESOLVE_RULE_MODULE_PATH,
+                                               .reason = "php_import_occurrence_invalid"};
+        } else {
+            proofs[i] = resolve_import_observed(ctx, rel, file_qn, imp, namespace_map, &targets[i],
+                                                &lookup_context, result->cached_lang);
+        }
         if (targets[i] && targets[i]->id == file->id)
             targets[i] = NULL;
         if (!targets[i] && !php_import_known_absent(ctx->gbuf, rel, imp, namespace_map))
@@ -4895,12 +4942,14 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
         (result->imports.count > 0 && !result->imports.items))
         return 0;
     int count = 0;
-    CBMLanguage lang = cbm_language_for_filename(path_leaf(rel));
+    /* Extraction disambiguates shared extensions such as Objective-C .m.
+     * Re-deriving the language from the filename loses that source fact. */
+    CBMLanguage lang = result->cached_lang;
     for (int i = 0; i < result->imports.count; i++)
         materialize_namespace_import(ctx, &result->imports.items[i], lang, namespace_map);
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source = file_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, file_qn) : NULL;
-    if (source && cbm_language_for_filename(path_leaf(rel)) == CBM_LANG_PHP) {
+    if (source && lang == CBM_LANG_PHP) {
         count =
             cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source, namespace_map);
     } else {
@@ -4913,7 +4962,7 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
             const CBMImport *imp = &result->imports.items[i];
             const cbm_gbuf_node_t *target = NULL;
             cbm_resolve_result_t proof = resolve_import_observed(
-                ctx, rel, file_qn, imp, namespace_map, &target, &lookup_context);
+                ctx, rel, file_qn, imp, namespace_map, &target, &lookup_context, lang);
             cbm_resolve_record_t row = import_record(result, rel, file_qn, imp, proof, false);
             yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
             yyjson_mut_val *properties = doc ? yyjson_mut_obj(doc) : NULL;

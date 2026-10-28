@@ -23,9 +23,12 @@ typedef struct {
     struct CProofDeclaration *proof_declarations;
     int proof_declaration_count, proof_declaration_cap;
     struct CProofInclude *proof_includes;
+    struct CProofBuiltinBinding *proof_builtins;
+    int proof_builtin_count, proof_builtin_cap;
     struct CProofUsing *proof_usings;
     int proof_using_count, proof_using_cap;
     bool binding_failed;
+    bool proof_preprocessor_unknown;
     uint32_t proof_syntax_limit; /* first unaudited syntax error; earlier complete sites survive */
     int callable_flow_depth;     /* delayed bodies cannot borrow mutable outer callable state */
     CBMScope *current_scope;
@@ -160,6 +163,13 @@ struct CLSPEvalMemoSlot {
     const void *node_id; // TSNode.id; NULL = empty
     const CBMType *result;
 };
+
+/* Conservative syntax audit shared with the source-fact collector. Only direct,
+ * fixed-arity free signatures with explicitly written builtin types qualify. */
+bool cbm_c_preprocessor_domain_unsupported(TSNode root);
+const CBMType *cbm_c_builtin_annotation(CBMArena *arena, const char *source, TSNode type);
+const CBMType *cbm_c_free_signature(CBMArena *arena, const char *source, TSNode declaration,
+                                    bool cpp_mode);
 
 // --- API ---
 

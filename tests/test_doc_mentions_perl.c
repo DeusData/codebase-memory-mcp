@@ -212,21 +212,21 @@ TEST(doc_mentions_perl_incremental_equals_full) {
     ASSERT_EQ(dm_index(repo, inc_db, NULL), 0);
     ASSERT_TRUE(pl_edge(inc_db, "lib.Knob.pm.__file__", "lib.Knob.Dial.spin"));
 
-    /* the module doc's text changes: the file is repaired alone */
+    /* A module-doc edit rebuilds the resolver generation. */
     th_write_file(
         TH_PATH(repo, "lib/Knob.pm"),
         "package Knob;\n\n=head1 NAME\n\nKnob, a knob - see L<Knob::Dial/spin>.\n\n=cut\n\n"
         "sub turn { 1 }\n1;\n");
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "module doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "module doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_TRUE(pl_edge(inc_db, "lib.Knob.pm.__file__", "lib.Knob.Dial.spin"));
 
     /* a reference added to the module doc: an edge from the File node */
     th_write_file(TH_PATH(repo, "lib/Knob.pm"),
                   "package Knob;\n\n=head1 NAME\n\nKnob, a knob - see L<Knob::Dial/spin> and\n"
                   "L<Knob::Dial>.\n\n=cut\n\nsub turn { 1 }\n1;\n");
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "module doc link", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "module doc link", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_TRUE(pl_edge(inc_db, "lib.Knob.pm.__file__", "lib.Knob.Dial.pm.__file__"));
 
     /* a new heading changes how a section is found: a full run */
@@ -249,11 +249,10 @@ TEST(doc_mentions_perl_incremental_equals_full) {
     dm_edge(inc_db, "lib.Knob.pm.__file__", "lib.Knob.Dial.spin", props, sizeof(props), &n);
     ASSERT_EQ(n, 0);
 
-    /* the sub goes: the files that name it are repaired, nothing else */
+    /* The sub goes: the rebuilt generation re-resolves its references. */
     th_write_file(TH_PATH(repo, "lib/Knob/Dial.pm"),
                   "package Knob::Dial;\n\n=head1 OVERVIEW\n\nThe dial.\n\n=cut\n\n1;\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "sub removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-              0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "sub removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     th_cleanup(tmp);
     PASS();
 }

@@ -43,7 +43,12 @@ enum {
     CBM_SOURCE_CLASS_ZERO_ARGUMENT_CONSTRUCTOR = 1u << 9,
     /* Complete source member-binding domain, including shadowing/effects.
      * This does not establish the callable identity of any member value. */
-    CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE = 1u << 10
+    CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE = 1u << 10,
+    CBM_SOURCE_FUNCTION_DEFINITION = 1u << 11,
+    CBM_SOURCE_DECL_EXTERN_C = 1u << 12,
+    /* Audited fixed parameters with no type, reference, default or unpacking.
+     * PHP may apply them to exact positional values without coercion rules. */
+    CBM_SOURCE_DECL_UNTYPED_VALUE_PARAMETERS = 1u << 13
 };
 
 // Registered function/method with full type signature.

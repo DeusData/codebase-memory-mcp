@@ -6,6 +6,7 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "sqlite3.h"
+#include "resolver_quality.h"
 
 static const char CS_SERVICE[] = "namespace Api {\npublic class Service {\n public void Go() {}\n "
                                  "public static void Build() {}\n}}\n";
@@ -191,7 +192,282 @@ TEST(resolver_cs_pipeline_preserves_exact_crossfile_target) {
     ASSERT_EQ(edges, 1);
     PASS();
 }
+
+static const char CS_PRIMITIVE_MAIN[] =
+    "using Api;\n"
+    "namespace App {\n"
+    "class Calc {\n"
+    " private int Helper(int x) { return x + 1; }\n"
+    " public void Run(int y) {\n"
+    "  Helper(y);\n"
+    "  this.Helper(7);\n"
+    "  Util.Square(y);\n"
+    "  Util.Wide(y);\n"
+    "  Util.Flag(true);\n"
+    " }\n"
+    " public void Gaps(int y) { Util.Over(y); Util.Narrow(1); Internal.Square(y); Util.Generic(y); "
+    "}\n"
+    " public void Local() { int value = 1; Util.Square(value); }\n"
+    " public void Bad(long wide, object unknown) {\n"
+    "  Util.Square(wide); Util.Square(unknown); Helper(1L); this.Helper(true); this.Static(1);\n"
+    " }\n"
+    " public static void StaticBad() { this.Helper(1); Helper(2); }\n"
+    " public void ByRef(int y) { Util.Square(ref y); }\n"
+    " public void Shadow(int Helper) { Helper(3); }\n"
+    " private static int Static(int x) { return x; }\n"
+    " public static int Forward(int y) { return Static(y); }\n"
+    "}\n"
+    "}\n";
+
+static const char CS_PRIMITIVE_UTIL[] = "namespace Api {\n"
+                                        "public class Util {\n"
+                                        " public static int Square(int x) { return x * x; }\n"
+                                        " public static long Wide(long x) { return x; }\n"
+                                        " public static bool Flag(bool value) { return value; }\n"
+                                        " public static byte Narrow(byte value) { return value; }\n"
+                                        " public static int Over(int x) { return x; }\n"
+                                        " public static long Over(long x) { return x; }\n"
+                                        " public static T Generic<T>(T value) { return value; }\n"
+                                        "}\n"
+                                        "}\n";
+
+static const char CS_PRIMITIVE_INTERNAL[] = "namespace App {\n"
+                                            "class Internal {\n"
+                                            " public static int Square(int x) { return x * x; }\n"
+                                            "}\n"
+                                            "}\n";
+
+static const char CS_PRIMITIVE_GLOBAL[] = "class Global {\n"
+                                          " private int Keep(int x) { return x; }\n"
+                                          " public int Run(int y) { return Keep(y); }\n"
+                                          "}\n";
+
+static const char CS_PRIMITIVE_DECOY[] = "namespace Other {\n"
+                                         "public class Util {\n"
+                                         " public static int Square(int x) { return x; }\n"
+                                         "}\n"
+                                         "}\n";
+
+static const RQ_Expected CS_PRIMITIVE_EXPECTED[] = {
+    {.case_id = "private-implicit",
+     .site = {.file = "main.cs", .caller = "Calc.Run", .needle = "Helper(y)"},
+     .relation = "CALLS",
+     .target = {.file = "main.cs",
+                .suffix = "Calc.Helper",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = " private int Helper(int x) { return x + 1; }"}},
+    {.case_id = "private-this",
+     .site = {.file = "main.cs", .caller = "Calc.Run", .needle = "this.Helper(7)"},
+     .relation = "CALLS",
+     .target = {.file = "main.cs",
+                .suffix = "Calc.Helper",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = " private int Helper(int x) { return x + 1; }"}},
+    {.case_id = "public-crossfile-parameter",
+     .site = {.file = "main.cs", .caller = "Calc.Run", .needle = "Util.Square(y)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Square",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " public static int Square(int x) { return x * x; }"}},
+    {.case_id = "primitive-widening",
+     .site = {.file = "main.cs", .caller = "Calc.Run", .needle = "Util.Wide(y)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Wide",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = " public static long Wide(long x) { return x; }"}},
+    {.case_id = "boolean-literal",
+     .site = {.file = "main.cs", .caller = "Calc.Run", .needle = "Util.Flag(true)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Flag",
+                .label = "Method",
+                .declaration_line = 5,
+                .declaration_text = " public static bool Flag(bool value) { return value; }"}},
+    {.case_id = "implicit-static-context",
+     .site = {.file = "main.cs", .caller = "Calc.Forward", .needle = "Static(y)"},
+     .relation = "CALLS",
+     .target = {.file = "main.cs",
+                .suffix = "Calc.Static",
+                .label = "Method",
+                .declaration_line = 20,
+                .declaration_text = " private static int Static(int x) { return x; }"}},
+    {.case_id = "global-namespace-lexical",
+     .site = {.file = "Global.cs", .caller = "Global.Run", .needle = "Keep(y)"},
+     .relation = "CALLS",
+     .target = {.file = "Global.cs",
+                .suffix = "Global.Keep",
+                .label = "Method",
+                .declaration_line = 2,
+                .declaration_text = " private int Keep(int x) { return x; }"}},
+    {.case_id = "overload-selection",
+     .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Util.Over(y)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Over",
+                .label = "Method",
+                .declaration_line = 7,
+                .declaration_text = " public static int Over(int x) { return x; }"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "csharp-overload-selection",
+     .why = "the complete name domain retains both source overloads",
+     .tried = "int-to-int selects the int declaration in C#; argument checks intentionally do not "
+              "rank overloads"},
+    {.case_id = "constant-narrowing",
+     .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Util.Narrow(1)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Narrow",
+                .label = "Method",
+                .declaration_line = 6,
+                .declaration_text = " public static byte Narrow(byte value) { return value; }"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "csharp-constant-narrowing",
+     .why = "constant-expression narrowing has no proof rule yet",
+     .tried = "the literal 1 fits byte, but the current primitive rules admit only identity and "
+              "widening"},
+    {.case_id = "internal-assembly-visibility",
+     .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Internal.Square(y)"},
+     .relation = "CALLS",
+     .target = {.file = "Internal.cs",
+                .suffix = "Internal.Square",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " public static int Square(int x) { return x * x; }"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "csharp-internal-assembly-visibility",
+     .why = "cross-file internal accessibility requires an explicit compilation/assembly domain",
+     .tried = "the fixture is one C# compilation; equal namespace and repository membership are "
+              "insufficient production evidence"},
+    {.case_id = "generic-inference",
+     .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Util.Generic(y)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Generic",
+                .label = "Method",
+                .declaration_line = 9,
+                .declaration_text = " public static T Generic<T>(T value) { return value; }"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "csharp-generic-inference",
+     .why = "generic inference and substitutions are not implemented by this proof bridge",
+     .tried = "the compiler infers T=int; primitive fixed-signature evidence cannot prove that "
+              "substitution"},
+    {.case_id = "local-primitive-flow",
+     .site = {.file = "main.cs", .caller = "Calc.Local", .needle = "Util.Square(value)"},
+     .relation = "CALLS",
+     .target = {.file = "Util.cs",
+                .suffix = "Util.Square",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " public static int Square(int x) { return x * x; }"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "csharp-local-primitive-flow",
+     .why = "local declaration and assignment flow remain conservative in this adapter",
+     .tried = "the explicit int local is genuine; only immutable parameter facts and source "
+              "literals are currently admitted"},
+};
+
+static const RQ_Forbidden CS_PRIMITIVE_FORBIDDEN[] = {
+    {.case_id = "long-to-int-narrowing",
+     .site = {.file = "main.cs", .caller = "Calc.Bad", .needle = "Util.Square(wide)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "unknown-argument-type",
+     .site = {.file = "main.cs", .caller = "Calc.Bad", .needle = "Util.Square(unknown)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "long-literal-narrowing",
+     .site = {.file = "main.cs", .caller = "Calc.Bad", .needle = "Helper(1L)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "bool-is-not-int",
+     .site = {.file = "main.cs", .caller = "Calc.Bad", .needle = "this.Helper(true)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "static-through-this",
+     .site = {.file = "main.cs", .caller = "Calc.Bad", .needle = "this.Static(1)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "this-from-static",
+     .site = {.file = "main.cs", .caller = "Calc.StaticBad", .needle = "this.Helper(1)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "implicit-instance-from-static",
+     .site = {.file = "main.cs", .caller = "Calc.StaticBad", .needle = "Helper(2)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "ref-is-not-value",
+     .site = {.file = "main.cs", .caller = "Calc.ByRef", .needle = "Util.Square(ref y)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "lexical-name-shadow",
+     .site = {.file = "main.cs", .caller = "Calc.Shadow", .needle = "Helper(3)"},
+     .relation = "CALLS",
+     .any_target = true},
+};
+
+TEST(resolver_cs_primitive_arguments_and_lexical_members_require_proofs) {
+    for (int driver = 0; driver < 2; driver++) {
+        const char *root = th_mktempdir("cbm_cs_primitive");
+        ASSERT_NOT_NULL(root);
+        char repo[768], database[768];
+        snprintf(repo, sizeof(repo), "%s/repo", root);
+        snprintf(database, sizeof(database), "%s/index.db", root);
+        const RQ_Source sources[] = {{.path = "main.cs", .text = CS_PRIMITIVE_MAIN},
+                                     {.path = "Util.cs", .text = CS_PRIMITIVE_UTIL},
+                                     {.path = "Internal.cs", .text = CS_PRIMITIVE_INTERNAL},
+                                     {.path = "Global.cs", .text = CS_PRIMITIVE_GLOBAL},
+                                     {.path = "Decoy.cs", .text = CS_PRIMITIVE_DECOY}};
+        bool ok = cbm_mkdir_p(repo, 0755);
+        for (size_t i = 0; ok && i < sizeof(sources) / sizeof(sources[0]); i++)
+            ok = th_write_file(TH_PATH(repo, sources[i].path), sources[i].text) == 0;
+        for (int i = 0; ok && i < 55; i++) {
+            char path[32];
+            snprintf(path, sizeof(path), "Filler%02d.cs", i);
+            ok = th_write_file(TH_PATH(repo, path), "// unrelated source file\n") == 0;
+        }
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+        ok = ok && (!old_workers || saved_workers);
+        cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+        cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+        ok = pipeline && cbm_pipeline_set_project_name(pipeline, "cs-direct") &&
+             cbm_pipeline_run(pipeline) == 0;
+        cbm_pipeline_free(pipeline);
+        if (saved_workers) {
+            cbm_setenv("CBM_WORKERS", saved_workers, 1);
+            free(saved_workers);
+        } else
+            cbm_unsetenv("CBM_WORKERS");
+        cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+        RQ_Report report = {0};
+        ok = store &&
+             rq_check(store, "cs-direct", "primitive-csharp-members", sources,
+                      sizeof(sources) / sizeof(sources[0]), CS_PRIMITIVE_EXPECTED,
+                      sizeof(CS_PRIMITIVE_EXPECTED) / sizeof(CS_PRIMITIVE_EXPECTED[0]),
+                      CS_PRIMITIVE_FORBIDDEN,
+                      sizeof(CS_PRIMITIVE_FORBIDDEN) / sizeof(CS_PRIMITIVE_FORBIDDEN[0]), &report,
+                      stderr) &&
+             ok;
+        if (store)
+            cbm_store_close(store);
+        th_cleanup(root);
+        ASSERT(ok);
+        ASSERT_EQ(report.genuine, 12);
+        ASSERT_EQ(report.found, 7);
+        ASSERT_EQ(report.missing, 5);
+        ASSERT_EQ(report.required_missing + report.wrong, 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_cs) {
+    RUN_TEST(resolver_cs_primitive_arguments_and_lexical_members_require_proofs);
     RUN_TEST(resolver_cs_alias_and_namespace_declared_receivers);
     RUN_TEST(resolver_cs_shadowed_mutated_and_unknown_types_abstain);
     RUN_TEST(resolver_cs_private_partial_inherited_and_duplicate_domains_abstain);

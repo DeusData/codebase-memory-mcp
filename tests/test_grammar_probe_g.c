@@ -40,6 +40,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "cbm.h"
+#include "resolver_quality.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -187,6 +188,49 @@ static GpgMetrics gpg_metrics(const char *filename, const char *content) {
     return gpg_metrics_files(&f, 1);
 }
 
+/* Full production indexing, a counted source-authored import obligation,
+ * and a required exact ESM call keep an all-gap fixture from passing vacuously. */
+static bool gpg_import_quality(const GpgFile *files, size_t file_count, const RQ_Source *inputs,
+                               size_t source_count, const char *suite, const RQ_Expected *gap,
+                               const RQ_Forbidden *forbidden, RQ_Report *report) {
+    if (file_count > 7 || source_count > 7)
+        return false;
+    const GpgFile control = {
+        "quality_control.js",
+        "export function target() { return 1; }\nexport function caller() { return target(); }\n"};
+    GpgFile indexed[8];
+    RQ_Source sources[8];
+    memcpy(indexed, files, file_count * sizeof(*files));
+    memcpy(sources, inputs, source_count * sizeof(*inputs));
+    indexed[file_count++] = control;
+    sources[source_count++] = (RQ_Source){.path = control.name, .text = control.content};
+    const RQ_Expected expected[] = {
+        *gap,
+        {.case_id = "required-esm-local-call",
+         .site = {.file = "quality_control.js",
+                  .caller = "quality_control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "quality_control.js",
+                    .suffix = "quality_control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 1; }"},
+         .mode = RQ_REQUIRED}};
+    GpgProj lp;
+    cbm_store_t *store = gpg_index_files(&lp, indexed, (int)file_count);
+    if (!store) {
+        gpg_cleanup(&lp, store);
+        return false;
+    }
+    bool ok =
+        rq_check_project_declarations(store, lp.project, suite, sources, source_count, expected, 2,
+                                      forbidden, forbidden ? 1 : 0, report, stderr);
+    gpg_cleanup(&lp, store);
+    return ok;
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * GROUP 1 — HTML (.html)
  *
@@ -206,9 +250,7 @@ TEST(probe_html_minimal_page) {
     PASS();
 }
 
-/* HTML: file with <script src> and <link rel=stylesheet> → IMPORTS edges.
- * RED: no HTML import resolver; script/link attributes are not walked into
- *      IMPORTS edges by the pipeline. */
+/* Exact source import: retained as a named resolver-quality obligation. */
 TEST(probe_html_script_imports) {
     static const GpgFile files[] = {{"app.js", "function init() { console.log('ready'); }\n"},
                                     {"index.html", "<!DOCTYPE html><html><head>\n"
@@ -217,8 +259,49 @@ TEST(probe_html_script_imports) {
                                                    "</head><body></body></html>\n"}};
     GpgMetrics m = gpg_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: HTML <script src> / <link href> not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — no HTML import resolver */
+    /* Keep the original fixture above. The source/configuration below makes
+     * this import obligation explicit without guessing ambient build roots. */
+    const GpgFile configured[] = {
+        {"app.js", "function init() { console.log('ready'); }\n"},
+        {"index.html",
+         "<!DOCTYPE html><html><head>\n<link rel=\"stylesheet\" href=\"style.css\">\n<script "
+         "src=\"app.js\"></script>\n</head><body></body></html>\n"}};
+    const RQ_Source sources[] = {{.path = configured[0].name, .text = configured[0].content},
+                                 {.path = configured[1].name, .text = configured[1].content}};
+    const RQ_Expected gap = {
+        .case_id = "probe_html_script_imports-exact-configured-import",
+        .site = {.file = "index.html",
+                 .caller = "index.html.__file__",
+                 .needle = "<script src=\"app.js\"></script>"},
+        .relation = "IMPORTS",
+        .target = {.file = "app.js",
+                   .suffix = "app.js.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "function init() { console.log('ready'); }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "html-relative-script-asset-domain",
+        .why =
+            "The authored static page has no base element and its relative script URL identifies "
+            "the adjacent app.js asset. No audited HTML asset import adapter exists. The "
+            "stylesheet URL has no project file and must not bind to a convenient existing asset.",
+        .tried = "Original fixture bytes and node/index checks are preserved. The separate exact "
+                 "source/configuration obligation, wrong-target control, and required ESM call use "
+                 "the full production pipeline; no source or launcher is executed by this test."};
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_html_script_imports-missing-stylesheet-has-no-project-target",
+        .site = {.file = "index.html",
+                 .caller = "index.html.__file__",
+                 .needle = "<link rel=\"stylesheet\" href=\"style.css\">"},
+        .relation = "IMPORTS",
+        .any_target = true};
+    RQ_Report report;
+    ASSERT_TRUE(gpg_import_quality(configured, sizeof(configured) / sizeof(configured[0]), sources,
+                                   sizeof(sources) / sizeof(sources[0]),
+                                   "probe_html_script_imports", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 

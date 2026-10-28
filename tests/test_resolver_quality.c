@@ -1139,7 +1139,205 @@ TEST(resolver_quality_oracle_rejects_malformed_external_expectations) {
     PASS();
 }
 
+/* Project-domain mode excludes an unrelated compiler builtin, not a wrong
+ * external target at the golden span or a project target at any other span. */
+static bool rq_project_domain_extra(rq_test_store_t *fixture, int64_t target_id, const char *target,
+                                    uint32_t start, uint32_t end, bool external) {
+    sqlite3 *db = cbm_store_get_db(fixture->store);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "INSERT INTO resolver_occurrences VALUES('rq',1,'main.c',"
+                      "'p.main.caller(int)','CALLS','extra',?1,?2,0,1,?4,0,0,0,?3,1,"
+                      "'fixture',1,?5,'{}')";
+    bool ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+              sqlite3_bind_int64(stmt, 1, start) == SQLITE_OK &&
+              sqlite3_bind_int64(stmt, 2, end) == SQLITE_OK &&
+              sqlite3_bind_text(stmt, 3, target, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+              sqlite3_bind_int(stmt, 4,
+                               external ? CBM_RESOLVE_DOMAIN_EXTERNAL
+                                        : CBM_RESOLVE_DOMAIN_PROJECT) == SQLITE_OK &&
+              sqlite3_bind_int(stmt, 5, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
+              sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    cbm_edge_t edge = {
+        .project = "rq", .source_id = fixture->caller, .target_id = target_id, .type = "CALLS"};
+    return ok && cbm_store_insert_edge(fixture->store, &edge) > 0;
+}
+
+TEST(resolver_quality_project_domain_preserves_exact_sites_and_project_targets) {
+    for (int mutation = 0; mutation < 3; mutation++) {
+        rq_test_store_t fixture;
+        ASSERT(rq_test_open(&fixture, true));
+        RQ_Source sources[3];
+        memcpy(sources, RQ_TEST_SOURCES, sizeof(sources));
+        sources[0].text = "void caller(int value) {\n    target(value); __builtin_trap();\n}\n"
+                          "void other(int value) { target(value); }\n";
+        char hash[CBM_SHA256_HEX_LEN + 1];
+        cbm_sha256_hex(sources[0].text, strlen(sources[0].text), hash);
+        sqlite3 *db = cbm_store_get_db(fixture.store);
+        sqlite3_stmt *stmt = NULL;
+        bool setup =
+            sqlite3_prepare_v2(db,
+                               "UPDATE resolver_file_summaries SET raw_content_identity=?1,"
+                               "raw_length=?2 WHERE project='rq' AND file_path='main.c'",
+                               -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_bind_text(stmt, 1, hash, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_int64(stmt, 2, (sqlite3_int64)strlen(sources[0].text)) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        cbm_node_t builtin = {.project = "rq",
+                              .label = "Function",
+                              .name = "__builtin_trap",
+                              .qualified_name = "compiler.__builtin_trap",
+                              .file_path = "<compiler-builtins>"};
+        int64_t builtin_id = cbm_store_upsert_node(fixture.store, &builtin);
+        setup = setup && builtin_id > 0 && rq_test_emit(&fixture, RQ_TEST_EXACT);
+        const char *extra = strstr(sources[0].text, "__builtin_trap()");
+        uint32_t start = mutation == 1 ? fixture.start : (uint32_t)(extra - sources[0].text);
+        uint32_t end = mutation == 1 ? fixture.end : start + (uint32_t)strlen("__builtin_trap()");
+        setup = setup && rq_project_domain_extra(
+                             &fixture, mutation == 2 ? fixture.decoy : builtin_id,
+                             mutation == 2 ? "p.decoy.target(int)" : "compiler.__builtin_trap",
+                             start, end, mutation != 2);
+        RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+        RQ_Report report = {0}, unrestricted = {0};
+        bool accepted =
+            setup && rq_check_project_declarations(fixture.store, "rq", "project-domain", sources,
+                                                   3, &item, 1, NULL, 0, &report, NULL);
+        bool default_accepted = setup && rq_check(fixture.store, "rq", "default-domain", sources, 3,
+                                                  &item, 1, NULL, 0, &unrestricted, NULL);
+        cbm_store_close(fixture.store);
+        ASSERT(setup);
+        ASSERT_EQ(accepted, mutation == 0);
+        ASSERT(!default_accepted);
+        ASSERT_EQ(report.genuine, 1);
+        ASSERT_EQ(report.found, 1);
+        ASSERT_EQ(report.missing, 0);
+        ASSERT_EQ(report.metadata_errors + report.invalid_oracle, 0);
+        if (mutation)
+            ASSERT_GT(report.wrong, 0);
+        else
+            ASSERT_EQ(report.wrong + report.projection_errors, 0);
+    }
+    PASS();
+}
+
+TEST(resolver_quality_oracle_requires_exact_authored_caller_variant) {
+    static const char *properties[] = {
+        "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":3}]}",
+        "{}",
+        "{\"variants\":[{\"file_path\":\"other.c\",\"start_line\":1,\"end_line\":3}]}",
+        "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":2,\"end_line\":3}]}",
+        "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":4}]}",
+        "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":3},"
+        "{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":3}]}",
+        "{",
+        "{\"variants\":{\"unexpected\":{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":3}}"
+        "}"};
+    for (size_t mutation = 0; mutation < 21; mutation++) {
+        rq_test_store_t fixture;
+        ASSERT(rq_test_open(&fixture, true));
+        ASSERT(rq_test_emit(&fixture, mutation == 11 ? RQ_TEST_CALLER : RQ_TEST_EXACT));
+        sqlite3 *db = cbm_store_get_db(fixture.store);
+        sqlite3_stmt *statement = NULL;
+        bool setup =
+            sqlite3_prepare_v2(
+                db,
+                "UPDATE nodes SET file_path='canonical.c',start_line=4,end_line=4,properties=?1 "
+                "WHERE id=?2",
+                -1, &statement, NULL) == SQLITE_OK &&
+            sqlite3_bind_text(statement, 1, properties[mutation < 8 ? mutation : 0], -1,
+                              SQLITE_STATIC) == SQLITE_OK &&
+            sqlite3_bind_int64(statement, 2, fixture.caller) == SQLITE_OK &&
+            sqlite3_step(statement) == SQLITE_DONE;
+        sqlite3_finalize(statement);
+        if (mutation >= 12) {
+            static const char *extra[] = {
+                "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":\"1\",\"end_line\":3}]}",
+                "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":\"3\"}]}",
+                "{\"variants\":[{\"file_path\":1,\"start_line\":1,\"end_line\":3}]}",
+                "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":1,\"start_line\":2,\"end_"
+                "line\":3}]}",
+                "{\"variants\":[{\"file_path\":\"main.c\",\"start_line\":1,\"end_line\":3}],"
+                "\"variants\":[]}"};
+            if (mutation < 16 || mutation == 20) {
+                statement = NULL;
+                setup = setup &&
+                        sqlite3_prepare_v2(db, "UPDATE nodes SET properties=?1 WHERE id=?2", -1,
+                                           &statement, NULL) == SQLITE_OK &&
+                        sqlite3_bind_text(statement, 1, extra[mutation == 20 ? 4 : mutation - 12],
+                                          -1, SQLITE_STATIC) == SQLITE_OK &&
+                        sqlite3_bind_int64(statement, 2, fixture.caller) == SQLITE_OK &&
+                        sqlite3_step(statement) == SQLITE_DONE;
+                sqlite3_finalize(statement);
+            }
+            if (mutation == 18) {
+                /* Even an overlapping canonical range cannot bypass an explicit variant. */
+                setup = setup &&
+                        sqlite3_exec(db,
+                                     "UPDATE nodes SET "
+                                     "file_path='main.c',start_line=1,end_line=3,properties='{}' "
+                                     "WHERE name='caller'",
+                                     NULL, NULL, NULL) == SQLITE_OK;
+            }
+        }
+        RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+        item.site.caller_variant_start_line = 1;
+        item.site.caller_variant_end_line = 3;
+        item.site.caller_variant_declaration = "void caller(int value) {";
+        if (mutation == 8)
+            item.site.caller_variant_declaration = "void invented(int value) {";
+        if (mutation == 9)
+            item.site.caller_variant_end_line = 0;
+        if (mutation == 10)
+            item.site.caller_variant_end_line = 1;
+        if (mutation == 16)
+            item.site.caller_variant_start_line = 0;
+        if (mutation == 17)
+            item.site.caller_variant_declaration = NULL;
+        if (mutation == 19) {
+            /* A stored variant alone cannot weaken an ordinary expectation. */
+            item.site.caller_variant_start_line = item.site.caller_variant_end_line = 0;
+            item.site.caller_variant_declaration = NULL;
+        }
+        RQ_Report report;
+        bool accepted = setup && rq_test_check(&fixture, &item, &report);
+        cbm_store_close(fixture.store);
+        ASSERT(setup);
+        ASSERT_EQ(accepted, mutation == 0);
+        if (mutation == 0) {
+            ASSERT_EQ(report.genuine, 1);
+            ASSERT_EQ(report.found, 1);
+            ASSERT_EQ(report.wrong + report.projection_errors + report.invalid_oracle, 0);
+        } else {
+            ASSERT(report.wrong + report.projection_errors + report.invalid_oracle > 0);
+        }
+    }
+    PASS();
+}
+
+TEST(resolver_quality_oracle_variant_bounds_cover_whole_occurrence) {
+    const RQ_Source sources[] = {
+        {.path = "main.c", .text = "void caller(int value) {\n    target(\n        value);\n}\n"},
+        {.path = "lib.c", .text = "void target(int value) {}\n"}};
+    for (unsigned mutation = 0; mutation < 3; mutation++) {
+        RQ_Expected item = rq_test_expected(RQ_REQUIRED);
+        item.site.needle = "target(\n        value)";
+        item.site.caller_variant_start_line = 1;
+        item.site.caller_variant_end_line = mutation == 0 ? 4 : mutation == 1 ? 2 : 5;
+        item.site.caller_variant_declaration = "void caller(int value) {";
+        RQ_State state = {0};
+        RQ_Report report = {0};
+        bool accepted = rq_prepare(&state, &item, 1, NULL, 0, sources, 2, &report, NULL);
+        ASSERT_EQ(accepted, mutation == 0);
+        ASSERT_EQ(report.invalid_oracle, mutation == 0 ? 0 : 1);
+    }
+    PASS();
+}
+
 SUITE(resolver_quality) {
+    RUN_TEST(resolver_quality_oracle_variant_bounds_cover_whole_occurrence);
+    RUN_TEST(resolver_quality_oracle_requires_exact_authored_caller_variant);
+    RUN_TEST(resolver_quality_project_domain_preserves_exact_sites_and_project_targets);
     RUN_TEST(resolver_quality_oracle_maps_one_preprocessed_occurrence_once);
     RUN_TEST(resolver_quality_oracle_rejects_preprocessed_metadata_and_span_corruption);
     RUN_TEST(resolver_quality_oracle_requires_explicit_preprocessed_mapping);

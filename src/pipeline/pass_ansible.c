@@ -68,6 +68,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
 #include "cbm.h"
 #include "helpers.h"
 #include "lang_specs.h"
@@ -86,6 +87,8 @@ typedef struct {
     char *scope_file;
     char *name;
     int line;
+    const cbm_resolve_proof_t *occurrence;
+    bool supported;
 } an_notify_t;
 
 typedef struct {
@@ -124,6 +127,13 @@ typedef struct {
     int fact_n;
     int fact_cap;
     int deploys;
+    CBMArena *arena;
+    cbm_shared_resolver_adapter_t adapter;
+    cbm_resolve_proof_source_t source;
+    size_t source_length;
+    unsigned play;
+    bool source_supported;
+    bool handlers_complete;
 } an_t;
 
 static bool an_type(TSNode n, const char *t) {
@@ -174,6 +184,15 @@ static bool an_scalar(const an_t *a, TSNode n, char *out, size_t sz) {
     memcpy(out, a->src + b, e - b);
     out[e - b] = '\0';
     if (dq || sq) {
+        for (const char *p = out; *p; p++) {
+            if (*p == '\n' || *p == '\r')
+                return false; /* YAML multiline folding is not modeled here. */
+            if (dq && *p == '\\') {
+                p++;
+                if (!*p || !strchr("\\\"nt/", *p))
+                    return false; /* Unknown escape semantics cannot select a path/name. */
+            }
+        }
         an_unescape(out, dq);
     }
     return out[0] != '\0';
@@ -243,15 +262,69 @@ static TSNode an_get(const an_t *a, TSNode value, const char *key) {
     return (TSNode){0};
 }
 
-static void an_edge(an_t *a, const cbm_gbuf_node_t *tgt, const char *kind, TSNode pair) {
-    if (!tgt || a->from <= 0 || tgt->id == a->from) {
-        return;
+static const cbm_resolve_proof_t *an_occurrence(an_t *a, int64_t owner, TSNode node,
+                                                const char *relation) {
+    const cbm_gbuf_node_t *from = cbm_gbuf_find_by_id(a->ctx->gbuf, owner);
+    if (!from || ts_node_is_null(node)) {
+        atomic_store(&a->ctx->resolver_failed, true);
+        return NULL;
     }
-    char props[CBM_SZ_128];
-    snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"ansible\",\"line\":%d}", kind,
+    cbm_resolve_proof_source_t source = a->source;
+    source.scope = from->qualified_name;
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    const char *spelling = end > start && end <= a->source_length
+                               ? cbm_arena_strndup(a->arena, a->src + start, end - start)
+                               : NULL;
+    return cbm_shared_resolver_adapter_occurrence(&a->adapter, &source, a->src, a->source_length,
+                                                  start, end, spelling, relation);
+}
+
+static bool an_record(an_t *a, const cbm_resolve_proof_t *occurrence, int64_t owner,
+                      const cbm_gbuf_node_t *target, const char *domain, bool supported,
+                      bool ambiguous, const char *reason, const char *properties) {
+    const cbm_resolve_proof_view_t *site = cbm_resolve_proof_view(occurrence);
+    if (!site) {
+        atomic_store(&a->ctx->resolver_failed, true);
+        return false;
+    }
+    bool exact = target && supported && !ambiguous;
+    cbm_resolve_result_t result = {
+        .binding = exact       ? CBM_RESOLVE_BINDING_UNIQUE
+                   : ambiguous ? CBM_RESOLVE_BINDING_AMBIGUOUS
+                               : CBM_RESOLVE_BINDING_UNRESOLVED,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = supported ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+        .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+        .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                             CBM_RESOLVE_FACT_LANGUAGE_BOUND
+                       : 0,
+        .target = exact ? target->qualified_name : "",
+        .candidate_count = exact       ? 1
+                           : ambiguous ? 2
+                                       : 0,
+        .reason = reason};
+    cbm_resolve_proof_key_t key = site->key;
+    key.lookup_domain = domain && domain[0] ? domain : ".";
+    key.binding_identity = result.target;
+    key.lookup_closed = supported;
+    const cbm_resolve_proof_t *lookup = cbm_resolve_proof_leaf(
+        &a->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN, &site->source, &key, &result);
+    return cbm_shared_resolver_adapter_record_proofs(&a->adapter, occurrence, owner,
+                                                     exact ? target->id : 0, properties, lookup);
+}
+
+static void an_edge(an_t *a, const cbm_gbuf_node_t *target, const char *kind, TSNode pair,
+                    bool supported) {
+    const cbm_resolve_proof_t *occurrence = an_occurrence(a, a->from, pair, "IMPORTS");
+    char properties[CBM_SZ_128];
+    snprintf(properties, sizeof(properties),
+             "{\"local_name\":\"%s\",\"via\":\"ansible\",\"line\":%d}", kind,
              (int)ts_node_start_point(pair).row + SKIP_ONE);
-    cbm_gbuf_insert_edge(a->ctx->gbuf, a->from, tgt->id, "IMPORTS", props);
-    a->edges++;
+    supported &= a->source_supported;
+    if (an_record(a, occurrence, a->from, target, a->dir, supported, false,
+                  "ansible_literal_dependency_lookup", properties) &&
+        target && supported)
+        a->edges++;
 }
 
 /* Pass 1 keeps the task files an include names: they are Ansible content
@@ -264,12 +337,15 @@ static void an_include(an_t *a, const cbm_gbuf_node_t *target) {
         int cap = a->inc_cap ? a->inc_cap * PAIR_LEN : AN_GROW_MIN;
         char **grown = cbm_realloc(CBM_MEM_CLASS_OTHER, a->incs, (size_t)cap * sizeof(*grown));
         if (!grown) {
+            atomic_store(&a->ctx->resolver_failed, true);
             return;
         }
         a->incs = grown;
         a->inc_cap = cap;
     }
     a->incs[a->inc_n++] = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, target->file_path);
+    if (!a->incs[a->inc_n - 1])
+        atomic_store(&a->ctx->resolver_failed, true);
 }
 
 /* A file `v` from `base` (repository-relative), its Module; NULL when none. */
@@ -307,46 +383,51 @@ static const cbm_gbuf_node_t *an_role(const an_t *a, const char *name) {
 }
 
 /* One mapping pair of a task or a play. */
+static bool an_literal(const char *value) {
+    return !strstr(value, "{{") && !strstr(value, "{%");
+}
+
 static void an_pair(an_t *a, TSNode pair) {
-    char key[CBM_SZ_64];
-    char v[CBM_SZ_1K];
-    if (!an_key(a, pair, key, sizeof(key))) {
+    char key[CBM_SZ_64], value_text[CBM_SZ_1K];
+    if (!an_key(a, pair, key, sizeof(key)))
         return;
-    }
     TSNode value = ts_node_child_by_field_name(pair, "value", sizeof("value") - SKIP_ONE);
-    if (strcmp(key, "import_playbook") == 0) {
-        if (an_scalar(a, value, v, sizeof(v)) && !strstr(v, "{{")) {
-            an_edge(a, an_file(a, a->dir, v), key, pair);
-        }
-    } else if (strcmp(key, "include_tasks") == 0 || strcmp(key, "import_tasks") == 0 ||
-               strcmp(key, "include") == 0) {
-        if ((an_scalar(a, value, v, sizeof(v)) ||
-             an_scalar(a, an_get(a, value, "file"), v, sizeof(v))) &&
-            !strstr(v, "{{")) {
-            char tasks[CBM_SZ_1K];
-            snprintf(tasks, sizeof(tasks), "%s/tasks", a->role);
-            const cbm_gbuf_node_t *t = an_file(a, a->dir, v);
-            const cbm_gbuf_node_t *target = t ? t : a->role[0] ? an_file(a, tasks, v) : NULL;
-            an_edge(a, target, key, pair);
-            an_include(a, target);
-        }
-    } else if (strcmp(key, "include_role") == 0 || strcmp(key, "import_role") == 0) {
-        if (an_scalar(a, an_get(a, value, "name"), v, sizeof(v)) && !strstr(v, "{{")) {
-            an_edge(a, an_role(a, v), key, pair);
-        }
-    } else if (strcmp(key, "roles") == 0) {
-        while (an_type(value, "block_node") && ts_node_named_child_count(value) == SKIP_ONE) {
+    if (!strcmp(key, "import_playbook")) {
+        bool literal =
+            an_scalar(a, value, value_text, sizeof(value_text)) && an_literal(value_text);
+        an_edge(a, literal ? an_file(a, a->dir, value_text) : NULL, key, pair, literal);
+    } else if (!strcmp(key, "include_tasks") || !strcmp(key, "import_tasks") ||
+               !strcmp(key, "include")) {
+        bool literal = (an_scalar(a, value, value_text, sizeof(value_text)) ||
+                        an_scalar(a, an_get(a, value, "file"), value_text, sizeof(value_text))) &&
+                       an_literal(value_text);
+        char tasks[CBM_SZ_1K];
+        snprintf(tasks, sizeof(tasks), "%s/tasks", a->role);
+        const cbm_gbuf_node_t *target = literal ? an_file(a, a->dir, value_text) : NULL;
+        if (literal && !target && a->role[0])
+            target = an_file(a, tasks, value_text);
+        an_edge(a, target, key, pair, literal);
+        an_include(a, target);
+    } else if (!strcmp(key, "include_role") || !strcmp(key, "import_role")) {
+        bool literal = an_scalar(a, an_get(a, value, "name"), value_text, sizeof(value_text)) &&
+                       an_literal(value_text);
+        an_edge(a, literal ? an_role(a, value_text) : NULL, key, pair, literal);
+    } else if (!strcmp(key, "roles")) {
+        while (an_type(value, "block_node") && ts_node_named_child_count(value) == SKIP_ONE)
             value = ts_node_named_child(value, 0);
+        if (!an_type(value, "block_sequence")) {
+            an_edge(a, NULL, key, pair, false);
+            return;
         }
-        for (uint32_t i = 0;
-             an_type(value, "block_sequence") && i < ts_node_named_child_count(value); i++) {
-            TSNode item = ts_node_named_child(ts_node_named_child(value, i), 0);
-            if ((an_scalar(a, item, v, sizeof(v)) ||
-                 an_scalar(a, an_get(a, item, "role"), v, sizeof(v)) ||
-                 an_scalar(a, an_get(a, item, "name"), v, sizeof(v))) &&
-                !strstr(v, "{{")) {
-                an_edge(a, an_role(a, v), key, ts_node_named_child(value, i));
-            }
+        for (uint32_t i = 0; i < ts_node_named_child_count(value); i++) {
+            TSNode entry = ts_node_named_child(value, i);
+            TSNode item = ts_node_named_child(entry, 0);
+            bool literal =
+                (an_scalar(a, item, value_text, sizeof(value_text)) ||
+                 an_scalar(a, an_get(a, item, "role"), value_text, sizeof(value_text)) ||
+                 an_scalar(a, an_get(a, item, "name"), value_text, sizeof(value_text))) &&
+                an_literal(value_text);
+            an_edge(a, literal ? an_role(a, value_text) : NULL, key, entry, literal);
         }
     }
 }
@@ -425,7 +506,9 @@ static char *an_read(const char *path, size_t *len) {
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > cbm_max_file_bytes()) {
+    /* Empty YAML is a successfully read non-playbook, not an I/O failure.
+     * Keep a padded empty buffer so the caller can distinguish those states. */
+    if (size < 0 || size > cbm_max_file_bytes()) {
         (void)fclose(f);
         return NULL;
     }
@@ -589,7 +672,7 @@ typedef struct {
     int cap;
 } an_ids_t;
 
-static void an_ids_add(CBMHashTable *ix, const char *key, int64_t id) {
+static bool an_ids_add(CBMHashTable *ix, const char *key, int64_t id) {
     an_ids_t *v = cbm_ht_get(ix, key);
     if (!v) {
         v = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*v));
@@ -597,23 +680,29 @@ static void an_ids_add(CBMHashTable *ix, const char *key, int64_t id) {
         if (!v || !owned) {
             cbm_free(CBM_MEM_CLASS_OTHER, v);
             cbm_free(CBM_MEM_CLASS_OTHER, owned);
-            return;
+            return false;
         }
         cbm_ht_set(ix, owned, v);
+        if (cbm_ht_get(ix, owned) != v) {
+            cbm_free(CBM_MEM_CLASS_OTHER, v);
+            cbm_free(CBM_MEM_CLASS_OTHER, owned);
+            return false;
+        }
     }
     if (v->count > 0 && v->items[v->count - SKIP_ONE] == id) {
-        return; /* a handler named and listening alike */
+        return true; /* repeated identical listener membership */
     }
     if (v->count == v->cap) {
         int cap = v->cap ? v->cap * PAIR_LEN : AN_GROW_MIN;
         int64_t *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, v->items, (size_t)cap * sizeof(int64_t));
         if (!grown) {
-            return;
+            return false;
         }
         v->items = grown;
         v->cap = cap;
     }
     v->items[v->count++] = id;
+    return true;
 }
 
 /* A task list being walked: its sequence, the next item, handlers or not. */
@@ -1234,33 +1323,53 @@ static void an_applies_reset(an_t *a) {
     a->fact_n = 0;
 }
 
-static void an_index_handler(an_t *a, const char *name, int64_t id) {
-    char key[CBM_SZ_2K];
+static void an_index_handler(an_t *a, const char *name, int64_t id, bool listener) {
+    /* A role loads handlers/main by convention. Merely residing somewhere
+     * below handlers/ is not a proof that an alternate file was loaded. */
     if (a->role_dir[0]) {
-        snprintf(key, sizeof(key), "%s\x1f%s", a->role_dir, name);
-        an_ids_add(a->handlers, key, id);
+        const char *suffix = a->file + strlen(a->role_dir);
+        if (strcmp(suffix, "/handlers/main.yml") && strcmp(suffix, "/handlers/main.yaml"))
+            return;
     }
-    snprintf(key, sizeof(key), "F:%s\x1f%s", a->file, name);
-    an_ids_add(a->handlers, key, id);
+    char key[CBM_SZ_2K];
+    if (!an_literal(name) || !a->source_supported) {
+        a->handlers_complete = false;
+        return;
+    }
+    if (a->role_dir[0]) {
+        snprintf(key, sizeof(key), "%c:%s\x1f%s", listener ? 'L' : 'N', a->role_dir, name);
+        if (!an_ids_add(a->handlers, key, id))
+            atomic_store(&a->ctx->resolver_failed, true);
+    }
+    snprintf(key, sizeof(key), "%c:F:%s#%u\x1f%s", listener ? 'L' : 'N', a->file, a->play, name);
+    if (!an_ids_add(a->handlers, key, id))
+        atomic_store(&a->ctx->resolver_failed, true);
 }
 
-static void an_note(an_t *a, int64_t task, const char *name, int line) {
+static void an_note(an_t *a, int64_t task, const char *name, int line, TSNode site) {
     if (a->note_n == a->note_cap) {
         int cap = a->note_cap ? a->note_cap * PAIR_LEN : AN_GROW_MIN;
         an_notify_t *grown =
             cbm_realloc(CBM_MEM_CLASS_OTHER, a->notes, (size_t)cap * sizeof(*grown));
         if (!grown) {
+            atomic_store(&a->ctx->resolver_failed, true);
             return;
         }
         a->notes = grown;
         a->note_cap = cap;
     }
-    a->notes[a->note_n++] =
-        (an_notify_t){.task = task,
-                      .scope_role = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, a->role_dir),
-                      .scope_file = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, a->file),
-                      .name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name),
-                      .line = line};
+    a->notes[a->note_n++] = (an_notify_t){
+        .task = task,
+        .scope_role = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, a->role_dir),
+        .scope_file = cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                                     cbm_arena_sprintf(a->arena, "%s#%u", a->file, a->play)),
+        .name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, name ? name : ""),
+        .line = line,
+        .occurrence = an_occurrence(a, task, site, "CALLS"),
+        .supported = name && name[0] && an_literal(name) && a->source_supported};
+    const an_notify_t *note = &a->notes[a->note_n - 1];
+    if (!note->scope_role || !note->scope_file || !note->name || !note->occurrence)
+        atomic_store(&a->ctx->resolver_failed, true);
 }
 
 /* Task (or handler) `m`: a Function named by its `name:` (else its module),
@@ -1306,14 +1415,20 @@ static void an_task(an_t *a, TSNode m, bool handler) {
     TSNode list;
     char n[CBM_SZ_256];
     if (handler) {
+        if (!named && !ts_node_is_null(an_get(a, m, "name")))
+            a->handlers_complete = false;
         if (named) {
-            an_index_handler(a, name, id);
+            an_index_handler(a, name, id, false);
         }
         TSNode listen = an_get(a, m, "listen");
         uint32_t ln = an_name_count(a, listen, &list);
+        if (!ln && !ts_node_is_null(listen))
+            a->handlers_complete = false;
         for (uint32_t i = 0; i < ln; i++) {
             if (an_name_at(a, listen, list, i, n, sizeof(n))) {
-                an_index_handler(a, n, id);
+                an_index_handler(a, n, id, true);
+            } else {
+                a->handlers_complete = false;
             }
         }
     }
@@ -1325,10 +1440,15 @@ static void an_task(an_t *a, TSNode m, bool handler) {
         }
         TSNode v = ts_node_child_by_field_name(pair, "value", sizeof("value") - SKIP_ONE);
         uint32_t nn = an_name_count(a, v, &list);
+        if (!nn) {
+            an_note(a, id, NULL, (int)ts_node_start_point(pair).row + SKIP_ONE, pair);
+            continue;
+        }
         for (uint32_t j = 0; j < nn; j++) {
-            if (an_name_at(a, v, list, j, n, sizeof(n)) && !strstr(n, "{{")) {
-                an_note(a, id, n, (int)ts_node_start_point(pair).row + SKIP_ONE);
-            }
+            bool named_notify = an_name_at(a, v, list, j, n, sizeof(n));
+            TSNode site = ts_node_is_null(list) ? v : ts_node_named_child(list, j);
+            an_note(a, id, named_notify ? n : NULL, (int)ts_node_start_point(pair).row + SKIP_ONE,
+                    site);
         }
     }
 }
@@ -1394,11 +1514,13 @@ static void an_file_tasks(an_t *a, TSNode top, bool playbook) {
     if (!playbook) {
         bool handlers = strncmp(a->file, "handlers/", sizeof("handlers/") - SKIP_ONE) == 0 ||
                         strstr(a->file, "/handlers/") != NULL;
+        a->play = 0;
         an_task_list(a, top, handlers);
         return;
     }
     for (uint32_t i = 0; i < ts_node_named_child_count(top); i++) {
         TSNode play = an_item(top, i);
+        a->play = i + 1;
         for (size_t s = 0; !ts_node_is_null(play) && s < sizeof(SECTIONS) / sizeof(SECTIONS[0]);
              s++) {
             an_task_list(a, an_seq(an_get(a, play, SECTIONS[s])),
@@ -1409,27 +1531,55 @@ static void an_file_tasks(an_t *a, TSNode top, bool playbook) {
 
 /* notify -> CALLS {via: notify, line} each handler of that name or listen
  * topic in the task's role, else in its file (a play's handlers). */
+static const an_ids_t *an_notify_targets(an_t *a, const an_notify_t *note, bool listener, char *key,
+                                         size_t size) {
+    const an_ids_t *ids = NULL;
+    if (note->scope_role && note->scope_role[0]) {
+        snprintf(key, size, "%c:%s\x1f%s", listener ? 'L' : 'N', note->scope_role, note->name);
+        ids = cbm_ht_get(a->handlers, key);
+    }
+    if (!ids) {
+        snprintf(key, size, "%c:F:%s\x1f%s", listener ? 'L' : 'N', note->scope_file, note->name);
+        ids = cbm_ht_get(a->handlers, key);
+    }
+    return ids;
+}
+
 static void an_link_notifies(an_t *a) {
     for (int i = 0; i < a->note_n; i++) {
-        const an_notify_t *n = &a->notes[i];
-        char key[CBM_SZ_2K];
-        const an_ids_t *ids = NULL;
-        if (n->scope_role && n->scope_role[0]) {
-            snprintf(key, sizeof(key), "%s\x1f%s", n->scope_role, n->name);
-            ids = cbm_ht_get(a->handlers, key);
-        }
-        if (!ids) {
-            snprintf(key, sizeof(key), "F:%s\x1f%s", n->scope_file, n->name);
-            ids = cbm_ht_get(a->handlers, key);
-        }
-        char props[CBM_SZ_64];
-        snprintf(props, sizeof(props), "{\"via\":\"notify\",\"line\":%d}", n->line);
-        for (int j = 0; ids && j < ids->count; j++) {
-            if (ids->items[j] != n->task) {
-                cbm_gbuf_insert_edge(a->ctx->gbuf, n->task, ids->items[j], "CALLS", props);
-                a->calls++;
+        const an_notify_t *note = &a->notes[i];
+        if (!note->name || !note->scope_file)
+            continue; /* allocation failure already prevents publication */
+        char properties[CBM_SZ_64], key[CBM_SZ_2K];
+        snprintf(properties, sizeof(properties), "{\"via\":\"notify\",\"line\":%d}", note->line);
+        bool supported = note->supported && a->handlers_complete;
+        bool found = false;
+        for (int listener = 0; listener < 2; listener++) {
+            const an_ids_t *ids = an_notify_targets(a, note, listener != 0, key, sizeof(key));
+            if (!ids || !ids->count)
+                continue;
+            found = true;
+            /* Named handlers need an unambiguous declaration. Listen topics
+             * deliberately broadcast: each exact membership is independently proved. */
+            bool ambiguous = !listener && ids->count != 1;
+            if (ambiguous) {
+                (void)an_record(a, note->occurrence, note->task, NULL, key, supported, true,
+                                "ansible_duplicate_handler_name", properties);
+                continue;
+            }
+            for (int j = 0; j < ids->count; j++) {
+                const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(a->ctx->gbuf, ids->items[j]);
+                if (an_record(a, note->occurrence, note->task, target, key, supported, false,
+                              listener ? "ansible_exact_listener_membership"
+                                       : "ansible_exact_handler_name",
+                              properties) &&
+                    supported && target)
+                    a->calls++;
             }
         }
+        if (!found)
+            (void)an_record(a, note->occurrence, note->task, NULL, note->scope_file, supported,
+                            false, "ansible_handler_not_resolved", properties);
     }
 }
 
@@ -1487,8 +1637,60 @@ static an_cand_t *an_cand_push(an_cands_t *c, int file, int inc_lo) {
     return &c->items[c->count++];
 }
 
+/* A closed YAML mapping cannot choose between duplicate keys or unmodeled
+ * merge keys. This check is linear in the parsed file, with per-mapping keys. */
+static bool an_unique_mappings(an_t *a, TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool more = true, complete = true;
+    while (more && complete) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (an_type(node, "block_mapping") || an_type(node, "flow_mapping")) {
+            CBMHashTable *keys = cbm_ht_create(0);
+            if (!keys) {
+                atomic_store(&a->ctx->resolver_failed, true);
+                complete = false;
+            }
+            for (uint32_t i = 0; complete && i < ts_node_named_child_count(node); i++) {
+                TSNode pair = ts_node_named_child(node, i);
+                if (an_type(pair, "comment"))
+                    continue;
+                char key[CBM_SZ_1K];
+                if (!an_key(a, pair, key, sizeof(key)) || !strcmp(key, "<<") ||
+                    cbm_ht_has(keys, key)) {
+                    complete = false;
+                    break;
+                }
+                const char *owned = cbm_arena_strdup(a->arena, key);
+                if (!owned) {
+                    atomic_store(&a->ctx->resolver_failed, true);
+                    complete = false;
+                    break;
+                }
+                cbm_ht_set(keys, owned, (void *)owned);
+                if (cbm_ht_get(keys, owned) != owned) {
+                    atomic_store(&a->ctx->resolver_failed, true);
+                    complete = false;
+                }
+            }
+            if (keys)
+                cbm_ht_free(keys);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return complete;
+}
+
 /* The per-file state both passes start from. */
-static void an_begin_file(an_t *a, const char *rel, const cbm_gbuf_node_t *fnode, const char *src) {
+static bool an_begin_file(an_t *a, const char *rel, const cbm_gbuf_node_t *fnode, const char *src,
+                          CBMLanguage language, TSNode root) {
     static const char FILE_SUFFIX[] = ".__file__";
     const char *slash = strrchr(rel, '/');
     a->src = src;
@@ -1504,6 +1706,10 @@ static void an_begin_file(an_t *a, const char *rel, const cbm_gbuf_node_t *fnode
     snprintf(a->base, sizeof(a->base), "%.*s", (int)(suffixed ? ql - sl : ql), qn);
     a->ordinal[0] = 0;
     a->ordinal[SKIP_ONE] = 0;
+    a->source_length = strlen(src);
+    a->source_supported = !ts_node_has_error(root) && an_unique_mappings(a, root);
+    return cbm_shared_resolver_adapter_capture(&a->adapter, rel, language, src, a->source_length,
+                                               &a->source);
 }
 
 /* Which candidates are Ansible: playbooks and role tasks / handlers files,
@@ -1512,6 +1718,7 @@ static void an_mark_ansible(const an_t *a, an_cands_t *c, const cbm_file_info_t 
     CBMHashTable *by_path = cbm_ht_create(0);
     int *work = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)c->count + SKIP_ONE) * sizeof(int));
     if (!by_path || !work) {
+        atomic_store(&a->ctx->resolver_failed, true);
         cbm_free(CBM_MEM_CLASS_OTHER, work);
         if (by_path) {
             cbm_ht_free(by_path);
@@ -1597,7 +1804,9 @@ static TSTree *an_parse(TSParser *parser, const cbm_file_info_t *f, char **src) 
 
 void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                int file_count) {
-    an_t a = {.ctx = ctx};
+    CBMArena arena;
+    cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+    an_t a = {.ctx = ctx, .arena = &arena, .handlers_complete = true};
     an_cands_t cands = {0};
     TSParser *parser = ts_parser_new();
     CBMHashTable *file_nodes = NULL;
@@ -1605,12 +1814,21 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         if (parser) {
             ts_parser_delete(parser);
         }
+        cbm_arena_destroy(&arena);
+        return;
+    }
+    if (!cbm_shared_resolver_adapter_init(&a.adapter, ctx, &arena)) {
+        cbm_shared_resolver_adapter_dispose(&a.adapter);
+        ts_parser_delete(parser);
+        cbm_arena_destroy(&arena);
         return;
     }
     /* pass 1: composition (IMPORTS); which files are playbooks, what each includes */
     for (int i = 0; i < file_count; i++) {
         char *src = NULL;
         TSTree *tree = an_parse(parser, &files[i], &src);
+        if (an_is_yaml(files[i].rel_path) && (!src || (an_is_sequence(src) && !tree)))
+            atomic_store(&ctx->resolver_failed, true);
         if (tree && !file_nodes) {
             a.modules = an_index(ctx, "Module");
             a.folders = an_index(ctx, "Folder");
@@ -1619,8 +1837,10 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const cbm_gbuf_node_t *fnode =
             tree && file_nodes ? cbm_ht_get(file_nodes, files[i].rel_path) : NULL;
         an_cand_t *c = fnode ? an_cand_push(&cands, i, a.inc_n) : NULL;
-        if (c) {
-            an_begin_file(&a, files[i].rel_path, fnode, src);
+        if (fnode && !c)
+            atomic_store(&ctx->resolver_failed, true);
+        if (c && an_begin_file(&a, files[i].rel_path, fnode, src, files[i].language,
+                               ts_tree_root_node(tree))) {
             an_walk(&a, ts_tree_root_node(tree));
             c->playbook = an_is_playbook(&a, an_top(ts_tree_root_node(tree)));
             c->inc_hi = a.inc_n;
@@ -1634,6 +1854,8 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     an_mark_ansible(&a, &cands, files);
     a.handlers = cands.count > 0 ? cbm_ht_create(0) : NULL;
     a.by_rel = a.handlers ? cbm_ht_create(0) : NULL;
+    if (cands.count > 0 && (!a.handlers || !a.by_rel))
+        atomic_store(&ctx->resolver_failed, true);
     for (int i = 0; a.by_rel && i < file_count; i++) {
         cbm_ht_set(a.by_rel, files[i].rel_path, (void *)(intptr_t)(i + SKIP_ONE));
     }
@@ -1644,9 +1866,11 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const cbm_file_info_t *f = &files[cands.items[c].file];
         char *src = NULL;
         TSTree *tree = cands.items[c].ansible ? an_parse(parser, f, &src) : NULL;
+        if (cands.items[c].ansible && (!src || !tree))
+            atomic_store(&ctx->resolver_failed, true);
         const cbm_gbuf_node_t *fnode = tree ? cbm_ht_get(file_nodes, f->rel_path) : NULL;
-        if (fnode) {
-            an_begin_file(&a, f->rel_path, fnode, src);
+        if (fnode &&
+            an_begin_file(&a, f->rel_path, fnode, src, f->language, ts_tree_root_node(tree))) {
             an_file_tasks(&a, an_top(ts_tree_root_node(tree)), cands.items[c].playbook);
             an_link_applies(&a);
             an_applies_reset(&a);
@@ -1665,6 +1889,8 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     }
     cbm_free(CBM_MEM_CLASS_OTHER, cands.items);
     an_free(&a);
+    cbm_shared_resolver_adapter_dispose(&a.adapter);
+    cbm_arena_destroy(&arena);
     if (a.edges > 0 || a.tasks > 0) {
         char e[CBM_SZ_32];
         char t[CBM_SZ_32];

@@ -10,7 +10,8 @@ typedef struct cbm_resolve_binding_index cbm_resolve_binding_index_t;
 /* Build once per source file. Borrows result/source until the arena is freed.
  * Supported syntax is deliberately explicit: Python module functions and
  * direct imports, Lua local functions, and explicit JavaScript/TypeScript
- * module function declarations/imports. Script globals remain unsupported. All
+ * module function declarations/imports, plus one inline Vue/Svelte script with
+ * an audited inert host. Script globals remain unsupported. All
  * potential local/reassigned names block that name across the file; this
  * over-abstention is a quality gap. Unknown syntax, dynamic namespace effects
  * and partial parses fail closed. The source must be the raw buffer used to
@@ -40,6 +41,12 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
                                                   const char *name, uint32_t start, uint32_t end,
                                                   CBMSourceOrigin origin,
                                                   cbm_resolve_result_t candidate);
+
+/* Exact whole-tag AST classification only, not target authority. This permits
+ * simple uppercase JSX names to request the ordinary lexical/import proof;
+ * all scope, export, target and projection checks still apply. */
+bool cbm_resolve_binding_jsx_occurrence(const cbm_resolve_binding_index_t *index, const char *name,
+                                        uint32_t start, uint32_t end, CBMSourceOrigin origin);
 
 /* A fixed diagnostic capability/reason string, never an inferred success. */
 const char *cbm_resolve_binding_status(const cbm_resolve_binding_index_t *index);

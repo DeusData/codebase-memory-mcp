@@ -1323,6 +1323,24 @@ static bool is_call_argument_label(TSNode node) {
     return false;
 }
 
+/* An opening JSX tag owns one invocation; its name and matching closing
+ * name are syntax, not independent value occurrences. Attribute expressions
+ * and children remain ordinary references. Use the existing walk cursor so
+ * deeply nested JSX does not introduce root-to-parent searches. */
+static bool is_jsx_tag_name(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if ((ctx->language != CBM_LANG_JAVASCRIPT && ctx->language != CBM_LANG_TSX) ||
+        strcmp(ts_node_type(node), "identifier") != 0)
+        return false;
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(cursor, node, &parent, &field) || !field || strcmp(field, "name"))
+        return false;
+    const char *kind = ts_node_type(parent);
+    return !strcmp(kind, "jsx_opening_element") || !strcmp(kind, "jsx_self_closing_element") ||
+           !strcmp(kind, "jsx_closing_element");
+}
+
 static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     if (!cursor)
@@ -2600,7 +2618,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (!is_reference_node(node, ctx->language)) {
         return;
     }
-    if (is_call_argument_label(node)) {
+    if (is_jsx_tag_name(ctx, node, NULL) || is_call_argument_label(node)) {
         return;
     }
     if (inside_call || inside_import) {
@@ -2757,6 +2775,9 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
                 cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
             }
         }
+        return;
+    }
+    if (is_jsx_tag_name(ctx, node, state)) {
         return;
     }
     if (is_forward_sibling_callee(ctx->language, node)) {

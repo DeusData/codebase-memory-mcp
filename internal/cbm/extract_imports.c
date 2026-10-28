@@ -64,6 +64,7 @@ static void parse_pkl_imports(CBMExtractCtx *ctx);
 static void parse_nickel_imports(CBMExtractCtx *ctx);
 static void parse_thrift_imports(CBMExtractCtx *ctx);
 static void parse_capnp_imports(CBMExtractCtx *ctx);
+static void parse_bicep_imports(CBMExtractCtx *ctx);
 static void parse_dlang_imports(CBMExtractCtx *ctx);
 static void parse_tablegen_imports(CBMExtractCtx *ctx);
 static void parse_crystal_imports(CBMExtractCtx *ctx);
@@ -2648,6 +2649,72 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
     }
 }
 
+/* PHP includes need an explicit source-directory anchor. A bare filename is
+ * searched through include_path/CWD, neither of which this snapshot captures.
+ * This deliberately small constant subset has no escapes or interpolation. */
+static const char *php_dir_include_path(CBMExtractCtx *ctx, TSNode expression) {
+    if (ts_node_has_error(ctx->root) || ts_node_has_error(expression) ||
+        strcmp(ts_node_type(expression), "require_once_expression") ||
+        ts_node_named_child_count(expression) != 1)
+        return NULL;
+    TSNode value = ts_node_named_child(expression, 0);
+    if (strcmp(ts_node_type(value), "binary_expression") || ts_node_named_child_count(value) != 2)
+        return NULL;
+    TSNode left = ts_node_named_child(value, 0), right = ts_node_named_child(value, 1);
+    if (strcmp(ts_node_type(left), "name") || strcmp(ts_node_type(right), "string"))
+        return NULL;
+    const char *anchor = cbm_node_text(ctx->arena, left, ctx->source);
+    const char *literal = cbm_node_text(ctx->arena, right, ctx->source);
+    if (!anchor || strcmp(anchor, "__DIR__") || !literal)
+        return NULL;
+    uint32_t at = ts_node_end_byte(left), end = ts_node_start_byte(right);
+    while (at < end && isspace((unsigned char)ctx->source[at]))
+        at++;
+    if (at == end || ctx->source[at++] != '.')
+        return NULL;
+    while (at < end && isspace((unsigned char)ctx->source[at]))
+        at++;
+    if (at != end)
+        return NULL;
+    size_t length = strlen(literal);
+    if (length < 4 || literal[0] != '\'' || literal[1] != '/' || literal[length - 1] != '\'')
+        return NULL;
+    for (size_t i = 2; i + 1 < length; i++) {
+        unsigned char c = (unsigned char)literal[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-' || c == '.' || c == '/'))
+            return NULL;
+    }
+    return cbm_arena_strndup(ctx->arena, literal + 2, length - 3);
+}
+
+static void emit_php_include(CBMExtractCtx *ctx, TSNode statement) {
+    if (ts_node_named_child_count(statement) != 1)
+        return;
+    TSNode expression = ts_node_named_child(statement, 0);
+    const char *kind = ts_node_type(expression);
+    if (strcmp(kind, "include_expression") && strcmp(kind, "include_once_expression") &&
+        strcmp(kind, "require_expression") && strcmp(kind, "require_once_expression"))
+        return;
+    const char *path = php_dir_include_path(ctx, expression);
+    if (path && path[0]) {
+        CBMImport import = {.local_name = path_last(ctx->arena, path),
+                            .module_path = path,
+                            .kind = CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH,
+                            .site_start_byte = ts_node_start_byte(expression),
+                            .site_end_byte = ts_node_end_byte(expression),
+                            .source_origin = CBM_SOURCE_ORIGIN_RAW};
+        cbm_imports_push(&ctx->result->imports, ctx->arena, import);
+        return;
+    }
+    /* Preserve the legacy carrier spelling while preventing a bare include
+     * such as 'Base' from being interpreted as `use Base`. */
+    int before = ctx->result->imports.count;
+    generic_import_from_text(ctx, statement);
+    if (ctx->result->imports.count == before + 1)
+        ctx->result->imports.items[before].kind = CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN;
+}
+
 static void parse_php_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -2660,10 +2727,7 @@ static void parse_php_imports(CBMExtractCtx *ctx) {
         if (strcmp(kind, "namespace_use_declaration") == 0) {
             emit_php_use_decl(ctx, node);
         } else if (strcmp(kind, "expression_statement") == 0) {
-            // require / include / require_once / include_once
-            if (!try_generic_path_fields(ctx, node)) {
-                generic_import_from_text(ctx, node);
-            }
+            emit_php_include(ctx, node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -2927,6 +2991,178 @@ static bool markup_script_host(CBMLanguage language) {
     return language == CBM_LANG_VUE || language == CBM_LANG_SVELTE || language == CBM_LANG_HTML ||
            language == CBM_LANG_ASTRO;
 }
+
+/* Component scripts have module-local bindings even without an explicit ESM
+ * statement. This proof subset admits one inline script and an inert host.
+ * Multiple script contexts, template expressions/directives, external scripts
+ * and unknown markup remain unproved; extraction is deliberately broader. */
+static bool embedded_binding_identifier(const char *source, TSNode value) {
+    uint32_t start = ts_node_start_byte(value), end = ts_node_end_byte(value);
+    if (end <= start + 2 || source[start++] != '{' || source[--end] != '}')
+        return false;
+    while (start < end && isspace((unsigned char)source[start]))
+        start++;
+    while (end > start && isspace((unsigned char)source[end - 1]))
+        end--;
+    if (start == end || !((source[start] >= 'a' && source[start] <= 'z') ||
+                          (source[start] >= 'A' && source[start] <= 'Z') ||
+                          source[start] == '_' || source[start] == '$'))
+        return false;
+    for (uint32_t i = start + 1; i < end; i++) {
+        unsigned char c = (unsigned char)source[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '$'))
+            return false;
+    }
+    return true;
+}
+
+static bool embedded_binding_attribute(CBMExtractCtx *ctx, TSNode attribute, bool script,
+                                        CBMLanguage *language, unsigned *seen) {
+    uint32_t count = ts_node_named_child_count(attribute);
+    if (!count || count > 2)
+        return false;
+    TSNode name_node = ts_node_named_child(attribute, 0);
+    if (strcmp(ts_node_type(name_node), "attribute_name"))
+        return false;
+    const char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0])
+        return false;
+    if (script) {
+        unsigned flag = ascii_trimmed_equals(name, "lang") ? 1u
+                        : ctx->language == CBM_LANG_VUE && !strcmp(name, "setup") ? 2u : 0u;
+        if (!flag || (*seen & flag) || (flag == 2u && count != 1))
+            return false;
+        *seen |= flag;
+        return apply_script_attribute(ctx, attribute, language);
+    }
+    /* A Svelte event handler may capture a bare identifier, but may not run
+     * an expression while creating the handler or write a script binding. */
+    if (ctx->language == CBM_LANG_SVELTE && !strncmp(name, "on:", 3)) {
+        if (!name[3] || count != 2)
+            return false;
+        for (const char *p = name + 3; *p; p++)
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')))
+                return false;
+        TSNode value = ts_node_named_child(attribute, 1);
+        return !strcmp(ts_node_type(value), "expression") &&
+               embedded_binding_identifier(ctx->source, value);
+    }
+    if (!strncmp(name, "v-", 2) || !strncmp(name, "on", 2))
+        return false;
+    for (const char *p = name; *p; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+            return false;
+    /* Static attribute text cannot conceal a component expression. This is
+     * intentionally narrower than either host grammar's value syntax. */
+    uint32_t begin = ts_node_end_byte(name_node), end = ts_node_end_byte(attribute);
+    for (uint32_t i = begin; i < end; i++)
+        if (ctx->source[i] == '{' || ctx->source[i] == '}' || ctx->source[i] == '&')
+            return false;
+    return true;
+}
+
+static bool embedded_binding_script(CBMExtractCtx *ctx, TSNode script,
+                                     CBMEmbeddedBlock *block, CBMLanguage *language) {
+    unsigned attributes = 0;
+    bool content = false, start_tag = false, end_tag = false;
+    uint32_t count = ts_node_named_child_count(script);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(script, i);
+        const char *kind = ts_node_type(child);
+        if (!strcmp(kind, "start_tag") && !start_tag) {
+            start_tag = true;
+            uint32_t children = ts_node_named_child_count(child);
+            for (uint32_t j = 0; j < children; j++) {
+                TSNode item = ts_node_named_child(child, j);
+                const char *item_kind = ts_node_type(item);
+                if (!strcmp(item_kind, "tag_name"))
+                    continue;
+                if (strcmp(item_kind, "attribute") ||
+                    !embedded_binding_attribute(ctx, item, true, language, &attributes))
+                    return false;
+            }
+        } else if (!strcmp(kind, "end_tag") && !end_tag) {
+            end_tag = true;
+        } else if (!strcmp(kind, "raw_text") && !content) {
+            content = true;
+            *block = (CBMEmbeddedBlock){.script = script, .content = child};
+        } else
+            return false;
+    }
+    return start_tag && end_tag && content;
+}
+
+TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TSRange *range) {
+    if (!ctx || !language || !range ||
+        (ctx->language != CBM_LANG_VUE && ctx->language != CBM_LANG_SVELTE) ||
+        !ctx->source || ctx->source_len <= 0 || ts_node_is_null(ctx->root) ||
+        ts_node_has_error(ctx->root) ||
+        ts_node_end_byte(ctx->root) != (uint32_t)ctx->source_len)
+        return NULL;
+    enum { BINDING_HOST_STACK = 512, BINDING_HOST_NODES = 1000000 };
+    TSNode stack[BINDING_HOST_STACK];
+    size_t top = 0, visited = 0;
+    stack[top++] = ctx->root;
+    CBMEmbeddedBlock block = {0};
+    bool found = false;
+    *language = CBM_LANG_JAVASCRIPT;
+    while (top) {
+        TSNode node = stack[--top];
+        if (++visited > BINDING_HOST_NODES)
+            return NULL;
+        const char *kind = ts_node_type(node);
+        if (!strcmp(kind, "script_element")) {
+            if (!ts_node_eq(ts_node_parent(node), ctx->root) || found ||
+                !embedded_binding_script(ctx, node, &block, language))
+                return NULL;
+            found = true;
+            continue;
+        }
+        if (!strcmp(kind, "attribute")) {
+            unsigned unused = 0;
+            if (!embedded_binding_attribute(ctx, node, false, language, &unused))
+                return NULL;
+            continue;
+        }
+        bool container = !strcmp(kind, "document") || !strcmp(kind, "element") ||
+                         !strcmp(kind, "template_element") || !strcmp(kind, "start_tag") ||
+                         !strcmp(kind, "end_tag") || !strcmp(kind, "self_closing_tag");
+        bool leaf = !strcmp(kind, "text") || !strcmp(kind, "comment") ||
+                    !strcmp(kind, "tag_name");
+        if (!container && !leaf)
+            return NULL;
+        uint32_t children = ts_node_named_child_count(node);
+        if (leaf && children)
+            return NULL;
+        if (children > BINDING_HOST_STACK - top)
+            return NULL;
+        for (uint32_t i = children; i > 0; i--)
+            stack[top++] = ts_node_named_child(node, i - 1);
+    }
+    if (!found)
+        return NULL;
+    *range = (TSRange){.start_point = ts_node_start_point(block.content),
+                       .end_point = ts_node_end_point(block.content),
+                       .start_byte = ts_node_start_byte(block.content),
+                       .end_byte = ts_node_end_byte(block.content)};
+    if (range->end_byte <= range->start_byte || range->end_byte > (uint32_t)ctx->source_len)
+        return NULL;
+    TSParser *parser = ts_parser_new();
+    TSTree *tree = NULL;
+    if (parser && ts_parser_set_language(parser, cbm_ts_language(*language)) &&
+        ts_parser_set_included_ranges(parser, range, 1))
+        tree = ts_parser_parse_string(parser, NULL, ctx->source, (uint32_t)ctx->source_len);
+    if (parser)
+        ts_parser_delete(parser);
+    if (tree && ts_node_has_error(ts_tree_root_node(tree))) {
+        ts_tree_delete(tree);
+        tree = NULL;
+    }
+    return tree;
+}
+
 
 static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock *block,
                                      CBMLanguage embedded_language) {
@@ -3592,6 +3828,36 @@ static void parse_make_imports(CBMExtractCtx *ctx) {
     }
 }
 
+/* This subset records the complete raw string token, never its first
+ * interpolated/escaped fragment. The path adapter separately proves repository
+ * containment and the exact target File. Unsupported literals keep the legacy
+ * carrier for diagnostics, but cannot acquire the audited kind. */
+static bool push_literal_relative_import(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(node) || ts_node_has_error(ctx->root))
+        return false;
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    if (end <= start + 2 || end > (uint32_t)ctx->source_len)
+        return false;
+    const char *raw = ctx->source + start;
+    size_t length = end - start;
+    char quote = raw[0];
+    if ((quote != '\'' && quote != '"') || raw[length - 1] != quote || raw[1] == '/')
+        return false;
+    for (size_t i = 1; i + 1 < length; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        if (c < ' ' || c == 0x7f || strchr("\\\"'$:#?%{}", c))
+            return false;
+    }
+    char *path = cbm_arena_strndup(ctx->arena, raw + 1, length - 2);
+    if (!path)
+        return false;
+    CBMImport imp = {.local_name = path_last(ctx->arena, path),
+                     .module_path = path,
+                     .kind = CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+    return true;
+}
+
 // --- CSS / SCSS imports ---
 // CSS @import "x.css" and SCSS @use/@forward 'x' are top-level statements that
 // carry a `string_value` (whose `string_content` is the unquoted path). The
@@ -3628,11 +3894,24 @@ static void parse_css_imports(CBMExtractCtx *ctx) {
         ts_tree_cursor_delete(&cursor);
         return;
     }
+    bool imports_allowed = true;
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *k = ts_node_type(node);
-        if (strcmp(k, "import_statement") == 0 || strcmp(k, "use_statement") == 0 ||
-            strcmp(k, "forward_statement") == 0 || strcmp(k, "include_statement") == 0) {
+        if (ctx->language == CBM_LANG_CSS) {
+            if (!strcmp(k, "import_statement")) {
+                TSNode target = ts_node_named_child(node, 0);
+                bool audited = imports_allowed && !strcmp(ts_node_type(target), "string_value") &&
+                               push_literal_relative_import(ctx, target);
+                if (!audited)
+                    css_push_import_from_stmt(ctx, node);
+            } else if (strcmp(k, "comment") && strcmp(k, "charset_statement")) {
+                /* Layer ordering and non-literal URL syntax require their own
+                 * proof. An import after a style rule is invalid CSS. */
+                imports_allowed = false;
+            }
+        } else if (strcmp(k, "import_statement") == 0 || strcmp(k, "use_statement") == 0 ||
+                   strcmp(k, "forward_statement") == 0 || strcmp(k, "include_statement") == 0) {
             css_push_import_from_stmt(ctx, node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
@@ -3976,12 +4255,32 @@ static void parse_capnp_imports(CBMExtractCtx *ctx) {
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
-        if (ts_node_is_named(node) &&
-            (strcmp(k, "import_using") == 0 || strcmp(k, "import_path") == 0)) {
-            push_string_descendant_import(ctx, node);
-            continue; /* don't double-emit from nested import_path */
+        if (ts_node_is_named(node) && strcmp(k, "import_path") == 0) {
+            if (!push_literal_relative_import(ctx, node))
+                push_string_descendant_import(ctx, node);
+            continue;
         }
         ts_nstack_push_children(&stack, node);
+    }
+}
+
+/* Bicep module paths occupy a direct string child of module_declaration.
+ * Never use a string from its deployment body or an interpolation fragment. */
+static void parse_bicep_imports(CBMExtractCtx *ctx) {
+    uint32_t count = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode declaration = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(declaration), "module_declaration"))
+            continue;
+        uint32_t children = ts_node_named_child_count(declaration);
+        for (uint32_t j = 0; j < children; j++) {
+            TSNode child = ts_node_named_child(declaration, j);
+            if (strcmp(ts_node_type(child), "string"))
+                continue;
+            if (!push_literal_relative_import(ctx, child))
+                push_path_import(ctx, child);
+            break;
+        }
     }
 }
 
@@ -4533,6 +4832,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_CAPNP:
         parse_capnp_imports(ctx);
+        break;
+    case CBM_LANG_BICEP:
+        parse_bicep_imports(ctx);
         break;
     case CBM_LANG_DLANG:
         parse_dlang_imports(ctx);

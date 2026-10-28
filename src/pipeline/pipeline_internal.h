@@ -624,7 +624,8 @@ static inline bool cbm_pipeline_test_extraction_ok(cbm_pipeline_ctx_t *ctx, CBML
 enum {
     CBM_PIPELINE_TEST_FAULT_EXTRACT_NULL = 1u << 0,
     CBM_PIPELINE_TEST_FAULT_DEF_MODULES_NULL = 1u << 1,
-    CBM_PIPELINE_TEST_FAULT_COLLECT_SPILL_NULL = 1u << 2
+    CBM_PIPELINE_TEST_FAULT_COLLECT_SPILL_NULL = 1u << 2,
+    CBM_PIPELINE_TEST_FAULT_RESOLVER_SPILL_NULL = 1u << 3
 };
 void cbm_pipeline_test_set_fault_mask(cbm_pipeline_t *p, unsigned mask);
 unsigned cbm_pipeline_test_fault_mask(const cbm_pipeline_t *p);
@@ -1046,6 +1047,25 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
  * The single decision point for BOTH the sequential semantic pass and the
  * parallel per-file resolve — the two venues must never diverge. */
 const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
+
+/* Immutable source-audited class bindings for the structural passes. Built
+ * once before workers; every source must match its extraction snapshot.
+ * Kotlin/C# namespace lookup additionally requires the complete graph file domain.
+ * C++ uses one proven quoted include; Rust uses declared module import bindings.
+ * These facts do not authorize method dispatch or controlled resolver edges. */
+typedef struct cbm_semantic_bindings cbm_semantic_bindings_t;
+cbm_semantic_bindings_t *cbm_semantic_bindings_build(cbm_pipeline_ctx_t *ctx,
+                                                     const cbm_file_info_t *files, int count,
+                                                     CBMFileResult **cache);
+void cbm_semantic_bindings_free(cbm_semantic_bindings_t *bindings);
+const char *cbm_semantic_class_base(const cbm_semantic_bindings_t *bindings,
+                                    const CBMDefinition *definition, const char *base,
+                                    const cbm_gbuf_node_t *candidate);
+
+/* Exact trait-impl occurrence plus source-audited Struct/Interface declarations. */
+bool cbm_semantic_rust_implementation(const cbm_semantic_bindings_t *bindings, const char *rel,
+                                      const CBMImplTrait *implementation, const char **struct_qn,
+                                      const char **trait_qn);
 
 /* Explicit-language override detection on the full graph (serial tail).
  * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches

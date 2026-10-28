@@ -6,6 +6,7 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "sqlite3.h"
+#include "resolver_quality.h"
 
 static bool java_row_admitted(const CBMResolvedCall *row) {
     cbm_resolve_result_t result = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
@@ -346,7 +347,204 @@ TEST(resolver_java_pipeline_keeps_canonical_crossfile_target) {
     PASS();
 }
 
+static const char JAVA_DIRECT_SOURCE[] =
+    "package app;\n"
+    "class Calc {\n"
+    " private int helper(int x) { return x + 1; }\n"
+    " int twice(int x) { return x * 2; }\n"
+    " long widen(long x) { return x; }\n"
+    " boolean flag(boolean x) { return x; }\n"
+    " int overloaded(int x) { return x; }\n"
+    " int overloaded(long x) { return 0; }\n"
+    " void run(int y, Alpha alpha, Beta beta) {\n"
+    "  helper(y);\n"
+    "  this.helper(7);\n"
+    "  twice(helper(y));\n"
+    "  widen(y);\n"
+    "  flag(true);\n"
+    "  alpha.handle();\n"
+    "  beta.handle();\n"
+    "  overloaded(y);\n"
+    " }\n"
+    " void forbidden(Other other, String unknown, int[] values) {\n"
+    "  helper(unknown); helper(values); helper(1L); other.hidden(); Calc.helper(1);\n"
+    " }\n"
+    " static void staticForbidden() { helper(1); this.helper(1); }\n"
+    "}\n";
+
+static const char JAVA_PACKAGE_SOURCE[] = "package app;\n"
+                                          "class Alpha { void handle() {} }\n"
+                                          "class Beta { void handle() {} }\n"
+                                          "class Other { private void hidden() {} }\n";
+
+static const RQ_Expected JAVA_DIRECT_EXPECTED[] = {
+    {.case_id = "implicit-private-primitive-argument",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "helper(y)"},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.helper",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " private int helper(int x) { return x + 1; }"}},
+    {.case_id = "explicit-this-primitive-literal",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "this.helper(7)"},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.helper",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " private int helper(int x) { return x + 1; }"}},
+    {.case_id = "source-proven-nested-return",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "twice(helper(y))"},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.twice",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = " int twice(int x) { return x * 2; }"}},
+    {.case_id = "nested-invocation-identity",
+     .site =
+         {.file = "main.java", .caller = "Calc.run", .needle = "helper(y)", .occurrence_index = 1},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.helper",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " private int helper(int x) { return x + 1; }"}},
+    {.case_id = "primitive-widening",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "widen(y)"},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.widen",
+                .label = "Method",
+                .declaration_line = 5,
+                .declaration_text = " long widen(long x) { return x; }"}},
+    {.case_id = "boolean-identity",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "flag(true)"},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.flag",
+                .label = "Method",
+                .declaration_line = 6,
+                .declaration_text = " boolean flag(boolean x) { return x; }"}},
+    {.case_id = "same-package-alpha",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "alpha.handle()"},
+     .relation = "CALLS",
+     .target = {.file = "support.java",
+                .suffix = "Alpha.handle",
+                .label = "Method",
+                .declaration_line = 2,
+                .declaration_text = "class Alpha { void handle() {} }"}},
+    {.case_id = "same-package-beta",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "beta.handle()"},
+     .relation = "CALLS",
+     .target = {.file = "support.java",
+                .suffix = "Beta.handle",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = "class Beta { void handle() {} }"}},
+    {.case_id = "overload-selection-remains-quality-debt",
+     .site = {.file = "main.java", .caller = "Calc.run", .needle = "overloaded(y)"},
+     .relation = "CALLS",
+     .target = {.file = "main.java",
+                .suffix = "Calc.overloaded",
+                .label = "Method",
+                .declaration_line = 7,
+                .declaration_text = " int overloaded(int x) { return x; }"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "java-overload-selection",
+     .why = "name-domain proof conservatively rejects competing source declarations",
+     .tried = "an int argument selects the int declaration in Java; primitive applicability "
+              "is proved only after a unique direct name has been established"},
+};
+
+static const RQ_Forbidden JAVA_DIRECT_FORBIDDEN[] = {
+    {.case_id = "unknown-argument",
+     .site = {.file = "main.java", .caller = "Calc.forbidden", .needle = "helper(unknown)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "array-is-not-primitive",
+     .site = {.file = "main.java", .caller = "Calc.forbidden", .needle = "helper(values)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "narrowing-is-not-invocation-conversion",
+     .site = {.file = "main.java", .caller = "Calc.forbidden", .needle = "helper(1L)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "private-owner-mismatch",
+     .site = {.file = "main.java", .caller = "Calc.forbidden", .needle = "other.hidden()"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "instance-through-class",
+     .site = {.file = "main.java", .caller = "Calc.forbidden", .needle = "Calc.helper(1)"},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "implicit-instance-from-static",
+     .site = {.file = "main.java",
+              .caller = "Calc.staticForbidden",
+              .needle = "helper(1)",
+              .occurrence_index = 1},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "explicit-this-from-static",
+     .site = {.file = "main.java", .caller = "Calc.staticForbidden", .needle = "this.helper(1)"},
+     .relation = "CALLS",
+     .any_target = true},
+};
+
+TEST(resolver_java_direct_members_require_source_applicability) {
+    for (int driver = 0; driver < 2; driver++) {
+        const char *root = th_mktempdir("cbm_java_direct");
+        ASSERT_NOT_NULL(root);
+        char repo[768], database[768];
+        snprintf(repo, sizeof(repo), "%s/repo", root);
+        snprintf(database, sizeof(database), "%s/index.db", root);
+        bool ok = cbm_mkdir_p(repo, 0755) &&
+                  th_write_file(TH_PATH(repo, "main.java"), JAVA_DIRECT_SOURCE) == 0 &&
+                  th_write_file(TH_PATH(repo, "support.java"), JAVA_PACKAGE_SOURCE) == 0;
+        for (int i = 0; ok && i < 55; i++) {
+            char file[32];
+            snprintf(file, sizeof(file), "Filler%02d.java", i);
+            ok = th_write_file(TH_PATH(repo, file), "// unrelated compilation unit\n") == 0;
+        }
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+        ok = ok && (!old_workers || saved_workers);
+        cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+        cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+        ok = pipeline && cbm_pipeline_set_project_name(pipeline, "java-direct") &&
+             cbm_pipeline_run(pipeline) == 0;
+        cbm_pipeline_free(pipeline);
+        if (saved_workers) {
+            cbm_setenv("CBM_WORKERS", saved_workers, 1);
+            free(saved_workers);
+        } else
+            cbm_unsetenv("CBM_WORKERS");
+        cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+        const RQ_Source sources[] = {{.path = "main.java", .text = JAVA_DIRECT_SOURCE},
+                                     {.path = "support.java", .text = JAVA_PACKAGE_SOURCE}};
+        RQ_Report report = {0};
+        ok = store &&
+             rq_check(store, "java-direct", "direct-java-members", sources, 2, JAVA_DIRECT_EXPECTED,
+                      sizeof(JAVA_DIRECT_EXPECTED) / sizeof(JAVA_DIRECT_EXPECTED[0]),
+                      JAVA_DIRECT_FORBIDDEN,
+                      sizeof(JAVA_DIRECT_FORBIDDEN) / sizeof(JAVA_DIRECT_FORBIDDEN[0]), &report,
+                      stderr) &&
+             ok;
+        if (store)
+            cbm_store_close(store);
+        th_cleanup(root);
+        ASSERT(ok);
+        ASSERT_EQ(report.genuine, 9);
+        ASSERT_EQ(report.found, 8);
+        ASSERT_EQ(report.missing, 1);
+        ASSERT_EQ(report.required_missing + report.wrong, 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_java) {
+    RUN_TEST(resolver_java_direct_members_require_source_applicability);
     RUN_TEST(resolver_java_declared_receiver_static_and_reference_have_proof);
     RUN_TEST(resolver_java_wrong_arity_varargs_and_null_source_abstain);
     RUN_TEST(resolver_java_full_graph_identity_does_not_duplicate_signature);

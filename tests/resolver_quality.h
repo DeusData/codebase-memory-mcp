@@ -34,6 +34,10 @@ typedef struct {
     /* Optional alternate coordinates for this SAME raw occurrence. The bytes
      * and source line must agree; zero/zero means no preprocessing map. */
     uint32_t preprocessed_start_byte, preprocessed_end_byte;
+    /* Optional authored caller variant, never inferred from the merged node.
+     * All three fields are required; the exact stored variant must agree. */
+    unsigned caller_variant_start_line, caller_variant_end_line;
+    const char *caller_variant_declaration;
 } RQ_Site;
 typedef enum {
     RQ_TARGET_PROJECT = 0,
@@ -173,11 +177,21 @@ static inline bool rq_anchor(RQ_State *state, const RQ_Source *sources, size_t c
 }
 /* Bounded external ontology: internal/cbm/lsp/py_builtins.c materializes
  * these Python symbols at this synthetic path. The expectation supplies the
- * exact identity and label independently of any observed resolver output. */
+ * exact identity and label independently of any observed resolver output.
+ * Kotlin adds only Any.hashCode and Int.toString. Their semantics are defined
+ * by the Kotlin stdlib API (-any/hash-code.html and -int/to-string.html); Int
+ * explicitly overrides toString. <kotlin-builtins> is the repository ontology
+ * path. An absent Int node is a quality gap, never authority for Any.toString. */
 static inline bool rq_external_target(const RQ_Target *target) {
-    if (target->domain != RQ_TARGET_EXTERNAL || !rq_equal(target->file, "<python-builtins>") ||
-        target->suffix || target->declaration_line || target->declaration_text ||
-        target->configuration_file || !rq_text(target->external_identity))
+    if (target->domain != RQ_TARGET_EXTERNAL || target->suffix || target->declaration_line ||
+        target->declaration_text || target->configuration_file ||
+        !rq_text(target->external_identity))
+        return false;
+    if (rq_equal(target->file, "<kotlin-builtins>"))
+        return rq_equal(target->label, "Method") &&
+               (rq_equal(target->external_identity, "kotlin.Any.hashCode") ||
+                rq_equal(target->external_identity, "kotlin.Int.toString"));
+    if (!rq_equal(target->file, "<python-builtins>"))
         return false;
     static const struct {
         const char *identity, *label;
@@ -334,6 +348,29 @@ static inline bool rq_prepare(RQ_State *states, const RQ_Expected *expected, siz
         bool valid = rq_text(state->case_id) && rq_text(state->relation) &&
                      rq_anchor(state, sources, source_count) &&
                      (state->any_target || rq_target_anchor(state->target, sources, source_count));
+        const RQ_Site *site = state->site;
+        if (site->caller_variant_start_line || site->caller_variant_end_line ||
+            site->caller_variant_declaration) {
+            const RQ_Target declaration = {.file = site->file,
+                                           .declaration_line = (int)site->caller_variant_start_line,
+                                           .declaration_text = site->caller_variant_declaration};
+            const char *text = rq_source(sources, source_count, site->file);
+            size_t length = text ? strlen(text) : 0;
+            unsigned lines = length && text[length - 1] != '\n' ? 1 : 0;
+            unsigned occurrence_end_line = 1;
+            for (size_t at = 0; at < length; at++) {
+                lines += text[at] == '\n';
+                if (state->end && at < state->end - 1)
+                    occurrence_end_line += text[at] == '\n';
+            }
+            valid = valid && site->caller_variant_start_line > 0 &&
+                    site->caller_variant_end_line >= site->caller_variant_start_line &&
+                    site->caller_variant_end_line <= lines &&
+                    (unsigned)state->line >= site->caller_variant_start_line &&
+                    (unsigned)state->line <= site->caller_variant_end_line &&
+                    occurrence_end_line <= site->caller_variant_end_line &&
+                    rq_target_anchor(&declaration, sources, source_count);
+        }
         for (size_t j = 0; j < i; j++) {
             const RQ_State *prior = states + j;
             bool same_site = !state->negative && !prior->negative &&
@@ -387,10 +424,45 @@ static inline bool rq_prepare(RQ_State *states, const RQ_Expected *expected, siz
     return report->invalid_oracle == 0;
 }
 
+/* A merged conditional declaration may have a different canonical range.
+ * Accept only one exact variant matching independently authored source bounds;
+ * a broad, duplicated, absent or malformed variant cannot authorize a caller. */
+static inline bool rq_caller_variant(sqlite3_stmt *row, int properties_column,
+                                     const RQ_State *state) {
+    const RQ_Site *site = state->site;
+    if (!site->caller_variant_start_line || !site->caller_variant_end_line ||
+        !rq_text(site->caller_variant_declaration))
+        return false;
+    const char *properties = (const char *)sqlite3_column_text(row, properties_column);
+    if (!properties)
+        return false;
+    sqlite3_stmt *query = NULL;
+    const char *sql = "SELECT COUNT(*) FROM json_each(?1,'$.variants') v "
+                      "WHERE json_type(?1,'$.variants')='array' AND v.type='object' "
+                      "AND (SELECT COUNT(*) FROM json_each(?1) r WHERE r.key='variants')=1 "
+                      "AND json_type(v.value,'$.file_path')='text' "
+                      "AND (SELECT COUNT(*) FROM json_each(v.value) k "
+                      "WHERE k.key IN ('file_path','start_line','end_line'))=3 "
+                      "AND json_type(v.value,'$.start_line')='integer' "
+                      "AND json_type(v.value,'$.end_line')='integer' "
+                      "AND json_extract(v.value,'$.file_path')=?2 "
+                      "AND json_extract(v.value,'$.start_line')=?3 "
+                      "AND json_extract(v.value,'$.end_line')=?4";
+    bool ok = sqlite3_prepare_v2(sqlite3_db_handle(row), sql, -1, &query, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(query, 1, properties, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+              sqlite3_bind_text(query, 2, site->file, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+              sqlite3_bind_int64(query, 3, site->caller_variant_start_line) == SQLITE_OK &&
+              sqlite3_bind_int64(query, 4, site->caller_variant_end_line) == SQLITE_OK &&
+              sqlite3_step(query) == SQLITE_ROW && sqlite3_column_int(query, 0) == 1 &&
+              sqlite3_step(query) == SQLITE_DONE;
+    sqlite3_finalize(query);
+    return ok;
+}
+
 /* Column layout shared by the row and graph checks: file/scope/relation,
  * span/origin, target identity and source declaration, then graph counterpart. */
 static inline bool rq_occurrence(sqlite3_stmt *stmt, RQ_State *states, size_t count,
-                                 RQ_Report *report, FILE *log) {
+                                 bool target_in_domain, RQ_Report *report, FILE *log) {
     const char *file = (const char *)sqlite3_column_text(stmt, 0);
     const char *scope = (const char *)sqlite3_column_text(stmt, 1);
     const char *relation = (const char *)sqlite3_column_text(stmt, 2);
@@ -418,15 +490,21 @@ static inline bool rq_occurrence(sqlite3_stmt *stmt, RQ_State *states, size_t co
         bool same_site = origin == CBM_SOURCE_ORIGIN_RAW ? raw_site : expanded_identity;
         mapped_origin |= expanded_identity;
         covered |= raw_site || expanded_site ||
-                   ((same_file || rq_equal(source_file, state->site->file)) && caller &&
-                    rq_equal(relation, state->relation));
+                   (target_in_domain && (same_file || rq_equal(source_file, state->site->file)) &&
+                    caller && rq_equal(relation, state->relation));
         bool source_range = sqlite3_column_int(stmt, 13) <= state->line &&
                             sqlite3_column_int(stmt, 14) >= state->line;
         bool structural_file = rq_equal((const char *)sqlite3_column_text(stmt, 18), "File") &&
                                sqlite3_column_int(stmt, 13) == 0 &&
                                sqlite3_column_int(stmt, 14) == 0;
-        if (!same_site || !caller || !rq_equal(source_file, state->site->file) ||
-            !rq_equal(relation, state->relation) || (!source_range && !structural_file))
+        bool variant = rq_caller_variant(stmt, 21, state);
+        bool source_identity = variant || (rq_equal(source_file, state->site->file) &&
+                                           (source_range || structural_file));
+        /* An explicit variant expectation must be independently verified even
+         * if the canonical declaration happens to overlap the occurrence. */
+        if (state->site->caller_variant_start_line)
+            source_identity = variant;
+        if (!same_site || !caller || !source_identity || !rq_equal(relation, state->relation))
             continue;
         bool target_ok = state->any_target ||
                          rq_target(state->target, target_file, target,
@@ -476,7 +554,7 @@ static inline bool rq_occurrence(sqlite3_stmt *stmt, RQ_State *states, size_t co
     return true;
 }
 static inline bool rq_projection(sqlite3_stmt *stmt, const RQ_State *states, size_t count,
-                                 RQ_Report *report, FILE *log) {
+                                 bool target_in_domain, RQ_Report *report, FILE *log) {
     const char *file = (const char *)sqlite3_column_text(stmt, 0);
     const char *scope = (const char *)sqlite3_column_text(stmt, 1);
     const char *relation = (const char *)sqlite3_column_text(stmt, 2);
@@ -495,7 +573,8 @@ static inline bool rq_projection(sqlite3_stmt *stmt, const RQ_State *states, siz
     bool covered = false, matched = false;
     for (size_t i = 0; i < count; i++) {
         const RQ_State *state = states + i;
-        if (!rq_equal(file, state->site->file) ||
+        bool variant = rq_caller_variant(stmt, 11, state);
+        if ((!rq_equal(file, state->site->file) && !variant) ||
             !rq_suffix(scope, source_name, state->site->caller))
             continue;
         bool target_ok = state->any_target ||
@@ -504,7 +583,8 @@ static inline bool rq_projection(sqlite3_stmt *stmt, const RQ_State *states, siz
                                    (const char *)sqlite3_column_text(stmt, 8),
                                    sqlite3_column_int(stmt, 5), sqlite3_column_int(stmt, 6));
         /* A known target under a different role is also inside the audit. */
-        covered |= rq_equal(relation, state->relation) || (!state->any_target && target_ok);
+        covered |= (target_in_domain && rq_equal(relation, state->relation)) ||
+                   (!state->any_target && target_ok);
         if (!rq_equal(relation, state->relation) || !target_ok)
             continue;
         if (!state->negative && state->found && sqlite3_column_int(stmt, 10))
@@ -522,15 +602,21 @@ static inline bool rq_projection(sqlite3_stmt *stmt, const RQ_State *states, siz
     return true;
 }
 static inline bool rq_query(sqlite3 *db, const char *project, const char *sql, bool projection,
-                            RQ_State *states, size_t count, RQ_Report *report, FILE *log) {
+                            RQ_State *states, size_t count, const RQ_Source *project_sources,
+                            size_t project_source_count, RQ_Report *report, FILE *log) {
     sqlite3_stmt *stmt = NULL;
     bool ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
               sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK;
     int step = SQLITE_ERROR;
     if (ok)
         while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
-            bool valid = projection ? rq_projection(stmt, states, count, report, log)
-                                    : rq_occurrence(stmt, states, count, report, log);
+            const char *target_file = (const char *)sqlite3_column_text(stmt, projection ? 4 : 7);
+            bool target_in_domain =
+                !project_sources ||
+                rq_source_input(project_sources, project_source_count, target_file);
+            bool valid = projection
+                             ? rq_projection(stmt, states, count, target_in_domain, report, log)
+                             : rq_occurrence(stmt, states, count, target_in_domain, report, log);
             ok = valid && ok;
         }
     if (step != SQLITE_DONE) {
@@ -579,11 +665,11 @@ static inline bool rq_finish(const char *suite, const RQ_Expected *expected, siz
 
 /* Run before closing the fixture store. NULL log suppresses diagnostics only;
  * it never changes accounting or gates. A non-NULL report is always populated. */
-static inline bool rq_check(cbm_store_t *store, const char *project, const char *suite,
-                            const RQ_Source *sources, size_t source_count,
-                            const RQ_Expected *expected, size_t count,
-                            const RQ_Forbidden *forbidden, size_t negative_count, RQ_Report *report,
-                            FILE *log) {
+static inline bool rq_check_domain(cbm_store_t *store, const char *project, const char *suite,
+                                   const RQ_Source *sources, size_t source_count,
+                                   const RQ_Expected *expected, size_t count,
+                                   const RQ_Forbidden *forbidden, size_t negative_count,
+                                   RQ_Report *report, FILE *log, bool project_declarations_only) {
     if (!report)
         return false;
     *report = (RQ_Report){.genuine = count};
@@ -623,7 +709,7 @@ static inline bool rq_check(cbm_store_t *store, const char *project, const char 
         "t.file_path,t.start_line,t.end_line,t.name,t.label,s.file_path,s.start_line,s.end_line,"
         "s.name,EXISTS(SELECT 1 FROM edges e WHERE e.project=r.project AND e.source_id=s.id "
         "AND e.target_id=t.id AND e.type=r.relation),r.domain,s.label,"
-        "v.content_identity,v.configuration_identity FROM resolver_occurrences r "
+        "v.content_identity,v.configuration_identity,s.properties FROM resolver_occurrences r "
         "LEFT JOIN resolver_occurrence_evidence v ON v.project=r.project AND v.ordinal=r.ordinal "
         "LEFT JOIN nodes s ON s.project=r.project AND s.qualified_name=r.scope "
         "LEFT JOIN nodes t ON t.project=r.project AND t.qualified_name=r.target "
@@ -632,14 +718,41 @@ static inline bool rq_check(cbm_store_t *store, const char *project, const char 
         "SELECT s.file_path,s.qualified_name,e.type,t.qualified_name,t.file_path,t.start_line,"
         "t.end_line,t.name,t.label,s.name,EXISTS(SELECT 1 FROM resolver_occurrences r "
         "WHERE r.project=e.project AND r.emitted=1 AND r.scope=s.qualified_name "
-        "AND r.target=t.qualified_name AND r.relation=e.type) FROM edges e "
+        "AND r.target=t.qualified_name AND r.relation=e.type),s.properties FROM edges e "
         "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1";
     if (valid && !report->metadata_errors) {
-        (void)rq_query(db, project, rows, false, states, count + negative_count, report, log);
-        (void)rq_query(db, project, edges, true, states, count + negative_count, report, log);
+        const RQ_Source *domain = project_declarations_only ? sources : NULL;
+        (void)rq_query(db, project, rows, false, states, count + negative_count, domain,
+                       source_count, report, log);
+        (void)rq_query(db, project, edges, true, states, count + negative_count, domain,
+                       source_count, report, log);
     }
     bool ok = valid && rq_finish(suite, expected, count, states, report, log);
     free(states);
     return ok;
+}
+/* Default: every target in each covered caller/relation remains audited. */
+static inline bool rq_check(cbm_store_t *store, const char *project, const char *suite,
+                            const RQ_Source *sources, size_t source_count,
+                            const RQ_Expected *expected, size_t count,
+                            const RQ_Forbidden *forbidden, size_t negative_count, RQ_Report *report,
+                            FILE *log) {
+    return rq_check_domain(store, project, suite, sources, source_count, expected, count, forbidden,
+                           negative_count, report, log, false);
+}
+
+/* Opt-in project declaration domain: source paths are authored inputs, never
+ * inferred from emitted targets. Exact golden spans still audit EVERY target,
+ * including external namesakes. Elsewhere in a covered caller/relation, all
+ * project-file targets remain covered while unrelated external builtin sites
+ * are outside this oracle's denominator and target domain. */
+static inline bool rq_check_project_declarations(cbm_store_t *store, const char *project,
+                                                 const char *suite, const RQ_Source *sources,
+                                                 size_t source_count, const RQ_Expected *expected,
+                                                 size_t count, const RQ_Forbidden *forbidden,
+                                                 size_t negative_count, RQ_Report *report,
+                                                 FILE *log) {
+    return rq_check_domain(store, project, suite, sources, source_count, expected, count, forbidden,
+                           negative_count, report, log, true);
 }
 #endif

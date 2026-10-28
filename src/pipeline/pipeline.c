@@ -15,7 +15,7 @@
 
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 8 };
+enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -2412,6 +2412,15 @@ CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, in
     return mt;
 }
 
+/* Infrastructure adapters run before the shared language resolver. Freeze
+ * their source identities from extraction without reordering semantic passes. */
+static int capture_sequential_resolver_sources(cbm_pipeline_ctx_t *ctx,
+                                               const cbm_file_info_t *files, int count) {
+    return cbm_shared_resolver_capture_sources(ctx, files, count, ctx->result_cache)
+               ? 0
+               : CBM_PIPELINE_ABORT_PRESERVE_DB;
+}
+
 /* Calls consume repository-wide HTTP binding facts as well as semantic
  * candidates. Freeze the shared audit before either path can emit an edge. */
 static int prepare_sequential_resolver(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -2489,6 +2498,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         bool ignore_err;
     } seq_passes[] = {
         {cbm_pipeline_pass_definitions, "definitions", false},
+        {capture_sequential_resolver_sources, "resolver_sources", false},
         {cbm_pipeline_pass_k8s, "k8s", true},
         {seq_pass_lsp_cross_dispatch, "lsp_cross", true},
         {prepare_sequential_resolver, "shared_resolver", false},

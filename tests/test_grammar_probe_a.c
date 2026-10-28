@@ -35,6 +35,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "resolver_quality.h"
 #include "cbm.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -180,6 +181,50 @@ static GpaMetrics gpa_metrics(const char *filename, const char *content) {
     return gpa_metrics_files(&f, 1);
 }
 
+/* Import quality covers project declarations, with exact source occurrences.
+ * External runtime libraries are outside this denominator. Every indexed fixture
+ * also contains a required supported call, so an empty graph cannot pass. */
+static bool gpa_import_quality(const GpaFile *files, size_t file_count, const RQ_Source *inputs,
+                               size_t source_count, const char *suite, const RQ_Expected *gap,
+                               const RQ_Forbidden *forbidden, RQ_Report *report) {
+    if (file_count > 7 || source_count > 7)
+        return false;
+    const GpaFile control = {
+        "quality_control.js",
+        "export function target() { return 1; }\nexport function caller() { return target(); }\n"};
+    GpaFile indexed[8];
+    RQ_Source sources[8];
+    memcpy(indexed, files, file_count * sizeof(*files));
+    memcpy(sources, inputs, source_count * sizeof(*inputs));
+    indexed[file_count++] = control;
+    sources[source_count++] = (RQ_Source){.path = control.name, .text = control.content};
+    const RQ_Expected expected[] = {
+        *gap,
+        {.case_id = "required-esm-local-call",
+         .site = {.file = "quality_control.js",
+                  .caller = "quality_control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "quality_control.js",
+                    .suffix = "quality_control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 1; }"},
+         .mode = RQ_REQUIRED}};
+    GpaProj lp;
+    cbm_store_t *store = gpa_index_files(&lp, indexed, (int)file_count);
+    if (!store) {
+        gpa_cleanup(&lp, store);
+        return false;
+    }
+    bool ok =
+        rq_check_project_declarations(store, lp.project, suite, sources, source_count, expected, 2,
+                                      forbidden, forbidden ? 1 : 0, report, stderr);
+    gpa_cleanup(&lp, store);
+    return ok;
+}
+
 /* ══════════════════════════════════════════════════════════════════
  * GROUP 1 — Ada (.adb)
  *
@@ -187,8 +232,8 @@ static GpaMetrics gpa_metrics(const char *filename, const char *content) {
  * OOP: Ada 95 tagged types can model inheritance but grammar-only extraction
  *      produces Function/Module — no Class node expected.
  * IMPORTS: Ada `with Pkg;` imports are extracted at the source level.
- *          Graph-level IMPORTS edges require the package body to be present;
- *          single-file fixture is expected RED (resolver can't find the target).
+ *          A WITH clause identifies a library unit declaration; its exact
+ *          source import remains a quality gap until an adapter proves it.
  * CALLS: covered by P5 breadth (CALL_CASES ada entry); not probed here.
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -239,9 +284,7 @@ TEST(probe_ada_no_crash) {
     PASS();
 }
 
-/* Ada: `with` import in a two-file fixture → IMPORTS edge at graph level.
- * RED: grammar-only Ada has no import-resolution pass that turns `with Pkg`
- *      into a graph IMPORTS edge pointing to the package body node. */
+/* Ada: an exact withed package specification remains a counted quality gap. */
 TEST(probe_ada_imports_edge) {
     static const GpaFile files[] = {
         {"math.ads",
@@ -258,8 +301,33 @@ TEST(probe_ada_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Ada `with` not yet resolved into IMPORTS edges by the pipeline. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — no Ada import resolver */
+
+    const RQ_Source sources[] = {
+        {.path = "math.ads", .text = files[0].content},
+        {.path = "main.adb", .text = files[1].content},
+    };
+    const RQ_Expected gap = {
+        .case_id = "probe_ada_imports_edge-exact-source-import",
+        .site = {.file = "main.adb", .caller = "main.adb.__file__", .needle = "with Math;"},
+        .relation = "IMPORTS",
+        .target = {.file = "math.ads",
+                   .suffix = "math.ads.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "package Math is"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_ada_imports_edge_binding_unproven",
+        .why = "Ada with names the Math library package declaration in math.ads; no audited Ada "
+               "import adapter exists.",
+        .tried = "Kept the package specification and context clause. A package body is not "
+                 "required to identify the withed declaration."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(files, sizeof(files) / sizeof(files[0]), sources,
+                                   sizeof(sources) / sizeof(sources[0]), "probe_ada_imports_edge",
+                                   &gap, NULL, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -415,8 +483,7 @@ TEST(probe_clojure_defrecord) {
     PASS();
 }
 
-/* Clojure: two-file :require → IMPORTS edge.
- * RED: grammar-only Clojure has no ns-resolution pass in the pipeline. */
+/* Clojure: preserve the wrong classpath layout and count a configured lib import. */
 TEST(probe_clojure_imports_edge) {
     static const GpaFile files[] = {
         {"util.clj",
@@ -430,8 +497,57 @@ TEST(probe_clojure_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Clojure ns :require not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+
+    const GpaFile quality_files[] = {
+        files[0],
+        files[1],
+        {"deps.edn", "{:paths [\"src\"]}\n"},
+        {"src/quality/util.clj", "(ns quality.util)\n(defn twice [x] (* 2 x))\n"},
+        {"src/quality/core.clj",
+         "(ns quality.core\n  (:require [quality.util :as u]))\n(defn run [n] (u/twice n))\n"},
+    };
+    const RQ_Source sources[] = {
+        {.path = "util.clj", .text = quality_files[0].content},
+        {.path = "core.clj", .text = quality_files[1].content},
+        {.path = "src/quality/util.clj", .text = quality_files[3].content},
+        {.path = "src/quality/core.clj", .text = quality_files[4].content},
+    };
+    /* The original myapp.util namespace requires myapp/util.clj under a classpath root; util.clj
+     * supplies no such path. A matching namespace string does not establish loading. */
+    const RQ_Forbidden forbidden = {.case_id = "probe_clojure_imports_edge-unconfigured-target",
+                                    .site = {.file = "core.clj",
+                                             .caller = "core.clj.__file__",
+                                             .needle = "(:require [myapp.util :as u])"},
+                                    .relation = "IMPORTS",
+                                    .target = {.file = "util.clj",
+                                               .suffix = "util.clj.__file__",
+                                               .label = "File",
+                                               .declaration_line = 1,
+                                               .declaration_text = "(ns myapp.util)"}};
+    const RQ_Expected gap = {
+        .case_id = "probe_clojure_imports_edge-exact-source-import",
+        .site = {.file = "src/quality/core.clj",
+                 .caller = "src.quality.core.clj.__file__",
+                 .needle = "(:require [quality.util :as u])"},
+        .relation = "IMPORTS",
+        .target = {.file = "src/quality/util.clj",
+                   .suffix = "src.quality.util.clj.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "(ns quality.util)"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_clojure_imports_edge_binding_unproven",
+        .why = "The declared src classpath and quality/util.clj establish the source lib, but "
+               "Clojure namespace import proof is unsupported.",
+        .tried = "Preserved the original invalid classpath layout as a negative; added a separate "
+                 "deps.edn-rooted exact namespace/path pair."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_clojure_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -486,8 +602,7 @@ TEST(probe_commonlisp_defstruct) {
     PASS();
 }
 
-/* Common Lisp: `require` in two-file fixture → IMPORTS edge.
- * RED: grammar-only CL has no package-resolution pass in the pipeline. */
+/* Common Lisp: distinguish package use from an explicit source-relative load. */
 TEST(probe_commonlisp_imports_edge) {
     static const GpaFile files[] = {
         {"util.lisp",
@@ -501,8 +616,56 @@ TEST(probe_commonlisp_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: CL package :use not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+
+    const GpaFile quality_files[] = {
+        files[0],
+        files[1],
+        {"quality/util.lisp", "(defpackage :quality-util (:use :cl) (:export :twice))\n(in-package "
+                              ":quality-util)\n(defun twice (x) (* 2 x))\n"},
+        {"quality/main.lisp", "(load (merge-pathnames \"util.lisp\" *load-truename*))\n"},
+    };
+    const RQ_Source sources[] = {
+        {.path = "util.lisp", .text = quality_files[0].content},
+        {.path = "main.lisp", .text = quality_files[1].content},
+        {.path = "quality/util.lisp", .text = quality_files[2].content},
+        {.path = "quality/main.lisp", .text = quality_files[3].content},
+    };
+    /* DEFPACKAGE :use inherits an existing package; it is not a request to load a similarly named
+     * file. No system or loading context identifies util.lisp. */
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_commonlisp_imports_edge-unconfigured-target",
+        .site = {.file = "main.lisp", .caller = "main.lisp.__file__", .needle = "(:use :cl :util)"},
+        .relation = "IMPORTS",
+        .target = {.file = "util.lisp",
+                   .suffix = "util.lisp.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "(defpackage :util (:export :double))"}};
+    const RQ_Expected gap = {
+        .case_id = "probe_commonlisp_imports_edge-exact-source-import",
+        .site = {.file = "quality/main.lisp",
+                 .caller = "quality.main.lisp.__file__",
+                 .needle = "(load (merge-pathnames \"util.lisp\" *load-truename*))"},
+        .relation = "IMPORTS",
+        .target = {.file = "quality/util.lisp",
+                   .suffix = "quality.util.lisp.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "(defpackage :quality-util (:use :cl) (:export :twice))"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_commonlisp_imports_edge_binding_unproven",
+        .why = "The LOAD pathname is anchored to the current source file via *load-truename*, but "
+               "Common Lisp file-load import proof is unsupported.",
+        .tried =
+            "Kept the original package-use form separate from an explicit source-relative LOAD. No "
+            "package-name-to-file inference or current-directory assumption is accepted."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_commonlisp_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -699,8 +862,7 @@ TEST(probe_d_interface_node) {
     PASS();
 }
 
-/* D: import in two-file fixture → IMPORTS edge.
- * RED: grammar-only D has no import resolver in the pipeline. */
+/* D: an exact root module import remains a counted quality gap. */
 TEST(probe_d_imports_edge) {
     static const GpaFile files[] = {
         {"util.d",
@@ -718,8 +880,33 @@ TEST(probe_d_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: D `import` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+
+    const RQ_Source sources[] = {
+        {.path = "util.d", .text = files[0].content},
+        {.path = "main.d", .text = files[1].content},
+    };
+    const RQ_Expected gap = {
+        .case_id = "probe_d_imports_edge-exact-source-import",
+        .site = {.file = "main.d", .caller = "main.d.__file__", .needle = "import util;"},
+        .relation = "IMPORTS",
+        .target = {.file = "util.d",
+                   .suffix = "util.d.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "module util;"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_d_imports_edge_binding_unproven",
+        .why = "The D module declaration and matching util.d source identify the imported module "
+               "in the fixture root; the D import adapter is unsupported.",
+        .tried = "Retained the exact import clause, module declaration and conventional root "
+                 "source layout; no basename-only edge is allowed."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(files, sizeof(files) / sizeof(files[0]), sources,
+                                   sizeof(sources) / sizeof(sources[0]), "probe_d_imports_edge",
+                                   &gap, NULL, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -762,8 +949,7 @@ TEST(probe_emacslisp_defvar) {
     PASS();
 }
 
-/* Emacs Lisp: `require` in two-file fixture → IMPORTS edge.
- * RED: grammar-only EmacsLisp has no require-resolver in the pipeline. */
+/* Emacs Lisp: feature names alone do not establish source-file locations. */
 TEST(probe_emacslisp_imports_edge) {
     static const GpaFile files[] = {
         {"math-util.el",
@@ -777,8 +963,57 @@ TEST(probe_emacslisp_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: EmacsLisp `require` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+
+    const GpaFile quality_files[] = {
+        files[0],
+        files[1],
+        {"quality/math.el", "(provide 'quality-math)\n(defun quality-double (x) (* 2 x))\n"},
+        {"quality/main.el", "(require 'quality-math (expand-file-name \"math.el\" "
+                            "(file-name-directory load-file-name)))\n"},
+    };
+    const RQ_Source sources[] = {
+        {.path = "math-util.el", .text = quality_files[0].content},
+        {.path = "main.el", .text = quality_files[1].content},
+        {.path = "quality/math.el", .text = quality_files[2].content},
+        {.path = "quality/main.el", .text = quality_files[3].content},
+    };
+    /* The original REQUIRE supplies no filename or load-path entry selecting the repository file.
+     * PROVIDE declares a feature, not its load-path location. */
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_emacslisp_imports_edge-unconfigured-target",
+        .site = {.file = "main.el", .caller = "main.el.__file__", .needle = "(require 'math-util)"},
+        .relation = "IMPORTS",
+        .target = {.file = "math-util.el",
+                   .suffix = "math-util.el.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "(provide 'math-util)"}};
+    const RQ_Expected gap = {
+        .case_id = "probe_emacslisp_imports_edge-exact-source-import",
+        .site = {.file = "quality/main.el",
+                 .caller = "quality.main.el.__file__",
+                 .needle = "(require 'quality-math (expand-file-name \"math.el\" "
+                           "(file-name-directory load-file-name)))"},
+        .relation = "IMPORTS",
+        .target = {.file = "quality/math.el",
+                   .suffix = "quality.math.el.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "(provide 'quality-math)"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_emacslisp_imports_edge_binding_unproven",
+        .why = "The explicit filename is anchored to load-file-name and the target provides "
+               "quality-math, but Emacs Lisp source-relative require proof is unsupported.",
+        .tried = "Kept the original feature-only require as a negative and added a separate "
+                 "filename anchored to the loaded source file; no ambient load-path or "
+                 "default-directory is assumed."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_emacslisp_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -815,23 +1050,66 @@ TEST(probe_fennel_lambda) {
     PASS();
 }
 
-/* Fennel: `require` in two-file fixture → IMPORTS edge.
- * RED: grammar-only Fennel has no require-resolver in the pipeline. */
+/* Exact source import: retained as a named resolver-quality obligation. */
 TEST(probe_fennel_imports_edge) {
-    static const GpaFile files[] = {
-        {"util.fnl",
-         "(fn double [x] (* 2 x))\n"
-         "{:double double}\n"},
-        {"main.fnl",
-         "(local util (require :util))\n"
-         "\n"
-         "(fn run [n]\n"
-         "  (util.double n))\n"}
-    };
+    static const GpaFile files[] = {{"util.fnl", "(fn double [x] (* 2 x))\n"
+                                                 "{:double double}\n"},
+                                    {"main.fnl", "(local util (require :util))\n"
+                                                 "\n"
+                                                 "(fn run [n]\n"
+                                                 "  (util.double n))\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Fennel `require` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+    /* Keep the original fixture above. The source/configuration below makes
+     * this import obligation explicit without guessing ambient build roots. */
+    const GpaFile configured[] = {
+        {"util.fnl", "(fn double [x] (* 2 x))\n{:double double}\n"},
+        {"configured-main.fnl", "(local fennel (require :fennel))\n(local util (fennel.dofile "
+                                "\"./util.fnl\"))\n(fn configured-run [n] (util.double n))\n"},
+        {"run-configured.sh",
+         "#!/bin/sh\nset -eu\ncd \"$(dirname \"$0\")\"\nexec fennel configured-main.fnl\n"},
+        {"decoy.fnl", "(fn double [x] (* 3 x))\n{:double double}\n"}};
+    const RQ_Source sources[] = {{.path = configured[0].name, .text = configured[0].content},
+                                 {.path = configured[1].name, .text = configured[1].content},
+                                 {.path = configured[2].name, .text = configured[2].content},
+                                 {.path = configured[3].name, .text = configured[3].content}};
+    const RQ_Expected gap = {
+        .case_id = "probe_fennel_imports_edge-exact-configured-import",
+        .site = {.file = "configured-main.fnl",
+                 .caller = "configured-main.fnl.__file__",
+                 .needle = "(fennel.dofile \"./util.fnl\")"},
+        .relation = "IMPORTS",
+        .target = {.file = "util.fnl",
+                   .suffix = "util.fnl.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "(fn double [x] (* 2 x))"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "fennel-explicit-file-load-domain",
+        .why = "The separate launcher fixes the working directory, and fennel.dofile explicitly "
+               "loads ./util.fnl without require search-path or package.loaded selection. No "
+               "audited Fennel file-load adapter exists; the original require remains conditional "
+               "on its runtime loader configuration.",
+        .tried = "Original fixture bytes and node/index checks are preserved. The separate exact "
+                 "source/configuration obligation, wrong-target control, and required ESM call use "
+                 "the full production pipeline; no source or launcher is executed by this test."};
+    const RQ_Forbidden forbidden = {.case_id = "probe_fennel_imports_edge-wrong-target",
+                                    .site = {.file = "configured-main.fnl",
+                                             .caller = "configured-main.fnl.__file__",
+                                             .needle = "(fennel.dofile \"./util.fnl\")"},
+                                    .relation = "IMPORTS",
+                                    .target = {.file = "decoy.fnl",
+                                               .suffix = "decoy.fnl.__file__",
+                                               .label = "File",
+                                               .declaration_line = 1,
+                                               .declaration_text = "(fn double [x] (* 3 x))"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(configured, sizeof(configured) / sizeof(configured[0]), sources,
+                                   sizeof(sources) / sizeof(sources[0]),
+                                   "probe_fennel_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -963,8 +1241,7 @@ TEST(probe_fsharp_class_inherits) {
     PASS();
 }
 
-/* F#: `open` in two-file fixture → IMPORTS edge.
- * RED: grammar-only F# has no `open`-resolver in the pipeline. */
+/* F#: source membership and compilation order accompany the exact open gap. */
 TEST(probe_fsharp_imports_edge) {
     static const GpaFile files[] = {
         {"MathUtils.fs",
@@ -981,8 +1258,59 @@ TEST(probe_fsharp_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: F# `open` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+
+    const GpaFile quality_files[] = {
+        files[0],
+        files[1],
+        {"quality/Quality.fsproj", "<Project Sdk=\"Microsoft.NET.Sdk\">\n  "
+                                   "<PropertyGroup><TargetFramework>net8.0</TargetFramework></"
+                                   "PropertyGroup>\n  <ItemGroup><Compile Include=\"MathUtils.fs\" "
+                                   "/><Compile Include=\"Main.fs\" /></ItemGroup>\n</Project>\n"},
+        {"quality/MathUtils.fs", "module MathUtils\nlet twice x = x * 2\n"},
+        {"quality/Main.fs", "module Main\nopen MathUtils\nlet run n = twice n\n"},
+    };
+    const RQ_Source sources[] = {
+        {.path = "MathUtils.fs", .text = quality_files[0].content},
+        {.path = "Main.fs", .text = quality_files[1].content},
+        {.path = "quality/MathUtils.fs", .text = quality_files[3].content},
+        {.path = "quality/Main.fs", .text = quality_files[4].content},
+    };
+    /* The original open clause does not declare source-file membership or compilation order. An
+     * arbitrary MathUtils.fs elsewhere in the index is insufficient. */
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_fsharp_imports_edge-unconfigured-target",
+        .site = {.file = "Main.fs", .caller = "Main.fs.__file__", .needle = "open MathUtils"},
+        .relation = "IMPORTS",
+        .target = {.file = "MathUtils.fs",
+                   .suffix = "MathUtils.fs.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "module MathUtils"}};
+    const RQ_Expected gap = {
+        .case_id = "probe_fsharp_imports_edge-exact-source-import",
+        .site = {.file = "quality/Main.fs",
+                 .caller = "quality.Main.fs.__file__",
+                 .needle = "open MathUtils"},
+        .relation = "IMPORTS",
+        .target = {.file = "quality/MathUtils.fs",
+                   .suffix = "quality.MathUtils.fs.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "module MathUtils"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_fsharp_imports_edge_binding_unproven",
+        .why = "The explicit project Compile order puts MathUtils.fs before Main.fs, but F# "
+               "project membership and open-module proof are unsupported.",
+        .tried =
+            "Kept the original unconfigured pair and added a separate ordered two-file project. "
+            "Matching module text across project boundaries must not authorize an edge."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_fsharp_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -1047,8 +1375,7 @@ TEST(probe_gleam_custom_type) {
     PASS();
 }
 
-/* Gleam: `import` in two-file fixture → IMPORTS edge.
- * RED: grammar-only Gleam has no import-resolver in the pipeline. */
+/* Gleam: count the configured src module import and reject unconfigured joins. */
 TEST(probe_gleam_imports_edge) {
     static const GpaFile files[] = {
         {"math_utils.gleam",
@@ -1064,8 +1391,58 @@ TEST(probe_gleam_imports_edge) {
     };
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Gleam `import` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+
+    const GpaFile quality_files[] = {
+        files[0],
+        files[1],
+        {"gleam.toml", "name = \"quality_import\"\nversion = \"1.0.0\"\n"},
+        {"src/quality_math.gleam", "pub fn twice(x: Int) -> Int { x * 2 }\n"},
+        {"src/quality_main.gleam",
+         "import quality_math\npub fn run(n: Int) -> Int { quality_math.twice(n) }\n"},
+    };
+    const RQ_Source sources[] = {
+        {.path = "math_utils.gleam", .text = quality_files[0].content},
+        {.path = "main.gleam", .text = quality_files[1].content},
+        {.path = "src/quality_math.gleam", .text = quality_files[3].content},
+        {.path = "src/quality_main.gleam", .text = quality_files[4].content},
+    };
+    /* The original root-level sources have no declared Gleam package/source root. A module spelling
+     * alone does not establish a file binding. */
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_gleam_imports_edge-unconfigured-target",
+        .site = {.file = "main.gleam",
+                 .caller = "main.gleam.__file__",
+                 .needle = "import math_utils"},
+        .relation = "IMPORTS",
+        .target = {.file = "math_utils.gleam",
+                   .suffix = "math_utils.gleam.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "pub fn double(x: Int) -> Int {"}};
+    const RQ_Expected gap = {
+        .case_id = "probe_gleam_imports_edge-exact-source-import",
+        .site = {.file = "src/quality_main.gleam",
+                 .caller = "src.quality_main.gleam.__file__",
+                 .needle = "import quality_math"},
+        .relation = "IMPORTS",
+        .target = {.file = "src/quality_math.gleam",
+                   .suffix = "src.quality_math.gleam.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "pub fn twice(x: Int) -> Int { x * 2 }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "probe_gleam_imports_edge_binding_unproven",
+        .why = "The named Gleam package and standard src module paths identify quality_math, but "
+               "Gleam import proof is unsupported.",
+        .tried = "Retained the original unconfigured root sources and added a distinct configured "
+                 "src module pair."};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_gleam_imports_edge", &gap, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2); /* exact import + required supported control */
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 

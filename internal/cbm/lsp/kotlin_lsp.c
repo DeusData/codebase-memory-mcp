@@ -639,34 +639,24 @@ static void kt_inject_delegate_call(KotlinLSPContext *ctx, const char *callee_qn
     cbm_calls_push(ctx->synthetic_calls, ctx->arena, call);
 }
 
-static void kt_retarget_callable_carrier(KotlinLSPContext *ctx, TSNode site,
-                                         const char *source_name, const char *target_qn) {
-    if (!ctx || !ctx->synthetic_calls || ts_node_is_null(site) || !source_name || !target_qn ||
-        !ctx->enclosing_func_qn) {
+/* A callable value changes the target, not the authored callee spelling.
+ * Preserve that spelling so the source occurrence can join its independent
+ * semantic proof. Only the exact caller and byte interval may acquire this
+ * guard; a nearby call or a same-named function is a different occurrence. */
+static void kt_require_callable_carrier_proof(KotlinLSPContext *ctx, TSNode site,
+                                              const char *source_name) {
+    if (!ctx || !ctx->synthetic_calls || ts_node_is_null(site) || !source_name ||
+        !ctx->enclosing_func_qn)
         return;
-    }
-    const char *target_name = kt_short(target_qn);
     uint32_t start = ts_node_start_byte(site);
     uint32_t end = ts_node_end_byte(site);
-    int line = (int)ts_node_start_point(site).row + 1;
-    const char *caller_leaf = kt_short(ctx->enclosing_func_qn);
     for (int i = 0; i < ctx->synthetic_calls->count; i++) {
         CBMCall *call = &ctx->synthetic_calls->items[i];
-        if (!call->callee_name || !call->enclosing_func_qn ||
-            strcmp(call->callee_name, source_name) != 0) {
-            continue;
-        }
-        const char *call_caller_leaf = kt_short(call->enclosing_func_qn);
-        if (strcmp(call->enclosing_func_qn, ctx->enclosing_func_qn) != 0 &&
-            (!caller_leaf || !call_caller_leaf || strcmp(call_caller_leaf, caller_leaf) != 0)) {
-            continue;
-        }
-        bool overlaps = call->site_end_byte > call->site_start_byte &&
-                        call->site_start_byte < end && call->site_end_byte > start;
-        if (!overlaps && call->start_line != line)
-            continue;
-        call->callee_name = cbm_arena_strdup(ctx->arena, target_name);
-        call->requires_lsp_resolution = true;
+        if (call->callee_name && call->enclosing_func_qn &&
+            !strcmp(call->callee_name, source_name) &&
+            !strcmp(call->enclosing_func_qn, ctx->enclosing_func_qn) &&
+            call->site_start_byte == start && call->site_end_byte == end)
+            call->requires_lsp_resolution = true;
     }
 }
 
@@ -3020,7 +3010,7 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
         if (target) {
             kt_emit_resolved_invocation_reason_at(ctx, target, "lsp_callable_alias", callee_text,
                                                   0.98f, call_node);
-            kt_retarget_callable_carrier(ctx, call_node, callee_text, target);
+            kt_require_callable_carrier_proof(ctx, call_node, callee_text);
             const CBMRegisteredFunc *rf =
                 ctx->registry ? cbm_registry_lookup_func(ctx->registry, target) : NULL;
             if (rf && rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&

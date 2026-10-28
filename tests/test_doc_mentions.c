@@ -403,14 +403,14 @@ TEST(doc_mentions_cs_namespace_publication) {
             free(after);
 
             /* These three cases cover clipped names, accepted trailing dots,
-             * and scope blobs that formerly failed the entire layer. Exercise
-             * both reuse of stored scopes and edits into/out of the bad region. */
+             * and scope blobs that formerly failed the entire layer. Every edit
+             * rebuilds the resolver generation; unchanged inputs above stay NOOP. */
             if (i == 0 || i == 2 || i == 4) {
                 char edited[2048];
                 snprintf(edited, sizeof(edited), "%s\n// body-only edit\n",
                          dm_namespace_healthy_source);
                 th_write_file(TH_PATH(repo, "Healthy.cs"), edited);
-                int step = dm_step(repo, db, full_db, label, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+                int step = dm_step(repo, db, full_db, label, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
                 bool state = dm_namespace_published(db, project, false, label);
                 correct = step == 0 && state && correct;
 
@@ -754,13 +754,12 @@ TEST(doc_mentions_cs_control_publication) {
             free(before);
             free(after);
 
-            /* Cover both an import and a base field across stored-scope reuse,
-             * a repaired field and reintroduction of the embedded NUL. */
+            /* Cover both an import and a base field across generation rebuilds,
+             * a repaired field and reintroduction of the embedded NUL. Scope
+             * deltas remain language-local facts, independent of the full route. */
             if (bytes[j] == 0 && (cases[i] == 1 || cases[i] == 7)) {
                 char repaired[2048], edited[2048], step_label[160];
-                cbm_incremental_route_t changed_route = cases[i] == 1
-                                                            ? CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR
-                                                            : CBM_INCREMENTAL_ROUTE_FORCED_FULL;
+                cbm_incremental_route_t changed_route = CBM_INCREMENTAL_ROUTE_FORCED_FULL;
                 int changed_delta =
                     cases[i] == 1 ? CBM_DOCLINK_DELTA_LOCAL : CBM_DOCLINK_DELTA_GLOBAL;
                 snprintf(edited, sizeof(edited), "%s\n// body-only edit\n",
@@ -768,7 +767,7 @@ TEST(doc_mentions_cs_control_publication) {
                 th_write_file(TH_PATH(repo, "Healthy.cs"), edited);
                 snprintf(step_label, sizeof(step_label), "%s/reuse", label);
                 int step =
-                    dm_step(repo, db, full_db, step_label, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+                    dm_step(repo, db, full_db, step_label, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
                 bool state = dm_control_published(db, project, label);
                 correct = step == 0 && state && correct;
 
@@ -5480,25 +5479,23 @@ TEST(doc_mentions_incremental_equals_full) {
     dm_row(inc_db, side_cs, "Tw", reason, sizeof(reason), NULL, 0);
     ASSERT_STR_EQ(reason, "graph_gap"); /* the arity-0 twin has no node */
 
-    /* a doc-comment edit re-extracts the file alone */
+    /* A doc-comment edit rebuilds the resolver generation. */
     th_write_file(TH_PATH(repo, "src/Main.cs"), DM_MAIN_EDITED);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     dm_edge(inc_db, "Main.Main", "Q.Other", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
 
     /* a body edit in a TARGET file: its scope is unchanged, and the edge into
      * it stands */
     th_write_file(TH_PATH(repo, "src/Sig.cs"), DM_SIG_BODY);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "target body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-        0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "target body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     dm_edge(inc_db, "Main.Main", "Sig.Sig.Go", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
 
     /* the file's own using directives scope nothing but the file */
     th_write_file(TH_PATH(repo, "src/Main.cs"), DM_MAIN_USING);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "using added", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-              0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "using added", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     dm_edge(inc_db, "Main.Main", "S.Extra", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
 
@@ -5506,8 +5503,8 @@ TEST(doc_mentions_incremental_equals_full) {
      * files whose rows name it, although they have no edge into the changed
      * file */
     th_write_file(TH_PATH(repo, "src/Ov.cs"), DM_OV_ONE);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "member removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "member removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     dm_edge(inc_db, "Main.Main", "Ov.Ov.Run", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
 
@@ -5541,8 +5538,7 @@ TEST(doc_mentions_incremental_equals_full) {
     /* moving every declaration of a target file to another line changes no
      * scope: the stored scopes carry no line numbers */
     th_write_file(TH_PATH(repo, "src/Q.cs"), DM_Q_TWIN_MOVED);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "lines moved", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-              0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "lines moved", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     dm_edge(inc_db, "Main.Main", "Q.Target", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
 
@@ -5584,10 +5580,9 @@ TEST(doc_mentions_incremental_equals_full) {
     PASS();
 }
 
-/* A project file is a file of the index like any other: the planner judges a
- * change to one by its scope blob. An edit the blob does not hold repairs
- * file by file; an edit of a <Using>, a new project file and a deleted one
- * rebuild. Every step ends in what a full index of the same tree holds. */
+/* A project file is a semantic input to the resolver generation: even a
+ * package-version edit rebuilds it, as do <Using> edits and added/deleted
+ * project files. Every step must equal a fresh full index of the same tree. */
 TEST(doc_mentions_incremental_project_files) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_ipf_XXXXXX");
@@ -5632,8 +5627,8 @@ TEST(doc_mentions_incremental_project_files) {
                   "  <ItemGroup><Using Include=\"R\" /></ItemGroup>\n"
                   "  <ItemGroup><PackageReference Include=\"P\" Version=\"2.0\" /></ItemGroup>\n"
                   "</Project>\n");
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "package version", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "package version", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     dm_edge(inc_db, "Main.Main", "R.ViaProject", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
 
@@ -9562,10 +9557,87 @@ static int dm_exec(const char *db, const char *sql) {
     return changed;
 }
 
-/* One damaged stored scope (A's row, `find` replaced by `put`): 0 when the
- * run that reads it fails visibly and the next one rebuilds; else the step
- * that went wrong (1 setup, 2 the damaged run, 3 the rebuild), with the
- * damaged run's error rows in *errors. */
+/* The scope blob stored for `rel_path` (the surface row's `dl`), into out;
+ * "" when there is none. */
+static void dm_stored_scope(const char *db, const char *rel_path, char *out, size_t cap) {
+    out[0] = '\0';
+    sqlite3 *h = NULL;
+    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(h,
+                               "SELECT json_extract(defs_json, '$.dl') FROM lsp_surface "
+                               "WHERE rel_path = ?1",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, rel_path, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
+                snprintf(out, cap, "%s", (const char *)sqlite3_column_text(st, 0));
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(h);
+}
+
+/* Load the actual persisted surface rows and graph. Direct reader controls
+ * use these bytes even when generation policy rebuilds before cache reuse. */
+typedef struct {
+    char *project;
+    cbm_gbuf_t *graph;
+    cbm_doclink_scope_t *scopes;
+    int count;
+} dm_stored_doclinks_t;
+
+static void dm_stored_doclinks_free(dm_stored_doclinks_t *stored) {
+    cbm_doclinks_free_scopes(stored->scopes, stored->count);
+    cbm_gbuf_free(stored->graph);
+    free(stored->project);
+}
+
+static bool dm_stored_doclinks_load(const char *repo, const char *db,
+                                    dm_stored_doclinks_t *stored) {
+    memset(stored, 0, sizeof(*stored));
+    stored->project = cbm_project_name_from_path(repo);
+    cbm_store_t *store = cbm_store_open_path(db);
+    cbm_lsp_surface_row_t *surfaces = NULL;
+    int count = 0;
+    bool ok =
+        stored->project && store &&
+        cbm_store_get_lsp_surfaces(store, stored->project, &surfaces, &count) == CBM_STORE_OK &&
+        cbm_doclinks_scopes_from_surfaces(surfaces, count, NULL, &stored->scopes, &stored->count) ==
+            0 &&
+        stored->count > 0;
+    cbm_store_free_lsp_surfaces(surfaces, count);
+    if (store) {
+        cbm_store_close(store);
+    }
+    if (ok) {
+        stored->graph = cbm_gbuf_new(stored->project, repo);
+        ok = stored->graph && cbm_gbuf_load_from_db(stored->graph, db, stored->project) == 0;
+    }
+    return ok;
+}
+
+/* 1: accepted, 0: rejected by the public build entry point, -1: setup failed.
+ * Every scope is passed as `base`, so the dispatcher sets run_file to
+ * CBM_NOT_FOUND rather than treating malformed bytes as a fresh-run scope. */
+static int dm_stored_scope_builds(const char *repo, const char *db) {
+    dm_stored_doclinks_t stored;
+    int result = -1;
+    if (dm_stored_doclinks_load(repo, db, &stored)) {
+        cbm_pipeline_ctx_t ctx = {.project_name = stored.project, .repo_path = repo};
+        cbm_doclinks_t *links =
+            cbm_doclinks_build(&ctx, NULL, 0, NULL, stored.scopes, stored.count, stored.graph);
+        result = links ? 1 : 0;
+        cbm_doclinks_free(links);
+    }
+    dm_stored_doclinks_free(&stored);
+    return result;
+}
+
+/* One damaged stored scope (A's row, `find` replaced by `put`): the direct
+ * stored-base reader rejects it, then the edited generation immediately
+ * rebuilds from source. The next unchanged run must be a stable NOOP.
+ * Returns 0, or the failed step (1 setup, 2 reader, 3 rebuild, 4 NOOP). */
 static int dm_damaged_scope_run(const char *find, const char *put, int *errors) {
     *errors = -1;
     char tmp[256];
@@ -9581,58 +9653,67 @@ static int dm_damaged_scope_run(const char *find, const char *put, int *errors) 
                                              "    /// <summary><see cref=\"Target\"/></summary>\n"
                                              "    public class Uses { }\n"
                                              "}\n");
-    char db[512];
+    char db[512], full_db[512];
     snprintf(db, sizeof(db), "%s/dmg.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
     char sql[512];
     snprintf(sql, sizeof(sql),
              "UPDATE lsp_surface SET defs_json = replace(defs_json, '%s', '%s') "
              "WHERE rel_path = 'src/A.cs' AND instr(defs_json, '%s') > 0",
              find, put, find);
-    char props[512];
+    char props[512], original[1024], damaged[1024], repaired[1024];
     int n = 0;
     int step = 1;
     bool ok = dm_index(repo, db, NULL) == 0;
     if (ok) {
         dm_edge(db, "B.Uses", "A.Target", props, sizeof(props), &n);
-        ok = n == 1 && dm_exec(db, sql) == 1;
+        dm_stored_scope(db, "src/A.cs", original, sizeof(original));
+        ok =
+            n == 1 && original[0] && dm_stored_scope_builds(repo, db) == 1 && dm_exec(db, sql) == 1;
     }
     if (ok) {
         step = 2;
+        dm_stored_scope(db, "src/A.cs", damaged, sizeof(damaged));
+        ok = damaged[0] && strcmp(original, damaged) != 0 && dm_stored_scope_builds(repo, db) == 0;
+    }
+    if (ok) {
+        step = 3;
         th_write_file(TH_PATH(repo, "src/B.cs"),
                       "namespace N\n"
                       "{\n"
                       "    /// <summary>Again <see cref=\"Target\"/></summary>\n"
                       "    public class Uses { }\n"
                       "}\n");
-        cbm_pipeline_incremental_test_reset_faults();
-        ok = dm_index(repo, db, NULL) == 0;
+        ok = dm_step(repo, db, full_db, "damaged scope rebuilt from source",
+                     CBM_INCREMENTAL_ROUTE_FORCED_FULL) == 0;
         *errors = dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved WHERE reason = 'error'");
-        /* never the row an index without A's declarations would write */
-        ok = ok && *errors == 1 &&
-             dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved WHERE raw = 'Target'") == 0;
+        dm_stored_scope(db, "src/A.cs", repaired, sizeof(repaired));
+        dm_edge(db, "B.Uses", "A.Target", props, sizeof(props), &n);
+        ok = ok && *errors == 0 && n == 1 && strcmp(original, repaired) == 0 &&
+             dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved") == 0 &&
+             dm_stored_scope_builds(repo, db) == 1;
     }
     if (ok) {
-        /* the next run rebuilds everything, and the edge is back */
-        step = 3;
-        ok = dm_index(repo, db, NULL) == 0 &&
-             cbm_pipeline_incremental_test_last_route() == CBM_INCREMENTAL_ROUTE_FORCED_FULL &&
-             dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved WHERE reason = 'error'") == 0;
-        if (ok) {
-            dm_edge(db, "B.Uses", "A.Target", props, sizeof(props), &n);
-            ok = n == 1;
-        }
+        step = 4;
+        char *before = dm_doclink_state(db);
+        ok =
+            dm_step(repo, db, full_db, "repaired scope unchanged", CBM_INCREMENTAL_ROUTE_NOOP) == 0;
+        char *after = dm_doclink_state(db);
+        ok = ok && before && after && strcmp(before, after) == 0;
+        free(before);
+        free(after);
     }
     dm_unlink_db(db);
+    dm_unlink_db(full_db);
     th_rmtree(tmp);
     return ok ? 0 : step;
 }
 
-/* A stored scope this code did not write -- a damaged row -- is not read
- * around: the file's declarations would silently be missing from every
- * lookup, and references to them would be reported `missing`. The layer
- * fails for that run, visibly, and the next index rebuilds from the files.
- * R8: a region with an empty name is such a record (the scanner never writes
- * one); read, it would nest a region without deepening the namespace. */
+/* Malformed persisted scopes must still be rejected by the cache reader.
+ * The integration route now heals them before reuse by rebuilding the
+ * resolver generation. Failed-layer publication/error/recovery remains
+ * covered by doc_mentions_index_status_and_delete.
+ * R8: an empty region name is malformed (the scanner never writes one). */
 TEST(doc_mentions_cs_damaged_stored_scope) {
     static const struct {
         const char *what, *find, *put;
@@ -9724,58 +9805,23 @@ TEST(doc_mentions_cs_unbalanced_brackets) {
 
 enum { DM_DEEP_SEGMENTS = 70 }; /* past the scanner's 64 namespace segments */
 
-/* A scope read back from the store is held to the nesting its writer keeps:
- * a region whose namespace has more segments than the scanner ever writes
- * fails the build of the run (bad_scope, the error row), as any other stored
- * scope this code did not write. The next run rebuilds everything. */
+/* The stored-base reader rejects namespace nesting beyond the scanner's
+ * limit. The generation rebuild must restore the exact original surface,
+ * retain Target's required edge without unresolved rows, and settle to NOOP. */
 TEST(doc_mentions_cs_stored_scope_nesting) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_deep_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    char repo[400];
-    snprintf(repo, sizeof(repo), "%s/repo", tmp);
-    th_write_file(TH_PATH(repo, "src/A.cs"), "namespace N\n{\n    public class Target { }\n}\n");
-    th_write_file(TH_PATH(repo, "src/B.cs"), "namespace N\n"
-                                             "{\n"
-                                             "    /// <summary><see cref=\"Target\"/></summary>\n"
-                                             "    public class Uses { }\n"
-                                             "}\n");
-    char db[512];
-    snprintf(db, sizeof(db), "%s/deep.db", tmp);
-    ASSERT_EQ(dm_index(repo, db, NULL), 0);
-    char props[512];
-    int n = 0;
-    dm_edge(db, "B.Uses", "A.Target", props, sizeof(props), &n);
-    ASSERT_EQ(n, 1);
-    /* A's region record names a namespace DM_DEEP_SEGMENTS segments deep */
-    char sql[1024];
-    size_t w = (size_t)snprintf(sql, sizeof(sql),
-                                "UPDATE lsp_surface SET defs_json = replace(defs_json, "
-                                "'\\tN\\n', '\\tN");
+    char nested[256];
+    size_t w = (size_t)snprintf(nested, sizeof(nested), "\\tN");
     for (int i = 1; i < DM_DEEP_SEGMENTS; i++) {
-        w += (size_t)snprintf(sql + w, sizeof(sql) - w, ".a");
+        w += (size_t)snprintf(nested + w, sizeof(nested) - w, ".a");
     }
-    snprintf(sql + w, sizeof(sql) - w,
-             "\\n') WHERE rel_path = 'src/A.cs' AND instr(defs_json, '\\tN\\n') > 0");
-    ASSERT_EQ(dm_exec(db, sql), 1);
-    th_write_file(TH_PATH(repo, "src/B.cs"),
-                  "namespace N\n"
-                  "{\n"
-                  "    /// <summary>Again <see cref=\"Target\"/></summary>\n"
-                  "    public class Uses { }\n"
-                  "}\n");
-    cbm_pipeline_incremental_test_reset_faults();
-    ASSERT_EQ(dm_index(repo, db, NULL), 0);
-    int errors = dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved WHERE reason = 'error'");
-    /* the next run rebuilds everything, and the edge is back */
-    ASSERT_EQ(dm_index(repo, db, NULL), 0);
-    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
-    dm_edge(db, "B.Uses", "A.Target", props, sizeof(props), &n);
-    dm_unlink_db(db);
-    th_rmtree(tmp);
-    ASSERT_EQ(errors, 1);
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
-    ASSERT_EQ(n, 1);
+    snprintf(nested + w, sizeof(nested) - w, "\\n");
+    int errors = -1;
+    int step = dm_damaged_scope_run("\\tN\\n", nested, &errors);
+    if (step != 0) {
+        printf("  stored namespace nesting: step %d went wrong (%d error rows)\n", step, errors);
+    }
+    ASSERT_EQ(step, 0);
+    ASSERT_EQ(errors, 0);
     PASS();
 }
 
@@ -9975,12 +10021,10 @@ TEST(doc_mentions_cs_scratch_table_work) {
     PASS();
 }
 
-/* An incremental repair finds the files whose unresolved rows name what a
- * changed file no longer declares by the identifiers the resolver reads --
- * a name with a non-ASCII letter included. The parts of `Hub` in two shared
- * trees both declare the member `Grüße` (the reference is ambiguous); one of
- * them stops declaring it, and the repaired index equals a full one (the
- * reference binds). */
+/* A changed resolver generation re-resolves names with non-ASCII letters.
+ * The parts of `Hub` in two shared trees both declare `Grüße` (the reference
+ * is ambiguous); one stops declaring it, and the rebuilt index equals a fresh
+ * full one with the reference bound to the remaining declaration. */
 TEST(doc_mentions_incremental_non_ascii_name) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_utf8name_XXXXXX");
@@ -10015,7 +10059,7 @@ TEST(doc_mentions_incremental_non_ascii_name) {
     th_write_file(TH_PATH(repo, "t2/Y.cs"),
                   "namespace N\n{\n    public partial class Hub { public void Keep() { } }\n}\n");
     int step = dm_step(repo, db, full_db, "a name with a non-ASCII letter removed",
-                       CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+                       CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     char props[512];
     int n = 0;
     dm_edge(db, "Uses.Uses",
@@ -10300,33 +10344,106 @@ TEST(doc_mentions_cs_rejected_scope_contained) {
     PASS();
 }
 
-/* The scope blob stored for `rel_path` (the surface row's `dl`), into out;
- * "" when there is none. */
-static void dm_stored_scope(const char *db, const char *rel_path, char *out, size_t cap) {
-    out[0] = '\0';
-    sqlite3 *h = NULL;
-    if (sqlite3_open_v2(db, &h, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(h,
-                               "SELECT json_extract(defs_json, '$.dl') FROM lsp_surface "
-                               "WHERE rel_path = ?1",
-                               -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(st, 1, rel_path, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_text(st, 0)) {
-                snprintf(out, cap, "%s", (const char *)sqlite3_column_text(st, 0));
+/* Resolve Healthy.cs against Bad.cs's actual persisted rejected marker. The
+ * base has run_file == CBM_NOT_FOUND, independently of the pipeline's full
+ * rebuild policy. An empty edge buffer prevents old published edges from
+ * satisfying the required positives. */
+static bool dm_rejected_scope_readback(const char *repo, const char *db) {
+    dm_stored_doclinks_t stored;
+    bool ok = dm_stored_doclinks_load(repo, db, &stored);
+    cbm_doclink_scope_t *base = NULL;
+    CBMFileResult *healthy = NULL;
+    cbm_gbuf_t *edges = NULL;
+    cbm_doclinks_t *links = NULL;
+    cbm_doc_link_row_t *rows = NULL;
+    int row_count = 0;
+    int base_count = 0;
+    bool marker = false;
+    if (ok) {
+        base = calloc((size_t)stored.count, sizeof(*base));
+        healthy =
+            cbm_extract_file(dm_rejected_files[1].text, (int)strlen(dm_rejected_files[1].text),
+                             CBM_LANG_CSHARP, stored.project, "Healthy.cs", 0, NULL, NULL);
+        edges = cbm_gbuf_new(stored.project, repo);
+        ok = base && healthy && healthy->doc_scope && edges;
+    }
+    if (ok) {
+        static const char rejected[] = CBM_DOCLINK_CS_SCOPE_TAG "\n!\trejected\n";
+        for (int i = 0; i < stored.count; i++) {
+            if (strcmp(stored.scopes[i].rel_path, "Healthy.cs") != 0) {
+                base[base_count++] = stored.scopes[i];
+            }
+            if (strcmp(stored.scopes[i].rel_path, "Bad.cs") == 0) {
+                marker = strncmp(stored.scopes[i].scope, rejected, sizeof(rejected) - 1) == 0;
             }
         }
-        sqlite3_finalize(st);
+        cbm_file_info_t file = {.rel_path = "Healthy.cs", .language = CBM_LANG_CSHARP};
+        cbm_pipeline_ctx_t ctx = {.project_name = stored.project, .repo_path = repo};
+        links = cbm_doclinks_build(&ctx, &file, 1, &healthy, base, base_count, stored.graph);
+        ok = marker && links;
+        if (ok) {
+            cbm_doclinks_resolve_file(links, 0, healthy, stored.graph, edges);
+            bool failed = false;
+            cbm_doclinks_take_rows(links, &rows, &row_count, &failed);
+            int hidden = 0, widget = 0;
+            for (int i = 0; i < row_count; i++) {
+                bool gap = strcmp(rows[i].rel_path, "Healthy.cs") == 0 &&
+                           strcmp(rows[i].reason, "graph_gap") == 0;
+                hidden += gap && strcmp(rows[i].raw, "Hidden2") == 0;
+                widget += gap && strcmp(rows[i].raw, "Widget") == 0;
+            }
+            ok = !failed && row_count == 2 && hidden == 1 && widget == 1;
+        }
     }
-    sqlite3_close(h);
+    if (ok) {
+        char qn[1024];
+        snprintf(qn, sizeof(qn), "%s.Healthy.Uses", stored.project);
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(stored.graph, qn);
+        const cbm_gbuf_edge_t **mentions = NULL;
+        int count = 0;
+        ok = source &&
+             cbm_gbuf_find_edges_by_source_type(edges, source->id, "MENTIONS", &mentions, &count) ==
+                 0 &&
+             count == 3 && cbm_gbuf_edge_count(edges) == 3;
+        static const char *const required[] = {"Healthy.Target", "Healthy.Shadow",
+                                               "Healthy.Lurker"};
+        static const char *const forbidden[] = {"Healthy.Hidden2", "Lib.Widget"};
+        for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+            snprintf(qn, sizeof(qn), "%s.%s", stored.project, required[i]);
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(stored.graph, qn);
+            int matches = 0;
+            for (int j = 0; j < count; j++) {
+                matches += target && mentions[j]->target_id == target->id;
+            }
+            ok = ok && target && matches == 1;
+        }
+        for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++) {
+            snprintf(qn, sizeof(qn), "%s.%s", stored.project, forbidden[i]);
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(stored.graph, qn);
+            int matches = 0;
+            for (int j = 0; j < count; j++) {
+                matches += target && mentions[j]->target_id == target->id;
+            }
+            ok = ok && target && matches == 0;
+        }
+    }
+    if (!ok) {
+        printf("  rejected stored-scope readback: marker=%d base=%d rows=%d edges=%d\n", marker,
+               base_count, row_count, edges ? cbm_gbuf_edge_count(edges) : -1);
+    }
+    cbm_doclinks_free_rows(rows, row_count);
+    cbm_doclinks_free(links);
+    cbm_gbuf_free(edges);
+    cbm_free_result(healthy);
+    free(base);
+    dm_stored_doclinks_free(&stored);
+    return ok;
 }
 
-/* S8 across runs: the scope its own run refused is stored as the rejected
- * marker, so a later incremental run that reads it back treats the file as
- * the full run does -- it declares nothing, its references are graph gaps --
- * instead of failing the layer over a stored scope the reader refuses. A
- * body-only edit elsewhere reads the marker back; one in the rejected file
- * compares its marker with the fresh one. Each step equals a full run. */
+/* S8 across runs: the rejected marker retains every quarantined type name.
+ * Direct stored-base readback must preserve healthy edges and reject their
+ * forbidden alternatives. Edited generations rebuild, and each published
+ * step must still equal a fresh full run with the same rejected scope. */
 TEST(doc_mentions_cs_rejected_scope_across_runs) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_rejected_runs_XXXXXX");
@@ -10359,15 +10476,16 @@ TEST(doc_mentions_cs_rejected_scope_across_runs) {
         printf("  stored for Bad.cs: %s\n", stored);
         marked = false;
     }
+    bool stored_readback = indexed == 0 && dm_rejected_scope_readback(repo, db);
     char edited[2048];
     snprintf(edited, sizeof(edited), "%s\n// body-only edit\n", dm_rejected_files[1].text);
     th_write_file(TH_PATH(repo, "Healthy.cs"), edited);
-    int read_back = dm_step(repo, db, full_db, "the rejected scope read back",
-                            CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    int read_back = dm_step(repo, db, full_db, "the rejected scope after a healthy-file edit",
+                            CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     snprintf(edited, sizeof(edited), "%s\n// body-only edit\n", dm_rejected_files[0].text);
     th_write_file(TH_PATH(repo, "Bad.cs"), edited);
-    int again = dm_step(repo, db, full_db, "the rejected file edited",
-                        CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    int again =
+        dm_step(repo, db, full_db, "the rejected file edited", CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     cbm_doclink_cs_test_spoil_scope(NULL);
     int errors = dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved WHERE reason = 'error'");
     int bad = 0;
@@ -10379,6 +10497,7 @@ TEST(doc_mentions_cs_rejected_scope_across_runs) {
     th_rmtree(tmp);
     ASSERT_EQ(indexed, 0);
     ASSERT_TRUE(marked);
+    ASSERT_TRUE(stored_readback);
     ASSERT_EQ(read_back, 0);
     ASSERT_EQ(again, 0);
     ASSERT_EQ(errors, 0);

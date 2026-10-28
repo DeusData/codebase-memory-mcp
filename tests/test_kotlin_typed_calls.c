@@ -1,28 +1,18 @@
-/*
- * test_kotlin_typed_calls.c — Kotlin member calls through a class PROPERTY
- * (primary-constructor `val`, body property, `this.prop`) bind to the
- * property's declared type, on both resolver venues (#1555).
+/* Kotlin typed receiver quality: preserve the original #1555 fixtures and
+ * their same-named decoys. Required explicit-import parameter controls exercise
+ * the current exact proof subset in both venues. Unsupported genuine bindings
+ * remain counted gaps; wrong targets, roles and callers are bugs.
  *
- * The cross-file Kotlin walk resolved a typed method PARAMETER by type, but
- * a property-typed receiver fell to the name guess: the cross registry held
- * the class from extraction defs (properties untyped, constructor vals
- * absent), and the walk's typed AST registration of the same class was
- * shadowed by that earlier entry. Each fixture call has a same-named decoy
- * method on another type, so a name guess is visible as a wrong target:
- *   - Service.log: `audit.inserir()` on `audit: Audit`, next to
- *     `repository: Repo` whose interface also declares inserir (the
- *     sequential venue's guess picks Repo.inserir);
- *   - two bounded contexts whose use cases both inject `repository`
- *     (the parallel venue's receiver-name guess bound the feriado use case
- *     to CompromissoRepository.inserir, the #1555 report).
- * One fixture, padded past MIN_FILES_FOR_PARALLEL, is indexed through the
- * sequential resolver (CBM_INDEX_SINGLE_THREAD=1) and the parallel one.
+ * The historical fixture comments below describe pre-proof behavior. In the
+ * independent oracle Int.toString is its own override, not Any.toString, and
+ * Ledger(x) belongs to the companion function of, never to the File node.
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "sqlite3.h"
+#include "resolver_quality.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,12 +116,487 @@ static const char *const KTC_FILES[][2] = {
      "    companion object {\n        fun of(x: String) = Ledger(x)\n    }\n}\n"},
 };
 
+static const char KTC_CONTROL_PATH[] = "src/main/kotlin/com/acme/quality/TypedControls.kt";
+static const char KTC_CONTROL[] =
+    "package com.acme.quality\n"
+    "\n"
+    "import com.acme.b.Audit\n"
+    "import com.acme.b.Builder\n"
+    "\n"
+    "fun auditParameter(audit: Audit, text: String): Long {\n"
+    "    return audit.inserir(text)\n"
+    "}\n"
+    "\n"
+    "fun builderAddParameter(builder: Builder, number: Int): Boolean {\n"
+    "    return builder.add(number)\n"
+    "}\n"
+    "\n"
+    "fun builderPutParameter(builder: Builder, key: String, number: Int): Int {\n"
+    "    return builder.put(key, number)\n"
+    "}\n";
+
+/* Exact source goldens close the project CALLS/USAGE domains of their callers.
+ * Standard-library let/run and arithmetic are outside that bounded project
+ * domain; the two explicitly authored external member sites remain exact.
+ * Every missing relationship is counted, with WHY and TRIED at its case. */
+static const RQ_Expected KTC_EXPECTED[] = {
+    {.case_id = "constructor-interface",
+     .site = {.file = "src/main/kotlin/com/acme/app/Service.kt",
+              .caller = "Service.Service.save",
+              .needle = "repository.inserir(x)",
+              .occurrence_index = 0,
+              .start_byte = 174,
+              .end_byte = 195},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/a/Repo.kt",
+                .suffix = "Repo.Repo.inserir",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun inserir(x: String): Long"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-constructor-interface",
+     .why = "Primary-constructor property receiver and interface dispatch are outside the complete "
+            "exact-owner proof subset.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "constructor-property",
+     .site = {.file = "src/main/kotlin/com/acme/app/Service.kt",
+              .caller = "Service.Service.log",
+              .needle = "audit.inserir(x)",
+              .occurrence_index = 0,
+              .start_byte = 227,
+              .end_byte = 243},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Audit.kt",
+                .suffix = "Audit.Audit.inserir",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun inserir(x: String): Long = 0L"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-constructor-property",
+     .why = "The Audit target is exact, but the Service constructor property is not declared into "
+            "the proof type environment.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "body-property-this",
+     .site = {.file = "src/main/kotlin/com/acme/app/Service.kt",
+              .caller = "Service.Holder.hold",
+              .needle = "this.audit.inserir(x)",
+              .occurrence_index = 0,
+              .start_byte = 333,
+              .end_byte = 354},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Audit.kt",
+                .suffix = "Audit.Audit.inserir",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun inserir(x: String): Long = 0L"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-body-property-this",
+     .why = "Body property through this requires a proven property binding; the owner domain "
+            "rejects property-bearing classes.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "feriado-interface",
+     .site = {.file = "src/main/kotlin/com/acme/feriado/app/CriarFeriadoUseCase.kt",
+              .caller = "CriarFeriadoUseCase.CriarFeriadoUseCase.executar",
+              .needle = "repository.inserir(nome)",
+              .occurrence_index = 0,
+              .start_byte = 190,
+              .end_byte = 214},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/feriado/domain/FeriadoRepository.kt",
+                .suffix = "FeriadoRepository.FeriadoRepository.inserir",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun inserir(nome: String): Long"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-feriado-interface",
+     .why = "Declared imported interface dispatch through a constructor property lacks receiver "
+            "and interface proof.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "agenda-interface",
+     .site = {.file = "src/main/kotlin/com/acme/agenda/app/CriarCompromissoUseCase.kt",
+              .caller = "CriarCompromissoUseCase.CriarCompromissoUseCase.executar",
+              .needle = "repository.inserir(titulo)",
+              .occurrence_index = 0,
+              .start_byte = 202,
+              .end_byte = 228},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/agenda/domain/CompromissoRepository.kt",
+                .suffix = "CompromissoRepository.CompromissoRepository.inserir",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun inserir(titulo: String): Long"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-agenda-interface",
+     .why = "Declared imported interface dispatch through a constructor property lacks receiver "
+            "and interface proof.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "extension-put-member",
+     .site = {.file = "src/main/kotlin/com/acme/b/Builders.kt",
+              .caller = "Builders.putAll",
+              .needle = "put(k, 1)",
+              .occurrence_index = 0,
+              .start_byte = 200,
+              .end_byte = 209},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Builders.kt",
+                .suffix = "Builders.Builder.put",
+                .label = "Method",
+                .declaration_line = 5,
+                .declaration_text = "    fun put(k: String, v: Int): Int = v"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-extension-put-member",
+     .why = "Extension-function implicit receiver priority is intentionally excluded; the "
+            "applicable two-argument member is independently declared.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "extension-add-member",
+     .site = {.file = "src/main/kotlin/com/acme/b/Builders.kt",
+              .caller = "Builders.add",
+              .needle = "add(s.length)",
+              .occurrence_index = 0,
+              .start_byte = 153,
+              .end_byte = 166},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Builders.kt",
+                .suffix = "Builders.Builder.add",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun add(x: Int): Boolean = true"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-extension-add-member",
+     .why = "Extension-function receiver priority and String.length argument typing require "
+            "separate proof; the Int member wins over the String extension.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "declared-hash-override",
+     .site = {.file = "src/main/kotlin/com/acme/d/Member.kt",
+              .caller = "Member.Member.hashCode",
+              .needle = "type.hashCode()",
+              .occurrence_index = 0,
+              .start_byte = 173,
+              .end_byte = 188},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/c/Proto.kt",
+                .suffix = "Proto.ProtoType.hashCode",
+                .label = "Method",
+                .declaration_line = 5,
+                .declaration_text = "    override fun hashCode() = s.length"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-declared-hash-override",
+     .why = "Constructor property receiver and override declarations are outside the current "
+            "plain-owner/callable proof subset.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "declared-string-override",
+     .site = {.file = "src/main/kotlin/com/acme/d/Member.kt",
+              .caller = "Member.Member.label",
+              .needle = "type.toString()",
+              .occurrence_index = 0,
+              .start_byte = 221,
+              .end_byte = 236},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/c/Proto.kt",
+                .suffix = "Proto.ProtoType.toString",
+                .label = "Method",
+                .declaration_line = 7,
+                .declaration_text = "    override fun toString() = s"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-declared-string-override",
+     .why = "Constructor property receiver and override declarations are outside the current "
+            "plain-owner/callable proof subset.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "inherited-any-hash",
+     .site = {.file = "src/main/kotlin/com/acme/d/Member.kt",
+              .caller = "Member.Member.plainHash",
+              .needle = "plain.hashCode()",
+              .occurrence_index = 0,
+              .start_byte = 265,
+              .end_byte = 281},
+     .relation = "CALLS",
+     .target = {.file = "<kotlin-builtins>",
+                .label = "Method",
+                .domain = RQ_TARGET_EXTERNAL,
+                .external_identity = "kotlin.Any.hashCode"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-inherited-any-hash",
+     .why = "Plain inherits Any.hashCode, but constructor-property and inherited external-method "
+            "evidence are not admitted.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "int-string-override",
+     .site = {.file = "src/main/kotlin/com/acme/d/Member.kt",
+              .caller = "Member.Member.countText",
+              .needle = "count.toString()",
+              .occurrence_index = 0,
+              .start_byte = 313,
+              .end_byte = 329},
+     .relation = "CALLS",
+     .target = {.file = "<kotlin-builtins>",
+                .label = "Method",
+                .domain = RQ_TARGET_EXTERNAL,
+                .external_identity = "kotlin.Int.toString"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-int-string-override",
+     .why =
+         "Int declares its own toString override; its exact external identity is not materialized "
+         "and a constructor-property proof is absent. Any.toString is a wrong target.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "nested-property-value",
+     .site = {.file = "src/main/kotlin/com/acme/w/SocketTest.kt",
+              .caller = "SocketTest.SocketTest.loop",
+              .needle = "webSocket",
+              .occurrence_index = 0,
+              .start_byte = 132,
+              .end_byte = 141},
+     .relation = "USAGE",
+     .target = {.file = "src/main/kotlin/com/acme/w/SocketTest.kt",
+                .suffix = "SocketTest.Streams.webSocket",
+                .label = "Variable",
+                .declaration_line = 11,
+                .declaration_text = "        var webSocket: String? = null"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-nested-property-value",
+     .why = "Nested member property binding lacks strict receiver/value proof; a same-named "
+            "function is never a valid substitute.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "nested-property-receiver",
+     .site = {.file = "src/main/kotlin/com/acme/w/SocketTest.kt",
+              .caller = "SocketTest.SocketTest.loop",
+              .needle = "server",
+              .occurrence_index = 1,
+              .start_byte = 125,
+              .end_byte = 131},
+     .relation = "USAGE",
+     .target = {.file = "src/main/kotlin/com/acme/w/SocketTest.kt",
+                .suffix = "SocketTest.SocketTest.server",
+                .label = "Variable",
+                .declaration_line = 4,
+                .declaration_text = "    private val server: Streams = Streams()"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-nested-property-receiver",
+     .why = "The receiver is itself a read of the exact server property; class-property value "
+            "bindings are outside the strict proof subset.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "member-over-value",
+     .site = {.file = "src/main/kotlin/com/acme/h/Conn.kt",
+              .caller = "Conn.RealConnection.isEligible",
+              .needle = "handshake()",
+              .occurrence_index = 2,
+              .start_byte = 232,
+              .end_byte = 243},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/h/Conn.kt",
+                .suffix = "Conn.RealConnection.handshake",
+                .label = "Method",
+                .declaration_line = 8,
+                .declaration_text = "    override fun handshake(): String? = handshake"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-member-over-value",
+     .why = "The String? constructor property has no invoke; the declared method is genuine, but "
+            "inheritance/override owner evidence is excluded.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "nested-check-call",
+     .site = {.file = "src/main/kotlin/com/acme/h/Conn.kt",
+              .caller = "Conn.RealConnection.isEligible",
+              .needle = "check(handshake()!!.length)",
+              .occurrence_index = 0,
+              .start_byte = 226,
+              .end_byte = 253},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/h/Conn.kt",
+                .suffix = "Conn.RealConnection.check",
+                .label = "Method",
+                .declaration_line = 12,
+                .declaration_text = "    private fun check(n: Int): Boolean = n > 0"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-nested-check-call",
+     .why = "The outer private check call is genuine too; inherited owner context and nested "
+            "expression argument proof are unsupported.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "let-enclosing-member",
+     .site = {.file = "src/main/kotlin/com/acme/l/Svc.kt",
+              .caller = "Svc.Svc.viaLet",
+              .needle = "ping()",
+              .occurrence_index = 1,
+              .start_byte = 140,
+              .end_byte = 146},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/l/Svc.kt",
+                .suffix = "Svc.Svc.ping",
+                .label = "Method",
+                .declaration_line = 6,
+                .declaration_text = "    fun ping(): Int = 2"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-let-enclosing-member",
+     .why = "The enclosing Svc member remains callable inside let; lambda/implicit receiver chains "
+            "and constructor-property owners are not admitted.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "run-enclosing-member",
+     .site = {.file = "src/main/kotlin/com/acme/l/Svc.kt",
+              .caller = "Svc.Svc.viaRun",
+              .needle = "ping()",
+              .occurrence_index = 2,
+              .start_byte = 185,
+              .end_byte = 191},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/l/Svc.kt",
+                .suffix = "Svc.Svc.ping",
+                .label = "Method",
+                .declaration_line = 6,
+                .declaration_text = "    fun ping(): Int = 2"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-run-enclosing-member",
+     .why = "The enclosing Svc member remains callable inside run; lambda/implicit receiver chains "
+            "and constructor-property owners are not admitted.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "companion-secondary-constructor",
+     .site = {.file = "src/main/kotlin/com/acme/k/Ledger.kt",
+              .caller = "Ledger.Ledger.of",
+              .needle = "Ledger(x)",
+              .occurrence_index = 0,
+              .start_byte = 181,
+              .end_byte = 190},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/k/Ledger.kt",
+                .suffix = "Ledger.Ledger.Ledger",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    constructor(a: String) : this(a, \"gen\")"},
+     .mode = RQ_KNOWN_GAP,
+     .gap_id = "kotlin-typed-companion-secondary-constructor",
+     .why =
+         "The exact secondary constructor is materialized, but anonymous companion method "
+         "extraction loses of; File attribution is incorrect and constructor proof is unsupported.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "required-audit-parameter",
+     .site = {.file = "src/main/kotlin/com/acme/quality/TypedControls.kt",
+              .caller = "TypedControls.auditParameter",
+              .needle = "audit.inserir(text)",
+              .occurrence_index = 0,
+              .start_byte = 143,
+              .end_byte = 162},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Audit.kt",
+                .suffix = "Audit.Audit.inserir",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun inserir(x: String): Long = 0L"},
+     .mode = RQ_REQUIRED,
+     .gap_id = NULL,
+     .why = "Explicit import, exact final plain class and typed function parameters provide "
+            "supported receiver and scalar argument proof.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "required-builder-add-parameter",
+     .site = {.file = "src/main/kotlin/com/acme/quality/TypedControls.kt",
+              .caller = "TypedControls.builderAddParameter",
+              .needle = "builder.add(number)",
+              .occurrence_index = 0,
+              .start_byte = 243,
+              .end_byte = 262},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Builders.kt",
+                .suffix = "Builders.Builder.add",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun add(x: Int): Boolean = true"},
+     .mode = RQ_REQUIRED,
+     .gap_id = NULL,
+     .why = "Explicit import, exact final plain class and typed function parameters provide "
+            "supported receiver and scalar argument proof.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."},
+    {.case_id = "required-builder-put-parameter",
+     .site = {.file = "src/main/kotlin/com/acme/quality/TypedControls.kt",
+              .caller = "TypedControls.builderPutParameter",
+              .needle = "builder.put(key, number)",
+              .occurrence_index = 0,
+              .start_byte = 352,
+              .end_byte = 376},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/acme/b/Builders.kt",
+                .suffix = "Builders.Builder.put",
+                .label = "Method",
+                .declaration_line = 5,
+                .declaration_text = "    fun put(k: String, v: Int): Int = v"},
+     .mode = RQ_REQUIRED,
+     .gap_id = NULL,
+     .why = "Explicit import, exact final plain class and typed function parameters provide "
+            "supported receiver and scalar argument proof.",
+     .tried = "Independent source declaration/occurrence audit; current kt_proof_class_fact, "
+              "kt_proof_exact_owner and kt_proof_function scope reviewed; original same-named "
+              "decoys retained."}};
+static const RQ_Forbidden KTC_FORBIDDEN[] = {
+    {.case_id = "property-not-calls",
+     .site = {.file = "src/main/kotlin/com/acme/w/SocketTest.kt",
+              .caller = "SocketTest.SocketTest.loop",
+              .needle = "webSocket",
+              .occurrence_index = 0,
+              .start_byte = 132,
+              .end_byte = 141},
+     .relation = "CALLS",
+     .any_target = true},
+    {.case_id = "property-not-call_reference",
+     .site = {.file = "src/main/kotlin/com/acme/w/SocketTest.kt",
+              .caller = "SocketTest.SocketTest.loop",
+              .needle = "webSocket",
+              .occurrence_index = 0,
+              .start_byte = 132,
+              .end_byte = 141},
+     .relation = "CALL_REFERENCE",
+     .any_target = true},
+    {.case_id = "ledger-not-file-attributed",
+     .site = {.file = "src/main/kotlin/com/acme/k/Ledger.kt",
+              .caller = "Ledger.kt.__file__",
+              .needle = "Ledger(x)",
+              .occurrence_index = 0,
+              .start_byte = 181,
+              .end_byte = 190},
+     .relation = "CALLS",
+     .any_target = true}};
+
 static int ktc_write_fixture(const char *dir) {
     for (size_t i = 0; i < sizeof(KTC_FILES) / sizeof(KTC_FILES[0]); i++) {
         if (th_write_file(TH_PATH(dir, KTC_FILES[i][0]), KTC_FILES[i][1]) != 0) {
             return -1;
         }
     }
+    if (th_write_file(TH_PATH(dir, KTC_CONTROL_PATH), KTC_CONTROL) != 0)
+        return -1;
     /* Past MIN_FILES_FOR_PARALLEL (50): the parallel venue is selected. */
     for (int i = 0; i < 55; i++) {
         char rel[96];
@@ -143,118 +608,6 @@ static int ktc_write_fixture(const char *dir) {
             return -1;
         }
     }
-    return 0;
-}
-
-/* Target QNs of the CALLS edges whose source QN ends in `.<src_tail>` and whose
- * callee text ends in `.<leaf>`, one per line into out; returns the count. */
-static int ktc_targets(sqlite3 *db, const char *src_tail, const char *leaf, char *out,
-                       size_t cap) {
-    out[0] = '\0';
-    static const char sql[] =
-        "SELECT t.qualified_name FROM edges e JOIN nodes s ON s.id = e.source_id "
-        "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'CALLS' "
-        "AND s.qualified_name LIKE '%.' || ?1 "
-        "AND (json_extract(e.properties, '$.callee') = ?2 "
-        "OR json_extract(e.properties, '$.callee') LIKE '%.' || ?2) ORDER BY 1";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
-        return -1;
-    }
-    sqlite3_bind_text(st, 1, src_tail, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, leaf, -1, SQLITE_STATIC);
-    int n = 0;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        const char *qn = (const char *)sqlite3_column_text(st, 0);
-        size_t used = strlen(out);
-        snprintf(out + used, cap - used, "%s\n", qn ? qn : "");
-        n++;
-    }
-    sqlite3_finalize(st);
-    return n;
-}
-
-/* Exactly one such edge, and its target QN ends in `.<want_tail>`. */
-static int ktc_expect(sqlite3 *db, const char *venue, const char *src_tail, const char *leaf,
-                      const char *want_tail) {
-    char got[2048];
-    int n = ktc_targets(db, src_tail, leaf, got, sizeof(got));
-    size_t gl = strlen(got);
-    size_t wl = strlen(want_tail);
-    if (n == 1 && gl > wl + 1 && got[gl - wl - 2] == '.' &&
-        strncmp(got + gl - wl - 1, want_tail, wl) == 0) {
-        return 1;
-    }
-    printf("\n  [%s] %s -> .%s: want one edge to ...%s, have %d:\n%s", venue, src_tail, leaf,
-           want_tail, n, got);
-    return 0;
-}
-
-/* ktc_expect, and the edge comes from the resolver (an lsp_* strategy), not a
- * name guess that happens to land on the same target. */
-static int ktc_expect_lsp(sqlite3 *db, const char *venue, const char *src_tail, const char *leaf,
-                          const char *want_tail) {
-    if (!ktc_expect(db, venue, src_tail, leaf, want_tail)) {
-        return 0;
-    }
-    static const char sql[] =
-        "SELECT coalesce(json_extract(e.properties, '$.strategy'), '') FROM edges e "
-        "JOIN nodes s ON s.id = e.source_id WHERE e.type = 'CALLS' "
-        "AND s.qualified_name LIKE '%.' || ?1 "
-        "AND (json_extract(e.properties, '$.callee') = ?2 "
-        "OR json_extract(e.properties, '$.callee') LIKE '%.' || ?2)";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
-        return 0;
-    }
-    sqlite3_bind_text(st, 1, src_tail, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, leaf, -1, SQLITE_STATIC);
-    char strategy[64] = "";
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        const char *s = (const char *)sqlite3_column_text(st, 0);
-        snprintf(strategy, sizeof(strategy), "%s", s ? s : "");
-    }
-    sqlite3_finalize(st);
-    if (strncmp(strategy, "lsp_", 4) == 0) {
-        return 1;
-    }
-    printf("\n  [%s] %s -> .%s: right target, but strategy '%s' (want lsp_*)\n", venue,
-           src_tail, leaf, strategy);
-    return 0;
-}
-
-/* The reference edges (USAGE / CALL_REFERENCE) from the method whose QN ends in
- * `.<src_tail>` to nodes named `name`: exactly one, a USAGE onto a non-callable. */
-static int ktc_expect_property_usage(sqlite3 *db, const char *venue, const char *src_tail,
-                                     const char *name) {
-    static const char sql[] =
-        "SELECT e.type || ' ' || t.label || ' ' || t.qualified_name FROM edges e "
-        "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
-        "WHERE e.type IN ('USAGE', 'CALL_REFERENCE', 'CALLS') "
-        "AND s.qualified_name LIKE '%.' || ?1 AND t.name = ?2 ORDER BY 1";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
-        return 0;
-    }
-    sqlite3_bind_text(st, 1, src_tail, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, name, -1, SQLITE_STATIC);
-    char got[1024] = "";
-    int n = 0;
-    bool ok = false;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        const char *row = (const char *)sqlite3_column_text(st, 0);
-        size_t used = strlen(got);
-        snprintf(got + used, sizeof(got) - used, "%s\n", row ? row : "");
-        ok = row && strncmp(row, "USAGE ", 6) == 0 && strstr(row, " Function ") == NULL &&
-             strstr(row, " Method ") == NULL;
-        n++;
-    }
-    sqlite3_finalize(st);
-    if (n == 1 && ok) {
-        return 1;
-    }
-    printf("\n  [%s] %s -> %s: want one USAGE onto the property, have %d:\n%s", venue, src_tail,
-           name, n, got);
     return 0;
 }
 
@@ -274,7 +627,7 @@ static int ktc_index(const char *dir, const char *db_name, bool single_thread, c
     int rc = -1;
     cbm_pipeline_t *p = cbm_pipeline_new(dir, db_out, CBM_MODE_FULL);
     if (p) {
-        rc = cbm_pipeline_run(p);
+        rc = cbm_pipeline_set_project_name(p, "ktc-quality") ? cbm_pipeline_run(p) : -1;
         cbm_pipeline_free(p);
     }
     if (saved_single) {
@@ -300,43 +653,21 @@ static int ktc_check_venue(const char *dir, const char *venue, bool single_threa
         printf("\n  [%s] index failed\n", venue);
         return 0;
     }
-    sqlite3 *db = NULL;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        if (db) {
-            sqlite3_close(db);
-        }
+    cbm_store_t *store = cbm_store_open_path_existing(db_path);
+    if (!store)
         return 0;
-    }
-    int ok = 1;
-    /* Constructor vals, each next to a same-named decoy on the other type. */
-    ok &= ktc_expect(db, venue, "Service.save", "inserir", "Repo.inserir");
-    ok &= ktc_expect(db, venue, "Service.log", "inserir", "Audit.inserir");
-    /* Body property read through `this`. */
-    ok &= ktc_expect(db, venue, "Holder.hold", "inserir", "Audit.inserir");
-    /* #1555: two ports sharing `inserir`, both injected as `repository`. */
-    ok &= ktc_expect(db, venue, "CriarFeriadoUseCase.executar", "inserir",
-                     "FeriadoRepository.inserir");
-    ok &= ktc_expect(db, venue, "CriarCompromissoUseCase.executar", "inserir",
-                     "CompromissoRepository.inserir");
-    /* Guard: a member wins over a same-named extension of the same file. */
-    ok &= ktc_expect(db, venue, "Builders.putAll", "put", "Builder.put");
-    ok &= ktc_expect(db, venue, "Builders.add", "add", "Builder.add");
-    /* kotlin.Any members: the declared override, else kotlin.Any (external). */
-    ok &= ktc_expect_lsp(db, venue, "Member.hashCode", "hashCode", "ProtoType.hashCode");
-    ok &= ktc_expect_lsp(db, venue, "Member.label", "toString", "ProtoType.toString");
-    ok &= ktc_expect_lsp(db, venue, "Member.plainHash", "hashCode", "Any.hashCode");
-    ok &= ktc_expect_lsp(db, venue, "Member.countText", "toString", "Any.toString");
-    /* A typed property read keeps the property node, never a same-named function. */
-    ok &= ktc_expect_property_usage(db, venue, "SocketTest.loop", "webSocket");
-    /* A typed constructor val never shadows the same-named member function. */
-    ok &= ktc_expect_lsp(db, venue, "RealConnection.isEligible", "handshake",
-                         "RealConnection.handshake");
-    /* The enclosing class's member inside a lambda with a typed receiver. */
-    ok &= ktc_expect_lsp(db, venue, "Svc.viaLet", "ping", "Svc.ping");
-    ok &= ktc_expect_lsp(db, venue, "Svc.viaRun", "ping", "Svc.ping");
-    ok &= ktc_expect_lsp(db, venue, "Ledger.kt.__file__", "Ledger", "Ledger.Ledger.Ledger");
-    sqlite3_close(db);
-    return ok;
+    RQ_Source sources[sizeof(KTC_FILES) / sizeof(KTC_FILES[0]) + 1] = {0};
+    size_t count = sizeof(KTC_FILES) / sizeof(KTC_FILES[0]);
+    for (size_t i = 0; i < count; i++)
+        sources[i] = (RQ_Source){.path = KTC_FILES[i][0], .text = KTC_FILES[i][1]};
+    sources[count++] = (RQ_Source){.path = KTC_CONTROL_PATH, .text = KTC_CONTROL};
+    RQ_Report report;
+    bool ok = rq_check_project_declarations(
+        store, "ktc-quality", venue, sources, count, KTC_EXPECTED,
+        sizeof(KTC_EXPECTED) / sizeof(KTC_EXPECTED[0]), KTC_FORBIDDEN,
+        sizeof(KTC_FORBIDDEN) / sizeof(KTC_FORBIDDEN[0]), &report, stderr);
+    cbm_store_close(store);
+    return ok && report.genuine == 21 && report.found >= 3 && !report.required_missing;
 }
 
 TEST(kotlin_property_receiver_binds_declared_type_both_venues) {
@@ -354,6 +685,71 @@ TEST(kotlin_property_receiver_binds_declared_type_both_venues) {
     PASS();
 }
 
+/* The source scope walker retains the outer Ledger class across the unnamed
+ * companion. Assert the authored raw owner/constructor identity independently
+ * of the persisted graph, whose missing companion method is a quality gap. */
+TEST(kotlin_typed_ledger_raw_owner_and_constructor_identity) {
+    const char *path = "src/main/kotlin/com/acme/k/Ledger.kt";
+    const char *source = NULL;
+    for (size_t i = 0; i < sizeof(KTC_FILES) / sizeof(KTC_FILES[0]); i++)
+        if (!strcmp(KTC_FILES[i][0], path))
+            source = KTC_FILES[i][1];
+    ASSERT_NOT_NULL(source);
+    const char *site = strstr(source, "Ledger(x)");
+    ASSERT_NOT_NULL(site);
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_KOTLIN,
+                                             "ktc-raw", path, 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    size_t calls = 0, constructors = 0;
+    bool owner = true;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->site_start_byte == (uint32_t)(site - source) &&
+            call->site_end_byte == (uint32_t)(site - source + strlen("Ledger(x)"))) {
+            calls++;
+            owner = owner && rq_equal(call->enclosing_func_qn,
+                                      "ktc-raw.src.main.kotlin.com.acme.k.Ledger.Ledger.of");
+        }
+    }
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *def = &result->defs.items[i];
+        if (rq_equal(def->label, "Method") && def->start_line == 4 &&
+            rq_suffix(def->qualified_name, def->name, "Ledger.Ledger.Ledger"))
+            constructors++;
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(calls, 1);
+    ASSERT_TRUE(owner);
+    ASSERT_EQ(constructors, 1);
+    PASS();
+}
+
+/* External expected identities cannot borrow a project declaration or a
+ * universal namesake. This checks the bounded oracle extension itself. */
+TEST(kotlin_typed_external_expected_identity_is_exact) {
+    RQ_Target target = {.file = "<kotlin-builtins>",
+                        .label = "Method",
+                        .domain = RQ_TARGET_EXTERNAL,
+                        .external_identity = "kotlin.Int.toString"};
+    ASSERT_TRUE(rq_external_target(&target));
+    target.external_identity = "kotlin.Any.hashCode";
+    ASSERT_TRUE(rq_external_target(&target));
+    target.external_identity = "kotlin.Any.toString";
+    ASSERT_FALSE(rq_external_target(&target));
+    target.external_identity = "kotlin.Int.toString";
+    target.file = "src/main/kotlin/com/acme/d/Member.kt";
+    ASSERT_FALSE(rq_external_target(&target));
+    target.file = "<kotlin-builtins>";
+    target.label = "Class";
+    ASSERT_FALSE(rq_external_target(&target));
+    target.label = "Method";
+    target.suffix = "Int.toString";
+    ASSERT_FALSE(rq_external_target(&target));
+    PASS();
+}
+
 SUITE(kotlin_typed_calls) {
     RUN_TEST(kotlin_property_receiver_binds_declared_type_both_venues);
+    RUN_TEST(kotlin_typed_external_expected_identity_is_exact);
+    RUN_TEST(kotlin_typed_ledger_raw_owner_and_constructor_identity);
 }

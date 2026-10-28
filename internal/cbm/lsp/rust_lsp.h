@@ -326,6 +326,7 @@ typedef struct {
     const char *graph_qualified_name;
     const char *sig;
     uint32_t source_flags;
+    const CBMType *source_signature;
 } CBMRustLSPDef;
 
 /* Run cross-file resolution on a single file. */

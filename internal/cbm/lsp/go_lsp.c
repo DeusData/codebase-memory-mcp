@@ -2074,8 +2074,9 @@ static void go_resolve_assignment_references_at(GoLSPContext *ctx, TSNode statem
 
 /* Any assignment that is guarded by a branch/loop makes the post-construct
  * callable identity a join of at least two paths. Clear the outer exact
- * identity before walking the construct; assignments inside its temporary
- * scope may still be exact locally, but cannot leak past the join. */
+ * identity before walking the construct and after each guarded branch.
+ * Assignments update the nearest binding, so a known target written inside
+ * a branch is valid there but must not escape to a sibling or the join. */
 static void go_invalidate_control_flow_aliases(GoLSPContext *ctx, TSNode node, int depth) {
     if (!ctx || ts_node_is_null(node))
         return;
@@ -2140,11 +2141,12 @@ static void resolve_calls_in_node_inner(GoLSPContext *ctx, TSNode node) {
     go_resolve_assignment_references_at(ctx, node);
     go_process_statement(ctx, node);
 
-    if (strcmp(kind, "if_statement") == 0 || strcmp(kind, "for_statement") == 0 ||
-        strcmp(kind, "expression_switch_statement") == 0 ||
-        strcmp(kind, "type_switch_statement") == 0 || strcmp(kind, "select_statement") == 0) {
+    bool control_flow = strcmp(kind, "if_statement") == 0 || strcmp(kind, "for_statement") == 0 ||
+                        strcmp(kind, "expression_switch_statement") == 0 ||
+                        strcmp(kind, "type_switch_statement") == 0 ||
+                        strcmp(kind, "select_statement") == 0;
+    if (control_flow)
         go_invalidate_control_flow_aliases(ctx, node, 0);
-    }
 
     /* Preserve exact declaration identities for leaves inside composite
      * values. The extraction role keeps these USAGE rather than claiming
@@ -2445,6 +2447,7 @@ recurse:;
             }
 
             ctx->current_scope = saved;
+            go_invalidate_control_flow_aliases(ctx, child, 0);
         }
 
         if (push_scope)
@@ -2522,6 +2525,7 @@ recurse:;
                 }
 
                 ctx->current_scope = saved;
+                go_invalidate_control_flow_aliases(ctx, child, 0);
             }
         }
         if (push_scope)
@@ -2538,7 +2542,14 @@ recurse:;
         TSTreeCursor *cursor = cbm_cursor_acquire(&lease, ctx->walk_depth, node);
         if (ts_tree_cursor_goto_first_child(cursor)) {
             do {
-                resolve_calls_in_node(ctx, ts_tree_cursor_current_node(cursor));
+                TSNode child = ts_tree_cursor_current_node(cursor);
+                resolve_calls_in_node(ctx, child);
+                const char *child_kind = ts_node_type(child);
+                if (control_flow &&
+                    (!strcmp(child_kind, "block") || !strcmp(child_kind, "if_statement") ||
+                     !strcmp(child_kind, "expression_case") ||
+                     !strcmp(child_kind, "default_case") || !strcmp(child_kind, "for_clause")))
+                    go_invalidate_control_flow_aliases(ctx, child, 0);
             } while (ts_tree_cursor_goto_next_sibling(cursor));
         }
         cbm_cursor_release(&lease);

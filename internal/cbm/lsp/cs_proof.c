@@ -11,6 +11,7 @@ typedef struct {
     const char *qn, *namespace;
     uint32_t line, flags;
     int arity;
+    const CBMType *signature;
 } cs_source_decl_t;
 typedef struct {
     CBMArena *arena;
@@ -112,8 +113,57 @@ static int csp_arity(TSNode method) {
     ts_tree_cursor_delete(&cursor);
     return count;
 }
+/* Predefined numeric/boolean spellings are lexical type identities. Named,
+ * nullable, array, generic and by-reference parameters remain unsupported. */
+static const CBMType *csp_primitive(cs_proof_source_t *source, TSNode node) {
+    if (!csp_is(node, "predefined_type"))
+        return NULL;
+    const char *name = csp_text(source, node);
+    static const char *const names[] = {"bool",  "sbyte",  "byte",    "short", "ushort",
+                                        "int",   "uint",   "long",    "ulong", "char",
+                                        "float", "double", "decimal", "void"};
+    for (size_t i = 0; name && i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(name, names[i]))
+            return cbm_type_builtin(source->arena, name);
+    return NULL;
+}
+
+static const CBMType *csp_signature(cs_proof_source_t *source, TSNode method) {
+    TSNode parameters = csp_field(method, "parameters");
+    if (ts_node_is_null(parameters))
+        return NULL;
+    const CBMType *types[65] = {0};
+    size_t count = 0;
+    uint32_t children = ts_node_named_child_count(parameters);
+    for (uint32_t i = 0; i < children; i++) {
+        TSNode parameter = ts_node_named_child(parameters, i);
+        if (csp_is(parameter, "comment"))
+            continue;
+        if (!csp_is(parameter, "parameter") || ts_node_named_child_count(parameter) != 2 ||
+            count == 64)
+            return NULL;
+        /* ref/out/in/params are tokens in this grammar, not necessarily named
+         * children; reject every non-type/name token explicitly. */
+        uint32_t parts = ts_node_child_count(parameter);
+        for (uint32_t j = 0; j < parts; j++) {
+            TSNode part = ts_node_child(parameter, j);
+            if (!ts_node_eq(part, csp_field(parameter, "type")) &&
+                !ts_node_eq(part, csp_field(parameter, "name")))
+                return NULL;
+        }
+        const CBMType *type = csp_primitive(source, csp_field(parameter, "type"));
+        if (!type || !strcmp(type->data.builtin.name, "void"))
+            return NULL;
+        types[count++] = type;
+    }
+    const CBMType **params = cbm_arena_alloc(source->arena, (count + 1) * sizeof(*params));
+    if (!params)
+        return NULL;
+    memcpy(params, types, (count + 1) * sizeof(*params));
+    return cbm_type_func(source->arena, NULL, params, NULL);
+}
 static void csp_add(cs_proof_source_t *source, const char *qn, const char *namespace, TSNode node,
-                    uint32_t flags, int arity) {
+                    uint32_t flags, int arity, const CBMType *signature) {
     if (!qn) {
         source->failed = true;
         return;
@@ -130,8 +180,8 @@ static void csp_add(cs_proof_source_t *source, const char *qn, const char *names
         source->declarations = items;
         source->capacity = capacity;
     }
-    source->declarations[source->count++] =
-        (cs_source_decl_t){qn, namespace, ts_node_start_point(node).row + 1, flags, arity};
+    source->declarations[source->count++] = (cs_source_decl_t){
+        qn, namespace, ts_node_start_point(node).row + 1, flags, arity, signature};
 }
 static bool csp_simple_class(cs_proof_source_t *source, TSNode node) {
     if (csp_modifier(source, node, "partial"))
@@ -168,7 +218,7 @@ static void csp_class_facts(cs_proof_source_t *source, TSNode node, const char *
     uint32_t flags = csp_modifiers(source, node, false) | CBM_SOURCE_DECL_TOP_LEVEL;
     if (complete)
         flags |= CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
-    csp_add(source, qn, namespace, node, flags, -1);
+    csp_add(source, qn, namespace, node, flags, -1, NULL);
     TSNode body = csp_field(node, "body");
     if (ts_node_is_null(body))
         return;
@@ -184,7 +234,7 @@ static void csp_class_facts(cs_proof_source_t *source, TSNode node, const char *
             if (csp_child_kind(child, "type_parameter_list"))
                 method_flags = 0;
             csp_add(source, csp_join(source, qn, method), namespace, child, method_flags,
-                    csp_arity(child));
+                    csp_arity(child), csp_signature(source, child));
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -222,8 +272,10 @@ bool cbm_cs_collect_source_facts(CBMArena *arena, const char *source, int length
                                  const char *module, CBMLSPDef *defs, int count) {
     if (count < 0 || (count && !defs))
         return false;
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < count; i++) {
         defs[i].source_flags = 0;
+        defs[i].source_signature = NULL;
+    }
     if (!arena || !source || length <= 0 || !module)
         return false;
     TSParser *parser = ts_parser_new();
@@ -269,8 +321,10 @@ bool cbm_cs_collect_source_facts(CBMArena *arena, const char *source, int length
             continue;
         def->source_flags = found->flags;
         def->namespace_name = found->namespace;
-        if (found->arity >= 0 && found->arity == def->signature_param_count)
+        if (found->arity >= 0 && found->arity == def->signature_param_count) {
             def->source_flags |= CBM_SOURCE_DECL_FIXED_ARITY;
+            def->source_signature = found->signature;
+        }
     }
     return true;
 }
@@ -295,7 +349,8 @@ typedef struct {
     CBMResolveTypeMap types;
     CBMHashTable *callers, *local_types;
     csp_scope_t *allocated;
-    bool static_call;
+    const CBMRegisteredType *enclosing_type;
+    bool static_context, static_call, implicit_call, same_class;
 } csp_context_t;
 static bool csp_put(csp_context_t *context, CBMHashTable *table, const char *name,
                     const char *target) {
@@ -460,6 +515,57 @@ static const CBMRegisteredType *csp_type(csp_context_t *context, csp_scope_t *sc
     }
     return NULL;
 }
+/* `this` and implicit receivers bind to the exact lexical class, even when
+ * that class is internal or its method private. Namespace equality alone never
+ * grants cross-file internal/assembly accessibility. */
+static const CBMRegisteredType *csp_lexical_type(csp_context_t *context, csp_scope_t *scope,
+                                                 TSNode node) {
+    const char *name = csp_text(&context->source, csp_field(node, "name"));
+    const char *qn = csp_join(&context->source, context->file->module_qn, name);
+    if (!name || !qn)
+        return NULL;
+    CBMNamespaceTypeIter iterator;
+    cbm_registry_types_in_namespace(context->registry, scope->namespace, name, &iterator);
+    const CBMRegisteredType *chosen = NULL, *candidate;
+    uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+    while ((candidate = cbm_namespace_type_next(&iterator, NULL))) {
+        if (!candidate->project_source || !candidate->graph_qualified_name ||
+            strcmp(candidate->graph_qualified_name, qn) || !candidate->declaration_identity ||
+            (candidate->source_flags & required) != required ||
+            (chosen && !csp_same_type(chosen, candidate)))
+            return NULL;
+        chosen = candidate;
+    }
+    return iterator.complete ? chosen : NULL;
+}
+
+static cbm_resolve_result_t csp_primitive_evidence(csp_context_t *context, const CBMType *type,
+                                                   TSNode site, const char *decision) {
+    if (!type || type->kind != CBM_TYPE_BUILTIN || ts_node_is_null(site))
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
+    cbm_resolve_result_t result = {
+        .binding = CBM_RESOLVE_BINDING_UNIQUE,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+        .rule = CBM_RESOLVE_RULE_DECLARED_TYPE,
+        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                 CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+        .target = type->data.builtin.name,
+        .candidate_count = 1,
+        .reason = decision};
+    cbm_resolve_proof_key_t key = {.lookup_domain = "csharp-predefined-type-syntax",
+                                   .lookup_key = csp_text(&context->source, site),
+                                   .type_identity = type->data.builtin.name,
+                                   .start_byte = ts_node_start_byte(site),
+                                   .end_byte = ts_node_end_byte(site),
+                                   .detail = decision};
+    result.proof = cbm_resolve_proof_leaf(&context->types.proofs, CBM_PROOF_SOURCE_FACT,
+                                          &context->types.proof_source, &key, &result);
+    if (!result.proof)
+        result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+    return result;
+}
+
 static cbm_resolve_result_t csp_type_evidence(csp_context_t *context, const CBMRegisteredType *type,
                                               TSNode site) {
     if (!type)
@@ -518,11 +624,14 @@ static cbm_resolve_method_candidate_t csp_candidate(const cbm_resolve_method_que
     (void)owner;
     csp_context_t *context = opaque;
     cbm_resolve_method_candidate_t proof = {.exposed = CBM_RESOLVE_METHOD_YES};
-    uint32_t required =
-        CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC | CBM_SOURCE_DECL_FIXED_ARITY;
+    uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_FIXED_ARITY;
     bool is_static = (candidate->source_flags & CBM_SOURCE_DECL_STATIC) != 0;
-    if ((candidate->source_flags & required) != required || is_static != context->static_call ||
-        candidate->min_params != 0 || candidate->type_param_names ||
+    bool accessible = context->same_class || (candidate->source_flags & CBM_SOURCE_DECL_PUBLIC);
+    bool receiver_valid = context->implicit_call && !context->static_context
+                              ? true
+                              : is_static == context->static_call;
+    if ((candidate->source_flags & required) != required || !accessible || !receiver_valid ||
+        candidate->min_params < 0 || candidate->type_param_names ||
         !(candidate->flags & CBM_FUNC_FLAG_PROJECT_SOURCE))
         return proof;
     proof.applicable = CBM_RESOLVE_METHOD_YES;
@@ -540,6 +649,8 @@ static bool csp_read_syntax(const char *kind) {
                                         "invocation_expression",
                                         "member_access_expression",
                                         "identifier",
+                                        "this",
+                                        "this_expression",
                                         "argument_list",
                                         "argument",
                                         "integer_literal",
@@ -574,7 +685,15 @@ static void csp_audit(csp_context_t *context, TSNode node, CBMHashTable *blocked
         return;
     }
     binding = binding || csp_is(node, "assignment_expression") ||
-              csp_is(node, "local_declaration_statement") || csp_is(node, "argument");
+              csp_is(node, "local_declaration_statement");
+    if (csp_is(node, "argument")) {
+        uint32_t children = ts_node_child_count(node);
+        for (uint32_t i = 0; i < children; i++) {
+            TSNode child = ts_node_child(node, i);
+            if (csp_is(child, "ref") || csp_is(child, "out") || csp_is(child, "in"))
+                binding = true;
+        }
+    }
     if (binding && csp_is(node, "identifier")) {
         const char *name = csp_text(&context->source, node);
         if (!name) {
@@ -592,40 +711,203 @@ static void csp_audit(csp_context_t *context, TSNode node, CBMHashTable *blocked
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
+static const CBMType *csp_argument_type(csp_context_t *context, CBMScope *scope,
+                                        CBMHashTable *blocked, TSNode node,
+                                        cbm_resolve_result_t *proof, unsigned depth) {
+    if (ts_node_is_null(node) || depth > 32)
+        return NULL;
+    if (csp_is(node, "identifier")) {
+        const char *name = csp_text(&context->source, node);
+        if (!name || cbm_ht_get(blocked, name))
+            return NULL;
+        cbm_resolve_type_fact_t fact =
+            cbm_resolve_types_lookup(&context->types, scope, name, ts_node_start_byte(node));
+        if (cbm_resolve_types_fact_status(&fact) != CBM_RESOLVE_TYPE_KNOWN || !fact.type ||
+            fact.type->kind != CBM_TYPE_BUILTIN)
+            return NULL;
+        *proof = fact.evidence;
+        return fact.type;
+    }
+    if (csp_is(node, "parenthesized_expression") && ts_node_named_child_count(node) == 1)
+        return csp_argument_type(context, scope, blocked, ts_node_named_child(node, 0), proof,
+                                 depth + 1);
+    const char *type_name = NULL, *text = csp_text(&context->source, node);
+    if (csp_is(node, "boolean_literal") && text &&
+        (!strcmp(text, "true") || !strcmp(text, "false")))
+        type_name = "bool";
+    else if (csp_is(node, "integer_literal") && text && *text) {
+        /* Decimal int/long literals only. Hex/binary/unsigned and boundary
+         * negation need their own literal typing rule; never guess int. */
+        uint64_t value = 0;
+        bool digit = false;
+        const unsigned char *at = (const unsigned char *)text;
+        for (; *at && *at != 'l' && *at != 'L'; at++) {
+            if (*at == '_')
+                continue;
+            if (*at < '0' || *at > '9' ||
+                value > (UINT64_C(9223372036854775807) - (*at - '0')) / 10)
+                return NULL;
+            value = value * 10 + (*at - '0');
+            digit = true;
+        }
+        bool is_long = *at == 'l' || *at == 'L';
+        if (!digit || (is_long ? at[1] != 0 : *at != 0) ||
+            (!is_long && value > UINT64_C(2147483647)))
+            return NULL;
+        type_name = is_long ? "long" : "int";
+    }
+    if (!type_name)
+        return NULL;
+    const CBMType *type = cbm_type_builtin(context->source.arena, type_name);
+    *proof = csp_primitive_evidence(context, type, node, "csharp-source-primitive-literal");
+    return type;
+}
+
+static bool csp_primitive_conversion(const CBMType *from, const CBMType *to) {
+    if (!from || !to || from->kind != CBM_TYPE_BUILTIN || to->kind != CBM_TYPE_BUILTIN)
+        return false;
+    const char *a = from->data.builtin.name, *b = to->data.builtin.name;
+    if (!a || !b || !strcmp(a, "void") || !strcmp(b, "void"))
+        return false;
+    if (!strcmp(a, b))
+        return true;
+    /* C# implicit numeric conversions only; no constant narrowing, boxing,
+     * user conversions, dynamic binding or overload ranking. */
+    static const struct {
+        const char *from, *to;
+    } conversions[] = {{"sbyte", "short,int,long,float,double,decimal"},
+                       {"byte", "short,ushort,int,uint,long,ulong,float,double,decimal"},
+                       {"short", "int,long,float,double,decimal"},
+                       {"ushort", "int,uint,long,ulong,float,double,decimal"},
+                       {"int", "long,float,double,decimal"},
+                       {"uint", "long,ulong,float,double,decimal"},
+                       {"long", "float,double,decimal"},
+                       {"ulong", "float,double,decimal"},
+                       {"char", "ushort,int,uint,long,ulong,float,double,decimal"},
+                       {"float", "double"}};
+    for (size_t i = 0; i < sizeof(conversions) / sizeof(conversions[0]); i++) {
+        if (strcmp(a, conversions[i].from))
+            continue;
+        const char *at = conversions[i].to;
+        while (*at) {
+            const char *comma = strchr(at, ',');
+            size_t length = comma ? (size_t)(comma - at) : strlen(at);
+            if (strlen(b) == length && !memcmp(at, b, length))
+                return true;
+            at += length;
+            if (*at)
+                at++;
+        }
+    }
+    return false;
+}
+
+static cbm_resolve_result_t csp_arguments(csp_context_t *context, CBMScope *scope,
+                                          CBMHashTable *blocked, TSNode arguments,
+                                          cbm_resolve_method_result_t selected) {
+    cbm_resolve_result_t result = selected.result;
+    if (!cbm_resolve_admit(&result) || !selected.method)
+        return result;
+    const CBMType *signature = selected.method->source_signature;
+    const CBMType *const *parameters =
+        signature && signature->kind == CBM_TYPE_FUNC ? signature->data.func.param_types : NULL;
+    int count = 0;
+    uint32_t children = ts_node_named_child_count(arguments);
+    for (uint32_t i = 0; i < children; i++) {
+        TSNode argument = ts_node_named_child(arguments, i);
+        if (csp_is(argument, "comment"))
+            continue;
+        if (!csp_is(argument, "argument") || ts_node_child_count(argument) != 1 || count >= 64 ||
+            !parameters || !parameters[count])
+            goto unsupported;
+        cbm_resolve_result_t evidence = {0};
+        const CBMType *type =
+            csp_argument_type(context, scope, blocked, ts_node_child(argument, 0), &evidence, 0);
+        if (!csp_primitive_conversion(type, parameters[count]) || !cbm_resolve_admit(&evidence) ||
+            !evidence.proof)
+            goto unsupported;
+        result =
+            cbm_lsp_proof_rule(&context->types, result, argument, selected.method->qualified_name,
+                               selected.method->short_name,
+                               "csharp-source-primitive-invocation-conversion", evidence.proof);
+        if (!cbm_resolve_admit(&result))
+            return result;
+        count++;
+    }
+    if (count != selected.method->min_params || (count && parameters[count]))
+        goto unsupported;
+    return result;
+unsupported:
+    return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                                  .reason = "csharp_argument_applicability_unproven"};
+}
+
 static void csp_call(csp_context_t *context, csp_scope_t *names, TSNode node, const char *caller,
                      CBMScope *scope, CBMHashTable *bound, CBMHashTable *blocked) {
     TSNode function = csp_field(node, "function"), arguments = csp_field(node, "arguments");
-    if (!csp_is(function, "member_access_expression") || ts_node_is_null(arguments) ||
-        ts_node_named_child_count(arguments))
+    if (ts_node_is_null(arguments))
         return;
-    TSNode receiver = csp_field(function, "expression"), member = csp_field(function, "name");
-    if (!csp_is(receiver, "identifier") || !csp_is(member, "identifier"))
+    bool implicit = csp_is(function, "identifier");
+    TSNode receiver = implicit ? (TSNode){0} : csp_field(function, "expression");
+    TSNode member = implicit ? function : csp_field(function, "name");
+    bool self = csp_is(receiver, "this") || csp_is(receiver, "this_expression");
+    if ((!implicit && !csp_is(function, "member_access_expression")) ||
+        (!implicit && !self && !csp_is(receiver, "identifier")) || !csp_is(member, "identifier"))
         return;
-    const char *variable = csp_text(&context->source, receiver),
-               *name = csp_text(&context->source, member);
-    if (!variable || !name || cbm_ht_get(blocked, variable))
+    const char *name = csp_text(&context->source, member);
+    if (!name)
         return;
-    cbm_resolve_type_fact_t fact =
-        cbm_resolve_types_lookup(&context->types, scope, variable, ts_node_start_byte(node));
+    static const char *const object_names[] = {"Equals",   "GetHashCode",     "GetType",
+                                               "ToString", "ReferenceEquals", "MemberwiseClone",
+                                               "Finalize"};
+    for (size_t i = 0; i < sizeof(object_names) / sizeof(object_names[0]); i++)
+        if (!strcmp(name, object_names[i]))
+            return;
+    cbm_resolve_type_fact_t fact = {0};
     const CBMRegisteredType *static_type = NULL;
+    context->implicit_call = implicit;
     context->static_call = false;
-    if (fact.status != CBM_RESOLVE_TYPE_KNOWN) {
-        if (cbm_ht_get(bound, variable))
+    if (implicit || self) {
+        const CBMRegisteredType *type = context->enclosing_type;
+        if (!type || (self && context->static_context) ||
+            (implicit && (cbm_ht_get(bound, name) || cbm_ht_get(blocked, name))))
             return;
-        static_type = csp_type(context, names, variable);
-        if (!static_type)
-            return;
-        cbm_resolve_result_t evidence = csp_type_evidence(context, static_type, receiver);
+        context->static_call = context->static_context;
         fact = (cbm_resolve_type_fact_t){
             .status = CBM_RESOLVE_TYPE_KNOWN,
             .origin = CBM_RESOLVE_TYPE_ANNOTATION,
             .proof_pool = &context->types.proofs,
-            .type = cbm_type_named(context->source.arena, static_type->qualified_name),
-            .evidence = evidence};
-        context->static_call = true;
+            .type = cbm_type_named(context->source.arena, type->qualified_name),
+            .evidence = cbm_lsp_proof_type_lookup(
+                &context->types, implicit ? name : "this", implicit ? member : receiver,
+                "csharp-lexical-enclosing-class", type->qualified_name, type->declaration_identity,
+                type->graph_qualified_name, type->source_flags, "csharp-source-lexical-receiver")};
+    } else {
+        const char *variable = csp_text(&context->source, receiver);
+        if (!variable || cbm_ht_get(blocked, variable))
+            return;
+        fact = cbm_resolve_types_lookup(&context->types, scope, variable, ts_node_start_byte(node));
+        if (fact.status != CBM_RESOLVE_TYPE_KNOWN) {
+            if (cbm_ht_get(bound, variable))
+                return;
+            static_type = csp_type(context, names, variable);
+            if (!static_type)
+                return;
+            fact = (cbm_resolve_type_fact_t){
+                .status = CBM_RESOLVE_TYPE_KNOWN,
+                .origin = CBM_RESOLVE_TYPE_ANNOTATION,
+                .proof_pool = &context->types.proofs,
+                .type = cbm_type_named(context->source.arena, static_type->qualified_name),
+                .evidence = csp_type_evidence(context, static_type, receiver)};
+            context->static_call = true;
+        }
     }
-    if (!fact.type || fact.type->kind != CBM_TYPE_NAMED)
+    if (cbm_resolve_types_fact_status(&fact) != CBM_RESOLVE_TYPE_KNOWN || !fact.type ||
+        fact.type->kind != CBM_TYPE_NAMED)
         return;
+    context->same_class =
+        context->enclosing_type &&
+        !strcmp(context->enclosing_type->qualified_name, fact.type->data.named.qualified_name);
     cbm_resolve_method_query_t query = {.proof_pool = &context->types.proofs,
                                         .proof_source = &context->types.proof_source,
                                         .lookup_domain = fact.type->data.named.qualified_name,
@@ -633,14 +915,15 @@ static void csp_call(csp_context_t *context, csp_scope_t *names, TSNode node, co
                                         .receiver = &fact,
                                         .receiver_qn = fact.type->data.named.qualified_name,
                                         .method_name = name,
-                                        .argument_count = 0,
+                                        .argument_count = -1,
                                         .adapter_facts = CBM_RESOLVE_METHOD_DIRECT_DOMAIN_COMPLETE |
                                                          CBM_RESOLVE_METHOD_OCCURRENCE_EXACT |
                                                          CBM_RESOLVE_METHOD_NAME_IDENTITY,
                                         .classify = csp_candidate,
                                         .context = context};
-    cbm_resolve_method_result_t result = cbm_resolve_method(&query);
-    csp_emit(context, caller, node, CBM_RESOLVED_INVOCATION, result.result);
+    cbm_resolve_method_result_t selected = cbm_resolve_method(&query);
+    cbm_resolve_result_t result = csp_arguments(context, scope, blocked, arguments, selected);
+    csp_emit(context, caller, node, CBM_RESOLVED_INVOCATION, result);
     if (static_type)
         csp_emit(context, caller, receiver, CBM_RESOLVED_TYPE_REFERENCE,
                  csp_type_evidence(context, static_type, receiver));
@@ -671,6 +954,7 @@ static void csp_function(csp_context_t *context, csp_scope_t *names, TSNode node
     if (!caller || caller->ambiguous || !caller->target || ts_node_is_null(body) ||
         ts_node_is_null(parameters))
         return;
+    context->static_context = csp_modifier(&context->source, node, "static");
     CBMHashTable *bound = cbm_ht_create(16), *blocked = cbm_ht_create(16);
     if (!bound || !blocked) {
         cbm_ht_free(bound);
@@ -704,6 +988,19 @@ static void csp_function(csp_context_t *context, csp_scope_t *names, TSNode node
                 /* ref/out/in/attributes/defaults need a separate binding model. */
                 if (ts_node_named_child_count(parameter) != 2 || cbm_ht_get(blocked, variable))
                     continue;
+                const CBMType *primitive = csp_primitive(&context->source, type_node);
+                if (primitive && strcmp(primitive->data.builtin.name, "void")) {
+                    /* Parameter modifiers are tokens; a by-reference parameter
+                     * must not lend a stable local value fact. */
+                    if (ts_node_child_count(parameter) != 2)
+                        continue;
+                    cbm_resolve_result_t proof = csp_primitive_evidence(
+                        context, primitive, type_node, "csharp-source-primitive-annotation");
+                    (void)cbm_resolve_types_declare(&context->types, scope, variable,
+                                                    ts_node_start_byte(parameter), primitive,
+                                                    CBM_RESOLVE_TYPE_ANNOTATION, &proof);
+                    continue;
+                }
                 if (!csp_is(type_node, "identifier") && !csp_is(type_node, "qualified_name"))
                     continue;
                 const CBMRegisteredType *type =
@@ -770,8 +1067,12 @@ static void csp_walk(csp_context_t *context, TSNode node, csp_scope_t *scope, un
             } else if (csp_is(child, "class_declaration") ||
                        csp_is(child, "interface_declaration") ||
                        csp_is(child, "struct_declaration")) {
-                if (csp_simple_class(&context->source, child))
+                if (csp_simple_class(&context->source, child)) {
+                    const CBMRegisteredType *previous = context->enclosing_type;
+                    context->enclosing_type = csp_lexical_type(context, scope, child);
                     csp_walk(context, csp_field(child, "body"), scope, depth + 1);
+                    context->enclosing_type = previous;
+                }
             } else if (csp_is(child, "method_declaration"))
                 csp_function(context, scope, child);
         } while (!context->source.failed && ts_tree_cursor_goto_next_sibling(&cursor));

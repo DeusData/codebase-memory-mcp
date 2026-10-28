@@ -51,6 +51,7 @@ static void c_memo_test_stage(CLSPContext *ctx, const char *stage) {
 }
 
 void cbm_c_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
+    result->lsp_failed = true;
     result->has_error = true;
     result->lsp_skipped = true;
     /* Static lifetime keeps the reason available even when the arena is full.
@@ -930,7 +931,15 @@ static const char *c_adl_resolve(CLSPContext *ctx, const char *name, TSNode call
 typedef struct CProofDeclaration {
     const char *qn;
     uint32_t at;
+    TSNode site;
+    const CBMType *signature;
+    bool external, c_linkage;
 } CProofDeclaration;
+
+typedef struct CProofBuiltinBinding {
+    const CBMVarBinding *binding;
+    const CBMType *type;
+} CProofBuiltinBinding;
 
 typedef struct CProofInclude {
     const char *path;
@@ -999,7 +1008,8 @@ static void c_proof_add_declaration(CLSPContext *ctx, const char *qn, uint32_t a
         ctx->proof_declarations = next;
         ctx->proof_declaration_cap = cap;
     }
-    ctx->proof_declarations[ctx->proof_declaration_count++] = (CProofDeclaration){qn, at};
+    ctx->proof_declarations[ctx->proof_declaration_count++] =
+        (CProofDeclaration){.qn = qn, .at = at};
 }
 
 static int c_proof_declaration_compare(const void *left, const void *right) {
@@ -1076,6 +1086,32 @@ static TSNode c_proof_function_name(TSNode declaration) {
     return (TSNode){0};
 }
 
+static bool c_proof_internal_declaration(CLSPContext *ctx, TSNode node) {
+    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (!strcmp(ts_node_type(child), "storage_class_specifier")) {
+            const char *text = c_node_text(ctx, child);
+            if (text && !strcmp(text, "static"))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool c_proof_c_linkage(CLSPContext *ctx, TSNode node) {
+    if (!ctx->cpp_mode)
+        return true;
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (strcmp(ts_node_type(parent), "linkage_specification"))
+            continue;
+        TSNode value = ts_node_child_by_field_name(parent, "value", 5);
+        const char *text = ts_node_is_null(value) ? NULL : c_node_text(ctx, value);
+        return text && !strcmp(text, "\"C\"");
+    }
+    return false;
+}
+
 static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, int depth) {
     if (depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
         ctx->binding_failed = true;
@@ -1113,10 +1149,20 @@ static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, in
             const char *name = c_proof_name(ctx, c_node_text(ctx, name_node));
             if (name && !strchr(name, '.')) {
                 const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name);
-                if (qn)
+                if (qn) {
+                    int before = ctx->proof_declaration_count;
                     c_proof_add_declaration(ctx, qn, ts_node_end_byte(name_node));
-                else
+                    if (ctx->proof_declaration_count > before && !strcmp(kind, "declaration")) {
+                        CProofDeclaration *decl = &ctx->proof_declarations[before];
+                        decl->site = node;
+                        decl->signature =
+                            cbm_c_free_signature(ctx->arena, ctx->source, node, ctx->cpp_mode);
+                        decl->external = !c_proof_internal_declaration(ctx, node);
+                        decl->c_linkage = c_proof_c_linkage(ctx, node);
+                    }
+                } else {
                     ctx->binding_failed = true;
+                }
             }
         }
         return;
@@ -1212,6 +1258,7 @@ static bool c_proof_syntax_complete(CLSPContext *ctx, TSNode node, unsigned dept
 
 static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
     ctx->proof_registry = c_proof_registry_snapshot(ctx, ctx->registry, 0);
+    ctx->proof_preprocessor_unknown = cbm_c_preprocessor_domain_unsupported(root);
     uint32_t visited = 0;
     ctx->proof_syntax_limit = ts_node_end_byte(root);
     (void)c_proof_syntax_complete(ctx, root, 0, &visited);
@@ -1339,6 +1386,121 @@ static bool c_proof_merge(cbm_resolve_result_t *result, cbm_resolve_result_t nex
     return true;
 }
 
+/* The generic type comparator intentionally compares FUNC values by identity.
+ * These separately parsed source signatures have a much narrower audited shape:
+ * one builtin return and at most 64 builtin parameters, with no variadic/default
+ * or user-defined types. Compare that shape explicitly without broadening the
+ * equality contract used by inference elsewhere. */
+static bool c_proof_signature_equal(const CBMType *left, const CBMType *right) {
+    if (!left || !right || left->kind != CBM_TYPE_FUNC || right->kind != CBM_TYPE_FUNC)
+        return false;
+    const CBMType **lr = left->data.func.return_types;
+    const CBMType **rr = right->data.func.return_types;
+    const CBMType **lp = left->data.func.param_types;
+    const CBMType **rp = right->data.func.param_types;
+    if (!lr || !rr || !lr[0] || !rr[0] || lr[1] || rr[1] || lr[0]->kind != CBM_TYPE_BUILTIN ||
+        rr[0]->kind != CBM_TYPE_BUILTIN || !cbm_type_equal(lr[0], rr[0]) || !lp || !rp)
+        return false;
+    for (unsigned i = 0; i <= 64; i++) {
+        if (!lp[i] || !rp[i])
+            return lp[i] == NULL && rp[i] == NULL;
+        if (i == 64 || lp[i]->kind != CBM_TYPE_BUILTIN || rp[i]->kind != CBM_TYPE_BUILTIN ||
+            !cbm_type_equal(lp[i], rp[i]))
+            return false;
+    }
+    return false;
+}
+
+/* A visible prototype establishes a linkage key, never a globally unique
+ * short-name guess. Every project candidate in that indexed bucket must have
+ * audited linkage facts; incompatible, duplicate and unknown definitions close
+ * the domain without a target. Static definitions belong to other TUs. */
+static cbm_resolve_result_t c_proof_external_definition(CLSPContext *ctx, const char *relative,
+                                                        const CBMType *signature, bool c_linkage) {
+    if (ctx->proof_preprocessor_unknown)
+        return c_proof_missing("c_external_preprocessor_domain_unproven");
+    const char *leaf = strrchr(relative, '.');
+    const char *name = leaf ? leaf + 1 : relative;
+    size_t namespace_len = leaf ? (size_t)(leaf - relative) : 0;
+    const CBMRegisteredFunc *chosen = NULL;
+    CBMFreeFuncIter iterator;
+    cbm_registry_free_funcs_by_short_name_chain(ctx->proof_registry, name, &iterator);
+    int index;
+    while ((index = cbm_free_func_iter_next(&iterator)) >= 0) {
+        const CBMRegisteredFunc *candidate = &iterator.reg->funcs[index];
+        if (!(candidate->flags & CBM_FUNC_FLAG_PROJECT_SOURCE) || candidate->receiver_type ||
+            !candidate->short_name || strcmp(candidate->short_name, name))
+            continue;
+        uint32_t known = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_TOP_LEVEL;
+        if ((candidate->source_flags & known) != known || !candidate->source_namespace)
+            return c_proof_missing("c_external_linkage_domain_incomplete");
+        if (candidate->source_flags & CBM_SOURCE_DECL_STATIC)
+            continue;
+        bool candidate_c = (candidate->source_flags & CBM_SOURCE_DECL_EXTERN_C) != 0;
+        if (candidate_c != c_linkage)
+            continue;
+        if (!c_linkage && (strlen(candidate->source_namespace) != namespace_len ||
+                           strncmp(candidate->source_namespace, relative, namespace_len)))
+            continue;
+        if (!signature || !candidate->source_signature ||
+            !c_proof_signature_equal(signature, candidate->source_signature))
+            return c_proof_missing("c_external_signature_conflict");
+        if (!(candidate->source_flags & CBM_SOURCE_FUNCTION_DEFINITION))
+            continue;
+        if (!candidate->declaration_identity || !candidate->graph_qualified_name ||
+            candidate->type_param_names)
+            return c_proof_missing("c_external_definition_identity_missing");
+        if (chosen && (strcmp(chosen->declaration_identity, candidate->declaration_identity) ||
+                       strcmp(chosen->graph_qualified_name, candidate->graph_qualified_name)))
+            return (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_AMBIGUOUS,
+                                          .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                          .candidate_count = 2,
+                                          .reason = "c_external_definitions_conflict"};
+        chosen = candidate;
+    }
+    return chosen ? c_proof_query(ctx, chosen->qualified_name, CBM_RESOLVE_RULE_SCOPE_BINDING)
+                  : (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                           .reason = "c_external_definition_missing"};
+}
+
+static cbm_resolve_result_t c_proof_visible_prototype(CLSPContext *ctx, const char *local,
+                                                      const char *relative, uint32_t at) {
+    cbm_resolve_result_t result = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE};
+    int lo = 0, hi = ctx->proof_declaration_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (strcmp(ctx->proof_declarations[mid].qn, local) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    const CBMType *signature = NULL;
+    bool linkage = false;
+    TSNode site = {0};
+    for (int i = lo;
+         i < ctx->proof_declaration_count && !strcmp(ctx->proof_declarations[i].qn, local); i++) {
+        const CProofDeclaration *decl = &ctx->proof_declarations[i];
+        if (decl->at >= at || ts_node_is_null(decl->site))
+            continue;
+        if (!decl->external || !decl->signature ||
+            (signature &&
+             (!c_proof_signature_equal(signature, decl->signature) || linkage != decl->c_linkage)))
+            return c_proof_missing("c_prototype_linkage_unsupported");
+        signature = decl->signature;
+        linkage = decl->c_linkage;
+        site = decl->site;
+    }
+    if (!signature)
+        return result;
+    result = c_proof_external_definition(ctx, relative, signature, linkage);
+    return cbm_resolve_admit(&result)
+               ? cbm_lsp_proof_rule(
+                     &ctx->field_types, result, site, "c-external-prototype", relative,
+                     "visible-source-prototype;compatible-signature;unique-external-definition",
+                     NULL)
+               : result;
+}
+
 /* A file module is a storage identity, not a C namespace. Includes expose
  * their declarations in the translation unit; collect every mapped module
  * rather than preferring the first header or the current file. */
@@ -1348,9 +1510,19 @@ static cbm_resolve_result_t c_proof_domain(CLSPContext *ctx, const char *relativ
     const char *local = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, relative);
     if (!local)
         return c_proof_missing("c_binding_allocation_failed");
-    if (c_proof_declared(ctx, local, at) &&
-        !c_proof_merge(&result, c_proof_query(ctx, local, CBM_RESOLVE_RULE_SCOPE_BINDING)))
-        return result;
+    if (c_proof_declared(ctx, local, at)) {
+        const CBMRegisteredFunc *registered = cbm_registry_lookup_func(ctx->proof_registry, local);
+        bool prototype = registered && (registered->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) &&
+                         !(registered->source_flags & CBM_SOURCE_FUNCTION_DEFINITION);
+        cbm_resolve_result_t local_result =
+            prototype ? c_proof_visible_prototype(ctx, local, relative, at)
+                      : c_proof_query(ctx, local, CBM_RESOLVE_RULE_SCOPE_BINDING);
+        if (!prototype && local_result.binding == CBM_RESOLVE_BINDING_UNRESOLVED &&
+            local_result.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE)
+            local_result = c_proof_visible_prototype(ctx, local, relative, at);
+        if (!c_proof_merge(&result, local_result))
+            return result;
+    }
     for (int i = 0; i < ctx->include_count; i++) {
         const CProofInclude *include = &ctx->proof_includes[i];
         if (include->at >= at)
@@ -1491,6 +1663,8 @@ static const char *c_exact_function_target_from_expr(CLSPContext *ctx, TSNode ex
 /* Unqualified C++ calls can add ADL candidates. Until associated namespaces
  * are enumerated, only arguments with no associated user-defined type are
  * complete. Qualified calls and lexical function pointers do not use ADL. */
+static bool c_proof_builtin_argument(CLSPContext *ctx, TSNode argument);
+
 static bool c_proof_call_domain(CLSPContext *ctx, TSNode call, TSNode function,
                                 const cbm_resolve_result_t *proof) {
     if (!ctx->cpp_mode || proof->rule == CBM_RESOLVE_RULE_CALLABLE_BINDING ||
@@ -1499,7 +1673,10 @@ static bool c_proof_call_domain(CLSPContext *ctx, TSNode call, TSNode function,
     TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
     uint32_t count = ts_node_named_child_count(args);
     for (uint32_t i = 0; i < count; i++) {
-        const char *kind = ts_node_type(ts_node_named_child(args, i));
+        TSNode argument = ts_node_named_child(args, i);
+        const char *kind = ts_node_type(argument);
+        if (c_proof_builtin_argument(ctx, argument))
+            continue;
         if (strcmp(kind, "number_literal") && strcmp(kind, "char_literal") &&
             strcmp(kind, "string_literal") && strcmp(kind, "true") && strcmp(kind, "false") &&
             strcmp(kind, "null"))
@@ -4076,6 +4253,66 @@ static const CBMType *c_proof_annotation_type(CLSPContext *ctx, const CBMType *t
     return NULL;
 }
 
+static size_t c_proof_builtin_slot(const CBMVarBinding *binding, int capacity) {
+    uintptr_t key = (uintptr_t)binding >> 3;
+    return (size_t)(key * (uintptr_t)2654435761u) & (size_t)(capacity - 1);
+}
+
+static void c_proof_observe_builtin(CLSPContext *ctx, const char *name, const CBMType *type,
+                                    TSNode site) {
+    if (!type || type->kind != CBM_TYPE_BUILTIN)
+        return;
+    TSNode annotation = ts_node_child_by_field_name(site, "type", 4);
+    if (ts_node_is_null(annotation))
+        annotation = ts_node_child_by_field_name(ts_node_parent(site), "type", 4);
+    const CBMType *written = cbm_c_builtin_annotation(ctx->arena, ctx->source, annotation);
+    const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
+    if (!written || !binding || !cbm_type_equal(written, type))
+        return;
+    if (ctx->proof_builtin_count * 2 >= ctx->proof_builtin_cap) {
+        int capacity = ctx->proof_builtin_cap ? ctx->proof_builtin_cap * 2 : 32;
+        CProofBuiltinBinding *next = cbm_arena_calloc(ctx->arena, (size_t)capacity * sizeof(*next));
+        if (!next) {
+            ctx->binding_failed = true;
+            return;
+        }
+        for (int i = 0; i < ctx->proof_builtin_cap; i++) {
+            CProofBuiltinBinding old = ctx->proof_builtins[i];
+            if (!old.binding)
+                continue;
+            size_t slot = c_proof_builtin_slot(old.binding, capacity);
+            while (next[slot].binding)
+                slot = (slot + 1) & (size_t)(capacity - 1);
+            next[slot] = old;
+        }
+        ctx->proof_builtins = next;
+        ctx->proof_builtin_cap = capacity;
+    }
+    size_t slot = c_proof_builtin_slot(binding, ctx->proof_builtin_cap);
+    while (ctx->proof_builtins[slot].binding && ctx->proof_builtins[slot].binding != binding)
+        slot = (slot + 1) & (size_t)(ctx->proof_builtin_cap - 1);
+    if (!ctx->proof_builtins[slot].binding)
+        ctx->proof_builtin_count++;
+    ctx->proof_builtins[slot] = (CProofBuiltinBinding){binding, written};
+}
+
+static bool c_proof_builtin_argument(CLSPContext *ctx, TSNode argument) {
+    if (ctx->proof_preprocessor_unknown || !ctx->proof_builtin_cap ||
+        strcmp(ts_node_type(argument), "identifier"))
+        return false;
+    const char *name = c_node_text(ctx, argument);
+    const CBMVarBinding *binding = cbm_scope_lookup_binding(ctx->current_scope, name);
+    if (!binding)
+        return false;
+    size_t slot = c_proof_builtin_slot(binding, ctx->proof_builtin_cap);
+    while (ctx->proof_builtins[slot].binding) {
+        if (ctx->proof_builtins[slot].binding == binding)
+            return cbm_type_equal(ctx->proof_builtins[slot].type, binding->type);
+        slot = (slot + 1) & (size_t)(ctx->proof_builtin_cap - 1);
+    }
+    return false;
+}
+
 /* Only explicit, resolved declaration types are donated. The type map then
  * keeps lexical identity and detects stale/replaced bindings; an inferred
  * `auto` type never acquires proof merely by naming a registered class. */
@@ -4083,6 +4320,7 @@ static void c_observe_declared_binding(CLSPContext *ctx, const char *name, const
                                        TSNode site) {
     if (!name || !type || ts_node_is_null(site) || ctx->eval_failure)
         return;
+    c_proof_observe_builtin(ctx, name, type, site);
     const CBMRegisteredType *owner = c_annotation_owner(ctx, site);
     if (!owner || !owner->qualified_name)
         return;
@@ -8216,6 +8454,8 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             rf.declaration_identity = d->declaration_identity;
             rf.graph_qualified_name = d->graph_qualified_name;
             rf.source_flags = d->source_flags;
+            rf.source_signature = d->source_signature;
+            rf.source_namespace = d->namespace_name;
             if (rf.source_flags & CBM_SOURCE_DECL_FIXED_ARITY)
                 rf.min_params = d->signature_param_count;
 

@@ -27,6 +27,7 @@
 #include "pipeline/helm_template.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
 #include "cbm.h"
 #include "helpers.h"
 #include "lang_specs.h"
@@ -136,14 +137,15 @@ static bool tf_string(const char *src, const char *mdir, TSNode n, char *out, si
  * the repository root. A value starting with the \x01 marker is already
  * from the root. */
 static bool tf_repo_path(const char *mdir, const char *v, char *out, size_t sz) {
+    if (!v || v[0] == '/' || (isalpha((unsigned char)v[0]) && v[1] == ':'))
+        return false;
     bool anchored = v[0] == '\x01';
     const char *rel = anchored ? v + SKIP_ONE : v;
     char buf[CBM_SZ_2K];
-    if (anchored) {
-        snprintf(buf, sizeof(buf), "%s", rel);
-    } else {
-        snprintf(buf, sizeof(buf), "%s%s%s", mdir, mdir[0] ? "/" : "", rel);
-    }
+    int written = anchored ? snprintf(buf, sizeof(buf), "%s", rel)
+                           : snprintf(buf, sizeof(buf), "%s%s%s", mdir, mdir[0] ? "/" : "", rel);
+    if (written < 0 || (size_t)written >= sizeof(buf))
+        return false;
     size_t n = 0;
     out[0] = '\0';
     for (const char *p = buf; *p;) {
@@ -964,6 +966,9 @@ typedef struct {
     const char *ref; /* static: var, local, module, data, resource */
     int line;
     bool dep; /* stands in the holder's depends_on list */
+    const cbm_resolve_proof_t *occurrence;
+    int64_t owner;
+    bool owner_materialized;
 } tf_ref_t;
 
 /* A module call with a local source. */
@@ -972,6 +977,9 @@ typedef struct {
     char *name; /* its block: module.X */
     char *dir;  /* the source directory, from the repository root */
     int line;
+    const cbm_resolve_proof_t *occurrence;
+    int64_t owner;
+    bool owner_materialized;
 } tf_call_t;
 
 typedef struct {
@@ -989,6 +997,10 @@ typedef struct {
     const char *src;  /* the file's text */
     const char *file; /* its repository path (arena) */
     bool dep;         /* walking a depends_on list */
+    cbm_shared_resolver_adapter_t *adapter;
+    cbm_resolve_proof_source_t source;
+    size_t source_length;
+    bool syntax_complete;
 } tf_mod_t;
 
 static const char TF_MODULE_PREFIX[] = "module.";
@@ -1031,6 +1043,56 @@ static const char *tf_block_name(CBMArena *a, const char *src, TSNode block, TSN
     return name;
 }
 
+/* Duplicate attributes have no deterministic Terraform/Terragrunt value.
+ * Keep references as unsupported outcomes instead of choosing the first key. */
+static bool tf_unique_attributes(cbm_pipeline_ctx_t *ctx, CBMArena *arena, const char *source,
+                                 TSNode root) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool more = true, complete = true;
+    while (more && complete) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (tf_type(node, "body")) {
+            CBMHashTable *keys = cbm_ht_create(0);
+            if (!keys) {
+                atomic_store(&ctx->resolver_failed, true);
+                complete = false;
+            }
+            for (uint32_t i = 0; complete && i < ts_node_named_child_count(node); i++) {
+                TSNode attribute = ts_node_named_child(node, i);
+                if (!tf_type(attribute, "attribute") || !ts_node_named_child_count(attribute))
+                    continue;
+                const char *key = tf_text(arena, source, ts_node_named_child(attribute, 0));
+                if (!key) {
+                    atomic_store(&ctx->resolver_failed, true);
+                    complete = false;
+                    break;
+                }
+                if (cbm_ht_has(keys, key)) {
+                    complete = false;
+                    break;
+                }
+                cbm_ht_set(keys, key, (void *)key);
+                if (cbm_ht_get(keys, key) != key) {
+                    atomic_store(&ctx->resolver_failed, true);
+                    complete = false;
+                }
+            }
+            if (keys)
+                cbm_ht_free(keys);
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return complete;
+}
+
 /* Room for one more element in a growing array. */
 static bool tf_grow(void **items, int *cap, int n, size_t size) {
     if (n < *cap) {
@@ -1046,12 +1108,53 @@ static bool tf_grow(void **items, int *cap, int n, size_t size) {
     return true;
 }
 
-static void tf_ref_push(tf_mod_t *m, const char *src_block, const char *ref, const char *key,
-                        const char *out, int line) {
-    if (tf_grow((void **)&m->refs, &m->ref_cap, m->ref_n, sizeof(*m->refs))) {
-        m->refs[m->ref_n++] = (tf_ref_t){
-            (char *)m->file, (char *)src_block, (char *)key, (char *)out, ref, line, m->dep};
+static int64_t tf_def_node(tf_mod_t *m, const char *file, const char *name);
+
+static const cbm_resolve_proof_t *tf_occurrence(tf_mod_t *m, const char *block, uint32_t start,
+                                                uint32_t end, const char *relation, int64_t *owner,
+                                                bool *owner_materialized) {
+    *owner = tf_def_node(m, m->file, block);
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_id(m->ctx->gbuf, *owner);
+    *owner_materialized = node != NULL;
+    if (!node)
+        node = cbm_pipeline_file_node(m->ctx->gbuf, m->ctx->project_name, m->file);
+    if (!node) {
+        atomic_store(&m->ctx->resolver_failed, true);
+        return NULL;
     }
+    *owner = node->id;
+    cbm_resolve_proof_source_t source = m->source;
+    source.scope = node->qualified_name;
+    const char *spelling = end > start && end <= m->source_length
+                               ? cbm_arena_strndup(m->arena, m->src + start, end - start)
+                               : NULL;
+    return cbm_shared_resolver_adapter_occurrence(m->adapter, &source, m->src, m->source_length,
+                                                  start, end, spelling, relation);
+}
+
+static void tf_ref_push(tf_mod_t *m, const char *src_block, const char *ref, const char *key,
+                        const char *out, TSNode traversal) {
+    if (!key || !tf_grow((void **)&m->refs, &m->ref_cap, m->ref_n, sizeof(*m->refs))) {
+        atomic_store(&m->ctx->resolver_failed, true);
+        return;
+    }
+    uint32_t end = ts_node_end_byte(traversal);
+    for (TSNode next = ts_node_next_named_sibling(traversal); !ts_node_is_null(next);
+         next = ts_node_next_named_sibling(next)) {
+        if (!tf_type(next, "get_attr") && !tf_type(next, "index") && !tf_type(next, "splat"))
+            break;
+        end = ts_node_end_byte(next);
+    }
+    tf_ref_t *r = &m->refs[m->ref_n++];
+    *r = (tf_ref_t){.file = (char *)m->file,
+                    .src = (char *)src_block,
+                    .key = (char *)key,
+                    .out = (char *)out,
+                    .ref = ref,
+                    .line = (int)ts_node_start_point(traversal).row + 1,
+                    .dep = m->dep};
+    r->occurrence = tf_occurrence(m, src_block, ts_node_start_byte(traversal), end, "USAGE",
+                                  &r->owner, &r->owner_materialized);
 }
 
 /* The identifier of a get_attr node. */
@@ -1106,23 +1209,21 @@ static void tf_traversal(tf_mod_t *m, const char *src_block, TSNode v) {
     if (!root || !a1) {
         return;
     }
-    int line = (int)ts_node_start_point(v).row + SKIP_ONE;
     if (strcmp(root, "var") == 0) {
-        tf_ref_push(m, src_block, "var", cbm_arena_sprintf(a, "variable.%s", a1), NULL, line);
+        tf_ref_push(m, src_block, "var", cbm_arena_sprintf(a, "variable.%s", a1), NULL, v);
     } else if (strcmp(root, "local") == 0) {
-        tf_ref_push(m, src_block, "local", cbm_arena_sprintf(a, "local.%s", a1), NULL, line);
+        tf_ref_push(m, src_block, "local", cbm_arena_sprintf(a, "local.%s", a1), NULL, v);
     } else if (strcmp(root, "module") == 0) {
         tf_ref_push(m, src_block, "module", cbm_arena_sprintf(a, "module.%s", a1),
-                    tf_attr(a, m->src, v, SKIP_ONE), line);
+                    tf_attr(a, m->src, v, SKIP_ONE), v);
     } else if (strcmp(root, "data") == 0) {
         const char *a2 = tf_attr(a, m->src, v, SKIP_ONE);
         if (a2) {
-            tf_ref_push(m, src_block, "data", cbm_arena_sprintf(a, "data.%s.%s", a1, a2), NULL,
-                        line);
+            tf_ref_push(m, src_block, "data", cbm_arena_sprintf(a, "data.%s.%s", a1, a2), NULL, v);
         }
     } else if (strchr(root, '_')) {
         tf_ref_push(m, src_block, "resource", cbm_arena_sprintf(a, "resource.%s.%s", root, a1),
-                    NULL, line);
+                    NULL, v);
     }
 }
 
@@ -1186,21 +1287,41 @@ static void tf_mod_call(tf_mod_t *m, const char *name, TSNode block, TSNode body
         }
         char v[CBM_SZ_1K];
         char dir[CBM_SZ_1K];
-        if (!tf_string(m->src, m->dir, ts_node_named_child(at, SKIP_ONE), v, sizeof(v)) ||
-            (strncmp(v, "./", sizeof("./") - SKIP_ONE) != 0 &&
-             strncmp(v, "../", sizeof("../") - SKIP_ONE) != 0) ||
-            !tf_repo_path(m->dir, v, dir, sizeof(dir)) ||
-            !tf_grow((void **)&m->mcalls, &m->call_cap, m->call_n, sizeof(*m->mcalls))) {
+        TSNode value = ts_node_named_child(at, SKIP_ONE);
+        bool literal = tf_string(m->src, m->dir, value, v, sizeof(v)) &&
+                       (strncmp(v, "./", 2) == 0 || strncmp(v, "../", 3) == 0) &&
+                       tf_repo_path(m->dir, v, dir, sizeof(dir));
+        if (!tf_grow((void **)&m->mcalls, &m->call_cap, m->call_n, sizeof(*m->mcalls))) {
+            atomic_store(&m->ctx->resolver_failed, true);
             return;
         }
-        char *d = cbm_arena_strdup(m->arena, dir);
-        if (d) {
-            m->mcalls[m->call_n++] = (tf_call_t){(char *)m->file, (char *)name, d,
-                                                 (int)ts_node_start_point(block).row + SKIP_ONE};
-            cbm_ht_set(m->calls, name, d);
-        }
+        tf_call_t *call = &m->mcalls[m->call_n++];
+        *call = (tf_call_t){.file = (char *)m->file,
+                            .name = (char *)name,
+                            .dir = literal ? cbm_arena_strdup(m->arena, dir) : NULL,
+                            .line = (int)ts_node_start_point(block).row + SKIP_ONE};
+        call->occurrence =
+            tf_occurrence(m, name, ts_node_start_byte(value), ts_node_end_byte(value), "IMPORTS",
+                          &call->owner, &call->owner_materialized);
+        if (literal && !call->dir)
+            atomic_store(&m->ctx->resolver_failed, true);
+        if (call->dir)
+            cbm_ht_set(m->calls, name, call->dir);
         return;
     }
+}
+
+/* An empty marker records a duplicate declaration; file order is never a
+ * binding rule. Distinct locals blocks may define distinct local keys. */
+static void tf_declare(tf_mod_t *m, const char *name) {
+    if (!name) {
+        atomic_store(&m->ctx->resolver_failed, true);
+        return;
+    }
+    const char *file = cbm_ht_has(m->decls, name) ? "" : m->file;
+    cbm_ht_set(m->decls, name, (void *)file);
+    if (cbm_ht_get(m->decls, name) != file)
+        atomic_store(&m->ctx->resolver_failed, true);
 }
 
 /* One file of a module: its declarations (blocks, locals entries), module
@@ -1215,7 +1336,7 @@ static void tf_mod_file(tf_mod_t *m, TSNode root) {
         if (!name) {
             continue;
         }
-        cbm_ht_set(m->decls, name, (void *)m->file); /* `{}` declares too */
+        tf_declare(m, name); /* `{}` declares too */
         if (ts_node_is_null(bb)) {
             continue;
         }
@@ -1224,7 +1345,7 @@ static void tf_mod_file(tf_mod_t *m, TSNode root) {
                 TSNode at = ts_node_named_child(bb, j);
                 if (tf_type(at, "attribute") && ts_node_named_child_count(at) > 0) {
                     const char *key = tf_text(a, m->src, ts_node_named_child(at, 0));
-                    cbm_ht_set(m->decls, cbm_arena_sprintf(a, "local.%s", key), (void *)m->file);
+                    tf_declare(m, cbm_arena_sprintf(a, "local.%s", key));
                 }
             }
         } else if (strncmp(name, TF_MODULE_PREFIX, sizeof(TF_MODULE_PREFIX) - SKIP_ONE) == 0) {
@@ -1266,67 +1387,109 @@ static bool tf_same_dir(const char *p, const char *q) {
     return pl == ql && strncmp(p, q, pl) == 0;
 }
 
-/* One reference edge; 1 when made. */
-static int tf_ref_edge(tf_mod_t *m, int64_t src, int64_t tgt, const char *type, const char *ref,
-                       int line) {
-    if (src <= 0 || tgt <= 0 || src == tgt) {
-        return 0;
+/* Closed adapter lookup proof, separate from the captured source occurrence.
+ * A missing or duplicate declaration is retained as a quality outcome. */
+static bool tf_record(cbm_shared_resolver_adapter_t *adapter, const cbm_resolve_proof_t *occurrence,
+                      int64_t owner, int64_t target_id, const char *domain, const char *reason,
+                      bool ambiguous, bool supported, const char *properties) {
+    const cbm_resolve_proof_view_t *site = cbm_resolve_proof_view(occurrence);
+    if (!site) {
+        atomic_store(&adapter->ctx->resolver_failed, true);
+        return false;
     }
-    char props[CBM_SZ_128];
-    snprintf(props, sizeof(props), "{\"ref\":\"%s\",\"via\":\"terraform\",\"line\":%d}", ref, line);
-    cbm_gbuf_insert_edge(m->ctx->gbuf, src, tgt, type, props);
-    return SKIP_ONE;
+    const cbm_gbuf_node_t *target =
+        target_id > 0 ? cbm_gbuf_find_by_id(adapter->ctx->gbuf, target_id) : NULL;
+    bool exact = target && supported && !ambiguous;
+    cbm_resolve_result_t result = {
+        .binding = exact       ? CBM_RESOLVE_BINDING_UNIQUE
+                   : ambiguous ? CBM_RESOLVE_BINDING_AMBIGUOUS
+                               : CBM_RESOLVE_BINDING_UNRESOLVED,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = supported ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+        .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+        .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                             CBM_RESOLVE_FACT_LANGUAGE_BOUND
+                       : 0,
+        .target = exact ? target->qualified_name : "",
+        .candidate_count = exact       ? 1
+                           : ambiguous ? 2
+                                       : 0,
+        .reason = reason};
+    cbm_resolve_proof_key_t key = site->key;
+    key.lookup_domain = domain && domain[0] ? domain : ".";
+    key.binding_identity = result.target;
+    key.lookup_closed = supported;
+    const cbm_resolve_proof_t *semantic = cbm_resolve_proof_leaf(
+        &adapter->proofs, CBM_PROOF_ADAPTER_DOMAIN, &site->source, &key, &result);
+    return cbm_shared_resolver_adapter_record_proofs(adapter, occurrence, owner,
+                                                     exact ? target_id : 0, properties, semantic);
 }
 
-/* Resolve the module's references against its declarations, module.X.Y
- * against the outputs of X's source directory (`mods`: directory -> its
- * module), and its local module calls to their directories' Folders. */
+/* References are resolved against every declaration in the exact module
+ * directory. Module output references additionally resolve its literal source. */
 static int tf_mod_link(tf_mod_t *m, CBMHashTable *mods, CBMHashTable *folders) {
     int edges = 0;
     for (int i = 0; i < m->ref_n; i++) {
         const tf_ref_t *r = &m->refs[i];
         const char *tfile = cbm_ht_get(m->decls, r->key);
-        const char *oname = NULL;
-        const char *ofile = NULL;
+        bool ambiguous = tfile && !tfile[0];
+        bool local = strcmp(r->ref, "local") == 0;
+        int64_t target = tfile && tfile[0] ? tf_def_node(m, tfile, local ? "locals" : r->key) : 0;
+        /* The graph models a locals block, not each local value. Retain this
+         * occurrence as missing finer declaration identity rather than emit a
+         * misleading block self-edge. */
+        bool same_block = target > 0 && target == r->owner;
+        char props[CBM_SZ_128];
+        snprintf(props, sizeof(props), "{\"ref\":\"%s\",\"via\":\"terraform\",\"line\":%d}", r->ref,
+                 r->line);
+        if (r->dep) {
+            if (r->owner_materialized && target > 0 && target != r->owner &&
+                cbm_gbuf_insert_edge(m->ctx->gbuf, r->owner, target, "DEPENDS_ON", props))
+                edges++;
+        } else if (tf_record(m->adapter, r->occurrence, r->owner, same_block ? 0 : target, m->dir,
+                             ambiguous    ? "terraform_duplicate_declaration"
+                             : same_block ? "terraform_same_block_declaration_identity_missing"
+                                          : "terraform_module_declaration_lookup",
+                             ambiguous, m->syntax_complete && r->owner_materialized && !same_block,
+                             props) &&
+                   target > 0 && !same_block)
+            edges++;
         if (r->out) {
-            const char *cdir = cbm_ht_get(m->calls, r->key);
+            const char *cdir = !ambiguous ? cbm_ht_get(m->calls, r->key) : NULL;
             const tf_mod_t *callee = cdir ? cbm_ht_get(mods, cdir) : NULL;
-            oname = callee ? cbm_arena_sprintf(m->arena, "output.%s", r->out) : NULL;
-            ofile = oname ? cbm_ht_get(callee->decls, oname) : NULL;
-        }
-        if (!tfile && !ofile) {
-            continue;
-        }
-        int64_t src = tf_def_node(m, r->file, r->src);
-        if (tfile) {
-            bool local = strcmp(r->ref, "local") == 0;
-            edges += tf_ref_edge(m, src, tf_def_node(m, tfile, local ? "locals" : r->key),
-                                 r->dep ? "DEPENDS_ON" : "USAGE", r->ref, r->line);
-        }
-        if (ofile) {
-            edges += tf_ref_edge(m, src, tf_def_node(m, ofile, oname), "USAGE", "output", r->line);
+            const char *oname = callee ? cbm_arena_sprintf(m->arena, "output.%s", r->out) : NULL;
+            const char *ofile = oname ? cbm_ht_get(callee->decls, oname) : NULL;
+            bool duplicate = ofile && !ofile[0];
+            target = ofile && ofile[0] ? tf_def_node(m, ofile, oname) : 0;
+            snprintf(props, sizeof(props), "{\"ref\":\"output\",\"via\":\"terraform\",\"line\":%d}",
+                     r->line);
+            if (tf_record(m->adapter, r->occurrence, r->owner, target, cdir ? cdir : m->dir,
+                          "terraform_local_module_output_lookup", duplicate,
+                          cdir && m->syntax_complete && r->owner_materialized && callee &&
+                              callee->syntax_complete,
+                          props) &&
+                target > 0)
+                edges++;
         }
     }
     for (int i = 0; i < m->call_n; i++) {
         const tf_call_t *c = &m->mcalls[i];
+        const char *declared = cbm_ht_get(m->decls, c->name);
+        bool ambiguous = declared && !declared[0];
         const cbm_gbuf_node_t *folder = NULL;
-        if (cbm_ht_get(mods, c->dir)) {
-            /* the repository root has no Folder: its Project stands for it */
+        if (c->dir && cbm_ht_get(mods, c->dir) && !ambiguous)
             folder = c->dir[0] ? (folders ? cbm_ht_get(folders, c->dir) : NULL)
                                : cbm_gbuf_find_by_qn(m->ctx->gbuf, m->ctx->project_name);
-        }
-        if (folder && !c->dir[0] && (!folder->label || strcmp(folder->label, "Project") != 0)) {
+        if (folder && !c->dir[0] && (!folder->label || strcmp(folder->label, "Project")))
             folder = NULL;
-        }
-        int64_t src = folder ? tf_def_node(m, c->file, c->name) : 0;
-        if (src <= 0) {
-            continue;
-        }
         char props[CBM_SZ_256];
         snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"terraform\",\"line\":%d}",
                  c->name + sizeof(TF_MODULE_PREFIX) - SKIP_ONE, c->line);
-        cbm_gbuf_insert_edge(m->ctx->gbuf, src, folder->id, "IMPORTS", props);
-        edges++;
+        if (tf_record(m->adapter, c->occurrence, c->owner, folder ? folder->id : 0,
+                      c->dir ? c->dir : m->dir, "terraform_literal_module_source", ambiguous,
+                      c->dir && m->syntax_complete && c->owner_materialized, props) &&
+            folder)
+            edges++;
     }
     return edges;
 }
@@ -1346,19 +1509,24 @@ static void tf_mod_free(tf_mod_t *m) {
 /* One module directory, its files `paths[0..n)`: parse each (read from the
  * repository) into its declarations, calls and references. */
 static tf_mod_t *tf_mod_parse(cbm_pipeline_ctx_t *ctx, CBMArena *arena, TSParser *parser,
-                              const char *const *paths, int n) {
+                              cbm_shared_resolver_adapter_t *adapter, const char *const *paths,
+                              int n) {
     tf_mod_t *m = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(*m));
     if (!m) {
+        atomic_store(&ctx->resolver_failed, true);
         return NULL;
     }
     const char *slash = strrchr(paths[0], '/');
     *m = (tf_mod_t){.ctx = ctx,
                     .arena = arena,
+                    .adapter = adapter,
+                    .syntax_complete = true,
                     .decls = cbm_ht_create(0),
                     .calls = cbm_ht_create(0),
                     .dir =
                         cbm_arena_strndup(arena, paths[0], slash ? (size_t)(slash - paths[0]) : 0)};
     if (!m->decls || !m->calls || !m->dir) {
+        atomic_store(&ctx->resolver_failed, true);
         tf_mod_free(m);
         return NULL;
     }
@@ -1368,10 +1536,19 @@ static tf_mod_t *tf_mod_parse(cbm_pipeline_ctx_t *ctx, CBMArena *arena, TSParser
         size_t len = 0;
         char *src = tf_read(path, &len);
         TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
+        if (!src || !tree)
+            atomic_store(&ctx->resolver_failed, true);
         if (tree) {
+            m->syntax_complete &= !ts_node_has_error(ts_tree_root_node(tree)) &&
+                                  tf_unique_attributes(ctx, arena, src, ts_tree_root_node(tree));
             m->src = src;
+            m->source_length = len;
             m->file = cbm_arena_strdup(arena, paths[i]);
-            tf_mod_file(m, ts_tree_root_node(tree));
+            if (!m->file)
+                atomic_store(&ctx->resolver_failed, true);
+            if (m->file && cbm_shared_resolver_adapter_capture(adapter, m->file, CBM_LANG_HCL, src,
+                                                               len, &m->source))
+                tf_mod_file(m, ts_tree_root_node(tree));
             ts_tree_delete(tree);
         }
         m->src = NULL;
@@ -1477,8 +1654,16 @@ static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *c
                         const char *const *vpaths, int vn) {
     CBMArena arena;
     cbm_arena_init_lazy(&arena, CBM_SZ_4K);
+    cbm_shared_resolver_adapter_t adapter;
+    if (!cbm_shared_resolver_adapter_init(&adapter, ctx, &arena)) {
+        cbm_shared_resolver_adapter_dispose(&adapter);
+        cbm_arena_destroy(&arena);
+        return 0;
+    }
     CBMHashTable *mods = cbm_ht_create(0);
     tf_mod_t **list = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)pn * sizeof(*list));
+    if (!mods || !list)
+        atomic_store(&ctx->resolver_failed, true);
     int nm = 0;
     int calls = 0;
     for (int i = 0; mods && list && i < pn;) {
@@ -1486,7 +1671,7 @@ static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *c
         while (j < pn && tf_same_dir(paths[i], paths[j])) {
             j++;
         }
-        tf_mod_t *m = tf_mod_parse(ctx, &arena, parser, paths + i, j - i);
+        tf_mod_t *m = tf_mod_parse(ctx, &arena, parser, &adapter, paths + i, j - i);
         if (m) {
             list[nm++] = m;
             cbm_ht_set(mods, m->dir, m);
@@ -1512,6 +1697,7 @@ static int tf_link_repo(cbm_pipeline_ctx_t *ctx, TSParser *parser, const char *c
         cbm_ht_free(mods);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, list);
+    cbm_shared_resolver_adapter_dispose(&adapter);
     cbm_arena_destroy(&arena);
     return edges;
 }
@@ -1591,6 +1777,12 @@ typedef struct {
     const char *udir;      /* its directory */
     const char *src;       /* the text of the file being read */
     int edges;
+    cbm_shared_resolver_adapter_t adapter;
+    cbm_resolve_proof_source_t source;
+    size_t source_length;
+    bool source_supported;
+    const cbm_resolve_proof_t *inherited_occurrence;
+    const cbm_resolve_proof_t *inherited_lookup;
 } tg_t;
 
 /* The directory part of `p`, in place; an anchored value keeps its anchor. */
@@ -1728,23 +1920,80 @@ static int64_t tg_def_node(const tg_t *g, const char *file, const char *name) {
     return n && n->file_path && strcmp(n->file_path, file) == 0 ? n->id : 0;
 }
 
-static void tg_edge(tg_t *g, int64_t src, const cbm_gbuf_node_t *tgt, const char *type,
-                    const char *props) {
-    if (src > 0 && tgt && tgt->id != src) {
-        cbm_gbuf_insert_edge(g->ctx->gbuf, src, tgt->id, type, props);
-        g->edges++;
-    }
-}
-
-/* Expression `e` as the repository path of a graph file (relative values
- * from `base`); NULL when unknown or not in the graph. */
-static const cbm_gbuf_node_t *tg_file(const tg_t *g, TSNode e, const char *base, char *path,
-                                      size_t sz) {
-    char v[CBM_SZ_1K];
-    if (ts_node_is_null(e) || !tg_eval(g, e, v, sizeof(v)) || !tf_repo_path(base, v, path, sz)) {
+static const cbm_resolve_proof_t *tg_edge(tg_t *g, int64_t owner, const cbm_gbuf_node_t *target,
+                                          const char *type, const char *properties,
+                                          TSNode expression, bool supported,
+                                          const cbm_resolve_proof_t **captured) {
+    if (strcmp(type, "IMPORTS")) {
+        if (owner > 0 && target && target->id != owner &&
+            cbm_gbuf_insert_edge(g->ctx->gbuf, owner, target->id, type, properties))
+            g->edges++;
         return NULL;
     }
-    return cbm_ht_get(g->files, path);
+    supported &= g->source_supported;
+    const cbm_gbuf_node_t *source_owner = g->inherited_occurrence
+                                              ? cbm_ht_get(g->files, g->source.file)
+                                              : cbm_gbuf_find_by_id(g->ctx->gbuf, owner);
+    if (!source_owner || ts_node_is_null(expression)) {
+        atomic_store(&g->ctx->resolver_failed, true);
+        return NULL;
+    }
+    cbm_resolve_proof_source_t source = g->source;
+    source.scope = source_owner->qualified_name;
+    uint32_t start = ts_node_start_byte(expression), end = ts_node_end_byte(expression);
+    const char *spelling = end > start && end <= g->source_length
+                               ? cbm_arena_strndup(g->arena, g->src + start, end - start)
+                               : NULL;
+    const cbm_resolve_proof_t *occurrence = cbm_shared_resolver_adapter_occurrence(
+        &g->adapter, &source, g->src, g->source_length, start, end, spelling, "IMPORTS");
+    if (!occurrence)
+        return NULL;
+    cbm_resolve_result_t result = {
+        .binding =
+            target && supported ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = supported ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+        .rule = CBM_RESOLVE_RULE_MODULE_PATH,
+        .facts = target && supported
+                     ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                           CBM_RESOLVE_FACT_PATH_BOUND
+                     : 0,
+        .target = target && supported ? target->qualified_name : "",
+        .candidate_count = target && supported ? 1 : 0,
+        .reason = "terragrunt_closed_literal_path_evaluation"};
+    cbm_resolve_proof_key_t key = occurrence->value.key;
+    key.lookup_domain = g->udir[0] ? g->udir : ".";
+    key.binding_identity = result.target;
+    key.lookup_closed = supported;
+    const cbm_resolve_proof_t *lookup = cbm_resolve_proof_leaf(
+        &g->adapter.proofs, CBM_PROOF_ADAPTER_DOMAIN, &source, &key, &result);
+    if (g->inherited_occurrence) {
+        /* The unit's include site depends on both the captured include lookup
+         * and the included file's exact read occurrence and evaluated target. */
+        const cbm_resolve_proof_t *read_premises[] = {occurrence, lookup};
+        const cbm_resolve_proof_t *read =
+            cbm_resolve_proof_derive(&g->adapter.proofs, CBM_PROOF_NAMED_JOIN, &source, &key,
+                                     &result, read_premises, 2, true);
+        occurrence = g->inherited_occurrence;
+        source = occurrence->value.source;
+        key = occurrence->value.key;
+        key.binding_identity = result.target;
+        key.lookup_closed = supported;
+        const cbm_resolve_proof_t *premises[] = {g->inherited_lookup, read};
+        lookup = cbm_resolve_proof_derive(&g->adapter.proofs, CBM_PROOF_NAMED_JOIN, &source, &key,
+                                          &result, premises, 2, true);
+    }
+    if (!lookup || !cbm_shared_resolver_adapter_record_proofs(&g->adapter, occurrence, owner,
+                                                              target && supported ? target->id : 0,
+                                                              properties, lookup)) {
+        atomic_store(&g->ctx->resolver_failed, true);
+        return NULL;
+    }
+    if (target && supported)
+        g->edges++;
+    if (captured)
+        *captured = occurrence;
+    return lookup;
 }
 
 /* Every read_terragrunt_config(E) of file `site` (its body `body`): IMPORTS
@@ -1768,13 +2017,15 @@ static void tg_reads(tg_t *g, TSNode body, const char *site, const char *base, i
             if (tf_type(c, "function_call") &&
                 tf_text_is(g->src, ts_node_named_child(c, 0), "read_terragrunt_config") &&
                 tg_args(c, args, SKIP_ONE) >= SKIP_ONE) {
-                char path[CBM_SZ_1K];
-                const cbm_gbuf_node_t *tgt = tg_file(g, args[0], base, path, sizeof(path));
+                char path[CBM_SZ_1K], value[CBM_SZ_1K];
+                bool supported = tg_eval(g, args[0], value, sizeof(value)) &&
+                                 tf_repo_path(base, value, path, sizeof(path));
+                const cbm_gbuf_node_t *tgt = supported ? cbm_ht_get(g->files, path) : NULL;
                 char props[CBM_SZ_2K];
                 snprintf(props, sizeof(props),
                          "{\"via\":\"terragrunt\",\"read\":\"%s\",\"line\":%d}", site,
                          (int)ts_node_start_point(c).row + SKIP_ONE);
-                tg_edge(g, src, tgt, "IMPORTS", props);
+                tg_edge(g, src, tgt, "IMPORTS", props, args[0], supported, NULL);
             }
             if (ts_tree_cursor_goto_first_child(&cur)) {
                 continue;
@@ -1790,10 +2041,17 @@ static void tg_reads(tg_t *g, TSNode body, const char *site, const char *base, i
     }
 }
 
+typedef struct {
+    char path[CBM_SZ_1K];
+    int64_t owner;
+    const cbm_resolve_proof_t *occurrence;
+    const cbm_resolve_proof_t *lookup;
+} tg_include_t;
+
 /* One block of the unit: an include, a dependency, the terraform block. An
  * include's file (its path into `inc`, its block into `inc_node`) is read
  * afterwards for the calls it holds. */
-static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_node) {
+static void tg_block(tg_t *g, TSNode b, tg_include_t *include) {
     TSNode bb;
     const char *name = tf_type(b, "block") ? tf_block_name(g->arena, g->src, b, &bb) : NULL;
     if (!name || ts_node_is_null(bb)) {
@@ -1803,15 +2061,20 @@ static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_n
     char path[CBM_SZ_1K];
     char props[CBM_SZ_256];
     if (strncmp(name, TG_INCLUDE, sizeof(TG_INCLUDE) - SKIP_ONE) == 0) {
-        const cbm_gbuf_node_t *tgt =
-            tg_file(g, tg_attr(g, bb, "path"), g->udir, path, sizeof(path));
-        int64_t src = tgt ? tg_def_node(g, g->unit, name) : 0;
+        TSNode value = tg_attr(g, bb, "path");
+        char evaluated[CBM_SZ_1K];
+        bool supported = !ts_node_is_null(value) &&
+                         tg_eval(g, value, evaluated, sizeof(evaluated)) &&
+                         tf_repo_path(g->udir, evaluated, path, sizeof(path));
+        const cbm_gbuf_node_t *tgt = supported ? cbm_ht_get(g->files, path) : NULL;
+        int64_t src = tg_def_node(g, g->unit, name);
         snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}",
                  name + sizeof(TG_INCLUDE) - SKIP_ONE, line);
-        tg_edge(g, src, tgt, "IMPORTS", props);
-        if (src > 0) {
-            snprintf(inc, inc_sz, "%s", path);
-            *inc_node = src;
+        include->lookup = tg_edge(g, src, tgt, "IMPORTS", props, ts_node_is_null(value) ? b : value,
+                                  supported, &include->occurrence);
+        if (src > 0 && tgt && include->lookup) {
+            snprintf(include->path, sizeof(include->path), "%s", path);
+            include->owner = src;
         }
     } else if (strncmp(name, TG_DEPENDENCY, sizeof(TG_DEPENDENCY) - SKIP_ONE) == 0) {
         char v[CBM_SZ_1K];
@@ -1824,19 +2087,19 @@ static void tg_block(tg_t *g, TSNode b, char *inc, size_t inc_sz, int64_t *inc_n
             snprintf(props, sizeof(props),
                      "{\"local_name\":\"%s\",\"via\":\"terragrunt\",\"line\":%d}",
                      name + sizeof(TG_DEPENDENCY) - SKIP_ONE, line);
-            tg_edge(g, tgt ? tg_def_node(g, g->unit, name) : 0, tgt, "DEPENDS_ON", props);
+            tg_edge(g, tgt ? tg_def_node(g, g->unit, name) : 0, tgt, "DEPENDS_ON", props, e, true,
+                    NULL);
         }
     } else if (strcmp(name, "terraform") == 0) {
         char v[CBM_SZ_1K];
         TSNode e = tg_attr(g, bb, "source");
-        if (!ts_node_is_null(e) && tg_eval(g, e, v, sizeof(v)) &&
-            (strncmp(v, "./", sizeof("./") - SKIP_ONE) == 0 ||
-             strncmp(v, "../", sizeof("../") - SKIP_ONE) == 0) &&
-            tf_repo_path(g->udir, v, path, sizeof(path))) {
-            const cbm_gbuf_node_t *tgt = g->folders ? cbm_ht_get(g->folders, path) : NULL;
-            snprintf(props, sizeof(props), "{\"via\":\"terragrunt\",\"line\":%d}", line);
-            tg_edge(g, tgt ? tg_def_node(g, g->unit, name) : 0, tgt, "IMPORTS", props);
-        }
+        bool supported = !ts_node_is_null(e) && tg_eval(g, e, v, sizeof(v)) &&
+                         (strncmp(v, "./", 2) == 0 || strncmp(v, "../", 3) == 0) &&
+                         tf_repo_path(g->udir, v, path, sizeof(path));
+        const cbm_gbuf_node_t *tgt = supported && g->folders ? cbm_ht_get(g->folders, path) : NULL;
+        snprintf(props, sizeof(props), "{\"via\":\"terragrunt\",\"line\":%d}", line);
+        tg_edge(g, tg_def_node(g, g->unit, name), tgt, "IMPORTS", props, ts_node_is_null(e) ? b : e,
+                supported, NULL);
     }
 }
 
@@ -1852,35 +2115,54 @@ static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
     size_t len = 0;
     char *src = g->udir ? tf_read(path, &len) : NULL;
     TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
-    char inc[TG_MAX_INCLUDES][CBM_SZ_1K];
-    int64_t inc_node[TG_MAX_INCLUDES];
+    if (!src || !tree)
+        atomic_store(&g->ctx->resolver_failed, true);
+    tg_include_t includes[TG_MAX_INCLUDES] = {0};
     int ni = 0;
-    if (tree) {
+    if (tree &&
+        cbm_shared_resolver_adapter_capture(&g->adapter, rel, CBM_LANG_HCL, src, len, &g->source)) {
         g->src = src;
+        g->source_length = len;
+        g->source_supported = !ts_node_has_error(ts_tree_root_node(tree)) &&
+                              tf_unique_attributes(g->ctx, g->arena, src, ts_tree_root_node(tree));
+        g->inherited_occurrence = NULL;
+        g->inherited_lookup = NULL;
         TSNode body = tf_root_body(ts_tree_root_node(tree));
         for (uint32_t i = 0; !ts_node_is_null(body) && i < ts_node_named_child_count(body); i++) {
-            inc_node[ni] = 0;
-            tg_block(g, ts_node_named_child(body, i), inc[ni], sizeof(inc[ni]), &inc_node[ni]);
-            if (ni < TG_MAX_INCLUDES - SKIP_ONE && inc_node[ni] > 0) {
+            includes[ni] = (tg_include_t){0};
+            tg_block(g, ts_node_named_child(body, i), &includes[ni]);
+            if (ni < TG_MAX_INCLUDES - SKIP_ONE && includes[ni].owner > 0) {
                 ni++; /* past the cap, the last slot is overwritten */
             }
         }
         tg_reads(g, body, rel, g->udir, 0);
-        ts_tree_delete(tree);
     }
+    if (tree)
+        ts_tree_delete(tree);
     cbm_free(CBM_MEM_CLASS_OTHER, src);
     for (int k = 0; k < ni; k++) {
-        snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, inc[k]);
+        snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, includes[k].path);
         src = tf_read(path, &len);
         tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
-        if (tree) {
+        if (!src || !tree)
+            atomic_store(&g->ctx->resolver_failed, true);
+        if (tree && cbm_shared_resolver_adapter_capture(&g->adapter, includes[k].path, CBM_LANG_HCL,
+                                                        src, len, &g->source)) {
             g->src = src;
+            g->source_length = len;
+            g->source_supported =
+                !ts_node_has_error(ts_tree_root_node(tree)) &&
+                tf_unique_attributes(g->ctx, g->arena, src, ts_tree_root_node(tree));
+            g->inherited_occurrence = includes[k].occurrence;
+            g->inherited_lookup = includes[k].lookup;
             char base[CBM_SZ_1K];
-            snprintf(base, sizeof(base), "%s", inc[k]);
+            snprintf(base, sizeof(base), "%s", includes[k].path);
             tg_dirname(base);
-            tg_reads(g, tf_root_body(ts_tree_root_node(tree)), inc[k], base, inc_node[k]);
-            ts_tree_delete(tree);
+            tg_reads(g, tf_root_body(ts_tree_root_node(tree)), includes[k].path, base,
+                     includes[k].owner);
         }
+        if (tree)
+            ts_tree_delete(tree);
         cbm_free(CBM_MEM_CLASS_OTHER, src);
     }
     g->src = NULL;
@@ -1907,7 +2189,16 @@ static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     CBMArena arena;
     cbm_arena_init_lazy(&arena, CBM_SZ_4K);
     tg_t g = {.ctx = ctx, .arena = &arena, .files = cbm_ht_create(0)};
+    if (!cbm_shared_resolver_adapter_init(&g.adapter, ctx, &arena)) {
+        cbm_shared_resolver_adapter_dispose(&g.adapter);
+        if (g.files)
+            cbm_ht_free(g.files);
+        cbm_arena_destroy(&arena);
+        return 0;
+    }
     const char **units = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)fn * sizeof(char *));
+    if (!g.files || !units)
+        atomic_store(&ctx->resolver_failed, true);
     int nu = 0;
     for (int i = 0; g.files && units && i < fn; i++) {
         const char *rel = fnodes[i]->file_path;
@@ -1932,6 +2223,7 @@ static int tg_link_units(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         cbm_ht_free(g.files);
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)units);
+    cbm_shared_resolver_adapter_dispose(&g.adapter);
     cbm_arena_destroy(&arena);
     return g.edges;
 }

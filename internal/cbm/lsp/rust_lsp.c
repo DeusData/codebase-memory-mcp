@@ -6271,6 +6271,15 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena, 
             rf.min_params = -1;
             rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
             rf.source_flags = d->source_flags;
+            rf.source_signature = d->source_signature;
+            if ((d->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) && d->source_signature &&
+                d->source_signature->kind == CBM_TYPE_FUNC &&
+                d->source_signature->data.func.param_types) {
+                rf.min_params = 0;
+                while (rf.min_params < 64 &&
+                       d->source_signature->data.func.param_types[rf.min_params])
+                    rf.min_params++;
+            }
             rf.declaration_identity = d->declaration_identity;
             rf.graph_qualified_name = d->graph_qualified_name;
             rf.sig = d->sig;
@@ -6417,6 +6426,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
             rdefs[n].graph_qualified_name = defs[i].graph_qualified_name;
             rdefs[n].sig = defs[i].sig;
             rdefs[n].source_flags = defs[i].source_flags;
+            rdefs[n].source_signature = defs[i].source_signature;
             n++;
         }
     }

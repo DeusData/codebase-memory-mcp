@@ -16,9 +16,9 @@
  *      are ambiguous); a relative specifier resolves with the usual extension
  *      and index rules; a bare one through the nearest tsconfig/jsconfig
  *      `paths` (the first target, as TypeScript tries it first) or
- *      `baseUrl`, else, when it is the `name` of a workspace package (the
- *      pipeline's package map), to that package's entry module (`exports`,
- *      `main`, `module`) when the repository indexes it; every other bare
+ *      baseUrl, else through an importer-scoped declared workspace or
+ *      package self-reference to its exact indexed entry module. A nearer
+ *      dependency or conflicting package ownership blocks that lookup; every other bare
  *      specifier, a package's subpath included, is external;
  *   5. the standard library's global names: external;
  *   6. the top-level declarations of the repository's script files (files
@@ -34,7 +34,7 @@
  */
 #include "pipeline/doc_links.h"
 #include "pipeline/path_alias.h"
-#include "pipeline/pipeline_internal.h" /* cbm_pipeline_file_node, cbm_pipeline_get_pkgmap */
+#include "pipeline/pipeline_internal.h" /* shared import-path resolution */
 #include "cbm.h"
 #include "doclink.h"
 #include "helpers.h" /* cbm_fqn_module_source_lang, cbm_is_test_file */
@@ -119,7 +119,7 @@ typedef struct {
     int run_count;
     CBMHashTable *by_path;                      /* rel_path -> (file index + 1) as a pointer */
     CBMHashTable *globals;                      /* name -> tr_global_t */
-    CBMHashTable *by_module;                    /* module QN -> (first file index + 1) */
+    const cbm_gbuf_t *graph;                    /* complete documentation graph, borrowed */
     const cbm_path_alias_collection_t *aliases; /* the pipeline's, borrowed */
     CBMHashTable *pkgmap;                       /* the pipeline's, borrowed */
     bool oom;
@@ -276,7 +276,6 @@ static void tr_destroy(void *index) {
     }
     cbm_ht_free(ix->by_path);
     cbm_ht_free(ix->globals);
-    cbm_ht_free(ix->by_module);
     cbm_free(CBM_MEM_CLASS_OTHER, ix->run_to_file);
     cbm_arena_destroy(&ix->arena);
     cbm_free(CBM_MEM_CLASS_OTHER, ix);
@@ -361,14 +360,7 @@ static void *tr_build(const cbm_doclink_build_in_t *in) {
     ok = ok && !ix->oom && tr_add_globals(ix);
     ix->aliases = in->ctx->path_aliases;
     ix->pkgmap = cbm_pipeline_get_pkgmap();
-    ix->by_module =
-        ok ? cbm_ht_create_in(CBM_MEM_CLASS_OTHER, (uint32_t)(ix->nfiles + SKIP_ONE)) : NULL;
-    ok = ok && ix->by_module;
-    for (int i = ix->nfiles - SKIP_ONE; ok && i >= 0; i--) {
-        if (ix->files[i].module_qn) {
-            cbm_ht_set(ix->by_module, ix->files[i].module_qn, (void *)(uintptr_t)(i + SKIP_ONE));
-        }
-    }
+    ix->graph = in->graph;
     if (!ok) {
         cbm_log_error("doc_links.ts.error", "step", "index", "reason", "alloc");
         tr_destroy(ix);
@@ -529,20 +521,29 @@ static int tr_path_file(const tr_index_t *ix, const char *base) {
     return hit;
 }
 
-/* The workspace package a bare specifier names (`name` or `@scope/name`, no
- * subpath): the file of its entry module, as the pipeline's package map
- * holds it. */
-static int tr_package_file(const tr_index_t *ix, const char *spec) {
+/* Bare package names are ownership markers, not global module targets. Use
+ * the same complete configuration and importer scope as dependency resolution,
+ * then join the exact entry path to this documentation index. */
+static int tr_package_file(const tr_index_t *ix, int from, const char *spec) {
     const char *slash = strchr(spec, '/');
     if (spec[0] == '@' && slash) {
         slash = strchr(slash + SKIP_ONE, '/');
     }
-    if (slash || !ix->pkgmap || !ix->by_module) {
+    if (slash || !ix->pkgmap || !ix->graph || !cbm_ht_get(ix->pkgmap, spec)) {
         return CBM_NOT_FOUND;
     }
-    const char *qn = (const char *)cbm_ht_get(ix->pkgmap, spec);
-    void *v = qn ? cbm_ht_get(ix->by_module, qn) : NULL;
-    return v ? (int)((uintptr_t)v - SKIP_ONE) : CBM_NOT_FOUND;
+    /* This adapter only reads the complete documentation graph. The live
+     * pipeline buffer can omit unchanged files during incremental resolution. */
+    cbm_pipeline_ctx_t context = {
+        .project_name = ix->project,
+        .gbuf = (cbm_gbuf_t *)ix->graph,
+    };
+    CBMImport import = {.module_path = spec, .kind = CBM_IMPORT_KIND_DEFAULT};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&context, ix->files[from].path, NULL, &import, NULL);
+    return target && target->file_path && target->label && !strcmp(target->label, "File")
+               ? tr_file_at(ix, target->file_path)
+               : CBM_NOT_FOUND;
 }
 
 /* A bare specifier the repository answers itself: the nearest
@@ -557,7 +558,7 @@ static int tr_bare_file(const tr_index_t *ix, int from, const char *spec) {
             return hit;
         }
     }
-    return tr_package_file(ix, spec);
+    return tr_package_file(ix, from, spec);
 }
 
 /* The file a module specifier written in file `from` names: -1 with

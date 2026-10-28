@@ -276,20 +276,20 @@ TEST(doc_mentions_c_incremental_equals_full) {
     ASSERT_EQ(dm_index(repo, inc_db, NULL), 0);
     ASSERT_TRUE(c_edge(inc_db, "src.use.user", "src.lib.a"));
 
-    /* a doc edit: the file is repaired alone */
+    /* A doc edit rebuilds the resolver generation. */
     th_write_file(TH_PATH(repo, "src/use.c"),
                   "/** Uses @ref a and @ref nope. */\nint user(void) { return 0; }\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
 
     /* a body edit in the target file: its scope is unchanged */
     th_write_file(TH_PATH(repo, "src/lib.c"),
                   "int a(void) { return 2; }\nint b(void) { return 1; }\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(c_edge(inc_db, "src.use.user", "src.lib.a"));
 
-    /* b goes: the files that name it are repaired, nothing else */
+    /* b goes: the rebuilt generation re-resolves every reference to it. */
     th_write_file(TH_PATH(repo, "src/lib.c"), "int a(void) { return 2; }\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "b removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "b removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(c_edge(inc_db, "src.use.user", "src.lib.a"));
 
     /* a becomes static (and b is back): changed records, a full run */

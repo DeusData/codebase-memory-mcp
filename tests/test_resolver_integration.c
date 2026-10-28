@@ -572,7 +572,208 @@ TEST(resolver_integration_long_module_alias_chain_preserves_exact_suffix) {
     PASS();
 }
 
+typedef struct {
+    const char *id;
+    const char *source_file;
+    const char *source;
+    const char *target_file;
+    const char *target;
+    const char *spelling;
+    bool required;
+    bool genuine;
+    const char *why_tried;
+} literal_import_case_t;
+
+static int literal_import_count(cbm_store_t *store, const literal_import_case_t *item,
+                                bool occurrences, bool exact) {
+    const char *sql =
+        occurrences
+            ? "SELECT count(*) FROM resolver_occurrences r JOIN nodes t "
+              "ON t.project=r.project AND t.qualified_name=r.target "
+              "WHERE r.project=?1 AND r.file_path=?2 AND r.relation='IMPORTS' AND r.emitted=1 "
+              "AND (?3=0 OR (t.label='File' AND t.file_path=?4 AND r.spelling=?5 "
+              "AND r.candidate_count=1))"
+            : "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+              "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND s.file_path=?2 "
+              "AND e.type='IMPORTS' AND (?3=0 OR (s.label='File' AND t.label='File' "
+              "AND t.file_path=?4))";
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) != SQLITE_OK)
+        return -1;
+    bool bound =
+        sqlite3_bind_text(statement, 1, RESOLVER_PROJECT, -1, SQLITE_STATIC) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 2, item->source_file, -1, SQLITE_STATIC) == SQLITE_OK &&
+        sqlite3_bind_int(statement, 3, exact) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 4, item->target_file, -1, SQLITE_STATIC) == SQLITE_OK;
+    if (occurrences)
+        bound = bound &&
+                sqlite3_bind_text(statement, 5, item->spelling, -1, SQLITE_STATIC) == SQLITE_OK;
+    int count =
+        bound && sqlite3_step(statement) == SQLITE_ROW ? sqlite3_column_int(statement, 0) : -1;
+    sqlite3_finalize(statement);
+    return count;
+}
+
+/* Source-authored import identities close the whole IMPORTS domain for each
+ * source file, including wrong same-basename targets. Known missing syntax is
+ * explicitly counted independently of the producer's extracted carriers. */
+static int literal_path_import_cases(const char *prefix, int expected_genuine,
+                                     int expected_missing) {
+    static const literal_import_case_t cases[] = {
+        {"objc.literal", "scope/Main.m", "#import \"Utils.m\"\n@interface Main\n@end\n",
+         "scope/Utils.m", "@interface Utils\n@end\n", "Utils.m", true, true, NULL},
+        {"objc.parent", "scope/nested/Main.m", "#import \"../Utils.m\"\n@interface Main\n@end\n",
+         "scope/Utils.m", "@interface Utils\n@end\n", "../Utils.m", true, true, NULL},
+        {"objc.system-root-unknown", "scope/Main.m", "#import <Utils.m>\n@interface Main\n@end\n",
+         "scope/Utils.m", "@interface Utils\n@end\n", "Utils.m", false, false, NULL},
+        {"objc.other-directory", "scope/Main.m", "#import \"Utils.m\"\n@interface Main\n@end\n",
+         "elsewhere/Utils.m", "@interface Utils\n@end\n", "Utils.m", false, false, NULL},
+        {"objc.above-root", "scope/Main.m", "#import \"../../Utils.m\"\n@interface Main\n@end\n",
+         "scope/Utils.m", "@interface Utils\n@end\n", "../../Utils.m", false, false, NULL},
+        {"objc.matlab-comment", "scope/Main.m",
+         "% #import \"Utils.m\"\nfunction value = Main()\nvalue = 1;\nend\n",
+         "scope/Utils.m", "@interface Utils\n@end\n", "Utils.m", false, false, NULL},
+        {"css.literal", "scope/main.css", "@import \"base.css\";\n", "scope/base.css",
+         "body { color: red; }\n", "base.css", true, true, NULL},
+        {"css.parent", "scope/nested/main.css", "@import \"../base.css\";\n", "scope/base.css",
+         "body { color: red; }\n", "../base.css", true, true, NULL},
+        {"css.url", "scope/main.css", "@import url(\"base.css\");\n", "scope/base.css",
+         "body { color: red; }\n", "base.css", false, true,
+         "URL function structure is not audited; quoted direct imports were verified separately."},
+        {"css.escaped", "scope/main.css", "@import \"b\\61se.css\";\n", "scope/base.css",
+         "body { color: red; }\n", "base.css", false, true,
+         "CSS escape decoding is not implemented; accepting the raw token would name another "
+         "file."},
+        {"css.invalid-order", "scope/main.css", "body {}\n@import \"base.css\";\n",
+         "scope/base.css", "body {}\n", "base.css", false, false, NULL},
+        {"css.remote", "scope/main.css", "@import \"https://example.invalid/base.css\";\n",
+         "scope/base.css", "body {}\n", "base.css", false, false, NULL},
+        {"css.above-root", "scope/main.css", "@import \"../../base.css\";\n", "scope/base.css",
+         "body {}\n", "base.css", false, false, NULL},
+        {"css.other-directory", "scope/main.css", "@import \"base.css\";\n", "elsewhere/base.css",
+         "body {}\n", "base.css", false, false, NULL},
+        {"bicep.literal", "scope/main.bicep", "module target 'sub.bicep' = { name: 'test' }\n",
+         "scope/sub.bicep", "output answer string = 'ok'\n", "sub.bicep", true, true, NULL},
+        {"bicep.parent", "scope/nested/main.bicep",
+         "module target '../sub.bicep' = { name: 'test' }\n", "scope/sub.bicep",
+         "output answer string = 'ok'\n", "../sub.bicep", true, true, NULL},
+        {"bicep.interpolation", "scope/main.bicep",
+         "var leaf = 'sub'\nmodule target '${leaf}.bicep' = { name: 'test' }\n", "scope/sub.bicep",
+         "output answer string = 'ok'\n", "sub.bicep", false, true,
+         "Constant string interpolation lacks an evaluator; exact complete literals have separate "
+         "positives."},
+        {"bicep.registry", "scope/main.bicep",
+         "module target 'br/example.invalid:sub' = { name: 'test' }\n", "scope/sub.bicep",
+         "output answer string = 'ok'\n", "sub.bicep", false, false, NULL},
+        {"capnp.literal", "scope/main.capnp",
+         "@0xbabcabcabcabcabc;\nusing Common = import \"common.capnp\";\n", "scope/common.capnp",
+         "@0xcabcabcabcabcabc;\nstruct Common { value @0 :Text; }\n", "common.capnp", true, true,
+         NULL},
+        {"capnp.parent", "scope/nested/main.capnp",
+         "@0xbabcabcabcabcabc;\nusing Common = import \"../common.capnp\";\n", "scope/common.capnp",
+         "@0xcabcabcabcabcabc;\nstruct Common { value @0 :Text; }\n", "../common.capnp", true, true,
+         NULL},
+        {"capnp.search-root", "scope/main.capnp",
+         "@0xbabcabcabcabcabc;\nusing Common = import \"/common.capnp\";\n", "scope/common.capnp",
+         "@0xcabcabcabcabcabc;\nstruct Common { value @0 :Text; }\n", "common.capnp", false, false,
+         NULL},
+    };
+    for (int parallel = 0; parallel < 2; parallel++) {
+        int genuine = 0, found = 0, missing = 0, wrong = 0;
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            const literal_import_case_t *item = &cases[i];
+            if (strncmp(item->id, prefix, strlen(prefix)))
+                continue;
+            resolver_fixture_t fixture;
+            ASSERT(fixture_init(&fixture, "", false, 55));
+            ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "scope/nested"), 0755));
+            ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "elsewhere"), 0755));
+            ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "decoys"), 0755));
+            ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, item->source_file), item->source), 0);
+            ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, item->target_file), item->target), 0);
+            const char *leaf = strrchr(item->target_file, '/');
+            char decoy[128];
+            snprintf(decoy, sizeof(decoy), "decoys/%s", leaf ? leaf + 1 : item->target_file);
+            ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, decoy), item->target), 0);
+            ASSERT_EQ(run_fixture(&fixture, fixture.database, parallel), 0);
+            cbm_store_t *store = cbm_store_open_path_existing(fixture.database);
+            ASSERT_NOT_NULL(store);
+            int edges = literal_import_count(store, item, false, false);
+            int exact = literal_import_count(store, item, false, true);
+            int rows = literal_import_count(store, item, true, false);
+            int exact_rows = literal_import_count(store, item, true, true);
+            cbm_store_close(store);
+            th_rmtree(fixture.root);
+            fprintf(stderr,
+                    "literal import case=%s parallel=%d genuine=%d required=%d edges=%d "
+                    "exact=%d rows=%d exact_rows=%d\n",
+                    item->id, parallel, item->genuine, item->required, edges, exact, rows,
+                    exact_rows);
+            ASSERT_GTE(edges, 0);
+            ASSERT_GTE(exact, 0);
+            ASSERT_GTE(rows, 0);
+            ASSERT_GTE(exact_rows, 0);
+            genuine += item->genuine;
+            found += item->genuine && exact == 1;
+            missing += item->genuine && exact == 0;
+            wrong += edges != exact || (!item->genuine && edges != 0);
+            if (item->genuine && !item->required)
+                ASSERT(item->why_tried && item->why_tried[0]);
+            ASSERT_EQ(edges, item->required ? 1 : 0);
+            ASSERT_EQ(exact, edges);
+            ASSERT_EQ(rows, edges);
+            ASSERT_EQ(exact_rows, rows);
+        }
+        fprintf(stderr,
+                "literal import quality parallel=%d genuine=%d found=%d missing=%d wrong=%d\n",
+                parallel, genuine, found, missing, wrong);
+        ASSERT_EQ(genuine, expected_genuine);
+        ASSERT_EQ(found, expected_genuine - expected_missing);
+        ASSERT_EQ(missing, expected_missing);
+        ASSERT_EQ(wrong, 0);
+    }
+    PASS();
+}
+
+TEST(resolver_integration_css_literal_paths_require_complete_source_tokens) {
+    return literal_path_import_cases("css.", 4, 2);
+}
+TEST(resolver_integration_bicep_literal_paths_require_complete_source_tokens) {
+    return literal_path_import_cases("bicep.", 3, 1);
+}
+TEST(resolver_integration_capnp_literal_paths_require_complete_source_tokens) {
+    return literal_path_import_cases("capnp.", 2, 0);
+}
+
+
+TEST(resolver_integration_objc_imports_retain_extracted_language) {
+    return literal_path_import_cases("objc.", 2, 0);
+}
+
+TEST(resolver_integration_objc_raw_imports_keep_delimiters) {
+    static const char source[] = "#import \"Utils.m\"\n#import <System.h>\n@interface Main\n@end\n";
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_OBJC,
+                                             "objc", "scope/Main.m", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    bool ok = !result->has_error && result->cached_lang == CBM_LANG_OBJC &&
+              result->imports.count == 2;
+    if (ok) {
+        const CBMImport *quoted = &result->imports.items[0], *system = &result->imports.items[1];
+        ok = quoted->kind == CBM_IMPORT_KIND_INCLUDE_QUOTED && quoted->module_path &&
+             !strcmp(quoted->module_path, "Utils.m") &&
+             system->kind == CBM_IMPORT_KIND_INCLUDE_SYSTEM && system->module_path &&
+             !strcmp(system->module_path, "System.h");
+    }
+    cbm_free_result(result);
+    ASSERT_TRUE(ok); PASS();
+}
+
 SUITE(resolver_integration) {
+    RUN_TEST(resolver_integration_objc_raw_imports_keep_delimiters);
+    RUN_TEST(resolver_integration_objc_imports_retain_extracted_language);
+    RUN_TEST(resolver_integration_css_literal_paths_require_complete_source_tokens);
+    RUN_TEST(resolver_integration_bicep_literal_paths_require_complete_source_tokens);
+    RUN_TEST(resolver_integration_capnp_literal_paths_require_complete_source_tokens);
     RUN_TEST(resolver_integration_long_export_chain_stabilizes_before_parallel_emission);
     RUN_TEST(resolver_integration_long_module_alias_chain_preserves_exact_suffix);
     RUN_TEST(resolver_integration_old_rules_version_rebuilds_unchanged_source);
