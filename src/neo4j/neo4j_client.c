@@ -457,8 +457,20 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
     size_t body_len = 0;
     char *body = yyjson_mut_write(b->doc, 0, &body_len);
     if (!body) {
-        set_err(c, "failed to serialize Neo4j request%s%s", NULL, NULL);
-        return -1;
+        /* Source files saved as Latin-1/cp1252 put bytes that are not UTF-8
+         * into names and docstrings, and JSON must be UTF-8, so the plain
+         * write refuses the batch. Write it again as ASCII with each invalid
+         * byte replaced by U+FFFD, rather than failing the whole sync over a
+         * stray accented character in a comment. */
+        body = yyjson_mut_write(b->doc,
+                                YYJSON_WRITE_ESCAPE_UNICODE | YYJSON_WRITE_ALLOW_INVALID_UNICODE |
+                                    YYJSON_WRITE_INF_AND_NAN_AS_NULL,
+                                &body_len);
+        if (!body) {
+            set_err(c, "failed to serialize Neo4j request%s%s", NULL, NULL);
+            return -1;
+        }
+        cbm_log_warn("neo4j.request.invalid_utf8", "action", "replaced_with_U+FFFD");
     }
     int status = 0;
     char *resp = NULL;

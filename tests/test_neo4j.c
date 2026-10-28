@@ -618,6 +618,31 @@ TEST(neo4j_rejects_malformed_2xx_bodies) {
     PASS();
 }
 
+TEST(neo4j_request_with_invalid_utf8_is_still_sent) {
+    /* A docstring from a Latin-1 source file ("Copyright \xa9 2004") is not
+     * UTF-8. It used to fail the whole sync with "failed to serialize Neo4j
+     * request"; it must now reach the transport (here a closed port). */
+    clear_neo4j_env();
+    cbm_neo4j_config_t cfg;
+    char err[256];
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://127.0.0.1:1", "neo4j", "pw", NULL, &cfg, err,
+                                       sizeof(err)),
+              0);
+    cbm_neo4j_t *c = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(c);
+    cbm_neo4j_batch_t b;
+    ASSERT_EQ(cbm_neo4j_batch_init(&b), 0);
+    yyjson_mut_val *params = cbm_neo4j_batch_add(&b, "RETURN $doc");
+    ASSERT_NOT_NULL(params);
+    yyjson_mut_obj_add_strcpy(b.doc, params, "doc", "Copyright \xa9 2004 valida\xe7\xe3o");
+    ASSERT_EQ(cbm_neo4j_batch_run(c, &b, NULL), -1);
+    ASSERT_NOT_NULL(cbm_neo4j_error(c));
+    ASSERT_NULL(strstr(cbm_neo4j_error(c), "serialize"));
+    cbm_neo4j_batch_free(&b);
+    cbm_neo4j_close(c);
+    PASS();
+}
+
 TEST(neo4j_sidecar_records_last_sync_error) {
     clear_neo4j_env();
     char *dir = th_mktempdir("cbm_n4_status");
@@ -982,6 +1007,7 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_store_remote_routing);
     RUN_TEST(neo4j_native_query_is_read_only);
     RUN_TEST(neo4j_rejects_malformed_2xx_bodies);
+    RUN_TEST(neo4j_request_with_invalid_utf8_is_still_sent);
     RUN_TEST(neo4j_sidecar_records_last_sync_error);
     RUN_TEST(neo4j_unavailable_graph_read_is_an_error);
     RUN_TEST(neo4j_inherited_sync_failure_fails_the_run);
