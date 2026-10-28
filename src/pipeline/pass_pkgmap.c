@@ -2037,6 +2037,49 @@ static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *c
     return NULL;
 }
 
+static bool explicit_relative_path(const char *p) {
+    return strncmp(p, "./", PAIR_LEN) == 0 || strncmp(p, "../", PAIR_LEN + SKIP_ONE) == 0;
+}
+
+enum { SIBLING_MAX_CANDS = 4 };
+
+/* The paths resolve_sibling_file tries for module_path, relative to the
+ * importer's directory `dir`, in priority order. Returns how many it wrote. */
+static int sibling_file_candidates(const char *dir, const char *module_path,
+                                   char cands[SIBLING_MAX_CANDS][PKGMAP_PATH_BUF]) {
+    int ncand = 0;
+    const char *sep = dir[0] ? "/" : "";
+    const char *base = module_path;
+    /* Skip a leading "./". */
+    if (strncmp(base, "./", PAIR_LEN) == 0) {
+        base += PAIR_LEN;
+    }
+    const char *slash = strrchr(base, '/');
+    /* 1. Direct sibling: dir/<module_path>. */
+    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, sep, base);
+    /* 2. SCSS partial: dir/[subdir/]_<basename>.scss (underscore-prefixed). */
+    {
+        const char *bn = slash ? slash + SKIP_ONE : base;
+        char *dpart = slash ? cbm_strndup(base, (size_t)(slash - base)) : strdup("");
+        if (dpart && bn[0] != '_') {
+            snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s%s_%s.scss", dir, sep, dpart,
+                     dpart[0] ? "/" : "", bn);
+        }
+        free(dpart);
+    }
+    /* 3. Meson subdir: dir/<module_path>/meson.build. */
+    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s/meson.build", dir, sep, base);
+    /* 4. Basename sibling: dir/<basename(module_path)>.  Covers include paths
+     *    that carry a non-relative prefix (Hyprlang `source = ~/.config/.../x.conf`,
+     *    absolute include paths) but reference a file sitting beside the importer.
+     *    An explicit `./` or `../` path names one location, which Strategy 1c
+     *    resolves exactly; its basename beside the importer is another file (#2797). */
+    if (slash && slash[SKIP_ONE] && !explicit_relative_path(module_path)) {
+        snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, sep, slash + SKIP_ONE);
+    }
+    return ncand;
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -2063,38 +2106,8 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         return NULL;
     }
 
-    /* Candidate relative paths, in priority order. */
-    char cands[5][PKGMAP_PATH_BUF];
-    int ncand = 0;
-    const char *base = module_path;
-    /* Skip a leading "./". */
-    if (base[0] == '.' && base[1] == '/') {
-        base += 2;
-    }
-    /* 1. Direct sibling: dir/<module_path>. */
-    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, dir[0] ? "/" : "", base);
-    /* 2. SCSS partial: dir/[subdir/]_<basename>.scss (underscore-prefixed). */
-    {
-        const char *slash = strrchr(base, '/');
-        const char *bn = slash ? slash + 1 : base;
-        char *dpart = slash ? cbm_strndup(base, (size_t)(slash - base)) : strdup("");
-        if (dpart && bn[0] != '_') {
-            snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s%s_%s.scss", dir, dir[0] ? "/" : "",
-                     dpart[0] ? dpart : "", dpart[0] ? "/" : "", bn);
-        }
-        free(dpart);
-    }
-    /* 3. Meson subdir: dir/<module_path>/meson.build. */
-    snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s/meson.build", dir, dir[0] ? "/" : "", base);
-    /* 4. Basename sibling: dir/<basename(module_path)>.  Covers include paths
-     *    that carry a non-relative prefix (Hyprlang `source = ~/.config/.../x.conf`,
-     *    absolute include paths) but reference a file sitting beside the importer. */
-    {
-        const char *slash = strrchr(base, '/');
-        if (slash && slash[1]) {
-            snprintf(cands[ncand++], PKGMAP_PATH_BUF, "%s%s%s", dir, dir[0] ? "/" : "", slash + 1);
-        }
-    }
+    char cands[SIBLING_MAX_CANDS][PKGMAP_PATH_BUF];
+    int ncand = sibling_file_candidates(dir, module_path, cands);
 
     const cbm_gbuf_node_t *found = NULL;
     for (int i = 0; i < ncand; i++) {
@@ -2113,6 +2126,36 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     }
     free(dir);
     return found;
+}
+
+/* The File an explicit relative import (`./x`, `../x`) names exactly, for
+ * files whose File QN differs from the module QN Strategy 1 tries
+ * (`../styles/global.css`, `../layouts/Layout.astro`, #2558). Resolved in
+ * stack buffers by cbm_repo_rel_join, which refuses a path above the
+ * repository root. */
+static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
+                                                    const char *source_rel, const char *module_path,
+                                                    bool php_only) {
+    if (!source_rel || !module_path || !explicit_relative_path(module_path)) {
+        return NULL;
+    }
+    char dir[PKGMAP_PATH_BUF];
+    int dir_len = snprintf(dir, sizeof(dir), "%s", source_rel);
+    if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
+        return NULL;
+    }
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+    char path[PKGMAP_PATH_BUF];
+    if (!cbm_repo_rel_join(dir, module_path, path, sizeof(path))) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+    return file && (!php_only || node_in_php_file(file)) ? file : NULL;
 }
 
 /* ── PHP PSR-4 class imports (#1186) ──────────────────────────────── */
@@ -2387,6 +2430,15 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
         if (sib) {
             return sib;
         }
+    }
+
+    /* Strategy 1c: relative non-module files can have a File QN that does not
+     * match the module QN above. Resolve the exact file after module and
+     * sibling lookup. */
+    const cbm_gbuf_node_t *rel_file =
+        resolve_relative_file(ctx, source_rel, imp->module_path, php_only);
+    if (rel_file) {
+        return rel_file;
     }
 
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,

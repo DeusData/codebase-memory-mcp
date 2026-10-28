@@ -500,6 +500,15 @@ TEST(lang_ext_vert) {
     ASSERT_EQ(cbm_language_for_extension(".vert"), CBM_LANG_GLSL);
     PASS();
 }
+/* Compute, geometry and tessellation stages are GLSL too (glslang naming). */
+TEST(lang_ext_glsl_other_stages) {
+    ASSERT_EQ(cbm_language_for_extension(".comp"), CBM_LANG_GLSL);
+    ASSERT_EQ(cbm_language_for_extension(".geom"), CBM_LANG_GLSL);
+    ASSERT_EQ(cbm_language_for_extension(".tesc"), CBM_LANG_GLSL);
+    ASSERT_EQ(cbm_language_for_extension(".tese"), CBM_LANG_GLSL);
+    PASS();
+}
+
 TEST(lang_ext_frag) {
     ASSERT_EQ(cbm_language_for_extension(".frag"), CBM_LANG_GLSL);
     PASS();
@@ -1654,6 +1663,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_glsl);
     RUN_TEST(lang_ext_vert);
     RUN_TEST(lang_ext_frag);
+    RUN_TEST(lang_ext_glsl_other_stages);
     RUN_TEST(lang_ext_ini);
     RUN_TEST(lang_ext_cfg);
     RUN_TEST(lang_ext_conf);

@@ -267,6 +267,147 @@ static int ei_edge_present(const EILangFile *files, int nfiles, const char *edge
     return got >= floor;
 }
 
+typedef struct {
+    const char *importer;
+    const char *target;
+} EIFileEdgeExpect;
+
+static int ei_file_edges_match(const EILangFile *files, int nfiles, const EIFileEdgeExpect *want,
+                               int nwant, int expected_count) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    int ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == expected_count;
+    if (store && !ok) {
+        int got = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
+        fprintf(stderr, "  [IMPORTS] FAIL count=%d expected==%d\n", got, expected_count);
+    }
+    for (int i = 0; store && i < nwant; i++) {
+        int64_t source_id = ei_node_id_for_file_label(store, lp.project, want[i].importer, "File");
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        int found = 0;
+        if (source_id > 0 &&
+            cbm_store_find_edges_by_source_type(store, source_id, "IMPORTS", &edges, &edge_count) ==
+                CBM_STORE_OK) {
+            for (int j = 0; j < edge_count; j++) {
+                cbm_node_t target;
+                memset(&target, 0, sizeof(target));
+                if (cbm_store_find_node_by_id(store, edges[j].target_id, &target) == CBM_STORE_OK) {
+                    found = target.file_path && strcmp(target.file_path, want[i].target) == 0;
+                    cbm_node_free_fields(&target);
+                }
+                if (found) {
+                    break;
+                }
+            }
+        }
+        cbm_store_free_edges(edges, edge_count);
+        if (!found) {
+            fprintf(stderr, "  [IMPORTS] FAIL %s -> %s\n", want[i].importer, want[i].target);
+            ok = 0;
+        }
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_relative_astro_css_imports_issue2558) {
+    static const EILangFile f[] = {
+        {"Badge.astro", "<span>outside</span>\n"},
+        {"src/components/shared/Button.astro",
+         "---\nexport function buttonLabel(t: string): string { return t; }\n---\n<button />\n"},
+        {"src/components/Badge.astro", "<span>badge</span>\n"},
+        {"src/components/Card.astro",
+         "---\nimport Badge from './Badge.astro';\n"
+         "import Button from './shared/Button.astro';\n---\n<div><Badge /><Button /></div>\n"},
+        {"src/layouts/local.css", "body { margin: 0; }\n"},
+        {"src/styles/global.css", "body { color: black; }\n"},
+        {"src/layouts/Layout.astro",
+         "---\nimport '../styles/global.css';\nimport './local.css';\n---\n"
+         "<html><body><slot /></body></html>\n"},
+        {"src/lib/format.ts", "export function formatTitle(t: string): string { return t.trim(); }\n"},
+        {"src/lib/registry.ts",
+         "import Badge from '../components/Badge.astro';\n"
+         "import '../styles/global.css';\n"
+         "import { formatTitle } from './format';\n"
+         "export function registry(): unknown[] { return [Badge, formatTitle]; }\n"},
+        {"src/lib/sub/deep.ts",
+         "import { formatTitle } from '../format';\n"
+         "import { registry } from '../registry.ts';\n"
+         "export function deep(): string { registry(); return formatTitle('x'); }\n"},
+        {"src/pages/index.astro",
+         "---\nimport Layout from '../layouts/Layout.astro';\n"
+         "import Card from '../components/Card.astro';\n"
+         "import Outside from '../../../Badge.astro';\n"
+         "import { formatTitle } from '../lib/format';\n"
+         "const title = formatTitle(' Home ');\n---\n"
+         "<Layout><h1>{title}</h1><Card /></Layout>\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"src/components/Card.astro", "src/components/Badge.astro"},
+        {"src/components/Card.astro", "src/components/shared/Button.astro"},
+        {"src/layouts/Layout.astro", "src/styles/global.css"},
+        {"src/layouts/Layout.astro", "src/layouts/local.css"},
+        {"src/lib/registry.ts", "src/components/Badge.astro"},
+        {"src/lib/registry.ts", "src/styles/global.css"},
+        {"src/lib/registry.ts", "src/lib/format.ts"},
+        {"src/lib/sub/deep.ts", "src/lib/format.ts"},
+        {"src/lib/sub/deep.ts", "src/lib/registry.ts"},
+        {"src/pages/index.astro", "src/layouts/Layout.astro"},
+        {"src/pages/index.astro", "src/components/Card.astro"},
+        {"src/pages/index.astro", "src/lib/format.ts"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 12));
+    PASS();
+}
+
+/* #2797: an explicit `../` path names one file. A same-named file beside the
+ * importer (checks/values.nix) must not stand in for it, whether the named
+ * file exists (lib/values.nix) or not (gone/values.nix). */
+TEST(ei_nix_parent_relative_import_issue2797) {
+    static const EILangFile f[] = {
+        {"lib/values.nix", "{ port = 1; }\n"},
+        {"lib/helper.nix", "{ x }: { id = x; }\n"},
+        {"checks/values.nix", "{ unrelated = true; }\n"},
+        {"checks/user.nix", "let\n"
+                            "  inherit (import ../lib/helper.nix { x = 1; }) id;\n"
+                            "  port = (import ../lib/values.nix).port;\n"
+                            "  gone = import ../gone/values.nix;\n"
+                            "in\n"
+                            "{ inherit id port; }\n"},
+        {"top.nix", "{ v = (import ./lib/values.nix).port; }\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"checks/user.nix", "lib/helper.nix"},
+        {"checks/user.nix", "lib/values.nix"},
+        {"top.nix", "lib/values.nix"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 3));
+    PASS();
+}
+
+/* #2797: the same basename guess applies to any grammar whose import is a
+ * file path, not only Nix. */
+TEST(ei_thrift_parent_relative_import_issue2797) {
+    static const EILangFile f[] = {
+        {"shared/base.thrift", "struct Base { 1: i32 id }\n"},
+        {"service/base.thrift", "struct Unrelated { 1: bool flag }\n"},
+        {"service/api.thrift", "include \"../shared/base.thrift\"\n"
+                               "service Api { base.Base get() }\n"},
+    };
+    static const EIFileEdgeExpect want[] = {
+        {"service/api.thrift", "shared/base.thrift"},
+    };
+
+    ASSERT_TRUE(ei_file_edges_match(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                    (int)(sizeof(want) / sizeof(want[0])), 1));
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * GREEN GUARD — Python
  *
@@ -2299,6 +2440,10 @@ TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 SUITE(edge_imports) {
+    RUN_TEST(ei_relative_astro_css_imports_issue2558);
+    RUN_TEST(ei_nix_parent_relative_import_issue2797);
+    RUN_TEST(ei_thrift_parent_relative_import_issue2797);
+
     /* ── GREEN GUARDS — Python (must stay passing) ── */
     RUN_TEST(ei_python_relative_from_import);
     RUN_TEST(ei_python_absolute_import);

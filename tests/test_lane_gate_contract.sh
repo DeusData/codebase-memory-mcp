@@ -45,7 +45,6 @@ t1_jobs() { # the jobs of a green T1 run; $1 = conclusion of the x86 leg
     job "changes" success
     job "security / security-static" success
     job "security / license-gate" skipped
-    job "security / codeql-gate" skipped
     job "lint / lint" success
     job "lint / lint-mem" success
     job "test / setup-matrix" success

@@ -2444,6 +2444,10 @@ TEST(server_handle_logs_request_without_params) {
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));
     PASS();
@@ -2460,6 +2464,59 @@ TEST(server_handle_unknown_method) {
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Issue #2433: a modern client probes server/discover before initialize.
+ * The -32601 stays so it falls back; only that probe is logged as info. */
+TEST(server_handle_discover_probe_logs_info) {
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel prev_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32601"));
+    ASSERT_NOT_NULL(strstr(resp, "Method not found"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=server/discover"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "level=info"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NULL(strstr(mcp_log_buf, "level=warn"));
+    ASSERT_NULL(strstr(mcp_log_buf, "status=error"));
+    free(resp);
+
+    mcp_log_buf[0] = '\0';
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"unknown/method\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "-32601"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=unknown/method"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "level=warn"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=error"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"initialize\","
+                                      "\"params\":{\"protocolVersion\":\"2026-07-28\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "2025-11-25"));
+    ASSERT_NULL(strstr(resp, "2026-07-28"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"resources\":[]"));
+    ASSERT_NULL(strstr(resp, "-32601"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(prev_level);
     PASS();
 }
 
@@ -4454,6 +4511,281 @@ TEST(tool_search_graph_bm25_applies_label_filter) {
     PASS();
 }
 
+/* #2386: the label filter must choose the BM25 candidate window, not trim it
+ * afterwards. 2001 Functions fill the window ahead of 3 Classes that rank
+ * strictly lower (longer file_path), so a post-window filter returns 0 Classes
+ * while reporting a saturated window. */
+static char *bm25_label_window_search(cbm_mcp_server_t *srv, const char *label_json) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2386,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-label-window\",\"query\":\"windowneedle\","
+             "\"label\":%s,\"limit\":10,\"format\":\"json\"}}}",
+             label_json);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_label_filter_selects_candidate_window) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-label-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-label-window"), CBM_STORE_OK);
+
+    for (int i = 0; i < 2001; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.fn_%04d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "many.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.cls_%d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Class",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "deeply/nested/package/layout/registry.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    /* The rare label comes back in full, and the window is not saturated. */
+    char *inner = bm25_label_window_search(srv, "\"Class\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_0\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_2\""));
+    ASSERT_NULL(strstr(inner, "\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+    free(inner);
+
+    /* The common label still overflows its own window and says so. */
+    inner = bm25_label_window_search(srv, "\"Function\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    /* A label carrying FTS5 syntax is never spliced into MATCH: the query
+     * stays in BM25 mode and the exact label check matches nothing. */
+    inner = bm25_label_window_search(srv, "\"Class\\\" OR windowneedle\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Scoping the MATCH to a label must not reorder that label's rows: a
+ * label-filtered query lists its rows in the same order as the unfiltered
+ * query does. The fixture's four `table` Methods differ in row length, which
+ * is exactly what a scored label phrase would re-weight. */
+TEST(tool_search_graph_bm25_label_scope_keeps_rank_order) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-find");
+    bm25_findability_fixture(store, "bm25-find");
+
+    char *all_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2387,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"limit\":20,\"format\":\"json\"}}}");
+    char *methods_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2388,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"label\":\"Method\","
+             "\"limit\":20,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(all_resp);
+    ASSERT_NOT_NULL(methods_resp);
+    char *all = extract_text_content(all_resp);
+    char *methods = extract_text_content(methods_resp);
+    free(all_resp);
+    free(methods_resp);
+    ASSERT_NOT_NULL(all);
+    ASSERT_NOT_NULL(methods);
+    ASSERT_NOT_NULL(strstr(methods, "\"total\":4"));
+
+    static const char *const qns[] = {
+        "\"bm25-find.core.Table.Table.unquoted\"",
+        "\"bm25-find.core.Table.Table.describe\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql\"",
+    };
+    enum { QN_COUNT = sizeof(qns) / sizeof(qns[0]) };
+    for (int i = 0; i < QN_COUNT; i++) {
+        for (int j = 0; j < QN_COUNT; j++) {
+            if (i == j) {
+                continue;
+            }
+            const char *ai = strstr(all, qns[i]);
+            const char *aj = strstr(all, qns[j]);
+            const char *mi = strstr(methods, qns[i]);
+            const char *mj = strstr(methods, qns[j]);
+            ASSERT_NOT_NULL(ai);
+            ASSERT_NOT_NULL(aj);
+            ASSERT_NOT_NULL(mi);
+            ASSERT_NOT_NULL(mj);
+            ASSERT_EQ(ai < aj, mi < mj);
+        }
+    }
+    free(all);
+    free(methods);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled BM25 query never ranks File, Folder, Variable or Project nodes
+ * (they match almost any token through their path), but an explicit label
+ * naming one of them must be served: those nodes are in nodes_fts, and
+ * excluding them there too answered `query=config label=Folder` with 0 rows
+ * and an exact "eq" total. One node per label shares the query tokens with a
+ * Function. */
+static void bm25_unranked_labels_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-noise");
+    struct {
+        const char *label, *name, *qn, *file;
+    } rows[] = {
+        {"Function", "loadconfig", "bm25-noise.app.loadconfig", "app/config.py"},
+        {"File", "__file__", "bm25-noise.app.config.py", "app/config.py"},
+        {"Folder", "config", "bm25-noise.app.config", "app/config"},
+        {"Variable", "CONFIG_PATH", "bm25-noise.app.config.CONFIG_PATH", "app/config.py"},
+        {"Project", "bm25-noise", "bm25-noise", ""},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        cbm_node_t node = {.project = project,
+                           .label = rows[i].label,
+                           .name = rows[i].name,
+                           .qualified_name = rows[i].qn,
+                           .file_path = rows[i].file,
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 1};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_noise_search(cbm_mcp_server_t *srv, const char *query, const char *label) {
+    char req[512];
+    char label_arg[128] = "";
+    if (label) {
+        snprintf(label_arg, sizeof(label_arg), ",\"label\":\"%s\"", label);
+    }
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2423,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-noise\",\"query\":\"%s\"%s,\"limit\":10,\"format\":\"json\"}}}",
+             query, label_arg);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_serves_unranked_labels_when_named) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-noise");
+    bm25_unranked_labels_fixture(store, "bm25-noise");
+
+    static const struct {
+        const char *label, *qn;
+    } named[] = {
+        {"File", "\"bm25-noise.app.config.py\",\"File\""},
+        {"Folder", "\"bm25-noise.app.config\",\"Folder\""},
+        {"Variable", "\"bm25-noise.app.config.CONFIG_PATH\",\"Variable\""},
+        {"Project", "\"bm25-noise\",\"Project\""},
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        char *inner = bm25_noise_search(srv, "noise config", named[i].label);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, named[i].qn));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "\"hint\""));
+        free(inner);
+    }
+
+    /* Without a label the four stay out of the ranking: only the Function. */
+    char *inner = bm25_noise_search(srv, "noise config", NULL);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-noise.app.loadconfig\",\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NULL(strstr(inner, "\"File\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NULL(strstr(inner, "\"Variable\""));
+    ASSERT_NULL(strstr(inner, "\"Project\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Labels are case-sensitive. A BM25 query whose label no node carries as
+ * spelled answers 0 rows like the structural path does, but never silently:
+ * the hint names the stored spelling, or get_graph_schema when the label is
+ * unknown. An existing label with no matching row is a true zero: no hint. */
+TEST(tool_search_graph_bm25_zero_hint_names_the_label) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-noise");
+    bm25_unranked_labels_fixture(store, "bm25-noise");
+
+    char *inner = bm25_noise_search(srv, "config", "folder");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"hint\":"));
+    ASSERT_NOT_NULL(strstr(inner, "retry with label=\\\"Folder\\\""));
+    free(inner);
+
+    inner = bm25_noise_search(srv, "config", "Widget");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NOT_NULL(strstr(inner, "get_graph_schema"));
+    free(inner);
+
+    inner = bm25_noise_search(srv, "zzznomatch", "Function");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NULL(strstr(inner, "\"hint\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* The definition whose NAME is the query ranks first: the `Table` class above
  * its own methods and above test methods that repeat "table" three times; the
  * `get_object_or_404` function above the test methods that contain it. */
@@ -6009,6 +6341,104 @@ TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct) {
     ASSERT_TRUE(page_truthful);
     ASSERT_TRUE(json_direct);
     ASSERT_TRUE(json_structured);
+    PASS();
+}
+
+/* #1115: with more indexed projects than were resident at once, the
+ * least-recently-used one answered "project not found or not indexed" from
+ * index_status, and list_projects and index_status disagreed in the same
+ * session. The server keeps one project store open and switches it whenever a
+ * call names another project, so twelve projects visited one after another
+ * force a switch on every step and each visit is the first touch of a project
+ * that is not resident. Every project must resolve through index_status and a
+ * query, and list_projects must report all twelve before and after the
+ * switches. */
+TEST(tool_project_discovery_agrees_across_store_switches_issue1115) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-switch-1115-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    enum { PROJECTS = 12 };
+    for (int i = 0; i < PROJECTS; i++) {
+        char project[32];
+        char db_path[512];
+        char root_path[512];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+        snprintf(root_path, sizeof(root_path),
+                 "/workspaces/organization/shared/services/lean-project-%02d", i);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(cbm_store_upsert_project(store, project, root_path), CBM_STORE_OK);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "entry",
+                           .qualified_name = "shared.module.entry",
+                           .file_path = "src/main.c",
+                           .start_line = 1,
+                           .end_line = 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+        cbm_store_close(store);
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *pre_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *pre_switch = extract_text_content(pre_switch_response);
+    bool list_complete_before_switches = pre_switch && strstr(pre_switch, "total: 12") &&
+                                         strstr(pre_switch, "lean-project-00") &&
+                                         strstr(pre_switch, "lean-project-11");
+    free(pre_switch);
+    free(pre_switch_response);
+
+    bool projects_resolve_after_switches = true;
+    for (int i = PROJECTS - 1; i >= 0; i--) {
+        char project[32];
+        char args[96];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+
+        char *status_response = cbm_mcp_handle_tool(srv, "index_status", args);
+        char *status = extract_text_content(status_response);
+        if (!status || !strstr(status, "ready")) {
+            projects_resolve_after_switches = false;
+        }
+        free(status);
+        free(status_response);
+
+        snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\"entry\"}", project);
+        char *search_response = cbm_mcp_handle_tool(srv, "search_graph", args);
+        char *search = extract_text_content(search_response);
+        if (!search || !strstr(search, "entry")) {
+            projects_resolve_after_switches = false;
+        }
+        free(search);
+        free(search_response);
+    }
+    char *post_switch_response = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":50}");
+    char *post_switch = extract_text_content(post_switch_response);
+    bool list_complete_after_switches = post_switch && strstr(post_switch, "total: 12") &&
+                                        strstr(post_switch, "lean-project-00") &&
+                                        strstr(post_switch, "lean-project-11");
+    free(post_switch);
+    free(post_switch_response);
+
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    for (int i = 0; i < PROJECTS; i++) {
+        char project[32];
+        snprintf(project, sizeof(project), "lean-project-%02d", i);
+        cleanup_project_db(cache, project);
+    }
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(list_complete_before_switches);
+    ASSERT_TRUE(projects_resolve_after_switches);
+    ASSERT_TRUE(list_complete_after_switches);
     PASS();
 }
 
@@ -12311,14 +12741,27 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     };
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_code",
-                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
-                            "\"file_pattern\":\"*.go\"}");
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\",\"file_pattern\":"
+             "\"*.go\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(probe.cancel_accepted);
     ASSERT_NOT_NULL(strstr(response, "cancelled"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "tool=search_code"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
 
     char logs[640];
     snprintf(logs, sizeof(logs), "%s/logs", cache.path);
@@ -12328,6 +12771,39 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(server_handle_logs_timeout_without_query) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=timeout"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -25013,6 +25489,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_prompts_get_validates_arguments);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
+    RUN_TEST(server_handle_discover_probe_logs_info);
 
     /* Server handle — edge cases */
     RUN_TEST(server_handle_invalid_json);
@@ -25057,6 +25534,10 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
     RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_label_filter_selects_candidate_window);
+    RUN_TEST(tool_search_graph_bm25_label_scope_keeps_rank_order);
+    RUN_TEST(tool_search_graph_bm25_serves_unranked_labels_when_named);
+    RUN_TEST(tool_search_graph_bm25_zero_hint_names_the_label);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
@@ -25072,6 +25553,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_prefix_directory_is_lossless_and_json_stays_direct);
     RUN_TEST(tool_query_graph_prefix_directory_recovers_rows_beyond_raw_estimate);
     RUN_TEST(tool_list_projects_tree_uses_one_stable_header_and_keeps_json_direct);
+    RUN_TEST(tool_project_discovery_agrees_across_store_switches_issue1115);
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_ingest_traces_stores_observed_calls);
@@ -25170,6 +25652,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);

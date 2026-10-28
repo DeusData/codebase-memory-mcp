@@ -435,29 +435,51 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
-    sb_append(&sb, "';\n\n");
+    sb_append(&sb, "';\n"
+                   "const AUGMENT_TIMEOUT_MS = 10000;\n\n");
 
     /* hook-augment requires hook_event_name; its default dialect accepts
      * Grep/Glob under PreToolUse, Read under PostToolUse, and the
      * SessionStart lifecycle event — and emits the Claude JSON envelope, so
      * the plugin unwraps additionalContext instead of pasting raw JSON into
-     * the tool output. Every failure path resolves to '' (fail open). */
+     * the tool output. Every failure path resolves to '' (fail open) —
+     * including a child that never exits: augment() is awaited inline in
+     * tool.execute.after, so a hung hook-augment would stall every
+     * grep/glob/read completion. The timer SIGKILLs the child and resolves
+     * ''; the promise keeps the first resolution, so the kill-triggered
+     * 'close' event cannot override it. Stream errors (EPIPE on a write
+     * still buffered when the child dies, spawn ENOENT) fire on child.stdin,
+     * not on the child, and would crash the host as an unhandled 'error'
+     * event — hence the stdin listener and the guarded end(). */
     sb_append(&sb, "function augment(payload) {\n"
                    "  return new Promise((resolve) => {\n"
                    "    const child = spawn(BIN, ['hook-augment'], {\n"
                    "      stdio: ['pipe', 'pipe', 'ignore'],\n"
                    "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
                    "    });\n"
+                   "    // Stream errors fire on the stream, not the child.\n"
+                   "    child.stdin.on('error', () => {});\n"
+                   "    const timer = setTimeout(() => {\n"
+                   "      child.kill('SIGKILL');\n"
+                   "      child.stdout.destroy();\n"
+                   "      resolve('');\n"
+                   "    }, AUGMENT_TIMEOUT_MS);\n"
                    "    let out = '';\n"
                    "    child.stdout.on('data', (d) => (out += d.toString()));\n"
-                   "    child.on('error', () => resolve(''));\n"
+                   "    child.on('error', () => {\n"
+                   "      clearTimeout(timer);\n"
+                   "      resolve('');\n"
+                   "    });\n"
                    "    child.on('close', () => {\n"
+                   "      clearTimeout(timer);\n"
                    "      try {\n"
                    "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
                    "        resolve(typeof ctx === 'string' ? ctx : '');\n"
                    "      } catch { resolve(''); }\n"
                    "    });\n"
-                   "    child.stdin.end(JSON.stringify(payload));\n"
+                   "    try {\n"
+                   "      child.stdin.end(JSON.stringify(payload));\n"
+                   "    } catch { resolve(''); }\n"
                    "  });\n"
                    "}\n\n");
 

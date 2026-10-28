@@ -760,6 +760,16 @@ typedef enum {
 cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char *class_fqn,
                                               const char *member, const char **out_qn);
 
+/* Get the current pipeline's declared-package map (NULL if none): the
+ * namespace/package → File-QN map built by cbm_pipeline_namespace_map_build
+ * from every indexed file's own `package`/`namespace`/`using` declaration.
+ * The import passes build it to resolve namespace imports; it is published
+ * here so the call passes can ask whether a package-path specifier names a
+ * package the tree itself declares (#1355). Set before resolve starts, read
+ * only afterwards — same single-writer contract as the pkgmap above. */
+CBMHashTable *cbm_pipeline_get_nsmap(void);
+void cbm_pipeline_set_nsmap(CBMHashTable *map);
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */

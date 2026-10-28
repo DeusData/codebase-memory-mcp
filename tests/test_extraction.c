@@ -879,6 +879,89 @@ TEST(csharp_interface) {
     PASS();
 }
 
+/* Issue #2071: a C# 14 extension block parses as a constructor_declaration
+ * named `extension` whose body holds the members, and has_error stays 0, so the
+ * members were dropped without any signal. They belong to the enclosing type. */
+TEST(csharp_extension_block_members) {
+    CBMFileResult *r = extract("namespace App;\n"
+                               "public static class NumberExtensions\n"
+                               "{\n"
+                               "    extension(IEnumerable<int> numbers)\n"
+                               "    {\n"
+                               "        public int SumPositive() => 0;\n"
+                               "        public static int Zero() => 0;\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "NumberExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "NumberExtensions"));
+    ASSERT(has_def(r, "Method", "SumPositive"));
+    ASSERT(has_def(r, "Method", "Zero"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same shape is a genuine constructor inside a type actually called
+ * `extension`, and must still be emitted (#2071). */
+TEST(csharp_constructor_of_type_named_extension) {
+    CBMFileResult *r =
+        extract("namespace App { public class extension { public extension() { } } }",
+                CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Escaping a type identifier does not change its constructor's identity. */
+TEST(csharp_constructor_of_escaped_type_named_extension) {
+    const char *src = "namespace App { public class @extension { "
+                      "public extension() { int ConstructorLocal() => 1; } } }";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "ConstructorLocal"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* All conditional branches expose extension members, but method-local
+ * functions must never be promoted to members of the enclosing type. */
+TEST(csharp_extension_block_conditional_members) {
+    const char *src = "public static class TextExtensions\n"
+                      "{\n"
+                      "    extension(string text)\n"
+                      "    {\n"
+                      "#if FIRST\n"
+                      "        public int First() { int Nested() => 1; return Nested(); }\n"
+                      "#elif SECOND\n"
+                      "        public int Second() => 2;\n"
+                      "#else\n"
+                      "#if NESTED\n"
+                      "        public int Third() => 3;\n"
+                      "#else\n"
+                      "        public int Fourth() => 4;\n"
+                      "#endif\n"
+                      "#endif\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CSHARP, "t", "TextExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "First"));
+    ASSERT(has_def(r, "Method", "Second"));
+    ASSERT(has_def(r, "Method", "Third"));
+    ASSERT(has_def(r, "Method", "Fourth"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    ASSERT_FALSE(has_def(r, "Method", "Nested"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Swift --- */
 TEST(swift_class) {
     CBMFileResult *r = extract("class Vehicle {\n    var speed: Int = 0\n    func accelerate() { "
@@ -1765,6 +1848,54 @@ TEST(elixir_call_string_argument) {
     PASS();
 }
 
+/* True when a channel with this name/transport/direction was extracted. */
+static int has_channel(CBMFileResult *r, const char *name, const char *transport,
+                       CBMChannelDirection dir) {
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *c = &r->channels.items[i];
+        if (c->channel_name && strcmp(c->channel_name, name) == 0 && c->transport &&
+            strcmp(c->transport, transport) == 0 && c->direction == dir)
+            return 1;
+    }
+    return 0;
+}
+
+/* Phoenix pub/sub and channel listeners. Both branches were unreachable: the
+ * emit side looked up an "arguments" FIELD that tree-sitter-elixir does not
+ * define, and the listener side dispatched on a "def" NODE TYPE that does not
+ * exist (Elixir defs are `call` nodes), so a Phoenix app produced no channels
+ * at all. */
+TEST(elixir_channels_pubsub_and_handle_in) {
+    CBMFileResult *r =
+        extract("defmodule Acme.Notifier do\n"
+                "  def announce(p) do\n"
+                "    Phoenix.PubSub.broadcast(Acme.PubSub, \"user:created\", p)\n"
+                "  end\n"
+                "  def watch, do: Phoenix.PubSub.subscribe(Acme.PubSub, \"user:updated\")\n"
+                "end\n"
+                "defmodule AcmeWeb.RoomChannel do\n"
+                "  def handle_in(\"new_msg\", payload, socket) do\n"
+                "    push(socket, \"pong\", %{})\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "  def handle_in(\"ping\", _p, socket) when is_map(socket) do\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "end\n",
+                CBM_LANG_ELIXIR, "t", "chan.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "user:created", "phoenix_pubsub", CBM_CHANNEL_EMIT));
+    ASSERT(has_channel(r, "user:updated", "phoenix_pubsub", CBM_CHANNEL_LISTEN));
+    /* handle_in clauses are listeners — including the guarded one. */
+    ASSERT(has_channel(r, "new_msg", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    ASSERT(has_channel(r, "ping", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    /* A bare push/broadcast inside the channel module is an emit. */
+    ASSERT(has_channel(r, "pong", "phoenix_channel", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -1773,6 +1904,33 @@ TEST(haskell_function) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "add"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2440: an infix-form definition (`a <+> b = ...`, ``x `plus` y = ...``) has
+ * no `name` field; its first named child is an `infix` node whose first child
+ * is the LEFT OPERAND, so the def was named `a` / `x`. It must be named after
+ * the operator, consistent with the prefix form `(<+>) a b = ...`. */
+TEST(haskell_infix_definition_name) {
+    CBMFileResult *r = extract("module M where\n"
+                               "\n"
+                               "(<+>) :: Int -> Int -> Int\n"
+                               "a <+> b = a + b\n"
+                               "\n"
+                               "plus :: Int -> Int -> Int\n"
+                               "x `plus` y = x + y\n"
+                               "\n"
+                               "f :: Int\n"
+                               "f = 1 <+> 2\n",
+                               CBM_LANG_HASKELL, "t", "M.hs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "f"));
+    ASSERT(has_def(r, "Function", "plus"));
+    ASSERT(has_def(r, "Function", "(<+>)"));
+    ASSERT_FALSE(has_def(r, "Function", "a"));
+    ASSERT_FALSE(has_def(r, "Function", "x"));
     cbm_free_result(r);
     PASS();
 }
@@ -6389,6 +6547,81 @@ TEST(extract_py_url_fold_no_fabrication_issue706) {
     ASSERT_TRUE(url_not_claimed(r, "requests.get", "slash"));
     ASSERT_TRUE(url_not_claimed(r, "requests.get", "empty"));
     ASSERT_TRUE(url_not_claimed(r, "requests.get", "two"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #523 follow-up: a Python string whose opening token is more than one
+ * quote -- a prefix (r"", u"", b"", Rb"", an f"" with no field) or a triple
+ * quote -- kept the prefix and the extra quotes in the URL (`f"http://..."`,
+ * `""http://...""`), so the HTTP_CALLS edge never matched a route. Each must
+ * yield the bare URL, positional or as `url=`. */
+TEST(extract_py_prefixed_string_url_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def f_plain():\n"
+                               "    return requests.get(f\"http://svc/v2/health\")\n"
+                               "def raw():\n"
+                               "    return requests.get(r\"http://svc/v2/health\")\n"
+                               "def uni():\n"
+                               "    return requests.get(u\"http://svc/v2/health\")\n"
+                               "def byt():\n"
+                               "    return requests.get(b\"http://svc/v2/health\")\n"
+                               "def raw_bytes():\n"
+                               "    return requests.get(Rb\"http://svc/v2/health\")\n"
+                               "def triple():\n"
+                               "    return requests.get(\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def triple_single():\n"
+                               "    return requests.get('''http://svc/v2/health''')\n"
+                               "def f_triple():\n"
+                               "    return requests.get(f\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def kw():\n"
+                               "    return requests.get(url=r\"http://svc/v2/health\")\n",
+                               CBM_LANG_PYTHON, "t", "client.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "uni"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "byt"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_bytes"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "kw"), "http://svc/v2/health");
+
+    /* A wrapped literal is still a fully known value, so it is exact. */
+    const CBMCall *raw = find_call_in_func(r, "requests.get", "raw");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_GTE(raw->arg_count, 1);
+    ASSERT_NOT_NULL(raw->args[0].value);
+    ASSERT_STR_EQ(raw->args[0].value, "http://svc/v2/health");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a plain one-quote literal keeps the literal path
+ * unchanged, and an interpolating f-string still folds its field to "{}". */
+TEST(extract_py_prefixed_string_url_controls_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def plain():\n"
+                               "    return requests.get(\"http://svc/v2/health\")\n"
+                               "def plain_single():\n"
+                               "    return requests.get('http://svc/v2/health')\n"
+                               "def field(order_id):\n"
+                               "    return requests.get(f\"http://svc/v2/orders/{order_id}\")\n"
+                               "def raw_field(order_id):\n"
+                               "    return requests.get(rf\"http://svc/v2/orders/{order_id}\")\n",
+                               CBM_LANG_PYTHON, "t", "ctl.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "field"), "http://svc/v2/orders/{}");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_field"), "http://svc/v2/orders/{}");
 
     cbm_free_result(r);
     PASS();
@@ -13129,6 +13362,10 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
+    RUN_TEST(csharp_extension_block_members);
+    RUN_TEST(csharp_constructor_of_type_named_extension);
+    RUN_TEST(csharp_constructor_of_escaped_type_named_extension);
+    RUN_TEST(csharp_extension_block_conditional_members);
     RUN_TEST(swift_class);
     RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
@@ -13176,7 +13413,9 @@ SUITE(extraction) {
     /* Functional */
     RUN_TEST(elixir_function);
     RUN_TEST(elixir_call_string_argument);
+    RUN_TEST(elixir_channels_pubsub_and_handle_in);
     RUN_TEST(haskell_function);
+    RUN_TEST(haskell_infix_definition_name);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
 
@@ -13418,6 +13657,8 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
     RUN_TEST(extract_py_concat_const_url_issue706);
     RUN_TEST(extract_py_url_fold_no_fabrication_issue706);
+    RUN_TEST(extract_py_prefixed_string_url_issue523);
+    RUN_TEST(extract_py_prefixed_string_url_controls_issue523);
     RUN_TEST(extract_ts_const_template_url_issue1147);
     RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
     RUN_TEST(extract_ts_folded_topics_keep_raw_identity);

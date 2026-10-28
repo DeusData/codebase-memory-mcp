@@ -1468,8 +1468,10 @@ static const char MCP_SERVER_INSTRUCTIONS[] =
     "query_graph runs multi-hop Cypher queries; get_architecture summarizes structure; "
     "detect_changes maps the current diff to affected symbols. Grep and file reads fit literal "
     "text, config values, comments and non-code files better; search_code combines text search "
-    "with graph context. The session project's index refreshes automatically; other projects "
-    "need index_repository. check_index_coverage tells whether a cited file was fully indexed. "
+    "with graph context. With auto_watch enabled, an index registered by an active MCP session "
+    "refreshes automatically; sessions register their root and successful explicit "
+    "index_repository targets. CLI calls do not add watches. check_index_coverage tells whether "
+    "a cited file was fully indexed. "
     "Results are paginated.";
 
 static const char MCP_ANALYSIS_SERVER_INSTRUCTIONS[] =
@@ -4010,6 +4012,7 @@ enum {
     BM25_BIND_EXACT = 8,
     BM25_BIND_KIND = 9,
     BM25_BIND_NS = 10,
+    BM25_BIND_LABEL_WEIGHT = 11,
     BM25_SQL_AUTO_LEN = -1,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
@@ -4018,6 +4021,11 @@ enum {
      * and then joining/filtering/re-ranking those, we bound all work to O(N) where
      * N = BM25_INNER_LIMIT rather than the full match set size. */
     BM25_INNER_LIMIT = 2000,
+    /* Longest label spliced into the MATCH pre-filter; real labels are short
+     * identifiers, so anything longer simply skips the pre-filter. */
+    BM25_LABEL_MAX = 64,
+    /* Room for "(<tokens>) AND label : \"<label>\"" around the token list. */
+    BM25_MATCH_BUF = BM25_QUERY_BUF + BM25_LABEL_MAX + 32,
 };
 
 /* Column weights for nodes_fts (name, qualified_name, label, file_path, body).
@@ -4036,8 +4044,28 @@ enum {
  * Safe against a legacy four-column nodes_fts: FTS5's bm25() reads a weight
  * only when an instance actually lands in that column (`nVal > ic`), so the
  * fifth weight is simply never consulted on a table that has no fifth
- * column. */
-#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, 1.0, 1.0, 0.3)"
+ * column.
+ *
+ * The label weight is bound (?11): 1.0 normally, 0.0 when the MATCH is scoped
+ * to a label (#2386). Every candidate then carries that label, so a label hit
+ * cannot tell them apart, and a zero weight keeps the added `label : "..."`
+ * phrase from shifting BM25 order by row length. */
+#define BM25_WEIGHTS "bm25(nodes_fts, 1.0, 1.0, ?11, 1.0, 0.3)"
+static const double BM25_LABEL_WEIGHT = 1.0;
+static const double BM25_LABEL_WEIGHT_SCOPED = 0.0;
+
+/* Labels an UNLABELLED query never ranks: path-shaped File/Folder nodes, the
+ * Project node and Variables match almost any token through their qualified
+ * name and file path, and would crowd definitions out of the result. They are
+ * still in nodes_fts, so an explicit `label` that names one of them is served
+ * from its own label-scoped window like any other label (?7 is the caller's
+ * label, NULL when none was given). Excluding them there too returned 0 rows
+ * -- often with an exact "eq" total -- although such nodes match. Section and
+ * Module are NOT excluded (#518/#519): they carry the prose the body column
+ * indexes. Shared by the ranked and the count query, so the two cannot
+ * desynchronise. */
+#define BM25_UNLABELLED_EXCLUSION \
+    "(?7 IS NOT NULL OR n.label NOT IN ('File','Folder','Variable','Project'))"
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
@@ -4086,6 +4114,85 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
     }
     out[pos] = '\0';
     return tokens;
+}
+
+/* Scope an FTS5 MATCH expression to one node label (#2386). The label filter
+ * must choose the BM25_INNER_LIMIT candidate window, not trim it afterwards:
+ * otherwise a label that is rare among a common token's matches falls outside
+ * the window and the search returns 0 rows although matching nodes exist.
+ * FTS5 matching is case-insensitive, so this is a superset pre-filter; the
+ * caller keeps the exact `n.label = ?` check. Only a plain identifier is
+ * spliced in, as a quoted FTS5 string; any other label leaves `tokens`
+ * unscoped, which is the pre-#2386 behaviour. Returns the label-column weight
+ * to bind for the resulting MATCH. */
+static double bm25_scope_match_to_label(const char *tokens, const char *label, char *out,
+                                        size_t out_size) {
+    snprintf(out, out_size, "%s", tokens);
+    if (!label || !label[0]) {
+        return BM25_LABEL_WEIGHT;
+    }
+    size_t len = 0;
+    for (; label[len]; len++) {
+        char ch = label[len];
+        bool ident = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                     (ch >= '0' && ch <= '9') || ch == '_';
+        if (!ident || len >= BM25_LABEL_MAX) {
+            return BM25_LABEL_WEIGHT;
+        }
+    }
+    char scoped[BM25_MATCH_BUF];
+    int n = snprintf(scoped, sizeof(scoped), "(%s) AND label : \"%s\"", tokens, label);
+    if (n <= 0 || (size_t)n >= sizeof(scoped) || (size_t)n >= out_size) {
+        return BM25_LABEL_WEIGHT;
+    }
+    memcpy(out, scoped, (size_t)n + 1);
+    return BM25_LABEL_WEIGHT_SCOPED;
+}
+
+/* A BM25 result is empty although nodes match when the label is spelled in a
+ * case no node carries: labels are case-sensitive, so `label=class` finds
+ * nothing while Class nodes match the query. Returns a hint (memory core,
+ * CBM_MEM_CLASS_OTHER) naming the label this project actually holds, or NULL
+ * when the label exists exactly (a true zero). The exact probe is an index
+ * seek on (project, label); the case-insensitive scan runs only when it
+ * misses. The caller's label is never echoed back, only the stored spelling. */
+static char *bm25_label_zero_hint(sqlite3 *db, const char *project, const char *label) {
+    enum { HINT_BIND_PROJECT = 1, HINT_BIND_LABEL = 2, HINT_COL_LABEL = 0, HINT_PROBE_EXACT = 0 };
+    if (!db || !label || !label[0]) {
+        return NULL;
+    }
+    static const char *const probes[] = {
+        "SELECT label FROM nodes WHERE project = ?1 AND label = ?2 LIMIT 1",
+        "SELECT label FROM nodes WHERE project = ?1 AND label = ?2 COLLATE NOCASE LIMIT 1",
+    };
+    char found[CBM_SZ_256] = "";
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]) && !found[0]; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, probes[i], BM25_SQL_AUTO_LEN, &st, NULL) != SQLITE_OK) {
+            return NULL;
+        }
+        sqlite3_bind_text(st, HINT_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, HINT_BIND_LABEL, label, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *stored = (const char *)sqlite3_column_text(st, HINT_COL_LABEL);
+            snprintf(found, sizeof(found), "%s", stored ? stored : "");
+        }
+        sqlite3_finalize(st);
+        if (found[0] && i == HINT_PROBE_EXACT) {
+            return NULL;
+        }
+    }
+    if (!found[0]) {
+        return cbm_mem_strdup(CBM_MEM_CLASS_OTHER,
+                              "no node in this project carries this label; get_graph_schema "
+                              "lists the labels this index holds");
+    }
+    char hint[CBM_SZ_512];
+    snprintf(hint, sizeof(hint),
+             "no node carries this label as spelled; labels are case-sensitive -- retry with "
+             "label=\"%s\"",
+             found);
+    return cbm_mem_strdup(CBM_MEM_CLASS_OTHER, hint);
 }
 
 static char *bm25_file_pattern_like(const char *file_pattern) {
@@ -4139,7 +4246,8 @@ static void bm25_lines_str(char *out, size_t size, int start, int end) {
 
 static void bm25_emit_metadata_tree(cbm_sb_t *sb, int total, int offset, int returned,
                                     bool candidate_window_saturated, bool budget_hit,
-                                    bool floor_exceeded, size_t max_output_bytes) {
+                                    bool floor_exceeded, size_t max_output_bytes,
+                                    const char *zero_hint) {
     bool has_more = total > offset + returned;
     cbm_tree_scalar_int(sb, "total", total);
     cbm_tree_scalar_str(sb, "total_relation", candidate_window_saturated ? "gte" : "eq");
@@ -4170,12 +4278,15 @@ static void bm25_emit_metadata_tree(cbm_sb_t *sb, int total, int offset, int ret
         cbm_tree_scalar_str(sb, "hint",
                             "first identity row exceeds max_output_bytes; raise "
                             "max_output_tokens");
+    } else if (zero_hint) {
+        cbm_tree_scalar_str(sb, "hint", zero_hint);
     }
 }
 
 static void bm25_emit_metadata_json(yyjson_mut_doc *doc, yyjson_mut_val *root, int total,
                                     int offset, int returned, bool candidate_window_saturated,
-                                    bool budget_hit, bool floor_exceeded, size_t max_output_bytes) {
+                                    bool budget_hit, bool floor_exceeded, size_t max_output_bytes,
+                                    const char *zero_hint) {
     bool has_more = total > offset + returned;
     yyjson_mut_obj_add_int(doc, root, "total", total);
     yyjson_mut_obj_add_str(doc, root, "total_relation", candidate_window_saturated ? "gte" : "eq");
@@ -4207,12 +4318,14 @@ static void bm25_emit_metadata_json(yyjson_mut_doc *doc, yyjson_mut_val *root, i
         yyjson_mut_obj_add_str(doc, root, "hint",
                                "first identity row exceeds max_output_bytes; raise "
                                "max_output_tokens");
+    } else if (zero_hint) {
+        yyjson_mut_obj_add_strcpy(doc, root, "hint", zero_hint);
     }
 }
 
 static char *bm25_render(const bm25_output_row_t *rows, int returned, int total, int offset,
                          bool candidate_window_saturated, bool tree_format, bool budget_hit,
-                         bool floor_exceeded, size_t max_output_bytes) {
+                         bool floor_exceeded, size_t max_output_bytes, const char *zero_hint) {
     if (tree_format) {
         cbm_sb_t sb;
         cbm_sb_init(&sb);
@@ -4230,7 +4343,7 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
             cbm_tree_row_end(&sb);
         }
         bm25_emit_metadata_tree(&sb, total, offset, returned, candidate_window_saturated,
-                                budget_hit, floor_exceeded, max_output_bytes);
+                                budget_hit, floor_exceeded, max_output_bytes, zero_hint);
         return cbm_sb_finish(&sb);
     }
 
@@ -4257,7 +4370,7 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
     }
     yyjson_mut_obj_add_val(doc, root, "rows", result_rows);
     bm25_emit_metadata_json(doc, root, total, offset, returned, candidate_window_saturated,
-                            budget_hit, floor_exceeded, max_output_bytes);
+                            budget_hit, floor_exceeded, max_output_bytes, zero_hint);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
@@ -4274,11 +4387,16 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!db) {
         return NULL;
     }
-    char fts_query[BM25_QUERY_BUF];
-    int tok_count = bm25_build_match(query, fts_query, sizeof(fts_query));
+    char fts_tokens[BM25_QUERY_BUF];
+    int tok_count = bm25_build_match(query, fts_tokens, sizeof(fts_tokens));
     if (tok_count == 0) {
         return NULL;
     }
+    /* One MATCH string for the ranked query, the count and the saturation
+     * probe, so all three describe the same label-scoped window. */
+    char fts_query[BM25_MATCH_BUF];
+    double label_weight =
+        bm25_scope_match_to_label(fts_tokens, label, fts_query, sizeof(fts_query));
     char *file_like = bm25_file_pattern_like(file_pattern);
 
     /* BM25 ranked query using a two-step approach to enable FTS5 early termination.
@@ -4321,12 +4439,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         ") fts "
         "JOIN nodes n ON n.id = fts.rowid "
         "WHERE n.project = ?2 "
-        /* Section and Module are NO LONGER excluded (#518/#519): they are the
-         * labels that carry prose — a Markdown section's body, a config file's
-         * description — so excluding them made the body column unreachable.
-         * This exclusion list is MIRRORED in the count query below; the two
-         * must be changed together or results desynchronise from counts. */
-        "  AND n.label NOT IN ('File','Folder','Variable','Project') "
+        "  AND " BM25_UNLABELLED_EXCLUSION " "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
         /* The caller's label filter applies in query mode exactly as it does
          * in the structural mode (2026-09-16 probe: `label=Class` was ignored
@@ -4376,6 +4489,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     } else {
         sqlite3_bind_null(stmt, BM25_BIND_NS);
     }
+    sqlite3_bind_double(stmt, BM25_BIND_LABEL_WEIGHT, label_weight);
 
     /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
@@ -4392,7 +4506,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             /* MIRRORS the ranked query's filter verbatim — same weights, same
              * label exclusions. Changing one alone reports a total that does
              * not describe the rows returned. */
-            "      AND n.label NOT IN ('File','Folder','Variable','Project')"
+            "      AND " BM25_UNLABELLED_EXCLUSION " "
             "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
             "      AND (?7 IS NULL OR n.label = ?7)"
             "      AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) "
@@ -4409,6 +4523,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
                               MCP_SQLITE_TRANSIENT);
             sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
+            sqlite3_bind_double(cs, BM25_BIND_LABEL_WEIGHT, label_weight);
             if (file_like) {
                 sqlite3_bind_text(cs, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
                                   MCP_SQLITE_TRANSIENT);
@@ -4441,9 +4556,10 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
 
     /* The top-candidate window is a performance ceiling, not an exact-total
      * boundary. Probe one candidate beyond it so a broad query never presents
-     * a window-local count as the complete match count. This is global to the
-     * FTS table; saturation is therefore conservatively reported even when
-     * later project/path filters might discard the hidden candidates. */
+     * a window-local count as the complete match count. The probe shares the
+     * label-scoped MATCH but is otherwise global to the FTS table; saturation
+     * is therefore conservatively reported even when later project/path
+     * filters might discard the hidden candidates. */
     bool candidate_window_saturated = true;
     {
         const char *probe_sql = "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1 "
@@ -4481,13 +4597,15 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!rows) {
         return heap_strdup("out of memory");
     }
+    /* Never a silent zero for a label the index spells differently. */
+    char *zero_hint = total == 0 ? bm25_label_zero_hint(db, project, label) : NULL;
 
     int returned = row_count;
     bool budget_hit = false;
     char *payload = NULL;
     for (;;) {
         payload = bm25_render(rows, returned, total, offset, candidate_window_saturated,
-                              tree_format, budget_hit, false, max_output_bytes);
+                              tree_format, budget_hit, false, max_output_bytes, zero_hint);
         if (!payload || strlen(payload) <= max_output_bytes || returned == 0) {
             break;
         }
@@ -4500,8 +4618,9 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     if (!payload || strlen(payload) > max_output_bytes || (row_count > 0 && returned == 0)) {
         free(payload);
         payload = bm25_render(rows, 0, total, offset, candidate_window_saturated, tree_format, true,
-                              row_count > 0, max_output_bytes);
+                              row_count > 0, max_output_bytes, zero_hint);
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, zero_hint);
     bm25_output_rows_free(rows, row_count);
     return payload;
 }
@@ -7379,8 +7498,8 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 }
 
 /* index_status "watch" object (#2167): is this project kept fresh by the
- * background watcher right now, and if not, why. Auto-sync covers the active
- * MCP session's project only; anything else needs index_repository again. */
+ * background watcher right now, and if not, why. Active MCP sessions register
+ * their root on connect and successful explicit index_repository targets. */
 static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjson_mut_val *root,
                                   const char *project) {
     cbm_mcp_watch_status_t status = {0};
@@ -7406,8 +7525,8 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
     } else {
         yyjson_mut_obj_add_str(doc, watch, "reason", status.reason ? status.reason : "unknown");
         yyjson_mut_obj_add_str(doc, watch, "hint",
-                               "Auto-sync watches only the active MCP session's project; "
-                               "re-run index_repository to refresh this index.");
+                               "To register this project for auto-sync, successfully "
+                               "re-index it from an active MCP session with auto_watch enabled.");
     }
     yyjson_mut_obj_add_val(doc, root, "watch", watch);
 }
@@ -20934,6 +21053,11 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
     return true;
 }
 
+static long long mcp_elapsed_us(struct timespec start, struct timespec end) {
+    return ((long long)(end.tv_sec - start.tv_sec) * MCP_S_TO_US) +
+           ((long long)(end.tv_nsec - start.tv_nsec) / MCP_MS_TO_US);
+}
+
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_jsonrpc_request_t req = {0};
     if (cbm_jsonrpc_parse(line, &req) < 0) {
@@ -20964,7 +21088,11 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &req_t0);
     char *result_json = NULL;
     char *request_error_json = NULL;
-    bool request_logged = false;
+    char *request_tool_name = NULL;
+    long long handler_duration_us = 0;
+    bool request_is_error = false;
+    bool request_cancelled = false;
+    bool request_timed_out = false;
 
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
@@ -20991,6 +21119,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+        request_tool_name = tool_name;
         srv->active_request_id = req.id;
         free(srv->active_request_id_str);
         srv->active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
@@ -21003,16 +21132,15 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         srv->active_request_id_str = NULL;
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - t0.tv_nsec) / MCP_MS_TO_US);
+        long long dur_us = mcp_elapsed_us(t0, t1);
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
-        long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                                   ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
-        request_logged = true;
+        handler_duration_us = mcp_elapsed_us(req_t0, t1);
+        request_is_error = is_err;
+        request_cancelled = mcp_request_cancelled(srv);
+        request_timed_out =
+            result_json && strstr(result_json, "\"code\":\"request_timeout\"") != NULL;
 
-        free(tool_name);
         free(tool_args);
     } else {
         /* Echo the original id (string or numeric, issue #253) on the error. */
@@ -21024,12 +21152,20 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .id_str = req.id_str,
             .error_json = err_obj,
         };
-        char *err = cbm_jsonrpc_format_response(&err_resp);
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        long long handler_us = mcp_elapsed_us(req_t0, t1);
+        struct timespec serialize_t0;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
+        char *err = cbm_jsonrpc_format_response(&err_resp);
+        struct timespec serialize_t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+        long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+        long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+        /* server/discover is the modern connect probe. -32601 stays so the
+         * client falls back to initialize; that miss is not an error (#2433). */
+        cbm_log_mcp_request(req.method, NULL, strcmp(req.method, "server/discover") != 0,
+                            duration_us, handler_us, serialization_us, false, false);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
@@ -21041,24 +21177,20 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .id_str = req.id_str,
             .error_json = request_error_json,
         };
+        struct timespec serialize_t0;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
         char *err = cbm_jsonrpc_format_response(&err_resp);
-        struct timespec t1;
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        struct timespec serialize_t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+        long long handler_us = mcp_elapsed_us(req_t0, serialize_t0);
+        long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+        long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+        cbm_log_mcp_request(req.method, NULL, true, duration_us, handler_us, serialization_us,
+                            false, false);
         free(request_error_json);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
-    }
-
-    if (!request_logged) {
-        struct timespec t1;
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, false, dur_us);
     }
 
     cbm_jsonrpc_response_t resp = {
@@ -21066,7 +21198,21 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         .id_str = req.id_str,
         .result_json = result_json,
     };
+    struct timespec serialize_t0;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
     char *out = cbm_jsonrpc_format_response(&resp);
+    struct timespec serialize_t1;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+    long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+    long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+    request_is_error = request_is_error || out == NULL;
+    if (!request_tool_name) {
+        handler_duration_us = duration_us - serialization_us;
+    }
+    cbm_log_mcp_request(req.method, request_tool_name, request_is_error, duration_us,
+                        handler_duration_us, serialization_us, request_cancelled,
+                        request_timed_out);
+    free(request_tool_name);
     free(result_json);
     cbm_mcp_server_request_scope_end(srv);
     cbm_jsonrpc_request_free(&req);

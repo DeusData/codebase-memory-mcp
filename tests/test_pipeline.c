@@ -5921,6 +5921,76 @@ TEST(pipeline_closure_repair_removed_def_drops_dependent_edge) {
     PASS();
 }
 
+/* #2276: the closure/delta route clones the previous generation's db file
+ * byte-for-byte and patches only nodes/edges/hashes/surfaces, so a reindex
+ * that keeps the same project name but a DIFFERENT repo_path (an artifact
+ * moved or reused from another checkout) leaves the `projects` row's
+ * root_path/indexed_at pinned to whichever directory the last FULL rebuild
+ * ran from, so every later root_path-keyed read then resolves files against
+ * a directory this run never touched. */
+TEST(pipeline_incremental_root_path_refreshed_across_directories) {
+    char dir_a[256];
+    char dir_b[256];
+    snprintf(dir_a, sizeof(dir_a), "/tmp/cbm_rootpath_a_XXXXXX");
+    snprintf(dir_b, sizeof(dir_b), "/tmp/cbm_rootpath_b_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir_a));
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir_b));
+    closure_probe_repo(dir_a);
+    closure_probe_repo(dir_b);
+    /* Body edit only, same exported names: the shape the closure route
+     * repairs without falling back to a full rebuild (mirrors
+     * pipeline_closure_repair_body_edit_converges_with_fresh_full above). */
+    write_temp_file(dir_b, "lib.ts",
+                    "export function closureProbeHelper(x: number): string {\n"
+                    "  const doubled = x + x;\n"
+                    "  return String(doubled);\n"
+                    "}\n");
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/rootpath.db", dir_a);
+    static const char *project = "rootpath-probe";
+
+    cbm_pipeline_t *first = cbm_pipeline_new(dir_a, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(first, project));
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    cbm_pipeline_free(first);
+
+    /* Reindex the SAME project name from dir_b: a valid existing generation
+     * exists, so this routes through the incremental path, not a first-time
+     * full build. */
+    cbm_pipeline_t *second = cbm_pipeline_new(dir_b, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(second, project));
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(second);
+    /* The bug is specific to the closure/delta route; confirm we actually
+     * exercised it rather than a silent fall-back to a full rebuild, which
+     * would pass even with the fix reverted. */
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+
+    /* cbm_pipeline_repo_path()/cbm_store_upsert_project() never call
+     * realpath(): the stored root_path is whatever was passed to
+     * cbm_pipeline_new(), verbatim, on both the full-rebuild path and this
+     * one. Compare against dir_b directly, not a canonicalized form, or
+     * this assertion only holds on a platform where /tmp is not itself a
+     * symlink (it resolves to /private/tmp on macOS). */
+    cbm_project_t info = {0};
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_get_project(store, project, &info), CBM_STORE_OK);
+    ASSERT_STR_EQ(info.root_path, dir_b);
+    free((char *)info.name);
+    free((char *)info.indexed_at);
+    free((char *)info.root_path);
+    cbm_store_close(store);
+
+    th_rmtree(dir_a);
+    th_rmtree(dir_b);
+    PASS();
+}
+
 TEST(pipeline_closure_repair_added_name_declines_to_full) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_closure_added_XXXXXX");
@@ -8467,6 +8537,45 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
     PASS();
 }
 
+#ifndef _WIN32
+/* A nested directory the process cannot open (permission-denied) must not
+ * abort the whole manifest walk: it has no control files to contribute, so
+ * it is skipped, and control files in sibling directories still get found.
+ * Root-not-a-directory (above) is a different, still fail-closed case. */
+TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_locked_dir_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "readable.py", "def Readable():\n    return 1\n");
+    write_temp_file(tmp, "locked/secret.txt", "should never be opened\n");
+    write_temp_file(tmp, "sibling/.gitignore", "*.log\n");
+
+    char locked_path[512];
+    snprintf(locked_path, sizeof(locked_path), "%s/locked", tmp);
+    ASSERT_EQ(chmod(locked_path, 0), 0);
+
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = -1;
+    int rc = cbm_pipeline_build_semantic_manifest("manifest-skip-locked", tmp, NULL, 0, NULL, 0,
+                                                  NULL, NULL, &manifest, &manifest_count);
+
+    bool found_sibling_gitignore = false;
+    for (int i = 0; i < manifest_count; i++) {
+        if (manifest[i].rel_path && strcmp(manifest[i].rel_path, "sibling/.gitignore") == 0) {
+            found_sibling_gitignore = true;
+        }
+    }
+
+    chmod(locked_path, 0755);
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(found_sibling_gitignore);
+    PASS();
+}
+#endif /* !_WIN32 */
+
 /* A fully validated staged graph must be able to recover from a definitely
  * non-SQLite destination without deleting evidence or overwriting an earlier
  * quarantine. The replacement happens only after the corrupt bytes are moved. */
@@ -9655,6 +9764,163 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* #606: a receiver typed as an unindexed (vendor/) class must not weakly bind a
+ * same-named project method. */
+static void write_php_receiver_fixture(const char *tmp) {
+    write_temp_file(tmp, "src/Item.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "class Item\n"
+                    "{\n"
+                    "    public function getUid(): int\n"
+                    "    {\n"
+                    "        return 1;\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/Domain/Repository.php",
+                    "<?php\n"
+                    "namespace App\\Domain;\n"
+                    "\n"
+                    "use App\\Item;\n"
+                    "use Vendor\\Storage\\File;\n"
+                    "\n"
+                    "class Repository\n"
+                    "{\n"
+                    "    public function findItem(): Item\n"
+                    "    {\n"
+                    "        return new Item();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function findFile(): File\n"
+                    "    {\n"
+                    "        return new File();\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/Listener.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "use Vendor\\Storage\\File;\n"
+                    "use function sprintf;\n"
+                    "\n"
+                    "class Listener\n"
+                    "{\n"
+                    "    public function vendorCall(File $file): int\n"
+                    "    {\n"
+                    "        return $file->getUid();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function selfCall(): int\n"
+                    "    {\n"
+                    "        return $this->localHelper();\n"
+                    "    }\n"
+                    "\n"
+                    "    private function localHelper(): int\n"
+                    "    {\n"
+                    "        return 1;\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/ChainListener.php",
+                    "<?php\n"
+                    "namespace App;\n"
+                    "\n"
+                    "use App\\Domain\\Repository;\n"
+                    "\n"
+                    "class ChainListener\n"
+                    "{\n"
+                    "    public function chainedVendorCall(Repository $repository): int\n"
+                    "    {\n"
+                    "        return $repository->findFile()->getUid();\n"
+                    "    }\n"
+                    "\n"
+                    "    public function projectCall(Repository $repository): Item\n"
+                    "    {\n"
+                    "        return $repository->findItem();\n"
+                    "    }\n"
+                    "}\n");
+}
+
+/* Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_php_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_php_receiver_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/php_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "src/Item.php", "getUid", "Method"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "vendorCall", "getUid"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "chainedVendorCall", "getUid"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "projectCall", "findItem"));
+    ASSERT_GTE(named_edge_count(s, project, "CALLS", "selfCall", "localHelper"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* >= 50 files forces pass_parallel.c. */
+TEST(pipeline_php_receiver_parallel_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_php_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_php_receiver_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/Filler%d.php", i);
+        snprintf(body, sizeof(body), "<?php\nfunction filler%d(): int\n{\n    return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/php_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(fixture_node_count(s, project, "src/Item.php", "getUid", "Method"), 1);
+    ASSERT_FALSE(cross_file_call_exists(s, project, "vendorCall", "getUid"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "chainedVendorCall", "getUid"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "projectCall", "findItem"));
+    ASSERT_GTE(named_edge_count(s, project, "CALLS", "selfCall", "localHelper"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
     th_rmtree(tmp);
     PASS();
 }
@@ -11588,6 +11854,486 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * (axios.get, api.patch on a renamed-axios instance, supertest request(app).get).
  * The regex false edge must stay suppressed in parallel too. CBM_WORKERS forces
  * >1 worker so the parallel path is taken regardless of the host core count. */
+/* #1355: padding count for write_external_import_shadow_fixture, deliberately
+ * well past MIN_FILES_FOR_PARALLEL (=50, a private #define in
+ * src/pipeline/pipeline.c — not exposed to tests, so this cannot be a
+ * static_assert against it) rather than sitting right at the threshold. The
+ * margin, not the exact value, is what the test depends on: a modest bump to
+ * the real threshold must not silently drop this fixture back onto the
+ * sequential-only path and leave the parallel resolver unexercised. Same
+ * pattern as ET_PARALLEL_PAD / CP_PARALLEL_PAD in test_edge_types_probe.c /
+ * test_convergence_probe.c. */
+enum { EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD = 64 };
+
+/* #1355: write the shared external-import-shadow fixture into `dir`.
+ * `pad_files` filler modules push the run over MIN_FILES_FOR_PARALLEL so the
+ * same tree can be indexed by both resolvers. */
+static void write_external_import_shadow_fixture(const char *dir, int pad_files) {
+    /* The lone project symbols named eq/sql — ordinary local helpers. */
+    write_temp_file(dir, "src/text-utils.ts",
+                    "export function eq(a: string, b: string): boolean {\n"
+                    "  return a.trim() === b.trim();\n"
+                    "}\n"
+                    "export function sql(chunk: string): string {\n"
+                    "  return chunk.replace(/\\s+/g, ' ');\n"
+                    "}\n"
+                    "export function normalize(s: string): string {\n"
+                    "  return s.trim().toLowerCase();\n"
+                    "}\n");
+    /* `eq` and `sql` come from an external package that is not in the tree, so
+     * the registry falls through to a project-wide same-name guess. These are
+     * the fabricated edges. `normalize` is imported relatively from the SAME
+     * file the guess would have picked — it must survive. */
+    write_temp_file(dir, "src/queries.ts",
+                    "import { eq, sql } from 'drizzle-orm';\n"
+                    "import { normalize } from './text-utils';\n"
+                    "export function buildQuery(id: string): unknown {\n"
+                    "  return [eq({ id }, id), sql('select 1'), normalize(id)];\n"
+                    "}\n");
+    /* No import of `eq` at all: nothing in the caller's source contradicts the
+     * guess, so the pre-existing fallback keeps its edge. */
+    write_temp_file(dir, "src/no-import.ts",
+                    "export function callsWithoutImport(a: string, b: string): boolean {\n"
+                    "  return eq(a, b);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function shadowPad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+/* #1355: assert the guard's whole contract against one indexed store. */
+static int assert_external_import_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the reported bug: an externally-imported name must not bind to the
+     * local homonym (RED before the fix, on both resolvers). */
+    if (cross_file_call_exists(s, project, "buildQuery", "eq")) {
+        rc = 4;
+    }
+    if (rc == 0 && cross_file_call_exists(s, project, "buildQuery", "sql")) {
+        rc = 5;
+    }
+    /* (2) the relative import to the very same file still resolves. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "buildQuery", "normalize")) {
+        rc = 6;
+    }
+    /* (3) a bare call the caller never imports keeps its pre-existing edge. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
+        rc = 7;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ext_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* Enough files that CBM_WORKERS can take the fused-parallel path; the same
+     * tree is then indexed by each resolver in turn, because the guard lives at
+     * two independent emit sites (pass_calls.c and pass_parallel.c). */
+    write_external_import_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    /* getenv() returns a pointer into the process environment that must be
+     * treated as read-only; strdup() below only ever reads through it. */
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_external_import_shadow_contract(tmp, "shadow-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_external_import_shadow_contract(tmp, "shadow-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355 / #1732: the same tree, but the bare specifier now names a WORKSPACE
+ * package that the repository itself ships. `main` deliberately points at a
+ * build artifact that is not checked in — the shape every real monorepo has,
+ * and the reason an entry-file lookup cannot answer this question. */
+static void write_workspace_shadow_fixture(const char *dir, int pad_files) {
+    /* One directory level only: write_temp_file's mkdir is documented as
+     * "simple version, one level", and a deeper path fails silently — which
+     * makes the fixture look healthy while the file never lands. */
+    write_temp_file(dir, "lib/package.json",
+                    "{\n  \"name\": \"@fixture/lib\",\n  \"main\": \"./dist/index.js\"\n}\n");
+    write_temp_file(dir, "lib/index.ts",
+                    "export function wsEq(a: string, b: string): boolean {\n"
+                    "  return a === b;\n"
+                    "}\n");
+    write_temp_file(dir, "app/package.json", "{\n  \"name\": \"@fixture/app\"\n}\n");
+    /* The lone project symbol named wsSpec — an ordinary local helper that a
+     * project-wide guess would happily bind an external `wsSpec` to. */
+    write_temp_file(dir, "app/spec-helpers.ts",
+                    "export function wsSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    write_temp_file(dir, "app/query.ts",
+                    "import { wsEq } from '@fixture/lib';\n"
+                    "import { wsSpec } from 'vitest';\n"
+                    "export function wsBuild(id: string): unknown {\n"
+                    "  return [wsEq(id, id), wsSpec('case')];\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function wsPad%02d(): number { return %d; }\n", i, i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_workspace_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the workspace sibling: the tree declares @fixture/lib, so the bare
+     * specifier is in-project and the fallback keeps its chance. RED without
+     * the package-map check — this is the 1377-edge class measured on
+     * drizzle-team/drizzle-orm. */
+    if (!cross_file_call_exists(s, project, "wsBuild", "wsEq")) {
+        rc = 4;
+    }
+    /* (2) a genuine third-party package in the very same file is still cut:
+     * the check must not disarm the guard wholesale. */
+    if (rc == 0 && cross_file_call_exists(s, project, "wsBuild", "wsSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ws_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_workspace_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_workspace_shadow_contract(tmp, "ws-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_workspace_shadow_contract(tmp, "ws-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355: the same tree once more, in a package-path language. A Kotlin/Java
+ * specifier is a dotted package path whether the package is the project's own
+ * or a dependency, so specifier shape decides nothing and the package map only
+ * knows manifest artifact names. The tree's own `package` declarations are the
+ * evidence, and the pipeline already collects them (the namespace map the
+ * import passes build). `assertEquals` is imported twice — from the project's
+ * package and from kotlin.test — exactly as JetBrains/Exposed writes it, which
+ * is what leaves the import map without a key and hands the call to the
+ * project-wide guess. */
+static void write_declared_package_shadow_fixture(const char *dir, int pad_files) {
+    /* One directory level only — write_temp_file's mkdir does not recurse, and
+     * a deeper path fails silently. The package path lives in the `package`
+     * declaration, not in the directory layout, which is the whole point. */
+    write_temp_file(dir, "util/Assert.kt",
+                    "package com.example.util\n"
+                    "\n"
+                    "fun pkgEq(a: String, b: String): Boolean {\n"
+                    "    return a == b\n"
+                    "}\n");
+    /* The lone project symbol named pkgSpec, in a third package so the guess
+     * that reaches it is a project-wide one and not a same-module hit. */
+    write_temp_file(dir, "spec/SpecHelpers.kt",
+                    "package com.example.spec\n"
+                    "\n"
+                    "fun pkgSpec(label: String): Boolean {\n"
+                    "    return label.isNotEmpty()\n"
+                    "}\n");
+    write_temp_file(dir, "app/Query.kt",
+                    "package com.example.app\n"
+                    "\n"
+                    "import com.example.util.pkgEq\n"
+                    "import kotlin.test.pkgEq\n"
+                    "import kotlin.test.pkgSpec\n"
+                    "import org.junit.pkgSpec\n"
+                    "\n"
+                    "fun pkgBuild(id: String): Boolean {\n"
+                    "    return pkgEq(id, id) && pkgSpec(id)\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/Pad%02d.kt", i);
+        snprintf(body, sizeof(body),
+                 "package com.example.app\n\nfun pkgPad%02d(): Int {\n    return %d\n}\n", i, i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_declared_package_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* The package the tree declares: `com.example.util` is in-project, so the
+     * call keeps its edge. RED without the declared-package check — this is the
+     * 426-edge class measured on JetBrains/Exposed.
+     *
+     * The matching negative — an undeclared package is still cut — is asserted
+     * where it can be reached on BOTH resolvers: directly on the predicate in
+     * test_registry.c (external_import_shadow_declared_package_kept, including
+     * `java.net.URL`), and end-to-end in the route fixture below. The
+     * sequential resolver builds its own import map straight from the
+     * extraction records, without the ambiguity check its parallel twin
+     * applies, so a doubly-imported Kotlin name resolves by `import_map` there
+     * and never reaches this guard at all — asserting the negative here would
+     * assert that quirk, not this contract. */
+    if (!cross_file_call_exists(s, project, "pkgBuild", "pkgEq")) {
+        rc = 4;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_pkg_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_declared_package_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_declared_package_shadow_contract(tmp, "pkg-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_declared_package_shadow_contract(tmp, "pkg-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355: the guard must suppress ONLY the plain-CALLS fall-through, never the
+ * route/HTTP/CONFIG classification that runs inside the emitters. A bare call
+ * bound by a package import is exactly the shape a route registration takes
+ * when the router is a dependency, and dropping it before classification costs
+ * the Route node and every HANDLES edge downstream of it. Same reasoning, and
+ * the same drop_plain_call seam, as the #592/#606 member guard. */
+static void write_route_shadow_fixture(const char *dir, int pad_files) {
+    /* The project symbols the guess would bind to. The file name puts "express"
+     * in their qualified names, which is what makes the resolved QN classify as
+     * a route registration — the same substring match main uses on real trees. */
+    write_temp_file(dir, "app/express-routes.ts",
+                    "export function regGet(path: string, handler: unknown): string {\n"
+                    "  return path;\n"
+                    "}\n"
+                    "export function regSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    /* Both names come from a package outside the tree. `regGet` carries a
+     * path-shaped first argument, so it is a route registration; `regSpec` is
+     * an ordinary fabricated edge and must still go. */
+    write_temp_file(dir, "app/server.ts",
+                    "import { regGet, regSpec } from 'vendor-router';\n"
+                    "export function boot(): string {\n"
+                    "  return regGet('/orders', () => 'ok') + regSpec('case');\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function routePad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_route_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the Route node survives the guard. RED when the guard returns before
+     * the emitter: main mints __route__ANY__/orders here and the published
+     * guard lost it, together with every HANDLES edge that hangs off it. */
+    if (count_nodes_named(s, project, "/orders") < 1) {
+        rc = 4;
+    }
+    /* (2) the fabricated plain-CALLS edge in the same file is still removed, so
+     * (1) cannot pass by the guard having been disarmed. */
+    if (rc == 0 && cross_file_call_exists(s, project, "boot", "regSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_route_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_route_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_route_shadow_contract(tmp, "route-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_route_shadow_contract(tmp, "route-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_par_XXXXXX");
@@ -13031,6 +13777,40 @@ TEST(pipeline_native_fetch_classified_as_http_calls) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_native_fetch_template_base_url_makes_route) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fetch_template_base_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/api.ts",
+                    "const BASE_URL = \"http://payments:8080\";\n"
+                    "export async function createPayment(body: unknown) {\n"
+                    "  return fetch(`${BASE_URL}/v1/payments`, { method: 'POST', body });\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fetch_template_base.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int http_call_count = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
+    int matching_route_count =
+        http_calls_to_route(s, project, "createPayment", "/v1/payments");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_EQ(http_call_count, 1);
+    ASSERT_EQ(matching_route_count, 1);
     PASS();
 }
 
@@ -27522,6 +28302,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
     RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_php_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_php_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_method_caller_keeps_lsp_join);
@@ -27552,6 +28334,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355);
     RUN_TEST(pipeline_python_package_relative_imports);
     RUN_TEST(pipeline_python_package_relative_imports_parallel);
     RUN_TEST(pipeline_python_from_import_bare_call_issue1237);
@@ -27563,6 +28349,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ts_config_object_url_http_calls_issue2235);
     RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
+    RUN_TEST(pipeline_native_fetch_template_base_url_makes_route);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
@@ -27934,6 +28721,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_dbt_jinja_lineage);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
     RUN_TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full);
+    RUN_TEST(pipeline_incremental_root_path_refreshed_across_directories);
     RUN_TEST(pipeline_closure_repair_removed_def_drops_dependent_edge);
     RUN_TEST(pipeline_closure_repair_added_name_declines_to_full);
     RUN_TEST(pipeline_closure_repair_new_file_declines_to_full);
@@ -27967,6 +28755,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
     RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
+#ifndef _WIN32
+    RUN_TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory);
+#endif
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
 #endif
