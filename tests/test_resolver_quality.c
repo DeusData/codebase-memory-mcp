@@ -1334,7 +1334,34 @@ TEST(resolver_quality_oracle_variant_bounds_cover_whole_occurrence) {
     PASS();
 }
 
+TEST(resolver_quality_oracle_accepts_crlf_without_weakening_declaration_identity) {
+    const struct {
+        const char *source;
+        bool valid;
+    } cases[] = {
+        {"// library\r\nvoid target(int value) {}\r\n", true},
+        {"// library\nvoid target(int value) {}\n", true},
+        {"// library\r\nvoid target(int value) {}", true},
+        {"// library\r\nvoid target(int value) {} \r\n", false},
+        {"// library\r\nvoid target(int value) {}\r\r\n", false},
+        {"// library\r\nvoid target(int value) {}\r", false},
+        {"// library\r\nvoid target(\rint value) {}\r\n", false},
+        {"// library\r\nvoid decoy(int value) {}\r\n", false},
+    };
+    const RQ_Target target = {.file = "lib.c",
+                              .suffix = "lib.target",
+                              .label = "Function",
+                              .declaration_line = 2,
+                              .declaration_text = "void target(int value) {}"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        RQ_Source input = {.path = "lib.c", .text = cases[i].source};
+        ASSERT_EQ(rq_target_anchor(&target, &input, 1), cases[i].valid);
+    }
+    PASS();
+}
+
 SUITE(resolver_quality) {
+    RUN_TEST(resolver_quality_oracle_accepts_crlf_without_weakening_declaration_identity);
     RUN_TEST(resolver_quality_oracle_variant_bounds_cover_whole_occurrence);
     RUN_TEST(resolver_quality_oracle_requires_exact_authored_caller_variant);
     RUN_TEST(resolver_quality_project_domain_preserves_exact_sites_and_project_targets);

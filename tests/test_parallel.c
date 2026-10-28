@@ -1023,8 +1023,10 @@ TEST(parallel_args_json_no_overflow) {
     ASSERT_TRUE(gbuf != NULL);
     char *source = parallel_fixture_source(path);
     ASSERT_NOT_NULL(source);
-    const char *call = strstr(source, "sink(\n");
-    const char *end = call ? strstr(call, "  );") : NULL;
+    const char *call = strstr(source, "  sink(");
+    ASSERT_NOT_NULL(call);
+    call += 2;
+    const char *end = strstr(call, "  );");
     ASSERT_NOT_NULL(end);
     RQ_Source input = {.path = "app.ts", .text = source};
     RQ_Expected expected = {
@@ -1076,8 +1078,10 @@ TEST(parallel_args_json_no_overflow) {
     const char *serializer_sources[] = {source, long_source};
     for (int control = 0; control < 2; control++) {
         const char *text = serializer_sources[control];
-        const char *site = strstr(text, "sink(\n");
-        const char *site_end = site ? strstr(site, "  );") : NULL;
+        const char *site = strstr(text, "  sink(");
+        ASSERT_NOT_NULL(site);
+        site += 2;
+        const char *site_end = strstr(site, "  );");
         ASSERT_NOT_NULL(site_end);
         CBMFileResult *extracted = cbm_extract_file(text, (int)strlen(text), CBM_LANG_TYPESCRIPT,
                                                     "argov-test", "app.ts", 0, NULL, NULL);
@@ -4268,7 +4272,7 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     }
     char path[512];
     snprintf(path, sizeof(path), "%s/main.rs", tmpdir);
-    FILE *file = cbm_fopen(path, "w");
+    FILE *file = cbm_fopen(path, "wb");
     if (!file) {
         rmdir(tmpdir);
         FAIL("fopen main.rs failed");
@@ -4601,7 +4605,7 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     char jdir[512];
     snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
     cbm_mkdir_p(jdir, 0755);
-    FILE *jf = cbm_fopen(jpath, "w");
+    FILE *jf = cbm_fopen(jpath, "wb");
     if (!jf) {
         FAIL("fopen example.java failed");
     }
@@ -4613,7 +4617,7 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     char kdir[512];
     snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
     cbm_mkdir_p(kdir, 0755);
-    FILE *kf = cbm_fopen(kpath, "w");
+    FILE *kf = cbm_fopen(kpath, "wb");
     if (!kf) {
         unlink(jpath);
         rmdir(tmpdir);
@@ -5240,7 +5244,7 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     char jdir[512];
     snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
     cbm_mkdir_p(jdir, 0755);
-    FILE *jf = cbm_fopen(jpath, "w");
+    FILE *jf = cbm_fopen(jpath, "wb");
     if (!jf) {
         FAIL("fopen Example.java failed");
     }
@@ -5252,7 +5256,7 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     char kdir[512];
     snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
     cbm_mkdir_p(kdir, 0755);
-    FILE *kf = cbm_fopen(kpath, "w");
+    FILE *kf = cbm_fopen(kpath, "wb");
     if (!kf) {
         FAIL("fopen KotlinService.kt failed");
     }

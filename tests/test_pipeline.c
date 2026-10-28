@@ -1410,7 +1410,7 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
 
     char nix_path[512];
     snprintf(nix_path, sizeof(nix_path), "%s/lib.nix", g_tmpdir);
-    FILE *nf = cbm_fopen(nix_path, "w");
+    FILE *nf = cbm_fopen(nix_path, "wb");
     if (!nf) {
         teardown_test_repo();
         FAIL("failed to write nix fixture");

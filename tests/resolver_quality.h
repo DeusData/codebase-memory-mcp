@@ -256,6 +256,8 @@ static inline bool rq_target_anchor(const RQ_Target *target, const RQ_Source *so
         text++;
     }
     size_t length = strcspn(text, "\n");
+    if (length > 0 && text[length] == '\n' && text[length - 1] == '\r')
+        length--;
     return strlen(target->declaration_text) == length &&
            !memcmp(text, target->declaration_text, length);
 }
