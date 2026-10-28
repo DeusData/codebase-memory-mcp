@@ -694,7 +694,7 @@ overwrite user-modified agents.
 
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
-| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
+| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, post-`Read` coverage, and a drift note after repeated searches without a graph call |
 | Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, skill, three read-only agents; `SessionStart` + `SubagentStart`, `PreToolUse` graph lookup for `Bash` searches |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
@@ -755,7 +755,10 @@ the requested tool call. Codex CLI's `PreToolUse` on `Bash` gives its shell
 searches the same context. GitHub Copilot CLI and VS Code's Copilot runtime get
 it after the search: their `preToolUse` can only decide permissions, so a
 `PostToolUse` entry for `Bash`, `Grep` and `Glob` appends the graph symbols to
-the tool result.
+the tool result. In Claude Code, once a session has run three searches with no
+codebase-memory-mcp tool call, the next augmentation adds one line saying so;
+the next note comes after six searches, then twelve. Claude's `PostToolUse`
+entry also matches the graph tools, and a graph tool call resets the count.
 
 Claude Code, Codex CLI, Qwen Code, GitHub Copilot CLI, and VS Code's Copilot
 runtime receive paired session/subagent context where the vendor exposes a

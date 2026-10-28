@@ -7804,6 +7804,85 @@ TEST(body_tokens_wide_body_samples_from_the_start) {
     PASS();
 }
 
+/* The YAML walkers kept their pending mappings in fixed-size stacks (256 for
+ * the dotted key-path walk, 512 for the infrastructure-binding scan) and
+ * silently stopped pushing once full (#2388). A root mapping with more nested
+ * sibling mappings than the old cap lost the full dotted key_path of every
+ * leaf past it: `k299.url` was only ever recorded as the bare `url` that the
+ * per-mapping walk of the nested block emits. */
+enum { WIDE_YAML_KEYS = 300, WIDE_YAML_ITEMS = 600 };
+
+static int has_string_ref_path(CBMFileResult *r, const char *key_path, const char *value) {
+    for (int i = 0; i < r->string_refs.count; i++) {
+        const CBMStringRef *s = &r->string_refs.items[i];
+        if (s->key_path && s->value && strcmp(s->key_path, key_path) == 0 &&
+            strcmp(s->value, value) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(yaml_key_paths_wide_mapping_exceed_old_stack_cap) {
+    size_t cap = (size_t)WIDE_YAML_KEYS * 48 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_YAML_KEYS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos,
+                                "k%d:\n  url: \"https://h%d.example.com/x\"\n", i, i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_YAML, "t", "wide.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_YAML_KEYS; i++) {
+        char path[32];
+        char value[48];
+        snprintf(path, sizeof(path), "k%d.url", i);
+        snprintf(value, sizeof(value), "https://h%d.example.com/x", i);
+        ASSERT(has_string_ref_path(r, path, value));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+static int has_infra_source(CBMFileResult *r, const char *source, const char *url) {
+    for (int i = 0; i < r->infra_bindings.count; i++) {
+        const CBMInfraBinding *b = &r->infra_bindings.items[i];
+        if (b->source_name && b->target_url && strcmp(b->source_name, source) == 0 &&
+            strcmp(b->target_url, url) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(yaml_infra_bindings_wide_sequence_exceed_old_stack_cap) {
+    size_t cap = (size_t)WIDE_YAML_ITEMS * 64 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_YAML_ITEMS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos,
+                                "- topic: t%d\n  push_endpoint: \"https://h%d.example.com/p\"\n", i,
+                                i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_YAML, "t", "pubsub.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_YAML_ITEMS; i++) {
+        char source[16];
+        char url[48];
+        snprintf(source, sizeof(source), "t%d", i);
+        snprintf(url, sizeof(url), "https://h%d.example.com/p", i);
+        ASSERT(has_infra_source(r, source, url));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Perl call-graph noise (#459 follow-up)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -14077,6 +14156,8 @@ SUITE(extraction) {
     RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
     RUN_TEST(body_tokens_wide_body_samples_from_the_start);
+    RUN_TEST(yaml_key_paths_wide_mapping_exceed_old_stack_cap);
+    RUN_TEST(yaml_infra_bindings_wide_sequence_exceed_old_stack_cap);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);

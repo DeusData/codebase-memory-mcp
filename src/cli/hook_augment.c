@@ -26,6 +26,8 @@
 #include "yyjson/yyjson.h"
 
 #include <ctype.h>
+#include <limits.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1414,6 +1416,129 @@ static void ha_tool_call_free(ha_tool_call_t *call) {
     call->input = NULL;
 }
 
+/* Drift reminder (#509). A Claude Code session that keeps searching with Grep,
+ * Glob or Bash and makes no codebase-memory-mcp tool call gets one factual line
+ * on its next augmentation once HA_DRIFT_FIRST searches have run; the threshold
+ * then doubles (3, 6, 12, ...), and a graph tool call resets the session. The
+ * managed PostToolUse hook matches the graph tools for that reset. The state
+ * lives in the process that runs hook requests, which is the daemon, keyed by
+ * the payload's session_id in a bounded table that evicts the least recently
+ * used session. Codex sends the same event payload, with a turn_id, but has no
+ * reset hook, so its sessions are not tracked. */
+enum {
+    HA_DRIFT_SESSIONS = 64,
+    HA_DRIFT_FIRST = 3,
+    HA_DRIFT_SESSION_MAX = 128,
+};
+
+typedef struct {
+    char session[HA_DRIFT_SESSION_MAX + 1];
+    unsigned searches;
+    unsigned threshold;
+    uint64_t used;
+} ha_drift_slot_t;
+
+static ha_drift_slot_t g_ha_drift[HA_DRIFT_SESSIONS];
+static uint64_t g_ha_drift_clock;
+static atomic_flag g_ha_drift_spin = ATOMIC_FLAG_INIT;
+
+static void ha_drift_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_ha_drift_spin, memory_order_acquire)) {}
+}
+
+static void ha_drift_unlock(void) {
+    atomic_flag_clear_explicit(&g_ha_drift_spin, memory_order_release);
+}
+
+static const char *ha_drift_session(yyjson_val *root, ha_lifecycle_dialect_t dialect) {
+    if (dialect != HA_DIALECT_EVENT || !root || yyjson_obj_get(root, "turn_id")) {
+        return NULL;
+    }
+    const char *session = ha_obj_str(root, "session_id");
+    size_t length = session ? strlen(session) : 0U;
+    if (length == 0U || length > HA_DRIFT_SESSION_MAX) {
+        return NULL;
+    }
+    for (size_t i = 0U; i < length; i++) {
+        unsigned char ch = (unsigned char)session[i];
+        if (!isalnum(ch) && ch != '-' && ch != '_' && ch != '.') {
+            return NULL;
+        }
+    }
+    return session;
+}
+
+/* Claude names MCP tools mcp__<server>__<tool>, and a plugin's servers
+ * mcp__plugin_<plugin>_<server>__<tool>. */
+static bool ha_is_graph_tool(const char *tool) {
+    return tool && strncmp(tool, "mcp__", 5) == 0 && strstr(tool, "codebase-memory-mcp__");
+}
+
+/* The caller holds the lock. An unknown session takes an empty slot, or else
+ * the least recently used one. */
+static ha_drift_slot_t *ha_drift_find(const char *session, bool create) {
+    ha_drift_slot_t *victim = NULL;
+    for (size_t i = 0U; i < HA_DRIFT_SESSIONS; i++) {
+        ha_drift_slot_t *slot = &g_ha_drift[i];
+        if (slot->session[0] && strcmp(slot->session, session) == 0) {
+            slot->used = ++g_ha_drift_clock;
+            return slot;
+        }
+        if (!victim || (victim->session[0] && (!slot->session[0] || slot->used < victim->used))) {
+            victim = slot;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    snprintf(victim->session, sizeof(victim->session), "%s", session);
+    victim->searches = 0U;
+    victim->threshold = HA_DRIFT_FIRST;
+    victim->used = ++g_ha_drift_clock;
+    return victim;
+}
+
+static void ha_drift_reset(const char *session) {
+    ha_drift_lock();
+    ha_drift_slot_t *slot = ha_drift_find(session, false);
+    if (slot) {
+        memset(slot, 0, sizeof(*slot));
+    }
+    ha_drift_unlock();
+}
+
+/* Counts one search. The reminder is due when the count has reached the
+ * threshold and this search has an augmentation to carry it; delivering it
+ * raises the threshold past the count by doubling. */
+static bool ha_drift_note_search(const char *session, bool augmented, unsigned *searches) {
+    ha_drift_lock();
+    ha_drift_slot_t *slot = ha_drift_find(session, true);
+    if (slot->searches < UINT_MAX) {
+        slot->searches++;
+    }
+    bool due = augmented && slot->searches >= slot->threshold;
+    while (due && slot->threshold <= slot->searches && slot->threshold <= UINT_MAX / 2U) {
+        slot->threshold *= 2U;
+    }
+    *searches = slot->searches;
+    ha_drift_unlock();
+    return due;
+}
+
+/* Writes the context followed by the drift line into out. Returns false when
+ * they do not fit, and the caller then sends the context alone. The context is
+ * at most 4096 bytes plus the follow-up line, so HA_DRIFT_CONTEXT_CAP fits it. */
+enum { HA_DRIFT_CONTEXT_CAP = 5120 };
+
+static bool ha_drift_context(char *out, size_t out_size, const char *context, unsigned searches) {
+    int written = snprintf(out, out_size,
+                           "%s\n[codebase-memory] This session has run %u searches since its last "
+                           "codebase-memory-mcp tool call. Questions about callers, callees, call "
+                           "paths and definitions are one graph call each.",
+                           context, searches);
+    return written > 0 && (size_t)written < out_size;
+}
+
 static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *event,
                                     const char *tool, bool *coverage) {
     if (coverage) {
@@ -1752,6 +1877,13 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
     ha_tool_call_read(root, forced_event, dialect, &call);
     const char *event = call.event;
     const char *tool = call.tool;
+    const char *session = ha_drift_session(root, dialect);
+    if (session && event && strcmp(event, "PostToolUse") == 0 && ha_is_graph_tool(tool)) {
+        ha_drift_reset(session);
+        ha_tool_call_free(&call);
+        yyjson_doc_free(doc);
+        return NULL;
+    }
     bool coverage = false;
     if (!ha_tool_event_supported(dialect, event, tool, &coverage)) {
         ha_tool_call_free(&call);
@@ -1809,10 +1941,17 @@ static char *ha_process(cbm_mcp_server_t *srv, const char *input_json, const cha
     }
 
     char *ctx = ha_resolve_and_query(srv, cwd, token);
+    unsigned searches = 0U;
+    char drift_context[HA_DRIFT_CONTEXT_CAP];
+    const char *text = ctx;
+    if (session && ha_drift_note_search(session, ctx != NULL, &searches) &&
+        ha_drift_context(drift_context, sizeof(drift_context), ctx, searches)) {
+        text = drift_context;
+    }
     char *output = NULL;
-    if (ctx) {
-        output = dialect == HA_DIALECT_COPILOT ? ha_build_copilot_json(ctx)
-                                               : ha_build_event_json(event, ctx);
+    if (text) {
+        output = dialect == HA_DIALECT_COPILOT ? ha_build_copilot_json(text)
+                                               : ha_build_event_json(event, text);
     }
     free(ctx);
     yyjson_doc_free(doc);
