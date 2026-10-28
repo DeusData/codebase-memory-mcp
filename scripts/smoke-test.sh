@@ -1697,7 +1697,8 @@ echo "OK 8c-i: Claude exact-tool graph subagent"
 
 # 8d: Claude Code hooks keep search augmentation and read-coverage reporting
 # separate: PreToolUse matches exactly Grep|Glob|Bash, while PostToolUse matches
-# exactly Read. Neither hook may grow a Search or catch-all matcher.
+# exactly Read plus the graph tools, whose calls reset the drift note. Neither
+# hook may grow a Search or catch-all matcher.
 if ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -1705,14 +1706,15 @@ all_hooks = d.get('hooks', {})
 pre = all_hooks.get('PreToolUse', [])
 post = all_hooks.get('PostToolUse', [])
 ok = (any(h.get('matcher') == 'Grep|Glob|Bash' for h in pre) and
-      any(h.get('matcher') == 'Read' for h in post))
-bad = any('Search' in str(h.get('matcher', '')) for h in pre + post)
+      any(h.get('matcher') == 'Read|mcp__.*codebase-memory-mcp__.*' for h in post))
+bad = any('Search' in str(h.get('matcher', '')) or h.get('matcher', '') in ('', '*')
+          for h in pre + post)
 sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
   echo "FAIL 8d: Claude search/read hook matchers are not exact"
   exit 1
 fi
-echo "OK 8d: Claude Code PreToolUse Grep|Glob|Bash + PostToolUse Read"
+echo "OK 8d: Claude Code PreToolUse Grep|Glob|Bash + PostToolUse Read and graph tools"
 
 # 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
 # #929: Windows installs a .cmd script (extensionless bash shims triggered the

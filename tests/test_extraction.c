@@ -6552,6 +6552,81 @@ TEST(extract_py_url_fold_no_fabrication_issue706) {
     PASS();
 }
 
+/* Issue #523 follow-up: a Python string whose opening token is more than one
+ * quote -- a prefix (r"", u"", b"", Rb"", an f"" with no field) or a triple
+ * quote -- kept the prefix and the extra quotes in the URL (`f"http://..."`,
+ * `""http://...""`), so the HTTP_CALLS edge never matched a route. Each must
+ * yield the bare URL, positional or as `url=`. */
+TEST(extract_py_prefixed_string_url_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def f_plain():\n"
+                               "    return requests.get(f\"http://svc/v2/health\")\n"
+                               "def raw():\n"
+                               "    return requests.get(r\"http://svc/v2/health\")\n"
+                               "def uni():\n"
+                               "    return requests.get(u\"http://svc/v2/health\")\n"
+                               "def byt():\n"
+                               "    return requests.get(b\"http://svc/v2/health\")\n"
+                               "def raw_bytes():\n"
+                               "    return requests.get(Rb\"http://svc/v2/health\")\n"
+                               "def triple():\n"
+                               "    return requests.get(\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def triple_single():\n"
+                               "    return requests.get('''http://svc/v2/health''')\n"
+                               "def f_triple():\n"
+                               "    return requests.get(f\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def kw():\n"
+                               "    return requests.get(url=r\"http://svc/v2/health\")\n",
+                               CBM_LANG_PYTHON, "t", "client.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "uni"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "byt"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_bytes"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "kw"), "http://svc/v2/health");
+
+    /* A wrapped literal is still a fully known value, so it is exact. */
+    const CBMCall *raw = find_call_in_func(r, "requests.get", "raw");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_GTE(raw->arg_count, 1);
+    ASSERT_NOT_NULL(raw->args[0].value);
+    ASSERT_STR_EQ(raw->args[0].value, "http://svc/v2/health");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a plain one-quote literal keeps the literal path
+ * unchanged, and an interpolating f-string still folds its field to "{}". */
+TEST(extract_py_prefixed_string_url_controls_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def plain():\n"
+                               "    return requests.get(\"http://svc/v2/health\")\n"
+                               "def plain_single():\n"
+                               "    return requests.get('http://svc/v2/health')\n"
+                               "def field(order_id):\n"
+                               "    return requests.get(f\"http://svc/v2/orders/{order_id}\")\n"
+                               "def raw_field(order_id):\n"
+                               "    return requests.get(rf\"http://svc/v2/orders/{order_id}\")\n",
+                               CBM_LANG_PYTHON, "t", "ctl.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "field"), "http://svc/v2/orders/{}");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_field"), "http://svc/v2/orders/{}");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1147: a frontend that composes every endpoint from module constants
  * -- a base constant, template literals over it, and an object-literal map of
  * endpoints -- extracted none of its API calls. Each template / concatenation
@@ -7355,6 +7430,85 @@ TEST(body_tokens_wide_body_samples_from_the_start) {
     ASSERT_NOT_NULL(d->body_tokens);
     ASSERT_GTE(strlen(d->body_tokens), ep);
     ASSERT_MEM_EQ(d->body_tokens, expect, ep);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+/* The YAML walkers kept their pending mappings in fixed-size stacks (256 for
+ * the dotted key-path walk, 512 for the infrastructure-binding scan) and
+ * silently stopped pushing once full (#2388). A root mapping with more nested
+ * sibling mappings than the old cap lost the full dotted key_path of every
+ * leaf past it: `k299.url` was only ever recorded as the bare `url` that the
+ * per-mapping walk of the nested block emits. */
+enum { WIDE_YAML_KEYS = 300, WIDE_YAML_ITEMS = 600 };
+
+static int has_string_ref_path(CBMFileResult *r, const char *key_path, const char *value) {
+    for (int i = 0; i < r->string_refs.count; i++) {
+        const CBMStringRef *s = &r->string_refs.items[i];
+        if (s->key_path && s->value && strcmp(s->key_path, key_path) == 0 &&
+            strcmp(s->value, value) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(yaml_key_paths_wide_mapping_exceed_old_stack_cap) {
+    size_t cap = (size_t)WIDE_YAML_KEYS * 48 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_YAML_KEYS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos,
+                                "k%d:\n  url: \"https://h%d.example.com/x\"\n", i, i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_YAML, "t", "wide.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_YAML_KEYS; i++) {
+        char path[32];
+        char value[48];
+        snprintf(path, sizeof(path), "k%d.url", i);
+        snprintf(value, sizeof(value), "https://h%d.example.com/x", i);
+        ASSERT(has_string_ref_path(r, path, value));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+static int has_infra_source(CBMFileResult *r, const char *source, const char *url) {
+    for (int i = 0; i < r->infra_bindings.count; i++) {
+        const CBMInfraBinding *b = &r->infra_bindings.items[i];
+        if (b->source_name && b->target_url && strcmp(b->source_name, source) == 0 &&
+            strcmp(b->target_url, url) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(yaml_infra_bindings_wide_sequence_exceed_old_stack_cap) {
+    size_t cap = (size_t)WIDE_YAML_ITEMS * 64 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_YAML_ITEMS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos,
+                                "- topic: t%d\n  push_endpoint: \"https://h%d.example.com/p\"\n", i,
+                                i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_YAML, "t", "pubsub.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_YAML_ITEMS; i++) {
+        char source[16];
+        char url[48];
+        snprintf(source, sizeof(source), "t%d", i);
+        snprintf(url, sizeof(url), "https://h%d.example.com/p", i);
+        ASSERT(has_infra_source(r, source, url));
+    }
     cbm_free_result(r);
     free(src);
     PASS();
@@ -13582,6 +13736,8 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
     RUN_TEST(extract_py_concat_const_url_issue706);
     RUN_TEST(extract_py_url_fold_no_fabrication_issue706);
+    RUN_TEST(extract_py_prefixed_string_url_issue523);
+    RUN_TEST(extract_py_prefixed_string_url_controls_issue523);
     RUN_TEST(extract_ts_const_template_url_issue1147);
     RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
     RUN_TEST(extract_ts_folded_topics_keep_raw_identity);
@@ -13619,6 +13775,8 @@ SUITE(extraction) {
     RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
     RUN_TEST(body_tokens_wide_body_samples_from_the_start);
+    RUN_TEST(yaml_key_paths_wide_mapping_exceed_old_stack_cap);
+    RUN_TEST(yaml_infra_bindings_wide_sequence_exceed_old_stack_cap);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);

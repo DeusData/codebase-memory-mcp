@@ -13,7 +13,7 @@ internal/cbm/lsp/perl_lsp.c	21
 internal/cbm/macro_table.c	1
 internal/cbm/service_patterns.c	2
 internal/cbm/sqlite_writer.c	74
-src/cli/activation_transaction.c	80
+src/cli/activation_transaction.c	78
 src/cli/agent_clients.c	73
 src/cli/agent_profiles.c	7
 src/cli/cli.c	166
