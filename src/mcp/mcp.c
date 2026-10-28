@@ -154,7 +154,7 @@ enum {
 #define MCP_MAX_MESSAGE_SIZE ((size_t)10U * 1024U * 1024U)
 #define MCP_MAX_HEADER_SIZE ((size_t)8U * 1024U)
 #define MCP_SEARCH_OUTPUT_MAX ((size_t)64U * 1024U * 1024U)
-#define MCP_SEARCH_SCAN_TIMEOUT_MS ((uint64_t)30000U)
+#define MCP_SEARCH_SCAN_TIMEOUT_MS ((uint64_t)180000U)
 #define MCP_FILE_OUTLINE_OUTPUT_MAX ((size_t)2U * 1024U * 1024U)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
