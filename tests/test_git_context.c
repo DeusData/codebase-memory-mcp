@@ -10,7 +10,9 @@
  *
  * The canonical_root tests shell out to `git`, so they SKIP_PLATFORM on
  * Windows (the CI shell there cannot init a repo via system()). The root-path
- * existence test runs on every platform.
+ * existence test runs on every platform. The bounded worktree-status tests
+ * below shell out through cbm_popen instead, so they run on every platform
+ * that has git on PATH.
  *
  * Reproduce-first guard: canonical_root_subdir is the genuine RED-without-the-fix
  * guard — a repo indexed from a subdirectory yields a relative --git-common-dir
@@ -495,6 +497,312 @@ TEST(git_branch_resolve_matches_full_context) {
 #endif /* _WIN32 */
 }
 
+/* The freshness verdict reads this snapshot, so an inherited GIT_DIR /
+ * GIT_WORK_TREE pointing at a dirty decoy must not make a clean fixture
+ * report the decoy's changes as its own (#2003). */
+TEST(worktree_status_ignores_inherited_repo_env) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based env-isolation test not supported on Windows CI");
+#else
+    char root[256];
+    char *raw = th_mktempdir("cbm_gitenv_status");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
+    snprintf(root, sizeof(root), "%s", raw);
+    if (make_env_isolation_tree(root) != 0) {
+        th_rmtree(root);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    char decoy[512], fixture[512], path[600];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(fixture, sizeof(fixture), "%s/fixture", root);
+    /* Dirty only the decoy: one tracked edit and one untracked file. */
+    snprintf(path, sizeof(path), "%s/a.go", decoy);
+    th_write_file(path, "package a // dirty\n");
+    snprintf(path, sizeof(path), "%s/untracked.go", decoy);
+    th_write_file(path, "package a\n");
+
+    git_env_snapshot_t snap;
+    git_env_hook_enter(&snap, decoy);
+    cbm_worktree_status_t st;
+    int rc = cbm_git_worktree_status(fixture, 4, &st);
+    git_env_hook_leave(&snap);
+    bool available = st.available;
+    int tracked = st.tracked_count;
+    int untracked = st.untracked_count;
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(root);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(available);
+    ASSERT_EQ(tracked, 0); /* the fixture is clean; the decoy is not */
+    ASSERT_EQ(untracked, 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
+/* ── Bounded worktree status (BT-240 increment 3) ──────────────────────
+ * These run on EVERY platform, not just POSIX: they shell out through
+ * cbm_popen instead of system(), so they work whenever git is on PATH —
+ * Windows CI included. The
+ * core status parser is platform-neutral and must be exercised everywhere git
+ * is available; only a genuinely missing git skips. */
+
+static int status_git_run(const char *dir, const char *args) {
+    char cmd[1024];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>%s", dir, args, null_dev);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return -1;
+    }
+    char drain[256];
+    while (fgets(drain, sizeof(drain), fp)) {
+    }
+    return cbm_pclose(fp);
+}
+
+static int status_make_repo(const char *dir) {
+    if (th_mkdir_p(dir) != 0) return -1;
+    if (status_git_run(dir, "init -q") != 0) return -1;
+    if (status_git_run(dir, "config user.email test@example.com") != 0) return -1;
+    if (status_git_run(dir, "config user.name Test") != 0) return -1;
+    if (th_write_file(TH_PATH(dir, ".keep"), "") != 0) return -1;
+    if (status_git_run(dir, "add -A") != 0) return -1;
+    if (status_git_run(dir, "commit -qm init") != 0) return -1;
+    return 0;
+}
+
+TEST(worktree_status_clean) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    if (status_make_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, 8, &st);
+    if (rc != 0 || !st.available) {
+        cbm_git_worktree_status_free(&st);
+        th_rmtree(tmp);
+        FAIL("clean repo status not available");
+    }
+    ASSERT_EQ(st.tracked_count, 0);
+    ASSERT_EQ(st.untracked_count, 0);
+    ASSERT_EQ(st.tracked_sample_count, 0);
+    ASSERT_EQ(st.untracked_sample_count, 0);
+    ASSERT_FALSE(st.tracked_truncated);
+    ASSERT_FALSE(st.untracked_truncated);
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(worktree_status_tracked_modified) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    if (status_make_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(tmp, "tracked.txt"), "v1") != 0 ||
+        status_git_run(tmp, "add -f -- tracked.txt") != 0 ||
+        status_git_run(tmp, "commit -q -m add-tracked") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to commit tracked file");
+    }
+    if (th_write_file(TH_PATH(tmp, "tracked.txt"), "v2") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to modify tracked file");
+    }
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, 8, &st);
+    if (rc != 0 || !st.available) {
+        cbm_git_worktree_status_free(&st);
+        th_rmtree(tmp);
+        FAIL("status not available");
+    }
+    ASSERT_EQ(st.tracked_count, 1);
+    ASSERT_EQ(st.untracked_count, 0);
+    ASSERT_EQ(st.tracked_sample_count, 1);
+    ASSERT_STR_EQ(st.tracked_paths[0], "tracked.txt");
+    ASSERT_FALSE(st.tracked_truncated);
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(worktree_status_untracked) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    if (status_make_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(tmp, "newfile.txt"), "n") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to create untracked file");
+    }
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, 8, &st);
+    if (rc != 0 || !st.available) {
+        cbm_git_worktree_status_free(&st);
+        th_rmtree(tmp);
+        FAIL("status not available");
+    }
+    ASSERT_EQ(st.untracked_count, 1);
+    ASSERT_EQ(st.tracked_count, 0);
+    ASSERT_EQ(st.untracked_sample_count, 1);
+    ASSERT_STR_EQ(st.untracked_paths[0], "newfile.txt");
+    ASSERT_FALSE(st.untracked_truncated);
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(worktree_status_rename_counts_once) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    if (status_make_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(tmp, "old.txt"), "o") != 0 ||
+        th_write_file(TH_PATH(tmp, "other.txt"), "x") != 0 ||
+        status_git_run(tmp, "add -A") != 0 ||
+        status_git_run(tmp, "commit -qm base") != 0 ||
+        status_git_run(tmp, "mv old.txt new.txt") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to stage a rename");
+    }
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, 8, &st);
+    if (rc != 0 || !st.available) {
+        cbm_git_worktree_status_free(&st);
+        th_rmtree(tmp);
+        FAIL("status not available");
+    }
+    ASSERT_EQ(st.tracked_count, 1); /* rename/copy counts ONCE, not twice */
+    ASSERT_EQ(st.tracked_sample_count, 1);
+    ASSERT_STR_EQ(st.tracked_paths[0], "new.txt"); /* sampled NEW path */
+    ASSERT_EQ(st.untracked_count, 0);
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(worktree_status_sample_cap_truncates) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    if (status_make_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    enum { N_FILES = 5, SAMPLE_MAX = 2 };
+    for (int i = 0; i < N_FILES; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/u%d.txt", tmp, i);
+        if (th_write_file(path, "u") != 0) {
+            th_rmtree(tmp);
+            FAIL("failed to create untracked file");
+        }
+    }
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, SAMPLE_MAX, &st);
+    if (rc != 0 || !st.available) {
+        cbm_git_worktree_status_free(&st);
+        th_rmtree(tmp);
+        FAIL("status not available");
+    }
+    ASSERT_EQ(st.untracked_count, N_FILES); /* full stream counted... */
+    ASSERT_EQ(st.untracked_sample_count, SAMPLE_MAX); /* ...samples bounded */
+    ASSERT_TRUE(st.untracked_truncated);
+    ASSERT_EQ(st.tracked_count, 0);
+    ASSERT_FALSE(st.tracked_truncated);
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(worktree_status_mixed_tracked_and_untracked) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    if (status_make_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    if (th_write_file(TH_PATH(tmp, "tracked.txt"), "v1") != 0 ||
+        status_git_run(tmp, "add -f -- tracked.txt") != 0 ||
+        status_git_run(tmp, "commit -q -m add-tracked") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to commit tracked file");
+    }
+    if (th_write_file(TH_PATH(tmp, "tracked.txt"), "v2") != 0 ||
+        th_write_file(TH_PATH(tmp, "untracked.txt"), "n") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to prepare mixed worktree");
+    }
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, 8, &st);
+    if (rc != 0 || !st.available) {
+        cbm_git_worktree_status_free(&st);
+        th_rmtree(tmp);
+        FAIL("status not available");
+    }
+    ASSERT_EQ(st.tracked_count, 1);
+    ASSERT_EQ(st.untracked_count, 1);
+    ASSERT_STR_EQ(st.tracked_paths[0], "tracked.txt");
+    ASSERT_STR_EQ(st.untracked_paths[0], "untracked.txt");
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Fail-closed contract: a non-repo directory must report unavailable with
+ * zero counts — never a silent "clean" tree. Does not need git on PATH. */
+TEST(worktree_status_unavailable_non_repo) {
+    char *tmp = th_mktempdir("cbm_wtstatus");
+    if (!tmp) FAIL("th_mktempdir returned NULL");
+
+    cbm_worktree_status_t st = {0};
+    int rc = cbm_git_worktree_status(tmp, 8, &st);
+    if (rc != 0) {
+        th_rmtree(tmp);
+        FAIL("status call returned an error");
+    }
+    ASSERT_FALSE(st.available);
+    ASSERT_EQ(st.tracked_count, 0);
+    ASSERT_EQ(st.untracked_count, 0);
+    ASSERT_EQ(st.tracked_sample_count, 0);
+    ASSERT_EQ(st.untracked_sample_count, 0);
+
+    cbm_git_worktree_status_free(&st);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
@@ -505,4 +813,12 @@ SUITE(git_context) {
     RUN_TEST(canonical_root_linked_worktree);
     RUN_TEST(git_context_ignores_inherited_repo_env);
     RUN_TEST(githistory_ignores_inherited_repo_env);
+    RUN_TEST(worktree_status_ignores_inherited_repo_env);
+    RUN_TEST(worktree_status_clean);
+    RUN_TEST(worktree_status_tracked_modified);
+    RUN_TEST(worktree_status_untracked);
+    RUN_TEST(worktree_status_rename_counts_once);
+    RUN_TEST(worktree_status_sample_cap_truncates);
+    RUN_TEST(worktree_status_mixed_tracked_and_untracked);
+    RUN_TEST(worktree_status_unavailable_non_repo);
 }
