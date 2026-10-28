@@ -846,7 +846,8 @@ TEST_PY_LSP_STRESS_SRCS = tests/test_py_lsp_stress.c
 TEST_PY_LSP_SCALE_SRCS = tests/test_py_lsp_scale.c
 
 TEST_TS_LSP_SRCS = tests/test_ts_lsp.c
-TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c
+TEST_JAVA_LSP_SRCS = tests/test_java_lsp.c tests/test_java_lsp_coverage.c \
+	tests/test_java_typed_calls.c
 TEST_KOTLIN_LSP_SRCS = tests/test_kotlin_lsp.c tests/test_kotlin_typed_calls.c
 TEST_RUST_LSP_SRCS = tests/test_rust_lsp.c
 
