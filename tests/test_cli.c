@@ -586,6 +586,10 @@ static size_t test_count_exec_hook(yyjson_val *root, const char *event_name,
     return matches;
 }
 
+/* The Claude PostToolUse matcher: Read coverage plus the graph tools, whose
+ * calls reset the drift reminder. */
+#define TEST_CLAUDE_POST_MATCHER "Read|mcp__.*codebase-memory-mcp__.*"
+
 #ifdef _WIN32
 static bool test_append_command_hook(yyjson_mut_doc *doc, yyjson_mut_val *event_entries,
                                      const char *matcher, const char *command) {
@@ -13680,7 +13684,8 @@ TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir) {
     static const char *const matchers[] = {"startup", "resume", "clear", "compact"};
     size_t owned =
         test_count_exec_hook(root, "PreToolUse", "Grep|Glob|Bash", binary, "hook-augment") +
-        test_count_exec_hook(root, "PostToolUse", "Read", binary, "hook-augment") +
+        test_count_exec_hook(root, "PostToolUse", TEST_CLAUDE_POST_MATCHER, binary,
+                             "hook-augment") +
         test_count_exec_hook(root, "SubagentStart", "*", binary, "hook-augment");
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         owned += test_count_exec_hook(root, "SessionStart", matchers[i], binary, "hook-augment");
@@ -14217,6 +14222,134 @@ TEST(cli_hook_augment_copilot_posttooluse_search) {
                 "supported=%d\n",
                 reached[0], reached[1], reached[2], view_silent, supported);
         FAIL("Copilot PostToolUse searches must reach graph augmentation");
+    }
+    PASS();
+}
+
+/* One Claude Code Grep search for the drift tests; returns whether it was
+ * augmented and sets *reminded when the drift line came with it. */
+static bool test_drift_search(cbm_mcp_server_t *srv, const char *session, const char *extra,
+                              const char *pattern, bool *reminded) {
+    char input[640];
+    snprintf(input, sizeof(input),
+             "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"%s\",%s\"tool_name\":\"Grep\","
+             "\"cwd\":\"/tmp/hookproj\",\"tool_input\":{\"pattern\":\"%s\"}}",
+             session, extra, pattern);
+    char *output = cbm_hook_augment_process(srv, input);
+    *reminded = output && strstr(output, "searches since its last codebase-memory-mcp tool call");
+    bool augmented = output != NULL;
+    free(output);
+    return augmented;
+}
+
+static bool test_drift_graph_call(cbm_mcp_server_t *srv, const char *session, const char *tool) {
+    char input[512];
+    snprintf(input, sizeof(input),
+             "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"%s\",\"tool_name\":\"%s\","
+             "\"cwd\":\"/tmp/hookproj\",\"tool_input\":{}}",
+             session, tool);
+    char *output = cbm_hook_augment_process(srv, input);
+    bool silent = output == NULL;
+    free(output);
+    return silent;
+}
+
+/* Drift reminder (#509): a Claude Code session that keeps searching without a
+ * graph call gets one factual line on its 3rd search, then its 6th and 12th.
+ * A graph tool call, by its plain or plugin name, resets the count. A search
+ * without an augmentation still counts and the line waits for the next one.
+ * Sessions are independent; Codex payloads (turn_id) and payloads without a
+ * session_id are never tracked. */
+TEST(cli_hook_augment_drift_reminder_counts_searches) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    const char *hit = "someIndexedSymbol";
+    bool ok = true;
+    bool reminded = false;
+    char diag[256] = "";
+
+    /* Reminders at 3, 6 and 12 searches; session b interleaves. */
+    for (int i = 1; ok && i <= 12; i++) {
+        bool b_reminded = false;
+        if (i <= 3) {
+            ok = test_drift_search(srv, "drift-test-b", "", hit, &b_reminded) &&
+                 b_reminded == (i == 3);
+        }
+        ok = ok && test_drift_search(srv, "drift-test-a", "", hit, &reminded) &&
+             reminded == (i == 3 || i == 6 || i == 12);
+        if (!ok)
+            snprintf(diag, sizeof(diag), "session a search %d reminded=%d", i, reminded);
+    }
+    /* A graph call resets; the plugin tool name resets too. */
+    for (int round = 0; ok && round < 2; round++) {
+        const char *tool = round == 0 ? "mcp__codebase-memory-mcp__trace_path"
+                                      : "mcp__plugin_codebase-memory-mcp_codebase-memory-mcp__"
+                                        "search_graph";
+        ok = test_drift_graph_call(srv, "drift-test-a", tool);
+        for (int i = 1; ok && i <= 3; i++) {
+            ok = test_drift_search(srv, "drift-test-a", "", hit, &reminded) && reminded == (i == 3);
+        }
+        if (!ok)
+            snprintf(diag, sizeof(diag), "reset round %d", round);
+    }
+    /* Another server's tool is no graph call: after a reset and one search it
+     * leaves the count alone, so the 3rd search still carries the line. */
+    ok = ok &&
+         test_drift_graph_call(srv, "drift-test-a", "mcp__codebase-memory-mcp__search_graph") &&
+         test_drift_search(srv, "drift-test-a", "", hit, &reminded) && !reminded &&
+         test_drift_graph_call(srv, "drift-test-a", "mcp__other__search") &&
+         test_drift_search(srv, "drift-test-a", "", hit, &reminded) && !reminded &&
+         test_drift_search(srv, "drift-test-a", "", hit, &reminded) && reminded;
+    if (!ok && !diag[0])
+        snprintf(diag, sizeof(diag), "foreign tool reset the count");
+    /* The 3rd search finds nothing, so the 4th carries the line; the next
+     * threshold is 6. */
+    bool expect_c[] = {false, false, false, true, false, true};
+    for (int i = 0; ok && i < 6; i++) {
+        bool augmented = test_drift_search(srv, "drift-test-c", "",
+                                           i == 2 ? "zzzNotIndexedAnywhere" : hit, &reminded);
+        ok = augmented == (i != 2) && reminded == expect_c[i];
+        if (!ok)
+            snprintf(diag, sizeof(diag), "session c search %d augmented=%d reminded=%d", i + 1,
+                     augmented, reminded);
+    }
+    /* Untracked: Codex, and no session_id. */
+    for (int i = 1; ok && i <= 6; i++) {
+        ok =
+            test_drift_search(srv, "drift-test-codex", "\"turn_id\":\"turn-1\",", hit, &reminded) &&
+            !reminded;
+        char input[512];
+        snprintf(input, sizeof(input),
+                 "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Grep\","
+                 "\"cwd\":\"/tmp/hookproj\",\"tool_input\":{\"pattern\":\"%s\"}}",
+                 hit);
+        char *output = cbm_hook_augment_process(srv, input);
+        ok = ok && output && !strstr(output, "since its last codebase-memory-mcp tool call");
+        free(output);
+        if (!ok)
+            snprintf(diag, sizeof(diag), "untracked search %d", i);
+    }
+    cbm_mcp_server_free(srv);
+    free(project);
+    if (!ok) {
+        fprintf(stderr, "drift diag: %s\n", diag);
+        FAIL("drift reminder must fire at 3, 6, 12 searches and reset on a graph call");
     }
     PASS();
 }
@@ -14882,7 +15015,8 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     size_t registered =
         test_count_exec_hook(settings_root, "PreToolUse", "Grep|Glob|Bash", binary,
                              "hook-augment") +
-        test_count_exec_hook(settings_root, "PostToolUse", "Read", binary, "hook-augment") +
+        test_count_exec_hook(settings_root, "PostToolUse", TEST_CLAUDE_POST_MATCHER, binary,
+                             "hook-augment") +
         test_count_exec_hook(settings_root, "SubagentStart", "*", binary, "hook-augment");
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         registered += test_count_exec_hook(settings_root, "SessionStart", matchers[i], binary,
@@ -16127,7 +16261,7 @@ TEST(cli_upsert_claude_hook_fresh) {
     ASSERT(strstr(data, "PreToolUse") != NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
     ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
-    ASSERT(strstr(data, "\"Read\"") != NULL);
+    ASSERT(strstr(data, "\"" TEST_CLAUDE_POST_MATCHER "\"") != NULL);
     ASSERT(strstr(data, "\"Grep|Glob|Read\"") == NULL);
     ASSERT_EQ(test_count_substring(data, "cbm-code-discovery-gate"), 2U);
 
@@ -16599,7 +16733,8 @@ TEST(cli_claude_hooks_use_exec_form_across_shells_issue1733) {
         size_t owned =
             test_count_exec_hook(root, "PreToolUse", "Grep|Glob|Bash", binary_path,
                                  "hook-augment") +
-            test_count_exec_hook(root, "PostToolUse", "Read", binary_path, "hook-augment") +
+            test_count_exec_hook(root, "PostToolUse", TEST_CLAUDE_POST_MATCHER, binary_path,
+                                 "hook-augment") +
             test_count_exec_hook(root, "SubagentStart", "*", binary_path, "hook-augment");
         for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
             owned += test_count_exec_hook(root, "SessionStart", matchers[i], binary_path,
@@ -16663,7 +16798,8 @@ TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733) {
     size_t before_owned =
         test_count_exec_hook(installed_root, "PreToolUse", "Grep|Glob|Bash", binary_path,
                              "hook-augment") +
-        test_count_exec_hook(installed_root, "PostToolUse", "Read", binary_path, "hook-augment") +
+        test_count_exec_hook(installed_root, "PostToolUse", TEST_CLAUDE_POST_MATCHER, binary_path,
+                             "hook-augment") +
         test_count_exec_hook(installed_root, "SubagentStart", "*", binary_path, "hook-augment");
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         before_owned += test_count_exec_hook(installed_root, "SessionStart", matchers[i],
@@ -16694,6 +16830,104 @@ TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733) {
         foreign_count != 1U)
         FAIL("custom --dir uninstall must remove seven exact-owned exec hooks and keep foreign "
              "hooks");
+    PASS();
+}
+
+/* Rewrite the current Claude PostToolUse matcher back to the previous "Read". */
+static bool test_claude_settings_to_read_matcher(const char *settings_path) {
+    char *text = read_test_file_alloc(settings_path);
+    const char *found = text ? strstr(text, TEST_CLAUDE_POST_MATCHER) : NULL;
+    if (!found) {
+        free(text);
+        return false;
+    }
+    size_t prefix = (size_t)(found - text);
+    size_t total = strlen(text) - strlen(TEST_CLAUDE_POST_MATCHER) + strlen("Read") + 1U;
+    char *rewritten = malloc(total);
+    if (!rewritten) {
+        free(text);
+        return false;
+    }
+    snprintf(rewritten, total, "%.*sRead%s", (int)prefix, text,
+             found + strlen(TEST_CLAUDE_POST_MATCHER));
+    write_test_file(settings_path, rewritten);
+    free(rewritten);
+    free(text);
+    return true;
+}
+
+/* The Claude PostToolUse hook also matches the graph tools, whose calls reset
+ * the drift reminder (#509). An install that finds the previous Read-only
+ * entry replaces it with one current entry, and uninstall removes the
+ * previous one too. */
+TEST(cli_claude_post_hook_matcher_migrates_from_read) {
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_config = save_test_env("CLAUDE_CONFIG_DIR");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-read-matcher-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char settings_path[640];
+    char install_dir[512];
+    char binary_path[640];
+    snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    snprintf(install_dir, sizeof(install_dir), "%s/bin", tmpdir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", install_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", install_dir);
+#endif
+    test_mkdirp(config_dir);
+    test_mkdirp(install_dir);
+    test_mark_claude_code_installed(tmpdir);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
+    size_t counts[4] = {0U, 0U, 0U, 0U};
+    int install_rc[2] = {-1, -1};
+    for (int round = 0; round < 2; round++) {
+        install_rc[round] = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+        char *settings = read_test_file_alloc(settings_path);
+        yyjson_doc *doc = settings ? yyjson_read(settings, strlen(settings), 0) : NULL;
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        counts[round * 2] = test_count_exec_hook(root, "PostToolUse", TEST_CLAUDE_POST_MATCHER,
+                                                 binary_path, "hook-augment");
+        counts[round * 2 + 1] =
+            test_count_exec_hook(root, "PostToolUse", "Read", binary_path, "hook-augment");
+        yyjson_doc_free(doc);
+        free(settings);
+        if (round == 0 && !test_claude_settings_to_read_matcher(settings_path))
+            break;
+    }
+    bool rewritten = test_claude_settings_to_read_matcher(settings_path);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
+    char *argv[] = {"uninstall", "--yes", dir_arg};
+    int uninstall_rc = cli_test_cmd_uninstall(3, argv);
+    char *uninstalled = read_test_file_alloc(settings_path);
+    size_t after_owned = test_count_substring(uninstalled ? uninstalled : "", "\"hook-augment\"");
+    free(uninstalled);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
+    test_rmdir_r(tmpdir);
+    if (install_rc[0] != 0 || install_rc[1] != 0 || counts[0] != 1U || counts[1] != 0U ||
+        counts[2] != 1U || counts[3] != 0U || !rewritten || uninstall_rc != 0 ||
+        after_owned != 0U) {
+        fprintf(stderr,
+                "Claude matcher diag install=%d,%d current=%zu,%zu read=%zu,%zu rewritten=%d "
+                "uninstall=%d after=%zu\n",
+                install_rc[0], install_rc[1], counts[0], counts[2], counts[1], counts[3], rewritten,
+                uninstall_rc, after_owned);
+        FAIL("Claude install must migrate the Read-only PostToolUse hook, and uninstall must "
+             "remove it");
+    }
     PASS();
 }
 
@@ -17062,7 +17296,7 @@ TEST(cli_upsert_claude_hook_existing) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
-    ASSERT(strstr(data, "\"Read\"") != NULL);
+    ASSERT(strstr(data, "\"" TEST_CLAUDE_POST_MATCHER "\"") != NULL);
     /* Existing hook preserved */
     ASSERT(strstr(data, "Bash") != NULL);
     ASSERT(strstr(data, "firewall") != NULL);
@@ -19206,6 +19440,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_codex_pretooluse_payload);
     RUN_TEST(cli_hook_augment_copilot_posttooluse_search);
     RUN_TEST(cli_hook_augment_copilot_posttooluse_noop_gate);
+    RUN_TEST(cli_hook_augment_drift_reminder_counts_searches);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
@@ -19291,6 +19526,7 @@ SUITE(cli) {
     RUN_TEST(cli_windows_claude_hook_command_is_shell_portable);
     RUN_TEST(cli_claude_hooks_use_exec_form_across_shells_issue1733);
     RUN_TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733);
+    RUN_TEST(cli_claude_post_hook_matcher_migrates_from_read);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_hook_augment_log_long_home_creates_no_cut_path);

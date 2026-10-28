@@ -1663,27 +1663,39 @@ typedef struct {
     TSNode node;
     const char *prefix;
 } yaml_walk_frame_t;
-#define YAML_WALK_STACK_CAP CBM_SZ_256
+/* On-stack first chunk of the key-path walk; wider mappings spill to the heap
+ * through cbm_walk_stack_reserve instead of dropping frames (#2388). */
+#define YAML_WALK_STACK_INLINE CBM_SZ_256
 
-/* Push block_mapping children of a block_node/block_mapping value onto the walk stack. */
-static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_frame_t *stack,
-                                     int *top) {
+/* Push block_mapping children of a block_node/block_mapping value onto the walk
+ * stack, growing it as needed. False when the stack could not grow (logged by
+ * cbm_walk_stack_reserve as extract.walk_stack_alloc_failed). */
+static bool push_yaml_block_children(TSNode val, const char *path, yaml_walk_frame_t **stack,
+                                     int *cap, int *top, const yaml_walk_frame_t *inline_buf) {
     uint32_t vnc = ts_node_named_child_count(val);
-    for (int vi = (int)vnc - SKIP_ONE; vi >= 0 && *top < YAML_WALK_STACK_CAP; vi--) {
+    if (!cbm_walk_stack_reserve((void **)stack, cap, *top + (int)vnc, sizeof(yaml_walk_frame_t),
+                                inline_buf, "yaml_key_paths")) {
+        return false;
+    }
+    for (int vi = (int)vnc - SKIP_ONE; vi >= 0; vi--) {
         TSNode vc = ts_node_named_child(val, (uint32_t)vi);
         const char *vctype = ts_node_type(vc);
         if (strcmp(vctype, "block_mapping") == 0 || strcmp(vctype, "block_mapping_pair") == 0) {
-            stack[(*top)++] = (yaml_walk_frame_t){vc, path};
+            (*stack)[(*top)++] = (yaml_walk_frame_t){vc, path};
         }
     }
+    return true;
 }
 
 static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_prefix) {
-    yaml_walk_frame_t stack[YAML_WALK_STACK_CAP];
+    yaml_walk_frame_t inline_stack[YAML_WALK_STACK_INLINE];
+    yaml_walk_frame_t *stack = inline_stack;
+    int cap = YAML_WALK_STACK_INLINE;
     int top = 0;
     stack[top++] = (yaml_walk_frame_t){root, root_prefix};
+    bool grown = true;
 
-    while (top > 0) {
+    while (grown && top > 0) {
         yaml_walk_frame_t frame = stack[--top];
         TSNode node = frame.node;
         const char *prefix = frame.prefix;
@@ -1709,12 +1721,16 @@ static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_
             }
             const char *vk = ts_node_type(val);
             if (strcmp(vk, "block_node") == 0 || strcmp(vk, "block_mapping") == 0) {
-                push_yaml_block_children(val, path, stack, &top);
+                grown = push_yaml_block_children(val, path, &stack, &cap, &top, inline_stack);
+                if (!grown) {
+                    break;
+                }
                 continue;
             }
             emit_yaml_leaf_value(ctx, val, path);
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 /* ── Infrastructure binding extraction ─────────────────────────────
@@ -1873,9 +1889,13 @@ static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
     emit_infra_bindings(ctx, sources, source_keys, n_sources, targets, n_targets);
 }
 
-#define INFRA_SCAN_STACK_CAP CBM_SZ_512
+/* On-stack first chunk of the binding scan; wider subtrees spill to the heap
+ * through cbm_walk_stack_reserve instead of dropping nodes (#2388). */
+#define INFRA_SCAN_STACK_INLINE CBM_SZ_512
 static void scan_yaml_for_infra_bindings(CBMExtractCtx *ctx, TSNode root) {
-    TSNode stack[INFRA_SCAN_STACK_CAP];
+    TSNode inline_stack[INFRA_SCAN_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = INFRA_SCAN_STACK_INLINE;
     int top = 0;
     stack[top++] = root;
     while (top > 0) {
@@ -1884,10 +1904,15 @@ static void scan_yaml_for_infra_bindings(CBMExtractCtx *ctx, TSNode root) {
             scan_mapping_for_bindings(ctx, node);
         }
         uint32_t nc = ts_node_named_child_count(node);
-        for (int i = (int)nc - SKIP_ONE; i >= 0 && top < INFRA_SCAN_STACK_CAP; i--) {
+        if (!cbm_walk_stack_reserve((void **)&stack, &cap, top + (int)nc, sizeof(TSNode),
+                                    inline_stack, "yaml_infra_bindings")) {
+            break;
+        }
+        for (int i = (int)nc - SKIP_ONE; i >= 0; i--) {
             stack[top++] = ts_node_named_child(node, (uint32_t)i);
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 /* ── HCL infrastructure binding extraction ───────────────────────────

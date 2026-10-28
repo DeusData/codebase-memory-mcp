@@ -38,7 +38,11 @@ static const char *const gd_inserts[] = {
     "INSERT INTO index_coverage(project,rel_path,kind,detail) VALUES(CAST(X'70' AS TEXT),CAST(X'62' AS TEXT),CAST(X'736b6970' AS TEXT),CAST(X'' AS TEXT));",
     "INSERT INTO index_coverage_meta(project,generation,index_mode,recorded_at,recording_status,ignored_files_stored,ignored_files_total,coverage_version,hash_records_complete) VALUES(CAST(X'70' AS TEXT),CAST(X'67656e' AS TEXT),CAST(X'66756c6c' AS TEXT),CAST(X'74' AS TEXT),CAST(X'636f6d706c657465' AS TEXT),-1,0,1,1);",
 };
-static const unsigned char gd_golden_sha[32] = { 0x46, 0x44, 0x71, 0x72, 0xdc, 0x9b, 0x2d, 0xa8, 0xda, 0xc8, 0x54, 0x5a, 0x56, 0x88, 0xab, 0x59, 0x1d, 0xad, 0x39, 0xe2, 0x9b, 0xe6, 0x33, 0x9c, 0x3d, 0x26, 0x49, 0x27, 0xd0, 0x94, 0xe9, 0x3e };
+/* Stream version 2: the oracle's version-1 stream (4038 framed bytes, golden
+ * 46447172dc9b2da8...) with only its version word set to 2. This fixture has
+ * no index_unresolved_candidates table and no unresolved_calls_complete
+ * column, so nothing else in its stream changes. */
+static const unsigned char gd_golden_sha[32] = { 0xd0, 0x51, 0xc4, 0x56, 0x11, 0x5c, 0xf7, 0x3c, 0x75, 0xe2, 0x89, 0xb5, 0xc3, 0x92, 0xa2, 0x56, 0xa5, 0x66, 0xe6, 0x62, 0xfd, 0x56, 0x66, 0x35, 0x05, 0xc6, 0x1e, 0xa5, 0x49, 0x7d, 0xa1, 0x30 };
 #define GD_GOLDEN_ROWS UINT64_C(17)
 #define GD_GOLDEN_BYTES UINT64_C(4038)
 
@@ -55,9 +59,11 @@ static bool gd_int(sqlite3 *db, const char *sql, int64_t want) {
     return ok;
 }
 static bool gd_seed(sqlite3 *db, bool reverse, bool meta) {
-    static const char drop[] = "PRAGMA foreign_keys=OFF;"
+    static const char drop[] =
+        "PRAGMA foreign_keys=OFF;"
         "DROP TABLE IF EXISTS edges;DROP TABLE IF EXISTS nodes;DROP TABLE IF EXISTS file_hashes;"
         "DROP TABLE IF EXISTS project_summaries;DROP TABLE IF EXISTS lsp_surface;"
+        "DROP TABLE IF EXISTS index_unresolved_candidates;"
         "DROP TABLE IF EXISTS index_coverage;DROP TABLE IF EXISTS index_coverage_meta;"
         "DROP TABLE IF EXISTS projects;DROP TABLE IF EXISTS store_meta;";
     if (!db || gd_sql(db,drop)!=SQLITE_OK) return false;
@@ -119,13 +125,76 @@ static bool gd_cancel(void *opaque) {
     return c->stop || (c->armed && c->trip && c->calls>=c->trip);
 }
 
+TEST(store_graph_digest_binds_unresolved_candidate_index) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_coverage_row_t row = {.rel_path = "calls.js",
+                              .kind = "unresolved_calls",
+                              .detail = "[{\"candidate\":\"p.target\"}]"};
+    bool setup = s && cbm_store_upsert_project(s, "p", "/tmp/digest-candidates") == CBM_STORE_OK &&
+                 cbm_store_upsert_file_hash(s, "p", "calls.js", "fixture", 0, 0) == CBM_STORE_OK &&
+                 cbm_store_coverage_replace(s, "p", &row, 1) == CBM_STORE_OK;
+    bool candidate_before = false, candidate_after = true;
+    cbm_store_graph_digest_t before = {0}, after = {0};
+    unsigned char content_before[CBM_STORE_GRAPH_DIGEST_BYTES] = {0},
+                  content_after[CBM_STORE_GRAPH_DIGEST_BYTES] = {0};
+    bool read_before =
+        setup &&
+        cbm_store_coverage_has_unresolved_candidate(s, "p", "p.target", &candidate_before) ==
+            CBM_STORE_OK &&
+        gd_p(s, &before) && cbm_store_graph_content_digest(s, "p", content_before) == CBM_STORE_OK;
+    /* Deliberately bypass publication/generation advancement: inbound reads this table. */
+    bool removed = read_before &&
+                   gd_sql(cbm_store_get_db(s),
+                          "DELETE FROM index_unresolved_candidates WHERE project='p'") == SQLITE_OK;
+    bool read_after =
+        removed &&
+        cbm_store_coverage_has_unresolved_candidate(s, "p", "p.target", &candidate_after) ==
+            CBM_STORE_OK &&
+        gd_p(s, &after) && cbm_store_graph_content_digest(s, "p", content_after) == CBM_STORE_OK;
+    cbm_store_close(s);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(read_before);
+    ASSERT_TRUE(candidate_before);
+    ASSERT_TRUE(removed);
+    ASSERT_TRUE(read_after);
+    ASSERT_FALSE(candidate_after);
+    ASSERT_TRUE(gd_different(&before, &after));
+    ASSERT_TRUE(memcmp(content_before, content_after, sizeof(content_before)) != 0);
+    PASS();
+}
+
+TEST(store_graph_digest_candidate_index_errors_are_not_legacy_absence) {
+    cbm_store_t *s = gd_fixture(false, false);
+    unsigned char legacy[CBM_STORE_GRAPH_DIGEST_BYTES] = {0},
+                  again[CBM_STORE_GRAPH_DIGEST_BYTES] = {0};
+    bool old = s && cbm_store_graph_content_digest(s, "p", legacy) == CBM_STORE_OK;
+    bool malformed =
+        old && gd_sql(cbm_store_get_db(s),
+                      "CREATE TABLE index_unresolved_candidates(project TEXT,unexpected TEXT)") ==
+                   SQLITE_OK;
+    int content_rc = malformed ? cbm_store_graph_content_digest(s, "p", again) : CBM_STORE_OK;
+    bool graph_rejected = malformed && gd_reject(s, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+    bool absent =
+        graph_rejected &&
+        gd_sql(cbm_store_get_db(s), "DROP TABLE index_unresolved_candidates") == SQLITE_OK &&
+        cbm_store_graph_content_digest(s, "p", again) == CBM_STORE_OK;
+    cbm_store_close(s);
+    ASSERT_TRUE(old);
+    ASSERT_TRUE(malformed);
+    ASSERT_EQ(content_rc, CBM_STORE_ERR);
+    ASSERT_TRUE(graph_rejected);
+    ASSERT_TRUE(absent);
+    ASSERT_TRUE(memcmp(legacy, again, sizeof(legacy)) == 0);
+    PASS();
+}
+
 TEST(store_graph_digest_independent_canonical_golden) {
     cbm_store_t *s=gd_fixture(false,false); cbm_store_graph_digest_t out={0};
     bool setup=s && gd_int(cbm_store_get_db(s),"SELECT count(*) FROM nodes",2) &&
         gd_int(cbm_store_get_db(s),"SELECT length(CAST(properties AS BLOB)) FROM nodes WHERE id=-7",4) &&
         gd_int(cbm_store_get_db(s),"SELECT count(*) FROM lsp_surface WHERE typeof(ref_bloom)='blob'",2);
     bool got=setup && gd_p(s,&out); cbm_store_close(s);
-    ASSERT_TRUE(setup); ASSERT_TRUE(got); ASSERT_EQ(out.version,1);
+    ASSERT_TRUE(setup); ASSERT_TRUE(got); ASSERT_EQ(out.version,2);
     ASSERT_TRUE(out.rows==GD_GOLDEN_ROWS); ASSERT_TRUE(out.framed_bytes==GD_GOLDEN_BYTES);
     ASSERT_TRUE(memcmp(out.sha256,gd_golden_sha,32)==0); PASS();
 }
@@ -301,6 +370,26 @@ TEST(store_graph_digest_legacy_generation_and_live_schema_compatibility) {
     bool seeded=s && cbm_store_upsert_project(s,"p","/live")==CBM_STORE_OK;
     bool compatible=seeded && gd_p(s,&live);cbm_store_close(s);
     ASSERT_TRUE(seeded);ASSERT_TRUE(compatible);PASS();
+}
+
+/* Legacy streams stay stable, while the new independent capture signal must
+ * be bound: changing only that value changes the digest. */
+TEST(store_graph_digest_binds_unresolved_capture_completeness) {
+    cbm_store_t *store = gd_fixture(false, false);
+    ASSERT_NOT_NULL(store);
+    cbm_store_graph_digest_t incomplete = {0}, complete = {0};
+    ASSERT_EQ(gd_sql(cbm_store_get_db(store),
+                     "ALTER TABLE index_coverage_meta ADD COLUMN "
+                     "unresolved_calls_complete INTEGER NOT NULL DEFAULT 0;"),
+              SQLITE_OK);
+    ASSERT_TRUE(gd_p(store, &incomplete));
+    ASSERT_EQ(gd_sql(cbm_store_get_db(store),
+                     "UPDATE index_coverage_meta SET unresolved_calls_complete=1;"),
+              SQLITE_OK);
+    ASSERT_TRUE(gd_p(store, &complete));
+    cbm_store_close(store);
+    ASSERT_TRUE(gd_different(&incomplete, &complete));
+    PASS();
 }
 
 TEST(store_graph_digest_schema_and_runtime_types_fail_closed) {
@@ -595,11 +684,14 @@ TEST(store_graph_digest_concurrent_isolation_with_held_callback_gates) {
 }
 
 SUITE(store_graph_digest) {
+    RUN_TEST(store_graph_digest_binds_unresolved_candidate_index);
+    RUN_TEST(store_graph_digest_candidate_index_errors_are_not_legacy_absence);
     RUN_TEST(store_graph_digest_independent_canonical_golden);
     RUN_TEST(store_graph_digest_logical_order_and_excluded_storage_are_stable);
     RUN_TEST(store_graph_digest_every_known_value_and_cross_project_edge_is_bound);
     RUN_TEST(store_graph_digest_raw_types_project_bytes_and_schema_sql_are_distinct);
     RUN_TEST(store_graph_digest_legacy_generation_and_live_schema_compatibility);
+    RUN_TEST(store_graph_digest_binds_unresolved_capture_completeness);
     RUN_TEST(store_graph_digest_schema_and_runtime_types_fail_closed);
     RUN_TEST(store_graph_digest_wal_pins_old_content_then_observes_next_scope);
     RUN_TEST(store_graph_digest_exact_budgets_zero_output_and_terminal_scope);
