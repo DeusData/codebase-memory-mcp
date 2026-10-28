@@ -92,38 +92,24 @@ static const gd_column_t gd_index_coverage_meta[] = {{"project", GD_T, 0, 1},
 static const gd_column_t gd_store_meta[] = {{"k", GD_T, 0, 1}, {"v", GD_T, 0, 0}};
 
 static const gd_column_t gd_resolver_occurrences[] = {
-    {"project", GD_T, 0, 1},
-    {"ordinal", GD_I, 0, 2},
-    {"file_path", GD_T, 0, 0},
-    {"scope", GD_T, 0, 0},
-    {"relation", GD_T, 0, 0},
-    {"spelling", GD_T, 0, 0},
-    {"start_byte", GD_I, 0, 0},
-    {"end_byte", GD_I, 0, 0},
-    {"source_origin", GD_I, 0, 0},
-    {"binding", GD_I, 0, 0},
-    {"domain", GD_I, 0, 0},
-    {"analysis", GD_I, 0, 0},
-    {"rule", GD_I, 0, 0},
-    {"facts", GD_I, 0, 0},
-    {"target", GD_T, 0, 0},
-    {"candidate_count", GD_I, 0, 0},
-    {"reason", GD_T, 0, 0},
-    {"emitted", GD_I, 0, 0},
-    {"rules_version", GD_I, 0, 0},
-    {"properties_json", GD_T, 0, 0},
+    {"project", GD_T, 0, 1},       {"ordinal", GD_I, 0, 2},
+    {"file_path", GD_T, 0, 0},     {"scope", GD_T, 0, 0},
+    {"relation", GD_T, 0, 0},      {"spelling", GD_T, 0, 0},
+    {"start_byte", GD_I, 0, 0},    {"end_byte", GD_I, 0, 0},
+    {"source_origin", GD_I, 0, 0}, {"binding", GD_I, 0, 0},
+    {"domain", GD_I, 0, 0},        {"analysis", GD_I, 0, 0},
+    {"rule", GD_I, 0, 0},          {"facts", GD_I, 0, 0},
+    {"target", GD_T, 0, 0},        {"candidate_count", GD_I, 0, 0},
+    {"reason", GD_T, 0, 0},        {"emitted", GD_I, 0, 0},
+    {"rules_version", GD_I, 0, 0}, {"properties_json", GD_T, 0, 0},
 };
 static const gd_column_t gd_resolver_generations[] = {
     {"project", GD_T, 0, 1},
     {"rules_version", GD_I, 0, 0},
 };
 static const gd_column_t gd_resolver_facts[] = {
-    {"project", GD_T, 0, 1},
-    {"id", GD_I, 0, 2},
-    {"kind", GD_I, 0, 0},
-    {"source_file", GD_T, 0, 0},
-    {"digest", GD_T, 0, 0},
-    {"payload", GD_T, 0, 0},
+    {"project", GD_T, 0, 1},     {"id", GD_I, 0, 2},     {"kind", GD_I, 0, 0},
+    {"source_file", GD_T, 0, 0}, {"digest", GD_T, 0, 0}, {"payload", GD_T, 0, 0},
 };
 static const gd_column_t gd_resolver_supports[] = {
     {"project", GD_T, 0, 1},
@@ -132,11 +118,8 @@ static const gd_column_t gd_resolver_supports[] = {
     {"premise", GD_I, 0, 0},
 };
 static const gd_column_t gd_resolver_lookups[] = {
-    {"project", GD_T, 0, 1},
-    {"fact", GD_I, 0, 2},
-    {"domain", GD_T, 0, 0},
-    {"key", GD_T, 0, 0},
-    {"status", GD_T, 0, 0},
+    {"project", GD_T, 0, 1}, {"fact", GD_I, 0, 2},   {"domain", GD_T, 0, 0},
+    {"key", GD_T, 0, 0},     {"status", GD_T, 0, 0},
 };
 static const gd_column_t gd_resolver_occurrence_evidence[] = {
     {"project", GD_T, 0, 1},
@@ -161,17 +144,10 @@ static const gd_column_t gd_resolver_file_summaries[] = {
     {"complete", GD_I, 0, 0},
 };
 static const gd_column_t gd_resolver_derived_bindings[] = {
-    {"project", GD_T, 0, 1},
-    {"file_path", GD_T, 0, 2},
-    {"key", GD_T, 0, 3},
-    {"kind", GD_I, 0, 4},
-    {"module", GD_I, 0, 0},
-    {"closed", GD_I, 0, 0},
-    {"binding", GD_I, 0, 0},
-    {"domain", GD_I, 0, 0},
-    {"analysis", GD_I, 0, 0},
-    {"target", GD_T, 0, 0},
-    {"proof", GD_I, 0, 0},
+    {"project", GD_T, 0, 1}, {"file_path", GD_T, 0, 2}, {"key", GD_T, 0, 3},
+    {"kind", GD_I, 0, 4},    {"module", GD_I, 0, 0},    {"closed", GD_I, 0, 0},
+    {"binding", GD_I, 0, 0}, {"domain", GD_I, 0, 0},    {"analysis", GD_I, 0, 0},
+    {"target", GD_T, 0, 0},  {"proof", GD_I, 0, 0},
 };
 
 /* These descriptors and SQL strings are immutable; all other state is local. */
@@ -210,7 +186,10 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "SELECT k,v FROM main.store_meta ORDER BY CAST(k AS BLOB) ASC;"},
     {"resolver_occurrences", gd_resolver_occurrences, GD_COLUMNS(gd_resolver_occurrences),
      "PRAGMA main.table_xinfo('resolver_occurrences');",
-     "SELECT project,ordinal,file_path,scope,relation,spelling,start_byte,end_byte,source_origin,binding,domain,analysis,rule,facts,target,candidate_count,reason,emitted,rules_version,properties_json FROM main.resolver_occurrences "
+     "SELECT "
+     "project,ordinal,file_path,scope,relation,spelling,start_byte,end_byte,source_origin,binding,"
+     "domain,analysis,rule,facts,target,candidate_count,reason,emitted,rules_version,properties_"
+     "json FROM main.resolver_occurrences "
      "ORDER BY CAST(project AS BLOB) ASC,ordinal ASC;"},
     {"resolver_generations", gd_resolver_generations, GD_COLUMNS(gd_resolver_generations),
      "PRAGMA main.table_xinfo('resolver_generations');",
@@ -228,18 +207,26 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "PRAGMA main.table_xinfo('resolver_lookups');",
      "SELECT project,fact,domain,key,status FROM main.resolver_lookups "
      "ORDER BY CAST(project AS BLOB) ASC,fact ASC;"},
-    {"resolver_occurrence_evidence", gd_resolver_occurrence_evidence, GD_COLUMNS(gd_resolver_occurrence_evidence),
+    {"resolver_occurrence_evidence", gd_resolver_occurrence_evidence,
+     GD_COLUMNS(gd_resolver_occurrence_evidence),
      "PRAGMA main.table_xinfo('resolver_occurrence_evidence');",
-     "SELECT project,ordinal,content_identity,configuration_identity,proof,source_binding_proof FROM main.resolver_occurrence_evidence "
+     "SELECT project,ordinal,content_identity,configuration_identity,proof,source_binding_proof "
+     "FROM main.resolver_occurrence_evidence "
      "ORDER BY CAST(project AS BLOB) ASC,ordinal ASC;"},
     {"resolver_file_summaries", gd_resolver_file_summaries, GD_COLUMNS(gd_resolver_file_summaries),
      "PRAGMA main.table_xinfo('resolver_file_summaries');",
-     "SELECT project,file_path,module,language,raw_content_identity,preprocessed_content_identity,configuration_identity,raw_length,preprocessed_length,extracted_summary,derived_summary,complete FROM main.resolver_file_summaries "
+     "SELECT "
+     "project,file_path,module,language,raw_content_identity,preprocessed_content_identity,"
+     "configuration_identity,raw_length,preprocessed_length,extracted_summary,derived_summary,"
+     "complete FROM main.resolver_file_summaries "
      "ORDER BY CAST(project AS BLOB) ASC,CAST(file_path AS BLOB) ASC;"},
-    {"resolver_derived_bindings", gd_resolver_derived_bindings, GD_COLUMNS(gd_resolver_derived_bindings),
+    {"resolver_derived_bindings", gd_resolver_derived_bindings,
+     GD_COLUMNS(gd_resolver_derived_bindings),
      "PRAGMA main.table_xinfo('resolver_derived_bindings');",
-     "SELECT project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof FROM main.resolver_derived_bindings "
-     "ORDER BY CAST(project AS BLOB) ASC,CAST(file_path AS BLOB) ASC,CAST(key AS BLOB) ASC,kind ASC;"}};
+     "SELECT project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof FROM "
+     "main.resolver_derived_bindings "
+     "ORDER BY CAST(project AS BLOB) ASC,CAST(file_path AS BLOB) ASC,CAST(key AS BLOB) ASC,kind "
+     "ASC;"}};
 
 #undef GD_B
 #undef GD_N

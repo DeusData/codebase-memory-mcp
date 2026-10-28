@@ -500,6 +500,24 @@ static bool supported_node(CBMLanguage language, const char *kind) {
     return listed(kind, language == CBM_LANG_PYTHON ? python : lua);
 }
 
+/* These grammar containers add no binders. The ordinary walk still audits
+ * every child in the inherited evaluation/target context. In particular,
+ * type_parameter is also used by PEP 695 declarations: only a generic_type
+ * argument list is transparent, never a declaration's type_parameters field. */
+static bool python_transparent_container(TSNode node, const char *parent) {
+    const char *kind = ts_node_type(node);
+    if (!strcmp(kind, "expression_list"))
+        return true;
+    if (!strcmp(kind, "generic_type"))
+        return parent && !strcmp(parent, "type");
+    if (!strcmp(kind, "type_parameter"))
+        return parent && !strcmp(parent, "generic_type");
+    if (!strcmp(kind, "keyword_separator") || !strcmp(kind, "positional_separator"))
+        return parent && (!strcmp(parent, "parameters") || !strcmp(parent, "lambda_parameters")) &&
+               ts_node_named_child_count(node) == 0;
+    return false;
+}
+
 /* Formatting arbitrary values can invoke user-defined __format__, __str__
  * or __repr__. Only literal builtin values are effect-free here. The normal
  * tree walk still audits every nested interpolation and format expression;
@@ -1853,7 +1871,8 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
     if (!ts_node_is_named(node)) {
         return state;
     }
-    if (!supported_node(index->language, kind)) {
+    if (!supported_node(index->language, kind) &&
+        !(index->language == CBM_LANG_PYTHON && python_transparent_container(node, parent_kind))) {
         fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "unsupported_binding_syntax");
         return state;
     }
@@ -2374,10 +2393,12 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
     uint32_t tree_end = (uint32_t)source_len;
     if (component && tree) {
         TSRange range = {0};
-        CBMExtractCtx host = {.arena = arena, .result = (CBMFileResult *)result,
+        CBMExtractCtx host = {.arena = arena,
+                              .result = (CBMFileResult *)result,
                               .source = source,
                               .source_len = source_len <= INT_MAX ? (int)source_len : -1,
-                              .language = language, .module_qn = result->module_qn,
+                              .language = language,
+                              .module_qn = result->module_qn,
                               .root = ts_tree_root_node(tree)};
         TSTree *script = cbm_component_binding_tree(&host, &language, &range);
         if (owned_tree)

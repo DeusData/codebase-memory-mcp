@@ -72,7 +72,8 @@ typedef struct {
 
 static void et_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\') *p = '/';
+        if (*p == '\\')
+            *p = '/';
     }
 }
 
@@ -80,7 +81,8 @@ static void et_to_fwd_slashes(char *p) {
 static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_et_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir))
+        return NULL;
     et_to_fwd_slashes(lp->tmpdir);
 
     for (int i = 0; i < nfiles; i++) {
@@ -93,16 +95,19 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
             *slash = '/';
         }
         FILE *f = fopen(path, "wb");
-        if (!f) return NULL;
+        if (!f)
+            return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
 
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
+    if (!lp->project)
+        return NULL;
 
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+    if (!home)
+        home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
@@ -110,26 +115,34 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
     unlink(lp->dbpath);
 
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv) return NULL;
+    if (!lp->srv)
+        return NULL;
 
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp) free(resp);
+    if (resp)
+        free(resp);
 
     return cbm_store_open_path(lp->dbpath);
 }
 
 static void et_cleanup(EtProj *lp, cbm_store_t *store) {
-    if (store) cbm_store_close(store);
-    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
-    free(lp->project); lp->project = NULL;
+    if (store)
+        cbm_store_close(store);
+    if (lp->srv) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+    }
+    free(lp->project);
+    lp->project = NULL;
     th_rmtree(lp->tmpdir);
     unlink(lp->dbpath);
     char wal[600], shm[600];
     snprintf(wal, sizeof(wal), "%s-wal", lp->dbpath);
     snprintf(shm, sizeof(shm), "%s-shm", lp->dbpath);
-    unlink(wal); unlink(shm);
+    unlink(wal);
+    unlink(shm);
 }
 
 /* Assert edge_type count >= floor; dump diagnostic on failure. */
@@ -154,8 +167,8 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
  * parallel pads the fixture past MIN_FILES_FOR_PARALLEL so the parallel
  * resolver mints the routes; must_qn (optional) is a Route qualified_name that
  * must exist -- the identity cross-repo HTTP matching joins on. */
-static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes,
-                                bool parallel, const char *must_qn) {
+static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes, bool parallel,
+                                const char *must_qn) {
     EtProj lp;
     cbm_store_t *store =
         parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
@@ -235,11 +248,12 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
     static char pad_body[ET_PARALLEL_PAD][64];
     EtFile files[ET_PAD_MAX] = {0};
     int n = 0;
-    for (int i = 0; i < n_mean; i++) files[n++] = meaningful[i];
+    for (int i = 0; i < n_mean; i++)
+        files[n++] = meaningful[i];
     for (int i = 0; i < ET_PARALLEL_PAD; i++) {
         snprintf(pad_name[i], sizeof(pad_name[i]), "pad/pad_%02d.py", i);
         snprintf(pad_body[i], sizeof(pad_body[i]), "def pad_%02d():\n    return %d\n", i, i);
-        files[n].name    = pad_name[i];
+        files[n].name = pad_name[i];
         files[n].content = pad_body[i];
         n++;
     }
@@ -428,9 +442,8 @@ static bool et_jsx_quality(const EtFile *files, int count, const RQ_Source *sour
 }
 TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
     static const EtFile f[] = {
-        {"tsconfig.json",
-         "{ \"compilerOptions\": { \"baseUrl\": \".\", "
-         "\"paths\": { \"@/*\": [\"./src/*\"] } } }\n"},
+        {"tsconfig.json", "{ \"compilerOptions\": { \"baseUrl\": \".\", "
+                          "\"paths\": { \"@/*\": [\"./src/*\"] } } }\n"},
         {"src/components/ui/kpi-card.tsx",
          "export function KpiCard({ label }: { label: string }) {\n"
          "  return <div>{label}</div>;\n}\n"},
@@ -645,10 +658,10 @@ TEST(calls_jsx_named_components_require_exact_binding) {
  * Included here as baseline sanity guard for this file. */
 TEST(handles_flask_python) {
     static const EtFile f[] = {
-        {"app.py",
-         "from flask import Flask\n\napp = Flask(__name__)\n\n\n"
-         "@app.route(\"/items\")\ndef list_items():\n    return {\"items\": []}\n\n\n"
-         "@app.route(\"/items/<int:item_id>\")\ndef get_item(item_id):\n    return {\"id\": item_id}\n"}};
+        {"app.py", "from flask import Flask\n\napp = Flask(__name__)\n\n\n"
+                   "@app.route(\"/items\")\ndef list_items():\n    return {\"items\": []}\n\n\n"
+                   "@app.route(\"/items/<int:item_id>\")\ndef get_item(item_id):\n    return "
+                   "{\"id\": item_id}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -669,14 +682,13 @@ TEST(handles_fastapi_python) {
  * Phase 2a emitted 0 Route/HANDLES edges (this asserts >=1 → RED without the
  * fix, GREEN with it). Direction-agnostic count via cbm_store_count_edges_by_type. */
 TEST(handles_drf_action_python) {
-    static const EtFile f[] = {
-        {"viewsets.py",
-         "from rest_framework.decorators import action\n"
-         "from rest_framework.viewsets import ViewSet\n\n"
-         "class CustomerTaskViewSet(ViewSet):\n"
-         "    @action(detail=True, methods=[\"post\"])\n"
-         "    def approve_draft_with_charge(self, request, pk=None):\n"
-         "        pass\n"}};
+    static const EtFile f[] = {{"viewsets.py",
+                                "from rest_framework.decorators import action\n"
+                                "from rest_framework.viewsets import ViewSet\n\n"
+                                "class CustomerTaskViewSet(ViewSet):\n"
+                                "    @action(detail=True, methods=[\"post\"])\n"
+                                "    def approve_draft_with_charge(self, request, pk=None):\n"
+                                "        pass\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -693,12 +705,11 @@ TEST(handles_express_ts) {
         {"express/router.ts",
          "export function expressGet(p: string, h: any): any { return h; }\n"
          "export function expressPost(p: string, h: any): any { return h; }\n"},
-        {"users.ts",
-         "import { expressGet, expressPost } from './express/router';\n\n"
-         "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
-         "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
-         "expressGet('/users', listUsers);\n"
-         "expressPost('/users', createUser);\n"}};
+        {"users.ts", "import { expressGet, expressPost } from './express/router';\n\n"
+                     "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
+                     "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
+                     "expressGet('/users', listUsers);\n"
+                     "expressPost('/users', createUser);\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -722,23 +733,21 @@ TEST(handles_fastify_js) {
 
 /* Go net/http + gin — local gin.Engine wrapper whose QN contains "gin." */
 TEST(handles_gin_go) {
-    static const EtFile f[] = {
-        {"gin/engine.go",
-         "package gin\n\n"
-         "type Engine struct{}\n\n"
-         "func Default() *Engine {\n    return &Engine{}\n}\n\n"
-         "func (e *Engine) GET(path string, handler interface{}) {}\n"
-         "func (e *Engine) POST(path string, handler interface{}) {}\n"},
-        {"main.go",
-         "package main\n\n"
-         "import \"gin\"\n\n"
-         "func listOrders(w interface{}, r interface{}) {}\n\n"
-         "func createOrder(w interface{}, r interface{}) {}\n\n"
-         "func main() {\n"
-         "    r := gin.Default()\n"
-         "    r.GET(\"/orders\", listOrders)\n"
-         "    r.POST(\"/orders\", createOrder)\n"
-         "}\n"}};
+    static const EtFile f[] = {{"gin/engine.go",
+                                "package gin\n\n"
+                                "type Engine struct{}\n\n"
+                                "func Default() *Engine {\n    return &Engine{}\n}\n\n"
+                                "func (e *Engine) GET(path string, handler interface{}) {}\n"
+                                "func (e *Engine) POST(path string, handler interface{}) {}\n"},
+                               {"main.go", "package main\n\n"
+                                           "import \"gin\"\n\n"
+                                           "func listOrders(w interface{}, r interface{}) {}\n\n"
+                                           "func createOrder(w interface{}, r interface{}) {}\n\n"
+                                           "func main() {\n"
+                                           "    r := gin.Default()\n"
+                                           "    r.GET(\"/orders\", listOrders)\n"
+                                           "    r.POST(\"/orders\", createOrder)\n"
+                                           "}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -753,39 +762,43 @@ TEST(handles_gin_go) {
  * leaves the route unprefixed (never guessed). Exact Route set on BOTH the
  * sequential and the parallel pipeline. */
 static const EtFile et_fiber_groups_issue686[] = {
-    {"main.go",
-     "package main\n\n"
-     "import \"github.com/gofiber/fiber/v2\"\n\n"
-     "func health(c *fiber.Ctx) error { return nil }\n"
-     "func getUser(c *fiber.Ctx) error { return nil }\n"
-     "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
-     "func listOrders(c *fiber.Ctx) error { return nil }\n"
-     "func ping(c *fiber.Ctx) error { return nil }\n"
-     "func report(c *fiber.Ctx) error { return nil }\n"
-     "func dyn(c *fiber.Ctx) error { return nil }\n\n"
-     "func main() {\n"
-     "    app := fiber.New()\n"
-     "    app.Get(\"/health\", health)\n"
-     "    api := app.Group(\"/api\")\n"
-     "    v1 := api.Group(\"/v1\", authMiddleware)\n"
-     "    v1.Get(\"/users/:id\", getUser)\n"
-     "    admin := app.Group(\"/admin\")\n"
-     "    admin.Post(\"/customers/:id\", updateCustomer)\n"
-     "    grp := api.Group(\"/shop\")\n"
-     "    grp.Get(\"/orders\", listOrders)\n"
-     "    grp = app.Group(\"/internal\")\n"
-     "    grp.Get(\"/ping\", ping)\n"
-     "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
-     "    prefix := \"/p\"\n"
-     "    dg := app.Group(prefix)\n"
-     "    dg.Get(\"/dyn\", dyn)\n"
-     "    app.Listen(\":3000\")\n"
-     "}\n\n"
-     "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+    {"main.go", "package main\n\n"
+                "import \"github.com/gofiber/fiber/v2\"\n\n"
+                "func health(c *fiber.Ctx) error { return nil }\n"
+                "func getUser(c *fiber.Ctx) error { return nil }\n"
+                "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+                "func listOrders(c *fiber.Ctx) error { return nil }\n"
+                "func ping(c *fiber.Ctx) error { return nil }\n"
+                "func report(c *fiber.Ctx) error { return nil }\n"
+                "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+                "func main() {\n"
+                "    app := fiber.New()\n"
+                "    app.Get(\"/health\", health)\n"
+                "    api := app.Group(\"/api\")\n"
+                "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+                "    v1.Get(\"/users/:id\", getUser)\n"
+                "    admin := app.Group(\"/admin\")\n"
+                "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+                "    grp := api.Group(\"/shop\")\n"
+                "    grp.Get(\"/orders\", listOrders)\n"
+                "    grp = app.Group(\"/internal\")\n"
+                "    grp.Get(\"/ping\", ping)\n"
+                "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+                "    prefix := \"/p\"\n"
+                "    dg := app.Group(prefix)\n"
+                "    dg.Get(\"/dyn\", dyn)\n"
+                "    app.Listen(\":3000\")\n"
+                "}\n\n"
+                "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
 
-static const char *et_fiber_groups_issue686_routes[] = {
-    "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
-    "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
+static const char *et_fiber_groups_issue686_routes[] = {"/health",
+                                                        "/api/v1/users/:id",
+                                                        "/admin/customers/:id",
+                                                        "/api/shop/orders",
+                                                        "/internal/ping",
+                                                        "/reports/daily",
+                                                        "/dyn",
+                                                        NULL};
 
 TEST(handles_fiber_group_prefix_sequential_issue686) {
     ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
@@ -802,20 +815,18 @@ TEST(handles_fiber_group_prefix_parallel_issue686) {
 /* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
  * idiomatic brace block. */
 TEST(handles_gin_group_prefix_issue686) {
-    static const EtFile f[] = {
-        {"main.go",
-         "package main\n\n"
-         "import \"github.com/gin-gonic/gin\"\n\n"
-         "func listOrders(c *gin.Context) {}\n"
-         "func createOrder(c *gin.Context) {}\n\n"
-         "func main() {\n"
-         "    r := gin.Default()\n"
-         "    v1 := r.Group(\"/v1\")\n"
-         "    {\n"
-         "        v1.GET(\"/orders\", listOrders)\n"
-         "        v1.POST(\"/orders\", createOrder)\n"
-         "    }\n"
-         "}\n"}};
+    static const EtFile f[] = {{"main.go", "package main\n\n"
+                                           "import \"github.com/gin-gonic/gin\"\n\n"
+                                           "func listOrders(c *gin.Context) {}\n"
+                                           "func createOrder(c *gin.Context) {}\n\n"
+                                           "func main() {\n"
+                                           "    r := gin.Default()\n"
+                                           "    v1 := r.Group(\"/v1\")\n"
+                                           "    {\n"
+                                           "        v1.GET(\"/orders\", listOrders)\n"
+                                           "        v1.POST(\"/orders\", createOrder)\n"
+                                           "    }\n"
+                                           "}\n"}};
     static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -827,18 +838,17 @@ TEST(handles_gin_group_prefix_issue686) {
  * ("/api/orders"). */
 TEST(handles_spring_java) {
     static const char *routes[] = {"/api/orders", "/api/orders/{id}", NULL};
-    static const EtFile f[] = {
-        {"OrderController.java",
-         "package com.example;\n\n"
-         "import org.springframework.web.bind.annotation.RequestMapping;\n"
-         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
-         "    @GetMapping(\"/orders\")\n"
-         "    public String listOrders() {\n"
-         "        return \"orders\";\n    }\n\n"
-         "    @GetMapping(\"/orders/{id}\")\n"
-         "    public String getOrder(int id) {\n"
-         "        return \"order:\" + id;\n    }\n}\n"}};
+    static const EtFile f[] = {{"OrderController.java",
+                                "package com.example;\n\n"
+                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+                                "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+                                "    @GetMapping(\"/orders\")\n"
+                                "    public String listOrders() {\n"
+                                "        return \"orders\";\n    }\n\n"
+                                "    @GetMapping(\"/orders/{id}\")\n"
+                                "    public String getOrder(int id) {\n"
+                                "        return \"order:\" + id;\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -852,18 +862,17 @@ TEST(handles_spring_java) {
  * @RequestMapping still produces one route on its own. */
 TEST(handles_spring_java_path_attribute_fourth) {
     static const char *routes[] = {"/api/orders", NULL};
-    static const EtFile f[] = {
-        {"OrderController.java",
-         "package com.example;\n\n"
-         "import org.springframework.web.bind.annotation.RequestMapping;\n"
-         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
-         "    @GetMapping(name = \"listOrders\",\n"
-         "                produces = \"application/json\",\n"
-         "                consumes = \"application/json\",\n"
-         "                path = \"/orders\")\n"
-         "    public String listOrders() {\n"
-         "        return \"orders\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"OrderController.java",
+                                "package com.example;\n\n"
+                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+                                "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+                                "    @GetMapping(name = \"listOrders\",\n"
+                                "                produces = \"application/json\",\n"
+                                "                consumes = \"application/json\",\n"
+                                "                path = \"/orders\")\n"
+                                "    public String listOrders() {\n"
+                                "        return \"orders\";\n    }\n}\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -896,19 +905,18 @@ TEST(handles_spring_kotlin) {
  * only the exact Route-name set catches that through the emission dedup. */
 TEST(handles_jaxrs_java) {
     static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
-    static const EtFile f[] = {
-        {"WidgetResource.java",
-         "package com.example;\n\n"
-         "import jakarta.ws.rs.GET;\n"
-         "import jakarta.ws.rs.Path;\n\n"
-         "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
-         "    @GET\n"
-         "    public String list() {\n"
-         "        return \"widgets\";\n    }\n\n"
-         "    @GET\n"
-         "    @Path(\"/count\")\n"
-         "    public String count() {\n"
-         "        return \"42\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"WidgetResource.java",
+                                "package com.example;\n\n"
+                                "import jakarta.ws.rs.GET;\n"
+                                "import jakarta.ws.rs.Path;\n\n"
+                                "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
+                                "    @GET\n"
+                                "    public String list() {\n"
+                                "        return \"widgets\";\n    }\n\n"
+                                "    @GET\n"
+                                "    @Path(\"/count\")\n"
+                                "    public String count() {\n"
+                                "        return \"42\";\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -919,19 +927,18 @@ TEST(handles_jaxrs_java) {
  * produce the same rooted Route set as the fixture above. */
 TEST(handles_jaxrs_java_relative_path) {
     static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
-    static const EtFile f[] = {
-        {"WidgetResource.java",
-         "package com.example;\n\n"
-         "import jakarta.ws.rs.GET;\n"
-         "import jakarta.ws.rs.Path;\n\n"
-         "@Path(\"api/v1/widgets\")\npublic class WidgetResource {\n"
-         "    @GET\n"
-         "    public String list() {\n"
-         "        return \"widgets\";\n    }\n\n"
-         "    @GET\n"
-         "    @Path(\"count\")\n"
-         "    public String count() {\n"
-         "        return \"42\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"WidgetResource.java",
+                                "package com.example;\n\n"
+                                "import jakarta.ws.rs.GET;\n"
+                                "import jakarta.ws.rs.Path;\n\n"
+                                "@Path(\"api/v1/widgets\")\npublic class WidgetResource {\n"
+                                "    @GET\n"
+                                "    public String list() {\n"
+                                "        return \"widgets\";\n    }\n\n"
+                                "    @GET\n"
+                                "    @Path(\"count\")\n"
+                                "    public String count() {\n"
+                                "        return \"42\";\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -943,15 +950,14 @@ TEST(handles_jaxrs_java_relative_path) {
  * Route node appears. */
 TEST(handles_spring_java_relative_string_not_route) {
     static const char *routes[] = {"/", NULL};
-    static const EtFile f[] = {
-        {"OrderController.java",
-         "package com.example;\n\n"
-         "import org.springframework.web.bind.annotation.RequestMapping;\n"
-         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-         "@RequestMapping(\"api\")\npublic class OrderController {\n"
-         "    @GetMapping(\"orders\")\n"
-         "    public String listOrders() {\n"
-         "        return \"orders\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"OrderController.java",
+                                "package com.example;\n\n"
+                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+                                "@RequestMapping(\"api\")\npublic class OrderController {\n"
+                                "    @GetMapping(\"orders\")\n"
+                                "    public String listOrders() {\n"
+                                "        return \"orders\";\n    }\n}\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -963,17 +969,16 @@ TEST(handles_spring_java_relative_string_not_route) {
 TEST(handles_jaxrs_scala) {
     static const char *routes[] = {"/billingAccount", "/billingAccount/{id}",
                                    "/billingAccount/{id}/attachment/{attachmentId}/content", NULL};
-    static const EtFile f[] = {
-        {"BillingAccountApiController.scala",
-         "package com.example\n\n"
-         "import jakarta.ws.rs.{GET, POST, Path}\n\n"
-         "@Path(\"/billingAccount\")\nclass BillingAccountApiController {\n"
-         "  @POST\n  @Path(\"\")\n"
-         "  def createBillingAccount(): String = \"created\"\n\n"
-         "  @GET\n  @Path(\"{id}\")\n"
-         "  def retrieveBillingAccount(): String = \"account\"\n\n"
-         "  @GET\n  @Path(\"{id}/attachment/{attachmentId}/content\")\n"
-         "  def retrieveAttachment(): String = \"attachment\"\n}\n"}};
+    static const EtFile f[] = {{"BillingAccountApiController.scala",
+                                "package com.example\n\n"
+                                "import jakarta.ws.rs.{GET, POST, Path}\n\n"
+                                "@Path(\"/billingAccount\")\nclass BillingAccountApiController {\n"
+                                "  @POST\n  @Path(\"\")\n"
+                                "  def createBillingAccount(): String = \"created\"\n\n"
+                                "  @GET\n  @Path(\"{id}\")\n"
+                                "  def retrieveBillingAccount(): String = \"account\"\n\n"
+                                "  @GET\n  @Path(\"{id}/attachment/{attachmentId}/content\")\n"
+                                "  def retrieveAttachment(): String = \"attachment\"\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 3));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -1141,21 +1146,21 @@ static bool et_service_quality(const EtFile *files, int count, int config_count,
  * required and never substitutes for either original method-group target. */
 TEST(handles_aspnet_csharp) {
     static const EtFile f[] = {
-        {"Microsoft/AspNetCore/Builder.cs",
-         "namespace Microsoft.AspNetCore {\n"
-         "    class WebApp {\n"
-         "        public static string MapGet(string path, System.Func<string> handler) { return handler(); }\n"
-         "        public static string MapPost(string path, System.Func<string> handler) { return handler(); }\n"
-         "    }\n}\n"},
-        {"Program.cs",
-         "using Microsoft.AspNetCore;\n\n"
-         "namespace App {\n"
-         "    class Program {\n"
-         "        static void Main() {\n"
-         "            WebApp.MapGet(\"/products\", GetProducts);\n"
-         "            WebApp.MapPost(\"/products\", CreateProduct);\n        }\n"
-         "        static string GetProducts() { return \"[]\"; }\n"
-         "        static string CreateProduct() { return \"{}\" ; }\n    }\n}\n"}};
+        {"Microsoft/AspNetCore/Builder.cs", "namespace Microsoft.AspNetCore {\n"
+                                            "    class WebApp {\n"
+                                            "        public static string MapGet(string path, "
+                                            "System.Func<string> handler) { return handler(); }\n"
+                                            "        public static string MapPost(string path, "
+                                            "System.Func<string> handler) { return handler(); }\n"
+                                            "    }\n}\n"},
+        {"Program.cs", "using Microsoft.AspNetCore;\n\n"
+                       "namespace App {\n"
+                       "    class Program {\n"
+                       "        static void Main() {\n"
+                       "            WebApp.MapGet(\"/products\", GetProducts);\n"
+                       "            WebApp.MapPost(\"/products\", CreateProduct);\n        }\n"
+                       "        static string GetProducts() { return \"[]\"; }\n"
+                       "        static string CreateProduct() { return \"{}\" ; }\n    }\n}\n"}};
 
     const EtFile files[] = {
         f[0],
@@ -1491,12 +1496,11 @@ TEST(handles_laravel_php) {
          "class Route {\n"
          "    public static function get($path, $handler) { return $handler; }\n"
          "    public static function post($path, $handler) { return $handler; }\n}\n"},
-        {"routes/web.php",
-         "<?php\nuse Laravel\\Route;\n\n"
-         "function showUsers() { return ['users' => []]; }\n"
-         "function storeUser() { return ['stored' => true]; }\n\n"
-         "Route::get('/users', 'showUsers');\n"
-         "Route::post('/users', 'storeUser');\n"}};
+        {"routes/web.php", "<?php\nuse Laravel\\Route;\n\n"
+                           "function showUsers() { return ['users' => []]; }\n"
+                           "function storeUser() { return ['stored' => true]; }\n\n"
+                           "Route::get('/users', 'showUsers');\n"
+                           "Route::post('/users', 'storeUser');\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -1512,20 +1516,19 @@ TEST(handles_laravel_php) {
 TEST(handles_laravel_facade_routes_issue952) {
     static const char *routes[] = {"/api/welcome", "/users/me", "/users/login",
                                    "/companies/tenants/list", NULL};
-    static const EtFile f[] = {
-        {"routes/api.php",
-         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
-         "Route::get('/api/welcome', WelcomeController::class);\n"
-         "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
-         "->group(function (): void {\n"
-         "    Route::get('/me', GetCurrentUserController::class);\n"
-         "    Route::post('/login', LoginUserController::class);\n"
-         "});\n"
-         "Route::prefix('companies')->group(function (): void {\n"
-         "    Route::prefix('tenants')->group(function (): void {\n"
-         "        Route::get('/list', ListTenantsController::class);\n"
-         "    });\n"
-         "});\n"}};
+    static const EtFile f[] = {{"routes/api.php",
+                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+                                "Route::get('/api/welcome', WelcomeController::class);\n"
+                                "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
+                                "->group(function (): void {\n"
+                                "    Route::get('/me', GetCurrentUserController::class);\n"
+                                "    Route::post('/login', LoginUserController::class);\n"
+                                "});\n"
+                                "Route::prefix('companies')->group(function (): void {\n"
+                                "    Route::prefix('tenants')->group(function (): void {\n"
+                                "        Route::get('/list', ListTenantsController::class);\n"
+                                "    });\n"
+                                "});\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -1536,13 +1539,12 @@ TEST(handles_laravel_facade_routes_issue952) {
  * slash. */
 TEST(handles_laravel_facade_no_junk_routes_issue952) {
     static const char *routes[] = {"/real", NULL};
-    static const EtFile f[] = {
-        {"routes/api.php",
-         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-         "use Illuminate\\Support\\Facades\\Cache;\n\n"
-         "Route::get('/real', RealController::class);\n"
-         "$v = Cache::get('users.count');\n"
-         "$w = Cache::get('/leading/slash/key');\n"}};
+    static const EtFile f[] = {{"routes/api.php",
+                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                                "use Illuminate\\Support\\Facades\\Cache;\n\n"
+                                "Route::get('/real', RealController::class);\n"
+                                "$v = Cache::get('users.count');\n"
+                                "$w = Cache::get('/leading/slash/key');\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -1553,13 +1555,13 @@ TEST(handles_laravel_facade_no_junk_routes_issue952) {
  * so per-file extraction alone minted `/users/me` where the runtime route is
  * `/api/users/me`, and cross-repo HTTP matching (which joins on the Route
  * qualified_name) never linked real callers. */
-#define ET_L11_BOOTSTRAP_HEAD                                                                      \
-    "<?php\n\nuse Illuminate\\Foundation\\Application;\n\n"                                        \
-    "return Application::configure(basePath: dirname(__DIR__))\n"                                  \
+#define ET_L11_BOOTSTRAP_HEAD                                     \
+    "<?php\n\nuse Illuminate\\Foundation\\Application;\n\n"       \
+    "return Application::configure(basePath: dirname(__DIR__))\n" \
     "    ->withRouting(\n"
-#define ET_L11_BOOTSTRAP_TAIL                                                                      \
-    "    )\n"                                                                                      \
-    "    ->withMiddleware(function ($middleware) {\n        //\n    })\n"                          \
+#define ET_L11_BOOTSTRAP_TAIL                                             \
+    "    )\n"                                                             \
+    "    ->withMiddleware(function ($middleware) {\n        //\n    })\n" \
     "    ->create();\n"
 
 static const char ET_L11_API_ROUTES[] =
@@ -1569,19 +1571,19 @@ static const char ET_L11_API_ROUTES[] =
     "});\n"
     "Route::post('/orders', [OrderController::class, 'store']);\n";
 
-static const char ET_L11_WEB_ROUTES[] = "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
-                                        "Route::get('/dashboard', [HomeController::class, 'index']);\n";
+static const char ET_L11_WEB_ROUTES[] =
+    "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+    "Route::get('/dashboard', [HomeController::class, 'index']);\n";
 
 /* Default convention: `api:` given, no `apiPrefix:` -> '/api'. */
 TEST(routes_laravel_withrouting_api_default_prefix_issue1146) {
     static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
-    static const EtFile f[] = {
-        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
-         "        web: __DIR__.'/../routes/web.php',\n"
-         "        api: __DIR__.'/../routes/api.php',\n"
-         "        commands: __DIR__.'/../routes/console.php',\n"
-         "        health: '/up',\n" ET_L11_BOOTSTRAP_TAIL},
-        {"routes/api.php", ET_L11_API_ROUTES}};
+    static const EtFile f[] = {{"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+                                "        web: __DIR__.'/../routes/web.php',\n"
+                                "        api: __DIR__.'/../routes/api.php',\n"
+                                "        commands: __DIR__.'/../routes/console.php',\n"
+                                "        health: '/up',\n" ET_L11_BOOTSTRAP_TAIL},
+                               {"routes/api.php", ET_L11_API_ROUTES}};
     ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, false, "__route__GET__/api/users/me"));
     PASS();
 }
@@ -1589,8 +1591,7 @@ TEST(routes_laravel_withrouting_api_default_prefix_issue1146) {
 /* Explicit `apiPrefix:` (multi-segment, array form of `api:`) replaces the
  * default for every mounted file. */
 TEST(routes_laravel_withrouting_api_custom_prefix_issue1146) {
-    static const char *routes[] = {"/v1/api/users/me", "/v1/api/orders", "/v1/api/partners",
-                                   NULL};
+    static const char *routes[] = {"/v1/api/users/me", "/v1/api/orders", "/v1/api/partners", NULL};
     static const EtFile f[] = {
         {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
          "        api: [__DIR__.'/../routes/api.php', __DIR__.'/../routes/partner.php'],\n"
@@ -1697,10 +1698,10 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
     }
     cbm_edge_t *edges = NULL;
     int n = 0;
-    int ok = store != NULL &&
-             cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) ==
-                 CBM_STORE_OK &&
-             n == wanted;
+    int ok =
+        store != NULL &&
+        cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) == CBM_STORE_OK &&
+        n == wanted;
     for (int i = 0; store && i < n; i++) {
         cbm_node_t src = {0};
         cbm_node_t tgt = {0};
@@ -1720,8 +1721,10 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
                     have_src && src.qualified_name ? src.qualified_name : "<?>",
                     have_tgt && tgt.name ? tgt.name : "<?>");
         }
-        if (have_src) cbm_node_free_fields(&src);
-        if (have_tgt) cbm_node_free_fields(&tgt);
+        if (have_src)
+            cbm_node_free_fields(&src);
+        if (have_tgt)
+            cbm_node_free_fields(&tgt);
     }
     for (int wi = 0; wi < wanted; wi++) {
         if (!found[wi]) {
@@ -1744,7 +1747,8 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
         fprintf(stderr, "  [ET-HANDLES] FAIL (%s path) expected=%d actual=%d\n",
                 parallel ? "parallel" : "sequential", wanted, n);
     }
-    if (edges) cbm_store_free_edges(edges, n);
+    if (edges)
+        cbm_store_free_edges(edges, n);
     et_cleanup(&lp, store);
     return ok;
 }
@@ -1761,8 +1765,8 @@ typedef struct {
     const char *handler_tail;
 } EtFlow;
 
-static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow *want,
-                           int wanted, int *found) {
+static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow *want, int wanted,
+                           int *found) {
     cbm_node_t src = {0};
     cbm_node_t tgt = {0};
     int have_src = cbm_store_find_node_by_id(store, e->source_id, &src) == CBM_STORE_OK;
@@ -1780,8 +1784,10 @@ static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow
                 have_src && src.qualified_name ? src.qualified_name : "<?>",
                 have_tgt && tgt.qualified_name ? tgt.qualified_name : "<?>");
     }
-    if (have_src) cbm_node_free_fields(&src);
-    if (have_tgt) cbm_node_free_fields(&tgt);
+    if (have_src)
+        cbm_node_free_fields(&src);
+    if (have_tgt)
+        cbm_node_free_fields(&tgt);
     return matched;
 }
 
@@ -1797,10 +1803,10 @@ static int et_data_flows_exact(const EtFile *files, int nfiles, const EtFlow *wa
     }
     cbm_edge_t *edges = NULL;
     int n = 0;
-    int ok = store != NULL &&
-             cbm_store_find_edges_by_type(store, lp.project, "DATA_FLOWS", &edges, &n) ==
-                 CBM_STORE_OK &&
-             n == wanted;
+    int ok =
+        store != NULL &&
+        cbm_store_find_edges_by_type(store, lp.project, "DATA_FLOWS", &edges, &n) == CBM_STORE_OK &&
+        n == wanted;
     for (int i = 0; store && i < n; i++) {
         if (!et_flow_matches(store, &edges[i], want, wanted, found)) {
             ok = 0;
@@ -1832,7 +1838,8 @@ static int et_data_flows_exact(const EtFile *files, int nfiles, const EtFlow *wa
         fprintf(stderr, "  [ET-FLOWS] FAIL (%s path) expected=%d actual=%d\n",
                 parallel ? "parallel" : "sequential", wanted, n);
     }
-    if (edges) cbm_store_free_edges(edges, n);
+    if (edges)
+        cbm_store_free_edges(edges, n);
     et_cleanup(&lp, store);
     return ok;
 }
@@ -2027,8 +2034,8 @@ static const EtFile et_laravel_psr4_absent_extra[] = {
 
 enum { ET_LARAVEL_PSR4_ABSENT_EXTRA = 3 };
 
-static const char *const et_laravel_psr4_absent_routes[] = {
-    "__route__GET__/blog/missing", "__route__GET__/blog/archive", NULL};
+static const char *const et_laravel_psr4_absent_routes[] = {"__route__GET__/blog/missing",
+                                                            "__route__GET__/blog/archive", NULL};
 
 static int et_laravel_psr4_absent(int parallel) {
     EtFile f[ET_LARAVEL_CLASS_FILES + ET_LARAVEL_PSR4_ABSENT_EXTRA];
@@ -2184,23 +2191,22 @@ TEST(routes_laravel_slashless_no_guessed_handlers_issue1146) {
  * test client call — stays what it is and mints no Route. */
 TEST(routes_laravel_slashless_no_junk_issue1146) {
     static const char *want[] = {"GET /real", NULL};
-    static const EtFile f[] = {
-        {"routes/web.php",
-         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-         "use Illuminate\\Support\\Facades\\Cache;\n\n"
-         "Route::get('real', 'RealController@show');\n\n"
-         "class UsersController {\n"
-         "    public function index($request) {\n"
-         "        $name = $request->get('name');\n"
-         "        $q = $request->query->get('q');\n"
-         "        $v = Cache::get('users.count');\n"
-         "        $c = config('app.name');\n"
-         "        $k = collect(['a' => 1])->get('a');\n"
-         "        $s = session()->get('key');\n"
-         "        $r = $this->router->get('status');\n"
-         "        $p = $this->post('login', []);\n"
-         "        return $this->get('users');\n"
-         "    }\n}\n"}};
+    static const EtFile f[] = {{"routes/web.php",
+                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                                "use Illuminate\\Support\\Facades\\Cache;\n\n"
+                                "Route::get('real', 'RealController@show');\n\n"
+                                "class UsersController {\n"
+                                "    public function index($request) {\n"
+                                "        $name = $request->get('name');\n"
+                                "        $q = $request->query->get('q');\n"
+                                "        $v = Cache::get('users.count');\n"
+                                "        $c = config('app.name');\n"
+                                "        $k = collect(['a' => 1])->get('a');\n"
+                                "        $s = session()->get('key');\n"
+                                "        $r = $this->router->get('status');\n"
+                                "        $p = $this->post('login', []);\n"
+                                "        return $this->get('users');\n"
+                                "    }\n}\n"}};
     ASSERT_TRUE(et_route_set_exact(f, 1, want, 0));
     PASS();
 }
@@ -2211,18 +2217,16 @@ TEST(routes_laravel_slashless_no_junk_issue1146) {
  * carries the "ActionDispatch" route-registration substring → ROUTE_REG → HANDLES. */
 TEST(handles_rails_ruby) {
     static const EtFile f[] = {
-        {"ActionDispatch/Routing.rb",
-         "module ActionDispatch\n  module Routing\n"
-         "    class Mapper\n"
-         "      def get(path, handler); end\n"
-         "      def post(path, handler); end\n"
-         "    end\n  end\nend\n"},
-        {"config/routes.rb",
-         "require_relative '../ActionDispatch/Routing'\n\n"
-         "mapper = ActionDispatch::Routing::Mapper.new\n\n"
-         "def list_items; end\ndef create_item; end\n\n"
-         "mapper.get '/items', list_items\n"
-         "mapper.post '/items', create_item\n"}};
+        {"ActionDispatch/Routing.rb", "module ActionDispatch\n  module Routing\n"
+                                      "    class Mapper\n"
+                                      "      def get(path, handler); end\n"
+                                      "      def post(path, handler); end\n"
+                                      "    end\n  end\nend\n"},
+        {"config/routes.rb", "require_relative '../ActionDispatch/Routing'\n\n"
+                             "mapper = ActionDispatch::Routing::Mapper.new\n\n"
+                             "def list_items; end\ndef create_item; end\n\n"
+                             "mapper.get '/items', list_items\n"
+                             "mapper.post '/items', create_item\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -2233,16 +2237,15 @@ TEST(handles_rails_ruby) {
  * cross-file `actix_web::get` would NOT (Rust lsp_cross unwired + '::' path not
  * resolved by the generic resolver). */
 TEST(handles_actix_rust) {
-    static const EtFile f[] = {
-        {"actix_web_app.rs",
-         "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
-         "    format!(\"{}\", path)\n}\n\n"
-         "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
-         "    format!(\"{}\", path)\n}\n\n"
-         "fn list_widgets() {}\nfn create_widget() {}\n\n"
-         "fn main() {\n"
-         "    actix_web_get(\"/widgets\", list_widgets);\n"
-         "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
+    static const EtFile f[] = {{"actix_web_app.rs",
+                                "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
+                                "    format!(\"{}\", path)\n}\n\n"
+                                "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
+                                "    format!(\"{}\", path)\n}\n\n"
+                                "fn list_widgets() {}\nfn create_widget() {}\n\n"
+                                "fn main() {\n"
+                                "    actix_web_get(\"/widgets\", list_widgets);\n"
+                                "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -2276,17 +2279,15 @@ TEST(http_calls_fetch_js) {
 /* axios (TypeScript) — "axios" substring in QN */
 TEST(http_calls_axios_ts) {
     static const EtFile f[] = {
-        {"axios.ts",
-         "export function axiosGet(url: string): Promise<any> {\n"
-         "    return Promise.resolve({ data: {} });\n}\n\n"
-         "export function axiosPost(url: string, data: any): Promise<any> {\n"
-         "    return Promise.resolve({ data });\n}\n"},
-        {"client.ts",
-         "import { axiosGet, axiosPost } from './axios';\n\n"
-         "export async function getOrders(): Promise<any> {\n"
-         "    return axiosGet('/api/orders');\n}\n\n"
-         "export async function submitOrder(payload: any): Promise<any> {\n"
-         "    return axiosPost('/api/orders', payload);\n}\n"}};
+        {"axios.ts", "export function axiosGet(url: string): Promise<any> {\n"
+                     "    return Promise.resolve({ data: {} });\n}\n\n"
+                     "export function axiosPost(url: string, data: any): Promise<any> {\n"
+                     "    return Promise.resolve({ data });\n}\n"},
+        {"client.ts", "import { axiosGet, axiosPost } from './axios';\n\n"
+                      "export async function getOrders(): Promise<any> {\n"
+                      "    return axiosGet('/api/orders');\n}\n\n"
+                      "export async function submitOrder(payload: any): Promise<any> {\n"
+                      "    return axiosPost('/api/orders', payload);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
 }
@@ -2318,13 +2319,12 @@ TEST(http_calls_nethttp_go) {
          "package resty\n\n"
          "func Get(url string) (interface{}, error) { return nil, nil }\n"
          "func Post(url string, body interface{}) (interface{}, error) { return nil, nil }\n"},
-        {"catalog/service.go",
-         "package catalog\n\n"
-         "import \"resty\"\n\n"
-         "func ListProducts() (interface{}, error) {\n"
-         "    return resty.Get(\"/api/products\")\n}\n\n"
-         "func CreateProduct(body interface{}) (interface{}, error) {\n"
-         "    return resty.Post(\"/api/products\", body)\n}\n"}};
+        {"catalog/service.go", "package catalog\n\n"
+                               "import \"resty\"\n\n"
+                               "func ListProducts() (interface{}, error) {\n"
+                               "    return resty.Get(\"/api/products\")\n}\n\n"
+                               "func CreateProduct(body interface{}) (interface{}, error) {\n"
+                               "    return resty.Post(\"/api/products\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
 }
@@ -2336,7 +2336,8 @@ TEST(http_calls_resttemplate_java) {
          "package http;\n\n"
          "public class RestTemplate {\n"
          "    public Object getForObject(String url, Class<?> responseType) { return null; }\n"
-         "    public Object postForObject(String url, Object req, Class<?> responseType) { return null; }\n"
+         "    public Object postForObject(String url, Object req, Class<?> responseType) { return "
+         "null; }\n"
          "}\n"},
         {"OrderClient.java",
          "package client;\n\n"
@@ -2511,7 +2512,8 @@ TEST(http_calls_restsharp_csharp) {
          "namespace Services {\n"
          "    class ProductService {\n"
          "        public string GetProducts() { return RestClient.Get(\"/products\"); }\n"
-         "        public string AddProduct(object p) { return RestClient.Post(\"/products\", p); }\n"
+         "        public string AddProduct(object p) { return RestClient.Post(\"/products\", p); "
+         "}\n"
          "    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
@@ -2520,10 +2522,9 @@ TEST(http_calls_restsharp_csharp) {
 /* HTTParty (Ruby) — "HTTParty" substring in resolved QN */
 TEST(http_calls_httparty_ruby) {
     static const EtFile f[] = {
-        {"HTTParty.rb",
-         "module HTTParty\n"
-         "  def self.get(url, opts = {}); end\n"
-         "  def self.post(url, opts = {}); end\nend\n"},
+        {"HTTParty.rb", "module HTTParty\n"
+                        "  def self.get(url, opts = {}); end\n"
+                        "  def self.post(url, opts = {}); end\nend\n"},
         {"user_client.rb",
          "require_relative 'HTTParty'\n\n"
          "def fetch_users\n  HTTParty.get('/api/users')\nend\n\n"
@@ -2705,7 +2706,8 @@ TEST(http_calls_reqwest_rust) {
     static const EtFile f[] = {
         {"reqwest_api.rs",
          "pub fn reqwest_get(url: &str) -> String {\n    url.to_string()\n}\n\n"
-         "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, body)\n}\n\n"
+         "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, "
+         "body)\n}\n\n"
          "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
          "pub fn push_item(body: &str) -> String {\n    reqwest_post(\"/api/items\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 1));
@@ -2727,12 +2729,11 @@ TEST(async_calls_celery_python) {
          "    def task(self):\n        def decorator(fn): return fn\n        return decorator\n\n"
          "    def send_task(self, name, args=None): return (name, args)\n\n"
          "app = Celery()\n"},
-        {"tasks/order_tasks.py",
-         "from celery.app import app\n\n\n"
-         "def dispatch_order_created(order_id):\n"
-         "    return app.send_task('order_created', args=[order_id])\n\n\n"
-         "def dispatch_order_shipped(order_id):\n"
-         "    return app.send_task('order_shipped', args=[order_id])\n"}};
+        {"tasks/order_tasks.py", "from celery.app import app\n\n\n"
+                                 "def dispatch_order_created(order_id):\n"
+                                 "    return app.send_task('order_created', args=[order_id])\n\n\n"
+                                 "def dispatch_order_shipped(order_id):\n"
+                                 "    return app.send_task('order_shipped', args=[order_id])\n"}};
 
     const EtFile files[] = {
         f[0],
@@ -2901,12 +2902,11 @@ TEST(async_calls_celery_wall_stall_seam) {
          "    def task(self):\n        def decorator(fn): return fn\n        return decorator\n\n"
          "    def send_task(self, name, args=None): return (name, args)\n\n"
          "app = Celery()\n"},
-        {"tasks/order_tasks.py",
-         "from celery.app import app\n\n\n"
-         "def dispatch_order_created(order_id):\n"
-         "    return app.send_task('order_created', args=[order_id])\n\n\n"
-         "def dispatch_order_shipped(order_id):\n"
-         "    return app.send_task('order_shipped', args=[order_id])\n"}};
+        {"tasks/order_tasks.py", "from celery.app import app\n\n\n"
+                                 "def dispatch_order_created(order_id):\n"
+                                 "    return app.send_task('order_created', args=[order_id])\n\n\n"
+                                 "def dispatch_order_shipped(order_id):\n"
+                                 "    return app.send_task('order_shipped', args=[order_id])\n"}};
 
     const EtFile files[] = {
         f[0],
@@ -3063,9 +3063,8 @@ TEST(async_calls_celery_wall_stall_seam) {
 /* Sidekiq (Ruby) — "Sidekiq" substring in resolved QN */
 TEST(async_calls_sidekiq_ruby) {
     static const EtFile f[] = {
-        {"Sidekiq/Worker.rb",
-         "module Sidekiq\n  module Worker\n"
-         "    def self.perform_async(*args); end\n  end\nend\n"},
+        {"Sidekiq/Worker.rb", "module Sidekiq\n  module Worker\n"
+                              "    def self.perform_async(*args); end\n  end\nend\n"},
         {"workers/notification_worker.rb",
          "require_relative '../Sidekiq/Worker'\n\n"
          "class NotificationWorker\n"
@@ -3083,12 +3082,11 @@ TEST(async_calls_kafkajs_ts) {
     static const EtFile f[] = {
         {"kafkajs/producer.ts",
          "export function kafkajsProduce(topic: string, message: any): void {}\n"},
-        {"events/order_events.ts",
-         "import { kafkajsProduce } from '../kafkajs/producer';\n\n"
-         "export function emitOrderCreated(orderId: string): void {\n"
-         "    kafkajsProduce('order-created', { orderId });\n}\n\n"
-         "export function emitOrderCancelled(orderId: string): void {\n"
-         "    kafkajsProduce('order-cancelled', { orderId });\n}\n"}};
+        {"events/order_events.ts", "import { kafkajsProduce } from '../kafkajs/producer';\n\n"
+                                   "export function emitOrderCreated(orderId: string): void {\n"
+                                   "    kafkajsProduce('order-created', { orderId });\n}\n\n"
+                                   "export function emitOrderCancelled(orderId: string): void {\n"
+                                   "    kafkajsProduce('order-cancelled', { orderId });\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
     PASS();
 }
@@ -3099,12 +3097,12 @@ TEST(async_calls_kafkajs_ts) {
 static bool et_sqs_configured(const EtFile *original, bool configured, bool parallel) {
     static const EtFile extras[] = {
         {"quality_control.mjs", "export function exact_target() { return 7; }\n"
-         "export function exact_caller() { return exact_target(); }\n"},
+                                "export function exact_caller() { return exact_target(); }\n"},
         {"other/decoy.go", "package other\n\ntype SQS struct{}\n"
-         "func New() *SQS { return &SQS{} }\n"
-         "func (s *SQS) SendMessage() {}\n"},
+                           "func New() *SQS { return &SQS{} }\n"
+                           "func (s *SQS) SendMessage() {}\n"},
         {"go.mod", "module example.com/application\n\ngo 1.22\n\n"
-         "require aws-sdk-go v0.0.0\nreplace aws-sdk-go => ./aws-sdk-go\n"},
+                   "require aws-sdk-go v0.0.0\nreplace aws-sdk-go => ./aws-sdk-go\n"},
         {"aws-sdk-go/go.mod", "module aws-sdk-go\n\ngo 1.22\n"}};
     EtFile files[6] = {original[0], original[1], extras[0], extras[1], extras[2], extras[3]};
     RQ_Source sources[4];
@@ -3112,38 +3110,55 @@ static bool et_sqs_configured(const EtFile *original, bool configured, bool para
         sources[i] = (RQ_Source){.path = files[i].name, .text = files[i].content};
     static const RQ_Expected expected[] = {
         {.case_id = "required-control",
-         .site = {.file = "quality_control.mjs", .caller = "exact_caller",
-                  .needle = "exact_target()", .occurrence_index = 1},
+         .site = {.file = "quality_control.mjs",
+                  .caller = "exact_caller",
+                  .needle = "exact_target()",
+                  .occurrence_index = 1},
          .relation = "CALLS",
-         .target = {.file = "quality_control.mjs", .suffix = "exact_target", .label = "Function",
+         .target = {.file = "quality_control.mjs",
+                    .suffix = "exact_target",
+                    .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "export function exact_target() { return 7; }"}},
         {.case_id = "configured-sqs-constructor-factory",
-         .site = {.file = "queue/dispatcher.go", .caller = "DispatchOrderEvent",
+         .site = {.file = "queue/dispatcher.go",
+                  .caller = "DispatchOrderEvent",
                   .needle = "sqs.New()"},
          .relation = "CALLS",
-         .target = {.file = "aws-sdk-go/service/sqs/api.go", .suffix = "New", .label = "Function",
+         .target = {.file = "aws-sdk-go/service/sqs/api.go",
+                    .suffix = "New",
+                    .label = "Function",
                     .declaration_line = 6,
                     .declaration_text = "func New() *SQS { return &SQS{} }"}},
         {.case_id = "configured-sqs-returned-receiver",
-         .site = {.file = "queue/dispatcher.go", .caller = "DispatchOrderEvent",
+         .site = {.file = "queue/dispatcher.go",
+                  .caller = "DispatchOrderEvent",
                   .needle = "client.SendMessage(&sqs.SendMessageInput{\n"
                             "        QueueUrl:    queueUrl,\n"
                             "        MessageBody: body,\n    })"},
          .relation = "CALLS",
-         .target = {.file = "aws-sdk-go/service/sqs/api.go", .suffix = "SQS.SendMessage",
-                    .label = "Method", .declaration_line = 8,
-                    .declaration_text =
-                        "func (s *SQS) SendMessage(input *SendMessageInput) error { return nil }"}}};
+         .target = {
+             .file = "aws-sdk-go/service/sqs/api.go",
+             .suffix = "SQS.SendMessage",
+             .label = "Method",
+             .declaration_line = 8,
+             .declaration_text =
+                 "func (s *SQS) SendMessage(input *SendMessageInput) error { return nil }"}}};
     RQ_Forbidden forbidden[2] = {
         {.case_id = "factory-no-folder-guess",
-         .site = expected[1].site, .relation = "CALLS",
-         .target = {.file = "other/decoy.go", .suffix = "New", .label = "Function",
+         .site = expected[1].site,
+         .relation = "CALLS",
+         .target = {.file = "other/decoy.go",
+                    .suffix = "New",
+                    .label = "Function",
                     .declaration_line = 4,
                     .declaration_text = "func New() *SQS { return &SQS{} }"}},
         {.case_id = "method-no-namesake-guess",
-         .site = expected[2].site, .relation = "CALLS",
-         .target = {.file = "other/decoy.go", .suffix = "SQS.SendMessage", .label = "Method",
+         .site = expected[2].site,
+         .relation = "CALLS",
+         .target = {.file = "other/decoy.go",
+                    .suffix = "SQS.SendMessage",
+                    .label = "Method",
                     .declaration_line = 5,
                     .declaration_text = "func (s *SQS) SendMessage() {}"}}};
     if (!configured)
@@ -3152,9 +3167,10 @@ static bool et_sqs_configured(const EtFile *original, bool configured, bool para
     cbm_store_t *store = parallel ? et_index_parallel(&project, files, configured ? 6 : 4)
                                   : et_index_files(&project, files, configured ? 6 : 4);
     RQ_Report report = {0};
-    bool ok = store && rq_check_project_declarations(
-                          store, project.project, configured ? "sqs-configured" : "sqs-unconfigured",
-                          sources, 4, expected, configured ? 3 : 1, forbidden, 2, &report, stderr);
+    bool ok =
+        store && rq_check_project_declarations(
+                     store, project.project, configured ? "sqs-configured" : "sqs-unconfigured",
+                     sources, 4, expected, configured ? 3 : 1, forbidden, 2, &report, stderr);
     ok = ok && report.genuine == (configured ? 3 : 1) && report.found == report.genuine &&
          report.missing == 0 && report.wrong == 0;
     /* queueUrl is the existing symbolic-expression route contract, not a
@@ -3166,15 +3182,20 @@ static bool et_sqs_configured(const EtFile *original, bool configured, bool para
         "json_extract(e.properties,'$.broker'),json_extract(e.properties,'$.url_path') "
         "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
         "WHERE e.project=?1 AND e.type='ASYNC_CALLS'";
-    bool queried = store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) ==
-                               SQLITE_OK &&
-                   sqlite3_bind_text(query, 1, project.project, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    bool queried =
+        store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(query, 1, project.project, -1, SQLITE_TRANSIENT) == SQLITE_OK;
     int count = 0, step = SQLITE_ERROR;
     if (queried)
         while ((step = sqlite3_step(query)) == SQLITE_ROW) {
             count++;
-            const char *values[] = {"queue/dispatcher.go", "DispatchOrderEvent", "Route", "queueUrl",
-                                     "__route__sqs__queueUrl", "sqs", "queueUrl"};
+            const char *values[] = {"queue/dispatcher.go",
+                                    "DispatchOrderEvent",
+                                    "Route",
+                                    "queueUrl",
+                                    "__route__sqs__queueUrl",
+                                    "sqs",
+                                    "queueUrl"};
             for (int i = 0; i < 7; i++) {
                 const char *value = (const char *)sqlite3_column_text(query, i);
                 ok = value && !strcmp(value, values[i]) && ok;
@@ -3198,14 +3219,13 @@ TEST(async_calls_sqs_go) {
          "type SQS struct{}\n\n"
          "func New() *SQS { return &SQS{} }\n\n"
          "func (s *SQS) SendMessage(input *SendMessageInput) error { return nil }\n"},
-        {"queue/dispatcher.go",
-         "package queue\n\n"
-         "import \"aws-sdk-go/service/sqs\"\n\n"
-         "func DispatchOrderEvent(queueUrl, body string) error {\n"
-         "    client := sqs.New()\n"
-         "    return client.SendMessage(&sqs.SendMessageInput{\n"
-         "        QueueUrl:    queueUrl,\n"
-         "        MessageBody: body,\n    })\n}\n"}};
+        {"queue/dispatcher.go", "package queue\n\n"
+                                "import \"aws-sdk-go/service/sqs\"\n\n"
+                                "func DispatchOrderEvent(queueUrl, body string) error {\n"
+                                "    client := sqs.New()\n"
+                                "    return client.SendMessage(&sqs.SendMessageInput{\n"
+                                "        QueueUrl:    queueUrl,\n"
+                                "        MessageBody: body,\n    })\n}\n"}};
     for (int parallel = 0; parallel < 2; parallel++) {
         ASSERT_TRUE(et_sqs_configured(f, false, parallel != 0));
         ASSERT_TRUE(et_sqs_configured(f, true, parallel != 0));
@@ -3216,17 +3236,15 @@ TEST(async_calls_sqs_go) {
 /* BullMQ (JavaScript) — "bullmq" substring in resolved QN */
 TEST(async_calls_bullmq_js) {
     static const EtFile f[] = {
-        {"bullmq/queue.js",
-         "class bullmqQueue {\n"
-         "    add(jobName, data) { return { jobName, data }; }\n}\n\n"
-         "module.exports = { bullmqQueue };\n"},
-        {"jobs/mailer.js",
-         "const { bullmqQueue } = require('./bullmq/queue');\n\n"
-         "const mailQueue = new bullmqQueue();\n\n"
-         "function scheduleWelcomeEmail(userId) {\n"
-         "    return mailQueue.add('welcome-email', { userId });\n}\n\n"
-         "function schedulePasswordReset(userId) {\n"
-         "    return mailQueue.add('password-reset', { userId });\n}\n"}};
+        {"bullmq/queue.js", "class bullmqQueue {\n"
+                            "    add(jobName, data) { return { jobName, data }; }\n}\n\n"
+                            "module.exports = { bullmqQueue };\n"},
+        {"jobs/mailer.js", "const { bullmqQueue } = require('./bullmq/queue');\n\n"
+                           "const mailQueue = new bullmqQueue();\n\n"
+                           "function scheduleWelcomeEmail(userId) {\n"
+                           "    return mailQueue.add('welcome-email', { userId });\n}\n\n"
+                           "function schedulePasswordReset(userId) {\n"
+                           "    return mailQueue.add('password-reset', { userId });\n}\n"}};
 
     const EtFile files[] = {
         f[0],
@@ -3478,14 +3496,13 @@ TEST(throws_java) {
  * the THROWS edge resolution never gets a usable exception name. */
 TEST(throws_kotlin) {
     static const EtFile meaningful[] = {
-        {"Service.kt",
-         "class NotFoundException(msg: String) : Exception(msg)\n\n"
-         "fun findItem(id: Int): String {\n"
-         "    if (id < 0) throw NotFoundException(\"item not found: $id\")\n"
-         "    return \"item:$id\"\n}\n\n"
-         "fun getCategory(name: String): String {\n"
-         "    if (name.isEmpty()) throw NotFoundException(\"category missing\")\n"
-         "    return name\n}\n"}};
+        {"Service.kt", "class NotFoundException(msg: String) : Exception(msg)\n\n"
+                       "fun findItem(id: Int): String {\n"
+                       "    if (id < 0) throw NotFoundException(\"item not found: $id\")\n"
+                       "    return \"item:$id\"\n}\n\n"
+                       "fun getCategory(name: String): String {\n"
+                       "    if (name.isEmpty()) throw NotFoundException(\"category missing\")\n"
+                       "    return name\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3501,17 +3518,16 @@ TEST(throws_kotlin) {
 /* Python — `raise ValidationException(...)` — checked (no Error/Panic) */
 TEST(throws_python) {
     static const EtFile meaningful[] = {
-        {"validate.py",
-         "class ValidationException(Exception):\n"
-         "    pass\n\n\n"
-         "def validate_email(email):\n"
-         "    if '@' not in email:\n"
-         "        raise ValidationException('invalid email: ' + email)\n"
-         "    return email\n\n\n"
-         "def validate_age(age):\n"
-         "    if age < 0:\n"
-         "        raise ValidationException('age must be non-negative')\n"
-         "    return age\n"}};
+        {"validate.py", "class ValidationException(Exception):\n"
+                        "    pass\n\n\n"
+                        "def validate_email(email):\n"
+                        "    if '@' not in email:\n"
+                        "        raise ValidationException('invalid email: ' + email)\n"
+                        "    return email\n\n\n"
+                        "def validate_age(age):\n"
+                        "    if age < 0:\n"
+                        "        raise ValidationException('age must be non-negative')\n"
+                        "    return age\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3527,17 +3543,15 @@ TEST(throws_python) {
 /* TypeScript — `throw new HttpException(...)` — checked (no Error/Panic) */
 TEST(throws_typescript) {
     static const EtFile meaningful[] = {
-        {"exceptions.ts",
-         "export class HttpException {\n"
-         "    constructor(public status: number, public message: string) {}\n}\n"},
-        {"controller.ts",
-         "import { HttpException } from './exceptions';\n\n"
-         "export function getUser(id: number): string {\n"
-         "    if (id <= 0) throw new HttpException(404, 'User not found');\n"
-         "    return `user:${id}`;\n}\n\n"
-         "export function updateUser(id: number, name: string): string {\n"
-         "    if (!name) throw new HttpException(400, 'Name required');\n"
-         "    return `updated:${id}`;\n}\n"}};
+        {"exceptions.ts", "export class HttpException {\n"
+                          "    constructor(public status: number, public message: string) {}\n}\n"},
+        {"controller.ts", "import { HttpException } from './exceptions';\n\n"
+                          "export function getUser(id: number): string {\n"
+                          "    if (id <= 0) throw new HttpException(404, 'User not found');\n"
+                          "    return `user:${id}`;\n}\n\n"
+                          "export function updateUser(id: number, name: string): string {\n"
+                          "    if (!name) throw new HttpException(400, 'Name required');\n"
+                          "    return `updated:${id}`;\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3606,14 +3620,13 @@ TEST(throws_php) {
 /* Scala — `throw new RecordException(...)` — checked */
 TEST(throws_scala) {
     static const EtFile meaningful[] = {
-        {"Records.scala",
-         "class RecordException(msg: String) extends Exception(msg)\n\n"
-         "def parseRecord(raw: String): String = {\n"
-         "    if (raw.isEmpty) throw new RecordException(\"empty record\")\n"
-         "    raw.trim\n}\n\n"
-         "def validateRecord(raw: String): Boolean = {\n"
-         "    if (raw.length < 2) throw new RecordException(\"too short\")\n"
-         "    true\n}\n"}};
+        {"Records.scala", "class RecordException(msg: String) extends Exception(msg)\n\n"
+                          "def parseRecord(raw: String): String = {\n"
+                          "    if (raw.isEmpty) throw new RecordException(\"empty record\")\n"
+                          "    raw.trim\n}\n\n"
+                          "def validateRecord(raw: String): Boolean = {\n"
+                          "    if (raw.length < 2) throw new RecordException(\"too short\")\n"
+                          "    true\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3633,17 +3646,16 @@ TEST(throws_scala) {
 
 /* Python — `raise ValueError(...)` — runtime exception */
 TEST(raises_python) {
-    static const EtFile meaningful[] = {
-        {"parser.py",
-         "class ValueError(Exception):\n    pass\n\n\n"
-         "def parse_int(s):\n"
-         "    if not s.isdigit():\n"
-         "        raise ValueError('not a digit: ' + s)\n"
-         "    return int(s)\n\n\n"
-         "def parse_float(s):\n"
-         "    try:\n        return float(s)\n"
-         "    except Exception:\n"
-         "        raise ValueError('not a float: ' + s)\n"}};
+    static const EtFile meaningful[] = {{"parser.py",
+                                         "class ValueError(Exception):\n    pass\n\n\n"
+                                         "def parse_int(s):\n"
+                                         "    if not s.isdigit():\n"
+                                         "        raise ValueError('not a digit: ' + s)\n"
+                                         "    return int(s)\n\n\n"
+                                         "def parse_float(s):\n"
+                                         "    try:\n        return float(s)\n"
+                                         "    except Exception:\n"
+                                         "        raise ValueError('not a float: ' + s)\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3659,17 +3671,15 @@ TEST(raises_python) {
 /* TypeScript — `throw new TypeError(...)` — runtime exception */
 TEST(raises_typescript) {
     static const EtFile meaningful[] = {
-        {"validators.ts",
-         "export class TypeError {\n"
-         "    constructor(public message: string) {}\n}\n"},
-        {"parser.ts",
-         "import { TypeError } from './validators';\n\n"
-         "export function parseNumber(val: unknown): number {\n"
-         "    if (typeof val !== 'number') throw new TypeError('not a number');\n"
-         "    return val as number;\n}\n\n"
-         "export function parseString(val: unknown): string {\n"
-         "    if (typeof val !== 'string') throw new TypeError('not a string');\n"
-         "    return val as string;\n}\n"}};
+        {"validators.ts", "export class TypeError {\n"
+                          "    constructor(public message: string) {}\n}\n"},
+        {"parser.ts", "import { TypeError } from './validators';\n\n"
+                      "export function parseNumber(val: unknown): number {\n"
+                      "    if (typeof val !== 'number') throw new TypeError('not a number');\n"
+                      "    return val as number;\n}\n\n"
+                      "export function parseString(val: unknown): string {\n"
+                      "    if (typeof val !== 'string') throw new TypeError('not a string');\n"
+                      "    return val as string;\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3689,14 +3699,13 @@ TEST(raises_typescript) {
  * exception identifier from a Kotlin throw_expression→call_expression. */
 TEST(raises_kotlin) {
     static const EtFile meaningful[] = {
-        {"Errors.kt",
-         "class IllegalArgumentError(msg: String) : RuntimeException(msg)\n\n"
-         "fun requirePositive(n: Int): Int {\n"
-         "    if (n <= 0) throw IllegalArgumentError(\"expected positive, got $n\")\n"
-         "    return n\n}\n\n"
-         "fun requireNonEmpty(s: String): String {\n"
-         "    if (s.isEmpty()) throw IllegalArgumentError(\"string is empty\")\n"
-         "    return s\n}\n"}};
+        {"Errors.kt", "class IllegalArgumentError(msg: String) : RuntimeException(msg)\n\n"
+                      "fun requirePositive(n: Int): Int {\n"
+                      "    if (n <= 0) throw IllegalArgumentError(\"expected positive, got $n\")\n"
+                      "    return n\n}\n\n"
+                      "fun requireNonEmpty(s: String): String {\n"
+                      "    if (s.isEmpty()) throw IllegalArgumentError(\"string is empty\")\n"
+                      "    return s\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -3881,8 +3890,8 @@ TEST(writes_python_explicit_global_missing_is_quality) {
  * callers remain outside this bounded oracle. A supported call and a foreign
  * same-named declaration guard against an empty or guessed graph. */
 static bool et_write_quality(const EtFile *original, int count, const EtFile *decoy,
-                              const RQ_Expected *gap, const RQ_Target *wrong_target,
-                              const char *suite) {
+                             const RQ_Expected *gap, const RQ_Target *wrong_target,
+                             const char *suite) {
     if (count < 1 || count > 13)
         return false;
     EtFile files[16];
@@ -3897,27 +3906,32 @@ static bool et_write_quality(const EtFile *original, int count, const EtFile *de
     const RQ_Expected expected[] = {
         *gap,
         {.case_id = "required-exact-call-control",
-         .site = {.file = "quality_control.js", .caller = "quality_control.caller",
-                  .needle = "target()", .occurrence_index = 1},
+         .site = {.file = "quality_control.js",
+                  .caller = "quality_control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
          .relation = "CALLS",
-         .target = {.file = "quality_control.js", .suffix = "quality_control.target",
-                    .label = "Function", .declaration_line = 1,
+         .target = {.file = "quality_control.js",
+                    .suffix = "quality_control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
                     .declaration_text = "export function target() { return 1; }"},
          .mode = RQ_REQUIRED}};
     const RQ_Forbidden forbidden = {.case_id = "foreign-write-target",
-                                    .site = gap->site, .relation = "WRITES",
+                                    .site = gap->site,
+                                    .relation = "WRITES",
                                     .target = *wrong_target};
     for (int driver = 0; driver < 2; driver++) {
         EtProj lp;
-        cbm_store_t *store = driver ? et_index_parallel(&lp, files, count)
-                                    : et_index_files(&lp, files, count);
+        cbm_store_t *store =
+            driver ? et_index_parallel(&lp, files, count) : et_index_files(&lp, files, count);
         if (!store) {
             et_cleanup(&lp, store);
             return false;
         }
         RQ_Report report;
         bool ok = rq_check_project_declarations(store, lp.project, suite, sources, (size_t)count,
-                                                  expected, 2, &forbidden, 1, &report, stderr);
+                                                expected, 2, &forbidden, 1, &report, stderr);
         et_cleanup(&lp, store);
         if (!ok || report.genuine != 2 || report.found != 1 || report.missing != 1)
             return false;
@@ -3927,33 +3941,38 @@ static bool et_write_quality(const EtFile *original, int count, const EtFile *de
 
 /* Go — short_var_declaration and assignment_statement */
 TEST(writes_go) {
-    static const EtFile meaningful[] = {
-        {"cache.go",
-         "package cache\n\n"
-         "var store map[string]string\n\n"
-         "func Set(key, value string) {\n"
-         "    store = make(map[string]string)\n"
-         "    store[key] = value\n}\n\n"
-         "func Reset() {\n"
-         "    store = nil\n}\n"}};
+    static const EtFile meaningful[] = {{"cache.go", "package cache\n\n"
+                                                     "var store map[string]string\n\n"
+                                                     "func Set(key, value string) {\n"
+                                                     "    store = make(map[string]string)\n"
+                                                     "    store[key] = value\n}\n\n"
+                                                     "func Reset() {\n"
+                                                     "    store = nil\n}\n"}};
     const EtFile decoy = {"decoy/cache.go", "package foreign\nvar store map[string]string\n"};
     const RQ_Expected gap = {
         .case_id = "writes_go-exact-declaration-write",
-        .site = {.file = "cache.go", .caller = "cache.Reset",
-                 .needle = "store", .occurrence_index = 3},
+        .site = {.file = "cache.go",
+                 .caller = "cache.Reset",
+                 .needle = "store",
+                 .occurrence_index = 3},
         .relation = "WRITES",
-        .target = {.file = "cache.go", .suffix = "cache.store",
-                   .label = "Variable", .declaration_line = 3,
+        .target = {.file = "cache.go",
+                   .suffix = "cache.store",
+                   .label = "Variable",
+                   .declaration_line = 3,
                    .declaration_text = "var store map[string]string"},
         .mode = RQ_KNOWN_GAP,
         .gap_id = "go-package-variable-write",
-        .why = "Reset assigns the declared package variable directly; it has no local shadow. The Go bridge does not yet prove write-target occurrences.",
+        .why = "Reset assigns the declared package variable directly; it has no local shadow. The "
+               "Go bridge does not yet prove write-target occurrences.",
         .tried = "The original source is unchanged. This exact assignment is measured in both "
                  "pipeline paths alongside a required supported call and a forbidden foreign "
                  "target; no edge-count substitute can satisfy it."};
-    const RQ_Target wrong = {.file = "decoy/cache.go", .suffix = "cache.store",
-                              .label = "Variable", .declaration_line = 2,
-                              .declaration_text = "var store map[string]string"};
+    const RQ_Target wrong = {.file = "decoy/cache.go",
+                             .suffix = "cache.store",
+                             .label = "Variable",
+                             .declaration_line = 2,
+                             .declaration_text = "var store map[string]string"};
     ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_go"));
     PASS();
 }
@@ -3961,100 +3980,120 @@ TEST(writes_go) {
 /* Java — field assignment inside a method */
 TEST(writes_java) {
     static const EtFile meaningful[] = {
-        {"Counter.java",
-         "package app;\n\n"
-         "class Counter {\n"
-         "    private int count = 0;\n\n"
-         "    public void increment() {\n"
-         "        count = count + 1;\n    }\n\n"
-         "    public void reset() {\n"
-         "        count = 0;\n    }\n\n"
-         "    public int get() {\n        return count;\n    }\n}\n"}};
+        {"Counter.java", "package app;\n\n"
+                         "class Counter {\n"
+                         "    private int count = 0;\n\n"
+                         "    public void increment() {\n"
+                         "        count = count + 1;\n    }\n\n"
+                         "    public void reset() {\n"
+                         "        count = 0;\n    }\n\n"
+                         "    public int get() {\n        return count;\n    }\n}\n"}};
     const EtFile decoy = {"Other.java", "package app;\nclass Other { int count = 7; }\n"};
     const RQ_Expected gap = {
         .case_id = "writes_java-exact-declaration-write",
-        .site = {.file = "Counter.java", .caller = "Counter.reset",
-                 .needle = "count", .occurrence_index = 3},
+        .site = {.file = "Counter.java",
+                 .caller = "Counter.reset",
+                 .needle = "count",
+                 .occurrence_index = 3},
         .relation = "WRITES",
-        .target = {.file = "Counter.java", .suffix = "Counter.count",
-                   .label = "Field", .declaration_line = 4,
+        .target = {.file = "Counter.java",
+                   .suffix = "Counter.count",
+                   .label = "Field",
+                   .declaration_line = 4,
                    .declaration_text = "    private int count = 0;"},
         .mode = RQ_KNOWN_GAP,
         .gap_id = "java-declared-field-write",
-        .why = "reset writes the field in its own Counter class. A count field in Other is a distinct declaration. Java write-target proofs are not yet admitted.",
+        .why = "reset writes the field in its own Counter class. A count field in Other is a "
+               "distinct declaration. Java write-target proofs are not yet admitted.",
         .tried = "The original source is unchanged. This exact assignment is measured in both "
                  "pipeline paths alongside a required supported call and a forbidden foreign "
                  "target; no edge-count substitute can satisfy it."};
-    const RQ_Target wrong = {.file = "Other.java", .suffix = "Other.count",
-                              .label = "Field", .declaration_line = 2,
-                              .declaration_text = "class Other { int count = 7; }"};
+    const RQ_Target wrong = {.file = "Other.java",
+                             .suffix = "Other.count",
+                             .label = "Field",
+                             .declaration_line = 2,
+                             .declaration_text = "class Other { int count = 7; }"};
     ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_java"));
     PASS();
 }
 
 /* Rust — local variable assignment (assignment_expression) */
 TEST(writes_rust) {
-    static const EtFile meaningful[] = {
-        {"accumulator.rs",
-         "pub struct Accumulator {\n    pub total: i64,\n}\n\n"
-         "impl Accumulator {\n"
-         "    pub fn add(&mut self, n: i64) {\n"
-         "        let total = self.total + n;\n"
-         "        self.total = total;\n    }\n\n"
-         "    pub fn clear(&mut self) {\n"
-         "        self.total = 0;\n    }\n}\n"}};
+    static const EtFile meaningful[] = {{"accumulator.rs",
+                                         "pub struct Accumulator {\n    pub total: i64,\n}\n\n"
+                                         "impl Accumulator {\n"
+                                         "    pub fn add(&mut self, n: i64) {\n"
+                                         "        let total = self.total + n;\n"
+                                         "        self.total = total;\n    }\n\n"
+                                         "    pub fn clear(&mut self) {\n"
+                                         "        self.total = 0;\n    }\n}\n"}};
     const EtFile decoy = {"decoy.rs", "pub struct Other {\n    pub total: i64,\n}\n"};
     const RQ_Expected gap = {
         .case_id = "writes_rust-exact-declaration-write",
-        .site = {.file = "accumulator.rs", .caller = "Accumulator.clear",
-                 .needle = "total", .occurrence_index = 5},
+        .site = {.file = "accumulator.rs",
+                 .caller = "Accumulator.clear",
+                 .needle = "total",
+                 .occurrence_index = 5},
         .relation = "WRITES",
-        .target = {.file = "accumulator.rs", .suffix = "Accumulator.total",
-                   .label = "Field", .declaration_line = 2,
+        .target = {.file = "accumulator.rs",
+                   .suffix = "Accumulator.total",
+                   .label = "Field",
+                   .declaration_line = 2,
                    .declaration_text = "    pub total: i64,"},
         .mode = RQ_KNOWN_GAP,
         .gap_id = "rust-declared-self-field-write",
-        .why = "clear assigns the field of its explicit &mut self receiver in impl Accumulator. The unrelated Other field is not its owner. Rust field-write proofs are not yet admitted.",
+        .why =
+            "clear assigns the field of its explicit &mut self receiver in impl Accumulator. The "
+            "unrelated Other field is not its owner. Rust field-write proofs are not yet admitted.",
         .tried = "The original source is unchanged. This exact assignment is measured in both "
                  "pipeline paths alongside a required supported call and a forbidden foreign "
                  "target; no edge-count substitute can satisfy it."};
-    const RQ_Target wrong = {.file = "decoy.rs", .suffix = "Other.total",
-                              .label = "Field", .declaration_line = 2,
-                              .declaration_text = "    pub total: i64,"};
+    const RQ_Target wrong = {.file = "decoy.rs",
+                             .suffix = "Other.total",
+                             .label = "Field",
+                             .declaration_line = 2,
+                             .declaration_text = "    pub total: i64,"};
     ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_rust"));
     PASS();
 }
 
 /* C# — property assignment inside methods */
 TEST(writes_csharp) {
-    static const EtFile meaningful[] = {
-        {"Config.cs",
-         "namespace App {\n"
-         "    class Config {\n"
-         "        public string Host = \"localhost\";\n"
-         "        public int Port = 8080;\n\n"
-         "        public void SetHost(string host) {\n"
-         "            Host = host;\n        }\n\n"
-         "        public void SetPort(int port) {\n"
-         "            Port = port;\n        }\n    }\n}\n"}};
-    const EtFile decoy = {"Other.cs", "namespace App {\n    class Other { public int Port = 7; }\n}\n"};
+    static const EtFile meaningful[] = {{"Config.cs",
+                                         "namespace App {\n"
+                                         "    class Config {\n"
+                                         "        public string Host = \"localhost\";\n"
+                                         "        public int Port = 8080;\n\n"
+                                         "        public void SetHost(string host) {\n"
+                                         "            Host = host;\n        }\n\n"
+                                         "        public void SetPort(int port) {\n"
+                                         "            Port = port;\n        }\n    }\n}\n"}};
+    const EtFile decoy = {"Other.cs",
+                          "namespace App {\n    class Other { public int Port = 7; }\n}\n"};
     const RQ_Expected gap = {
         .case_id = "writes_csharp-exact-declaration-write",
-        .site = {.file = "Config.cs", .caller = "Config.SetPort",
-                 .needle = "Port", .occurrence_index = 2},
+        .site = {.file = "Config.cs",
+                 .caller = "Config.SetPort",
+                 .needle = "Port",
+                 .occurrence_index = 2},
         .relation = "WRITES",
-        .target = {.file = "Config.cs", .suffix = "Config.Port",
-                   .label = "Field", .declaration_line = 4,
+        .target = {.file = "Config.cs",
+                   .suffix = "Config.Port",
+                   .label = "Field",
+                   .declaration_line = 4,
                    .declaration_text = "        public int Port = 8080;"},
         .mode = RQ_KNOWN_GAP,
         .gap_id = "csharp-declared-field-write",
-        .why = "SetPort writes the Port field of its containing Config class; the lower-case port is its parameter. C# write-target proofs are not yet admitted.",
+        .why = "SetPort writes the Port field of its containing Config class; the lower-case port "
+               "is its parameter. C# write-target proofs are not yet admitted.",
         .tried = "The original source is unchanged. This exact assignment is measured in both "
                  "pipeline paths alongside a required supported call and a forbidden foreign "
                  "target; no edge-count substitute can satisfy it."};
-    const RQ_Target wrong = {.file = "Other.cs", .suffix = "Other.Port",
-                              .label = "Field", .declaration_line = 2,
-                              .declaration_text = "    class Other { public int Port = 7; }"};
+    const RQ_Target wrong = {.file = "Other.cs",
+                             .suffix = "Other.Port",
+                             .label = "Field",
+                             .declaration_line = 2,
+                             .declaration_text = "    class Other { public int Port = 7; }"};
     ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_csharp"));
     PASS();
 }
@@ -4078,12 +4117,11 @@ TEST(writes_csharp) {
  * the receiver type's QN for Go methods. */
 TEST(defines_method_go) {
     static const EtFile f[] = {
-        {"service.go",
-         "package svc\n\n"
-         "type OrderService struct {\n    db interface{}\n}\n\n"
-         "func (s *OrderService) Create(name string) string {\n    return name\n}\n\n"
-         "func (s *OrderService) Delete(id int) bool {\n    return id > 0\n}\n\n"
-         "func (s *OrderService) List() []string {\n    return nil\n}\n"}};
+        {"service.go", "package svc\n\n"
+                       "type OrderService struct {\n    db interface{}\n}\n\n"
+                       "func (s *OrderService) Create(name string) string {\n    return name\n}\n\n"
+                       "func (s *OrderService) Delete(id int) bool {\n    return id > 0\n}\n\n"
+                       "func (s *OrderService) List() []string {\n    return nil\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -4105,66 +4143,61 @@ TEST(defines_method_rust) {
 
 /* Java — class with instance and static methods */
 TEST(defines_method_java) {
-    static const EtFile f[] = {
-        {"Account.java",
-         "package bank;\n\n"
-         "public class Account {\n"
-         "    private double balance;\n\n"
-         "    public Account(double initial) { this.balance = initial; }\n\n"
-         "    public void deposit(double amount) { balance += amount; }\n"
-         "    public boolean withdraw(double amount) {\n"
-         "        if (amount > balance) return false;\n"
-         "        balance -= amount;\n        return true;\n    }\n"
-         "    public double getBalance() { return balance; }\n}\n"}};
+    static const EtFile f[] = {{"Account.java",
+                                "package bank;\n\n"
+                                "public class Account {\n"
+                                "    private double balance;\n\n"
+                                "    public Account(double initial) { this.balance = initial; }\n\n"
+                                "    public void deposit(double amount) { balance += amount; }\n"
+                                "    public boolean withdraw(double amount) {\n"
+                                "        if (amount > balance) return false;\n"
+                                "        balance -= amount;\n        return true;\n    }\n"
+                                "    public double getBalance() { return balance; }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* C# — class with multiple methods */
 TEST(defines_method_csharp) {
-    static const EtFile f[] = {
-        {"Queue.cs",
-         "using System.Collections.Generic;\n\n"
-         "namespace Collections {\n"
-         "    public class Queue<T> {\n"
-         "        private List<T> items = new List<T>();\n\n"
-         "        public void Enqueue(T item) { items.Add(item); }\n"
-         "        public T Dequeue() {\n"
-         "            T item = items[0];\n"
-         "            items.RemoveAt(0);\n"
-         "            return item;\n        }\n"
-         "        public int Count() { return items.Count; }\n    }\n}\n"}};
+    static const EtFile f[] = {{"Queue.cs",
+                                "using System.Collections.Generic;\n\n"
+                                "namespace Collections {\n"
+                                "    public class Queue<T> {\n"
+                                "        private List<T> items = new List<T>();\n\n"
+                                "        public void Enqueue(T item) { items.Add(item); }\n"
+                                "        public T Dequeue() {\n"
+                                "            T item = items[0];\n"
+                                "            items.RemoveAt(0);\n"
+                                "            return item;\n        }\n"
+                                "        public int Count() { return items.Count; }\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* PHP — class with methods */
 TEST(defines_method_php) {
-    static const EtFile f[] = {
-        {"Cart.php",
-         "<?php\n\n"
-         "class Cart {\n"
-         "    private array $items = [];\n\n"
-         "    public function add(string $sku, int $qty): void {\n"
-         "        $this->items[$sku] = $qty;\n    }\n\n"
-         "    public function remove(string $sku): void {\n"
-         "        unset($this->items[$sku]);\n    }\n\n"
-         "    public function total(): int {\n"
-         "        return array_sum($this->items);\n    }\n}\n"}};
+    static const EtFile f[] = {{"Cart.php",
+                                "<?php\n\n"
+                                "class Cart {\n"
+                                "    private array $items = [];\n\n"
+                                "    public function add(string $sku, int $qty): void {\n"
+                                "        $this->items[$sku] = $qty;\n    }\n\n"
+                                "    public function remove(string $sku): void {\n"
+                                "        unset($this->items[$sku]);\n    }\n\n"
+                                "    public function total(): int {\n"
+                                "        return array_sum($this->items);\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* Ruby — class with instance methods */
 TEST(defines_method_ruby) {
-    static const EtFile f[] = {
-        {"stack.rb",
-         "class Stack\n"
-         "  def initialize\n    @items = []\n  end\n\n"
-         "  def push(item)\n    @items.push(item)\n  end\n\n"
-         "  def pop\n    @items.pop\n  end\n\n"
-         "  def peek\n    @items.last\n  end\n\n"
-         "  def empty?\n    @items.empty?\n  end\nend\n"}};
+    static const EtFile f[] = {{"stack.rb", "class Stack\n"
+                                            "  def initialize\n    @items = []\n  end\n\n"
+                                            "  def push(item)\n    @items.push(item)\n  end\n\n"
+                                            "  def pop\n    @items.pop\n  end\n\n"
+                                            "  def peek\n    @items.last\n  end\n\n"
+                                            "  def empty?\n    @items.empty?\n  end\nend\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -4172,13 +4205,12 @@ TEST(defines_method_ruby) {
 /* Kotlin — class with methods */
 TEST(defines_method_kotlin) {
     static const EtFile f[] = {
-        {"Wallet.kt",
-         "class Wallet(private var balance: Double) {\n"
-         "    fun deposit(amount: Double) {\n        balance += amount\n    }\n\n"
-         "    fun withdraw(amount: Double): Boolean {\n"
-         "        if (amount > balance) return false\n"
-         "        balance -= amount\n        return true\n    }\n\n"
-         "    fun getBalance(): Double = balance\n}\n"}};
+        {"Wallet.kt", "class Wallet(private var balance: Double) {\n"
+                      "    fun deposit(amount: Double) {\n        balance += amount\n    }\n\n"
+                      "    fun withdraw(amount: Double): Boolean {\n"
+                      "        if (amount > balance) return false\n"
+                      "        balance -= amount\n        return true\n    }\n\n"
+                      "    fun getBalance(): Double = balance\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -4186,13 +4218,15 @@ TEST(defines_method_kotlin) {
 /* TypeScript — class with methods and constructor */
 TEST(defines_method_typescript) {
     static const EtFile f[] = {
-        {"Logger.ts",
-         "export class Logger {\n"
-         "    private prefix: string;\n\n"
-         "    constructor(prefix: string) {\n        this.prefix = prefix;\n    }\n\n"
-         "    info(msg: string): void {\n        console.log(`[${this.prefix}] INFO: ${msg}`);\n    }\n\n"
-         "    warn(msg: string): void {\n        console.warn(`[${this.prefix}] WARN: ${msg}`);\n    }\n\n"
-         "    error(msg: string): void {\n        console.error(`[${this.prefix}] ERR: ${msg}`);\n    }\n}\n"}};
+        {"Logger.ts", "export class Logger {\n"
+                      "    private prefix: string;\n\n"
+                      "    constructor(prefix: string) {\n        this.prefix = prefix;\n    }\n\n"
+                      "    info(msg: string): void {\n        console.log(`[${this.prefix}] INFO: "
+                      "${msg}`);\n    }\n\n"
+                      "    warn(msg: string): void {\n        console.warn(`[${this.prefix}] WARN: "
+                      "${msg}`);\n    }\n\n"
+                      "    error(msg: string): void {\n        console.error(`[${this.prefix}] "
+                      "ERR: ${msg}`);\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -4226,29 +4260,28 @@ TEST(defines_method_scala) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(override_go_interface) {
-    static const EtFile meaningful[] = {
-        {"shapes.go",
-         "package shapes\n\n"
-         "type Shape interface {\n"
-         "    Area() float64\n    Perimeter() float64\n}\n\n"
-         "type Circle struct {\n    Radius float64\n}\n\n"
-         "func (c *Circle) Area() float64 {\n"
-         "    return 3.14159 * c.Radius * c.Radius\n}\n\n"
-         "func (c *Circle) Perimeter() float64 {\n"
-         "    return 2.0 * 3.14159 * c.Radius\n}\n\n"
-         "type Rectangle struct {\n    Width, Height float64\n}\n\n"
-         "func (r *Rectangle) Area() float64 {\n"
-         "    return r.Width * r.Height\n}\n\n"
-         "func (r *Rectangle) Perimeter() float64 {\n"
-         "    return 2.0 * (r.Width + r.Height)\n}\n"}};
+    static const EtFile meaningful[] = {{"shapes.go",
+                                         "package shapes\n\n"
+                                         "type Shape interface {\n"
+                                         "    Area() float64\n    Perimeter() float64\n}\n\n"
+                                         "type Circle struct {\n    Radius float64\n}\n\n"
+                                         "func (c *Circle) Area() float64 {\n"
+                                         "    return 3.14159 * c.Radius * c.Radius\n}\n\n"
+                                         "func (c *Circle) Perimeter() float64 {\n"
+                                         "    return 2.0 * 3.14159 * c.Radius\n}\n\n"
+                                         "type Rectangle struct {\n    Width, Height float64\n}\n\n"
+                                         "func (r *Rectangle) Area() float64 {\n"
+                                         "    return r.Width * r.Height\n}\n\n"
+                                         "func (r *Rectangle) Perimeter() float64 {\n"
+                                         "    return 2.0 * (r.Width + r.Height)\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
     int override_edges = store ? cbm_store_count_edges_by_type(store, lp.project, "OVERRIDE") : -1;
-    int implements     = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS") : -1;
+    int implements = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS") : -1;
     if (override_edges < 1 || implements < 1) {
-        fprintf(stderr, "  [ET-OVERRIDE] Go: OVERRIDE=%d IMPLEMENTS=%d\n",
-                override_edges, implements);
+        fprintf(stderr, "  [ET-OVERRIDE] Go: OVERRIDE=%d IMPLEMENTS=%d\n", override_edges,
+                implements);
     }
     et_cleanup(&lp, store);
     /* Both IMPLEMENTS (struct→interface) and OVERRIDE (method→interface-method) expected. */
@@ -4342,18 +4375,16 @@ static int et_xlang_routes(const EtFile *files, int nfiles, bool parallel, const
  * definitions. Controls: POST is unchanged, and a bare PHP `get('/x')` (no
  * route-registration callee) stays dropped — no Route, no CALLS into JS. */
 static const EtFile et_xlang_laravel[] = {
-    {"app/Http/Controllers/LeadController.php",
-     "<?php\nnamespace App\\Http\\Controllers;\n\n"
-     "class LeadController\n{\n"
-     "    public function index() { return []; }\n"
-     "    public function store() { return []; }\n}\n"},
-    {"routes/web.php",
-     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-     "use App\\Http\\Controllers\\LeadController;\n\n"
-     "Route::get('/leads', [LeadController::class, 'index']);\n"
-     "Route::post('/leads/store', [LeadController::class, 'store']);\n"
-     "$router->get('/reports', [LeadController::class, 'index']);\n\n"
-     "function report_file() { return get('/files/report'); }\n"},
+    {"app/Http/Controllers/LeadController.php", "<?php\nnamespace App\\Http\\Controllers;\n\n"
+                                                "class LeadController\n{\n"
+                                                "    public function index() { return []; }\n"
+                                                "    public function store() { return []; }\n}\n"},
+    {"routes/web.php", "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                       "use App\\Http\\Controllers\\LeadController;\n\n"
+                       "Route::get('/leads', [LeadController::class, 'index']);\n"
+                       "Route::post('/leads/store', [LeadController::class, 'store']);\n"
+                       "$router->get('/reports', [LeadController::class, 'index']);\n\n"
+                       "function report_file() { return get('/files/report'); }\n"},
     {"resources/js/http.js", "export function get(url) {\n  return url;\n}\n"},
     {"resources/js/store.js", "export class Store {\n  get(key) {\n    return key;\n  }\n}\n"},
 };
@@ -4368,8 +4399,8 @@ TEST(routes_laravel_get_survives_xlang_guard) {
 
 TEST(routes_laravel_get_survives_xlang_guard_parallel) {
     ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
-                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
-                                true, et_xlang_laravel_routes));
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])), true,
+                                et_xlang_laravel_routes));
     PASS();
 }
 
@@ -4377,16 +4408,15 @@ TEST(routes_laravel_get_survives_xlang_guard_parallel) {
  * unchanged; a member `memo.get(key)` (route suffix, no path) and a bare
  * `get('/cache/key')` stay dropped — no Route, no CALLS into Python. */
 static const EtFile et_xlang_express[] = {
-    {"web/server.js",
-     "const express = require('express');\n"
-     "const { health } = require('./handlers');\n\n"
-     "const app = express();\n\n"
-     "app.get('/health', health);\n"
-     "app.post('/items', health);\n\n"
-     "function readCache(memo, key) {\n"
-     "  return memo.get(key) || get('/cache/key');\n"
-     "}\n"
-     "module.exports = { readCache };\n"},
+    {"web/server.js", "const express = require('express');\n"
+                      "const { health } = require('./handlers');\n\n"
+                      "const app = express();\n\n"
+                      "app.get('/health', health);\n"
+                      "app.post('/items', health);\n\n"
+                      "function readCache(memo, key) {\n"
+                      "  return memo.get(key) || get('/cache/key');\n"
+                      "}\n"
+                      "module.exports = { readCache };\n"},
     {"web/handlers.js",
      "function health(req, res) {\n  return res;\n}\nmodule.exports = { health };\n"},
     {"tools/cache.py", "def get(key):\n    return key\n"},
@@ -4403,8 +4433,8 @@ TEST(routes_express_get_survives_xlang_guard) {
 
 TEST(routes_express_get_survives_xlang_guard_parallel) {
     ASSERT_TRUE(et_xlang_routes(et_xlang_express,
-                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
-                                true, et_xlang_express_routes));
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])), true,
+                                et_xlang_express_routes));
     PASS();
 }
 

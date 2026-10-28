@@ -3095,11 +3095,14 @@ TEST(tool_trace_deep) {
 
 TEST(tool_sg_rel_imports) {
     ASSERT(fastapi_physical_import());
+    /* relationship requires an actual import edge. Degree counts semantic
+     * relations only, so min_degree would incorrectly exclude this File.
+     * tool_sg_min_degree independently checks the semantic degree contract. */
     double ms;
     char *r = call_tool_timed("search_graph", &ms,
                               "{\"project\":\"%s\",\"label\":\"File\","
                               "\"qn_pattern\":\"[.]fastapi[.]security[.]oauth2[.]py[.]__file__$\","
-                              "\"relationship\":\"IMPORTS\",\"min_degree\":1}",
+                              "\"relationship\":\"IMPORTS\"}",
                               g_project);
     TOOL_OK(r, ms);
     ASSERT_EQ(count_in_response(r, "total"), 1);

@@ -620,6 +620,65 @@ static int literal_import_count(cbm_store_t *store, const literal_import_case_t 
 static int literal_path_import_cases(const char *prefix, int expected_genuine,
                                      int expected_missing) {
     static const literal_import_case_t cases[] = {
+        {"just.literal", "scope/main.just", "import 'utils.just'\n", "scope/utils.just",
+         "target:\n  @echo target\n", "utils.just", true, true, NULL},
+        {"just.parent", "scope/nested/main.just", "import '../utils.just'\n", "scope/utils.just",
+         "target:\n  @echo target\n", "../utils.just", true, true, NULL},
+        {"just.optional", "scope/main.just", "import? './utils.just'\n", "scope/utils.just",
+         "target:\n  @echo target\n", "./utils.just", true, true, NULL},
+        {"just.home-is-not-literal-folder", "scope/main.just", "import '~/utils.just'\n",
+         "scope/~/utils.just", "target:\n  @echo target\n", "~/utils.just", false, false, NULL},
+        {"just.computed-prefix", "scope/main.just", "import './utils.just' + 'other'\n",
+         "scope/utils.just", "target:\n  @echo target\n", "./utils.just", false, false, NULL},
+        {"just.other-directory", "scope/main.just", "import 'utils.just'\n", "elsewhere/utils.just",
+         "target:\n  @echo target\n", "utils.just", false, false, NULL},
+        {"just.no-string", "scope/main.just", "import path\n", "scope/utils.just",
+         "target:\n  @echo target\n", "utils.just", false, false, NULL},
+        {"func.literal", "scope/main.fc", "#include \"utils.fc\";\n", "scope/utils.fc",
+         "int target() { return 1; }\n", "utils.fc", true, true, NULL},
+        {"func.parent", "scope/nested/main.fc", "#include \"../utils.fc\";\n", "scope/utils.fc",
+         "int target() { return 1; }\n", "../utils.fc", true, true, NULL},
+        {"func.computed-prefix", "scope/main.fc", "#include \"./utils.fc\" + \"other\";\n",
+         "scope/utils.fc", "int target() { return 1; }\n", "./utils.fc", false, false, NULL},
+        {"func.other-directory", "scope/main.fc", "#include \"utils.fc\";\n", "elsewhere/utils.fc",
+         "int target() { return 1; }\n", "utils.fc", false, false, NULL},
+        {"scss.use", "scope/main.scss", "@use \"./base.scss\";\n", "scope/base.scss",
+         "$answer: 1;\n", "./base.scss", true, true, NULL},
+        {"scss.forward", "scope/main.scss", "@forward \"base.scss\";\n", "scope/base.scss",
+         "$answer: 1;\n", "base.scss", true, true, NULL},
+        {"scss.partial", "scope/main.scss", "@use \"base\";\n", "scope/_base.scss", "$answer: 1;\n",
+         "base", true, true, NULL},
+        {"scss.interpolated", "scope/main.scss",
+         "$suffix: \"other\";\n@import \"./base#{$suffix}.scss\";\n", "scope/base#{$suffix}.scss",
+         "$answer: 1;\n", "./base#{$suffix}.scss", false, false, NULL},
+        {"scss.mixin-string-not-import", "scope/main.scss", "@include wrapper(\"./base.scss\");\n",
+         "scope/base.scss", "$answer: 1;\n", "./base.scss", false, false, NULL},
+        {"scss.ambiguous", "scope/main.scss", "@use \"./base.scss\";\n", "scope/base.scss",
+         "$answer: 1;\n", "./base.scss", false, false, NULL},
+        {"scss.underscore-ambiguous", "scope/main.scss", "@use \"./_base.scss\";\n",
+         "scope/_base.scss", "$base: 1;\n", "./_base.scss", false, false, NULL},
+        {"scss.import-only-unsupported", "scope/main.scss", "@import \"base.scss\";\n",
+         "scope/base.scss", "$answer: 1;\n", "base.scss", false, true,
+         "Sass @import has separate import-only precedence; the bounded proof supports "
+         "@use/@forward "
+         "only. Literal module directives and competing partials are tested separately."},
+        {"meson.literal", "scope/meson.build", "subdir('sub')\n", "scope/sub/meson.build",
+         "answer = 1\n", "sub", true, true, NULL},
+        {"meson.dot-relative", "scope/meson.build", "subdir('./sub')\n", "scope/sub/meson.build",
+         "answer = 1\n", "./sub", true, true, NULL},
+        {"meson.concat-prefix", "scope/meson.build", "subdir('sub' + '-other')\n",
+         "scope/sub/meson.build", "answer = 1\n", "sub", false, false, NULL},
+        {"meson.nested-expression", "scope/meson.build", "subdir(join_paths('sub', 'other'))\n",
+         "scope/sub/meson.build", "answer = 1\n", "sub", false, false, NULL},
+        {"meson.false-branch", "scope/meson.build", "if false\n  subdir('sub')\nendif\n",
+         "scope/sub/meson.build", "answer = 1\n", "sub", false, false, NULL},
+        {"meson.after-subdir-done", "scope/meson.build", "subdir_done()\nsubdir('sub')\n",
+         "scope/sub/meson.build", "answer = 1\n", "sub", false, false, NULL},
+        {"meson.parent-segment-forbidden", "scope/meson.build", "subdir('child/../sub')\n",
+         "scope/sub/meson.build", "answer = 1\n", "child/../sub", false, false, NULL},
+        {"meson.keyword-condition", "scope/meson.build",
+         "subdir('sub', if_found: dependency('unknown', required: false))\n",
+         "scope/sub/meson.build", "answer = 1\n", "sub", false, false, NULL},
         {"objc.literal", "scope/Main.m", "#import \"Utils.m\"\n@interface Main\n@end\n",
          "scope/Utils.m", "@interface Utils\n@end\n", "Utils.m", true, true, NULL},
         {"objc.parent", "scope/nested/Main.m", "#import \"../Utils.m\"\n@interface Main\n@end\n",
@@ -631,8 +690,8 @@ static int literal_path_import_cases(const char *prefix, int expected_genuine,
         {"objc.above-root", "scope/Main.m", "#import \"../../Utils.m\"\n@interface Main\n@end\n",
          "scope/Utils.m", "@interface Utils\n@end\n", "../../Utils.m", false, false, NULL},
         {"objc.matlab-comment", "scope/Main.m",
-         "% #import \"Utils.m\"\nfunction value = Main()\nvalue = 1;\nend\n",
-         "scope/Utils.m", "@interface Utils\n@end\n", "Utils.m", false, false, NULL},
+         "% #import \"Utils.m\"\nfunction value = Main()\nvalue = 1;\nend\n", "scope/Utils.m",
+         "@interface Utils\n@end\n", "Utils.m", false, false, NULL},
         {"css.literal", "scope/main.css", "@import \"base.css\";\n", "scope/base.css",
          "body { color: red; }\n", "base.css", true, true, NULL},
         {"css.parent", "scope/nested/main.css", "@import \"../base.css\";\n", "scope/base.css",
@@ -689,6 +748,21 @@ static int literal_path_import_cases(const char *prefix, int expected_genuine,
             ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "scope/nested"), 0755));
             ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "elsewhere"), 0755));
             ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "decoys"), 0755));
+            char target_dir[512];
+            snprintf(target_dir, sizeof(target_dir), "%s/%s", fixture.repo, item->target_file);
+            char *target_slash = strrchr(target_dir, '/');
+            ASSERT_NOT_NULL(target_slash);
+            *target_slash = '\0';
+            ASSERT(cbm_mkdir_p(target_dir, 0755));
+            if (!strcmp(item->id, "scss.ambiguous")) {
+                ASSERT_EQ(
+                    th_write_file(TH_PATH(fixture.repo, "scope/_base.scss"), "$competing: 2;\n"),
+                    0);
+            } else if (!strcmp(item->id, "scss.underscore-ambiguous")) {
+                ASSERT_EQ(
+                    th_write_file(TH_PATH(fixture.repo, "scope/__base.scss"), "$competing: 2;\n"),
+                    0);
+            }
             ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, item->source_file), item->source), 0);
             ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, item->target_file), item->target), 0);
             const char *leaf = strrchr(item->target_file, '/');
@@ -745,18 +819,17 @@ TEST(resolver_integration_capnp_literal_paths_require_complete_source_tokens) {
     return literal_path_import_cases("capnp.", 2, 0);
 }
 
-
 TEST(resolver_integration_objc_imports_retain_extracted_language) {
     return literal_path_import_cases("objc.", 2, 0);
 }
 
 TEST(resolver_integration_objc_raw_imports_keep_delimiters) {
     static const char source[] = "#import \"Utils.m\"\n#import <System.h>\n@interface Main\n@end\n";
-    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_OBJC,
-                                             "objc", "scope/Main.m", 0, NULL, NULL);
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_OBJC, "objc",
+                                             "scope/Main.m", 0, NULL, NULL);
     ASSERT_NOT_NULL(result);
-    bool ok = !result->has_error && result->cached_lang == CBM_LANG_OBJC &&
-              result->imports.count == 2;
+    bool ok =
+        !result->has_error && result->cached_lang == CBM_LANG_OBJC && result->imports.count == 2;
     if (ok) {
         const CBMImport *quoted = &result->imports.items[0], *system = &result->imports.items[1];
         ok = quoted->kind == CBM_IMPORT_KIND_INCLUDE_QUOTED && quoted->module_path &&
@@ -765,10 +838,174 @@ TEST(resolver_integration_objc_raw_imports_keep_delimiters) {
              !strcmp(system->module_path, "System.h");
     }
     cbm_free_result(result);
-    ASSERT_TRUE(ok); PASS();
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(resolver_integration_just_paths_require_complete_literal_proof) {
+    return literal_path_import_cases("just.", 3, 0);
+}
+TEST(resolver_integration_func_paths_require_complete_literal_proof) {
+    return literal_path_import_cases("func.", 2, 0);
+}
+TEST(resolver_integration_scss_paths_require_complete_literal_proof) {
+    return literal_path_import_cases("scss.", 4, 1);
+}
+TEST(resolver_integration_meson_paths_require_complete_literal_proof) {
+    return literal_path_import_cases("meson.", 2, 0);
+}
+
+/* A decoded ECMAScript StringValue is a dependency identity. Until decoding
+ * is supported, the genuine escaped import/call remains measured recall debt;
+ * the normalized raw escape's real file is always a forbidden target. */
+static bool ecma_escape_call_site(cbm_store_t *store, const char *file, const char *source,
+                                  const char *caller, bool required, int *wrong) {
+    const char *site = strstr(source, "invoke()");
+    if (!site)
+        return false;
+    char *sql = sqlite3_mprintf(
+        "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+        "WHERE e.project='resolver-integration' AND s.qualified_name=%Q AND e.type='CALLS'",
+        caller);
+    int all = sql ? count_sql(store, sql) : -1;
+    sqlite3_free(sql);
+    int exact = count_edge(store, caller, RESOLVER_PROJECT ".scope.actual.target", "CALLS");
+    sqlite3_stmt *statement = NULL;
+    sql = sqlite3_mprintf("SELECT start_byte,end_byte,emitted,target FROM resolver_occurrences "
+                          "WHERE project='resolver-integration' AND file_path=%Q AND scope=%Q "
+                          "AND relation='CALLS' AND spelling='invoke'",
+                          file, caller);
+    bool ok =
+        sql && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) == SQLITE_OK;
+    sqlite3_free(sql);
+    if (ok && sqlite3_step(statement) == SQLITE_ROW) {
+        const char *target = (const char *)sqlite3_column_text(statement, 3);
+        ok = sqlite3_column_int64(statement, 0) == (sqlite3_int64)(site - source) &&
+             sqlite3_column_int64(statement, 1) ==
+                 (sqlite3_int64)(site - source + strlen("invoke()")) &&
+             sqlite3_column_int(statement, 2) == (required ? 1 : 0) &&
+             (!required || (target && !strcmp(target, RESOLVER_PROJECT ".scope.actual.target"))) &&
+             sqlite3_step(statement) == SQLITE_DONE;
+    } else {
+        ok = false;
+    }
+    sqlite3_finalize(statement);
+    fprintf(stderr, "ECMA escape call file=%s required=%d all=%d exact=%d site_ok=%d\n", file,
+            required, all, exact, ok);
+    *wrong += all != exact;
+    return ok && all == (required ? 1 : 0) && exact == all;
+}
+
+static int ecma_escaped_path_cases(const char *extension) {
+    static const char *const names[] = {"plain", "escaped", "reexport", "shadowed_require"};
+    static const char *const sources[] = {
+        "import { target as invoke } from './actual.js';\n"
+        "export function plainCall() { return invoke(); }\n",
+        "import { target as invoke } from './\\u0061ctual.js';\n"
+        "export function escapedCall() { return invoke(); }\n",
+        "export { target } from './\\u0061ctual.js';\n",
+        "function require(path) { return path; }\n"
+        "const imported = require('./\\u0061ctual.js');\n",
+    };
+    static const char target[] = "export function target() { return 7; }\n";
+    static const char decoy[] = "export function target() { return 99; }\n";
+    for (int parallel = 0; parallel < 2; parallel++) {
+        resolver_fixture_t fixture;
+        ASSERT(fixture_init(&fixture, "", false, 55));
+        ASSERT(cbm_mkdir_p(TH_PATH(fixture.repo, "scope"), 0755));
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, "scope/actual.js"), target), 0);
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, "scope/u0061ctual.js"), decoy), 0);
+        char paths[4][128];
+        for (size_t i = 0; i < 4; i++) {
+            snprintf(paths[i], sizeof(paths[i]), "scope/%s.%s", names[i], extension);
+            ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, paths[i]), sources[i]), 0);
+        }
+        ASSERT_EQ(run_fixture(&fixture, fixture.database, parallel), 0);
+        cbm_store_t *store = cbm_store_open_path_existing(fixture.database);
+        ASSERT_NOT_NULL(store);
+        int anchors = count_sql(
+            store, "SELECT count(*) FROM nodes WHERE project='resolver-integration' "
+                   "AND name='target' AND label='Function' AND start_line=1 AND end_line=1 "
+                   "AND file_path IN ('scope/actual.js','scope/u0061ctual.js')");
+        bool ok = anchors == 2;
+        int found = 0, missing = 0, wrong = 0;
+        for (size_t i = 0; i < 4; i++) {
+            literal_import_case_t expected = {.source_file = paths[i],
+                                              .target_file = "scope/actual.js",
+                                              .spelling = i ? "./\\u0061ctual.js" : "./actual.js"};
+            int all = literal_import_count(store, &expected, false, false);
+            int exact = literal_import_count(store, &expected, false, true);
+            int rows = literal_import_count(store, &expected, true, false);
+            int exact_rows = literal_import_count(store, &expected, true, true);
+            bool required = i == 0;
+            bool genuine = i < 3;
+            found += genuine && exact == 1;
+            missing += genuine && exact == 0;
+            wrong += all != exact || rows != exact_rows || (!genuine && all != 0);
+            fprintf(
+                stderr,
+                "ECMA escape import file=%s required=%d all=%d exact=%d rows=%d exact_rows=%d\n",
+                paths[i], required, all, exact, rows, exact_rows);
+            ok = ok && all == (required ? 1 : 0) && exact == all && rows == all &&
+                 exact_rows == rows;
+        }
+        bool plain_call = ecma_escape_call_site(
+            store, paths[0], sources[0], RESOLVER_PROJECT ".scope.plain.plainCall", true, &wrong);
+        bool escaped_call =
+            ecma_escape_call_site(store, paths[1], sources[1],
+                                  RESOLVER_PROJECT ".scope.escaped.escapedCall", false, &wrong);
+        int plain_found = count_edge(store, RESOLVER_PROJECT ".scope.plain.plainCall",
+                                     RESOLVER_PROJECT ".scope.actual.target", "CALLS");
+        found += plain_found == 1;
+        missing += plain_found == 0;
+        int escaped_found = count_edge(store, RESOLVER_PROJECT ".scope.escaped.escapedCall",
+                                       RESOLVER_PROJECT ".scope.actual.target", "CALLS");
+        found += escaped_found == 1;
+        missing += escaped_found == 0;
+        cbm_store_close(store);
+        th_rmtree(fixture.root);
+        /* WHY: String escape decoding is unsupported. Tried: a real decoded
+         * target, real raw-normalized decoy, named/reexport carriers,
+         * a locally shadowed require negative, and a required plain import plus call.
+         * The two escaped ESM dependencies and escaped invocation remain genuine
+         * quality obligations; none may be satisfied by the decoy. */
+        fprintf(
+            stderr,
+            "ECMA escape quality extension=%s parallel=%d genuine=5 found=%d missing=%d wrong=%d\n",
+            extension, parallel, found, missing, wrong);
+        ASSERT(ok);
+        ASSERT(plain_call);
+        ASSERT(escaped_call);
+        ASSERT_EQ(found, 2);
+        ASSERT_EQ(missing, 3);
+        ASSERT_EQ(wrong, 0);
+    }
+    PASS();
+}
+
+TEST(resolver_integration_js_escaped_module_paths_never_bind_raw_decoys) {
+    return ecma_escaped_path_cases("js");
+}
+TEST(resolver_integration_ts_escaped_module_paths_never_bind_raw_decoys) {
+    return ecma_escaped_path_cases("ts");
+}
+TEST(resolver_integration_tsx_escaped_module_paths_never_bind_raw_decoys) {
+    return ecma_escaped_path_cases("tsx");
+}
+TEST(resolver_integration_arkts_escaped_module_paths_never_bind_raw_decoys) {
+    return ecma_escaped_path_cases("ets");
 }
 
 SUITE(resolver_integration) {
+    RUN_TEST(resolver_integration_js_escaped_module_paths_never_bind_raw_decoys);
+    RUN_TEST(resolver_integration_ts_escaped_module_paths_never_bind_raw_decoys);
+    RUN_TEST(resolver_integration_tsx_escaped_module_paths_never_bind_raw_decoys);
+    RUN_TEST(resolver_integration_arkts_escaped_module_paths_never_bind_raw_decoys);
+
+    RUN_TEST(resolver_integration_just_paths_require_complete_literal_proof);
+    RUN_TEST(resolver_integration_func_paths_require_complete_literal_proof);
+    RUN_TEST(resolver_integration_scss_paths_require_complete_literal_proof);
+    RUN_TEST(resolver_integration_meson_paths_require_complete_literal_proof);
     RUN_TEST(resolver_integration_objc_raw_imports_keep_delimiters);
     RUN_TEST(resolver_integration_objc_imports_retain_extracted_language);
     RUN_TEST(resolver_integration_css_literal_paths_require_complete_source_tokens);

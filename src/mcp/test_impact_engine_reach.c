@@ -1116,7 +1116,7 @@ static bool te_resolver_misses(te_ctx_t *c, cbm_impact_walk_t *walk, te_misses_t
 }
 
 static void te_misses_free(te_misses_t *m) {
-    CBMHashTable *tables[] = {m->tokens, m->files, m->owners,       m->sinks,
+    CBMHashTable *tables[] = {m->tokens, m->files, m->owners,  m->sinks,
                               m->roles,  m->mains, m->parents, m->suite_names};
     for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
         if (tables[i])
@@ -1625,12 +1625,13 @@ bool te_reach(te_ctx_t *c) {
             bool conservative =
                 te_call_chain(walk, &misses, way_in, "", note + used, sizeof(note) - (size_t)used);
             char key[32];
-            conservative = conservative ||
-                           cbm_ht_get(misses.parents,
-                                      te_miss_id_key(sinks.runner_main.items[i], key));
+            conservative =
+                conservative ||
+                cbm_ht_get(misses.parents, te_miss_id_key(sinks.runner_main.items[i], key));
             if (conservative) {
                 size_t length = strlen(note);
-                snprintf(note + length, sizeof(note) - length, " (includes unresolved source uses)");
+                snprintf(note + length, sizeof(note) - length,
+                         " (includes unresolved source uses)");
             }
             ok = te_fallback(c, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED, note);
             break;

@@ -62,33 +62,39 @@ typedef struct {
 
 static void gpf_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\') *p = '/';
+        if (*p == '\\')
+            *p = '/';
     }
 }
 
 static cbm_store_t *gpf_open_indexed(GpfProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
+    if (!lp->project)
+        return NULL;
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+    if (!home)
+        home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv) return NULL;
+    if (!lp->srv)
+        return NULL;
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp) free(resp);
+    if (resp)
+        free(resp);
     return cbm_store_open_path(lp->dbpath);
 }
 
 static cbm_store_t *gpf_index_files(GpfProj *lp, const GpfFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_gpf_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir))
+        return NULL;
     gpf_to_fwd_slashes(lp->tmpdir);
     for (int i = 0; i < nfiles; i++) {
         char path[700];
@@ -100,7 +106,8 @@ static cbm_store_t *gpf_index_files(GpfProj *lp, const GpfFile *files, int nfile
             *slash = '/';
         }
         FILE *f = fopen(path, "wb");
-        if (!f) return NULL;
+        if (!f)
+            return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
@@ -108,8 +115,12 @@ static cbm_store_t *gpf_index_files(GpfProj *lp, const GpfFile *files, int nfile
 }
 
 static void gpf_cleanup(GpfProj *lp, cbm_store_t *store) {
-    if (store) cbm_store_close(store);
-    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
+    if (store)
+        cbm_store_close(store);
+    if (lp->srv) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+    }
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
@@ -136,16 +147,16 @@ static int gpf_count_label(cbm_store_t *store, const char *project, const char *
 typedef struct {
     int ok;
     int total_nodes;
-    int functions;   /* Function label */
-    int modules;     /* Module label */
-    int classes;     /* Class label */
-    int resources;   /* Resource label (k8s) */
-    int charts;      /* Chart label (helm) */
-    int variables;   /* Variable label */
-    int imports;     /* IMPORTS edges */
-    int depends_on;  /* DEPENDS_ON edges */
-    int infra_maps;  /* INFRA_MAPS edges */
-    int routes;      /* Route label */
+    int functions;  /* Function label */
+    int modules;    /* Module label */
+    int classes;    /* Class label */
+    int resources;  /* Resource label (k8s) */
+    int charts;     /* Chart label (helm) */
+    int variables;  /* Variable label */
+    int imports;    /* IMPORTS edges */
+    int depends_on; /* DEPENDS_ON edges */
+    int infra_maps; /* INFRA_MAPS edges */
+    int routes;     /* Route label */
 } GpfMetrics;
 
 static GpfMetrics gpf_metrics_files(const GpfFile *files, int nfiles) {
@@ -153,18 +164,18 @@ static GpfMetrics gpf_metrics_files(const GpfFile *files, int nfiles) {
     cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
     GpfMetrics m = {0};
     if (store) {
-        m.ok          = 1;
+        m.ok = 1;
         m.total_nodes = cbm_store_count_nodes(store, lp.project);
-        m.functions   = gpf_count_label(store, lp.project, "Function");
-        m.modules     = gpf_count_label(store, lp.project, "Module");
-        m.classes     = gpf_count_label(store, lp.project, "Class");
-        m.resources   = gpf_count_label(store, lp.project, "Resource");
-        m.charts      = gpf_count_label(store, lp.project, "Chart");
-        m.variables   = gpf_count_label(store, lp.project, "Variable");
-        m.imports     = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
-        m.depends_on  = cbm_store_count_edges_by_type(store, lp.project, "DEPENDS_ON");
-        m.infra_maps  = cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS");
-        m.routes      = gpf_count_label(store, lp.project, "Route");
+        m.functions = gpf_count_label(store, lp.project, "Function");
+        m.modules = gpf_count_label(store, lp.project, "Module");
+        m.classes = gpf_count_label(store, lp.project, "Class");
+        m.resources = gpf_count_label(store, lp.project, "Resource");
+        m.charts = gpf_count_label(store, lp.project, "Chart");
+        m.variables = gpf_count_label(store, lp.project, "Variable");
+        m.imports = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
+        m.depends_on = cbm_store_count_edges_by_type(store, lp.project, "DEPENDS_ON");
+        m.infra_maps = cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS");
+        m.routes = gpf_count_label(store, lp.project, "Route");
     }
     gpf_cleanup(&lp, store);
     return m;
@@ -221,7 +232,6 @@ static bool gpf_literal_import_quality(const GpfFile files[2], const RQ_Source i
     gpf_cleanup(&lp, store);
     return accepted;
 }
-
 
 /* Infrastructure goldens are authored from source and explicit build membership.
  * Each covered caller/relation is closed; a guessed target is a bug. Padding
@@ -283,11 +293,10 @@ static bool gpf_infra_quality(const GpfFile *files, size_t nfiles, const char *s
 
 /* HCL: minimal resource block → at least 1 node (Module) and 1 Class node. */
 TEST(probe_hcl_resource_nodes) {
-    GpfMetrics m = gpf_metrics("main.tf",
-        "resource \"aws_s3_bucket\" \"my_bucket\" {\n"
-        "  bucket = \"my-tf-test-bucket\"\n"
-        "  acl    = \"private\"\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("main.tf", "resource \"aws_s3_bucket\" \"my_bucket\" {\n"
+                                          "  bucket = \"my-tf-test-bucket\"\n"
+                                          "  acl    = \"private\"\n"
+                                          "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum a Module node is created for an HCL file. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -297,16 +306,15 @@ TEST(probe_hcl_resource_nodes) {
 
 /* HCL: Class node present alongside Module (label histogram: Class:1,Module:1). */
 TEST(probe_hcl_class_node) {
-    GpfMetrics m = gpf_metrics("infra.hcl",
-        "resource \"aws_instance\" \"web\" {\n"
-        "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
-        "  instance_type = \"t2.micro\"\n"
-        "}\n"
-        "\n"
-        "resource \"aws_instance\" \"db\" {\n"
-        "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
-        "  instance_type = \"t2.small\"\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("infra.hcl", "resource \"aws_instance\" \"web\" {\n"
+                                            "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
+                                            "  instance_type = \"t2.micro\"\n"
+                                            "}\n"
+                                            "\n"
+                                            "resource \"aws_instance\" \"db\" {\n"
+                                            "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
+                                            "  instance_type = \"t2.small\"\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: histogram confirms Class:1,Module:1 for any non-empty HCL file. */
     ASSERT_TRUE(m.classes >= 1);
@@ -318,18 +326,18 @@ TEST(probe_hcl_class_node) {
  * RED: grammar-only HCL extractor produces only Class+Module (one per file);
  *      individual resource/module blocks are not broken out as distinct nodes. */
 TEST(probe_hcl_module_block_node) {
-    GpfMetrics m = gpf_metrics("modules.tf",
-        "module \"vpc\" {\n"
-        "  source  = \"terraform-aws-modules/vpc/aws\"\n"
-        "  version = \"3.14.0\"\n"
-        "  cidr    = \"10.0.0.0/16\"\n"
-        "}\n"
-        "\n"
-        "module \"eks\" {\n"
-        "  source          = \"terraform-aws-modules/eks/aws\"\n"
-        "  version         = \"18.26.6\"\n"
-        "  cluster_name    = \"my-eks-cluster\"\n"
-        "}\n");
+    GpfMetrics m =
+        gpf_metrics("modules.tf", "module \"vpc\" {\n"
+                                  "  source  = \"terraform-aws-modules/vpc/aws\"\n"
+                                  "  version = \"3.14.0\"\n"
+                                  "  cidr    = \"10.0.0.0/16\"\n"
+                                  "}\n"
+                                  "\n"
+                                  "module \"eks\" {\n"
+                                  "  source          = \"terraform-aws-modules/eks/aws\"\n"
+                                  "  version         = \"18.26.6\"\n"
+                                  "  cluster_name    = \"my-eks-cluster\"\n"
+                                  "}\n");
     ASSERT_TRUE(m.ok);
     /* RED: individual module blocks not extracted as separate Resource/Module nodes;
      *      only the file-level Class+Module pair is produced. */
@@ -341,14 +349,13 @@ TEST(probe_hcl_module_block_node) {
  * RED: INFRA_MAPS is produced only by the parallel-path pipeline (>50 files);
  *      single-file fixture never crosses the threshold. */
 TEST(probe_hcl_infra_maps_edge) {
-    GpfMetrics m = gpf_metrics("sched.tf",
-        "resource \"google_cloud_scheduler_job\" \"cron\" {\n"
-        "  name     = \"cron-job\"\n"
-        "  schedule = \"0 * * * *\"\n"
-        "  http_target {\n"
-        "    uri = \"https://my-service.example.com/run\"\n"
-        "  }\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("sched.tf", "resource \"google_cloud_scheduler_job\" \"cron\" {\n"
+                                           "  name     = \"cron-job\"\n"
+                                           "  schedule = \"0 * * * *\"\n"
+                                           "  http_target {\n"
+                                           "    uri = \"https://my-service.example.com/run\"\n"
+                                           "  }\n"
+                                           "}\n");
     ASSERT_TRUE(m.ok);
     /* RED: INFRA_MAPS requires parallel-path (>50 files) — not triggered here. */
     ASSERT_TRUE(m.infra_maps >= 1); /* expected RED — parallel path only */
@@ -358,16 +365,12 @@ TEST(probe_hcl_infra_maps_edge) {
 /* HCL: two-file fixture (.tf + .hcl) → still no cross-file IMPORTS edge
  * because HCL/Terraform uses a directory-level evaluation model, not imports. */
 TEST(probe_hcl_no_spurious_imports) {
-    static const GpfFile files[] = {
-        {"vars.hcl",
-         "variable \"region\" {\n"
-         "  default = \"us-east-1\"\n"
-         "}\n"},
-        {"main.tf",
-         "resource \"aws_s3_bucket\" \"b\" {\n"
-         "  bucket = \"test\"\n"
-         "}\n"}
-    };
+    static const GpfFile files[] = {{"vars.hcl", "variable \"region\" {\n"
+                                                 "  default = \"us-east-1\"\n"
+                                                 "}\n"},
+                                    {"main.tf", "resource \"aws_s3_bucket\" \"b\" {\n"
+                                                "  bucket = \"test\"\n"
+                                                "}\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* GREEN: HCL has no import syntax — pipeline should emit 0 IMPORTS edges. */
@@ -380,22 +383,21 @@ TEST(probe_hcl_no_spurious_imports) {
  * argument blocks) are part of it. cloud-foundation-fabric minted 1,342
  * `dynamic` and 205 `content` Classes next to 898 resources. */
 TEST(probe_hcl_nested_blocks_are_not_classes) {
-    GpfMetrics m = gpf_metrics("main.tf",
-        "resource \"google_container_cluster\" \"main\" {\n"
-        "  name = \"main\"\n"
-        "  addons_config {\n"
-        "    http_load_balancing { disabled = false }\n"
-        "  }\n"
-        "  dynamic \"node_pool\" {\n"
-        "    for_each = var.pools\n"
-        "    content {\n"
-        "      name = node_pool.value.name\n"
-        "    }\n"
-        "  }\n"
-        "  lifecycle {\n"
-        "    ignore_changes = [node_pool]\n"
-        "  }\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("main.tf", "resource \"google_container_cluster\" \"main\" {\n"
+                                          "  name = \"main\"\n"
+                                          "  addons_config {\n"
+                                          "    http_load_balancing { disabled = false }\n"
+                                          "  }\n"
+                                          "  dynamic \"node_pool\" {\n"
+                                          "    for_each = var.pools\n"
+                                          "    content {\n"
+                                          "      name = node_pool.value.name\n"
+                                          "    }\n"
+                                          "  }\n"
+                                          "  lifecycle {\n"
+                                          "    ignore_changes = [node_pool]\n"
+                                          "  }\n"
+                                          "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.classes, 1);
     PASS();
@@ -403,10 +405,9 @@ TEST(probe_hcl_nested_blocks_are_not_classes) {
 
 /* OpenTofu configuration (.tofu) is indexed like .tf. */
 TEST(probe_tofu_file_indexed) {
-    GpfMetrics m = gpf_metrics("main.tofu",
-        "resource \"aws_s3_bucket\" \"logs\" {\n"
-        "  bucket = \"logs\"\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("main.tofu", "resource \"aws_s3_bucket\" \"logs\" {\n"
+                                            "  bucket = \"logs\"\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.classes, 1);
     PASS();
@@ -414,9 +415,8 @@ TEST(probe_tofu_file_indexed) {
 
 /* A variable file's assignments are its content. */
 TEST(probe_tfvars_file_indexed) {
-    GpfMetrics m = gpf_metrics("prod.tfvars",
-        "region       = \"europe-west1\"\n"
-        "node_count   = 3\n");
+    GpfMetrics m = gpf_metrics("prod.tfvars", "region       = \"europe-west1\"\n"
+                                              "node_count   = 3\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.variables >= 2);
     PASS();
@@ -431,16 +431,15 @@ TEST(probe_tfvars_file_indexed) {
 
 /* K8s: Pod manifest → Resource node (kind=Pod, name=nginx-pod). */
 TEST(probe_k8s_pod_resource_node) {
-    GpfMetrics m = gpf_metrics("pod.yaml",
-        "apiVersion: v1\n"
-        "kind: Pod\n"
-        "metadata:\n"
-        "  name: nginx-pod\n"
-        "  namespace: default\n"
-        "spec:\n"
-        "  containers:\n"
-        "  - name: nginx\n"
-        "    image: nginx:1.21\n");
+    GpfMetrics m = gpf_metrics("pod.yaml", "apiVersion: v1\n"
+                                           "kind: Pod\n"
+                                           "metadata:\n"
+                                           "  name: nginx-pod\n"
+                                           "  namespace: default\n"
+                                           "spec:\n"
+                                           "  containers:\n"
+                                           "  - name: nginx\n"
+                                           "    image: nginx:1.21\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pass_k8s emits a Resource node for any k8s manifest with apiVersion. */
     ASSERT_TRUE(m.resources >= 1);
@@ -449,24 +448,23 @@ TEST(probe_k8s_pod_resource_node) {
 
 /* K8s: Deployment manifest → Resource node. */
 TEST(probe_k8s_deployment_resource_node) {
-    GpfMetrics m = gpf_metrics("deploy.yaml",
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: my-app\n"
-        "spec:\n"
-        "  replicas: 3\n"
-        "  selector:\n"
-        "    matchLabels:\n"
-        "      app: my-app\n"
-        "  template:\n"
-        "    metadata:\n"
-        "      labels:\n"
-        "        app: my-app\n"
-        "    spec:\n"
-        "      containers:\n"
-        "      - name: app\n"
-        "        image: my-app:latest\n");
+    GpfMetrics m = gpf_metrics("deploy.yaml", "apiVersion: apps/v1\n"
+                                              "kind: Deployment\n"
+                                              "metadata:\n"
+                                              "  name: my-app\n"
+                                              "spec:\n"
+                                              "  replicas: 3\n"
+                                              "  selector:\n"
+                                              "    matchLabels:\n"
+                                              "      app: my-app\n"
+                                              "  template:\n"
+                                              "    metadata:\n"
+                                              "      labels:\n"
+                                              "        app: my-app\n"
+                                              "    spec:\n"
+                                              "      containers:\n"
+                                              "      - name: app\n"
+                                              "        image: my-app:latest\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Deployment kind → Resource node via pass_k8s. */
     ASSERT_TRUE(m.resources >= 1);
@@ -475,25 +473,21 @@ TEST(probe_k8s_deployment_resource_node) {
 
 /* K8s: two manifests in one directory → 2 Resource nodes (one per file). */
 TEST(probe_k8s_two_manifests) {
-    static const GpfFile files[] = {
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: my-svc\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: my-app\n"
-         "  ports:\n"
-         "  - port: 80\n"},
-        {"configmap.yaml",
-         "apiVersion: v1\n"
-         "kind: ConfigMap\n"
-         "metadata:\n"
-         "  name: app-config\n"
-         "data:\n"
-         "  key: value\n"}
-    };
+    static const GpfFile files[] = {{"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: my-svc\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: my-app\n"
+                                                     "  ports:\n"
+                                                     "  - port: 80\n"},
+                                    {"configmap.yaml", "apiVersion: v1\n"
+                                                       "kind: ConfigMap\n"
+                                                       "metadata:\n"
+                                                       "  name: app-config\n"
+                                                       "data:\n"
+                                                       "  key: value\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* GREEN: each manifest file produces its own Resource node. */
@@ -506,30 +500,26 @@ TEST(probe_k8s_two_manifests) {
  * pod labels and linked only through a "selector value == workload name"
  * guess that Kubernetes does not make. */
 TEST(probe_k8s_infra_maps_edge) {
-    static const GpfFile files[] = {
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: frontend\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: frontend\n"
-         "    spec:\n"
-         "      containers:\n"
-         "      - name: frontend\n"
-         "        image: frontend:latest\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: frontend-svc\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: frontend\n"}
-    };
+    static const GpfFile files[] = {{"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: frontend\n"
+                                                    "spec:\n"
+                                                    "  template:\n"
+                                                    "    metadata:\n"
+                                                    "      labels:\n"
+                                                    "        app: frontend\n"
+                                                    "    spec:\n"
+                                                    "      containers:\n"
+                                                    "      - name: frontend\n"
+                                                    "        image: frontend:latest\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: frontend-svc\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: frontend\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 1);
@@ -539,39 +529,34 @@ TEST(probe_k8s_infra_maps_edge) {
 /* A selector is the AND of its pairs: `tier: back` pods are not selected by a
  * `{app: web, tier: front}` Service. */
 TEST(probe_k8s_selector_requires_all_pairs) {
-    static const GpfFile files[] = {
-        {"front.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: web-front\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: web\n"
-         "        tier: front\n"},
-        {"back.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: web-back\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: web\n"
-         "        tier: back\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: web\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: web\n"
-         "    tier: front\n"}
-    };
+    static const GpfFile files[] = {{"front.yaml", "apiVersion: apps/v1\n"
+                                                   "kind: Deployment\n"
+                                                   "metadata:\n"
+                                                   "  name: web-front\n"
+                                                   "spec:\n"
+                                                   "  template:\n"
+                                                   "    metadata:\n"
+                                                   "      labels:\n"
+                                                   "        app: web\n"
+                                                   "        tier: front\n"},
+                                    {"back.yaml", "apiVersion: apps/v1\n"
+                                                  "kind: Deployment\n"
+                                                  "metadata:\n"
+                                                  "  name: web-back\n"
+                                                  "spec:\n"
+                                                  "  template:\n"
+                                                  "    metadata:\n"
+                                                  "      labels:\n"
+                                                  "        app: web\n"
+                                                  "        tier: back\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: web\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: web\n"
+                                                     "    tier: front\n"}};
     GpfMetrics m = gpf_metrics_files(files, 3);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 1);
@@ -581,28 +566,24 @@ TEST(probe_k8s_selector_requires_all_pairs) {
 /* Only the pod template's labels are selectable; the workload's own
  * metadata.labels are not. */
 TEST(probe_k8s_selector_ignores_workload_metadata_labels) {
-    static const GpfFile files[] = {
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: api\n"
-         "  labels:\n"
-         "    app: web\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: api\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: web\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: web\n"}
-    };
+    static const GpfFile files[] = {{"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: api\n"
+                                                    "  labels:\n"
+                                                    "    app: web\n"
+                                                    "spec:\n"
+                                                    "  template:\n"
+                                                    "    metadata:\n"
+                                                    "      labels:\n"
+                                                    "        app: api\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: web\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: web\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 0);
@@ -611,26 +592,22 @@ TEST(probe_k8s_selector_ignores_workload_metadata_labels) {
 
 /* A workload whose NAME equals a selector value is not selected by it. */
 TEST(probe_k8s_selector_no_name_guess) {
-    static const GpfFile files[] = {
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: frontend\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: fe\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: frontend\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: frontend\n"}
-    };
+    static const GpfFile files[] = {{"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: frontend\n"
+                                                    "spec:\n"
+                                                    "  template:\n"
+                                                    "    metadata:\n"
+                                                    "      labels:\n"
+                                                    "        app: fe\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: frontend\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: frontend\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 0);
@@ -639,26 +616,22 @@ TEST(probe_k8s_selector_no_name_guess) {
 
 /* `component: web` does not select pods labelled `app: web`. */
 TEST(probe_k8s_selector_key_matters) {
-    static const GpfFile files[] = {
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: api\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: web\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: web\n"
-         "spec:\n"
-         "  selector:\n"
-         "    component: web\n"}
-    };
+    static const GpfFile files[] = {{"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: api\n"
+                                                    "spec:\n"
+                                                    "  template:\n"
+                                                    "    metadata:\n"
+                                                    "      labels:\n"
+                                                    "        app: web\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: web\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    component: web\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 0);
@@ -667,28 +640,24 @@ TEST(probe_k8s_selector_key_matters) {
 
 /* A Service selects pods of its own namespace only. */
 TEST(probe_k8s_selector_namespace_scoped) {
-    static const GpfFile files[] = {
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: web\n"
-         "  namespace: team-b\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: web\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: web\n"
-         "  namespace: team-a\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: web\n"}
-    };
+    static const GpfFile files[] = {{"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: web\n"
+                                                    "  namespace: team-b\n"
+                                                    "spec:\n"
+                                                    "  template:\n"
+                                                    "    metadata:\n"
+                                                    "      labels:\n"
+                                                    "        app: web\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: web\n"
+                                                     "  namespace: team-a\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: web\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 0);
@@ -750,12 +719,11 @@ TEST(probe_k8s_selector_beyond_512_manifests) {
 
 /* Kustomize: overlay file → Module node. */
 TEST(probe_kustomize_module_node) {
-    GpfMetrics m = gpf_metrics("kustomization.yaml",
-        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-        "kind: Kustomization\n"
-        "resources:\n"
-        "  - deploy.yaml\n"
-        "  - service.yaml\n");
+    GpfMetrics m = gpf_metrics("kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                                     "kind: Kustomization\n"
+                                                     "resources:\n"
+                                                     "  - deploy.yaml\n"
+                                                     "  - service.yaml\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: handle_kustomize always emits a Module node for the overlay file. */
     ASSERT_TRUE(m.modules >= 1);
@@ -769,36 +737,32 @@ TEST(probe_kustomize_module_node) {
  *      when apiVersion is present; without it they are plain YAML with no node
  *      in the graph, so the IMPORTS edge can't be created. */
 TEST(probe_kustomize_imports_edges) {
-    static const GpfFile files[] = {
-        {"kustomization.yaml",
-         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-         "kind: Kustomization\n"
-         "resources:\n"
-         "  - deploy.yaml\n"
-         "  - service.yaml\n"},
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: myapp\n"
-         "spec:\n"
-         "  replicas: 1\n"
-         "  template:\n"
-         "    spec:\n"
-         "      containers:\n"
-         "      - name: app\n"
-         "        image: myapp:v1\n"},
-        {"service.yaml",
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: myapp-svc\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: myapp\n"
-         "  ports:\n"
-         "  - port: 80\n"}
-    };
+    static const GpfFile files[] = {{"kustomization.yaml",
+                                     "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                     "kind: Kustomization\n"
+                                     "resources:\n"
+                                     "  - deploy.yaml\n"
+                                     "  - service.yaml\n"},
+                                    {"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: myapp\n"
+                                                    "spec:\n"
+                                                    "  replicas: 1\n"
+                                                    "  template:\n"
+                                                    "    spec:\n"
+                                                    "      containers:\n"
+                                                    "      - name: app\n"
+                                                    "        image: myapp:v1\n"},
+                                    {"service.yaml", "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: myapp-svc\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: myapp\n"
+                                                     "  ports:\n"
+                                                     "  - port: 80\n"}};
     GpfMetrics m = gpf_metrics_files(files, 3);
     ASSERT_TRUE(m.ok);
     /* Kustomize Module node is always emitted. */
@@ -813,13 +777,12 @@ TEST(probe_kustomize_imports_edges) {
 
 /* Kustomize: base overlay with patches entry → Module node (no crash). */
 TEST(probe_kustomize_with_patches) {
-    GpfMetrics m = gpf_metrics("kustomization.yaml",
-        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-        "kind: Kustomization\n"
-        "bases:\n"
-        "  - ../base\n"
-        "patches:\n"
-        "  - path: replica-patch.yaml\n");
+    GpfMetrics m = gpf_metrics("kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                                     "kind: Kustomization\n"
+                                                     "bases:\n"
+                                                     "  - ../base\n"
+                                                     "patches:\n"
+                                                     "  - path: replica-patch.yaml\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: handle_kustomize emits Module node regardless of patches content. */
     ASSERT_TRUE(m.modules >= 1);
@@ -832,15 +795,15 @@ TEST(probe_kustomize_with_patches) {
  * manifest behind it is still a manifest. onedr0p/home-ops opens 428 of its
  * manifests this way and got a Resource for 26 of 390 objects. */
 TEST(probe_k8s_manifest_after_leading_comment) {
-    GpfMetrics m = gpf_metrics("helmrelease.yaml",
-        "---\n"
-        "# yaml-language-server: $schema=https://example.com/helmrelease.json\n"
-        "apiVersion: helm.toolkit.fluxcd.io/v2\n"
-        "kind: HelmRelease\n"
-        "metadata:\n"
-        "  name: echo\n"
-        "spec:\n"
-        "  interval: 1h\n");
+    GpfMetrics m = gpf_metrics(
+        "helmrelease.yaml", "---\n"
+                            "# yaml-language-server: $schema=https://example.com/helmrelease.json\n"
+                            "apiVersion: helm.toolkit.fluxcd.io/v2\n"
+                            "kind: HelmRelease\n"
+                            "metadata:\n"
+                            "  name: echo\n"
+                            "spec:\n"
+                            "  interval: 1h\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 1);
     PASS();
@@ -849,13 +812,12 @@ TEST(probe_k8s_manifest_after_leading_comment) {
 /* A comment between a key and its block (`metadata: # owned by ...`) sits
  * ahead of the value; the object still has its name. */
 TEST(probe_k8s_manifest_metadata_after_key_line_comment) {
-    GpfMetrics m = gpf_metrics("deploy.yaml",
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata: # owned by the platform team\n"
-        "  name: web\n"
-        "spec:\n"
-        "  replicas: 1\n");
+    GpfMetrics m = gpf_metrics("deploy.yaml", "apiVersion: apps/v1\n"
+                                              "kind: Deployment\n"
+                                              "metadata: # owned by the platform team\n"
+                                              "  name: web\n"
+                                              "spec:\n"
+                                              "  replicas: 1\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 1);
     PASS();
@@ -865,17 +827,16 @@ TEST(probe_k8s_manifest_metadata_after_key_line_comment) {
 
 /* The QN and properties of the Resource named `name` after indexing `files`;
  * false when there is no such node or it is not unique. */
-static bool gpf_resource(const GpfFile *files, int nfiles, const char *name, char *qn,
-                         size_t qn_sz, char *props, size_t props_sz) {
+static bool gpf_resource(const GpfFile *files, int nfiles, const char *name, char *qn, size_t qn_sz,
+                         char *props, size_t props_sz) {
     GpfProj lp;
     cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
     bool found = false;
     int hits = 0;
     cbm_node_t *nodes = NULL;
     int count = 0;
-    if (store &&
-        cbm_store_find_nodes_by_label(store, lp.project, "Resource", &nodes, &count) ==
-            CBM_STORE_OK) {
+    if (store && cbm_store_find_nodes_by_label(store, lp.project, "Resource", &nodes, &count) ==
+                     CBM_STORE_OK) {
         for (int i = 0; i < count; i++) {
             if (nodes[i].name && strcmp(nodes[i].name, name) == 0) {
                 hits++;
@@ -897,21 +858,20 @@ static bool gpf_resource(const GpfFile *files, int nfiles, const char *name, cha
  * microservices-demo ship a Deployment and its Service in one file, and
  * 3,139 objects of the 17 infra corpora sat behind a file's first `---`. */
 TEST(probe_k8s_every_document_is_an_object) {
-    GpfMetrics m = gpf_metrics("app.yaml",
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: web\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: Service\n"
-        "metadata:\n"
-        "  name: web\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: ConfigMap\n"
-        "metadata:\n"
-        "  name: web-config\n");
+    GpfMetrics m = gpf_metrics("app.yaml", "apiVersion: apps/v1\n"
+                                           "kind: Deployment\n"
+                                           "metadata:\n"
+                                           "  name: web\n"
+                                           "---\n"
+                                           "apiVersion: v1\n"
+                                           "kind: Service\n"
+                                           "metadata:\n"
+                                           "  name: web\n"
+                                           "---\n"
+                                           "apiVersion: v1\n"
+                                           "kind: ConfigMap\n"
+                                           "metadata:\n"
+                                           "  name: web-config\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 3);
     PASS();
@@ -920,24 +880,23 @@ TEST(probe_k8s_every_document_is_an_object) {
 /* ...and the Service in the second document selects the Deployment in the
  * first. */
 TEST(probe_k8s_selector_across_documents) {
-    GpfMetrics m = gpf_metrics("app.yaml",
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: web\n"
-        "spec:\n"
-        "  template:\n"
-        "    metadata:\n"
-        "      labels:\n"
-        "        app: web\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: Service\n"
-        "metadata:\n"
-        "  name: web\n"
-        "spec:\n"
-        "  selector:\n"
-        "    app: web\n");
+    GpfMetrics m = gpf_metrics("app.yaml", "apiVersion: apps/v1\n"
+                                           "kind: Deployment\n"
+                                           "metadata:\n"
+                                           "  name: web\n"
+                                           "spec:\n"
+                                           "  template:\n"
+                                           "    metadata:\n"
+                                           "      labels:\n"
+                                           "        app: web\n"
+                                           "---\n"
+                                           "apiVersion: v1\n"
+                                           "kind: Service\n"
+                                           "metadata:\n"
+                                           "  name: web\n"
+                                           "spec:\n"
+                                           "  selector:\n"
+                                           "    app: web\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 2);
     ASSERT_EQ(m.infra_maps, 1);
@@ -975,13 +934,13 @@ static int gpf_graph_mentions(const GpfFile *files, int nfiles, const char *need
 
 /* A Secret's stringData is secret material, whatever its keys are called. */
 TEST(probe_secret_stringdata_mints_no_route) {
-    static const GpfFile files[] = {{"alerting-secret.yaml",
-                                     "apiVersion: v1\n"
-                                     "kind: Secret\n"
-                                     "metadata:\n"
-                                     "  name: alerting\n"
-                                     "stringData:\n"
-                                     "  webhook_url: https://hooks.example.com/T0/B0/s3cr3tpath\n"}};
+    static const GpfFile files[] = {
+        {"alerting-secret.yaml", "apiVersion: v1\n"
+                                 "kind: Secret\n"
+                                 "metadata:\n"
+                                 "  name: alerting\n"
+                                 "stringData:\n"
+                                 "  webhook_url: https://hooks.example.com/T0/B0/s3cr3tpath\n"}};
     ASSERT_EQ(gpf_graph_mentions(files, 1, "s3cr3tpath"), 0);
     PASS();
 }
@@ -1022,9 +981,10 @@ static int gpf_resource_edges(const GpfFile *files, int nfiles, const char *type
     int n = -1;
     if (store) {
         sqlite3_stmt *st = NULL;
-        const char *sql = "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-                          "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type=?2 "
-                          "AND s.label='Resource' AND t.label='Resource' AND instr(e.properties,?3)";
+        const char *sql =
+            "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+            "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type=?2 "
+            "AND s.label='Resource' AND t.label='Resource' AND instr(e.properties,?3)";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
             sqlite3_bind_text(st, 2, type, -1, SQLITE_STATIC);
@@ -1346,15 +1306,13 @@ TEST(probe_k8s_rbac_ingress_hpa_webhook_references) {
  * kind; a reference to an object that is not in the repo draws nothing. */
 TEST(probe_k8s_cr_uses_its_crd_and_unresolved_draws_nothing) {
     static const GpfFile files[] = {
-        {"crd.yaml",
-         "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n"
-         "metadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n"
-         "  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n"},
-        {"widget.yaml",
-         "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w1\n"
-         "---\n"
-         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: lonely\nspec:\n"
-         "  template:\n    spec:\n      serviceAccountName: not-in-repo\n"}};
+        {"crd.yaml", "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n"
+                     "metadata:\n  name: widgets.example.com\nspec:\n  group: example.com\n"
+                     "  names:\n    kind: Widget\n    plural: widgets\n  scope: Namespaced\n"},
+        {"widget.yaml", "apiVersion: example.com/v1\nkind: Widget\nmetadata:\n  name: w1\n"
+                        "---\n"
+                        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: lonely\nspec:\n"
+                        "  template:\n    spec:\n      serviceAccountName: not-in-repo\n"}};
     ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"crd\""), 1);
     ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"serviceAccountName\""), 0);
     PASS();
@@ -1699,18 +1657,17 @@ TEST(probe_go_controller_chain_with_comment_lines) {
         {"go.mod", "module example.com/proj\n\ngo 1.22\n"},
         {"api/v1/widget.go", "package v1\n\ntype Widget struct {\n\tName string\n}\n"},
         {"api/v1/gadget.go", "package v1\n\ntype Gadget struct {\n\tName string\n}\n"},
-        {"internal/controller/widget.go",
-         "package controller\n\n"
-         "import (\n\tv1 \"example.com/proj/api/v1\"\n"
-         "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
-         "func Add(mgr ctrl.Manager) error {\n"
-         "\t// gadgets would be b.Owns(&v1.Gadget{}) (not yet)\n"
-         "\treturn ctrl.NewControllerManagedBy(mgr).\n"
-         "\t\tNamed(\"widget\").\n"
-         "\t\t// watch all widgets\n"
-         "\t\tFor(&v1.Widget{}).\n"
-         "\t\tComplete(nil)\n"
-         "}\n"}};
+        {"internal/controller/widget.go", "package controller\n\n"
+                                          "import (\n\tv1 \"example.com/proj/api/v1\"\n"
+                                          "\tctrl \"sigs.k8s.io/controller-runtime\"\n)\n\n"
+                                          "func Add(mgr ctrl.Manager) error {\n"
+                                          "\t// gadgets would be b.Owns(&v1.Gadget{}) (not yet)\n"
+                                          "\treturn ctrl.NewControllerManagedBy(mgr).\n"
+                                          "\t\tNamed(\"widget\").\n"
+                                          "\t\t// watch all widgets\n"
+                                          "\t\tFor(&v1.Widget{}).\n"
+                                          "\t\tComplete(nil)\n"
+                                          "}\n"}};
     ASSERT_EQ(gpf_edges_into_file(files, 4, "HANDLES", "api/v1/widget.go"), 1);
     ASSERT_EQ(gpf_edges_into_file(files, 4, "HANDLES", "api/v1/gadget.go"), 0);
     PASS();
@@ -1776,12 +1733,11 @@ TEST(probe_flux_refs_meet_in_the_deploy_scope) {
         {"infra/kustomization.yaml",
          "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
          "resources:\n  - cert-manager.yaml\n"},
-        {"infra/cert-manager.yaml",
-         "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\n"
-         "metadata:\n  name: cert-manager\n  namespace: cert-manager\n"
-         "spec:\n  interval: 1h\n---\n"
-         "apiVersion: cert-manager.io/v1\nkind: ClusterIssuer\n"
-         "metadata:\n  name: letsencrypt\nspec:\n  selfSigned: {}\n"},
+        {"infra/cert-manager.yaml", "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\n"
+                                    "metadata:\n  name: cert-manager\n  namespace: cert-manager\n"
+                                    "spec:\n  interval: 1h\n---\n"
+                                    "apiVersion: cert-manager.io/v1\nkind: ClusterIssuer\n"
+                                    "metadata:\n  name: letsencrypt\nspec:\n  selfSigned: {}\n"},
         {"apps/prod/kustomization.yaml",
          "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n"
          "namespace: podinfo\nresources:\n  - ../base/podinfo\n"},
@@ -2045,9 +2001,9 @@ TEST(probe_flux_refs_meet_in_the_deploy_scope) {
                                   "probe_flux_refs_meet_in_the_deploy_scope/configured", expected,
                                   6, forbidden, 6));
     /* apps -> infra; podinfo -> cert-manager in another namespace and root */
-    ASSERT_EQ(gpf_typed_edges(files, 9, "DEPENDS_ON", "Resource", "Resource",
-                              "\"via\":\"dependsOn\""),
-              2);
+    ASSERT_EQ(
+        gpf_typed_edges(files, 9, "DEPENDS_ON", "Resource", "Resource", "\"via\":\"dependsOn\""),
+        2);
     PASS();
 }
 
@@ -2065,13 +2021,15 @@ TEST(probe_capi_refs_follow_the_api_group) {
         "metadata:\n  name: c1\n---\n"
         "apiVersion: controlplane.cluster.x-k8s.io/v1beta2\nkind: KubeadmControlPlane\n"
         "metadata:\n  name: c1-cp\nspec:\n  machineTemplate:\n    spec:\n"
-        "      infrastructureRef:\n        kind: DockerMachineTemplate\n        name: cp-infra\n---\n"
+        "      infrastructureRef:\n        kind: DockerMachineTemplate\n        name: "
+        "cp-infra\n---\n"
         "apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\nkind: DockerMachineTemplate\n"
         "metadata:\n  name: cp-infra\n---\n"
         "apiVersion: cluster.x-k8s.io/v1beta2\nkind: MachineDeployment\nmetadata:\n  name: md\n"
         "spec:\n  clusterName: c1\n  template:\n    spec:\n      bootstrap:\n"
         "        configRef:\n          kind: KubeadmConfigTemplate\n          name: md-boot\n"
-        "      infrastructureRef:\n        kind: DockerMachineTemplate\n        name: md-infra\n---\n"
+        "      infrastructureRef:\n        kind: DockerMachineTemplate\n        name: "
+        "md-infra\n---\n"
         "apiVersion: bootstrap.cluster.x-k8s.io/v1beta2\nkind: KubeadmConfigTemplate\n"
         "metadata:\n  name: md-boot\n---\n"
         "apiVersion: infrastructure.cluster.x-k8s.io/v1beta2\nkind: DockerMachineTemplate\n"
@@ -2093,10 +2051,10 @@ TEST(probe_capi_refs_follow_the_api_group) {
      * with complete reference fields and literal namespaces. All nine complete
      * reference obligations are counted; CNPG never gains CAPI field semantics.
      * These are source-reference checks, not claims of successful reconciliation. */
-    const GpfFile original_build[] = {
-        files[0],
-        {"kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: "
-                               "Kustomization\nresources:\n  - templates/cluster.yaml\n"}};
+    const GpfFile original_build[] = {files[0],
+                                      {"kustomization.yaml",
+                                       "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: "
+                                       "Kustomization\nresources:\n  - templates/cluster.yaml\n"}};
     const RQ_Expected original_expected[] = {
         {.case_id = "original-cluster-class",
          .site = {.file = "templates/cluster.yaml",
@@ -2599,10 +2557,10 @@ TEST(probe_cert_manager_and_kkp_refs) {
      * explicit Secret kinds, and an authored controller flag. The latter measures
      * all seven dependencies; wrong namespaces and kinds remain forbidden.
      * Secret contents and successful reconciliation are outside this identity test. */
-    const GpfFile original_build[] = {
-        files[0],
-        {"pki/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: "
-                                   "Kustomization\nresources:\n  - certs.yaml\n"}};
+    const GpfFile original_build[] = {files[0],
+                                      {"pki/kustomization.yaml",
+                                       "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: "
+                                       "Kustomization\nresources:\n  - certs.yaml\n"}};
     const RQ_Expected original_expected[] = {
         {.case_id = "original-issuer-ca-secret",
          .site = {.file = "pki/certs.yaml",
@@ -3424,9 +3382,9 @@ TEST(probe_k8s_selectors_pick_their_own_version) {
         ASSERT_TRUE(gpf_infra_quality(configured, 3, scenarios[selected], &expected[selected], 1,
                                       forbidden[selected], 2));
     }
-    ASSERT_EQ(gpf_typed_edges(files, 2, "INFRA_MAPS", "Resource", "Resource",
-                              "\"kind\":\"selector\""),
-              2);
+    ASSERT_EQ(
+        gpf_typed_edges(files, 2, "INFRA_MAPS", "Resource", "Resource", "\"kind\":\"selector\""),
+        2);
     PASS();
 }
 
@@ -3462,8 +3420,7 @@ TEST(probe_k8s_ingress_and_httproute_expose_routes) {
 
 /* Run MCP `tool` on the indexed fixture; `args_fmt` holds one %s, the
  * project. The response is the caller's to free; NULL when indexing failed. */
-static char *gpf_tool_on(const GpfFile *files, int nfiles, const char *tool,
-                         const char *args_fmt) {
+static char *gpf_tool_on(const GpfFile *files, int nfiles, const char *tool, const char *args_fmt) {
     GpfProj lp;
     cbm_store_t *store = gpf_index_files(&lp, files, nfiles);
     char *resp = NULL;
@@ -3620,8 +3577,8 @@ TEST(probe_mcp_trace_run) {
     ASSERT_NOT_NULL(r);
     /* qualified names are grouped by prefix, split at a dot */
     ASSERT_NOT_NULL(strstr(r, "Deployment/-/server"));
-    ASSERT_NOT_NULL(strstr(r, "[\"__image__acme/server\"")); /* dotless: the whole QN */
-    ASSERT_NOT_NULL(strstr(r, ".svc\",\"rows\":[[\"Dockerfile\""));   /* its Module */
+    ASSERT_NOT_NULL(strstr(r, "[\"__image__acme/server\""));         /* dotless: the whole QN */
+    ASSERT_NOT_NULL(strstr(r, ".svc\",\"rows\":[[\"Dockerfile\""));  /* its Module */
     ASSERT_NOT_NULL(strstr(r, ".cmd.server\",\"rows\":[[\"main\"")); /* what it starts */
     ASSERT_NOT_NULL(strstr(r, "Deployment/-/server#env/server/LISTEN_PORT"));
     free(r);
@@ -3749,8 +3706,8 @@ TEST(probe_gitops_objects_deploy_their_units) {
          "spec:\n  source:\n    path: charts/web\n"}};
     ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Resource", "\"via\":\"flux\""), 2);
     ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "File", "\"via\":\"flux\""), 1);
-    ASSERT_EQ(
-        gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Chart", "\"via\":\"helmrelease\""), 2);
+    ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Chart", "\"via\":\"helmrelease\""),
+              2);
     ASSERT_EQ(gpf_typed_edges(files, 7, "DEPLOYS", "Resource", "Chart", "\"via\":\"argo\""), 1);
     PASS();
 }
@@ -3786,15 +3743,15 @@ static char *gpf_deploys(const GpfFile *files, int nfiles) {
     return out;
 }
 
-#define GPF_ASSERT_DEPLOYS(files, n, want)                                                         \
-    do {                                                                                           \
-        char *got_ = gpf_deploys(files, n);                                                        \
-        if (!got_ || strcmp(got_, want) != 0) {                                                    \
-            fprintf(stderr, "DEPLOYS got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);        \
-            free(got_);                                                                            \
-            FAIL("DEPLOYS edge set");                                                              \
-        }                                                                                          \
-        free(got_);                                                                                \
+#define GPF_ASSERT_DEPLOYS(files, n, want)                                                  \
+    do {                                                                                    \
+        char *got_ = gpf_deploys(files, n);                                                 \
+        if (!got_ || strcmp(got_, want) != 0) {                                             \
+            fprintf(stderr, "DEPLOYS got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want); \
+            free(got_);                                                                     \
+            FAIL("DEPLOYS edge set");                                                       \
+        }                                                                                   \
+        free(got_);                                                                         \
     } while (0)
 
 /* Every SPAWNS edge a script or recipe draws (api=shell) as "source ->
@@ -3824,15 +3781,15 @@ static char *gpf_spawns(const GpfFile *files, int nfiles) {
     return out;
 }
 
-#define GPF_ASSERT_SPAWNS(files, n, want)                                                          \
-    do {                                                                                           \
-        char *got_ = gpf_spawns(files, n);                                                         \
-        if (!got_ || strcmp(got_, want) != 0) {                                                    \
-            fprintf(stderr, "SPAWNS got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);         \
-            free(got_);                                                                            \
-            FAIL("SPAWNS edge set");                                                               \
-        }                                                                                          \
-        free(got_);                                                                                \
+#define GPF_ASSERT_SPAWNS(files, n, want)                                                  \
+    do {                                                                                   \
+        char *got_ = gpf_spawns(files, n);                                                 \
+        if (!got_ || strcmp(got_, want) != 0) {                                            \
+            fprintf(stderr, "SPAWNS got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want); \
+            free(got_);                                                                    \
+            FAIL("SPAWNS edge set");                                                       \
+        }                                                                                  \
+        free(got_);                                                                        \
     } while (0)
 
 /* Every SPAWNS and DEPLOYS edge as "source -> target (TYPE api|via[
@@ -3870,15 +3827,15 @@ static char *gpf_runs(const GpfFile *files, int nfiles) {
     return out;
 }
 
-#define GPF_ASSERT_RUNS(files, n, want)                                                            \
-    do {                                                                                           \
-        char *got_ = gpf_runs(files, n);                                                           \
-        if (!got_ || strcmp(got_, want) != 0) {                                                    \
-            fprintf(stderr, "runs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);           \
-            free(got_);                                                                            \
-            FAIL("SPAWNS / DEPLOYS edge set");                                                     \
-        }                                                                                          \
-        free(got_);                                                                                \
+#define GPF_ASSERT_RUNS(files, n, want)                                                  \
+    do {                                                                                 \
+        char *got_ = gpf_runs(files, n);                                                 \
+        if (!got_ || strcmp(got_, want) != 0) {                                          \
+            fprintf(stderr, "runs got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want); \
+            free(got_);                                                                  \
+            FAIL("SPAWNS / DEPLOYS edge set");                                           \
+        }                                                                                \
+        free(got_);                                                                      \
     } while (0)
 
 /* Every DEPENDS_ON edge into an Image as "@<file> -> <repository> (via)",
@@ -3906,15 +3863,15 @@ static char *gpf_images(const GpfFile *files, int nfiles) {
     return out;
 }
 
-#define GPF_ASSERT_IMAGES(files, n, want)                                                          \
-    do {                                                                                           \
-        char *got_ = gpf_images(files, n);                                                         \
-        if (!got_ || strcmp(got_, want) != 0) {                                                    \
-            fprintf(stderr, "images got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want);         \
-            free(got_);                                                                            \
-            FAIL("Image DEPENDS_ON edge set");                                                     \
-        }                                                                                          \
-        free(got_);                                                                                \
+#define GPF_ASSERT_IMAGES(files, n, want)                                                  \
+    do {                                                                                   \
+        char *got_ = gpf_images(files, n);                                                 \
+        if (!got_ || strcmp(got_, want) != 0) {                                            \
+            fprintf(stderr, "images got:\n%s\nwant:\n%s\n", got_ ? got_ : "(null)", want); \
+            free(got_);                                                                    \
+            FAIL("Image DEPENDS_ON edge set");                                             \
+        }                                                                                  \
+        free(got_);                                                                        \
     } while (0)
 
 /* A Dockerfile DEPENDS_ON each image it builds on: FROM and COPY --from,
@@ -3949,9 +3906,10 @@ static char *gpf_image_nodes(const GpfFile *files, int nfiles) {
     char *out = NULL;
     if (store) {
         sqlite3_stmt *st = NULL;
-        const char *sql = "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT name || ' [' "
-                          "|| coalesce(json_extract(properties,'$.registry'), '-') || ']' AS x "
-                          "FROM nodes WHERE project=?1 AND label='Image' ORDER BY x)";
+        const char *sql =
+            "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT name || ' [' "
+            "|| coalesce(json_extract(properties,'$.registry'), '-') || ']' AS x "
+            "FROM nodes WHERE project=?1 AND label='Image' ORDER BY x)";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
             if (sqlite3_step(st) == SQLITE_ROW) {
@@ -4007,14 +3965,13 @@ TEST(probe_image_without_registry_host_stays_unknown) {
  * Containerfile, pipeline.Dockerfile. A template of one (Dockerfile.j2) and a
  * BuildKit ignore file (Dockerfile.dockerignore) are not. */
 TEST(probe_dockerfile_variants_are_dockerfiles) {
-    static const GpfFile files[] = {
-        {"svc/Dockerfile", "FROM alpine:3.20\n"},
-        {"svc/Dockerfile.debug", "FROM debian:12\n"},
-        {"svc/Dockerfile-test", "FROM ubuntu:24.04\n"},
-        {"svc/Dockerfile.dockerignore", "FROM busybox\n"},
-        {"Containerfile", "FROM quay.io/podman/stable\n"},
-        {"tools/pipeline.Dockerfile", "FROM node:20\n"},
-        {"tools/Dockerfile.j2", "FROM {{ base_image }}\n"}};
+    static const GpfFile files[] = {{"svc/Dockerfile", "FROM alpine:3.20\n"},
+                                    {"svc/Dockerfile.debug", "FROM debian:12\n"},
+                                    {"svc/Dockerfile-test", "FROM ubuntu:24.04\n"},
+                                    {"svc/Dockerfile.dockerignore", "FROM busybox\n"},
+                                    {"Containerfile", "FROM quay.io/podman/stable\n"},
+                                    {"tools/pipeline.Dockerfile", "FROM node:20\n"},
+                                    {"tools/Dockerfile.j2", "FROM {{ base_image }}\n"}};
     GPF_ASSERT_IMAGES(files, 7,
                       "@Containerfile -> quay.io/podman/stable (from)\n"
                       "@svc/Dockerfile -> alpine (from)\n"
@@ -4037,7 +3994,8 @@ TEST(probe_dockerfile_entrypoint_runs) {
                            "FROM gcr.io/distroless/static\nCOPY --from=build /out/server /server\n"
                            "ENTRYPOINT [\"/server\", \"--port\", \"8080\"]\n"},
         {"py/app.py", "print('x')\n"},
-        {"py/Dockerfile", "FROM python:3.12\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"app.py\"]\n"},
+        {"py/Dockerfile",
+         "FROM python:3.12\nWORKDIR /app\nCOPY . .\nCMD [\"python\", \"app.py\"]\n"},
         {"node/index.js", "console.log(1);\n"},
         {"node/Dockerfile",
          "FROM gcr.io/distroless/nodejs22\nWORKDIR /app\nCOPY index.js .\nCMD [\"index.js\"]\n"},
@@ -4113,14 +4071,13 @@ TEST(probe_build_configs_build_images_from_dockerfiles) {
     static const GpfFile files[] = {
         {"src/web/Dockerfile", "FROM nginx:1.27\n"},
         {"src/api/Dockerfile.prod", "FROM golang:1.22\n"},
-        {"skaffold.yaml",
-         "apiVersion: skaffold/v4beta6\nkind: Config\nbuild:\n  artifacts:\n"
-         "    - image: web\n      context: src/web\n"
-         "    - image: api\n      context: src/api\n      docker:\n"
-         "        dockerfile: Dockerfile.prod\n"
-         "    - image: koapp\n      ko:\n        main: ./cmd\n"
-         "profiles:\n  - name: dev\n    build:\n      artifacts:\n"
-         "        - image: dev-web\n          context: src/web\n"},
+        {"skaffold.yaml", "apiVersion: skaffold/v4beta6\nkind: Config\nbuild:\n  artifacts:\n"
+                          "    - image: web\n      context: src/web\n"
+                          "    - image: api\n      context: src/api\n      docker:\n"
+                          "        dockerfile: Dockerfile.prod\n"
+                          "    - image: koapp\n      ko:\n        main: ./cmd\n"
+                          "profiles:\n  - name: dev\n    build:\n      artifacts:\n"
+                          "        - image: dev-web\n          context: src/web\n"},
         {".env", "REG=ghcr.io/acme\n# comment\nexport UNUSED='x'\n"},
         {"compose.yaml", "services:\n  frontend:\n    image: ${REG}/frontend:${TAG:-1}\n"
                          "    build:\n      context: ./src/web\n"
@@ -4186,15 +4143,14 @@ TEST(probe_compose_services_are_resources) {
          "        condition: service_healthy\n"
          "  worker:\n    build:\n      context: .\n      dockerfile: worker/Dockerfile\n"}};
     char *got = gpf_compose(files, 3);
-    static const char want[] =
-        "Service/cache -> Image:redis (USAGE image)\n"
-        "Service/cache -> Service/db (DEPENDS_ON depends_on)\n"
-        "Service/db -> Image:postgres (USAGE image)\n"
-        "Service/web -> Image:acme/web (USAGE image)\n"
-        "Service/web -> Module:web/Dockerfile (DEPENDS_ON build)\n"
-        "Service/web -> Service/cache (DEPENDS_ON depends_on)\n"
-        "Service/web -> Service/db (DEPENDS_ON depends_on)\n"
-        "Service/worker -> Module:worker/Dockerfile (DEPENDS_ON build)";
+    static const char want[] = "Service/cache -> Image:redis (USAGE image)\n"
+                               "Service/cache -> Service/db (DEPENDS_ON depends_on)\n"
+                               "Service/db -> Image:postgres (USAGE image)\n"
+                               "Service/web -> Image:acme/web (USAGE image)\n"
+                               "Service/web -> Module:web/Dockerfile (DEPENDS_ON build)\n"
+                               "Service/web -> Service/cache (DEPENDS_ON depends_on)\n"
+                               "Service/web -> Service/db (DEPENDS_ON depends_on)\n"
+                               "Service/worker -> Module:worker/Dockerfile (DEPENDS_ON build)";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "compose got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
@@ -4443,7 +4399,8 @@ static char *gpf_env_joins(const GpfFile *files, int nfiles) {
             "json_extract(e.properties,'$.strategy')='env_read' ORDER BY x)), '') || char(10) || "
             "'#image_containers=' || coalesce((SELECT group_concat(c, ',') FROM (SELECT "
             "json_extract(e.properties,'$.container') AS c FROM edges e JOIN nodes s ON "
-            "s.id=e.source_id WHERE e.project=?1 AND e.type='USAGE' AND s.file_path='k8s/shop.yaml' "
+            "s.id=e.source_id WHERE e.project=?1 AND e.type='USAGE' AND "
+            "s.file_path='k8s/shop.yaml' "
             "AND json_extract(e.properties,'$.ref')='image' ORDER BY c)), '')";
         if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, lp.project, -1, SQLITE_STATIC);
@@ -4504,7 +4461,8 @@ TEST(probe_env_address_connects_to_its_service) {
          "            - name: LOCAL_ADDR\n              value: \"localhost:9000\"\n"
          "            - name: GREETING\n              value: catalog\n"
          "            - name: PRICES_ADDR\n              value: \"catalog.other:3550\"\n"
-         "            - name: MAIL_URL\n              value: \"smtp://mail.shop.example.com:25\"\n"},
+         "            - name: MAIL_URL\n              value: "
+         "\"smtp://mail.shop.example.com:25\"\n"},
         {"k8s/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: catalog\n"
                          "  namespace: shop\n---\napiVersion: v1\nkind: Service\nmetadata:\n"
                          "  name: cache\n  namespace: shop\n---\napiVersion: v1\nkind: Service\n"
@@ -4610,8 +4568,9 @@ TEST(probe_kustomize_patches_override_their_base) {
          "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: app\n"
          "  labels:\n    tier: front\n    app: web\n    note: a=b\nspec:\n"
          "  template:\n    metadata:\n      labels:\n        app: web\n"},
-        {"base/svc.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: app\n"
-                          "spec:\n  selector:\n    app: web\n"},
+        {"base/svc.yaml",
+         "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: app\n"
+         "spec:\n  selector:\n    app: web\n"},
         {"overlays/prod/kustomization.yaml",
          "namespace: app\nresources:\n- ../../base\ncomponents:\n- ../../components/extra\n"
          "patches:\n"
@@ -4732,7 +4691,8 @@ TEST(probe_kustomize_helm_charts_deploy_their_chart) {
     char *got = gpf_kcharts(files, n);
     static const char want[] =
         "obs/kustomization.yaml Resource -> Chart/loki {\"via\":\"helmcharts\",\"external\":true,"
-        "\"chart\":\"loki\",\"url\":\"https://grafana.github.io/helm-charts\",\"version\":\"6.46.0\","
+        "\"chart\":\"loki\",\"url\":\"https://grafana.github.io/"
+        "helm-charts\",\"version\":\"6.46.0\","
         "\"release\":\"logs\",\"namespace\":\"obs\",\"values\":\"obs/values.yaml\"}\n"
         "plain/kustomization.yaml File -> Chart/loki {\"via\":\"helmcharts\",\"external\":true,"
         "\"chart\":\"loki\",\"url\":\"oci://registry.example.com/charts\"}\n"
@@ -4782,16 +4742,14 @@ static char *gpf_tf_refs(const GpfFile *files, int nfiles) {
  * from the top-level block holding it, the block declaring it in the same
  * directory -- the module, all its .tf files -- with the reference kind and
  * line; an entry of the block's depends_on list is a DEPENDS_ON (beside a
- * USAGE where the block also uses the object). A bare label (`variable prefix {}`) names its block like a quoted
- * one. A name mentioned in string text, a `/ *` glob inside an
- * interpolation, a reference to the block holding it, and a directory
- * declaring nothing of the name make no edge; the generic name matcher
- * makes none at all for a .tf file. */
+ * USAGE where the block also uses the object). A bare label (`variable prefix {}`) names its block
+ * like a quoted one. A name mentioned in string text, a `/ *` glob inside an interpolation, a
+ * reference to the block holding it, and a directory declaring nothing of the name make no edge;
+ * the generic name matcher makes none at all for a .tf file. */
 TEST(probe_terraform_refs_resolve_in_their_module) {
     static const GpfFile files[] = {
-        {"infra/variables.tf",
-         "variable \"region\" {}\nvariable prefix {\n  default = \"x\"\n}\n"
-         "variable \"unused\" {\n  description = \"see var.region\"\n}\n"},
+        {"infra/variables.tf", "variable \"region\" {}\nvariable prefix {\n  default = \"x\"\n}\n"
+                               "variable \"unused\" {\n  description = \"see var.region\"\n}\n"},
         {"infra/main.tf",
          "locals {\n  name = \"${var.prefix}-svc\"\n  full = \"${local.name}-${var.region}\"\n}\n"
          "resource \"aws_s3_bucket\" \"logs\" {\n  bucket = local.full\n}\n"
@@ -4845,8 +4803,8 @@ TEST(probe_terraform_module_files_extract_no_generic_refs) {
     int usages[3];
     int defs[3];
     for (int i = 0; i < 3; i++) {
-        CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_HCL, "probe", names[i],
-                                            0, NULL, NULL);
+        CBMFileResult *r =
+            cbm_extract_file(src, (int)strlen(src), CBM_LANG_HCL, "probe", names[i], 0, NULL, NULL);
         ASSERT_NOT_NULL(r);
         calls[i] = r->calls.count;
         usages[i] = r->usages.count;
@@ -4877,7 +4835,8 @@ static char *gpf_tf_modules(const GpfFile *files, int nfiles) {
             "s.name || ' ' || e.type || ' ' || CASE t.label WHEN 'Folder' THEN 'Folder:' || "
             "t.file_path WHEN 'Project' THEN 'Project' ELSE t.file_path || ' ' || t.name END || "
             "' ' || coalesce(json_extract(e.properties,'$.local_name'), "
-            "json_extract(e.properties,'$.ref')) || ':' || json_extract(e.properties,'$.line') AS x "
+            "json_extract(e.properties,'$.ref')) || ':' || json_extract(e.properties,'$.line') AS "
+            "x "
             "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
             "WHERE e.project=?1 AND json_extract(e.properties,'$.via')='terraform' AND "
             "(e.type='IMPORTS' OR json_extract(e.properties,'$.ref')='output') ORDER BY x)), '')";
@@ -4901,35 +4860,33 @@ static char *gpf_tf_modules(const GpfFile *files, int nfiles) {
  * repository root, and an output the module does not declare make none. */
 TEST(probe_terraform_module_calls_import_their_source) {
     static const GpfFile files[] = {
-        {"main.tf",
-         "module \"net\" {\n  source = \"./modules/net\"\n}\n"
-         "module \"cnt\" {\n  source = \"./modules/net\"\n  count  = 2\n}\n"
-         "module \"reg\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n"
-         "  version = \"5.0.0\"\n}\n"
-         "module \"gone\" {\n  source = \"./modules/missing\"\n}\n"
-         "module \"out\" {\n  source = \"../outside\"\n}\n"
-         "output \"a\" {\n  value = module.net.id\n}\n"
-         "output \"b\" {\n  value = module.cnt[0].id\n}\n"
-         "output \"c\" {\n  value = module.cnt[*].name\n}\n"
-         "output \"d\" {\n  value = module.net.nope\n}\n"
-         "output \"e\" {\n  value = module.reg.vpc_id\n}\n"
-         "module \"bare\" {\n  source = \"modules/net\"\n}\n"
-         "module \"docs\" {\n  source = \"./docs\"\n}\n"},
+        {"main.tf", "module \"net\" {\n  source = \"./modules/net\"\n}\n"
+                    "module \"cnt\" {\n  source = \"./modules/net\"\n  count  = 2\n}\n"
+                    "module \"reg\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n"
+                    "  version = \"5.0.0\"\n}\n"
+                    "module \"gone\" {\n  source = \"./modules/missing\"\n}\n"
+                    "module \"out\" {\n  source = \"../outside\"\n}\n"
+                    "output \"a\" {\n  value = module.net.id\n}\n"
+                    "output \"b\" {\n  value = module.cnt[0].id\n}\n"
+                    "output \"c\" {\n  value = module.cnt[*].name\n}\n"
+                    "output \"d\" {\n  value = module.net.nope\n}\n"
+                    "output \"e\" {\n  value = module.reg.vpc_id\n}\n"
+                    "module \"bare\" {\n  source = \"modules/net\"\n}\n"
+                    "module \"docs\" {\n  source = \"./docs\"\n}\n"},
         {"docs/README.md", "# docs\n"},
         {"modules/net/main.tf",
          "output \"id\" {\n  value = \"x\"\n}\noutput \"name\" {\n  value = \"n\"\n}\n"},
-        {"examples/basic/main.tf",
-         "module \"root\" {\n  source = \"../..\"\n}\noutput \"r\" {\n  value = module.root.a\n}\n"}};
+        {"examples/basic/main.tf", "module \"root\" {\n  source = \"../..\"\n}\noutput \"r\" {\n  "
+                                   "value = module.root.a\n}\n"}};
     int n = (int)(sizeof(files) / sizeof(files[0]));
     char *got = gpf_tf_modules(files, n);
-    static const char want[] =
-        "examples/basic/main.tf module.root IMPORTS Project root:1\n"
-        "examples/basic/main.tf output.r USAGE main.tf output.a output:5\n"
-        "main.tf module.cnt IMPORTS Folder:modules/net cnt:4\n"
-        "main.tf module.net IMPORTS Folder:modules/net net:1\n"
-        "main.tf output.a USAGE modules/net/main.tf output.id output:19\n"
-        "main.tf output.b USAGE modules/net/main.tf output.id output:22\n"
-        "main.tf output.c USAGE modules/net/main.tf output.name output:25";
+    static const char want[] = "examples/basic/main.tf module.root IMPORTS Project root:1\n"
+                               "examples/basic/main.tf output.r USAGE main.tf output.a output:5\n"
+                               "main.tf module.cnt IMPORTS Folder:modules/net cnt:4\n"
+                               "main.tf module.net IMPORTS Folder:modules/net net:1\n"
+                               "main.tf output.a USAGE modules/net/main.tf output.id output:19\n"
+                               "main.tf output.b USAGE modules/net/main.tf output.id output:22\n"
+                               "main.tf output.c USAGE modules/net/main.tf output.name output:25";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "terraform modules got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
@@ -4951,7 +4908,8 @@ static char *gpf_tf_tfvars(const GpfFile *files, int nfiles) {
             "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.file_path || ' ' || "
             "s.name || ' -> ' || t.file_path || ' ' || t.name || ' ' || "
             "json_extract(e.properties,'$.line') || CASE WHEN "
-            "json_extract(e.properties,'$.inferred') THEN ' inferred' ELSE '' END AS x FROM edges e "
+            "json_extract(e.properties,'$.inferred') THEN ' inferred' ELSE '' END AS x FROM edges "
+            "e "
             "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 "
             "AND e.type='OVERRIDE' AND json_extract(e.properties,'$.via')='tfvars' ORDER BY x)), "
             "'')";
@@ -5050,7 +5008,8 @@ TEST(probe_terragrunt_units_compose_their_files) {
         {"live/app/env.hcl", "locals {\n  name = \"app\"\n}\n"},
         {"_common/app.hcl",
          "locals {\n  acct = read_terragrunt_config(find_in_parent_folders(\"account.hcl\"))\n}\n"},
-        {"live/db/terragrunt.hcl", "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"},
+        {"live/db/terragrunt.hcl",
+         "include \"root\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n"},
         {"modules/app/main.tf", "variable \"x\" {}\n"}};
     int n = (int)(sizeof(files) / sizeof(files[0]));
     char *got = gpf_tg_edges(files, n);
@@ -5157,15 +5116,18 @@ static char *gpf_tf_k8s(const GpfFile *files, int nfiles) {
     if (store) {
         sqlite3_stmt *st = NULL;
         const char *sql =
-            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' || "
+            "SELECT coalesce((SELECT group_concat(x, char(10)) FROM (SELECT s.name || ' DEPLOYS ' "
+            "|| "
             "t.name || ' ' || json_extract(t.properties,'$.obj_key') || ' v=' || "
-            "coalesce(json_extract(t.properties,'$.version'), '-') AS x FROM edges e JOIN nodes s ON "
+            "coalesce(json_extract(t.properties,'$.version'), '-') AS x FROM edges e JOIN nodes s "
+            "ON "
             "s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND "
             "e.type='DEPLOYS' AND t.label='Resource' AND "
             "json_extract(e.properties,'$.via')='terraform' ORDER BY x)), '') || char(10) || "
             "'terraform resources ' || (SELECT COUNT(*) FROM nodes WHERE project=?1 AND "
             "label='Resource' AND json_extract(properties,'$.ecosystem')='terraform') || "
-            "coalesce((SELECT group_concat(y, '') FROM (SELECT char(10) || s.label || ':' || s.name "
+            "coalesce((SELECT group_concat(y, '') FROM (SELECT char(10) || s.label || ':' || "
+            "s.name "
             "|| ' INFRA_MAPS ' || t.name AS y FROM edges e JOIN nodes s ON s.id=e.source_id JOIN "
             "nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='INFRA_MAPS' AND "
             "json_extract(t.properties,'$.ecosystem')='terraform' ORDER BY y)), '')";
@@ -5193,7 +5155,8 @@ static char *gpf_tf_k8s(const GpfFile *files, int nfiles) {
 TEST(probe_terraform_kubernetes_objects_are_resources) {
     static const GpfFile files[] = {
         {"k8s/main.tf",
-         "resource \"kubernetes_namespace_v1\" \"apps\" {\n  metadata {\n    name = \"apps\"\n  }\n}\n"
+         "resource \"kubernetes_namespace_v1\" \"apps\" {\n  metadata {\n    name = \"apps\"\n  "
+         "}\n}\n"
          "resource \"kubernetes_deployment\" \"web\" {\n  metadata {\n    name      = \"web\"\n"
          "    namespace = \"apps\"\n  }\n  spec {\n    template {\n      metadata {\n"
          "        name = \"inner\"\n      }\n    }\n  }\n}\n"
@@ -5201,7 +5164,8 @@ TEST(probe_terraform_kubernetes_objects_are_resources) {
          "    \"apiVersion\" = \"cert-manager.io/v1\"\n    \"kind\"       = \"Certificate\"\n"
          "    \"metadata\" = {\n      \"name\"      = \"tls\"\n      \"namespace\" = \"apps\"\n"
          "    }\n  }\n}\n"
-         "resource \"kubernetes_service\" \"computed\" {\n  metadata {\n    name = var.name\n  }\n}\n"
+         "resource \"kubernetes_service\" \"computed\" {\n  metadata {\n    name = var.name\n  "
+         "}\n}\n"
          "resource \"kubernetes_api_service\" \"metrics\" {\n  metadata {\n"
          "    name = \"v1beta1.metrics.k8s.io\"\n  }\n  spec {\n    service {\n"
          "      name      = \"metrics-server\"\n      namespace = \"kube-system\"\n    }\n  }\n}\n"
@@ -5297,9 +5261,8 @@ TEST(probe_kustomize_name_prefix_makes_variants) {
          "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n"
          "  name: widgets.example.com\n"},
         {"base/ns.yaml", "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: system\n"},
-        {"base/apisvc.yaml",
-         "apiVersion: apiregistration.k8s.io/v1\nkind: APIService\nmetadata:\n"
-         "  name: v1.example.com\n"},
+        {"base/apisvc.yaml", "apiVersion: apiregistration.k8s.io/v1\nkind: APIService\nmetadata:\n"
+                             "  name: v1.example.com\n"},
         {"base/role.yaml",
          "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n"
          "  name: reader\n"},
@@ -5412,34 +5375,33 @@ TEST(probe_ansible_tasks_are_functions) {
         {"patches/ops.yaml", "- op: add\n  path: /x\n  value: 1\n"}};
     int n = (int)(sizeof(files) / sizeof(files[0]));
     char *got = gpf_ansible_tasks(files, n);
-    static const char want[] =
-        "other.yml:3 task debug [debug]\n"
-        "other.yml:4 task include_tasks [include_tasks]\n"
-        "roles/apps/csi/handlers/main.yml:1 handler restart csi [command]\n"
-        "roles/apps/csi/tasks/main.yml:1 task Csi [command]\n"
-        "roles/apps/lb/handlers/main.yml:1 handler restart csi [command]\n"
-        "roles/other/handlers/main.yml:1 handler restart csi [command]\n"
-        "roles/web/handlers/main.yml:1 handler restart web [service]\n"
-        "roles/web/handlers/main.yml:5 handler log change [debug]\n"
-        "roles/web/tasks/extra.yml:1 task Extra [command]\n"
-        "roles/web/tasks/main.yml:1 task Install web [package]\n"
-        "roles/web/tasks/main.yml:8 task Inside block [template]\n"
-        "roles/web/tasks/main.yml:14 task Rescue it [debug]\n"
-        "roles/web/tasks/main.yml:18 task Always it [file]\n"
-        "roles/web/tasks/main.yml:22 task include_tasks [include_tasks]\n"
-        "site.yml:3 task Prep [command]\n"
-        "site.yml:8 handler reload all [service]\n"
-        "site.yml:11 task Ping [ping]\n"
-        "tasks/common.yml:1 task Common [shell]\n"
-        "tasks/common.yml:3 task Say \"hi\" [debug]\n"
-        "tasks/common.yml:6 task it's [debug]\n"
-        "tasks/common.yml:9 task Act [shell]\n"
-        "Csi -> roles/apps/csi/handlers/main.yml:restart csi @3\n"
-        "Inside block -> roles/web/handlers/main.yml:restart web @12\n"
-        "Install web -> roles/web/handlers/main.yml:log change @4\n"
-        "Install web -> roles/web/handlers/main.yml:restart web @4\n"
-        "Ping -> site.yml:reload all @13\n"
-        "functions 21 defined 21";
+    static const char want[] = "other.yml:3 task debug [debug]\n"
+                               "other.yml:4 task include_tasks [include_tasks]\n"
+                               "roles/apps/csi/handlers/main.yml:1 handler restart csi [command]\n"
+                               "roles/apps/csi/tasks/main.yml:1 task Csi [command]\n"
+                               "roles/apps/lb/handlers/main.yml:1 handler restart csi [command]\n"
+                               "roles/other/handlers/main.yml:1 handler restart csi [command]\n"
+                               "roles/web/handlers/main.yml:1 handler restart web [service]\n"
+                               "roles/web/handlers/main.yml:5 handler log change [debug]\n"
+                               "roles/web/tasks/extra.yml:1 task Extra [command]\n"
+                               "roles/web/tasks/main.yml:1 task Install web [package]\n"
+                               "roles/web/tasks/main.yml:8 task Inside block [template]\n"
+                               "roles/web/tasks/main.yml:14 task Rescue it [debug]\n"
+                               "roles/web/tasks/main.yml:18 task Always it [file]\n"
+                               "roles/web/tasks/main.yml:22 task include_tasks [include_tasks]\n"
+                               "site.yml:3 task Prep [command]\n"
+                               "site.yml:8 handler reload all [service]\n"
+                               "site.yml:11 task Ping [ping]\n"
+                               "tasks/common.yml:1 task Common [shell]\n"
+                               "tasks/common.yml:3 task Say \"hi\" [debug]\n"
+                               "tasks/common.yml:6 task it's [debug]\n"
+                               "tasks/common.yml:9 task Act [shell]\n"
+                               "Csi -> roles/apps/csi/handlers/main.yml:restart csi @3\n"
+                               "Inside block -> roles/web/handlers/main.yml:restart web @12\n"
+                               "Install web -> roles/web/handlers/main.yml:log change @4\n"
+                               "Install web -> roles/web/handlers/main.yml:restart web @4\n"
+                               "Ping -> site.yml:reload all @13\n"
+                               "functions 21 defined 21";
     if (!got || strcmp(got, want) != 0) {
         fprintf(stderr, "ansible tasks got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
@@ -5501,7 +5463,8 @@ TEST(probe_ansible_kube_tasks_deploy_their_templates) {
          "- name: Render from defaults\n  template:\n    src: \"{{ item.file }}.j2\"\n"
          "    dest: \"{{ conf }}/x/{{ item.file }}\"\n  loop: \"{{ app_extra }}\"\n"
          "  register: extra_out\n"
-         "- name: Apply from defaults\n  kube:\n    filename: \"{{ conf }}/x/{{ item.item.file }}\"\n"
+         "- name: Apply from defaults\n  kube:\n    filename: \"{{ conf }}/x/{{ item.item.file "
+         "}}\"\n"
          "  loop: \"{{ extra_out.results }}\"\n"
          "- name: Facts\n  set_fact:\n    sf_list:\n      - {file: e.yml}\n"
          "- name: Render from facts\n  template:\n    src: \"{{ item.file }}.j2\"\n"
@@ -5512,7 +5475,8 @@ TEST(probe_ansible_kube_tasks_deploy_their_templates) {
          "- name: Pairs\n  template:\n    src: \"{{ item.name }}/{{ item.file }}.j2\"\n"
          "    dest: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n  with_items:\n"
          "    - {name: c, file: c.yml}\n"
-         "- name: Apply pairs\n  kube:\n    filename: \"{{ conf }}/{{ item.name }}-{{ item.file }}\"\n"
+         "- name: Apply pairs\n  kube:\n    filename: \"{{ conf }}/{{ item.name }}-{{ item.file "
+         "}}\"\n"
          "  loop:\n    - {name: c, file: c.yml}\n"
          "- name: Rendered literal\n  template:\n    src: \"{{ item.file }}.j2\"\n"
          "    dest: \"{{ conf }}/r/{{ item.file }}\"\n  with_items:\n    - {file: ipam.yml}\n"
@@ -5602,28 +5566,28 @@ TEST(probe_script_http_request_calls_its_route) {
     static const GpfFile files[] = {
         {"k8s/api.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: api\n"},
         {"k8s/localhost.yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: localhost\n"},
-        {"dl.sh",
-         "#!/bin/bash\nVER=1.2.3\n"
-         "curl -fsSL https://github.com/x/y/releases/download/v1/tool.tgz -o tool.tgz\n"
-         "curl -X POST -d '{}' \"http://api:8080/v1/items?token=s3cr3t-token\"\n"
-         "wget --post-data=x https://user:pw-secret@dl.example.com/a/b\n"
-         "curl -I https://example.com/head\n"
-         "curl -x http://proxy.local:3128 https://example.org/target\n"
-         "curl -LO \"https://dl.example.com/v${VER}/x-${VER}.tgz\"\n"
-         "curl \"https://dl.example.com/r/${UNKNOWN}/y.tgz\"\n"
-         "curl http://localhost:9090/metrics\n"
-         "curl -G -d q=1 https://example.com/search\n"
-         "curl --request DELETE https://example.com/item/1\n"
-         "curl -fsSLO https://dl.example.com/u/$OS-$ARCH.tgz\n"
-         "curl -LO https://dl.example.com/j/`uname`.tgz\n"
-         "curl -LO https://dl.example.com/q/${VER}$OS.tgz\n"
-         "curl https://api.example.com/v1/ping\n"
-         "curl http://api.default.svc.cluster.local:8080/health\n"
-         "curl \"https://${HOST}/api/x\"\n"},
-        {"Makefile", "TOOL_VERSION=0.1.1\nARCH=amd64\n"
-                     "install:\n\tcurl -sSL https://get.example.com/install.sh | sh\n"
-                     "bin/tool:\n\tcurl -sLo \"bin/tool\" https://dl.example.com/t/v$(TOOL_VERSION)/"
-                     "tool_v$(TOOL_VERSION)_$(OS)_$(ARCH)\n"}};
+        {"dl.sh", "#!/bin/bash\nVER=1.2.3\n"
+                  "curl -fsSL https://github.com/x/y/releases/download/v1/tool.tgz -o tool.tgz\n"
+                  "curl -X POST -d '{}' \"http://api:8080/v1/items?token=s3cr3t-token\"\n"
+                  "wget --post-data=x https://user:pw-secret@dl.example.com/a/b\n"
+                  "curl -I https://example.com/head\n"
+                  "curl -x http://proxy.local:3128 https://example.org/target\n"
+                  "curl -LO \"https://dl.example.com/v${VER}/x-${VER}.tgz\"\n"
+                  "curl \"https://dl.example.com/r/${UNKNOWN}/y.tgz\"\n"
+                  "curl http://localhost:9090/metrics\n"
+                  "curl -G -d q=1 https://example.com/search\n"
+                  "curl --request DELETE https://example.com/item/1\n"
+                  "curl -fsSLO https://dl.example.com/u/$OS-$ARCH.tgz\n"
+                  "curl -LO https://dl.example.com/j/`uname`.tgz\n"
+                  "curl -LO https://dl.example.com/q/${VER}$OS.tgz\n"
+                  "curl https://api.example.com/v1/ping\n"
+                  "curl http://api.default.svc.cluster.local:8080/health\n"
+                  "curl \"https://${HOST}/api/x\"\n"},
+        {"Makefile",
+         "TOOL_VERSION=0.1.1\nARCH=amd64\n"
+         "install:\n\tcurl -sSL https://get.example.com/install.sh | sh\n"
+         "bin/tool:\n\tcurl -sLo \"bin/tool\" https://dl.example.com/t/v$(TOOL_VERSION)/"
+         "tool_v$(TOOL_VERSION)_$(OS)_$(ARCH)\n"}};
     int n = (int)(sizeof(files) / sizeof(files[0]));
     char *got = gpf_script_http(files, n);
     static const char want[] =
@@ -5697,7 +5661,8 @@ TEST(probe_container_env_joins_its_own_image_readers) {
         {"side/Dockerfile", "FROM golang:1.22 AS build\nCOPY side/main.go shared/util.go /src/\n"
                             "RUN go build -o /app /src\nFROM alpine:3.20\n"
                             "COPY --from=build /app /app\nENTRYPOINT [\"/app\"]\n"},
-        {"side/main.go", "package main\n\nimport \"os\"\n\nfunc main() { _ = os.Getenv(\"PORT\") }\n"},
+        {"side/main.go",
+         "package main\n\nimport \"os\"\n\nfunc main() { _ = os.Getenv(\"PORT\") }\n"},
         {"shared/util.go", "package shared\n\nimport \"os\"\n\n"
                            "func Port() string { return os.Getenv(\"PORT\") }\n"},
         {"other/main.go", "package main\n\nimport \"os\"\n\n"
@@ -5843,27 +5808,26 @@ TEST(probe_shell_paths_follow_the_script) {
         {"apps/web/sub/extra.yaml", GPF_CM("extra")},
         {"apps/web/config.yaml", GPF_CM("config-here")},
         {"config.yaml", GPF_CM("config-root")},
-        {"apps/web/deploy.sh",
-         "#!/usr/bin/env bash\n"
-         "SCRIPT_ROOT=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd -P)\n"
-         "context=\"${KUBECTL_CONTEXT:-gke}\"\n"
-         "if ! kubectl config get-contexts \"${context}\"; then\n"
-         "  context=\"other\"\n"
-         "fi\n"
-         "pushd \"${SCRIPT_ROOT}\" >/dev/null\n"
-         "kubectl --context=\"${context}\" apply -f .\n"
-         "popd >/dev/null\n"
-         "( cd sub && kubectl apply -f cm.yaml )\n"
-         "kubectl apply -f extra.yaml\n"
-         "ambiguous() { kubectl apply -f config.yaml; }\n"
-         "unique() { kubectl apply -f deployment.yaml; }\n"
-         "deploy() {\n"
-         "  local kubectl=(\n"
-         "    kubectl\n"
-         "    --context=\"${context}\"\n"
-         "  )\n"
-         "  \"${kubectl[@]}\" apply -f service.yaml\n"
-         "}\n"}};
+        {"apps/web/deploy.sh", "#!/usr/bin/env bash\n"
+                               "SCRIPT_ROOT=$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd -P)\n"
+                               "context=\"${KUBECTL_CONTEXT:-gke}\"\n"
+                               "if ! kubectl config get-contexts \"${context}\"; then\n"
+                               "  context=\"other\"\n"
+                               "fi\n"
+                               "pushd \"${SCRIPT_ROOT}\" >/dev/null\n"
+                               "kubectl --context=\"${context}\" apply -f .\n"
+                               "popd >/dev/null\n"
+                               "( cd sub && kubectl apply -f cm.yaml )\n"
+                               "kubectl apply -f extra.yaml\n"
+                               "ambiguous() { kubectl apply -f config.yaml; }\n"
+                               "unique() { kubectl apply -f deployment.yaml; }\n"
+                               "deploy() {\n"
+                               "  local kubectl=(\n"
+                               "    kubectl\n"
+                               "    --context=\"${context}\"\n"
+                               "  )\n"
+                               "  \"${kubectl[@]}\" apply -f service.yaml\n"
+                               "}\n"}};
     GPF_ASSERT_DEPLOYS(files, 7,
                        "@apps/web/deploy.sh -> File:apps/web/config.yaml (kubectl)\n"
                        "@apps/web/deploy.sh -> File:apps/web/deployment.yaml (kubectl)\n"
@@ -5881,17 +5845,16 @@ TEST(probe_shell_paths_follow_the_script) {
 TEST(probe_shell_programs_by_path_spawn) {
     static const GpfFile files[] = {
         {"hack/lib.sh", "#!/bin/sh\necho lib\n"},
-        {"hack/run.sh",
-         "#!/usr/bin/env bash\n"
-         "cd \"$(dirname \"$0\")/..\"\n"
-         "./_build/kubermatic-installer deploy kubermatic-master --config x.yaml\n"
-         "\"${INSTALL_DIR}/kubermatic-installer\" deploy seed-mla\n"
-         "./hack/lib.sh\n"
-         "if command -v bin/checker >/dev/null; then echo ok; fi\n"
-         "version=$(bin/werf version)\n"
-         "retry 3 /usr/local/bin/helm version\n"
-         "while read -r l; do echo \"$l\"; done < <(./bin/lister --all)\n"
-         "run() { bin/tool --flag; }\n"}};
+        {"hack/run.sh", "#!/usr/bin/env bash\n"
+                        "cd \"$(dirname \"$0\")/..\"\n"
+                        "./_build/kubermatic-installer deploy kubermatic-master --config x.yaml\n"
+                        "\"${INSTALL_DIR}/kubermatic-installer\" deploy seed-mla\n"
+                        "./hack/lib.sh\n"
+                        "if command -v bin/checker >/dev/null; then echo ok; fi\n"
+                        "version=$(bin/werf version)\n"
+                        "retry 3 /usr/local/bin/helm version\n"
+                        "while read -r l; do echo \"$l\"; done < <(./bin/lister --all)\n"
+                        "run() { bin/tool --flag; }\n"}};
     GPF_ASSERT_SPAWNS(files, 2,
                       "@hack/run.sh -> helm\n"
                       "@hack/run.sh -> kubermatic-installer\n"
@@ -5974,32 +5937,31 @@ TEST(probe_ci_and_scripts_run_scripts) {
         {"Makefile", "test:\n"
                      "\t./hack/test.sh\n"
                      "\t/bin/bash hack/lint.sh\n"},
-        {".github/workflows/ci.yml",
-         "name: ci\n"
-         "on: [push]\n"
-         "env:\n"
-         "  CHART_DIR: charts/web\n"
-         "jobs:\n"
-         "  test:\n"
-         "    runs-on: ubuntu-latest\n"
-         "    steps:\n"
-         "      - uses: actions/checkout@v4\n"
-         "      - run: ./hack/test.sh\n"
-         "      - name: multi\n"
-         "        run: |\n"
-         "          sh hack/lint.sh --fix\n"
-         "          ${{ github.workspace }}/hack/e2e.sh\n"
-         "          helm upgrade --install web \"$CHART_DIR\"\n"
-         "          ./bin/tool --x\n"
-         "      - working-directory: ops\n"
-         "        run: ./apply.sh\n"
-         "      - run: \"${{ matrix.dir }}/hack/other.sh\"\n"
-         "      - shell: pwsh\n"
-         "        run: ./hack/ci/lint.sh\n"
-         "  win:\n"
-         "    runs-on: windows-latest\n"
-         "    steps:\n"
-         "      - run: ./hack/ci/run-e2e.sh\n"},
+        {".github/workflows/ci.yml", "name: ci\n"
+                                     "on: [push]\n"
+                                     "env:\n"
+                                     "  CHART_DIR: charts/web\n"
+                                     "jobs:\n"
+                                     "  test:\n"
+                                     "    runs-on: ubuntu-latest\n"
+                                     "    steps:\n"
+                                     "      - uses: actions/checkout@v4\n"
+                                     "      - run: ./hack/test.sh\n"
+                                     "      - name: multi\n"
+                                     "        run: |\n"
+                                     "          sh hack/lint.sh --fix\n"
+                                     "          ${{ github.workspace }}/hack/e2e.sh\n"
+                                     "          helm upgrade --install web \"$CHART_DIR\"\n"
+                                     "          ./bin/tool --x\n"
+                                     "      - working-directory: ops\n"
+                                     "        run: ./apply.sh\n"
+                                     "      - run: \"${{ matrix.dir }}/hack/other.sh\"\n"
+                                     "      - shell: pwsh\n"
+                                     "        run: ./hack/ci/lint.sh\n"
+                                     "  win:\n"
+                                     "    runs-on: windows-latest\n"
+                                     "    steps:\n"
+                                     "      - run: ./hack/ci/run-e2e.sh\n"},
         {".github/actions/setup/setup.sh", "#!/bin/sh\necho setup\n"},
         {".github/actions/setup/action.yml", "name: setup\n"
                                              "runs:\n"
@@ -6060,7 +6022,8 @@ static char *gpf_make_model(const GpfFile *files, int nfiles) {
             "SELECT coalesce(group_concat(x, char(10)), '') FROM (SELECT x FROM ("
             "SELECT 'fn ' || file_path || ':' || name || ' ' || start_line || '-' || end_line "
             "|| CASE WHEN json_extract(properties,'$.variants') IS NULL THEN '' ELSE "
-            "' +variants' END AS x FROM nodes WHERE project=?1 AND label='Function' AND (file_path LIKE "
+            "' +variants' END AS x FROM nodes WHERE project=?1 AND label='Function' AND (file_path "
+            "LIKE "
             "'%Makefile' OR file_path LIKE '%.mk') UNION ALL SELECT 'import ' || s.file_path || "
             "' -> ' || t.label || ':' || t.file_path || ' (' || "
             "json_extract(e.properties,'$.local_name') || ')' FROM edges e JOIN nodes s ON "
@@ -6174,45 +6137,44 @@ TEST(probe_make_rules_have_a_node_per_target) {
  * edge for an unknown target or -C value, a target no rule has, a rule only
  * inside a conditional (no node), or no target. */
 TEST(probe_make_targets_spawn_their_rules) {
-    static const GpfFile files[] = {
-        {"Makefile", "include mk/common.mk\n"
-                     "VERSION := 1\n"
-                     "KEYS = a \\\n"
-                     "       b \\\n"
-                     "       c\n\n"
-                     "build:\n"
-                     "\tgo build ./...\n\n"
-                     "test: build\n"
-                     "\t$(MAKE) lint\n"
-                     "\t$(MAKE) -C sub check\n\n"
-                     "ifeq ($(CI),true)\n"
-                     "cond:\n"
-                     "\techo ci\n"
-                     "endif\n\n"
-                     "keys:\n"
-                     "\t@for k in $(KEYS); do \\\n"
-                     "\t  echo $$k; \\\n"
-                     "\tdone; \\\n"
-                     "\t$(MAKE) build\n\n"
-                     "after:\n"
-                     "\techo one\n"},
-        {"mk/common.mk", "lint:\n\techo lint\n"},
-        {"sub/Makefile", "check:\n\techo check\n"},
-        {"hack/ci.sh", "#!/bin/sh\n"
-                       "make test VERBOSE=1\n"
-                       "make -C sub -j 4 check\n"
-                       "make -f Makefile build unknown-target\n"
-                       "make \"$TARGET\"\n"
-                       "make -C \"$DIR\" build\n"
-                       "make cond\n"
-                       "make\n"
-                       "gmake --directory=sub check\n"},
-        {".github/workflows/ci.yml", "on: [push]\n"
-                                     "jobs:\n"
-                                     "  ci:\n"
-                                     "    runs-on: ubuntu-latest\n"
-                                     "    steps:\n"
-                                     "      - run: make -j8 build\n"}};
+    static const GpfFile files[] = {{"Makefile", "include mk/common.mk\n"
+                                                 "VERSION := 1\n"
+                                                 "KEYS = a \\\n"
+                                                 "       b \\\n"
+                                                 "       c\n\n"
+                                                 "build:\n"
+                                                 "\tgo build ./...\n\n"
+                                                 "test: build\n"
+                                                 "\t$(MAKE) lint\n"
+                                                 "\t$(MAKE) -C sub check\n\n"
+                                                 "ifeq ($(CI),true)\n"
+                                                 "cond:\n"
+                                                 "\techo ci\n"
+                                                 "endif\n\n"
+                                                 "keys:\n"
+                                                 "\t@for k in $(KEYS); do \\\n"
+                                                 "\t  echo $$k; \\\n"
+                                                 "\tdone; \\\n"
+                                                 "\t$(MAKE) build\n\n"
+                                                 "after:\n"
+                                                 "\techo one\n"},
+                                    {"mk/common.mk", "lint:\n\techo lint\n"},
+                                    {"sub/Makefile", "check:\n\techo check\n"},
+                                    {"hack/ci.sh", "#!/bin/sh\n"
+                                                   "make test VERBOSE=1\n"
+                                                   "make -C sub -j 4 check\n"
+                                                   "make -f Makefile build unknown-target\n"
+                                                   "make \"$TARGET\"\n"
+                                                   "make -C \"$DIR\" build\n"
+                                                   "make cond\n"
+                                                   "make\n"
+                                                   "gmake --directory=sub check\n"},
+                                    {".github/workflows/ci.yml", "on: [push]\n"
+                                                                 "jobs:\n"
+                                                                 "  ci:\n"
+                                                                 "    runs-on: ubuntu-latest\n"
+                                                                 "    steps:\n"
+                                                                 "      - run: make -j8 build\n"}};
     GPF_ASSERT_RUNS(
         files, 5,
         "@.github/workflows/ci.yml -> rule:Makefile:build (SPAWNS shell github-actions/ci)\n"
@@ -6283,26 +6245,27 @@ TEST(probe_go_installer_deploys_charts) {
                               "\tf, err := os.Open(filepath.Join(directory, \"Chart.yaml\"))\n"
                               "\tif err != nil {\n\t\treturn nil, err\n\t}\n"
                               "\tdefer f.Close()\n\treturn &Chart{}, nil\n}\n"},
-        {"pkg/stack/stack.go", "package stack\n\n"
-                               "import (\n\t\"path/filepath\"\n\n"
-                               "\t\"example.com/inst/pkg/helm\"\n)\n\n"
-                               "const (\n"
-                               "\tMonitoringPrefix      = \"monitoring\"\n"
-                               "\tNodeExporterChartName = \"node-exporter\"\n"
-                               "\tMinioChartName        = \"minio\"\n"
-                               "\tchartName             = \"telemetry\"\n)\n\n"
-                               "type Options struct{ ChartsDirectory string }\n\n"
-                               "func deployNodeExporter(opt Options) {\n"
-                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, "
-                               "MonitoringPrefix, NodeExporterChartName))\n}\n\n"
-                               "func deployMinio(opt Options) {\n"
-                               "\tname := MinioChartName\n"
-                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, name))\n}\n\n"
-                               "func deployTelemetry(opt Options) {\n"
-                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, "
-                               "\"telemetry\"))\n}\n\n"
-                               "func deployFromArg(opt Options, chartName string) {\n"
-                               "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, chartName))\n}\n"},
+        {"pkg/stack/stack.go",
+         "package stack\n\n"
+         "import (\n\t\"path/filepath\"\n\n"
+         "\t\"example.com/inst/pkg/helm\"\n)\n\n"
+         "const (\n"
+         "\tMonitoringPrefix      = \"monitoring\"\n"
+         "\tNodeExporterChartName = \"node-exporter\"\n"
+         "\tMinioChartName        = \"minio\"\n"
+         "\tchartName             = \"telemetry\"\n)\n\n"
+         "type Options struct{ ChartsDirectory string }\n\n"
+         "func deployNodeExporter(opt Options) {\n"
+         "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, "
+         "MonitoringPrefix, NodeExporterChartName))\n}\n\n"
+         "func deployMinio(opt Options) {\n"
+         "\tname := MinioChartName\n"
+         "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, name))\n}\n\n"
+         "func deployTelemetry(opt Options) {\n"
+         "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, "
+         "\"telemetry\"))\n}\n\n"
+         "func deployFromArg(opt Options, chartName string) {\n"
+         "\thelm.LoadChart(filepath.Join(opt.ChartsDirectory, chartName))\n}\n"},
         {"pkg/sdk/load.go", "package sdk\n\n"
                             "import \"helm.sh/helm/v3/pkg/chart/loader\"\n\n"
                             "func loadExample() {\n"
@@ -7424,8 +7387,8 @@ TEST(probe_docker_default_images_marked_and_overrides) {
          .declaration_line = 2,
          .declaration_text = "  web:",
          .mode = RQ_REQUIRED}};
-    if (!gpf_image_quality(files, 5, "probe_docker_default_images_marked_and_overrides",
-                           want, expected, 2)) {
+    if (!gpf_image_quality(files, 5, "probe_docker_default_images_marked_and_overrides", want,
+                           expected, 2)) {
         FAIL("default-valued images and their in-repo overrides");
     }
     ASSERT_EQ(
@@ -7481,7 +7444,8 @@ TEST(probe_helm_template_images_render_with_defaults) {
          "image:\n  repository: bitnami/postgresql\n  tag: \"\"\n  digest: \"\"\n"},
         {"charts/app/charts/db/templates/sts.yaml",
          "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: db\nspec:\n  template:\n"
-         "    spec:\n      containers:\n        - name: db\n          {{- if .Values.image.digest }}\n"
+         "    spec:\n      containers:\n        - name: db\n          {{- if .Values.image.digest "
+         "}}\n"
          "          image: \"{{ .Values.global.imageRegistry | default \"docker.io\" }}/"
          "{{ .Values.image.repository }}@{{ .Values.image.digest }}\"\n          {{- else }}\n"
          "          image: \"{{ .Values.global.imageRegistry | default \"docker.io\" }}/"
@@ -7563,9 +7527,8 @@ TEST(probe_helm_template_images_render_with_defaults) {
          .tried =
              "Preserved the original chart sources and all exact DEPLOYS rows; check independent "
              "expression spans, required literal controls and both production drivers."}};
-    if (!gpf_image_multisite_quality(files, 7,
-                                    "probe_helm_template_images_render_with_defaults",
-                                    want, expected, 3)) {
+    if (!gpf_image_multisite_quality(files, 7, "probe_helm_template_images_render_with_defaults",
+                                     want, expected, 3)) {
         FAIL("Helm template images rendered with the chart family's defaults");
     }
     PASS();
@@ -7636,7 +7599,9 @@ TEST(probe_helm_release_images) {
      * contracts; both drivers also require a raw Pod image and an ESM call. */
     const GpfImageExpected expected[] = {
         {.case_id = "probe_helm_release_images/image-1",
-         .row = "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 ref=image default_of=[\"image.repository\",\"image.tag\"]",
+         .row =
+             "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+             "ref=image default_of=[\"image.repository\",\"image.tag\"]",
          .repository = "ghcr.io/acme/app",
          .image = "ghcr.io/acme/app:1.0",
          .site = {.file = "charts/app/templates/deploy.yaml",
@@ -7651,7 +7616,9 @@ TEST(probe_helm_release_images) {
          .tried = "Kept the original sources and all chart/release DEPLOYS rows; the same "
                   "run requires a raw literal Pod image and an ESM call in both drivers."},
         {.case_id = "probe_helm_release_images/image-2",
-         .row = "Resource:Deployment/kapp -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 ref=image default_of=[\"image.repository\",\"image.tag\"]",
+         .row =
+             "Resource:Deployment/kapp -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+             "ref=image default_of=[\"image.repository\",\"image.tag\"]",
          .repository = "ghcr.io/acme/app",
          .image = "ghcr.io/acme/app:1.0",
          .site = {.file = "kz/charts/app/templates/deploy.yaml",
@@ -7673,21 +7640,19 @@ TEST(probe_helm_release_images) {
 }
 
 /* The chart every release test below deploys: an image from two values. */
-#define GPF_APP_CHART                                                                              \
-    {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},                      \
-        {"charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},    \
-    {                                                                                              \
-        "charts/app/templates/deploy.yaml",                                                        \
-            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"  \
-            "    spec:\n      containers:\n        - name: app\n"                                  \
-            "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"        \
-    }
+#define GPF_APP_CHART                                                                           \
+    {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},                   \
+        {"charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"}, \
+        {"charts/app/templates/deploy.yaml",                                                    \
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"  \
+         "    spec:\n      containers:\n        - name: app\n"                                  \
+         "          image: \"{{ .Values.image.repository }}:{{ .Values.image.tag }}\"\n"}
 
 /* The edges of the chart's defaults (every test below has them). */
-#define GPF_APP_DEFAULTS                                                                           \
-    "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "                     \
-    "default_of=[\"image.repository\",\"image.tag\"]\n"                                            \
-    "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "          \
+#define GPF_APP_DEFAULTS                                                                  \
+    "Chart:app -> Image:ghcr.io/acme/app DEPLOYS image=- via=chart ref=image "            \
+    "default_of=[\"image.repository\",\"image.tag\"]\n"                                   \
+    "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 " \
     "ref=image default_of=[\"image.repository\",\"image.tag\"]"
 
 /* A Terraform number set on a helm_release reaches the chart as the string
@@ -7724,9 +7689,8 @@ TEST(probe_helm_release_terraform_number_set) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_terraform_number_set",
-                           want, &expected, 1)) {
+    if (!gpf_image_quality(files, 4, "probe_helm_release_terraform_number_set", want, &expected,
+                           1)) {
         FAIL("a Terraform number set is its exact decimal");
     }
     PASS();
@@ -7771,9 +7735,8 @@ TEST(probe_helm_release_flux_unread_sources) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_flux_unread_sources",
-                           GPF_APP_DEFAULTS, &expected, 1)) {
+    if (!gpf_image_quality(files, 4, "probe_helm_release_flux_unread_sources", GPF_APP_DEFAULTS,
+                           &expected, 1)) {
         FAIL("a HelmRelease with a source not read has no image of its own");
     }
     PASS();
@@ -7813,8 +7776,7 @@ TEST(probe_helm_release_kustomize_unread_sources) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_kustomize_unread_sources",
+    if (!gpf_image_quality(files, 4, "probe_helm_release_kustomize_unread_sources",
                            GPF_APP_DEFAULTS, &expected, 1)) {
         FAIL("a helmCharts entry with a part not read has no image of its own");
     }
@@ -7849,9 +7811,8 @@ TEST(probe_helm_release_terraform_dynamic_set) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_terraform_dynamic_set",
-                           GPF_APP_DEFAULTS, &expected, 1)) {
+    if (!gpf_image_quality(files, 4, "probe_helm_release_terraform_dynamic_set", GPF_APP_DEFAULTS,
+                           &expected, 1)) {
         FAIL("a helm_release with a dynamic set has no image of its own");
     }
     PASS();
@@ -7875,7 +7836,8 @@ TEST(probe_helm_release_terraform_sensitive_and_postrender) {
          "    value = var.pw\n  }\n}\n"
          "resource \"helm_release\" \"post\" {\n  name  = \"post\"\n"
          "  chart = \"../charts/app\"\n  set {\n    name  = \"image.tag\"\n"
-         "    value = \"3.3\"\n  }\n  postrender {\n    binary_path = \"./kustomize.sh\"\n  }\n}\n"}};
+         "    value = \"3.3\"\n  }\n  postrender {\n    binary_path = \"./kustomize.sh\"\n  "
+         "}\n}\n"}};
     const GpfImageExpected expected = {
         .case_id = "probe_helm_release_terraform_sensitive_and_postrender/default-image",
         .row = "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
@@ -7894,8 +7856,7 @@ TEST(probe_helm_release_terraform_sensitive_and_postrender) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_terraform_sensitive_and_postrender",
+    if (!gpf_image_quality(files, 4, "probe_helm_release_terraform_sensitive_and_postrender",
                            GPF_APP_DEFAULTS, &expected, 1)) {
         FAIL("any set_sensitive and a postrender make release images unknown");
     }
@@ -7907,7 +7868,8 @@ TEST(probe_helm_release_terraform_sensitive_and_postrender) {
  * with the chart's default tag. */
 TEST(probe_helm_release_terraform_sensitive_read_earlier) {
     static const GpfFile files[] = {
-        {"charts/web/Chart.yaml", "apiVersion: v2\nname: web\nversion: 1.0.0\nappVersion: \"1.0\"\n"},
+        {"charts/web/Chart.yaml",
+         "apiVersion: v2\nname: web\nversion: 1.0.0\nappVersion: \"1.0\"\n"},
         {"charts/web/values.yaml", "image:\n  repository: ghcr.io/acme/web\n"},
         {"charts/web/templates/deploy.yaml",
          "{{- $tag := .Values.image.tag | default .Chart.AppVersion }}\n"
@@ -7942,9 +7904,8 @@ TEST(probe_helm_release_terraform_sensitive_read_earlier) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_terraform_sensitive_read_earlier",
-                           want, &expected, 1)) {
+    if (!gpf_image_quality(files, 4, "probe_helm_release_terraform_sensitive_read_earlier", want,
+                           &expected, 1)) {
         FAIL("a set_sensitive read on another line makes the release images unknown");
     }
     PASS();
@@ -7981,8 +7942,7 @@ TEST(probe_helm_release_terraform_postrender_forms) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_terraform_postrender_forms",
+    if (!gpf_image_quality(files, 4, "probe_helm_release_terraform_postrender_forms",
                            GPF_APP_DEFAULTS, &expected, 1)) {
         FAIL("a dynamic or attribute postrender makes release images unknown");
     }
@@ -8006,9 +7966,11 @@ TEST(probe_helm_checksum_include_by_base_path) {
         {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
                                   "  - name: redis\n    version: 1.0.0\n    alias: cache\n"},
         {"charts/app/values.yaml", "image:\n  repository: ghcr.io/acme/app\n  tag: \"1.0\"\n"},
-        {"charts/app/templates/cm.yaml", "{{- $_ := set .Values.image \"tag\" \"2.0\" }}\n"
-                                         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n"},
-        {"charts/app/templates/secret.yaml", "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\n"},
+        {"charts/app/templates/cm.yaml",
+         "{{- $_ := set .Values.image \"tag\" \"2.0\" }}\n"
+         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\n"},
+        {"charts/app/templates/secret.yaml",
+         "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app\n"},
         {"charts/app/templates/deploy.yaml",
          "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
          "    metadata:\n      annotations:\n        checksum/secret: "
@@ -8049,7 +8011,9 @@ TEST(probe_helm_checksum_include_by_base_path) {
      * Helm's template evaluation order; retain all three genuine obligations. */
     const GpfImageExpected expected[] = {
         {.case_id = "probe_helm_checksum_include_by_base_path/image-1",
-         .row = "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 ref=image default_of=[\"image.repository\",\"image.tag\"]",
+         .row =
+             "Resource:Deployment/app -> Image:ghcr.io/acme/app USAGE image=ghcr.io/acme/app:1.0 "
+             "ref=image default_of=[\"image.repository\",\"image.tag\"]",
          .repository = "ghcr.io/acme/app",
          .image = "ghcr.io/acme/app:1.0",
          .site = {.file = "charts/app/templates/deploy.yaml",
@@ -8064,7 +8028,9 @@ TEST(probe_helm_checksum_include_by_base_path) {
          .tried = "Kept the original sources and all chart/release DEPLOYS rows; the same "
                   "run requires a raw literal Pod image and an ESM call in both drivers."},
         {.case_id = "probe_helm_checksum_include_by_base_path/image-2",
-         .row = "Resource:StatefulSet/redis -> Image:ghcr.io/acme/redis USAGE image=ghcr.io/acme/redis:7.0 ref=image default_of=[\"image.repository\",\"image.tag\"]",
+         .row = "Resource:StatefulSet/redis -> Image:ghcr.io/acme/redis USAGE "
+                "image=ghcr.io/acme/redis:7.0 ref=image "
+                "default_of=[\"image.repository\",\"image.tag\"]",
          .repository = "ghcr.io/acme/redis",
          .image = "ghcr.io/acme/redis:7.0",
          .site = {.file = "charts/app/charts/redis/templates/sts.yaml",
@@ -8079,7 +8045,8 @@ TEST(probe_helm_checksum_include_by_base_path) {
          .tried = "Kept the original sources and all chart/release DEPLOYS rows; the same "
                   "run requires a raw literal Pod image and an ESM call in both drivers."},
         {.case_id = "probe_helm_checksum_include_by_base_path/image-3",
-         .row = "Resource:StatefulSet/redis -> Image:ghcr.io/app/charts/cache/templates USAGE image=ghcr.io/app/charts/cache/templates:1 ref=image",
+         .row = "Resource:StatefulSet/redis -> Image:ghcr.io/app/charts/cache/templates USAGE "
+                "image=ghcr.io/app/charts/cache/templates:1 ref=image",
          .repository = "ghcr.io/app/charts/cache/templates",
          .image = "ghcr.io/app/charts/cache/templates:1",
          .site = {.file = "charts/app/charts/redis/templates/sts.yaml",
@@ -8094,7 +8061,8 @@ TEST(probe_helm_checksum_include_by_base_path) {
          .tried = "Kept the original sources and all chart/release DEPLOYS rows; the same "
                   "run requires a raw literal Pod image and an ESM call in both drivers."},
     };
-    if (!gpf_image_quality(files, 9, "probe_helm_checksum_include_by_base_path", want, expected, 3)) {
+    if (!gpf_image_quality(files, 9, "probe_helm_checksum_include_by_base_path", want, expected,
+                           3)) {
         FAIL("a checksum include by .Template.BasePath names the chart's own file");
     }
     PASS();
@@ -8132,9 +8100,8 @@ TEST(probe_helm_release_kustomize_transformers) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 4,
-                           "probe_helm_release_kustomize_transformers",
-                           GPF_APP_DEFAULTS, &expected, 1)) {
+    if (!gpf_image_quality(files, 4, "probe_helm_release_kustomize_transformers", GPF_APP_DEFAULTS,
+                           &expected, 1)) {
         FAIL("a kustomization's own transformers make its release images unknown");
     }
     PASS();
@@ -8173,9 +8140,7 @@ TEST(probe_helm_empty_values_file_renders) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 3,
-                           "probe_helm_empty_values_file_renders",
-                           want, &expected, 1)) {
+    if (!gpf_image_quality(files, 3, "probe_helm_empty_values_file_renders", want, &expected, 1)) {
         FAIL("an empty values.yaml renders with {}");
     }
     PASS();
@@ -8219,9 +8184,8 @@ TEST(probe_helm_aliased_subchart_chart_name) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 5,
-                           "probe_helm_aliased_subchart_chart_name",
-                           want, &expected, 1)) {
+    if (!gpf_image_quality(files, 5, "probe_helm_aliased_subchart_chart_name", want, &expected,
+                           1)) {
         FAIL("an aliased subchart's .Chart.Name is the alias");
     }
     PASS();
@@ -8232,8 +8196,7 @@ TEST(probe_helm_aliased_subchart_chart_name) {
 TEST(probe_helm_list_path_mark_on_chart_edge) {
     static const GpfFile files[] = {
         {"charts/app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
-        {"charts/app/values.yaml",
-         "images:\n  - repository: ghcr.io/acme/app\n    tag: \"1.0\"\n"},
+        {"charts/app/values.yaml", "images:\n  - repository: ghcr.io/acme/app\n    tag: \"1.0\"\n"},
         {"charts/app/templates/deploy.yaml",
          "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  template:\n"
          "    spec:\n      containers:\n        - name: app\n"
@@ -8263,9 +8226,8 @@ TEST(probe_helm_list_path_mark_on_chart_edge) {
         .tried = "Kept every original fixture and exact chart/release DEPLOYS row, including "
                  "unread-values and postrenderer prohibitions. The same run requires a raw literal "
                  "Pod image and an ESM call in both drivers."};
-    if (!gpf_image_quality(files, 3,
-                           "probe_helm_list_path_mark_on_chart_edge",
-                           want, &expected, 1)) {
+    if (!gpf_image_quality(files, 3, "probe_helm_list_path_mark_on_chart_edge", want, &expected,
+                           1)) {
         FAIL("a list path's mark is kept whole on the chart edge");
     }
     PASS();
@@ -8590,9 +8552,8 @@ TEST(probe_docker_long_build_args_kept_whole) {
 TEST(probe_helm_include_resolves_in_the_chart_family) {
     static const GpfFile files[] = {
         {"app/Chart.yaml", "apiVersion: v2\nname: app\nversion: 0.1.0\n"},
-        {"app/templates/_helpers.tpl",
-         "{{- define \"app.fullname\" -}}app{{- end }}\n"
-         "{{- define \"app.labels\" -}}tier: web{{- end }}\n"},
+        {"app/templates/_helpers.tpl", "{{- define \"app.fullname\" -}}app{{- end }}\n"
+                                       "{{- define \"app.labels\" -}}tier: web{{- end }}\n"},
         {"app/templates/deployment.yaml",
          "{{- define \"web.resources\" }}\ncpu: 1\n{{- if .Values.big }}\nmemory: 2Gi\n{{- end }}\n"
          "{{- end }}\n---\n"
@@ -8833,12 +8794,12 @@ TEST(probe_k8s_cr_prefers_the_crd_in_its_bundle) {
 
 /* ── Bundles: a Service selects inside what is deployed together ───── */
 
-#define GPF_DEPLOY(name, label)                                                                  \
+#define GPF_DEPLOY(name, label)                                                                \
     "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: " name "\nspec:\n  template:\n" \
     "    metadata:\n      labels:\n        app: " label "\n"
-#define GPF_SVC(name, label)                                                                     \
-    "apiVersion: v1\nkind: Service\nmetadata:\n  name: " name "\nspec:\n  selector:\n    app: " \
-    label "\n"
+#define GPF_SVC(name, label)                                  \
+    "apiVersion: v1\nkind: Service\nmetadata:\n  name: " name \
+    "\nspec:\n  selector:\n    app: " label "\n"
 
 /* Two copies of one app in two directories (microservices-demo ships
  * kubernetes-manifests/, release/ and kustomize/base/; k8s.io one prow per
@@ -8889,29 +8850,28 @@ TEST(probe_k8s_kustomize_namespace_is_effective) {
 /* Flow-style label maps (`labels: { app: kdc }`, deckhouse's kerberos demo)
  * are label maps; a selector given that way selects just the same. */
 TEST(probe_k8s_selector_flow_mapping) {
-    GpfMetrics m = gpf_metrics("kdc.yaml",
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: kdc\n"
-        "spec:\n"
-        "  template:\n"
-        "    metadata:\n"
-        "      labels: { app: kdc, tier: \"auth\" }\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: Service\n"
-        "metadata:\n"
-        "  name: kdc\n"
-        "spec:\n"
-        "  selector: { app: kdc }\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: Service\n"
-        "metadata:\n"
-        "  name: other\n"
-        "spec:\n"
-        "  selector: {app: kdc, tier: web}\n");
+    GpfMetrics m = gpf_metrics("kdc.yaml", "apiVersion: apps/v1\n"
+                                           "kind: Deployment\n"
+                                           "metadata:\n"
+                                           "  name: kdc\n"
+                                           "spec:\n"
+                                           "  template:\n"
+                                           "    metadata:\n"
+                                           "      labels: { app: kdc, tier: \"auth\" }\n"
+                                           "---\n"
+                                           "apiVersion: v1\n"
+                                           "kind: Service\n"
+                                           "metadata:\n"
+                                           "  name: kdc\n"
+                                           "spec:\n"
+                                           "  selector: { app: kdc }\n"
+                                           "---\n"
+                                           "apiVersion: v1\n"
+                                           "kind: Service\n"
+                                           "metadata:\n"
+                                           "  name: other\n"
+                                           "spec:\n"
+                                           "  selector: {app: kdc, tier: web}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 3);
     ASSERT_EQ(m.infra_maps, 1); /* `other` needs tier=web, which kdc lacks */
@@ -8921,18 +8881,17 @@ TEST(probe_k8s_selector_flow_mapping) {
 /* An anchored name (`name: &name app`, onedr0p/home-ops reuses it in the
  * chart values) is still the object's name; so is a tagged one. */
 TEST(probe_k8s_anchored_and_tagged_names) {
-    GpfMetrics m = gpf_metrics("release.yaml",
-        "apiVersion: helm.toolkit.fluxcd.io/v2\n"
-        "kind: HelmRelease\n"
-        "metadata:\n"
-        "  name: &name actions-runner-controller\n"
-        "spec:\n"
-        "  releaseName: *name\n"
-        "---\n"
-        "apiVersion: v1\n"
-        "kind: ConfigMap\n"
-        "metadata:\n"
-        "  name: !!str settings\n");
+    GpfMetrics m = gpf_metrics("release.yaml", "apiVersion: helm.toolkit.fluxcd.io/v2\n"
+                                               "kind: HelmRelease\n"
+                                               "metadata:\n"
+                                               "  name: &name actions-runner-controller\n"
+                                               "spec:\n"
+                                               "  releaseName: *name\n"
+                                               "---\n"
+                                               "apiVersion: v1\n"
+                                               "kind: ConfigMap\n"
+                                               "metadata:\n"
+                                               "  name: !!str settings\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 2);
     PASS();
@@ -8940,18 +8899,17 @@ TEST(probe_k8s_anchored_and_tagged_names) {
 
 /* One name in two namespaces is two objects. */
 TEST(probe_k8s_same_name_two_namespaces) {
-    GpfMetrics m = gpf_metrics("app.yaml",
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: web\n"
-        "  namespace: staging\n"
-        "---\n"
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: web\n"
-        "  namespace: prod\n");
+    GpfMetrics m = gpf_metrics("app.yaml", "apiVersion: apps/v1\n"
+                                           "kind: Deployment\n"
+                                           "metadata:\n"
+                                           "  name: web\n"
+                                           "  namespace: staging\n"
+                                           "---\n"
+                                           "apiVersion: apps/v1\n"
+                                           "kind: Deployment\n"
+                                           "metadata:\n"
+                                           "  name: web\n"
+                                           "  namespace: prod\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 2);
     PASS();
@@ -8961,11 +8919,10 @@ TEST(probe_k8s_same_name_two_namespaces) {
  * file; `obj_key` is the logical identity (effective namespace, `?` when the
  * deploy decides it). */
 TEST(probe_k8s_identity_key) {
-    static const GpfFile files[] = {{"app.yaml",
-                                     "apiVersion: apps/v1\n"
-                                     "kind: Deployment\n"
-                                     "metadata:\n"
-                                     "  name: web\n"}};
+    static const GpfFile files[] = {{"app.yaml", "apiVersion: apps/v1\n"
+                                                 "kind: Deployment\n"
+                                                 "metadata:\n"
+                                                 "  name: web\n"}};
     char qn[256];
     char props[512];
     ASSERT_TRUE(gpf_resource(files, 1, "Deployment/web", qn, sizeof(qn), props, sizeof(props)));
@@ -8979,17 +8936,15 @@ TEST(probe_k8s_identity_key) {
 /* Core-group objects say `core`; a declared namespace is part of the QN; a
  * cluster-scoped kind's logical key has no namespace (`_`). */
 TEST(probe_k8s_identity_core_namespaced_and_cluster_scoped) {
-    static const GpfFile svc[] = {{"svc.yaml",
-                                   "apiVersion: v1\n"
-                                   "kind: Service\n"
-                                   "metadata:\n"
-                                   "  name: web\n"
-                                   "  namespace: prod\n"}};
-    static const GpfFile ns[] = {{"ns.yaml",
-                                  "apiVersion: v1\n"
-                                  "kind: Namespace\n"
-                                  "metadata:\n"
-                                  "  name: prod\n"}};
+    static const GpfFile svc[] = {{"svc.yaml", "apiVersion: v1\n"
+                                               "kind: Service\n"
+                                               "metadata:\n"
+                                               "  name: web\n"
+                                               "  namespace: prod\n"}};
+    static const GpfFile ns[] = {{"ns.yaml", "apiVersion: v1\n"
+                                             "kind: Namespace\n"
+                                             "metadata:\n"
+                                             "  name: prod\n"}};
     char qn[256];
     char props[512];
     ASSERT_TRUE(gpf_resource(svc, 1, "Service/web", qn, sizeof(qn), props, sizeof(props)));
@@ -9012,12 +8967,10 @@ TEST(probe_kustomize_imports_after_leading_comment) {
          "kind: Kustomization\n"
          "resources:\n"
          "  - namespace.yaml\n"},
-        {"namespace.yaml",
-         "apiVersion: v1\n"
-         "kind: Namespace\n"
-         "metadata:\n"
-         "  name: network\n"}
-    };
+        {"namespace.yaml", "apiVersion: v1\n"
+                           "kind: Namespace\n"
+                           "metadata:\n"
+                           "  name: network\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.imports >= 1);
@@ -9028,25 +8981,21 @@ TEST(probe_kustomize_imports_after_leading_comment) {
  * kubernetes/apps: `# - argocd.yaml ...`) is a comment ahead of the list;
  * the entries below it are still the list. */
 TEST(probe_kustomize_entries_after_commented_out_entry) {
-    static const GpfFile files[] = {
-        {"kustomization.yaml",
-         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-         "kind: Kustomization\n"
-         "resources:\n"
-         "  # - argocd.yaml applied by hand\n"
-         "  - atlantis.yaml\n"
-         "  - datadog.yaml\n"},
-        {"atlantis.yaml",
-         "apiVersion: v1\n"
-         "kind: Namespace\n"
-         "metadata:\n"
-         "  name: atlantis\n"},
-        {"datadog.yaml",
-         "apiVersion: v1\n"
-         "kind: Namespace\n"
-         "metadata:\n"
-         "  name: datadog\n"}
-    };
+    static const GpfFile files[] = {{"kustomization.yaml",
+                                     "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                     "kind: Kustomization\n"
+                                     "resources:\n"
+                                     "  # - argocd.yaml applied by hand\n"
+                                     "  - atlantis.yaml\n"
+                                     "  - datadog.yaml\n"},
+                                    {"atlantis.yaml", "apiVersion: v1\n"
+                                                      "kind: Namespace\n"
+                                                      "metadata:\n"
+                                                      "  name: atlantis\n"},
+                                    {"datadog.yaml", "apiVersion: v1\n"
+                                                     "kind: Namespace\n"
+                                                     "metadata:\n"
+                                                     "  name: datadog\n"}};
     GpfMetrics m = gpf_metrics_files(files, 3);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.imports, 2);
@@ -9055,18 +9004,15 @@ TEST(probe_kustomize_entries_after_commented_out_entry) {
 
 /* Same with the comment trailing the key line. */
 TEST(probe_kustomize_entries_after_key_line_comment) {
-    static const GpfFile files[] = {
-        {"kustomization.yaml",
-         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-         "kind: Kustomization\n"
-         "resources: # applied by Argo CD\n"
-         "  - atlantis.yaml\n"},
-        {"atlantis.yaml",
-         "apiVersion: v1\n"
-         "kind: Namespace\n"
-         "metadata:\n"
-         "  name: atlantis\n"}
-    };
+    static const GpfFile files[] = {{"kustomization.yaml",
+                                     "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                     "kind: Kustomization\n"
+                                     "resources: # applied by Argo CD\n"
+                                     "  - atlantis.yaml\n"},
+                                    {"atlantis.yaml", "apiVersion: v1\n"
+                                                      "kind: Namespace\n"
+                                                      "metadata:\n"
+                                                      "  name: atlantis\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.imports, 1);
@@ -9076,18 +9022,15 @@ TEST(probe_kustomize_entries_after_key_line_comment) {
 /* kustomize also reads an extensionless file named `Kustomization`
  * (kubermatic's addons use it); it was never discovered as a kustomization. */
 TEST(probe_kustomize_extensionless_file) {
-    static const GpfFile files[] = {
-        {"Kustomization",
-         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-         "kind: Kustomization\n"
-         "resources:\n"
-         "  - namespace.yaml\n"},
-        {"namespace.yaml",
-         "apiVersion: v1\n"
-         "kind: Namespace\n"
-         "metadata:\n"
-         "  name: addons\n"}
-    };
+    static const GpfFile files[] = {{"Kustomization",
+                                     "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                     "kind: Kustomization\n"
+                                     "resources:\n"
+                                     "  - namespace.yaml\n"},
+                                    {"namespace.yaml", "apiVersion: v1\n"
+                                                       "kind: Namespace\n"
+                                                       "metadata:\n"
+                                                       "  name: addons\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.modules >= 1);
@@ -9100,15 +9043,14 @@ TEST(probe_kustomize_extensionless_file) {
  * manifest (deckhouse: `kind` 1,358, `apiVersion` 1,347, `metadata` 1,336)
  * and fed name-similarity config links. */
 TEST(probe_k8s_manifest_mints_no_envelope_variables) {
-    GpfMetrics m = gpf_metrics("deploy.yaml",
-        "# a manifest\n"
-        "apiVersion: apps/v1\n"
-        "kind: Deployment\n"
-        "metadata:\n"
-        "  name: web\n"
-        "spec:\n"
-        "  replicas: 2\n"
-        "status: {}\n");
+    GpfMetrics m = gpf_metrics("deploy.yaml", "# a manifest\n"
+                                              "apiVersion: apps/v1\n"
+                                              "kind: Deployment\n"
+                                              "metadata:\n"
+                                              "  name: web\n"
+                                              "spec:\n"
+                                              "  replicas: 2\n"
+                                              "status: {}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.resources, 1);
     ASSERT_EQ(m.variables, 0);
@@ -9117,11 +9059,10 @@ TEST(probe_k8s_manifest_mints_no_envelope_variables) {
 
 /* A plain config YAML keeps its top-level keys as Variables. */
 TEST(probe_yaml_config_keeps_variables) {
-    GpfMetrics m = gpf_metrics("config.yaml",
-        "server:\n"
-        "  port: 8080\n"
-        "kind: production\n"
-        "replicas: 3\n");
+    GpfMetrics m = gpf_metrics("config.yaml", "server:\n"
+                                              "  port: 8080\n"
+                                              "kind: production\n"
+                                              "replicas: 3\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.variables >= 3);
     PASS();
@@ -9131,21 +9072,17 @@ TEST(probe_yaml_config_keeps_variables) {
  * not a published one: `app` depends on the local `common`, and no external
  * Chart node stands in for it. `common` is read after `app`. */
 TEST(probe_helm_file_dependency_links_local_chart) {
-    static const GpfFile files[] = {
-        {"charts/app/Chart.yaml",
-         "apiVersion: v2\n"
-         "name: app\n"
-         "version: 1.0.0\n"
-         "dependencies:\n"
-         "  - name: common\n"
-         "    repository: file://../common\n"
-         "    version: 1.x\n"},
-        {"charts/common/Chart.yaml",
-         "apiVersion: v2\n"
-         "name: common\n"
-         "type: library\n"
-         "version: 1.2.0\n"}
-    };
+    static const GpfFile files[] = {{"charts/app/Chart.yaml", "apiVersion: v2\n"
+                                                              "name: app\n"
+                                                              "version: 1.0.0\n"
+                                                              "dependencies:\n"
+                                                              "  - name: common\n"
+                                                              "    repository: file://../common\n"
+                                                              "    version: 1.x\n"},
+                                    {"charts/common/Chart.yaml", "apiVersion: v2\n"
+                                                                 "name: common\n"
+                                                                 "type: library\n"
+                                                                 "version: 1.2.0\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.charts, 2);
@@ -9164,8 +9101,7 @@ TEST(probe_helm_unresolved_file_dependency_stays_external) {
          "version: 1.0.0\n"
          "dependencies:\n"
          "  - name: constraint-templates\n"
-         "    repository: \"file:///deckhouse/modules/policy/charts/constraint_templates\"\n"}
-    };
+         "    repository: \"file:///deckhouse/modules/policy/charts/constraint_templates\"\n"}};
     GpfMetrics m = gpf_metrics_files(files, 1);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.charts, 2);
@@ -9306,19 +9242,16 @@ TEST(probe_kustomize_remote_base_names_no_symbol) {
          "kind: Kustomization\n"
          "resources:\n"
          "  - https://github.com/example/csi-driver.git/deploy/kubernetes/base\n"},
-        {"hack/deploy.sh",
-         "#!/usr/bin/env bash\n"
-         "deploy() {\n"
-         "  echo deploying\n"
-         "}\n"},
+        {"hack/deploy.sh", "#!/usr/bin/env bash\n"
+                           "deploy() {\n"
+                           "  echo deploying\n"
+                           "}\n"},
         /* Same name as the URL's last segment: the sibling lookup's basename
          * candidate must not bind a remote base to it either. */
-        {"base.yaml",
-         "apiVersion: v1\n"
-         "kind: ConfigMap\n"
-         "metadata:\n"
-         "  name: local\n"}
-    };
+        {"base.yaml", "apiVersion: v1\n"
+                      "kind: ConfigMap\n"
+                      "metadata:\n"
+                      "  name: local\n"}};
     GpfMetrics m = gpf_metrics_files(files, 3);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.imports, 0);
@@ -9329,11 +9262,10 @@ TEST(probe_kustomize_remote_base_names_no_symbol) {
  * the file's own Module: its import lookup took entries as repo-root paths
  * and resolved none of them in any of 17 infra repositories. */
 TEST(probe_kustomize_single_module) {
-    GpfMetrics m = gpf_metrics("kustomization.yaml",
-        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-        "kind: Kustomization\n"
-        "resources:\n"
-        "  - deploy.yaml\n");
+    GpfMetrics m = gpf_metrics("kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                                     "kind: Kustomization\n"
+                                                     "resources:\n"
+                                                     "  - deploy.yaml\n");
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.modules, 1);
     PASS();
@@ -9343,23 +9275,19 @@ TEST(probe_kustomize_single_module) {
  * overlay they resolve through the sibling lookup, not the repo root. */
 TEST(probe_kustomize_nested_sibling_entries) {
     static const GpfFile files[] = {
-        {"apps/base/podinfo/kustomization.yaml",
-         "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-         "kind: Kustomization\n"
-         "resources:\n"
-         "  - namespace.yaml\n"
-         "  - release.yaml\n"},
-        {"apps/base/podinfo/namespace.yaml",
-         "apiVersion: v1\n"
-         "kind: Namespace\n"
-         "metadata:\n"
-         "  name: podinfo\n"},
-        {"apps/base/podinfo/release.yaml",
-         "apiVersion: helm.toolkit.fluxcd.io/v2\n"
-         "kind: HelmRelease\n"
-         "metadata:\n"
-         "  name: podinfo\n"}
-    };
+        {"apps/base/podinfo/kustomization.yaml", "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                                                 "kind: Kustomization\n"
+                                                 "resources:\n"
+                                                 "  - namespace.yaml\n"
+                                                 "  - release.yaml\n"},
+        {"apps/base/podinfo/namespace.yaml", "apiVersion: v1\n"
+                                             "kind: Namespace\n"
+                                             "metadata:\n"
+                                             "  name: podinfo\n"},
+        {"apps/base/podinfo/release.yaml", "apiVersion: helm.toolkit.fluxcd.io/v2\n"
+                                           "kind: HelmRelease\n"
+                                           "metadata:\n"
+                                           "  name: podinfo\n"}};
     GpfMetrics m = gpf_metrics_files(files, 3);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.imports, 2);
@@ -9370,27 +9298,23 @@ TEST(probe_kustomize_nested_sibling_entries) {
  * had no selector and linked to nothing. The workload's name differs from the
  * selector value, so only the pod-template label can match. */
 TEST(probe_k8s_selector_after_leading_separator) {
-    static const GpfFile files[] = {
-        {"service.yaml",
-         "---\n"
-         "apiVersion: v1\n"
-         "kind: Service\n"
-         "metadata:\n"
-         "  name: web\n"
-         "spec:\n"
-         "  selector:\n"
-         "    app: web-pods\n"},
-        {"deploy.yaml",
-         "apiVersion: apps/v1\n"
-         "kind: Deployment\n"
-         "metadata:\n"
-         "  name: web-deploy\n"
-         "spec:\n"
-         "  template:\n"
-         "    metadata:\n"
-         "      labels:\n"
-         "        app: web-pods\n"}
-    };
+    static const GpfFile files[] = {{"service.yaml", "---\n"
+                                                     "apiVersion: v1\n"
+                                                     "kind: Service\n"
+                                                     "metadata:\n"
+                                                     "  name: web\n"
+                                                     "spec:\n"
+                                                     "  selector:\n"
+                                                     "    app: web-pods\n"},
+                                    {"deploy.yaml", "apiVersion: apps/v1\n"
+                                                    "kind: Deployment\n"
+                                                    "metadata:\n"
+                                                    "  name: web-deploy\n"
+                                                    "spec:\n"
+                                                    "  template:\n"
+                                                    "    metadata:\n"
+                                                    "      labels:\n"
+                                                    "        app: web-pods\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_EQ(m.infra_maps, 1);
@@ -9409,17 +9333,16 @@ TEST(probe_k8s_selector_after_leading_separator) {
 
 /* Nix: attribute set with derivation-like attrs → at least 1 node. */
 TEST(probe_nix_attrset_node) {
-    GpfMetrics m = gpf_metrics("default.nix",
-        "{ pkgs ? import <nixpkgs> {} }:\n"
-        "\n"
-        "pkgs.stdenv.mkDerivation {\n"
-        "  pname = \"mypackage\";\n"
-        "  version = \"1.0.0\";\n"
-        "  src = ./src;\n"
-        "  buildInputs = [ pkgs.gcc pkgs.make ];\n"
-        "  buildPhase = \"make\";\n"
-        "  installPhase = \"make install\";\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("default.nix", "{ pkgs ? import <nixpkgs> {} }:\n"
+                                              "\n"
+                                              "pkgs.stdenv.mkDerivation {\n"
+                                              "  pname = \"mypackage\";\n"
+                                              "  version = \"1.0.0\";\n"
+                                              "  src = ./src;\n"
+                                              "  buildInputs = [ pkgs.gcc pkgs.make ];\n"
+                                              "  buildPhase = \"make\";\n"
+                                              "  installPhase = \"make install\";\n"
+                                              "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty Nix file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9429,14 +9352,13 @@ TEST(probe_nix_attrset_node) {
 
 /* Nix: let-binding expression — multiple top-level attrs. */
 TEST(probe_nix_let_binding) {
-    GpfMetrics m = gpf_metrics("lib.nix",
-        "let\n"
-        "  double = x: x * 2;\n"
-        "  square = x: x * x;\n"
-        "  cube   = x: x * x * x;\n"
-        "in {\n"
-        "  inherit double square cube;\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("lib.nix", "let\n"
+                                          "  double = x: x * 2;\n"
+                                          "  square = x: x * x;\n"
+                                          "  cube   = x: x * x * x;\n"
+                                          "in {\n"
+                                          "  inherit double square cube;\n"
+                                          "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: file-level Module node created. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9446,13 +9368,9 @@ TEST(probe_nix_let_binding) {
 /* Nix: `import` in two-file fixture → IMPORTS edge.
  * RED: Nix import expressions are not resolved into IMPORTS graph edges. */
 TEST(probe_nix_import_edge) {
-    static const GpfFile files[] = {
-        {"utils.nix",
-         "{ double = x: x * 2; }\n"},
-        {"default.nix",
-         "let utils = import ./utils.nix;\n"
-         "in { result = utils.double 21; }\n"}
-    };
+    static const GpfFile files[] = {{"utils.nix", "{ double = x: x * 2; }\n"},
+                                    {"default.nix", "let utils = import ./utils.nix;\n"
+                                                    "in { result = utils.double 21; }\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: Nix `import` not resolved into IMPORTS edges by the grammar-only pipeline. */
@@ -9471,17 +9389,16 @@ TEST(probe_nix_import_edge) {
 
 /* Nickel: record literal → Module node (no crash). */
 TEST(probe_nickel_record_node) {
-    GpfMetrics m = gpf_metrics("config.ncl",
-        "{\n"
-        "  server = {\n"
-        "    host = \"localhost\",\n"
-        "    port = 8080,\n"
-        "  },\n"
-        "  database = {\n"
-        "    name = \"mydb\",\n"
-        "    max_connections = 10,\n"
-        "  },\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("config.ncl", "{\n"
+                                             "  server = {\n"
+                                             "    host = \"localhost\",\n"
+                                             "    port = 8080,\n"
+                                             "  },\n"
+                                             "  database = {\n"
+                                             "    name = \"mydb\",\n"
+                                             "    max_connections = 10,\n"
+                                             "  },\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty Nickel file produces a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9491,10 +9408,9 @@ TEST(probe_nickel_record_node) {
 
 /* Nickel: let-binding with function value. */
 TEST(probe_nickel_let_fn) {
-    GpfMetrics m = gpf_metrics("lib.ncl",
-        "let double = fun x => x * 2 in\n"
-        "let square = fun x => x * x in\n"
-        "{ double, square }\n");
+    GpfMetrics m = gpf_metrics("lib.ncl", "let double = fun x => x * 2 in\n"
+                                          "let square = fun x => x * x in\n"
+                                          "{ double, square }\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: file-level Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9504,12 +9420,9 @@ TEST(probe_nickel_let_fn) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_nickel_import_edge) {
-    static const GpfFile files[] = {
-        {"utils.ncl", "{ double = fun x => x * 2 }\n"},
-        {"main.ncl",
-         "let utils = import \"utils.ncl\" in\n"
-         "{ result = utils.double 21 }\n"}
-    };
+    static const GpfFile files[] = {{"utils.ncl", "{ double = fun x => x * 2 }\n"},
+                                    {"main.ncl", "let utils = import \"utils.ncl\" in\n"
+                                                 "{ result = utils.double 21 }\n"}};
 
     const RQ_Source sources[] = {
         {.path = "utils.ncl", .text = files[0].content},
@@ -9552,11 +9465,10 @@ TEST(probe_nickel_import_edge) {
 
 /* Pkl: property assignments → Module node. */
 TEST(probe_pkl_properties_node) {
-    GpfMetrics m = gpf_metrics("config.pkl",
-        "host = \"localhost\"\n"
-        "port = 8080\n"
-        "debug = false\n"
-        "maxConnections = 10\n");
+    GpfMetrics m = gpf_metrics("config.pkl", "host = \"localhost\"\n"
+                                             "port = 8080\n"
+                                             "debug = false\n"
+                                             "maxConnections = 10\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty Pkl file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9566,15 +9478,14 @@ TEST(probe_pkl_properties_node) {
 
 /* Pkl: class-like object definition. */
 TEST(probe_pkl_object_block) {
-    GpfMetrics m = gpf_metrics("server.pkl",
-        "server {\n"
-        "  host = \"0.0.0.0\"\n"
-        "  port = 443\n"
-        "  tls {\n"
-        "    enabled = true\n"
-        "    cert = \"/etc/ssl/cert.pem\"\n"
-        "  }\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("server.pkl", "server {\n"
+                                             "  host = \"0.0.0.0\"\n"
+                                             "  port = 443\n"
+                                             "  tls {\n"
+                                             "    enabled = true\n"
+                                             "    cert = \"/etc/ssl/cert.pem\"\n"
+                                             "  }\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9584,15 +9495,11 @@ TEST(probe_pkl_object_block) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_pkl_import_edge) {
-    static const GpfFile files[] = {
-        {"base.pkl",
-         "host = \"localhost\"\n"
-         "port = 8080\n"},
-        {"prod.pkl",
-         "amends \"base.pkl\"\n"
-         "\n"
-         "port = 443\n"}
-    };
+    static const GpfFile files[] = {{"base.pkl", "host = \"localhost\"\n"
+                                                 "port = 8080\n"},
+                                    {"prod.pkl", "amends \"base.pkl\"\n"
+                                                 "\n"
+                                                 "port = 443\n"}};
 
     const RQ_Source sources[] = {
         {.path = "base.pkl", .text = files[0].content},
@@ -9633,13 +9540,12 @@ TEST(probe_pkl_import_edge) {
 
 /* RON: struct-like record → Module node. */
 TEST(probe_ron_record_node) {
-    GpfMetrics m = gpf_metrics("config.ron",
-        "(\n"
-        "  host: \"localhost\",\n"
-        "  port: 8080,\n"
-        "  debug: false,\n"
-        "  tags: [\"api\", \"v2\"],\n"
-        ")\n");
+    GpfMetrics m = gpf_metrics("config.ron", "(\n"
+                                             "  host: \"localhost\",\n"
+                                             "  port: 8080,\n"
+                                             "  debug: false,\n"
+                                             "  tags: [\"api\", \"v2\"],\n"
+                                             ")\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: RON file produces at least 1 node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9649,13 +9555,12 @@ TEST(probe_ron_record_node) {
 
 /* RON: named struct. */
 TEST(probe_ron_named_struct) {
-    GpfMetrics m = gpf_metrics("scene.ron",
-        "Scene(\n"
-        "  entities: [\n"
-        "    Entity(id: 1, name: \"player\"),\n"
-        "    Entity(id: 2, name: \"enemy\"),\n"
-        "  ],\n"
-        ")\n");
+    GpfMetrics m = gpf_metrics("scene.ron", "Scene(\n"
+                                            "  entities: [\n"
+                                            "    Entity(id: 1, name: \"player\"),\n"
+                                            "    Entity(id: 2, name: \"enemy\"),\n"
+                                            "  ],\n"
+                                            ")\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node for the RON file. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9664,11 +9569,10 @@ TEST(probe_ron_named_struct) {
 
 /* RON: no import mechanism → 0 IMPORTS edges expected. */
 TEST(probe_ron_no_imports) {
-    GpfMetrics m = gpf_metrics("data.ron",
-        "[\n"
-        "  (key: \"a\", value: 1),\n"
-        "  (key: \"b\", value: 2),\n"
-        "]\n");
+    GpfMetrics m = gpf_metrics("data.ron", "[\n"
+                                           "  (key: \"a\", value: 1),\n"
+                                           "  (key: \"b\", value: 2),\n"
+                                           "]\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: RON has no import syntax; pipeline emits 0 IMPORTS edges. */
     ASSERT_TRUE(m.imports == 0);
@@ -9685,13 +9589,12 @@ TEST(probe_ron_no_imports) {
 
 /* Jsonnet: object literal → Module node. */
 TEST(probe_jsonnet_object_node) {
-    GpfMetrics m = gpf_metrics("config.jsonnet",
-        "{\n"
-        "  local env = \"prod\",\n"
-        "  host: \"api.example.com\",\n"
-        "  port: 443,\n"
-        "  debug: env == \"dev\",\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("config.jsonnet", "{\n"
+                                                 "  local env = \"prod\",\n"
+                                                 "  host: \"api.example.com\",\n"
+                                                 "  port: 443,\n"
+                                                 "  debug: env == \"dev\",\n"
+                                                 "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty Jsonnet file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9701,12 +9604,11 @@ TEST(probe_jsonnet_object_node) {
 
 /* Jsonnet: function definition in object. */
 TEST(probe_jsonnet_function_in_object) {
-    GpfMetrics m = gpf_metrics("lib.jsonnet",
-        "{\n"
-        "  double(x):: x * 2,\n"
-        "  square(x):: x * x,\n"
-        "  greet(name):: \"Hello, \" + name,\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("lib.jsonnet", "{\n"
+                                              "  double(x):: x * 2,\n"
+                                              "  square(x):: x * x,\n"
+                                              "  greet(name):: \"Hello, \" + name,\n"
+                                              "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9716,17 +9618,13 @@ TEST(probe_jsonnet_function_in_object) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_jsonnet_import_edge) {
-    static const GpfFile files[] = {
-        {"utils.libsonnet",
-         "{\n"
-         "  double(x):: x * 2,\n"
-         "}\n"},
-        {"main.jsonnet",
-         "local utils = import 'utils.libsonnet';\n"
-         "{\n"
-         "  result: utils.double(21),\n"
-         "}\n"}
-    };
+    static const GpfFile files[] = {{"utils.libsonnet", "{\n"
+                                                        "  double(x):: x * 2,\n"
+                                                        "}\n"},
+                                    {"main.jsonnet", "local utils = import 'utils.libsonnet';\n"
+                                                     "{\n"
+                                                     "  result: utils.double(21),\n"
+                                                     "}\n"}};
 
     const RQ_Source sources[] = {
         {.path = "utils.libsonnet", .text = files[0].content},
@@ -9766,17 +9664,16 @@ TEST(probe_jsonnet_import_edge) {
 
 /* KDL: node with children → Module node. */
 TEST(probe_kdl_node_block) {
-    GpfMetrics m = gpf_metrics("config.kdl",
-        "server {\n"
-        "  host \"localhost\"\n"
-        "  port 8080\n"
-        "}\n"
-        "\n"
-        "database {\n"
-        "  host \"db.internal\"\n"
-        "  port 5432\n"
-        "  name \"mydb\"\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("config.kdl", "server {\n"
+                                             "  host \"localhost\"\n"
+                                             "  port 8080\n"
+                                             "}\n"
+                                             "\n"
+                                             "database {\n"
+                                             "  host \"db.internal\"\n"
+                                             "  port 5432\n"
+                                             "  name \"mydb\"\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: KDL file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9786,10 +9683,10 @@ TEST(probe_kdl_node_block) {
 
 /* KDL: flat node list (key-value style). */
 TEST(probe_kdl_flat_nodes) {
-    GpfMetrics m = gpf_metrics("manifest.kdl",
-        "package \"my-package\" version=\"1.0.0\"\n"
-        "description \"A test package\"\n"
-        "author \"Test Author\" email=\"test@example.com\"\n");
+    GpfMetrics m =
+        gpf_metrics("manifest.kdl", "package \"my-package\" version=\"1.0.0\"\n"
+                                    "description \"A test package\"\n"
+                                    "author \"Test Author\" email=\"test@example.com\"\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9798,11 +9695,10 @@ TEST(probe_kdl_flat_nodes) {
 
 /* KDL: no import mechanism → 0 IMPORTS edges. */
 TEST(probe_kdl_no_imports) {
-    GpfMetrics m = gpf_metrics("data.kdl",
-        "items {\n"
-        "  item id=1 name=\"alpha\"\n"
-        "  item id=2 name=\"beta\"\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("data.kdl", "items {\n"
+                                           "  item id=1 name=\"alpha\"\n"
+                                           "  item id=2 name=\"beta\"\n"
+                                           "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: KDL has no import syntax; 0 IMPORTS edges expected. */
     ASSERT_TRUE(m.imports == 0);
@@ -9819,21 +9715,20 @@ TEST(probe_kdl_no_imports) {
 
 /* Hyprlang: section block → Module node. */
 TEST(probe_hyprlang_section_node) {
-    GpfMetrics m = gpf_metrics("hyprland.conf",
-        "general {\n"
-        "  gaps_in = 5\n"
-        "  gaps_out = 10\n"
-        "  border_size = 2\n"
-        "  col.active_border = rgba(33ccffee)\n"
-        "}\n"
-        "\n"
-        "decoration {\n"
-        "  rounding = 10\n"
-        "  blur {\n"
-        "    enabled = true\n"
-        "    size = 3\n"
-        "  }\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("hyprland.conf", "general {\n"
+                                                "  gaps_in = 5\n"
+                                                "  gaps_out = 10\n"
+                                                "  border_size = 2\n"
+                                                "  col.active_border = rgba(33ccffee)\n"
+                                                "}\n"
+                                                "\n"
+                                                "decoration {\n"
+                                                "  rounding = 10\n"
+                                                "  blur {\n"
+                                                "    enabled = true\n"
+                                                "    size = 3\n"
+                                                "  }\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty Hyprlang file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9843,11 +9738,10 @@ TEST(probe_hyprlang_section_node) {
 
 /* Hyprlang: keybind and monitor directives. */
 TEST(probe_hyprlang_directives) {
-    GpfMetrics m = gpf_metrics("binds.hl",
-        "bind = $mainMod, Q, killactive\n"
-        "bind = $mainMod, M, exit\n"
-        "bind = $mainMod, F, fullscreen\n"
-        "monitor = DP-1, 1920x1080@144, 0x0, 1\n");
+    GpfMetrics m = gpf_metrics("binds.hl", "bind = $mainMod, Q, killactive\n"
+                                           "bind = $mainMod, M, exit\n"
+                                           "bind = $mainMod, F, fullscreen\n"
+                                           "monitor = DP-1, 1920x1080@144, 0x0, 1\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node for any non-empty .hl file. */
     ASSERT_TRUE(m.modules >= 1);
@@ -9856,17 +9750,13 @@ TEST(probe_hyprlang_directives) {
 
 /* Hyprlang: HOME-qualified source must not bind to a repository basename. */
 TEST(probe_hyprlang_source_import_edge) {
-    static const GpfFile files[] = {
-        {"colors.conf",
-         "col.active_border = rgba(33ccffee)\n"
-         "col.inactive_border = rgba(595959aa)\n"},
-        {"hyprland.conf",
-         "source = ~/.config/hypr/colors.conf\n"
-         "\n"
-         "general {\n"
-         "  gaps_in = 5\n"
-         "}\n"}
-    };
+    static const GpfFile files[] = {{"colors.conf", "col.active_border = rgba(33ccffee)\n"
+                                                    "col.inactive_border = rgba(595959aa)\n"},
+                                    {"hyprland.conf", "source = ~/.config/hypr/colors.conf\n"
+                                                      "\n"
+                                                      "general {\n"
+                                                      "  gaps_in = 5\n"
+                                                      "}\n"}};
 
     const RQ_Source sources[] = {
         {.path = "colors.conf", .text = files[0].content},
@@ -9905,15 +9795,14 @@ TEST(probe_hyprlang_source_import_edge) {
 
 /* DeviceTree: minimal DTS with root node → Module node. */
 TEST(probe_devicetree_root_node) {
-    GpfMetrics m = gpf_metrics("board.dts",
-        "/dts-v1/;\n"
-        "\n"
-        "/ {\n"
-        "  compatible = \"vendor,board\";\n"
-        "  model = \"Vendor Board v1\";\n"
-        "  #address-cells = <1>;\n"
-        "  #size-cells = <1>;\n"
-        "};\n");
+    GpfMetrics m = gpf_metrics("board.dts", "/dts-v1/;\n"
+                                            "\n"
+                                            "/ {\n"
+                                            "  compatible = \"vendor,board\";\n"
+                                            "  model = \"Vendor Board v1\";\n"
+                                            "  #address-cells = <1>;\n"
+                                            "  #size-cells = <1>;\n"
+                                            "};\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty DTS file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -9923,26 +9812,25 @@ TEST(probe_devicetree_root_node) {
 
 /* DeviceTree: named child nodes (cpu, memory). */
 TEST(probe_devicetree_child_nodes) {
-    GpfMetrics m = gpf_metrics("soc.dts",
-        "/dts-v1/;\n"
-        "\n"
-        "/ {\n"
-        "  cpus {\n"
-        "    #address-cells = <1>;\n"
-        "    #size-cells = <0>;\n"
-        "    cpu@0 {\n"
-        "      compatible = \"arm,cortex-a53\";\n"
-        "      reg = <0>;\n"
-        "    };\n"
-        "    cpu@1 {\n"
-        "      compatible = \"arm,cortex-a53\";\n"
-        "      reg = <1>;\n"
-        "    };\n"
-        "  };\n"
-        "  memory@80000000 {\n"
-        "    reg = <0x80000000 0x40000000>;\n"
-        "  };\n"
-        "};\n");
+    GpfMetrics m = gpf_metrics("soc.dts", "/dts-v1/;\n"
+                                          "\n"
+                                          "/ {\n"
+                                          "  cpus {\n"
+                                          "    #address-cells = <1>;\n"
+                                          "    #size-cells = <0>;\n"
+                                          "    cpu@0 {\n"
+                                          "      compatible = \"arm,cortex-a53\";\n"
+                                          "      reg = <0>;\n"
+                                          "    };\n"
+                                          "    cpu@1 {\n"
+                                          "      compatible = \"arm,cortex-a53\";\n"
+                                          "      reg = <1>;\n"
+                                          "    };\n"
+                                          "  };\n"
+                                          "  memory@80000000 {\n"
+                                          "    reg = <0x80000000 0x40000000>;\n"
+                                          "  };\n"
+                                          "};\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node (child nodes not individually extracted in grammar-only path). */
     ASSERT_TRUE(m.modules >= 1);
@@ -9952,22 +9840,18 @@ TEST(probe_devicetree_child_nodes) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_devicetree_include_edge) {
-    static const GpfFile files[] = {
-        {"soc.dtsi",
-         "/dts-v1/;\n"
-         "/ {\n"
-         "  soc: soc {\n"
-         "    compatible = \"simple-bus\";\n"
-         "  };\n"
-         "};\n"},
-        {"board.dts",
-         "/dts-v1/;\n"
-         "#include \"soc.dtsi\"\n"
-         "\n"
-         "/ {\n"
-         "  model = \"My Board\";\n"
-         "};\n"}
-    };
+    static const GpfFile files[] = {{"soc.dtsi", "/dts-v1/;\n"
+                                                 "/ {\n"
+                                                 "  soc: soc {\n"
+                                                 "    compatible = \"simple-bus\";\n"
+                                                 "  };\n"
+                                                 "};\n"},
+                                    {"board.dts", "/dts-v1/;\n"
+                                                  "#include \"soc.dtsi\"\n"
+                                                  "\n"
+                                                  "/ {\n"
+                                                  "  model = \"My Board\";\n"
+                                                  "};\n"}};
 
     const RQ_Source sources[] = {
         {.path = "soc.dtsi", .text = files[0].content},
@@ -10011,14 +9895,13 @@ TEST(probe_devicetree_include_edge) {
 
 /* CMake: function definition → Function node. */
 TEST(probe_cmake_function_node) {
-    GpfMetrics m = gpf_metrics("CMakeLists.txt",
-        "cmake_minimum_required(VERSION 3.16)\n"
-        "project(MyProject)\n"
-        "\n"
-        "function(add_test_target name)\n"
-        "  add_executable(${name} ${name}.cpp)\n"
-        "  target_link_libraries(${name} PRIVATE gtest)\n"
-        "endfunction()\n");
+    GpfMetrics m = gpf_metrics("CMakeLists.txt", "cmake_minimum_required(VERSION 3.16)\n"
+                                                 "project(MyProject)\n"
+                                                 "\n"
+                                                 "function(add_test_target name)\n"
+                                                 "  add_executable(${name} ${name}.cpp)\n"
+                                                 "  target_link_libraries(${name} PRIVATE gtest)\n"
+                                                 "endfunction()\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: CMake function() definition must produce a Function node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -10028,14 +9911,13 @@ TEST(probe_cmake_function_node) {
 
 /* CMake: macro definition → Function node (macros map to Function label). */
 TEST(probe_cmake_macro_node) {
-    GpfMetrics m = gpf_metrics("helpers.cmake",
-        "macro(print_var varname)\n"
-        "  message(STATUS \"${varname} = ${${varname}}\")\n"
-        "endmacro()\n"
-        "\n"
-        "function(setup_target name)\n"
-        "  add_library(${name} STATIC)\n"
-        "endfunction()\n");
+    GpfMetrics m = gpf_metrics("helpers.cmake", "macro(print_var varname)\n"
+                                                "  message(STATUS \"${varname} = ${${varname}}\")\n"
+                                                "endmacro()\n"
+                                                "\n"
+                                                "function(setup_target name)\n"
+                                                "  add_library(${name} STATIC)\n"
+                                                "endfunction()\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both function() and macro() produce Function nodes. */
     ASSERT_TRUE(m.functions >= 1);
@@ -10045,17 +9927,14 @@ TEST(probe_cmake_macro_node) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_cmake_include_edge) {
-    static const GpfFile files[] = {
-        {"helpers.cmake",
-         "function(check_compiler)\n"
-         "  message(STATUS \"Compiler: ${CMAKE_CXX_COMPILER_ID}\")\n"
-         "endfunction()\n"},
-        {"CMakeLists.txt",
-         "cmake_minimum_required(VERSION 3.16)\n"
-         "project(Foo)\n"
-         "include(helpers.cmake)\n"
-         "check_compiler()\n"}
-    };
+    static const GpfFile files[] = {{"helpers.cmake",
+                                     "function(check_compiler)\n"
+                                     "  message(STATUS \"Compiler: ${CMAKE_CXX_COMPILER_ID}\")\n"
+                                     "endfunction()\n"},
+                                    {"CMakeLists.txt", "cmake_minimum_required(VERSION 3.16)\n"
+                                                       "project(Foo)\n"
+                                                       "include(helpers.cmake)\n"
+                                                       "check_compiler()\n"}};
 
     const RQ_Source sources[] = {
         {.path = "helpers.cmake", .text = files[0].content},
@@ -10089,18 +9968,15 @@ TEST(probe_cmake_include_edge) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_cmake_subdirectory_edge) {
-    static const GpfFile files[] = {
-        {"CMakeLists.txt",
-         "cmake_minimum_required(VERSION 3.16)\n"
-         "project(Root)\n"
-         "add_subdirectory(lib)\n"},
-        {"lib/CMakeLists.txt",
-         "add_library(mylib STATIC mylib.cpp)\n"
-         "\n"
-         "function(mylib_configure target)\n"
-         "  target_link_libraries(${target} PRIVATE mylib)\n"
-         "endfunction()\n"}
-    };
+    static const GpfFile files[] = {{"CMakeLists.txt", "cmake_minimum_required(VERSION 3.16)\n"
+                                                       "project(Root)\n"
+                                                       "add_subdirectory(lib)\n"},
+                                    {"lib/CMakeLists.txt",
+                                     "add_library(mylib STATIC mylib.cpp)\n"
+                                     "\n"
+                                     "function(mylib_configure target)\n"
+                                     "  target_link_libraries(${target} PRIVATE mylib)\n"
+                                     "endfunction()\n"}};
 
     const RQ_Source sources[] = {
         {.path = "CMakeLists.txt", .text = files[0].content},
@@ -10142,19 +10018,18 @@ TEST(probe_cmake_subdirectory_edge) {
 
 /* Makefile: phony targets → Function nodes. */
 TEST(probe_makefile_target_nodes) {
-    GpfMetrics m = gpf_metrics("Makefile",
-        ".PHONY: all build test clean\n"
-        "\n"
-        "all: build\n"
-        "\n"
-        "build:\n"
-        "\tgcc -o myapp main.c utils.c\n"
-        "\n"
-        "test:\n"
-        "\t./run_tests.sh\n"
-        "\n"
-        "clean:\n"
-        "\trm -f myapp *.o\n");
+    GpfMetrics m = gpf_metrics("Makefile", ".PHONY: all build test clean\n"
+                                           "\n"
+                                           "all: build\n"
+                                           "\n"
+                                           "build:\n"
+                                           "\tgcc -o myapp main.c utils.c\n"
+                                           "\n"
+                                           "test:\n"
+                                           "\t./run_tests.sh\n"
+                                           "\n"
+                                           "clean:\n"
+                                           "\trm -f myapp *.o\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least the first target must produce a Function node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -10164,15 +10039,14 @@ TEST(probe_makefile_target_nodes) {
 
 /* Makefile: pattern rules and variables. */
 TEST(probe_makefile_pattern_rule) {
-    GpfMetrics m = gpf_metrics("rules.mk",
-        "CC = gcc\n"
-        "CFLAGS = -Wall -Wextra -O2\n"
-        "\n"
-        "%.o: %.c\n"
-        "\t$(CC) $(CFLAGS) -c $< -o $@\n"
-        "\n"
-        "install:\n"
-        "\tcp myapp /usr/local/bin/\n");
+    GpfMetrics m = gpf_metrics("rules.mk", "CC = gcc\n"
+                                           "CFLAGS = -Wall -Wextra -O2\n"
+                                           "\n"
+                                           "%.o: %.c\n"
+                                           "\t$(CC) $(CFLAGS) -c $< -o $@\n"
+                                           "\n"
+                                           "install:\n"
+                                           "\tcp myapp /usr/local/bin/\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node for any non-empty Makefile. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10182,19 +10056,15 @@ TEST(probe_makefile_pattern_rule) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_makefile_include_edge) {
-    static const GpfFile files[] = {
-        {"common.mk",
-         "CC = gcc\n"
-         "CFLAGS = -Wall -O2\n"
-         "\n"
-         "clean:\n"
-         "\trm -f *.o\n"},
-        {"Makefile",
-         "include common.mk\n"
-         "\n"
-         "all:\n"
-         "\t$(CC) $(CFLAGS) -o myapp main.c\n"}
-    };
+    static const GpfFile files[] = {{"common.mk", "CC = gcc\n"
+                                                  "CFLAGS = -Wall -O2\n"
+                                                  "\n"
+                                                  "clean:\n"
+                                                  "\trm -f *.o\n"},
+                                    {"Makefile", "include common.mk\n"
+                                                 "\n"
+                                                 "all:\n"
+                                                 "\t$(CC) $(CFLAGS) -o myapp main.c\n"}};
 
     const RQ_Source sources[] = {
         {.path = "common.mk", .text = files[0].content},
@@ -10236,14 +10106,13 @@ TEST(probe_makefile_include_edge) {
 
 /* Meson: project + executable → Module node. */
 TEST(probe_meson_project_node) {
-    GpfMetrics m = gpf_metrics("meson.build",
-        "project('myapp', 'c',\n"
-        "  version: '1.0.0',\n"
-        "  default_options: ['warning_level=2'])\n"
-        "\n"
-        "executable('myapp',\n"
-        "  sources: ['main.c', 'utils.c'],\n"
-        "  install: true)\n");
+    GpfMetrics m = gpf_metrics("meson.build", "project('myapp', 'c',\n"
+                                              "  version: '1.0.0',\n"
+                                              "  default_options: ['warning_level=2'])\n"
+                                              "\n"
+                                              "executable('myapp',\n"
+                                              "  sources: ['main.c', 'utils.c'],\n"
+                                              "  install: true)\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty meson.build produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10253,11 +10122,11 @@ TEST(probe_meson_project_node) {
 
 /* Meson: options file → Module node. */
 TEST(probe_meson_options_node) {
-    GpfMetrics m = gpf_metrics("meson.options",
-        "option('enable_tests', type: 'boolean', value: true,\n"
-        "  description: 'Build and run tests')\n"
-        "option('build_type', type: 'combo', choices: ['debug', 'release'],\n"
-        "  value: 'release')\n");
+    GpfMetrics m = gpf_metrics(
+        "meson.options", "option('enable_tests', type: 'boolean', value: true,\n"
+                         "  description: 'Build and run tests')\n"
+                         "option('build_type', type: 'combo', choices: ['debug', 'release'],\n"
+                         "  value: 'release')\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: meson.options also produces a Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -10267,13 +10136,9 @@ TEST(probe_meson_options_node) {
 /* Meson: subdir() across two files → IMPORTS edge.
  * RED: Meson subdir() not resolved into IMPORTS edges. */
 TEST(probe_meson_subdir_edge) {
-    static const GpfFile files[] = {
-        {"meson.build",
-         "project('root', 'c')\n"
-         "subdir('lib')\n"},
-        {"lib/meson.build",
-         "static_library('mylib', 'mylib.c')\n"}
-    };
+    static const GpfFile files[] = {{"meson.build", "project('root', 'c')\n"
+                                                    "subdir('lib')\n"},
+                                    {"lib/meson.build", "static_library('mylib', 'mylib.c')\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: Meson subdir() not resolved into IMPORTS edges. */
@@ -10292,14 +10157,13 @@ TEST(probe_meson_subdir_edge) {
 
 /* GN: executable target → Module node (individual targets not extracted). */
 TEST(probe_gn_executable_node) {
-    GpfMetrics m = gpf_metrics("BUILD.gn",
-        "executable(\"myapp\") {\n"
-        "  sources = [\n"
-        "    \"main.cc\",\n"
-        "    \"utils.cc\",\n"
-        "  ]\n"
-        "  deps = [ \"//third_party/base\" ]\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("BUILD.gn", "executable(\"myapp\") {\n"
+                                           "  sources = [\n"
+                                           "    \"main.cc\",\n"
+                                           "    \"utils.cc\",\n"
+                                           "  ]\n"
+                                           "  deps = [ \"//third_party/base\" ]\n"
+                                           "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty .gn file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10309,14 +10173,13 @@ TEST(probe_gn_executable_node) {
 
 /* GN: shared_library and static_library targets. */
 TEST(probe_gn_library_targets) {
-    GpfMetrics m = gpf_metrics("lib.gn",
-        "static_library(\"crypto\") {\n"
-        "  sources = [ \"crypto.cc\", \"sha256.cc\" ]\n"
-        "}\n"
-        "\n"
-        "shared_library(\"net\") {\n"
-        "  sources = [ \"net.cc\", \"socket.cc\" ]\n"
-        "}\n");
+    GpfMetrics m = gpf_metrics("lib.gn", "static_library(\"crypto\") {\n"
+                                         "  sources = [ \"crypto.cc\", \"sha256.cc\" ]\n"
+                                         "}\n"
+                                         "\n"
+                                         "shared_library(\"net\") {\n"
+                                         "  sources = [ \"net.cc\", \"socket.cc\" ]\n"
+                                         "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -10326,20 +10189,17 @@ TEST(probe_gn_library_targets) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_gn_import_edge) {
-    static const GpfFile files[] = {
-        {"//build/common.gni",
-         "template(\"cc_binary\") {\n"
-         "  executable(target_name) {\n"
-         "    forward_variables_from(invoker, \"*\")\n"
-         "  }\n"
-         "}\n"},
-        {"BUILD.gn",
-         "import(\"//build/common.gni\")\n"
-         "\n"
-         "cc_binary(\"myapp\") {\n"
-         "  sources = [ \"main.cc\" ]\n"
-         "}\n"}
-    };
+    static const GpfFile files[] = {{"//build/common.gni",
+                                     "template(\"cc_binary\") {\n"
+                                     "  executable(target_name) {\n"
+                                     "    forward_variables_from(invoker, \"*\")\n"
+                                     "  }\n"
+                                     "}\n"},
+                                    {"BUILD.gn", "import(\"//build/common.gni\")\n"
+                                                 "\n"
+                                                 "cc_binary(\"myapp\") {\n"
+                                                 "  sources = [ \"main.cc\" ]\n"
+                                                 "}\n"}};
 
     const RQ_Source sources[] = {
         {.path = "build/common.gni", .text = files[0].content},
@@ -10383,18 +10243,17 @@ TEST(probe_gn_import_edge) {
 
 /* Just: recipe definitions → at least Module node. */
 TEST(probe_just_recipe_nodes) {
-    GpfMetrics m = gpf_metrics("justfile",
-        "build:\n"
-        "  cargo build --release\n"
-        "\n"
-        "test:\n"
-        "  cargo test\n"
-        "\n"
-        "clean:\n"
-        "  cargo clean\n"
-        "\n"
-        "fmt:\n"
-        "  cargo fmt\n");
+    GpfMetrics m = gpf_metrics("justfile", "build:\n"
+                                           "  cargo build --release\n"
+                                           "\n"
+                                           "test:\n"
+                                           "  cargo test\n"
+                                           "\n"
+                                           "clean:\n"
+                                           "  cargo clean\n"
+                                           "\n"
+                                           "fmt:\n"
+                                           "  cargo fmt\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty justfile produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10406,15 +10265,14 @@ TEST(probe_just_recipe_nodes) {
  * RED: histogram shows Module:1 only — individual recipes are not extracted
  *      as Function nodes by the grammar-only Just extractor. */
 TEST(probe_just_recipe_function_nodes) {
-    GpfMetrics m = gpf_metrics("Justfile",
-        "deploy env:\n"
-        "  ./scripts/deploy.sh {{env}}\n"
-        "\n"
-        "lint:\n"
-        "  golangci-lint run ./...\n"
-        "\n"
-        "generate:\n"
-        "  go generate ./...\n");
+    GpfMetrics m = gpf_metrics("Justfile", "deploy env:\n"
+                                           "  ./scripts/deploy.sh {{env}}\n"
+                                           "\n"
+                                           "lint:\n"
+                                           "  golangci-lint run ./...\n"
+                                           "\n"
+                                           "generate:\n"
+                                           "  go generate ./...\n");
     ASSERT_TRUE(m.ok);
     /* RED: Just recipes not extracted as Function nodes (only Module:1 in histogram). */
     ASSERT_TRUE(m.functions >= 1); /* expected RED — no Just recipe → Function extraction */
@@ -10424,19 +10282,15 @@ TEST(probe_just_recipe_function_nodes) {
 /* Just: `import` directive (Just >=1.5) → IMPORTS edge.
  * RED: Just `import` not resolved into IMPORTS edges. */
 TEST(probe_just_import_edge) {
-    static const GpfFile files[] = {
-        {"common.just",
-         "fmt:\n"
-         "  cargo fmt\n"
-         "\n"
-         "lint:\n"
-         "  cargo clippy\n"},
-        {"justfile",
-         "import 'common.just'\n"
-         "\n"
-         "build:\n"
-         "  cargo build\n"}
-    };
+    static const GpfFile files[] = {{"common.just", "fmt:\n"
+                                                    "  cargo fmt\n"
+                                                    "\n"
+                                                    "lint:\n"
+                                                    "  cargo clippy\n"},
+                                    {"justfile", "import 'common.just'\n"
+                                                 "\n"
+                                                 "build:\n"
+                                                 "  cargo build\n"}};
     GpfMetrics m = gpf_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: Just `import` not resolved into IMPORTS edges. */
@@ -10456,22 +10310,22 @@ TEST(probe_just_import_edge) {
 
 /* BitBake: recipe with task and variable → Module node. */
 TEST(probe_bitbake_recipe_node) {
-    GpfMetrics m = gpf_metrics("mypackage_1.0.bb",
-        "DESCRIPTION = \"A simple test package\"\n"
-        "HOMEPAGE = \"https://example.com\"\n"
-        "LICENSE = \"MIT\"\n"
-        "LIC_FILES_CHKSUM = \"file://COPYING;md5=abc123\"\n"
-        "\n"
-        "SRC_URI = \"https://example.com/mypackage-1.0.tar.gz\"\n"
-        "\n"
-        "do_compile() {\n"
-        "  make\n"
-        "}\n"
-        "\n"
-        "do_install() {\n"
-        "  install -d ${D}${bindir}\n"
-        "  install -m 0755 myapp ${D}${bindir}/\n"
-        "}\n");
+    GpfMetrics m =
+        gpf_metrics("mypackage_1.0.bb", "DESCRIPTION = \"A simple test package\"\n"
+                                        "HOMEPAGE = \"https://example.com\"\n"
+                                        "LICENSE = \"MIT\"\n"
+                                        "LIC_FILES_CHKSUM = \"file://COPYING;md5=abc123\"\n"
+                                        "\n"
+                                        "SRC_URI = \"https://example.com/mypackage-1.0.tar.gz\"\n"
+                                        "\n"
+                                        "do_compile() {\n"
+                                        "  make\n"
+                                        "}\n"
+                                        "\n"
+                                        "do_install() {\n"
+                                        "  install -d ${D}${bindir}\n"
+                                        "  install -m 0755 myapp ${D}${bindir}/\n"
+                                        "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: any non-empty .bb file produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10482,18 +10336,18 @@ TEST(probe_bitbake_recipe_node) {
 /* BitBake: bbclass file → Module node. */
 TEST(probe_bitbake_bbclass_node) {
     GpfMetrics m = gpf_metrics("cmake.bbclass",
-        "# CMake class for BitBake\n"
-        "EXTRA_OECMAKE ?= \"\"\n"
-        "\n"
-        "cmake_do_configure() {\n"
-        "  cmake -DCMAKE_INSTALL_PREFIX=${prefix} ${EXTRA_OECMAKE} ${S}\n"
-        "}\n"
-        "\n"
-        "cmake_do_compile() {\n"
-        "  make ${EXTRA_OEMAKE}\n"
-        "}\n"
-        "\n"
-        "EXPORT_FUNCTIONS do_configure do_compile\n");
+                               "# CMake class for BitBake\n"
+                               "EXTRA_OECMAKE ?= \"\"\n"
+                               "\n"
+                               "cmake_do_configure() {\n"
+                               "  cmake -DCMAKE_INSTALL_PREFIX=${prefix} ${EXTRA_OECMAKE} ${S}\n"
+                               "}\n"
+                               "\n"
+                               "cmake_do_compile() {\n"
+                               "  make ${EXTRA_OEMAKE}\n"
+                               "}\n"
+                               "\n"
+                               "EXPORT_FUNCTIONS do_configure do_compile\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: .bbclass produces a Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -10503,20 +10357,17 @@ TEST(probe_bitbake_bbclass_node) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_bitbake_require_edge) {
-    static const GpfFile files[] = {
-        {"mypackage.inc",
-         "DESCRIPTION = \"Shared package metadata\"\n"
-         "LICENSE = \"MIT\"\n"
-         "SRC_URI = \"https://example.com/pkg-${PV}.tar.gz\"\n"},
-        {"mypackage_1.0.bb",
-         "require mypackage.inc\n"
-         "\n"
-         "PV = \"1.0\"\n"
-         "\n"
-         "do_compile() {\n"
-         "  make\n"
-         "}\n"}
-    };
+    static const GpfFile files[] = {{"mypackage.inc",
+                                     "DESCRIPTION = \"Shared package metadata\"\n"
+                                     "LICENSE = \"MIT\"\n"
+                                     "SRC_URI = \"https://example.com/pkg-${PV}.tar.gz\"\n"},
+                                    {"mypackage_1.0.bb", "require mypackage.inc\n"
+                                                         "\n"
+                                                         "PV = \"1.0\"\n"
+                                                         "\n"
+                                                         "do_compile() {\n"
+                                                         "  make\n"
+                                                         "}\n"}};
 
     const RQ_Source sources[] = {
         {.path = "mypackage.inc", .text = files[0].content},
@@ -10559,17 +10410,16 @@ TEST(probe_bitbake_require_edge) {
 
 /* Kconfig: config entries → Module and Class nodes. */
 TEST(probe_kconfig_config_entries) {
-    GpfMetrics m = gpf_metrics("Kconfig",
-        "config MYDRV\n"
-        "  tristate \"My Driver\"\n"
-        "  depends on PCI\n"
-        "  help\n"
-        "    Enable this driver for My Device.\n"
-        "\n"
-        "config MYDRV_DEBUG\n"
-        "  bool \"Enable debug output\"\n"
-        "  depends on MYDRV\n"
-        "  default n\n");
+    GpfMetrics m = gpf_metrics("Kconfig", "config MYDRV\n"
+                                          "  tristate \"My Driver\"\n"
+                                          "  depends on PCI\n"
+                                          "  help\n"
+                                          "    Enable this driver for My Device.\n"
+                                          "\n"
+                                          "config MYDRV_DEBUG\n"
+                                          "  bool \"Enable debug output\"\n"
+                                          "  depends on MYDRV\n"
+                                          "  default n\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: histogram confirms Class:1,Module:1 for any Kconfig file. */
     ASSERT_TRUE(m.modules >= 1);
@@ -10579,17 +10429,16 @@ TEST(probe_kconfig_config_entries) {
 
 /* Kconfig: menu block with multiple entries. */
 TEST(probe_kconfig_menu_block) {
-    GpfMetrics m = gpf_metrics("Kconfig",
-        "menu \"Network Support\"\n"
-        "\n"
-        "config NET\n"
-        "  bool \"Networking support\"\n"
-        "\n"
-        "config INET\n"
-        "  bool \"TCP/IP networking\"\n"
-        "  depends on NET\n"
-        "\n"
-        "endmenu\n");
+    GpfMetrics m = gpf_metrics("Kconfig", "menu \"Network Support\"\n"
+                                          "\n"
+                                          "config NET\n"
+                                          "  bool \"Networking support\"\n"
+                                          "\n"
+                                          "config INET\n"
+                                          "  bool \"TCP/IP networking\"\n"
+                                          "  depends on NET\n"
+                                          "\n"
+                                          "endmenu\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Module + Class nodes for the file. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10600,16 +10449,12 @@ TEST(probe_kconfig_menu_block) {
 /* Count this genuine import as a named quality gap until its source and
  * path-scope proof is implemented. Any guessed target remains a bug. */
 TEST(probe_kconfig_source_edge) {
-    static const GpfFile files[] = {
-        {"drivers/Kconfig",
-         "config DRV_USB\n"
-         "  tristate \"USB Driver\"\n"
-         "  depends on USB\n"},
-        {"Kconfig",
-         "mainmenu \"Linux Kernel Configuration\"\n"
-         "\n"
-         "source \"drivers/Kconfig\"\n"}
-    };
+    static const GpfFile files[] = {{"drivers/Kconfig", "config DRV_USB\n"
+                                                        "  tristate \"USB Driver\"\n"
+                                                        "  depends on USB\n"},
+                                    {"Kconfig", "mainmenu \"Linux Kernel Configuration\"\n"
+                                                "\n"
+                                                "source \"drivers/Kconfig\"\n"}};
 
     const RQ_Source sources[] = {
         {.path = "drivers/Kconfig", .text = files[0].content},
@@ -10654,15 +10499,14 @@ TEST(probe_kconfig_source_edge) {
 
 /* Go mod: module directive → Module node. */
 TEST(probe_gomod_module_node) {
-    GpfMetrics m = gpf_metrics("go.mod",
-        "module example.com/myapp\n"
-        "\n"
-        "go 1.21\n"
-        "\n"
-        "require (\n"
-        "  github.com/gin-gonic/gin v1.9.1\n"
-        "  github.com/stretchr/testify v1.8.4\n"
-        ")\n");
+    GpfMetrics m = gpf_metrics("go.mod", "module example.com/myapp\n"
+                                         "\n"
+                                         "go 1.21\n"
+                                         "\n"
+                                         "require (\n"
+                                         "  github.com/gin-gonic/gin v1.9.1\n"
+                                         "  github.com/stretchr/testify v1.8.4\n"
+                                         ")\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: go.mod produces at least a Module node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -10672,10 +10516,9 @@ TEST(probe_gomod_module_node) {
 
 /* Go mod: simple module with go directive only. */
 TEST(probe_gomod_simple) {
-    GpfMetrics m = gpf_metrics("go.mod",
-        "module example.com/simple\n"
-        "\n"
-        "go 1.21\n");
+    GpfMetrics m = gpf_metrics("go.mod", "module example.com/simple\n"
+                                         "\n"
+                                         "go 1.21\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: even a minimal go.mod with no requires produces a Module node. */
     ASSERT_TRUE(m.modules >= 1);
@@ -10686,16 +10529,15 @@ TEST(probe_gomod_simple) {
  * RED: go.mod `require` directives are not resolved into DEPENDS_ON edges;
  *      pass_pkgmap only uses go.mod for intra-repo module path mapping. */
 TEST(probe_gomod_depends_on_edges) {
-    GpfMetrics m = gpf_metrics("go.mod",
-        "module example.com/server\n"
-        "\n"
-        "go 1.21\n"
-        "\n"
-        "require (\n"
-        "  github.com/gorilla/mux v1.8.1\n"
-        "  github.com/sirupsen/logrus v1.9.3\n"
-        "  github.com/prometheus/client_golang v1.17.0\n"
-        ")\n");
+    GpfMetrics m = gpf_metrics("go.mod", "module example.com/server\n"
+                                         "\n"
+                                         "go 1.21\n"
+                                         "\n"
+                                         "require (\n"
+                                         "  github.com/gorilla/mux v1.8.1\n"
+                                         "  github.com/sirupsen/logrus v1.9.3\n"
+                                         "  github.com/prometheus/client_golang v1.17.0\n"
+                                         ")\n");
     ASSERT_TRUE(m.ok);
     /* RED: go.mod require → DEPENDS_ON not implemented (pkgmap handles path mapping only). */
     ASSERT_TRUE(m.depends_on >= 1); /* expected RED — no go.mod DEPENDS_ON producer */
@@ -10706,22 +10548,18 @@ TEST(probe_gomod_depends_on_edges) {
  * GREEN: the presence of go.mod enables the pkgmap resolver to link
  *        cross-package imports in Go source files. */
 TEST(probe_gomod_enables_go_imports) {
-    static const GpfFile files[] = {
-        {"go.mod",
-         "module example.com/demo\n"
-         "\n"
-         "go 1.21\n"},
-        {"pkg/calc/calc.go",
-         "package calc\n"
-         "\n"
-         "func Add(a, b int) int { return a + b }\n"},
-        {"main.go",
-         "package main\n"
-         "\n"
-         "import \"example.com/demo/pkg/calc\"\n"
-         "\n"
-         "func main() { _ = calc.Add(1, 2) }\n"}
-    };
+    static const GpfFile files[] = {{"go.mod", "module example.com/demo\n"
+                                               "\n"
+                                               "go 1.21\n"},
+                                    {"pkg/calc/calc.go",
+                                     "package calc\n"
+                                     "\n"
+                                     "func Add(a, b int) int { return a + b }\n"},
+                                    {"main.go", "package main\n"
+                                                "\n"
+                                                "import \"example.com/demo/pkg/calc\"\n"
+                                                "\n"
+                                                "func main() { _ = calc.Add(1, 2) }\n"}};
     GpfMetrics m = gpf_metrics_files(files, 3);
     ASSERT_TRUE(m.ok);
     /* GREEN: go.mod enables the pkgmap resolver; main.go → calc IMPORTS edge. */

@@ -61,39 +61,45 @@ typedef struct {
 } GpaProj;
 
 typedef struct {
-    const char *name;    /* relative filename, may include '/' for subdirs */
+    const char *name; /* relative filename, may include '/' for subdirs */
     const char *content;
 } GpaFile;
 
 static void gpa_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\') *p = '/';
+        if (*p == '\\')
+            *p = '/';
     }
 }
 
 static cbm_store_t *gpa_open_indexed(GpaProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
+    if (!lp->project)
+        return NULL;
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+    if (!home)
+        home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv) return NULL;
+    if (!lp->srv)
+        return NULL;
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp) free(resp);
+    if (resp)
+        free(resp);
     return cbm_store_open_path(lp->dbpath);
 }
 
 static cbm_store_t *gpa_index_files(GpaProj *lp, const GpaFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_gpa_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir))
+        return NULL;
     gpa_to_fwd_slashes(lp->tmpdir);
     for (int i = 0; i < nfiles; i++) {
         char path[700];
@@ -105,7 +111,8 @@ static cbm_store_t *gpa_index_files(GpaProj *lp, const GpaFile *files, int nfile
             *slash = '/';
         }
         FILE *f = fopen(path, "wb");
-        if (!f) return NULL;
+        if (!f)
+            return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
@@ -113,8 +120,12 @@ static cbm_store_t *gpa_index_files(GpaProj *lp, const GpaFile *files, int nfile
 }
 
 static void gpa_cleanup(GpaProj *lp, cbm_store_t *store) {
-    if (store) cbm_store_close(store);
-    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
+    if (store)
+        cbm_store_close(store);
+    if (lp->srv) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+    }
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
@@ -139,11 +150,12 @@ static int gpa_count_label(cbm_store_t *store, const char *project, const char *
 
 /* Sum of all type-like labels. */
 static int gpa_type_nodes(cbm_store_t *store, const char *project) {
-    static const char *labels[] = {"Class","Struct","Interface","Enum","Trait","Type",NULL};
+    static const char *labels[] = {"Class", "Struct", "Interface", "Enum", "Trait", "Type", NULL};
     int total = 0;
     for (int i = 0; labels[i]; i++) {
         int n = gpa_count_label(store, project, labels[i]);
-        if (n > 0) total += n;
+        if (n > 0)
+            total += n;
     }
     return total;
 }
@@ -154,9 +166,9 @@ typedef struct {
     int total_nodes;
     int functions;
     int methods;
-    int types;     /* type-like sum */
-    int imports;   /* IMPORTS edges */
-    int inherits;  /* INHERITS edges */
+    int types;    /* type-like sum */
+    int imports;  /* IMPORTS edges */
+    int inherits; /* INHERITS edges */
 } GpaMetrics;
 
 static GpaMetrics gpa_metrics_files(const GpaFile *files, int nfiles) {
@@ -164,13 +176,13 @@ static GpaMetrics gpa_metrics_files(const GpaFile *files, int nfiles) {
     cbm_store_t *store = gpa_index_files(&lp, files, nfiles);
     GpaMetrics m = {0};
     if (store) {
-        m.ok          = 1;
+        m.ok = 1;
         m.total_nodes = cbm_store_count_nodes(store, lp.project);
-        m.functions   = gpa_count_label(store, lp.project, "Function");
-        m.methods     = gpa_count_label(store, lp.project, "Method");
-        m.types       = gpa_type_nodes(store, lp.project);
-        m.imports     = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
-        m.inherits    = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
+        m.functions = gpa_count_label(store, lp.project, "Function");
+        m.methods = gpa_count_label(store, lp.project, "Method");
+        m.types = gpa_type_nodes(store, lp.project);
+        m.imports = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
+        m.inherits = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
     }
     gpa_cleanup(&lp, store);
     return m;
@@ -239,19 +251,18 @@ static bool gpa_import_quality(const GpaFile *files, size_t file_count, const RQ
 
 /* Ada: two procedure definitions → at least 2 Function nodes. */
 TEST(probe_ada_functions) {
-    GpaMetrics m = gpa_metrics("calc.adb",
-        "procedure Calc is\n"
-        "   function Add(A, B : Integer) return Integer is\n"
-        "   begin\n"
-        "      return A + B;\n"
-        "   end Add;\n"
-        "   function Sub(A, B : Integer) return Integer is\n"
-        "   begin\n"
-        "      return A - B;\n"
-        "   end Sub;\n"
-        "begin\n"
-        "   null;\n"
-        "end Calc;\n");
+    GpaMetrics m = gpa_metrics("calc.adb", "procedure Calc is\n"
+                                           "   function Add(A, B : Integer) return Integer is\n"
+                                           "   begin\n"
+                                           "      return A + B;\n"
+                                           "   end Add;\n"
+                                           "   function Sub(A, B : Integer) return Integer is\n"
+                                           "   begin\n"
+                                           "      return A - B;\n"
+                                           "   end Sub;\n"
+                                           "begin\n"
+                                           "   null;\n"
+                                           "end Calc;\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 1); /* GREEN: at least the outer procedure or inner ones */
     PASS();
@@ -259,12 +270,11 @@ TEST(probe_ada_functions) {
 
 /* Ada: a package spec (.ads) with multiple subprogram specs → Function nodes. */
 TEST(probe_ada_package_spec_nodes) {
-    GpaMetrics m = gpa_metrics("math.ads",
-        "package Math is\n"
-        "   function Square(X : Float) return Float;\n"
-        "   function Cube(X : Float) return Float;\n"
-        "   function Abs_Val(X : Float) return Float;\n"
-        "end Math;\n");
+    GpaMetrics m = gpa_metrics("math.ads", "package Math is\n"
+                                           "   function Square(X : Float) return Float;\n"
+                                           "   function Cube(X : Float) return Float;\n"
+                                           "   function Abs_Val(X : Float) return Float;\n"
+                                           "end Math;\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: spec subprogram declarations must produce Function nodes. */
     ASSERT_TRUE(m.functions >= 1);
@@ -273,12 +283,11 @@ TEST(probe_ada_package_spec_nodes) {
 
 /* Ada: pipeline indexes the file and produces at least 1 node (no crash). */
 TEST(probe_ada_no_crash) {
-    GpaMetrics m = gpa_metrics("hello.adb",
-        "with Ada.Text_IO;\n"
-        "procedure Hello is\n"
-        "begin\n"
-        "   Ada.Text_IO.Put_Line(\"Hello\");\n"
-        "end Hello;\n");
+    GpaMetrics m = gpa_metrics("hello.adb", "with Ada.Text_IO;\n"
+                                            "procedure Hello is\n"
+                                            "begin\n"
+                                            "   Ada.Text_IO.Put_Line(\"Hello\");\n"
+                                            "end Hello;\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1);
     PASS();
@@ -286,19 +295,15 @@ TEST(probe_ada_no_crash) {
 
 /* Ada: an exact withed package specification remains a counted quality gap. */
 TEST(probe_ada_imports_edge) {
-    static const GpaFile files[] = {
-        {"math.ads",
-         "package Math is\n"
-         "   function Square(X : Float) return Float;\n"
-         "end Math;\n"},
-        {"main.adb",
-         "with Math;\n"
-         "procedure Main is\n"
-         "   R : Float;\n"
-         "begin\n"
-         "   R := Math.Square(3.0);\n"
-         "end Main;\n"}
-    };
+    static const GpaFile files[] = {{"math.ads", "package Math is\n"
+                                                 "   function Square(X : Float) return Float;\n"
+                                                 "end Math;\n"},
+                                    {"main.adb", "with Math;\n"
+                                                 "procedure Main is\n"
+                                                 "   R : Float;\n"
+                                                 "begin\n"
+                                                 "   R := Math.Square(3.0);\n"
+                                                 "end Main;\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 
@@ -340,14 +345,13 @@ TEST(probe_ada_imports_edge) {
 
 /* Awk: two function definitions → 2 Function nodes. */
 TEST(probe_awk_functions) {
-    GpaMetrics m = gpa_metrics("stats.awk",
-        "function max(a, b) {\n"
-        "    return (a > b) ? a : b\n"
-        "}\n"
-        "\n"
-        "function min(a, b) {\n"
-        "    return (a < b) ? a : b\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("stats.awk", "function max(a, b) {\n"
+                                            "    return (a > b) ? a : b\n"
+                                            "}\n"
+                                            "\n"
+                                            "function min(a, b) {\n"
+                                            "    return (a < b) ? a : b\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both user-defined functions must reach the graph. */
     ASSERT_TRUE(m.functions >= 2);
@@ -356,9 +360,11 @@ TEST(probe_awk_functions) {
 
 /* Awk: three functions in one file — broader coverage of def-count floor. */
 TEST(probe_awk_three_functions) {
-    GpaMetrics m = gpa_metrics("util.awk",
+    GpaMetrics m = gpa_metrics(
+        "util.awk",
         "function trim(s) { sub(/^[ \\t]+/, \"\", s); sub(/[ \\t]+$/, \"\", s); return s }\n"
-        "function upper(s,    i, c, r) { for(i=1;i<=length(s);i++) r=r toupper(substr(s,i,1)); return r }\n"
+        "function upper(s,    i, c, r) { for(i=1;i<=length(s);i++) r=r toupper(substr(s,i,1)); "
+        "return r }\n"
         "function repeat(s, n,    i, r) { for(i=0;i<n;i++) r=r s; return r }\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: all three functions must appear as nodes. */
@@ -368,10 +374,9 @@ TEST(probe_awk_three_functions) {
 
 /* Awk has no OOP — no type-like nodes expected. */
 TEST(probe_awk_no_type_nodes) {
-    GpaMetrics m = gpa_metrics("proc.awk",
-        "function process(line) {\n"
-        "    print line\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("proc.awk", "function process(line) {\n"
+                                           "    print line\n"
+                                           "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: awk produces 0 type-like nodes (no classes/structs). */
     ASSERT_TRUE(m.types == 0);
@@ -388,14 +393,13 @@ TEST(probe_awk_no_type_nodes) {
 
 /* Cairo: two free functions → 2 Function nodes. */
 TEST(probe_cairo_functions) {
-    GpaMetrics m = gpa_metrics("math.cairo",
-        "fn add(x: felt252, y: felt252) -> felt252 {\n"
-        "    x + y\n"
-        "}\n"
-        "\n"
-        "fn mul(x: felt252, y: felt252) -> felt252 {\n"
-        "    x * y\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("math.cairo", "fn add(x: felt252, y: felt252) -> felt252 {\n"
+                                             "    x + y\n"
+                                             "}\n"
+                                             "\n"
+                                             "fn mul(x: felt252, y: felt252) -> felt252 {\n"
+                                             "    x * y\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both functions must be graph nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -404,12 +408,11 @@ TEST(probe_cairo_functions) {
 
 /* Cairo: trait definition — if the grammar/extractor models it. */
 TEST(probe_cairo_trait_or_type) {
-    GpaMetrics m = gpa_metrics("iface.cairo",
-        "trait IMath {\n"
-        "    fn add(x: felt252, y: felt252) -> felt252;\n"
-        "}\n"
-        "\n"
-        "fn zero() -> felt252 { 0 }\n");
+    GpaMetrics m = gpa_metrics("iface.cairo", "trait IMath {\n"
+                                              "    fn add(x: felt252, y: felt252) -> felt252;\n"
+                                              "}\n"
+                                              "\n"
+                                              "fn zero() -> felt252 { 0 }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1); /* GREEN: at least the function node. */
     PASS();
@@ -417,10 +420,9 @@ TEST(probe_cairo_trait_or_type) {
 
 /* Cairo: three functions to exercise def-count floor. */
 TEST(probe_cairo_three_functions) {
-    GpaMetrics m = gpa_metrics("ops.cairo",
-        "fn identity(x: felt252) -> felt252 { x }\n"
-        "fn negate(x: felt252) -> felt252 { -x }\n"
-        "fn square(x: felt252) -> felt252 { x * x }\n");
+    GpaMetrics m = gpa_metrics("ops.cairo", "fn identity(x: felt252) -> felt252 { x }\n"
+                                            "fn negate(x: felt252) -> felt252 { -x }\n"
+                                            "fn square(x: felt252) -> felt252 { x * x }\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: all three free functions. */
     ASSERT_TRUE(m.functions >= 3);
@@ -438,14 +440,13 @@ TEST(probe_cairo_three_functions) {
 
 /* Clojure: two `defn` definitions → 2 Function nodes. */
 TEST(probe_clojure_functions) {
-    GpaMetrics m = gpa_metrics("core.clj",
-        "(ns myapp.core)\n"
-        "\n"
-        "(defn greet [name]\n"
-        "  (str \"Hello, \" name))\n"
-        "\n"
-        "(defn farewell [name]\n"
-        "  (str \"Goodbye, \" name))\n");
+    GpaMetrics m = gpa_metrics("core.clj", "(ns myapp.core)\n"
+                                           "\n"
+                                           "(defn greet [name]\n"
+                                           "  (str \"Hello, \" name))\n"
+                                           "\n"
+                                           "(defn farewell [name]\n"
+                                           "  (str \"Goodbye, \" name))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both defn forms must produce Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -454,16 +455,15 @@ TEST(probe_clojure_functions) {
 
 /* Clojure: defmulti / defmethod (polymorphic dispatch). */
 TEST(probe_clojure_defmulti) {
-    GpaMetrics m = gpa_metrics("dispatch.clj",
-        "(ns myapp.dispatch)\n"
-        "\n"
-        "(defmulti area :shape)\n"
-        "\n"
-        "(defmethod area :circle [s]\n"
-        "  (* Math/PI (:r s) (:r s)))\n"
-        "\n"
-        "(defmethod area :rect [s]\n"
-        "  (* (:w s) (:h s)))\n");
+    GpaMetrics m = gpa_metrics("dispatch.clj", "(ns myapp.dispatch)\n"
+                                               "\n"
+                                               "(defmulti area :shape)\n"
+                                               "\n"
+                                               "(defmethod area :circle [s]\n"
+                                               "  (* Math/PI (:r s) (:r s)))\n"
+                                               "\n"
+                                               "(defmethod area :rect [s]\n"
+                                               "  (* (:w s) (:h s)))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least the defmulti + defmethod forms produce Function nodes. */
     ASSERT_TRUE(m.functions >= 1);
@@ -472,12 +472,11 @@ TEST(probe_clojure_defmulti) {
 
 /* Clojure: defrecord → type-like node (if grammar models it). */
 TEST(probe_clojure_defrecord) {
-    GpaMetrics m = gpa_metrics("model.clj",
-        "(ns myapp.model)\n"
-        "\n"
-        "(defrecord Point [x y])\n"
-        "\n"
-        "(defn make-point [x y] (->Point x y))\n");
+    GpaMetrics m = gpa_metrics("model.clj", "(ns myapp.model)\n"
+                                            "\n"
+                                            "(defrecord Point [x y])\n"
+                                            "\n"
+                                            "(defn make-point [x y] (->Point x y))\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1); /* GREEN: at minimum the function node. */
     PASS();
@@ -485,16 +484,12 @@ TEST(probe_clojure_defrecord) {
 
 /* Clojure: preserve the wrong classpath layout and count a configured lib import. */
 TEST(probe_clojure_imports_edge) {
-    static const GpaFile files[] = {
-        {"util.clj",
-         "(ns myapp.util)\n"
-         "(defn double-it [x] (* 2 x))\n"},
-        {"core.clj",
-         "(ns myapp.core\n"
-         "  (:require [myapp.util :as u]))\n"
-         "\n"
-         "(defn run [n] (u/double-it n))\n"}
-    };
+    static const GpaFile files[] = {{"util.clj", "(ns myapp.util)\n"
+                                                 "(defn double-it [x] (* 2 x))\n"},
+                                    {"core.clj", "(ns myapp.core\n"
+                                                 "  (:require [myapp.util :as u]))\n"
+                                                 "\n"
+                                                 "(defn run [n] (u/double-it n))\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 
@@ -561,12 +556,11 @@ TEST(probe_clojure_imports_edge) {
 
 /* Common Lisp: two `defun` definitions → 2 Function nodes. */
 TEST(probe_commonlisp_functions) {
-    GpaMetrics m = gpa_metrics("math.lisp",
-        "(defun square (x)\n"
-        "  (* x x))\n"
-        "\n"
-        "(defun cube (x)\n"
-        "  (* x (square x)))\n");
+    GpaMetrics m = gpa_metrics("math.lisp", "(defun square (x)\n"
+                                            "  (* x x))\n"
+                                            "\n"
+                                            "(defun cube (x)\n"
+                                            "  (* x (square x)))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both defun forms must be Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -575,13 +569,12 @@ TEST(probe_commonlisp_functions) {
 
 /* Common Lisp: `defmacro` — if extractor models it as a Function. */
 TEST(probe_commonlisp_defmacro) {
-    GpaMetrics m = gpa_metrics("macros.lisp",
-        "(defmacro when-positive (n &body body)\n"
-        "  `(when (> ,n 0) ,@body))\n"
-        "\n"
-        "(defun use-macro (x)\n"
-        "  (when-positive x\n"
-        "    (format t \"positive~%\")))\n");
+    GpaMetrics m = gpa_metrics("macros.lisp", "(defmacro when-positive (n &body body)\n"
+                                              "  `(when (> ,n 0) ,@body))\n"
+                                              "\n"
+                                              "(defun use-macro (x)\n"
+                                              "  (when-positive x\n"
+                                              "    (format t \"positive~%\")))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum defun should produce a Function node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -590,13 +583,12 @@ TEST(probe_commonlisp_defmacro) {
 
 /* Common Lisp: defstruct → type-like node (if grammar models it). */
 TEST(probe_commonlisp_defstruct) {
-    GpaMetrics m = gpa_metrics("types.lisp",
-        "(defstruct point\n"
-        "  (x 0)\n"
-        "  (y 0))\n"
-        "\n"
-        "(defun make-pt (a b)\n"
-        "  (make-point :x a :y b))\n");
+    GpaMetrics m = gpa_metrics("types.lisp", "(defstruct point\n"
+                                             "  (x 0)\n"
+                                             "  (y 0))\n"
+                                             "\n"
+                                             "(defun make-pt (a b)\n"
+                                             "  (make-point :x a :y b))\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1); /* GREEN: at minimum the function. */
     PASS();
@@ -604,16 +596,12 @@ TEST(probe_commonlisp_defstruct) {
 
 /* Common Lisp: distinguish package use from an explicit source-relative load. */
 TEST(probe_commonlisp_imports_edge) {
-    static const GpaFile files[] = {
-        {"util.lisp",
-         "(defpackage :util (:export :double))\n"
-         "(in-package :util)\n"
-         "(defun double (x) (* 2 x))\n"},
-        {"main.lisp",
-         "(defpackage :main (:use :cl :util))\n"
-         "(in-package :main)\n"
-         "(defun run (n) (util:double n))\n"}
-    };
+    static const GpaFile files[] = {{"util.lisp", "(defpackage :util (:export :double))\n"
+                                                  "(in-package :util)\n"
+                                                  "(defun double (x) (* 2 x))\n"},
+                                    {"main.lisp", "(defpackage :main (:use :cl :util))\n"
+                                                  "(in-package :main)\n"
+                                                  "(defun run (n) (util:double n))\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 
@@ -680,15 +668,14 @@ TEST(probe_commonlisp_imports_edge) {
 
 /* Crystal: class and method definitions → Class + Function/Method nodes. */
 TEST(probe_crystal_class_node) {
-    GpaMetrics m = gpa_metrics("animal.cr",
-        "class Animal\n"
-        "  def initialize(@name : String)\n"
-        "  end\n"
-        "\n"
-        "  def speak : String\n"
-        "    \"...\"\n"
-        "  end\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("animal.cr", "class Animal\n"
+                                            "  def initialize(@name : String)\n"
+                                            "  end\n"
+                                            "\n"
+                                            "  def speak : String\n"
+                                            "    \"...\"\n"
+                                            "  end\n"
+                                            "end\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: class Animal must produce a Class node. */
     ASSERT_TRUE(m.types >= 1);
@@ -699,18 +686,17 @@ TEST(probe_crystal_class_node) {
  * GREEN for Class node (histogram confirms Class:1); INHERITS edge status probed
  * separately below. */
 TEST(probe_crystal_subclass_node) {
-    GpaMetrics m = gpa_metrics("pets.cr",
-        "class Animal\n"
-        "  def breathe; end\n"
-        "end\n"
-        "\n"
-        "class Dog < Animal\n"
-        "  def bark; \"woof\"; end\n"
-        "end\n"
-        "\n"
-        "class Cat < Animal\n"
-        "  def meow; \"meow\"; end\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("pets.cr", "class Animal\n"
+                                          "  def breathe; end\n"
+                                          "end\n"
+                                          "\n"
+                                          "class Dog < Animal\n"
+                                          "  def bark; \"woof\"; end\n"
+                                          "end\n"
+                                          "\n"
+                                          "class Cat < Animal\n"
+                                          "  def meow; \"meow\"; end\n"
+                                          "end\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least 2 class nodes (Dog, Cat; Animal also expected). */
     ASSERT_TRUE(m.types >= 2);
@@ -721,14 +707,13 @@ TEST(probe_crystal_subclass_node) {
  * RED: grammar-only Crystal pipeline does not yet resolve base_classes into
  *      INHERITS graph edges (no Crystal branch in pass_semantic.c resolver). */
 TEST(probe_crystal_inherits_edge) {
-    GpaMetrics m = gpa_metrics("inherit.cr",
-        "class Base\n"
-        "  def do_base; end\n"
-        "end\n"
-        "\n"
-        "class Derived < Base\n"
-        "  def do_derived; end\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("inherit.cr", "class Base\n"
+                                             "  def do_base; end\n"
+                                             "end\n"
+                                             "\n"
+                                             "class Derived < Base\n"
+                                             "  def do_derived; end\n"
+                                             "end\n");
     ASSERT_TRUE(m.ok);
     /* RED: Crystal INHERITS edge not yet produced by the pipeline. */
     ASSERT_TRUE(m.inherits >= 1); /* expected RED */
@@ -737,16 +722,15 @@ TEST(probe_crystal_inherits_edge) {
 
 /* Crystal: module definition → type-like node. */
 TEST(probe_crystal_module_node) {
-    GpaMetrics m = gpa_metrics("mixin.cr",
-        "module Greetable\n"
-        "  def greet\n"
-        "    puts \"Hello!\"\n"
-        "  end\n"
-        "end\n"
-        "\n"
-        "class Person\n"
-        "  include Greetable\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("mixin.cr", "module Greetable\n"
+                                           "  def greet\n"
+                                           "    puts \"Hello!\"\n"
+                                           "  end\n"
+                                           "end\n"
+                                           "\n"
+                                           "class Person\n"
+                                           "  include Greetable\n"
+                                           "end\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both the module and class should yield type-like nodes. */
     ASSERT_TRUE(m.types >= 1);
@@ -756,18 +740,14 @@ TEST(probe_crystal_module_node) {
 /* Crystal: require in two-file fixture → IMPORTS edge.
  * RED: grammar-only Crystal has no `require` resolver in the pipeline. */
 TEST(probe_crystal_imports_edge) {
-    static const GpaFile files[] = {
-        {"util.cr",
-         "def double(x : Int32) : Int32\n"
-         "  x * 2\n"
-         "end\n"},
-        {"main.cr",
-         "require \"./util\"\n"
-         "\n"
-         "def run(n : Int32) : Int32\n"
-         "  double(n)\n"
-         "end\n"}
-    };
+    static const GpaFile files[] = {{"util.cr", "def double(x : Int32) : Int32\n"
+                                                "  x * 2\n"
+                                                "end\n"},
+                                    {"main.cr", "require \"./util\"\n"
+                                                "\n"
+                                                "def run(n : Int32) : Int32\n"
+                                                "  double(n)\n"
+                                                "end\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: Crystal `require` not resolved into IMPORTS edges. */
@@ -784,16 +764,15 @@ TEST(probe_crystal_imports_edge) {
 
 /* D: two free functions → 2 Function nodes. */
 TEST(probe_d_functions) {
-    GpaMetrics m = gpa_metrics("math.d",
-        "int square(int x)\n"
-        "{\n"
-        "    return x * x;\n"
-        "}\n"
-        "\n"
-        "int cube(int x)\n"
-        "{\n"
-        "    return x * square(x);\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("math.d", "int square(int x)\n"
+                                         "{\n"
+                                         "    return x * x;\n"
+                                         "}\n"
+                                         "\n"
+                                         "int cube(int x)\n"
+                                         "{\n"
+                                         "    return x * square(x);\n"
+                                         "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both functions must be Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -804,18 +783,17 @@ TEST(probe_d_functions) {
  * RED: the grammar-only D extractor produces Function:2/Module:1 (histogram);
  *      structs may not yet be extracted as distinct Struct nodes. */
 TEST(probe_d_struct_node) {
-    GpaMetrics m = gpa_metrics("point.d",
-        "struct Point\n"
-        "{\n"
-        "    double x;\n"
-        "    double y;\n"
-        "}\n"
-        "\n"
-        "double dist(Point a, Point b)\n"
-        "{\n"
-        "    import std.math : sqrt;\n"
-        "    return sqrt((a.x-b.x)^^2 + (a.y-b.y)^^2);\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("point.d", "struct Point\n"
+                                          "{\n"
+                                          "    double x;\n"
+                                          "    double y;\n"
+                                          "}\n"
+                                          "\n"
+                                          "double dist(Point a, Point b)\n"
+                                          "{\n"
+                                          "    import std.math : sqrt;\n"
+                                          "    return sqrt((a.x-b.x)^^2 + (a.y-b.y)^^2);\n"
+                                          "}\n");
     ASSERT_TRUE(m.ok);
     /* REAL BUG (NEW-16, node-extraction incompleteness): d_class_types DOES list
      * "struct_declaration" (lang_specs.c:943-950), so the spec is configured, yet 0
@@ -828,34 +806,32 @@ TEST(probe_d_struct_node) {
 /* D: class with inheritance `class Dog : Animal`.
  * RED: D OOP classes not expected in the current histogram (only Function/Module). */
 TEST(probe_d_class_inherits) {
-    GpaMetrics m = gpa_metrics("pets.d",
-        "class Animal\n"
-        "{\n"
-        "    void breathe() {}\n"
-        "}\n"
-        "\n"
-        "class Dog : Animal\n"
-        "{\n"
-        "    void bark() {}\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("pets.d", "class Animal\n"
+                                         "{\n"
+                                         "    void breathe() {}\n"
+                                         "}\n"
+                                         "\n"
+                                         "class Dog : Animal\n"
+                                         "{\n"
+                                         "    void bark() {}\n"
+                                         "}\n");
     ASSERT_TRUE(m.ok);
     /* RED: D class not yet extracted as Class node nor INHERITS edge produced. */
-    ASSERT_TRUE(m.types >= 1);       /* expected RED — no D class extractor */
-    ASSERT_TRUE(m.inherits >= 1);    /* expected RED — no D INHERITS resolver */
+    ASSERT_TRUE(m.types >= 1);    /* expected RED — no D class extractor */
+    ASSERT_TRUE(m.inherits >= 1); /* expected RED — no D INHERITS resolver */
     PASS();
 }
 
 /* D: interface definition.
  * RED: D interfaces not expected in current grammar histogram. */
 TEST(probe_d_interface_node) {
-    GpaMetrics m = gpa_metrics("iface.d",
-        "interface IWriter\n"
-        "{\n"
-        "    void write(string s);\n"
-        "    void flush();\n"
-        "}\n"
-        "\n"
-        "void noop() {}\n");
+    GpaMetrics m = gpa_metrics("iface.d", "interface IWriter\n"
+                                          "{\n"
+                                          "    void write(string s);\n"
+                                          "    void flush();\n"
+                                          "}\n"
+                                          "\n"
+                                          "void noop() {}\n");
     ASSERT_TRUE(m.ok);
     /* RED: D interface not yet yielding Interface node. */
     ASSERT_TRUE(m.types >= 1); /* expected RED */
@@ -864,20 +840,16 @@ TEST(probe_d_interface_node) {
 
 /* D: an exact root module import remains a counted quality gap. */
 TEST(probe_d_imports_edge) {
-    static const GpaFile files[] = {
-        {"util.d",
-         "module util;\n"
-         "\n"
-         "int double_val(int x) { return x * 2; }\n"},
-        {"main.d",
-         "module main;\n"
-         "\n"
-         "import util;\n"
-         "\n"
-         "void run() {\n"
-         "    int y = double_val(21);\n"
-         "}\n"}
-    };
+    static const GpaFile files[] = {{"util.d", "module util;\n"
+                                               "\n"
+                                               "int double_val(int x) { return x * 2; }\n"},
+                                    {"main.d", "module main;\n"
+                                               "\n"
+                                               "import util;\n"
+                                               "\n"
+                                               "void run() {\n"
+                                               "    int y = double_val(21);\n"
+                                               "}\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 
@@ -919,14 +891,13 @@ TEST(probe_d_imports_edge) {
 
 /* Emacs Lisp: two `defun` definitions → 2 Function nodes. */
 TEST(probe_emacslisp_functions) {
-    GpaMetrics m = gpa_metrics("util.el",
-        "(defun el-square (x)\n"
-        "  \"Return X squared.\"\n"
-        "  (* x x))\n"
-        "\n"
-        "(defun el-cube (x)\n"
-        "  \"Return X cubed.\"\n"
-        "  (* x (el-square x)))\n");
+    GpaMetrics m = gpa_metrics("util.el", "(defun el-square (x)\n"
+                                          "  \"Return X squared.\"\n"
+                                          "  (* x x))\n"
+                                          "\n"
+                                          "(defun el-cube (x)\n"
+                                          "  \"Return X cubed.\"\n"
+                                          "  (* x (el-square x)))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both defun forms must produce Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -935,14 +906,13 @@ TEST(probe_emacslisp_functions) {
 
 /* Emacs Lisp: defvar / defconst — global variable definitions. */
 TEST(probe_emacslisp_defvar) {
-    GpaMetrics m = gpa_metrics("config.el",
-        "(defvar my-config-max 100\n"
-        "  \"Maximum value for config.\")\n"
-        "\n"
-        "(defconst my-version \"1.0\"\n"
-        "  \"Package version.\")\n"
-        "\n"
-        "(defun my-get-max () my-config-max)\n");
+    GpaMetrics m = gpa_metrics("config.el", "(defvar my-config-max 100\n"
+                                            "  \"Maximum value for config.\")\n"
+                                            "\n"
+                                            "(defconst my-version \"1.0\"\n"
+                                            "  \"Package version.\")\n"
+                                            "\n"
+                                            "(defun my-get-max () my-config-max)\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum the defun should produce a Function node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -951,16 +921,12 @@ TEST(probe_emacslisp_defvar) {
 
 /* Emacs Lisp: feature names alone do not establish source-file locations. */
 TEST(probe_emacslisp_imports_edge) {
-    static const GpaFile files[] = {
-        {"math-util.el",
-         "(provide 'math-util)\n"
-         "\n"
-         "(defun math-util-double (x) (* 2 x))\n"},
-        {"main.el",
-         "(require 'math-util)\n"
-         "\n"
-         "(defun main-run (n) (math-util-double n))\n"}
-    };
+    static const GpaFile files[] = {{"math-util.el", "(provide 'math-util)\n"
+                                                     "\n"
+                                                     "(defun math-util-double (x) (* 2 x))\n"},
+                                    {"main.el", "(require 'math-util)\n"
+                                                "\n"
+                                                "(defun main-run (n) (math-util-double n))\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 
@@ -1026,12 +992,11 @@ TEST(probe_emacslisp_imports_edge) {
 
 /* Fennel: two `fn` definitions → 2 Function nodes. */
 TEST(probe_fennel_functions) {
-    GpaMetrics m = gpa_metrics("ops.fnl",
-        "(fn add [a b]\n"
-        "  (+ a b))\n"
-        "\n"
-        "(fn mul [a b]\n"
-        "  (* a b))\n");
+    GpaMetrics m = gpa_metrics("ops.fnl", "(fn add [a b]\n"
+                                          "  (+ a b))\n"
+                                          "\n"
+                                          "(fn mul [a b]\n"
+                                          "  (* a b))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both fn forms must be Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -1040,10 +1005,9 @@ TEST(probe_fennel_functions) {
 
 /* Fennel: `lambda` (shorthand fn) definition. */
 TEST(probe_fennel_lambda) {
-    GpaMetrics m = gpa_metrics("lambdas.fnl",
-        "(fn double [x] (* 2 x))\n"
-        "(fn square [x] (* x x))\n"
-        "(fn cube [x] (* x x x))\n");
+    GpaMetrics m = gpa_metrics("lambdas.fnl", "(fn double [x] (* 2 x))\n"
+                                              "(fn square [x] (* x x))\n"
+                                              "(fn cube [x] (* x x x))\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: all three fn forms must be Function nodes. */
     ASSERT_TRUE(m.functions >= 3);
@@ -1124,11 +1088,10 @@ TEST(probe_fennel_imports_edge) {
 
 /* Fish: single function definition → at least 1 Function node. */
 TEST(probe_fish_function_node) {
-    GpaMetrics m = gpa_metrics("greet.fish",
-        "function greet\n"
-        "    set name $argv[1]\n"
-        "    echo \"Hello, $name!\"\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("greet.fish", "function greet\n"
+                                             "    set name $argv[1]\n"
+                                             "    echo \"Hello, $name!\"\n"
+                                             "end\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: the function must appear as a node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -1139,14 +1102,13 @@ TEST(probe_fish_function_node) {
  * The P5 CALL_CASES fixture has 2 fns but histogram shows Function:1.
  * RED: second fish function not extracted (possible grammar gap in extractor). */
 TEST(probe_fish_two_functions) {
-    GpaMetrics m = gpa_metrics("funcs.fish",
-        "function say_hello\n"
-        "    echo \"Hello!\"\n"
-        "end\n"
-        "\n"
-        "function say_bye\n"
-        "    echo \"Bye!\"\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("funcs.fish", "function say_hello\n"
+                                             "    echo \"Hello!\"\n"
+                                             "end\n"
+                                             "\n"
+                                             "function say_bye\n"
+                                             "    echo \"Bye!\"\n"
+                                             "end\n");
     ASSERT_TRUE(m.ok);
     /* RED: only 1 of the 2 fish functions appears to be extracted (histogram gap). */
     ASSERT_TRUE(m.functions >= 2); /* expected RED — second fn not extracted */
@@ -1155,10 +1117,9 @@ TEST(probe_fish_two_functions) {
 
 /* Fish has no OOP and no import mechanism; verify no spurious type nodes. */
 TEST(probe_fish_no_type_nodes) {
-    GpaMetrics m = gpa_metrics("noop.fish",
-        "function noop\n"
-        "    true\n"
-        "end\n");
+    GpaMetrics m = gpa_metrics("noop.fish", "function noop\n"
+                                            "    true\n"
+                                            "end\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: fish produces 0 type-like nodes. */
     ASSERT_TRUE(m.types == 0);
@@ -1175,10 +1136,9 @@ TEST(probe_fish_no_type_nodes) {
 
 /* F#: two `let` function bindings → 2 Function nodes. */
 TEST(probe_fsharp_functions) {
-    GpaMetrics m = gpa_metrics("calc.fs",
-        "let square x = x * x\n"
-        "\n"
-        "let cube x = x * square x\n");
+    GpaMetrics m = gpa_metrics("calc.fs", "let square x = x * x\n"
+                                          "\n"
+                                          "let cube x = x * square x\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both let-bindings must produce Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -1189,15 +1149,14 @@ TEST(probe_fsharp_functions) {
  * RED: the grammar histogram shows only Function/Module; record types not yet
  *      extracted as Type/Struct nodes. */
 TEST(probe_fsharp_record_type) {
-    GpaMetrics m = gpa_metrics("model.fs",
-        "type Point = { X: float; Y: float }\n"
-        "\n"
-        "let origin = { X = 0.0; Y = 0.0 }\n"
-        "\n"
-        "let dist (a: Point) (b: Point) =\n"
-        "    let dx = a.X - b.X\n"
-        "    let dy = a.Y - b.Y\n"
-        "    sqrt (dx*dx + dy*dy)\n");
+    GpaMetrics m = gpa_metrics("model.fs", "type Point = { X: float; Y: float }\n"
+                                           "\n"
+                                           "let origin = { X = 0.0; Y = 0.0 }\n"
+                                           "\n"
+                                           "let dist (a: Point) (b: Point) =\n"
+                                           "    let dx = a.X - b.X\n"
+                                           "    let dy = a.Y - b.Y\n"
+                                           "    sqrt (dx*dx + dy*dy)\n");
     ASSERT_TRUE(m.ok);
     /* RED: F# record type not yet extracted as a Type/Struct node. */
     ASSERT_TRUE(m.types >= 1); /* expected RED */
@@ -1207,15 +1166,14 @@ TEST(probe_fsharp_record_type) {
 /* F#: discriminated union → type-like node.
  * RED: same root cause as record types. */
 TEST(probe_fsharp_discriminated_union) {
-    GpaMetrics m = gpa_metrics("shape.fs",
-        "type Shape =\n"
-        "    | Circle of float\n"
-        "    | Rectangle of float * float\n"
-        "\n"
-        "let area shape =\n"
-        "    match shape with\n"
-        "    | Circle r -> System.Math.PI * r * r\n"
-        "    | Rectangle (w, h) -> w * h\n");
+    GpaMetrics m = gpa_metrics("shape.fs", "type Shape =\n"
+                                           "    | Circle of float\n"
+                                           "    | Rectangle of float * float\n"
+                                           "\n"
+                                           "let area shape =\n"
+                                           "    match shape with\n"
+                                           "    | Circle r -> System.Math.PI * r * r\n"
+                                           "    | Rectangle (w, h) -> w * h\n");
     ASSERT_TRUE(m.ok);
     /* RED: F# discriminated union not yet extracted as a Type node. */
     ASSERT_TRUE(m.types >= 1); /* expected RED */
@@ -1225,15 +1183,14 @@ TEST(probe_fsharp_discriminated_union) {
 /* F#: class with `inherit` → Class node + INHERITS edge.
  * RED: class nodes not in histogram; no F# INHERITS resolver. */
 TEST(probe_fsharp_class_inherits) {
-    GpaMetrics m = gpa_metrics("oop.fs",
-        "type Animal(name: string) =\n"
-        "    member _.Name = name\n"
-        "    abstract member Speak: unit -> string\n"
-        "    default _.Speak() = \"...\"\n"
-        "\n"
-        "type Dog(name: string) =\n"
-        "    inherit Animal(name)\n"
-        "    override _.Speak() = \"Woof!\"\n");
+    GpaMetrics m = gpa_metrics("oop.fs", "type Animal(name: string) =\n"
+                                         "    member _.Name = name\n"
+                                         "    abstract member Speak: unit -> string\n"
+                                         "    default _.Speak() = \"...\"\n"
+                                         "\n"
+                                         "type Dog(name: string) =\n"
+                                         "    inherit Animal(name)\n"
+                                         "    override _.Speak() = \"Woof!\"\n");
     ASSERT_TRUE(m.ok);
     /* RED: F# OOP class/inherit not yet modeled by the extractor. */
     ASSERT_TRUE(m.types >= 1);    /* expected RED — no F# class extraction */
@@ -1243,19 +1200,15 @@ TEST(probe_fsharp_class_inherits) {
 
 /* F#: source membership and compilation order accompany the exact open gap. */
 TEST(probe_fsharp_imports_edge) {
-    static const GpaFile files[] = {
-        {"MathUtils.fs",
-         "module MathUtils\n"
-         "\n"
-         "let double x = x * 2\n"
-         "let triple x = x * 3\n"},
-        {"Main.fs",
-         "module Main\n"
-         "\n"
-         "open MathUtils\n"
-         "\n"
-         "let run n = double n + triple n\n"}
-    };
+    static const GpaFile files[] = {{"MathUtils.fs", "module MathUtils\n"
+                                                     "\n"
+                                                     "let double x = x * 2\n"
+                                                     "let triple x = x * 3\n"},
+                                    {"Main.fs", "module Main\n"
+                                                "\n"
+                                                "open MathUtils\n"
+                                                "\n"
+                                                "let run n = double n + triple n\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 
@@ -1324,14 +1277,13 @@ TEST(probe_fsharp_imports_edge) {
 
 /* Gleam: two `pub fn` definitions → 2 Function nodes. */
 TEST(probe_gleam_functions) {
-    GpaMetrics m = gpa_metrics("math.gleam",
-        "pub fn square(x: Int) -> Int {\n"
-        "  x * x\n"
-        "}\n"
-        "\n"
-        "pub fn cube(x: Int) -> Int {\n"
-        "  x * square(x)\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("math.gleam", "pub fn square(x: Int) -> Int {\n"
+                                             "  x * x\n"
+                                             "}\n"
+                                             "\n"
+                                             "pub fn cube(x: Int) -> Int {\n"
+                                             "  x * square(x)\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both pub fn definitions must produce Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -1340,14 +1292,13 @@ TEST(probe_gleam_functions) {
 
 /* Gleam: private (non-pub) function — must also produce a Function node. */
 TEST(probe_gleam_private_function) {
-    GpaMetrics m = gpa_metrics("util.gleam",
-        "fn internal_double(x: Int) -> Int {\n"
-        "  x * 2\n"
-        "}\n"
-        "\n"
-        "pub fn double(x: Int) -> Int {\n"
-        "  internal_double(x)\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("util.gleam", "fn internal_double(x: Int) -> Int {\n"
+                                             "  x * 2\n"
+                                             "}\n"
+                                             "\n"
+                                             "pub fn double(x: Int) -> Int {\n"
+                                             "  internal_double(x)\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: both the private and public fn must become Function nodes. */
     ASSERT_TRUE(m.functions >= 2);
@@ -1357,18 +1308,17 @@ TEST(probe_gleam_private_function) {
 /* Gleam: custom type definition → type-like node.
  * RED: histogram shows Function/Module only; custom types not yet extracted. */
 TEST(probe_gleam_custom_type) {
-    GpaMetrics m = gpa_metrics("types.gleam",
-        "pub type Shape {\n"
-        "  Circle(Float)\n"
-        "  Rectangle(Float, Float)\n"
-        "}\n"
-        "\n"
-        "pub fn area(s: Shape) -> Float {\n"
-        "  case s {\n"
-        "    Circle(r) -> 3.14159 *. r *. r\n"
-        "    Rectangle(w, h) -> w *. h\n"
-        "  }\n"
-        "}\n");
+    GpaMetrics m = gpa_metrics("types.gleam", "pub type Shape {\n"
+                                              "  Circle(Float)\n"
+                                              "  Rectangle(Float, Float)\n"
+                                              "}\n"
+                                              "\n"
+                                              "pub fn area(s: Shape) -> Float {\n"
+                                              "  case s {\n"
+                                              "    Circle(r) -> 3.14159 *. r *. r\n"
+                                              "    Rectangle(w, h) -> w *. h\n"
+                                              "  }\n"
+                                              "}\n");
     ASSERT_TRUE(m.ok);
     /* RED: Gleam custom type not yet extracted as a Type node. */
     ASSERT_TRUE(m.types >= 1); /* expected RED */
@@ -1377,18 +1327,14 @@ TEST(probe_gleam_custom_type) {
 
 /* Gleam: count the configured src module import and reject unconfigured joins. */
 TEST(probe_gleam_imports_edge) {
-    static const GpaFile files[] = {
-        {"math_utils.gleam",
-         "pub fn double(x: Int) -> Int {\n"
-         "  x * 2\n"
-         "}\n"},
-        {"main.gleam",
-         "import math_utils\n"
-         "\n"
-         "pub fn run(n: Int) -> Int {\n"
-         "  math_utils.double(n)\n"
-         "}\n"}
-    };
+    static const GpaFile files[] = {{"math_utils.gleam", "pub fn double(x: Int) -> Int {\n"
+                                                         "  x * 2\n"
+                                                         "}\n"},
+                                    {"main.gleam", "import math_utils\n"
+                                                   "\n"
+                                                   "pub fn run(n: Int) -> Int {\n"
+                                                   "  math_utils.double(n)\n"
+                                                   "}\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
 

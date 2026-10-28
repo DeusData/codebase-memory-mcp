@@ -602,8 +602,8 @@ static int ktc_write_fixture(const char *dir) {
         char rel[96];
         char body[128];
         snprintf(rel, sizeof(rel), "src/main/kotlin/com/acme/pad/Pad%d.kt", i);
-        snprintf(body, sizeof(body), "package com.acme.pad\n\nclass Pad%d {\n    fun v%d(): Int = %d\n}\n",
-                 i, i, i);
+        snprintf(body, sizeof(body),
+                 "package com.acme.pad\n\nclass Pad%d {\n    fun v%d(): Int = %d\n}\n", i, i, i);
         if (th_write_file(TH_PATH(dir, rel), body) != 0) {
             return -1;
         }

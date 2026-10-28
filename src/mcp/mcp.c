@@ -784,7 +784,8 @@ static const tool_def_t TOOLS[] = {
      "\"default\":\"none\",\"description\":\"Coverage rows: counts, five samples, or up to "
      "500.\"},"
      "\"resolver_capabilities\":{\"type\":\"boolean\",\"default\":false,"
-     "\"description\":\"Include every language's configured syntax, supported proof subsets and "
+     "\"description\":\"Include every language's configured syntax, per-edge support, proof "
+     "subsets and "
      "limitations.\"},"
      "\"resolver_offset\":{\"type\":\"integer\",\"minimum\":0,\"default\":0,"
      "\"description\":\"Offset for abstained resolver occurrences.\"},"
@@ -7542,6 +7543,26 @@ static bool add_resolver_miss(const cbm_resolve_record_t *row, void *context) {
            yyjson_mut_arr_add_val(writer->rows, item);
 }
 
+static bool add_resolver_edge_capabilities(yyjson_mut_doc *doc, yyjson_mut_val *row,
+                                           const cbm_resolve_capabilities_t *cap) {
+    yyjson_mut_val *edges = yyjson_mut_arr(doc);
+    if (!edges)
+        return false;
+    for (int i = 0; i < CBM_RESOLVE_EDGE_COUNT; i++) {
+        const cbm_resolve_edge_capability_t *capability = &cap->edges[i];
+        const char *availability = capability->availability == CBM_RESOLVE_EDGE_SUPPORTED_SUBSET
+                                       ? "supported_subset"
+                                       : "unsupported";
+        yyjson_mut_val *edge = yyjson_mut_obj(doc);
+        if (!edge || !yyjson_mut_obj_add_str(doc, edge, "relation", capability->relation) ||
+            !yyjson_mut_obj_add_str(doc, edge, "availability", availability) ||
+            !yyjson_mut_obj_add_str(doc, edge, "limitation", capability->limitation) ||
+            !yyjson_mut_arr_add_val(edges, edge))
+            return false;
+    }
+    return yyjson_mut_obj_add_val(doc, row, "edge_capabilities", edges);
+}
+
 static bool add_resolver_capabilities(yyjson_mut_doc *doc, yyjson_mut_val *root) {
     static const struct {
         uint32_t flag;
@@ -7570,7 +7591,8 @@ static bool add_resolver_capabilities(yyjson_mut_doc *doc, yyjson_mut_val *root)
                   yyjson_mut_obj_add_bool(doc, syntax, "imports", cap.syntax_imports) &&
                   yyjson_mut_obj_add_bool(doc, syntax, "writes", cap.syntax_writes) &&
                   yyjson_mut_obj_add_val(doc, row, "syntax_configured", syntax) &&
-                  yyjson_mut_obj_add_val(doc, row, "supported_proof_subsets", proofs);
+                  yyjson_mut_obj_add_val(doc, row, "supported_proof_subsets", proofs) &&
+                  add_resolver_edge_capabilities(doc, row, &cap);
         for (size_t j = 0; ok && j < sizeof(features) / sizeof(features[0]); j++)
             if (cap.proof_subsets & features[j].flag)
                 ok = yyjson_mut_arr_add_str(doc, proofs, features[j].name);

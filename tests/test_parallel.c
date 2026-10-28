@@ -973,24 +973,23 @@ TEST(parallel_args_json_no_overflow) {
  * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
  * ImageController actions, 2026-10-18). `small` has the same body and is the
  * control that the fixture produces all three at all. Both resolvers. */
-static const char f14_body[] =
-    "    total = 0\n"
-    "    for item in range(10):\n"
-    "        if item % 3 == 0:\n"
-    "            total += item * 2\n"
-    "        elif item % 5 == 1:\n"
-    "            total -= len(str(item))\n"
-    "        else:\n"
-    "            total ^= hash((item, total))\n"
-    "    values = [x * x for x in range(total % 7 + 3)]\n"
-    "    mapping = {str(k): v for k, v in enumerate(values)}\n"
-    "    while total > 100:\n"
-    "        total //= 3\n"
-    "    try:\n"
-    "        result = sorted(mapping.items(), key=lambda kv: kv[1])\n"
-    "    except ValueError as err:\n"
-    "        result = [(\"error\", str(err))]\n"
-    "    return result, total, mapping\n";
+static const char f14_body[] = "    total = 0\n"
+                               "    for item in range(10):\n"
+                               "        if item % 3 == 0:\n"
+                               "            total += item * 2\n"
+                               "        elif item % 5 == 1:\n"
+                               "            total -= len(str(item))\n"
+                               "        else:\n"
+                               "            total ^= hash((item, total))\n"
+                               "    values = [x * x for x in range(total % 7 + 3)]\n"
+                               "    mapping = {str(k): v for k, v in enumerate(values)}\n"
+                               "    while total > 100:\n"
+                               "        total //= 3\n"
+                               "    try:\n"
+                               "        result = sorted(mapping.items(), key=lambda kv: kv[1])\n"
+                               "    except ValueError as err:\n"
+                               "        result = [(\"error\", str(err))]\n"
+                               "    return result, total, mapping\n";
 
 static bool f14_props_have(const cbm_gbuf_t *gb, const char *project, const char *name,
                            const char *venue) {
@@ -1011,8 +1010,8 @@ TEST(parallel_wide_definition_keeps_fp_sp_bt_f14) {
     char params[CBM_SZ_4K];
     size_t pos = 0;
     for (int i = 0; i < 50; i++) {
-        pos += (size_t)snprintf(params + pos, sizeof(params) - pos, "%sp%02d: Dict[str, int] = None",
-                                i ? ", " : "", i);
+        pos += (size_t)snprintf(params + pos, sizeof(params) - pos,
+                                "%sp%02d: Dict[str, int] = None", i ? ", " : "", i);
     }
     char src[CBM_SZ_8K];
     snprintf(src, sizeof(src), "def small(a, b):\n%s\n\ndef wide(%s):\n%s", f14_body, params,
@@ -5939,7 +5938,6 @@ TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue118
     ASSERT_EQ(php_xfile_run("use Exception;\n"), 1);
     PASS();
 }
-
 
 /* A fresh PHP external row replaces stale evidence for its exact occurrence,
  * including an older external row, without clearing a real project invocation

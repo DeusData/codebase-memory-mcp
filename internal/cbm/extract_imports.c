@@ -35,6 +35,7 @@ static void parse_lua_imports(CBMExtractCtx *ctx);
 static void parse_r_imports(CBMExtractCtx *ctx);
 static void parse_kotlin_imports(CBMExtractCtx *ctx);
 static void parse_dart_imports(CBMExtractCtx *ctx);
+static bool push_literal_relative_import(CBMExtractCtx *ctx, TSNode node);
 static void parse_haskell_imports(CBMExtractCtx *ctx);
 static void parse_zig_imports(CBMExtractCtx *ctx);
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type);
@@ -58,6 +59,7 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx);
 static void parse_kconfig_imports(CBMExtractCtx *ctx);
 static void parse_gn_imports(CBMExtractCtx *ctx);
 static void parse_just_imports(CBMExtractCtx *ctx);
+static void parse_func_imports(CBMExtractCtx *ctx);
 static void parse_nix_imports(CBMExtractCtx *ctx);
 static void parse_jsonnet_imports(CBMExtractCtx *ctx);
 static void parse_pkl_imports(CBMExtractCtx *ctx);
@@ -2385,12 +2387,65 @@ static bool find_first_descendant_of(TSNode node, const char *type, // NOLINT(mi
     return false;
 }
 
+/* A dependency URI needs the complete direct-import shape. In particular,
+ * the first string inside a conditional import or an export is not evidence
+ * that this library is the selected dependency. The shared literal helper
+ * subsequently audits the complete token, including escapes and interpolation. */
+static bool dart_direct_import(TSNode declaration, TSNode uri) {
+    enum { DART_IMPORT_MAX_NODES = 256, DART_IMPORT_MAX_DEPTH = 32 };
+    if (ts_node_is_null(declaration) || ts_node_has_error(declaration))
+        return false;
+    TSTreeCursor cursor = ts_tree_cursor_new(declaration);
+    unsigned depth = 0, visited = 0, imports = 0, strings = 0;
+    bool valid = true;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool literal = !strcmp(kind, "string_literal");
+        if (++visited > DART_IMPORT_MAX_NODES || depth > DART_IMPORT_MAX_DEPTH ||
+            ts_node_is_missing(node) || ts_node_has_error(node) || !strcmp(kind, "deferred")) {
+            valid = false;
+            break;
+        }
+        if (literal) {
+            strings++;
+            if (!ts_node_eq(node, uri)) {
+                valid = false;
+                break;
+            }
+        } else if (ts_node_is_named(node)) {
+            if (!strcmp(kind, "library_import"))
+                imports++;
+            else if (strcmp(kind, "import_or_export") && strcmp(kind, "import_specification") &&
+                     strcmp(kind, "configurable_uri") && strcmp(kind, "uri") &&
+                     strcmp(kind, "combinator") && strcmp(kind, "identifier_list") &&
+                     strcmp(kind, "identifier") && strcmp(kind, "comment") &&
+                     strcmp(kind, "documentation_comment")) {
+                valid = false;
+                break;
+            }
+        }
+        if (!literal && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto done;
+            depth--;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    return valid && imports == 1 && strings == 1;
+}
+
 // --- Dart imports ---
 // tree-sitter-dart wraps each top-level import as `import_or_export`; the URI is
 // a `string_literal` nested under library_import -> import_specification ->
 // configurable_uri -> uri. The old dispatch matched "import_declaration" (which
-// tree-sitter-dart never emits) -> 0 imports. Find the first string_literal under
-// each import_or_export and strip its quotes.
+// tree-sitter-dart never emits) -> 0 imports. Preserve unproven raw carriers for
+// diagnostics, but only a complete direct-import URI gains path authority.
 static void parse_dart_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -2405,6 +2460,8 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
         }
         TSNode uri = node;
         if (find_first_descendant_of(node, "string_literal", &uri)) {
+            if (dart_direct_import(node, uri) && push_literal_relative_import(ctx, uri))
+                continue;
             char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
             if (path && path[0]) {
                 CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
@@ -3005,20 +3062,20 @@ static bool embedded_binding_identifier(const char *source, TSNode value) {
     while (end > start && isspace((unsigned char)source[end - 1]))
         end--;
     if (start == end || !((source[start] >= 'a' && source[start] <= 'z') ||
-                          (source[start] >= 'A' && source[start] <= 'Z') ||
-                          source[start] == '_' || source[start] == '$'))
+                          (source[start] >= 'A' && source[start] <= 'Z') || source[start] == '_' ||
+                          source[start] == '$'))
         return false;
     for (uint32_t i = start + 1; i < end; i++) {
         unsigned char c = (unsigned char)source[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '_' || c == '$'))
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '$'))
             return false;
     }
     return true;
 }
 
 static bool embedded_binding_attribute(CBMExtractCtx *ctx, TSNode attribute, bool script,
-                                        CBMLanguage *language, unsigned *seen) {
+                                       CBMLanguage *language, unsigned *seen) {
     uint32_t count = ts_node_named_child_count(attribute);
     if (!count || count > 2)
         return false;
@@ -3029,8 +3086,9 @@ static bool embedded_binding_attribute(CBMExtractCtx *ctx, TSNode attribute, boo
     if (!name || !name[0])
         return false;
     if (script) {
-        unsigned flag = ascii_trimmed_equals(name, "lang") ? 1u
-                        : ctx->language == CBM_LANG_VUE && !strcmp(name, "setup") ? 2u : 0u;
+        unsigned flag = ascii_trimmed_equals(name, "lang")                        ? 1u
+                        : ctx->language == CBM_LANG_VUE && !strcmp(name, "setup") ? 2u
+                                                                                  : 0u;
         if (!flag || (*seen & flag) || (flag == 2u && count != 1))
             return false;
         *seen |= flag;
@@ -3051,8 +3109,8 @@ static bool embedded_binding_attribute(CBMExtractCtx *ctx, TSNode attribute, boo
     if (!strncmp(name, "v-", 2) || !strncmp(name, "on", 2))
         return false;
     for (const char *p = name; *p; p++)
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-              (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+              *p == '_' || *p == '-'))
             return false;
     /* Static attribute text cannot conceal a component expression. This is
      * intentionally narrower than either host grammar's value syntax. */
@@ -3063,8 +3121,8 @@ static bool embedded_binding_attribute(CBMExtractCtx *ctx, TSNode attribute, boo
     return true;
 }
 
-static bool embedded_binding_script(CBMExtractCtx *ctx, TSNode script,
-                                     CBMEmbeddedBlock *block, CBMLanguage *language) {
+static bool embedded_binding_script(CBMExtractCtx *ctx, TSNode script, CBMEmbeddedBlock *block,
+                                    CBMLanguage *language) {
     unsigned attributes = 0;
     bool content = false, start_tag = false, end_tag = false;
     uint32_t count = ts_node_named_child_count(script);
@@ -3096,9 +3154,8 @@ static bool embedded_binding_script(CBMExtractCtx *ctx, TSNode script,
 
 TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TSRange *range) {
     if (!ctx || !language || !range ||
-        (ctx->language != CBM_LANG_VUE && ctx->language != CBM_LANG_SVELTE) ||
-        !ctx->source || ctx->source_len <= 0 || ts_node_is_null(ctx->root) ||
-        ts_node_has_error(ctx->root) ||
+        (ctx->language != CBM_LANG_VUE && ctx->language != CBM_LANG_SVELTE) || !ctx->source ||
+        ctx->source_len <= 0 || ts_node_is_null(ctx->root) || ts_node_has_error(ctx->root) ||
         ts_node_end_byte(ctx->root) != (uint32_t)ctx->source_len)
         return NULL;
     enum { BINDING_HOST_STACK = 512, BINDING_HOST_NODES = 1000000 };
@@ -3129,8 +3186,7 @@ TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TS
         bool container = !strcmp(kind, "document") || !strcmp(kind, "element") ||
                          !strcmp(kind, "template_element") || !strcmp(kind, "start_tag") ||
                          !strcmp(kind, "end_tag") || !strcmp(kind, "self_closing_tag");
-        bool leaf = !strcmp(kind, "text") || !strcmp(kind, "comment") ||
-                    !strcmp(kind, "tag_name");
+        bool leaf = !strcmp(kind, "text") || !strcmp(kind, "comment") || !strcmp(kind, "tag_name");
         if (!container && !leaf)
             return NULL;
         uint32_t children = ts_node_named_child_count(node);
@@ -3162,7 +3218,6 @@ TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TS
     }
     return tree;
 }
-
 
 static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock *block,
                                      CBMLanguage embedded_language) {
@@ -3858,6 +3913,32 @@ static bool push_literal_relative_import(CBMExtractCtx *ctx, TSNode node) {
     return true;
 }
 
+/* A literal leaf is evidence only when it is the entire argument of an
+ * audited statement. Ignoring whitespace cannot hide operators or keywords. */
+static bool import_token_side(CBMExtractCtx *ctx, uint32_t start, uint32_t end,
+                              const char *expected) {
+    if (end < start || end > (uint32_t)ctx->source_len)
+        return false;
+    for (uint32_t i = start; i < end; i++) {
+        unsigned char c = (unsigned char)ctx->source[i];
+        if (isspace(c))
+            continue;
+        if (!*expected || c != (unsigned char)*expected++)
+            return false;
+    }
+    return !*expected;
+}
+
+static bool import_literal_envelope(CBMExtractCtx *ctx, TSNode statement, TSNode token,
+                                    const char *prefix, const char *suffix) {
+    if (ts_node_is_null(statement) || ts_node_is_null(token))
+        return false;
+    uint32_t first = ts_node_start_byte(statement), last = ts_node_end_byte(statement);
+    uint32_t start = ts_node_start_byte(token), end = ts_node_end_byte(token);
+    return first <= start && end <= last && import_token_side(ctx, first, start, prefix) &&
+           import_token_side(ctx, end, last, suffix);
+}
+
 // --- CSS / SCSS imports ---
 // CSS @import "x.css" and SCSS @use/@forward 'x' are top-level statements that
 // carry a `string_value` (whose `string_content` is the unquoted path). The
@@ -3910,9 +3991,20 @@ static void parse_css_imports(CBMExtractCtx *ctx) {
                  * proof. An import after a style rule is invalid CSS. */
                 imports_allowed = false;
             }
-        } else if (strcmp(k, "import_statement") == 0 || strcmp(k, "use_statement") == 0 ||
-                   strcmp(k, "forward_statement") == 0 || strcmp(k, "include_statement") == 0) {
-            css_push_import_from_stmt(ctx, node);
+        } else if (!strcmp(k, "use_statement") || !strcmp(k, "forward_statement")) {
+            TSNode token = {0};
+            const char *prefix = !strcmp(k, "use_statement") ? "@use" : "@forward";
+            bool audited = imports_allowed &&
+                           find_first_descendant_of(node, "string_value", &token) &&
+                           import_literal_envelope(ctx, node, token, prefix, ";") &&
+                           push_literal_relative_import(ctx, token);
+            if (!audited)
+                css_push_import_from_stmt(ctx, node);
+        } else if (ctx->language == CBM_LANG_SCSS) {
+            if (!strcmp(k, "import_statement") || !strcmp(k, "include_statement"))
+                css_push_import_from_stmt(ctx, node);
+            if (strcmp(k, "comment") && strcmp(k, "charset_statement"))
+                imports_allowed = false;
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
@@ -4060,39 +4152,52 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx) {
     }
 }
 
-// --- Meson imports: subdir('name') → descend into name/meson.build ---
-// Meson's subdir() includes a child directory's meson.build into the build.
-// The grammar models a call as `function_expression` (id + argument_list).
-// Find subdir() calls and push the directory name as the module path; the
-// pipeline resolver maps "name" → "name/meson.build".
-static void parse_meson_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->root);
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        const char *k = ts_node_type(node);
-        /* tree-sitter-meson models a call as `normal_command` (identifier +
-         * arguments) and string arguments as `string`. */
-        if (strcmp(k, "normal_command") == 0) {
-            uint32_t nc = ts_node_named_child_count(node);
-            if (nc >= 1) {
-                TSNode fn = ts_node_named_child(node, 0);
-                char *fname = cbm_node_text(a, fn, ctx->source);
-                if (fname && strcmp(fname, "subdir") == 0) {
-                    TSNode str = node;
-                    if (find_first_descendant_of(node, "string", &str)) {
-                        char *path = strip_quotes(a, cbm_node_text(a, str, ctx->source));
-                        if (path && path[0]) {
-                            CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                            cbm_imports_push(&ctx->result->imports, a, imp);
-                        }
-                    }
+// --- Meson imports: complete unconditional subdir('name') calls ---
+static void meson_legacy_imports(CBMExtractCtx *ctx, TSNode root, TSNodeStack *stack) {
+    ts_nstack_push(stack, root);
+    while (stack->count > 0) {
+        TSNode node = ts_nstack_pop(stack);
+        if (!strcmp(ts_node_type(node), "normal_command") && ts_node_named_child_count(node)) {
+            char *name = cbm_node_text(ctx->arena, ts_node_named_child(node, 0), ctx->source);
+            TSNode token = {0};
+            if (name && !strcmp(name, "subdir") &&
+                find_first_descendant_of(node, "string", &token)) {
+                char *path =
+                    strip_quotes(ctx->arena, cbm_node_text(ctx->arena, token, ctx->source));
+                if (path && path[0]) {
+                    CBMImport imp = {.local_name = path_last(ctx->arena, path),
+                                     .module_path = path};
+                    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
                 }
             }
         }
-        ts_nstack_push_children(&stack, node);
+        ts_nstack_push_children(stack, node);
+    }
+}
+
+static void parse_meson_imports(CBMExtractCtx *ctx) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    bool unconditional = true;
+    uint32_t count = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode root = ts_node_named_child(ctx->root, i), call = root;
+        if (!strcmp(ts_node_type(root), "comment"))
+            continue;
+        if (!strcmp(ts_node_type(root), "expression_statement") &&
+            ts_node_named_child_count(root) == 1)
+            call = ts_node_named_child(root, 0);
+        TSNode token = {0};
+        bool audited = unconditional && !strcmp(ts_node_type(call), "normal_command") &&
+                       find_first_descendant_of(call, "string", &token) &&
+                       import_literal_envelope(ctx, root, token, "subdir(", ")") &&
+                       push_literal_relative_import(ctx, token);
+        if (!audited) {
+            /* Conditions, subdir_done(), assignments and other calls can change
+             * execution. Preserve carriers, but cannot prove later execution. */
+            unconditional = false;
+            meson_legacy_imports(ctx, root, &stack);
+        }
     }
 }
 
@@ -4134,10 +4239,37 @@ static void parse_just_imports(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         if (strcmp(ts_node_type(node), "import") == 0) {
-            push_string_descendant_import(ctx, node);
+            TSNode token = {0};
+            bool audited = find_first_descendant_of(node, "string", &token) &&
+                           (import_literal_envelope(ctx, node, token, "import", "") ||
+                            import_literal_envelope(ctx, node, token, "import?", ""));
+            if (audited) {
+                uint32_t start = ts_node_start_byte(token), end = ts_node_end_byte(token);
+                audited = end > start + 2 && end <= (uint32_t)ctx->source_len &&
+                          ctx->source[start + 1] != '~' && push_literal_relative_import(ctx, token);
+            }
+            if (!audited)
+                push_string_descendant_import(ctx, node);
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+/* FunC parse_include prefixes the including filename's directory and then
+ * reads the complete string path. No extension or basename search occurs. */
+static void parse_func_imports(CBMExtractCtx *ctx) {
+    uint32_t count = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode node = ts_node_named_child(ctx->root, i), token = {0};
+        if (strcmp(ts_node_type(node), "include_directive"))
+            continue;
+        /* The grammar aliases the complete string literal to include_path. */
+        bool audited = find_first_descendant_of(node, "include_path", &token) &&
+                       import_literal_envelope(ctx, node, token, "#include", ";") &&
+                       push_literal_relative_import(ctx, token);
+        if (!audited)
+            push_string_descendant_import(ctx, node);
+    }
 }
 
 // --- Nix imports: import ./path ---
@@ -4811,6 +4943,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_JUST:
         parse_just_imports(ctx);
+        break;
+    case CBM_LANG_FUNC:
+        parse_func_imports(ctx);
         break;
     case CBM_LANG_MESON:
         parse_meson_imports(ctx);

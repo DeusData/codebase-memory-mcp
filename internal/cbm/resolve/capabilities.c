@@ -69,6 +69,18 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_CAPNP, EDGE(IMPORTS),
      "Complete literal relative import paths; absolute search paths, escaped and concatenated "
      "strings abstain."},
+    {CBM_LANG_JUST, EDGE(IMPORTS),
+     "Complete literal imports relative to the declaring file; home expansion, shell expansion, "
+     "escaping and computed paths abstain."},
+    {CBM_LANG_FUNC, EDGE(IMPORTS),
+     "Complete literal #include paths relative to the including source file; escaped strings, "
+     "computed paths and custom source-provider mappings abstain."},
+    {CBM_LANG_SCSS, EDGE(IMPORTS),
+     "Complete initial literal @use/@forward URLs with unique relative file/partial candidates; "
+     "@import, configured importers, load paths, index directories and effects abstain."},
+    {CBM_LANG_MESON, EDGE(IMPORTS),
+     "Complete literal subdir calls in an unconditional initial statement prefix; parent "
+     "traversal, keyword arguments, conditions and prior unknown effects abstain."},
     {CBM_LANG_SCALA, EDGE(IMPORTS),
      "Exact declared namespace members only; no semantic binding proof bridge advertised."},
     {CBM_LANG_HCL, EDGE(IMPORTS) | EDGE(USAGE),

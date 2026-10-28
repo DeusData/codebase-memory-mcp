@@ -4323,8 +4323,7 @@ static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
      * source binding, including shadowing, still decides whether it emits. */
     if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
          ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
-        !ts_node_is_null(callee->expr) &&
-        strcmp(ts_node_type(callee->expr), "identifier") == 0) {
+        !ts_node_is_null(callee->expr) && strcmp(ts_node_type(callee->expr), "identifier") == 0) {
         return true;
     }
     /* CSS function names occupy a grammar-proven callable role. Generic keyword

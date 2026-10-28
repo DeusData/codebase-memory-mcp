@@ -389,17 +389,17 @@ typedef struct {
 // members, C include delimiters, and Rust module declarations carry distinct
 // evidence and must not be conflated with a default module/class binding.
 typedef enum {
-    CBM_IMPORT_KIND_DEFAULT = 0,         // module / class / namespace (language default)
-    CBM_IMPORT_KIND_FUNCTION,            // PHP `use function A\b`
-    CBM_IMPORT_KIND_CONST,               // PHP `use const A\B`
-    CBM_IMPORT_KIND_INCLUDE_QUOTED,      // C-family include relative to the importing file
-    CBM_IMPORT_KIND_INCLUDE_SYSTEM,      // C-family include requiring configured search roots
-    CBM_IMPORT_KIND_MODULE_DECLARATION,  // Rust `mod name;` file membership
-    CBM_IMPORT_KIND_PYTHON_MODULE_ROOT,  // `import a.b`: binds root a
-    CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS, // `import a.b as x`: binds module a.b
-    CBM_IMPORT_KIND_PYTHON_FROM,         // `from a import b`: binds member/submodule b
+    CBM_IMPORT_KIND_DEFAULT = 0,           // module / class / namespace (language default)
+    CBM_IMPORT_KIND_FUNCTION,              // PHP `use function A\b`
+    CBM_IMPORT_KIND_CONST,                 // PHP `use const A\B`
+    CBM_IMPORT_KIND_INCLUDE_QUOTED,        // C-family include relative to the importing file
+    CBM_IMPORT_KIND_INCLUDE_SYSTEM,        // C-family include requiring configured search roots
+    CBM_IMPORT_KIND_MODULE_DECLARATION,    // Rust `mod name;` file membership
+    CBM_IMPORT_KIND_PYTHON_MODULE_ROOT,    // `import a.b`: binds root a
+    CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS,   // `import a.b as x`: binds module a.b
+    CBM_IMPORT_KIND_PYTHON_FROM,           // `from a import b`: binds member/submodule b
     CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH, // audited complete literal, relative to source file
-    CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN, // runtime include lookup has no captured path authority
+    CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN,  // runtime include lookup has no captured path authority
 } CBMImportKind;
 
 typedef struct {

@@ -66,39 +66,45 @@ typedef struct {
 } GpeProj;
 
 typedef struct {
-    const char *name;    /* relative filename, may include '/' for subdirs */
+    const char *name; /* relative filename, may include '/' for subdirs */
     const char *content;
 } GpeFile;
 
 static void gpe_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\') *p = '/';
+        if (*p == '\\')
+            *p = '/';
     }
 }
 
 static cbm_store_t *gpe_open_indexed(GpeProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
+    if (!lp->project)
+        return NULL;
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+    if (!home)
+        home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv) return NULL;
+    if (!lp->srv)
+        return NULL;
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp) free(resp);
+    if (resp)
+        free(resp);
     return cbm_store_open_path(lp->dbpath);
 }
 
 static cbm_store_t *gpe_index_files(GpeProj *lp, const GpeFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_gpe_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir))
+        return NULL;
     gpe_to_fwd_slashes(lp->tmpdir);
     for (int i = 0; i < nfiles; i++) {
         char path[700];
@@ -110,7 +116,8 @@ static cbm_store_t *gpe_index_files(GpeProj *lp, const GpeFile *files, int nfile
             *slash = '/';
         }
         FILE *f = fopen(path, "wb");
-        if (!f) return NULL;
+        if (!f)
+            return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
@@ -118,8 +125,12 @@ static cbm_store_t *gpe_index_files(GpeProj *lp, const GpeFile *files, int nfile
 }
 
 static void gpe_cleanup(GpeProj *lp, cbm_store_t *store) {
-    if (store) cbm_store_close(store);
-    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
+    if (store)
+        cbm_store_close(store);
+    if (lp->srv) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+    }
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
@@ -144,11 +155,12 @@ static int gpe_count_label(cbm_store_t *store, const char *project, const char *
 
 /* Sum of all type-like labels. */
 static int gpe_type_nodes(cbm_store_t *store, const char *project) {
-    static const char *labels[] = {"Class","Struct","Interface","Enum","Trait","Type",NULL};
+    static const char *labels[] = {"Class", "Struct", "Interface", "Enum", "Trait", "Type", NULL};
     int total = 0;
     for (int i = 0; labels[i]; i++) {
         int n = gpe_count_label(store, project, labels[i]);
-        if (n > 0) total += n;
+        if (n > 0)
+            total += n;
     }
     return total;
 }
@@ -159,9 +171,9 @@ typedef struct {
     int total_nodes;
     int functions;
     int methods;
-    int types;     /* type-like sum */
-    int imports;   /* IMPORTS edges */
-    int inherits;  /* INHERITS edges */
+    int types;    /* type-like sum */
+    int imports;  /* IMPORTS edges */
+    int inherits; /* INHERITS edges */
 } GpeMetrics;
 
 static GpeMetrics gpe_metrics_files(const GpeFile *files, int nfiles) {
@@ -169,13 +181,13 @@ static GpeMetrics gpe_metrics_files(const GpeFile *files, int nfiles) {
     cbm_store_t *store = gpe_index_files(&lp, files, nfiles);
     GpeMetrics m = {0};
     if (store) {
-        m.ok          = 1;
+        m.ok = 1;
         m.total_nodes = cbm_store_count_nodes(store, lp.project);
-        m.functions   = gpe_count_label(store, lp.project, "Function");
-        m.methods     = gpe_count_label(store, lp.project, "Method");
-        m.types       = gpe_type_nodes(store, lp.project);
-        m.imports     = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
-        m.inherits    = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
+        m.functions = gpe_count_label(store, lp.project, "Function");
+        m.methods = gpe_count_label(store, lp.project, "Method");
+        m.types = gpe_type_nodes(store, lp.project);
+        m.imports = cbm_store_count_edges_by_type(store, lp.project, "IMPORTS");
+        m.inherits = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
     }
     gpe_cleanup(&lp, store);
     return m;
@@ -247,15 +259,14 @@ static bool gpe_import_quality(const GpeFile *files, size_t file_count, const RQ
 
 /* Protobuf: single message definition → at least 1 Class node. */
 TEST(probe_proto_message_node) {
-    GpeMetrics m = gpe_metrics("user.proto",
-        "syntax = \"proto3\";\n"
-        "package user;\n"
-        "\n"
-        "message User {\n"
-        "  int64  id    = 1;\n"
-        "  string name  = 2;\n"
-        "  string email = 3;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("user.proto", "syntax = \"proto3\";\n"
+                                             "package user;\n"
+                                             "\n"
+                                             "message User {\n"
+                                             "  int64  id    = 1;\n"
+                                             "  string name  = 2;\n"
+                                             "  string email = 3;\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: the `message` definition must produce a Class node. */
     ASSERT_TRUE(m.types >= 1);
@@ -265,17 +276,16 @@ TEST(probe_proto_message_node) {
 /* Protobuf: service definition — whether the service itself or its RPC
  * methods produce extractable nodes. */
 TEST(probe_proto_service_node) {
-    GpeMetrics m = gpe_metrics("svc.proto",
-        "syntax = \"proto3\";\n"
-        "package svc;\n"
-        "\n"
-        "message Req  { string query = 1; }\n"
-        "message Resp { string result = 1; }\n"
-        "\n"
-        "service SearchService {\n"
-        "  rpc Search(Req) returns (Resp);\n"
-        "  rpc Suggest(Req) returns (Resp);\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("svc.proto", "syntax = \"proto3\";\n"
+                                            "package svc;\n"
+                                            "\n"
+                                            "message Req  { string query = 1; }\n"
+                                            "message Resp { string result = 1; }\n"
+                                            "\n"
+                                            "service SearchService {\n"
+                                            "  rpc Search(Req) returns (Resp);\n"
+                                            "  rpc Suggest(Req) returns (Resp);\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least the two message defs must produce Class nodes. */
     ASSERT_TRUE(m.types >= 2);
@@ -284,19 +294,18 @@ TEST(probe_proto_service_node) {
 
 /* Protobuf: enum definition — confirm enum maps to a Class-like node. */
 TEST(probe_proto_enum_node) {
-    GpeMetrics m = gpe_metrics("status.proto",
-        "syntax = \"proto3\";\n"
-        "\n"
-        "enum Status {\n"
-        "  STATUS_UNKNOWN = 0;\n"
-        "  STATUS_ACTIVE  = 1;\n"
-        "  STATUS_INACTIVE = 2;\n"
-        "}\n"
-        "\n"
-        "message Item {\n"
-        "  int64  id     = 1;\n"
-        "  Status status = 2;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("status.proto", "syntax = \"proto3\";\n"
+                                               "\n"
+                                               "enum Status {\n"
+                                               "  STATUS_UNKNOWN = 0;\n"
+                                               "  STATUS_ACTIVE  = 1;\n"
+                                               "  STATUS_INACTIVE = 2;\n"
+                                               "}\n"
+                                               "\n"
+                                               "message Item {\n"
+                                               "  int64  id     = 1;\n"
+                                               "  Status status = 2;\n"
+                                               "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum the message must produce a Class node; enum may add
      * another — total >= 1 is the safe floor. */
@@ -386,14 +395,13 @@ TEST(probe_proto_import_edge) {
 
 /* Thrift: service method → at least 1 Function node. */
 TEST(probe_thrift_service_function) {
-    GpeMetrics m = gpe_metrics("calc.thrift",
-        "namespace go calc\n"
-        "\n"
-        "service Calculator {\n"
-        "  i32 add(1: i32 a, 2: i32 b)\n"
-        "  i32 subtract(1: i32 a, 2: i32 b)\n"
-        "  i32 multiply(1: i32 a, 2: i32 b)\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("calc.thrift", "namespace go calc\n"
+                                              "\n"
+                                              "service Calculator {\n"
+                                              "  i32 add(1: i32 a, 2: i32 b)\n"
+                                              "  i32 subtract(1: i32 a, 2: i32 b)\n"
+                                              "  i32 multiply(1: i32 a, 2: i32 b)\n"
+                                              "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least one service method must appear as a Function node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -405,19 +413,18 @@ TEST(probe_thrift_service_function) {
  *   extraction is not confirmed and may not be implemented in the grammar
  *   extractor. */
 TEST(probe_thrift_struct_node) {
-    GpeMetrics m = gpe_metrics("types.thrift",
-        "namespace go types\n"
-        "\n"
-        "struct User {\n"
-        "  1: required i64    id\n"
-        "  2: required string name\n"
-        "  3: optional string email\n"
-        "}\n"
-        "\n"
-        "struct Address {\n"
-        "  1: required string street\n"
-        "  2: required string city\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("types.thrift", "namespace go types\n"
+                                               "\n"
+                                               "struct User {\n"
+                                               "  1: required i64    id\n"
+                                               "  2: required string name\n"
+                                               "  3: optional string email\n"
+                                               "}\n"
+                                               "\n"
+                                               "struct Address {\n"
+                                               "  1: required string street\n"
+                                               "  2: required string city\n"
+                                               "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1); /* GREEN: at minimum Module node */
     /* RED: Thrift struct not yet extracted as a Struct/Class node. */
@@ -427,21 +434,20 @@ TEST(probe_thrift_struct_node) {
 
 /* Thrift: exception definition — a special struct-like type. */
 TEST(probe_thrift_exception_node) {
-    GpeMetrics m = gpe_metrics("errors.thrift",
-        "namespace go errors\n"
-        "\n"
-        "exception NotFound {\n"
-        "  1: required string message\n"
-        "}\n"
-        "\n"
-        "exception Unauthorized {\n"
-        "  1: required string reason\n"
-        "}\n"
-        "\n"
-        "service Auth {\n"
-        "  void login(1: string user, 2: string pass)\n"
-        "      throws (1: Unauthorized e)\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("errors.thrift", "namespace go errors\n"
+                                                "\n"
+                                                "exception NotFound {\n"
+                                                "  1: required string message\n"
+                                                "}\n"
+                                                "\n"
+                                                "exception Unauthorized {\n"
+                                                "  1: required string reason\n"
+                                                "}\n"
+                                                "\n"
+                                                "service Auth {\n"
+                                                "  void login(1: string user, 2: string pass)\n"
+                                                "      throws (1: Unauthorized e)\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least the service method must appear as a Function node. */
     ASSERT_TRUE(m.functions >= 1);
@@ -532,14 +538,13 @@ TEST(probe_thrift_include_edge) {
 
 /* Cap'n Proto: struct definition → at least 1 Class node. */
 TEST(probe_capnp_struct_node) {
-    GpeMetrics m = gpe_metrics("schema.capnp",
-        "@0xdbb9ad1f14bf0b36;\n"
-        "\n"
-        "struct Person {\n"
-        "  id    @0 :UInt32;\n"
-        "  name  @1 :Text;\n"
-        "  email @2 :Text;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("schema.capnp", "@0xdbb9ad1f14bf0b36;\n"
+                                               "\n"
+                                               "struct Person {\n"
+                                               "  id    @0 :UInt32;\n"
+                                               "  name  @1 :Text;\n"
+                                               "  email @2 :Text;\n"
+                                               "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: the struct must produce a Class node. */
     ASSERT_TRUE(m.types >= 1);
@@ -548,15 +553,14 @@ TEST(probe_capnp_struct_node) {
 
 /* Cap'n Proto: interface definition → Class (or Interface) node. */
 TEST(probe_capnp_interface_node) {
-    GpeMetrics m = gpe_metrics("service.capnp",
-        "@0xabc123def456789a;\n"
-        "\n"
-        "struct Request  { query @0 :Text; }\n"
-        "struct Response { result @0 :Text; }\n"
-        "\n"
-        "interface SearchService {\n"
-        "  search @0 (req :Request) -> (resp :Response);\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("service.capnp", "@0xabc123def456789a;\n"
+                                                "\n"
+                                                "struct Request  { query @0 :Text; }\n"
+                                                "struct Response { result @0 :Text; }\n"
+                                                "\n"
+                                                "interface SearchService {\n"
+                                                "  search @0 (req :Request) -> (resp :Response);\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum the two struct definitions must produce Class nodes. */
     ASSERT_TRUE(m.types >= 2);
@@ -565,19 +569,18 @@ TEST(probe_capnp_interface_node) {
 
 /* Cap'n Proto: enum definition. */
 TEST(probe_capnp_enum_node) {
-    GpeMetrics m = gpe_metrics("enums.capnp",
-        "@0x1234567890abcdef;\n"
-        "\n"
-        "enum Color {\n"
-        "  red   @0;\n"
-        "  green @1;\n"
-        "  blue  @2;\n"
-        "}\n"
-        "\n"
-        "struct Widget {\n"
-        "  color @0 :Color;\n"
-        "  label @1 :Text;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("enums.capnp", "@0x1234567890abcdef;\n"
+                                              "\n"
+                                              "enum Color {\n"
+                                              "  red   @0;\n"
+                                              "  green @1;\n"
+                                              "  blue  @2;\n"
+                                              "}\n"
+                                              "\n"
+                                              "struct Widget {\n"
+                                              "  color @0 :Color;\n"
+                                              "  label @1 :Text;\n"
+                                              "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: the struct must produce a Class node; enum may add another. */
     ASSERT_TRUE(m.types >= 1);
@@ -587,18 +590,14 @@ TEST(probe_capnp_enum_node) {
 /* Cap'n Proto: two-file import → IMPORTS edge.
  * RED: grammar-only Cap'n Proto has no import-resolver pass in the pipeline. */
 TEST(probe_capnp_import_edge) {
-    static const GpeFile files[] = {
-        {"common.capnp",
-         "@0xaabbccddeeff0011;\n"
-         "struct Timestamp { seconds @0 :Int64; }\n"},
-        {"event.capnp",
-         "@0x1122334455667788;\n"
-         "using Common = import \"common.capnp\";\n"
-         "struct Event {\n"
-         "  id        @0 :Text;\n"
-         "  createdAt @1 :Common.Timestamp;\n"
-         "}\n"}
-    };
+    static const GpeFile files[] = {{"common.capnp", "@0xaabbccddeeff0011;\n"
+                                                     "struct Timestamp { seconds @0 :Int64; }\n"},
+                                    {"event.capnp", "@0x1122334455667788;\n"
+                                                    "using Common = import \"common.capnp\";\n"
+                                                    "struct Event {\n"
+                                                    "  id        @0 :Text;\n"
+                                                    "  createdAt @1 :Common.Timestamp;\n"
+                                                    "}\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: Cap'n Proto `import` not resolved into IMPORTS edges. */
@@ -619,12 +618,11 @@ TEST(probe_capnp_import_edge) {
 
 /* WIT: record and enum inside an interface → 2 Class nodes + 1 Function. */
 TEST(probe_wit_record_enum_function) {
-    GpeMetrics m = gpe_metrics("types.wit",
-        "interface geometry {\n"
-        "  record point { x: u32, y: u32 }\n"
-        "  enum color { red, green, blue }\n"
-        "  area: func() -> u32;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("types.wit", "interface geometry {\n"
+                                            "  record point { x: u32, y: u32 }\n"
+                                            "  enum color { red, green, blue }\n"
+                                            "  area: func() -> u32;\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: record → Class, enum → Class, func → Function.
      * Histogram confirms Class:2, Function:1 for this pattern. */
@@ -635,11 +633,10 @@ TEST(probe_wit_record_enum_function) {
 
 /* WIT: world definition as a top-level construct. */
 TEST(probe_wit_world_node) {
-    GpeMetrics m = gpe_metrics("world.wit",
-        "world calculator {\n"
-        "  export add: func(a: u32, b: u32) -> u32;\n"
-        "  export subtract: func(a: u32, b: u32) -> u32;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("world.wit", "world calculator {\n"
+                                            "  export add: func(a: u32, b: u32) -> u32;\n"
+                                            "  export subtract: func(a: u32, b: u32) -> u32;\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     /* REAL BUG (class 16 node-extraction incompleteness): `func`s declared
      * inside a WIT `world { export X: func ... }` block are NOT extracted as
@@ -654,12 +651,11 @@ TEST(probe_wit_world_node) {
 
 /* WIT: type alias definition. */
 TEST(probe_wit_type_alias) {
-    GpeMetrics m = gpe_metrics("alias.wit",
-        "interface types {\n"
-        "  type error-code = u32;\n"
-        "  record error { code: error-code, msg: string }\n"
-        "  get-error: func(code: error-code) -> error;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("alias.wit", "interface types {\n"
+                                            "  type error-code = u32;\n"
+                                            "  record error { code: error-code, msg: string }\n"
+                                            "  get-error: func(code: error-code) -> error;\n"
+                                            "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: the record → Class, func → Function. */
     ASSERT_TRUE(m.types >= 1);
@@ -669,14 +665,13 @@ TEST(probe_wit_type_alias) {
 
 /* WIT: variant definition (tagged union). */
 TEST(probe_wit_variant_node) {
-    GpeMetrics m = gpe_metrics("result.wit",
-        "interface result-types {\n"
-        "  variant result {\n"
-        "    ok(u32),\n"
-        "    err(string),\n"
-        "  }\n"
-        "  unwrap: func(r: result) -> u32;\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("result.wit", "interface result-types {\n"
+                                             "  variant result {\n"
+                                             "    ok(u32),\n"
+                                             "    err(string),\n"
+                                             "  }\n"
+                                             "  unwrap: func(r: result) -> u32;\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum the function must appear; variant may add a Class. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -763,17 +758,16 @@ TEST(probe_smithy_structure_node) {
      * before `$version`, which is invalid Smithy and failed to parse → 0
      * nodes.  Mirrors the working test_grammar_regression.c smithy fixture
      * (namespace, then structure) which yields Class:1. */
-    GpeMetrics m = gpe_metrics("model.smithy",
-        "$version: \"2\"\n"
-        "\n"
-        "namespace com.example\n"
-        "\n"
-        "structure User {\n"
-        "  @required\n"
-        "  id: String\n"
-        "  name: String\n"
-        "  email: String\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("model.smithy", "$version: \"2\"\n"
+                                               "\n"
+                                               "namespace com.example\n"
+                                               "\n"
+                                               "structure User {\n"
+                                               "  @required\n"
+                                               "  id: String\n"
+                                               "  name: String\n"
+                                               "  email: String\n"
+                                               "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: structure → Class node. */
     ASSERT_TRUE(m.types >= 1);
@@ -782,26 +776,26 @@ TEST(probe_smithy_structure_node) {
 
 /* Smithy: service + operation definitions. */
 TEST(probe_smithy_service_node) {
-    GpeMetrics m = gpe_metrics("service.smithy",
-        "namespace com.example\n"
-        "\n"
-        "service UserService {\n"
-        "  version: \"2024-01-01\"\n"
-        "  operations: [GetUser, CreateUser]\n"
-        "}\n"
-        "\n"
-        "operation GetUser {\n"
-        "  input: GetUserInput\n"
-        "  output: GetUserOutput\n"
-        "}\n"
-        "\n"
-        "operation CreateUser {\n"
-        "  input: CreateUserInput\n"
-        "}\n"
-        "\n"
-        "structure GetUserInput    { @required id: String }\n"
-        "structure GetUserOutput   { id: String, name: String }\n"
-        "structure CreateUserInput { @required name: String }\n");
+    GpeMetrics m =
+        gpe_metrics("service.smithy", "namespace com.example\n"
+                                      "\n"
+                                      "service UserService {\n"
+                                      "  version: \"2024-01-01\"\n"
+                                      "  operations: [GetUser, CreateUser]\n"
+                                      "}\n"
+                                      "\n"
+                                      "operation GetUser {\n"
+                                      "  input: GetUserInput\n"
+                                      "  output: GetUserOutput\n"
+                                      "}\n"
+                                      "\n"
+                                      "operation CreateUser {\n"
+                                      "  input: CreateUserInput\n"
+                                      "}\n"
+                                      "\n"
+                                      "structure GetUserInput    { @required id: String }\n"
+                                      "structure GetUserOutput   { id: String, name: String }\n"
+                                      "structure CreateUserInput { @required name: String }\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum the structure definitions must produce Class nodes. */
     ASSERT_TRUE(m.types >= 1);
@@ -810,19 +804,18 @@ TEST(probe_smithy_service_node) {
 
 /* Smithy: enum definition. */
 TEST(probe_smithy_enum_node) {
-    GpeMetrics m = gpe_metrics("enum.smithy",
-        "namespace com.example\n"
-        "\n"
-        "enum Status {\n"
-        "  ACTIVE = \"active\"\n"
-        "  INACTIVE = \"inactive\"\n"
-        "  PENDING = \"pending\"\n"
-        "}\n"
-        "\n"
-        "structure Item {\n"
-        "  id: String\n"
-        "  status: Status\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("enum.smithy", "namespace com.example\n"
+                                              "\n"
+                                              "enum Status {\n"
+                                              "  ACTIVE = \"active\"\n"
+                                              "  INACTIVE = \"inactive\"\n"
+                                              "  PENDING = \"pending\"\n"
+                                              "}\n"
+                                              "\n"
+                                              "structure Item {\n"
+                                              "  id: String\n"
+                                              "  status: Status\n"
+                                              "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: structure → Class; enum may produce another type node. */
     ASSERT_TRUE(m.types >= 1);
@@ -909,21 +902,20 @@ TEST(probe_smithy_use_edge) {
 
 /* Prisma: model definition → at least 1 Class node. */
 TEST(probe_prisma_model_node) {
-    GpeMetrics m = gpe_metrics("schema.prisma",
-        "generator client {\n"
-        "  provider = \"prisma-client-js\"\n"
-        "}\n"
-        "\n"
-        "datasource db {\n"
-        "  provider = \"postgresql\"\n"
-        "  url      = env(\"DATABASE_URL\")\n"
-        "}\n"
-        "\n"
-        "model User {\n"
-        "  id    Int    @id @default(autoincrement())\n"
-        "  name  String\n"
-        "  email String @unique\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("schema.prisma", "generator client {\n"
+                                                "  provider = \"prisma-client-js\"\n"
+                                                "}\n"
+                                                "\n"
+                                                "datasource db {\n"
+                                                "  provider = \"postgresql\"\n"
+                                                "  url      = env(\"DATABASE_URL\")\n"
+                                                "}\n"
+                                                "\n"
+                                                "model User {\n"
+                                                "  id    Int    @id @default(autoincrement())\n"
+                                                "  name  String\n"
+                                                "  email String @unique\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: `model User` must produce a Class node. */
     ASSERT_TRUE(m.types >= 1);
@@ -933,19 +925,19 @@ TEST(probe_prisma_model_node) {
 /* Prisma: multiple model definitions → multiple Class nodes. */
 TEST(probe_prisma_multiple_models) {
     GpeMetrics m = gpe_metrics("blog.prisma",
-        "model User {\n"
-        "  id    Int    @id @default(autoincrement())\n"
-        "  name  String\n"
-        "  posts Post[]\n"
-        "}\n"
-        "\n"
-        "model Post {\n"
-        "  id       Int    @id @default(autoincrement())\n"
-        "  title    String\n"
-        "  content  String\n"
-        "  authorId Int\n"
-        "  author   User   @relation(fields: [authorId], references: [id])\n"
-        "}\n");
+                               "model User {\n"
+                               "  id    Int    @id @default(autoincrement())\n"
+                               "  name  String\n"
+                               "  posts Post[]\n"
+                               "}\n"
+                               "\n"
+                               "model Post {\n"
+                               "  id       Int    @id @default(autoincrement())\n"
+                               "  title    String\n"
+                               "  content  String\n"
+                               "  authorId Int\n"
+                               "  author   User   @relation(fields: [authorId], references: [id])\n"
+                               "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: two model definitions → at least 2 Class nodes. */
     ASSERT_TRUE(m.types >= 2);
@@ -954,17 +946,16 @@ TEST(probe_prisma_multiple_models) {
 
 /* Prisma: enum definition — does it yield an additional type node? */
 TEST(probe_prisma_enum_node) {
-    GpeMetrics m = gpe_metrics("status.prisma",
-        "enum Role {\n"
-        "  USER\n"
-        "  ADMIN\n"
-        "  MODERATOR\n"
-        "}\n"
-        "\n"
-        "model Account {\n"
-        "  id   Int  @id @default(autoincrement())\n"
-        "  role Role @default(USER)\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("status.prisma", "enum Role {\n"
+                                                "  USER\n"
+                                                "  ADMIN\n"
+                                                "  MODERATOR\n"
+                                                "}\n"
+                                                "\n"
+                                                "model Account {\n"
+                                                "  id   Int  @id @default(autoincrement())\n"
+                                                "  role Role @default(USER)\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: model → Class; enum may add another — floor is >= 1. */
     ASSERT_TRUE(m.types >= 1);
@@ -973,15 +964,14 @@ TEST(probe_prisma_enum_node) {
 
 /* Prisma: no-crash for a datasource-only schema (no models). */
 TEST(probe_prisma_datasource_only) {
-    GpeMetrics m = gpe_metrics("config.prisma",
-        "generator client {\n"
-        "  provider = \"prisma-client-js\"\n"
-        "}\n"
-        "\n"
-        "datasource db {\n"
-        "  provider = \"sqlite\"\n"
-        "  url      = \"file:./dev.db\"\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("config.prisma", "generator client {\n"
+                                                "  provider = \"prisma-client-js\"\n"
+                                                "}\n"
+                                                "\n"
+                                                "datasource db {\n"
+                                                "  provider = \"sqlite\"\n"
+                                                "  url      = \"file:./dev.db\"\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash on a schema with no models. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1001,12 +991,11 @@ TEST(probe_prisma_datasource_only) {
 
 /* GraphQL: type definition → at least 1 Class node. */
 TEST(probe_graphql_type_node) {
-    GpeMetrics m = gpe_metrics("schema.graphql",
-        "type User {\n"
-        "  id:    ID!\n"
-        "  name:  String!\n"
-        "  email: String!\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("schema.graphql", "type User {\n"
+                                                 "  id:    ID!\n"
+                                                 "  name:  String!\n"
+                                                 "  email: String!\n"
+                                                 "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: `type User` must produce a Class node. */
     ASSERT_TRUE(m.types >= 1);
@@ -1015,23 +1004,22 @@ TEST(probe_graphql_type_node) {
 
 /* GraphQL: multiple type definitions → multiple Class nodes. */
 TEST(probe_graphql_multiple_types) {
-    GpeMetrics m = gpe_metrics("schema.gql",
-        "type Query {\n"
-        "  user(id: ID!): User\n"
-        "  users: [User!]!\n"
-        "}\n"
-        "\n"
-        "type User {\n"
-        "  id:    ID!\n"
-        "  name:  String!\n"
-        "  posts: [Post!]!\n"
-        "}\n"
-        "\n"
-        "type Post {\n"
-        "  id:      ID!\n"
-        "  title:   String!\n"
-        "  content: String!\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("schema.gql", "type Query {\n"
+                                             "  user(id: ID!): User\n"
+                                             "  users: [User!]!\n"
+                                             "}\n"
+                                             "\n"
+                                             "type User {\n"
+                                             "  id:    ID!\n"
+                                             "  name:  String!\n"
+                                             "  posts: [Post!]!\n"
+                                             "}\n"
+                                             "\n"
+                                             "type Post {\n"
+                                             "  id:      ID!\n"
+                                             "  title:   String!\n"
+                                             "  content: String!\n"
+                                             "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: 3 type definitions → at least 2 Class nodes. */
     ASSERT_TRUE(m.types >= 2);
@@ -1040,15 +1028,14 @@ TEST(probe_graphql_multiple_types) {
 
 /* GraphQL: interface definition → type-like node. */
 TEST(probe_graphql_interface_node) {
-    GpeMetrics m = gpe_metrics("iface.graphql",
-        "interface Node {\n"
-        "  id: ID!\n"
-        "}\n"
-        "\n"
-        "type User implements Node {\n"
-        "  id:   ID!\n"
-        "  name: String!\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("iface.graphql", "interface Node {\n"
+                                                "  id: ID!\n"
+                                                "}\n"
+                                                "\n"
+                                                "type User implements Node {\n"
+                                                "  id:   ID!\n"
+                                                "  name: String!\n"
+                                                "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at minimum `type User` → Class; `interface Node` may add one. */
     ASSERT_TRUE(m.types >= 1);
@@ -1057,20 +1044,19 @@ TEST(probe_graphql_interface_node) {
 
 /* GraphQL: input type definition. */
 TEST(probe_graphql_input_type) {
-    GpeMetrics m = gpe_metrics("mutations.graphql",
-        "input CreateUserInput {\n"
-        "  name:  String!\n"
-        "  email: String!\n"
-        "}\n"
-        "\n"
-        "type Mutation {\n"
-        "  createUser(input: CreateUserInput!): User!\n"
-        "}\n"
-        "\n"
-        "type User {\n"
-        "  id:   ID!\n"
-        "  name: String!\n"
-        "}\n");
+    GpeMetrics m = gpe_metrics("mutations.graphql", "input CreateUserInput {\n"
+                                                    "  name:  String!\n"
+                                                    "  email: String!\n"
+                                                    "}\n"
+                                                    "\n"
+                                                    "type Mutation {\n"
+                                                    "  createUser(input: CreateUserInput!): User!\n"
+                                                    "}\n"
+                                                    "\n"
+                                                    "type User {\n"
+                                                    "  id:   ID!\n"
+                                                    "  name: String!\n"
+                                                    "}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: at least two type-like nodes expected (input + type + type). */
     ASSERT_TRUE(m.types >= 2);
@@ -1091,15 +1077,14 @@ TEST(probe_graphql_input_type) {
 
 /* Vue: single-file component indexes without crash. */
 TEST(probe_vue_no_crash) {
-    GpeMetrics m = gpe_metrics("App.vue",
-        "<template>\n"
-        "  <div>{{ message }}</div>\n"
-        "</template>\n"
-        "\n"
-        "<script setup>\n"
-        "import { ref } from 'vue'\n"
-        "const message = ref('Hello World')\n"
-        "</script>\n");
+    GpeMetrics m = gpe_metrics("App.vue", "<template>\n"
+                                          "  <div>{{ message }}</div>\n"
+                                          "</template>\n"
+                                          "\n"
+                                          "<script setup>\n"
+                                          "import { ref } from 'vue'\n"
+                                          "const message = ref('Hello World')\n"
+                                          "</script>\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash and must produce at least 1 node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1108,18 +1093,18 @@ TEST(probe_vue_no_crash) {
 
 /* Vue: <script setup> with two imports — extraction-level import count. */
 TEST(probe_vue_script_imports) {
-    GpeMetrics m = gpe_metrics("Counter.vue",
-        "<script setup>\n"
-        "import { ref, computed } from 'vue'\n"
-        "import BaseButton from './BaseButton.vue'\n"
-        "\n"
-        "const count = ref(0)\n"
-        "const doubled = computed(() => count.value * 2)\n"
-        "</script>\n"
-        "\n"
-        "<template>\n"
-        "  <BaseButton @click=\"count++\">{{ doubled }}</BaseButton>\n"
-        "</template>\n");
+    GpeMetrics m =
+        gpe_metrics("Counter.vue", "<script setup>\n"
+                                   "import { ref, computed } from 'vue'\n"
+                                   "import BaseButton from './BaseButton.vue'\n"
+                                   "\n"
+                                   "const count = ref(0)\n"
+                                   "const doubled = computed(() => count.value * 2)\n"
+                                   "</script>\n"
+                                   "\n"
+                                   "<template>\n"
+                                   "  <BaseButton @click=\"count++\">{{ doubled }}</BaseButton>\n"
+                                   "</template>\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline indexes without crash. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1133,17 +1118,14 @@ TEST(probe_vue_script_imports) {
  * RED: .vue extension may not be handled by the JS/TS import resolver. */
 TEST(probe_vue_cross_component_import) {
     static const GpeFile files[] = {
-        {"BaseButton.vue",
-         "<template><button><slot /></button></template>\n"
-         "<script setup>\n"
-         "defineProps({ label: String })\n"
-         "</script>\n"},
-        {"App.vue",
-         "<script setup>\n"
-         "import BaseButton from './BaseButton.vue'\n"
-         "</script>\n"
-         "<template><BaseButton label=\"Click\" /></template>\n"}
-    };
+        {"BaseButton.vue", "<template><button><slot /></button></template>\n"
+                           "<script setup>\n"
+                           "defineProps({ label: String })\n"
+                           "</script>\n"},
+        {"App.vue", "<script setup>\n"
+                    "import BaseButton from './BaseButton.vue'\n"
+                    "</script>\n"
+                    "<template><BaseButton label=\"Click\" /></template>\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: .vue cross-component IMPORTS edge not confirmed by the pipeline. */
@@ -1162,12 +1144,11 @@ TEST(probe_vue_cross_component_import) {
 
 /* Svelte: single-file component indexes without crash. */
 TEST(probe_svelte_no_crash) {
-    GpeMetrics m = gpe_metrics("App.svelte",
-        "<script>\n"
-        "  let name = 'World';\n"
-        "  function greet() { return `Hello ${name}`; }\n"
-        "</script>\n"
-        "<h1>{greet()}</h1>\n");
+    GpeMetrics m = gpe_metrics("App.svelte", "<script>\n"
+                                             "  let name = 'World';\n"
+                                             "  function greet() { return `Hello ${name}`; }\n"
+                                             "</script>\n"
+                                             "<h1>{greet()}</h1>\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash and must produce at least 1 node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1176,15 +1157,15 @@ TEST(probe_svelte_no_crash) {
 
 /* Svelte: <script> with imports — extraction-level behavior. */
 TEST(probe_svelte_script_imports) {
-    GpeMetrics m = gpe_metrics("Counter.svelte",
-        "<script>\n"
-        "  import { onMount } from 'svelte';\n"
-        "  import Button from './Button.svelte';\n"
-        "\n"
-        "  let count = 0;\n"
-        "  onMount(() => { count = 1; });\n"
-        "</script>\n"
-        "<Button on:click={() => count++}>{count}</Button>\n");
+    GpeMetrics m =
+        gpe_metrics("Counter.svelte", "<script>\n"
+                                      "  import { onMount } from 'svelte';\n"
+                                      "  import Button from './Button.svelte';\n"
+                                      "\n"
+                                      "  let count = 0;\n"
+                                      "  onMount(() => { count = 1; });\n"
+                                      "</script>\n"
+                                      "<Button on:click={() => count++}>{count}</Button>\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline indexes without crash. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1194,18 +1175,14 @@ TEST(probe_svelte_script_imports) {
 /* Svelte: two-file cross-component import → IMPORTS graph edge.
  * RED: .svelte extension may not be handled by the JS/TS import resolver. */
 TEST(probe_svelte_cross_component_import) {
-    static const GpeFile files[] = {
-        {"Button.svelte",
-         "<script>\n"
-         "  export let label = 'Click';\n"
-         "</script>\n"
-         "<button>{label}</button>\n"},
-        {"App.svelte",
-         "<script>\n"
-         "  import Button from './Button.svelte';\n"
-         "</script>\n"
-         "<Button label=\"Go\" />\n"}
-    };
+    static const GpeFile files[] = {{"Button.svelte", "<script>\n"
+                                                      "  export let label = 'Click';\n"
+                                                      "</script>\n"
+                                                      "<button>{label}</button>\n"},
+                                    {"App.svelte", "<script>\n"
+                                                   "  import Button from './Button.svelte';\n"
+                                                   "</script>\n"
+                                                   "<Button label=\"Go\" />\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: .svelte cross-component IMPORTS edge not confirmed by the pipeline. */
@@ -1224,13 +1201,12 @@ TEST(probe_svelte_cross_component_import) {
 
 /* Astro: single-file component indexes without crash. */
 TEST(probe_astro_no_crash) {
-    GpeMetrics m = gpe_metrics("index.astro",
-        "---\n"
-        "const greeting = 'Hello World';\n"
-        "---\n"
-        "<html>\n"
-        "  <body><h1>{greeting}</h1></body>\n"
-        "</html>\n");
+    GpeMetrics m = gpe_metrics("index.astro", "---\n"
+                                              "const greeting = 'Hello World';\n"
+                                              "---\n"
+                                              "<html>\n"
+                                              "  <body><h1>{greeting}</h1></body>\n"
+                                              "</html>\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash and must produce at least 1 node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1239,15 +1215,14 @@ TEST(probe_astro_no_crash) {
 
 /* Astro: frontmatter with imports. */
 TEST(probe_astro_frontmatter_imports) {
-    GpeMetrics m = gpe_metrics("Page.astro",
-        "---\n"
-        "import confetti from 'canvas-confetti';\n"
-        "import dayjs from 'dayjs';\n"
-        "\n"
-        "confetti();\n"
-        "const now = dayjs().format();\n"
-        "---\n"
-        "<div>{now}</div>\n");
+    GpeMetrics m = gpe_metrics("Page.astro", "---\n"
+                                             "import confetti from 'canvas-confetti';\n"
+                                             "import dayjs from 'dayjs';\n"
+                                             "\n"
+                                             "confetti();\n"
+                                             "const now = dayjs().format();\n"
+                                             "---\n"
+                                             "<div>{now}</div>\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline indexes without crash. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1257,18 +1232,14 @@ TEST(probe_astro_frontmatter_imports) {
 /* Astro: two-file cross-component import → IMPORTS graph edge.
  * RED: .astro extension may not be handled by the JS/TS import resolver. */
 TEST(probe_astro_cross_component_import) {
-    static const GpeFile files[] = {
-        {"Card.astro",
-         "---\n"
-         "const { title } = Astro.props;\n"
-         "---\n"
-         "<div class=\"card\"><h2>{title}</h2></div>\n"},
-        {"index.astro",
-         "---\n"
-         "import Card from './Card.astro';\n"
-         "---\n"
-         "<Card title=\"Hello\" />\n"}
-    };
+    static const GpeFile files[] = {{"Card.astro", "---\n"
+                                                   "const { title } = Astro.props;\n"
+                                                   "---\n"
+                                                   "<div class=\"card\"><h2>{title}</h2></div>\n"},
+                                    {"index.astro", "---\n"
+                                                    "import Card from './Card.astro';\n"
+                                                    "---\n"
+                                                    "<Card title=\"Hello\" />\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     /* RED: .astro cross-component IMPORTS edge not confirmed by the pipeline. */
@@ -1288,12 +1259,11 @@ TEST(probe_astro_cross_component_import) {
 
 /* Blade: basic template indexes without crash. */
 TEST(probe_blade_no_crash) {
-    GpeMetrics m = gpe_metrics("welcome.blade.php",
-        "@extends('layouts.app')\n"
-        "\n"
-        "@section('content')\n"
-        "<h1>Welcome</h1>\n"
-        "@endsection\n");
+    GpeMetrics m = gpe_metrics("welcome.blade.php", "@extends('layouts.app')\n"
+                                                    "\n"
+                                                    "@section('content')\n"
+                                                    "<h1>Welcome</h1>\n"
+                                                    "@endsection\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash and must produce at least 1 node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1303,15 +1273,12 @@ TEST(probe_blade_no_crash) {
 /* Blade: @include directive — not modeled as IMPORTS. */
 TEST(probe_blade_include_no_imports_edge) {
     static const GpeFile files[] = {
-        {"partials/header.blade.php",
-         "<header><nav>Menu</nav></header>\n"},
-        {"home.blade.php",
-         "@extends('layouts.app')\n"
-         "@section('content')\n"
-         "@include('partials.header')\n"
-         "<main>Home</main>\n"
-         "@endsection\n"}
-    };
+        {"partials/header.blade.php", "<header><nav>Menu</nav></header>\n"},
+        {"home.blade.php", "@extends('layouts.app')\n"
+                           "@section('content')\n"
+                           "@include('partials.header')\n"
+                           "<main>Home</main>\n"
+                           "@endsection\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1322,17 +1289,16 @@ TEST(probe_blade_include_no_imports_edge) {
 
 /* Blade: conditional and loop directives — pipeline stability. */
 TEST(probe_blade_directives_no_crash) {
-    GpeMetrics m = gpe_metrics("list.blade.php",
-        "@extends('layouts.app')\n"
-        "@section('content')\n"
-        "@if($items->count() > 0)\n"
-        "  @foreach($items as $item)\n"
-        "    <div>{{ $item->name }}</div>\n"
-        "  @endforeach\n"
-        "@else\n"
-        "  <p>No items found.</p>\n"
-        "@endif\n"
-        "@endsection\n");
+    GpeMetrics m = gpe_metrics("list.blade.php", "@extends('layouts.app')\n"
+                                                 "@section('content')\n"
+                                                 "@if($items->count() > 0)\n"
+                                                 "  @foreach($items as $item)\n"
+                                                 "    <div>{{ $item->name }}</div>\n"
+                                                 "  @endforeach\n"
+                                                 "@else\n"
+                                                 "  <p>No items found.</p>\n"
+                                                 "@endif\n"
+                                                 "@endsection\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: complex directives must not crash the pipeline. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1349,12 +1315,11 @@ TEST(probe_blade_directives_no_crash) {
 
 /* Liquid: basic template indexes without crash. */
 TEST(probe_liquid_no_crash) {
-    GpeMetrics m = gpe_metrics("index.liquid",
-        "{% if customer %}\n"
-        "  <p>Welcome, {{ customer.name }}!</p>\n"
-        "{% else %}\n"
-        "  <p>Hello, visitor!</p>\n"
-        "{% endif %}\n");
+    GpeMetrics m = gpe_metrics("index.liquid", "{% if customer %}\n"
+                                               "  <p>Welcome, {{ customer.name }}!</p>\n"
+                                               "{% else %}\n"
+                                               "  <p>Hello, visitor!</p>\n"
+                                               "{% endif %}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash and must produce at least 1 node. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1363,13 +1328,12 @@ TEST(probe_liquid_no_crash) {
 
 /* Liquid: for-loop + filters — pipeline stability. */
 TEST(probe_liquid_loop_and_filters) {
-    GpeMetrics m = gpe_metrics("products.liquid",
-        "{% for product in collection.products %}\n"
-        "  <div class=\"product\">\n"
-        "    <h2>{{ product.title | upcase }}</h2>\n"
-        "    <p>{{ product.price | money }}</p>\n"
-        "  </div>\n"
-        "{% endfor %}\n");
+    GpeMetrics m = gpe_metrics("products.liquid", "{% for product in collection.products %}\n"
+                                                  "  <div class=\"product\">\n"
+                                                  "    <h2>{{ product.title | upcase }}</h2>\n"
+                                                  "    <p>{{ product.price | money }}</p>\n"
+                                                  "  </div>\n"
+                                                  "{% endfor %}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: for-loop with filters must not crash. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1379,13 +1343,10 @@ TEST(probe_liquid_loop_and_filters) {
 /* Liquid: render/include — not modeled as IMPORTS. */
 TEST(probe_liquid_render_no_imports_edge) {
     static const GpeFile files[] = {
-        {"snippets/card.liquid",
-         "<div class=\"card\">{{ card.title }}</div>\n"},
-        {"sections/featured.liquid",
-         "<section>\n"
-         "  {% render 'snippets/card', card: featured_product %}\n"
-         "</section>\n"}
-    };
+        {"snippets/card.liquid", "<div class=\"card\">{{ card.title }}</div>\n"},
+        {"sections/featured.liquid", "<section>\n"
+                                     "  {% render 'snippets/card', card: featured_product %}\n"
+                                     "</section>\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1404,12 +1365,11 @@ TEST(probe_liquid_render_no_imports_edge) {
 
 /* Jinja2: basic template indexes without crash (.j2 extension). */
 TEST(probe_jinja2_no_crash_j2) {
-    GpeMetrics m = gpe_metrics("config.j2",
-        "{% if env == 'production' %}\n"
-        "database_url: {{ db_url }}\n"
-        "{% else %}\n"
-        "database_url: sqlite:///dev.db\n"
-        "{% endif %}\n");
+    GpeMetrics m = gpe_metrics("config.j2", "{% if env == 'production' %}\n"
+                                            "database_url: {{ db_url }}\n"
+                                            "{% else %}\n"
+                                            "database_url: sqlite:///dev.db\n"
+                                            "{% endif %}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash on a .j2 file. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1419,17 +1379,14 @@ TEST(probe_jinja2_no_crash_j2) {
 /* Jinja2: extends and block directives (.jinja2 extension). */
 TEST(probe_jinja2_extends_no_imports_edge) {
     static const GpeFile files[] = {
-        {"base.html.jinja2",
-         "<!DOCTYPE html>\n"
-         "<html>\n"
-         "<head>{% block head %}{% endblock %}</head>\n"
-         "<body>{% block body %}{% endblock %}</body>\n"
-         "</html>\n"},
-        {"page.html.jinja2",
-         "{% extends \"base.html.jinja2\" %}\n"
-         "{% block head %}<title>Page</title>{% endblock %}\n"
-         "{% block body %}<h1>Hello</h1>{% endblock %}\n"}
-    };
+        {"base.html.jinja2", "<!DOCTYPE html>\n"
+                             "<html>\n"
+                             "<head>{% block head %}{% endblock %}</head>\n"
+                             "<body>{% block body %}{% endblock %}</body>\n"
+                             "</html>\n"},
+        {"page.html.jinja2", "{% extends \"base.html.jinja2\" %}\n"
+                             "{% block head %}<title>Page</title>{% endblock %}\n"
+                             "{% block body %}<h1>Hello</h1>{% endblock %}\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1440,19 +1397,19 @@ TEST(probe_jinja2_extends_no_imports_edge) {
 
 /* Jinja2: macro definition — does the extractor produce a node? */
 TEST(probe_jinja2_macro_no_crash) {
-    GpeMetrics m = gpe_metrics("macros.jinja",
-        "{% macro render_field(field, label='') %}\n"
-        "  <div class=\"field\">\n"
-        "    {% if label %}<label>{{ label }}</label>{% endif %}\n"
-        "    {{ field }}\n"
-        "  </div>\n"
-        "{% endmacro %}\n"
-        "\n"
-        "{% macro render_errors(field) %}\n"
-        "  {% for error in field.errors %}\n"
-        "    <span class=\"error\">{{ error }}</span>\n"
-        "  {% endfor %}\n"
-        "{% endmacro %}\n");
+    GpeMetrics m =
+        gpe_metrics("macros.jinja", "{% macro render_field(field, label='') %}\n"
+                                    "  <div class=\"field\">\n"
+                                    "    {% if label %}<label>{{ label }}</label>{% endif %}\n"
+                                    "    {{ field }}\n"
+                                    "  </div>\n"
+                                    "{% endmacro %}\n"
+                                    "\n"
+                                    "{% macro render_errors(field) %}\n"
+                                    "  {% for error in field.errors %}\n"
+                                    "    <span class=\"error\">{{ error }}</span>\n"
+                                    "  {% endfor %}\n"
+                                    "{% endmacro %}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: macro-heavy template must not crash the pipeline. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1469,20 +1426,19 @@ TEST(probe_jinja2_macro_no_crash) {
 
 /* Go Template: basic template indexes without crash (.gotmpl). */
 TEST(probe_gotemplate_no_crash_gotmpl) {
-    GpeMetrics m = gpe_metrics("page.gotmpl",
-        "{{ define \"page\" }}\n"
-        "<!DOCTYPE html>\n"
-        "<html>\n"
-        "<body>\n"
-        "  <h1>{{ .Title }}</h1>\n"
-        "  {{ if .Items }}\n"
-        "  <ul>\n"
-        "    {{ range .Items }}<li>{{ . }}</li>{{ end }}\n"
-        "  </ul>\n"
-        "  {{ end }}\n"
-        "</body>\n"
-        "</html>\n"
-        "{{ end }}\n");
+    GpeMetrics m = gpe_metrics("page.gotmpl", "{{ define \"page\" }}\n"
+                                              "<!DOCTYPE html>\n"
+                                              "<html>\n"
+                                              "<body>\n"
+                                              "  <h1>{{ .Title }}</h1>\n"
+                                              "  {{ if .Items }}\n"
+                                              "  <ul>\n"
+                                              "    {{ range .Items }}<li>{{ . }}</li>{{ end }}\n"
+                                              "  </ul>\n"
+                                              "  {{ end }}\n"
+                                              "</body>\n"
+                                              "</html>\n"
+                                              "{{ end }}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash on a .gotmpl file. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1491,17 +1447,16 @@ TEST(probe_gotemplate_no_crash_gotmpl) {
 
 /* Go Template: Helm-style .tpl with named template definitions. */
 TEST(probe_gotemplate_helm_tpl) {
-    GpeMetrics m = gpe_metrics("_helpers.tpl",
-        "{{/*\n"
-        "Expand the name of the chart.\n"
-        "*/}}\n"
-        "{{- define \"myapp.name\" -}}\n"
-        "{{- .Chart.Name | trunc 63 | trimSuffix \"-\" }}\n"
-        "{{- end }}\n"
-        "\n"
-        "{{- define \"myapp.labels\" -}}\n"
-        "helm.sh/chart: {{ include \"myapp.name\" . }}\n"
-        "{{- end }}\n");
+    GpeMetrics m = gpe_metrics("_helpers.tpl", "{{/*\n"
+                                               "Expand the name of the chart.\n"
+                                               "*/}}\n"
+                                               "{{- define \"myapp.name\" -}}\n"
+                                               "{{- .Chart.Name | trunc 63 | trimSuffix \"-\" }}\n"
+                                               "{{- end }}\n"
+                                               "\n"
+                                               "{{- define \"myapp.labels\" -}}\n"
+                                               "helm.sh/chart: {{ include \"myapp.name\" . }}\n"
+                                               "{{- end }}\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: Helm helper template must not crash. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1510,17 +1465,14 @@ TEST(probe_gotemplate_helm_tpl) {
 
 /* Go Template: `template` call — not modeled as IMPORTS. */
 TEST(probe_gotemplate_template_call_no_imports) {
-    static const GpeFile files[] = {
-        {"layout.tmpl",
-         "{{ define \"layout\" }}\n"
-         "<html><body>{{ template \"content\" . }}</body></html>\n"
-         "{{ end }}\n"},
-        {"page.tmpl",
-         "{{ define \"content\" }}\n"
-         "<h1>{{ .Title }}</h1>\n"
-         "{{ end }}\n"
-         "{{ template \"layout\" . }}\n"}
-    };
+    static const GpeFile files[] = {{"layout.tmpl",
+                                     "{{ define \"layout\" }}\n"
+                                     "<html><body>{{ template \"content\" . }}</body></html>\n"
+                                     "{{ end }}\n"},
+                                    {"page.tmpl", "{{ define \"content\" }}\n"
+                                                  "<h1>{{ .Title }}</h1>\n"
+                                                  "{{ end }}\n"
+                                                  "{{ template \"layout\" . }}\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1539,11 +1491,10 @@ TEST(probe_gotemplate_template_call_no_imports) {
 
 /* Mermaid: flowchart diagram indexes without crash (.mmd). */
 TEST(probe_mermaid_flowchart_no_crash) {
-    GpeMetrics m = gpe_metrics("flow.mmd",
-        "graph TD\n"
-        "  A[Start] --> B{Is it?}\n"
-        "  B -- Yes --> C[OK]\n"
-        "  B -- No  --> D[End]\n");
+    GpeMetrics m = gpe_metrics("flow.mmd", "graph TD\n"
+                                           "  A[Start] --> B{Is it?}\n"
+                                           "  B -- Yes --> C[OK]\n"
+                                           "  B -- No  --> D[End]\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash on a .mmd file. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1552,12 +1503,11 @@ TEST(probe_mermaid_flowchart_no_crash) {
 
 /* Mermaid: sequence diagram (.mermaid extension). */
 TEST(probe_mermaid_sequence_no_crash) {
-    GpeMetrics m = gpe_metrics("auth.mermaid",
-        "sequenceDiagram\n"
-        "  participant Client\n"
-        "  participant Server\n"
-        "  Client->>Server: POST /login\n"
-        "  Server-->>Client: 200 OK + token\n");
+    GpeMetrics m = gpe_metrics("auth.mermaid", "sequenceDiagram\n"
+                                               "  participant Client\n"
+                                               "  participant Server\n"
+                                               "  Client->>Server: POST /login\n"
+                                               "  Server-->>Client: 200 OK + token\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: sequence diagram must not crash. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1566,19 +1516,18 @@ TEST(probe_mermaid_sequence_no_crash) {
 
 /* Mermaid: entity-relationship diagram. */
 TEST(probe_mermaid_er_diagram_no_crash) {
-    GpeMetrics m = gpe_metrics("schema.mmd",
-        "erDiagram\n"
-        "  USER {\n"
-        "    int id PK\n"
-        "    string name\n"
-        "    string email\n"
-        "  }\n"
-        "  POST {\n"
-        "    int id PK\n"
-        "    int authorId FK\n"
-        "    string title\n"
-        "  }\n"
-        "  USER ||--o{ POST : \"writes\"\n");
+    GpeMetrics m = gpe_metrics("schema.mmd", "erDiagram\n"
+                                             "  USER {\n"
+                                             "    int id PK\n"
+                                             "    string name\n"
+                                             "    string email\n"
+                                             "  }\n"
+                                             "  POST {\n"
+                                             "    int id PK\n"
+                                             "    int authorId FK\n"
+                                             "    string title\n"
+                                             "  }\n"
+                                             "  USER ||--o{ POST : \"writes\"\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: ER diagram must not crash the pipeline. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1595,12 +1544,11 @@ TEST(probe_mermaid_er_diagram_no_crash) {
 
 /* JSDoc: basic parameter documentation indexes without crash. */
 TEST(probe_jsdoc_params_no_crash) {
-    GpeMetrics m = gpe_metrics("api.jsdoc",
-        "/**\n"
-        " * @param {number} x - First operand\n"
-        " * @param {number} y - Second operand\n"
-        " * @returns {number} The sum\n"
-        " */\n");
+    GpeMetrics m = gpe_metrics("api.jsdoc", "/**\n"
+                                            " * @param {number} x - First operand\n"
+                                            " * @param {number} y - Second operand\n"
+                                            " * @returns {number} The sum\n"
+                                            " */\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: pipeline must not crash on a .jsdoc file. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1609,23 +1557,22 @@ TEST(probe_jsdoc_params_no_crash) {
 
 /* JSDoc: @module and @typedef annotations. */
 TEST(probe_jsdoc_module_typedef_no_crash) {
-    GpeMetrics m = gpe_metrics("types.jsdoc",
-        "/**\n"
-        " * @module utils\n"
-        " */\n"
-        "\n"
-        "/**\n"
-        " * @typedef {Object} User\n"
-        " * @property {number} id - User identifier\n"
-        " * @property {string} name - User full name\n"
-        " * @property {string} email - User email address\n"
-        " */\n"
-        "\n"
-        "/**\n"
-        " * @callback Predicate\n"
-        " * @param {User} user\n"
-        " * @returns {boolean}\n"
-        " */\n");
+    GpeMetrics m = gpe_metrics("types.jsdoc", "/**\n"
+                                              " * @module utils\n"
+                                              " */\n"
+                                              "\n"
+                                              "/**\n"
+                                              " * @typedef {Object} User\n"
+                                              " * @property {number} id - User identifier\n"
+                                              " * @property {string} name - User full name\n"
+                                              " * @property {string} email - User email address\n"
+                                              " */\n"
+                                              "\n"
+                                              "/**\n"
+                                              " * @callback Predicate\n"
+                                              " * @param {User} user\n"
+                                              " * @returns {boolean}\n"
+                                              " */\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: module + typedef annotations must not crash the pipeline. */
     ASSERT_TRUE(m.total_nodes >= 1);
@@ -1634,12 +1581,11 @@ TEST(probe_jsdoc_module_typedef_no_crash) {
 
 /* JSDoc: no function or type nodes expected — markup-only label set. */
 TEST(probe_jsdoc_no_function_or_type_nodes) {
-    GpeMetrics m = gpe_metrics("helpers.jsdoc",
-        "/**\n"
-        " * @function formatDate\n"
-        " * @param {Date} date\n"
-        " * @returns {string}\n"
-        " */\n");
+    GpeMetrics m = gpe_metrics("helpers.jsdoc", "/**\n"
+                                                " * @function formatDate\n"
+                                                " * @param {Date} date\n"
+                                                " * @returns {string}\n"
+                                                " */\n");
     ASSERT_TRUE(m.ok);
     /* GREEN: JSDoc produces only Module:1 — no Function or Class nodes. */
     ASSERT_TRUE(m.types == 0);

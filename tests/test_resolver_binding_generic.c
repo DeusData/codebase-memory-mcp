@@ -1055,7 +1055,6 @@ TEST(resolver_binding_python_literal_formatting_crossfile_and_effects) {
     PASS();
 }
 
-
 /* Exception handling does not invalidate unrelated lexical identities. Its
  * conditional declarations, handler aliases and writes still shadow bindings;
  * nested dynamic operations remain visible to the complete source walk. */
@@ -1065,24 +1064,33 @@ TEST(resolver_binding_python_try_preserves_scope_and_effect_barriers) {
         bool admitted;
     } cases[] = {
         {"def caller():\n    try:\n        return target()\n"
-         "    except ValueError:\n        return 0\n", true},
+         "    except ValueError:\n        return 0\n",
+         true},
         {"def caller():\n    try:\n        pass\n"
-         "    except ValueError:\n        return target()\n", true},
+         "    except ValueError:\n        return target()\n",
+         true},
         {"def caller():\n    try:\n        pass\n"
-         "    except ValueError:\n        pass\n    else:\n        return target()\n", true},
+         "    except ValueError:\n        pass\n    else:\n        return target()\n",
+         true},
         {"def caller():\n    try:\n        pass\n    finally:\n        return target()\n", true},
         {"def caller():\n    try:\n        pass\n"
-         "    except ValueError as target:\n        return target()\n", false},
+         "    except ValueError as target:\n        return target()\n",
+         false},
         {"def caller():\n    try:\n        pass\n"
-         "    except ValueError as target:\n        pass\n    return target()\n", false},
+         "    except ValueError as target:\n        pass\n    return target()\n",
+         false},
         {"def caller():\n    try:\n        target = None\n"
-         "    finally:\n        return target()\n", false},
+         "    finally:\n        return target()\n",
+         false},
         {"def caller():\n    try:\n        exec('target = None')\n"
-         "    finally:\n        return target()\n", false},
+         "    finally:\n        return target()\n",
+         false},
         {"try:\n    target = None\nexcept ValueError:\n    pass\n"
-         "def caller():\n    return target()\n", false},
+         "def caller():\n    return target()\n",
+         false},
         {"def caller():\n    try:\n        globals()['target'] = None\n"
-         "    finally:\n        return target()\n", false},
+         "    finally:\n        return target()\n",
+         false},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char source[768];
@@ -1122,19 +1130,24 @@ TEST(resolver_binding_python_try_crossfile_and_conditional_rebinding) {
         {"def target():\n    return 1\n"
          "def unrelated():\n    try:\n        return 2\n"
          "    except ValueError:\n        return 3\n"
-         "def local():\n    return target()\n", true},
+         "def local():\n    return target()\n",
+         true},
         {"def target():\n    return 1\n"
          "def unrelated():\n    try:\n        pass\n    finally:\n        pass\n"
-         "def local():\n    return target()\n", true},
+         "def local():\n    return target()\n",
+         true},
         {"def target():\n    return 1\n"
          "try:\n    target = None\nexcept ValueError:\n    pass\n"
-         "def local():\n    return target()\n", false},
+         "def local():\n    return target()\n",
+         false},
         {"def target():\n    return 1\n"
          "try:\n    pass\nexcept ValueError as target:\n    pass\n"
-         "def local():\n    return target()\n", false},
+         "def local():\n    return target()\n",
+         false},
         {"def target():\n    return 1\n"
          "try:\n    pass\nfinally:\n    exec('target = None')\n"
-         "def local():\n    return target()\n", false},
+         "def local():\n    return target()\n",
+         false},
     };
     for (int driver = 0; driver < 2; driver++) {
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -1622,9 +1635,8 @@ TEST(resolver_binding_python_annotation_pipeline_roles_and_exports) {
 
 static bool embedded_binding_venue(const char *path, const char *source, bool required,
                                    int driver) {
-    static const char *control =
-        "export function proven() { return 1; }\n"
-        "export function check() { return proven(); }\n";
+    static const char *control = "export function proven() { return 1; }\n"
+                                 "export function check() { return proven(); }\n";
     const RQ_Source sources[] = {
         {.path = path, .text = source},
         {.path = "decoy.ts", .text = "export function callee() { return 0; }\n"},
@@ -1647,26 +1659,37 @@ static bool embedded_binding_venue(const char *path, const char *source, bool re
     const char *control_site = strstr(control, "return proven();") + strlen("return ");
     const RQ_Expected expected[] = {
         {.case_id = "independent-esm-control",
-         .site = {.file = "control.mjs", .caller = "check",
+         .site = {.file = "control.mjs",
+                  .caller = "check",
                   .start_byte = (uint32_t)(control_site - control),
                   .end_byte = (uint32_t)(control_site - control) + 8},
          .relation = "CALLS",
-         .target = {.file = "control.mjs", .suffix = "proven", .label = "Function", .declaration_line = 1,
+         .target = {.file = "control.mjs",
+                    .suffix = "proven",
+                    .label = "Function",
+                    .declaration_line = 1,
                     .declaration_text = "export function proven() { return 1; }"}},
         {.case_id = "component-script-exact-local-call",
          .site = {.file = path, .caller = "caller", .start_byte = start, .end_byte = start + 8},
          .relation = "CALLS",
-         .target = {.file = path, .suffix = "callee", .label = "Function", .declaration_line = line,
+         .target = {.file = path,
+                    .suffix = "callee",
+                    .label = "Function",
+                    .declaration_line = line,
                     .declaration_text = declaration_text}}};
     const RQ_Forbidden forbidden[] = {
         {.case_id = "component-never-targets-same-name-other-file",
          .site = {.file = path, .caller = "caller", .start_byte = start, .end_byte = start + 8},
          .relation = "CALLS",
-         .target = {.file = "decoy.ts", .suffix = "callee", .label = "Function", .declaration_line = 1,
+         .target = {.file = "decoy.ts",
+                    .suffix = "callee",
+                    .label = "Function",
+                    .declaration_line = 1,
                     .declaration_text = "export function callee() { return 0; }"}},
         {.case_id = "unproved-component-scope-abstains",
          .site = {.file = path, .caller = "caller", .start_byte = start, .end_byte = start + 8},
-         .relation = "CALLS", .any_target = true}};
+         .relation = "CALLS",
+         .any_target = true}};
     const char *root = th_mktempdir("cbm_embedded_binding");
     if (!root)
         return false;
@@ -1696,8 +1719,10 @@ static bool embedded_binding_venue(const char *path, const char *source, bool re
         cbm_unsetenv("CBM_WORKERS");
     cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
     RQ_Report report = {0};
-    ok = store && rq_check(store, "embedded-bindings", path, sources, 3, expected,
-                           required ? 2 : 1, forbidden, required ? 1 : 2, &report, stderr) && ok;
+    ok = store &&
+         rq_check(store, "embedded-bindings", path, sources, 3, expected, required ? 2 : 1,
+                  forbidden, required ? 1 : 2, &report, stderr) &&
+         ok;
     ok = ok && report.genuine == (required ? 2 : 1) && report.found == report.genuine &&
          !report.missing && !report.wrong;
     if (store)
@@ -1707,20 +1732,21 @@ static bool embedded_binding_venue(const char *path, const char *source, bool re
 }
 
 TEST(resolver_binding_component_scripts_exact_local_scope) {
-    static const struct { const char *path, *source; } fixtures[] = {
-        {"App.vue", "<template><p>Vue</p></template>\n<script setup lang=\"ts\">\n"
-         "function callee(): number { return 42; }\n"
-         "function caller(): number { return callee(); }\n</script>\n"},
-        {"App.vue", "<template><p>Vue</p></template>\n<script setup>\n"
-         "function callee() { return 42; }\n"
-         "function caller() { return callee(); }\n</script>\n"},
-        {"Toggle.svelte", "<script lang=\"ts\">\n"
-         "function callee(): number { return 42; }\n"
-         "function caller(): number { return callee(); }\n</script>\n"
-         "<button on:click={caller}>Toggle</button>\n"},
-        {"Toggle.svelte", "<script>\nfunction callee() { return 42; }\n"
-         "function caller() { return callee(); }\n</script>\n"
-         "<button on:click={caller}>Toggle</button>\n"}};
+    static const struct {
+        const char *path, *source;
+    } fixtures[] = {{"App.vue", "<template><p>Vue</p></template>\n<script setup lang=\"ts\">\n"
+                                "function callee(): number { return 42; }\n"
+                                "function caller(): number { return callee(); }\n</script>\n"},
+                    {"App.vue", "<template><p>Vue</p></template>\n<script setup>\n"
+                                "function callee() { return 42; }\n"
+                                "function caller() { return callee(); }\n</script>\n"},
+                    {"Toggle.svelte", "<script lang=\"ts\">\n"
+                                      "function callee(): number { return 42; }\n"
+                                      "function caller(): number { return callee(); }\n</script>\n"
+                                      "<button on:click={caller}>Toggle</button>\n"},
+                    {"Toggle.svelte", "<script>\nfunction callee() { return 42; }\n"
+                                      "function caller() { return callee(); }\n</script>\n"
+                                      "<button on:click={caller}>Toggle</button>\n"}};
     for (int driver = 0; driver < 2; driver++)
         for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++)
             ASSERT(embedded_binding_venue(fixtures[i].path, fixtures[i].source, true, driver));
@@ -1728,19 +1754,23 @@ TEST(resolver_binding_component_scripts_exact_local_scope) {
 }
 
 TEST(resolver_binding_component_scripts_scope_and_write_barriers) {
-    static const struct { const char *path, *source; } fixtures[] = {
+    static const struct {
+        const char *path, *source;
+    } fixtures[] = {
         {"App.vue", "<template><button @click=\"callee = caller\">Change</button></template>\n"
-         "<script setup>\nfunction callee() { return 42; }\n"
-         "function caller() { return callee(); }\n</script>\n"},
+                    "<script setup>\nfunction callee() { return 42; }\n"
+                    "function caller() { return callee(); }\n</script>\n"},
         {"Toggle.svelte", "<script>\nfunction callee() { return 42; }\n"
-         "function caller() { return callee(); }\n</script>\n"
-         "<button on:click={() => callee = caller}>Change</button>\n"},
-        {"App.vue", "<script setup lang=\"ts\">\n"
+                          "function caller() { return callee(); }\n</script>\n"
+                          "<button on:click={() => callee = caller}>Change</button>\n"},
+        {"App.vue",
+         "<script setup lang=\"ts\">\n"
          "function callee(): number { return 42; }\n"
          "function caller(callee: () => number): number { return callee(); }\n</script>\n"},
         {"Toggle.svelte", "<script>\nfunction callee() { return 42; }\n"
-         "function caller() { return callee(); }\ncallee = () => 0;\n</script>\n"},
-        {"Toggle.svelte", "<script context=\"module\">\nfunction callee() { return 42; }\n"
+                          "function caller() { return callee(); }\ncallee = () => 0;\n</script>\n"},
+        {"Toggle.svelte",
+         "<script context=\"module\">\nfunction callee() { return 42; }\n"
          "</script>\n<script>\nfunction caller(callee) { return callee(); }\n</script>\n"}};
     for (int driver = 0; driver < 2; driver++)
         for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++)
@@ -1748,7 +1778,519 @@ TEST(resolver_binding_component_scripts_scope_and_write_barriers) {
     PASS();
 }
 
+/* Ordinary annotation/return containers are transparent to the binding audit;
+ * their descendants retain declaration, evaluation and namespace-effect roles.
+ */
+TEST(resolver_binding_python_annotation_containers_and_parameter_separators) {
+    const struct {
+        const char *tail;
+        bool exact;
+    } cases[] = {
+        {"def caller(value: Optional[str]) -> Tuple[str, str]:\n"
+         "    return target(), value\n",
+         true},
+        {"def caller(value, /, *, option=None):\n    return target(), option\n", true},
+        {"def caller(*, target=None):\n    return target()\n", false},
+        {"def caller(target, /):\n    return target()\n", false},
+        {"def caller(value: Optional[str]):\n    target, other = None, None\n"
+         "    return target()\n",
+         false},
+        {"def caller(value: Optional[globals().__setitem__('target', None)]):\n  "
+         "  return target()\n",
+         false},
+        {"def caller(value: Optional[str] = globals().__setitem__('target', "
+         "None)):\n    return target()\n",
+         false},
+        /* QUALITY GAP python-pep695-binding-audit. WHY: these genuine target()
+         * calls have unsupported declaration type scopes. TRIED: the source
+         * audit still rejects the declaration's type_parameter, independently
+         * of newly admitted generic-annotation argument containers. This is
+         * a capability assertion, not a forbidden semantic target. */
+        {"def caller[T](value: T):\n    return target()\n", false},
+        {"class Container[T]:\n    pass\ndef caller():\n    return target()\n", false},
+        /* QUALITY GAP python-annotation-subscription-effects. WHY: a no-value
+         * annotation preserves this genuine runtime target binding, but the
+         * subscription effect audit is intentionally unproved. TRIED: retain
+         * python_inert_annotation's existing barrier; do not count this miss
+         * as a false-positive target or weaken the separate annotation oracle. */
+        {"target: Optional[str]\ndef caller():\n    return target()\n", false},
+        {"def caller(value: Optional[str]):\n    pair = 1, "
+         "globals().__setitem__('target', None)\n    return target()\n",
+         false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char source[1024];
+        snprintf(source, sizeof(source),
+                 "from typing import Optional, Tuple\ndef target():\n    return 1\n%s",
+                 cases[i].tail);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                               "containers", "main.py", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        ASSERT(!file->has_error && !file->parse_incomplete && !file->parse_unusable);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, file, CBM_LANG_PYTHON, source, strlen(source));
+        const char *site = strstr(source, "return target()");
+        ASSERT_NOT_NULL(site);
+        uint32_t start = (uint32_t)(site + strlen("return ") - source);
+        cbm_resolve_result_t proof = cbm_resolve_binding_local(
+            index, "target", start, start + strlen("target()"), CBM_SOURCE_ORIGIN_RAW);
+        bool exact = cbm_resolve_admit(&proof) && proof.proof && proof.target &&
+                     !strcmp(proof.target, "containers.main.target");
+        if (exact != cases[i].exact)
+            fprintf(stderr, "Python container case=%zu status=%s exact=%d\n", i,
+                    cbm_resolve_binding_status(index), exact);
+        cbm_arena_destroy(&arena);
+        cbm_free_result(file);
+        ASSERT_EQ(exact, cases[i].exact);
+    }
+    PASS();
+}
+
+static bool python_physical_package_golden(const char *manifest, bool source_layout,
+                                           bool explicit_src, int driver) {
+    static const char library[] = "from typing import Optional, Tuple\n"
+                                  "def target(value: Optional[str] = None) -> Tuple[str, str]:\n"
+                                  "    return '', ''\n";
+    static const char decoy[] = "def target():\n    return 99\n";
+    const char *library_path = source_layout ? "src/sample/utils.py" : "sample/utils.py";
+    const char *decoy_path = source_layout ? "decoy/utils.py" : "src/sample/utils.py";
+    const char *initializer = source_layout ? "src/sample/__init__.py" : "sample/__init__.py";
+    bool supported = !source_layout || explicit_src;
+    char main[256];
+    snprintf(main, sizeof(main),
+             "from %ssample.utils import target\ndef caller():\n    return target()\n"
+             "def local():\n    return 1\ndef control():\n    return local()\n",
+             explicit_src ? "src." : "");
+    const RQ_Source sources[] = {{.path = "main.py", .text = main},
+                                 {.path = library_path, .text = library},
+                                 {.path = initializer, .text = ""},
+                                 {.path = decoy_path, .text = decoy}};
+    const RQ_Expected expected[] = {
+        {.case_id = "physical-python-package-local-control",
+         .site =
+             {.file = "main.py", .caller = "control", .needle = "local()", .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "main.py",
+                    .suffix = "main.local",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "def local():"}},
+        {.case_id = "physical-python-package-exact-imported-function",
+         .site = {.file = "main.py", .caller = "caller", .needle = "target()"},
+         .relation = "CALLS",
+         .target = {.file = library_path,
+                    .suffix = source_layout ? "src.sample.utils.target" : "sample.utils.target",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "def target(value: Optional[str] = None) -> Tuple[str, str]:"}}};
+    const RQ_Forbidden forbidden = {
+        .case_id = "distribution-name-does-not-authorize-src-layout",
+        .site = {.file = "main.py", .caller = "caller", .needle = "target()"},
+        .relation = "CALLS",
+        .any_target = true};
+    const char *root = th_mktempdir("cbm_python_physical_package");
+    if (!root)
+        return false;
+    char repo[768], database[768];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    bool ok = cbm_mkdir_p(repo, 0755) && cbm_mkdir_p(TH_PATH(repo, "sample"), 0755) &&
+              cbm_mkdir_p(TH_PATH(repo, "src/sample"), 0755) &&
+              cbm_mkdir_p(TH_PATH(repo, "decoy"), 0755);
+    for (size_t i = 0; ok && i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = th_write_file(TH_PATH(repo, sources[i].path), sources[i].text) == 0;
+    if (ok && manifest)
+        ok = th_write_file(TH_PATH(repo, "pyproject.toml"), manifest) == 0;
+    for (int i = 0; ok && i < 55; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "filler%02d.py", i);
+        ok = th_write_file(TH_PATH(repo, path), "# unrelated source\n") == 0;
+    }
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    ok = ok && (!old_workers || saved_workers);
+    cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+    ok = pipeline && cbm_pipeline_set_project_name(pipeline, "physical-python") &&
+         cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else
+        cbm_unsetenv("CBM_WORKERS");
+    cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+    RQ_Report report = {0};
+    ok = store &&
+         rq_check(store, "physical-python", "python-physical-package", sources,
+                  sizeof(sources) / sizeof(sources[0]), expected, supported ? 2 : 1,
+                  supported ? NULL : &forbidden, supported ? 0 : 1, &report, stderr) &&
+         report.genuine == (supported ? 2u : 1u) && report.found == report.genuine &&
+         !report.wrong && !report.missing && ok;
+    if (store) {
+        /* IMPORTS records the physical dependency, separately from the local
+         * imported callable binding. Every emitted row must project to Files. */
+        const char *sql = "SELECT count(*) FROM resolver_occurrences r JOIN nodes s ON "
+                          "s.project=r.project AND s.qualified_name=r.scope JOIN nodes t ON "
+                          "t.project=r.project AND t.qualified_name=r.target JOIN edges e ON "
+                          "e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
+                          "WHERE r.project='physical-python' AND r.relation='IMPORTS' AND "
+                          "r.emitted=1 "
+                          "AND s.file_path='main.py' AND s.label='File' AND t.label='File'";
+        ok = generic_count(store, sql) == (supported ? 1 : 0) && ok;
+        ok = generic_count(store, "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                  "JOIN nodes t ON t.id=e.target_id WHERE e.type='IMPORTS' "
+                                  "AND s.file_path='main.py' AND t.label!='File'") == 0 &&
+             ok;
+        cbm_store_close(store);
+    }
+    th_cleanup(root);
+    return ok;
+}
+
+TEST(resolver_binding_python_distribution_name_is_not_import_root) {
+    static const char manifest[] = "[project]\nname = 'sample'\nversion = '1.0'\n";
+    static const char other_distribution[] = "[project]\nname = 'unrelated-dist'\n";
+    for (int driver = 0; driver < 2; driver++) {
+        ASSERT(python_physical_package_golden(NULL, false, false, driver));
+        ASSERT(python_physical_package_golden(manifest, false, false, driver));
+        ASSERT(python_physical_package_golden(other_distribution, false, false, driver));
+        ASSERT(python_physical_package_golden(manifest, true, false, driver));
+        ASSERT(python_physical_package_golden(manifest, true, true, driver));
+    }
+    PASS();
+}
+
+/* A captured DEFAULT path is syntax, not an audited dependency adapter.
+ * These genuine literal imports stay in the recall denominator; the shell
+ * expansion additionally demonstrates a wrong concrete target, independently
+ * of the missing-adapter quality gaps. */
+TEST(resolver_binding_unsupported_import_carriers_do_not_authorize_paths) {
+    static const RQ_Source sources[] = {
+        {.path = "main.jsonnet", .text = "local utils = import './utils.libsonnet';\nutils\n"},
+        {.path = "utils.libsonnet", .text = "{ value: 1 }\n"},
+        {.path = "main.ncl", .text = "let utils = import \"./utils.ncl\" in\nutils\n"},
+        {.path = "utils.ncl", .text = "{ value = 1 }\n"},
+        {.path = "main.sh", .text = "name=actual\nsource \"./${name}.sh\"\n"},
+        {.path = "actual.sh", .text = "readonly actual=1\n"},
+        {.path = "${name}.sh", .text = "readonly decoy=1\n"},
+        {.path = "control.js",
+         .text = "export function target() { return 1; }\n"
+                 "export function caller() { return target(); }\n"}};
+    static const struct {
+        size_t source;
+        CBMLanguage language;
+        const char *path;
+    } carriers[] = {{0, CBM_LANG_JSONNET, "./utils.libsonnet"},
+                    {2, CBM_LANG_NICKEL, "./utils.ncl"},
+                    {4, CBM_LANG_BASH, "./${name}.sh"}};
+    for (size_t i = 0; i < sizeof(carriers) / sizeof(carriers[0]); i++) {
+        const RQ_Source *source = &sources[carriers[i].source];
+        CBMFileResult *file =
+            cbm_extract_file(source->text, (int)strlen(source->text), carriers[i].language,
+                             "unsupported-imports", source->path, 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        ASSERT(!file->has_error && !file->parse_incomplete && !file->parse_unusable);
+        ASSERT_EQ(file->imports.count, 1);
+        ASSERT_EQ(file->imports.items[0].kind, CBM_IMPORT_KIND_DEFAULT);
+        ASSERT_STR_EQ(file->imports.items[0].module_path, carriers[i].path);
+        cbm_free_result(file);
+    }
+    static const RQ_Expected expected[] = {
+        {.case_id = "jsonnet-explicit-relative-import-missing-adapter",
+         .site = {.file = "main.jsonnet",
+                  .caller = "main.jsonnet.__file__",
+                  .needle = "import './utils.libsonnet'"},
+         .relation = "IMPORTS",
+         .target = {.file = "utils.libsonnet",
+                    .suffix = "utils.libsonnet.__file__",
+                    .label = "File",
+                    .declaration_line = 1,
+                    .declaration_text = "{ value: 1 }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "jsonnet-dependency-adapter-missing",
+         .why = "The source-relative literal import is genuine, but no audited "
+                "Jsonnet dependency "
+                "adapter supplies occurrence and path-scope evidence.",
+         .tried = "Required the actual DEFAULT extractor carrier with the exact "
+                  "./ path and kept "
+                  "the physical target source; generic path matching is "
+                  "insufficient proof."},
+        {.case_id = "nickel-explicit-relative-import-missing-adapter",
+         .site = {.file = "main.ncl",
+                  .caller = "main.ncl.__file__",
+                  .needle = "import \"./utils.ncl\""},
+         .relation = "IMPORTS",
+         .target = {.file = "utils.ncl",
+                    .suffix = "utils.ncl.__file__",
+                    .label = "File",
+                    .declaration_line = 1,
+                    .declaration_text = "{ value = 1 }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "nickel-dependency-adapter-missing",
+         .why = "The source-relative literal import is genuine, but no audited "
+                "Nickel dependency "
+                "adapter supplies occurrence and path-scope evidence.",
+         .tried = "Required the actual DEFAULT extractor carrier with the exact "
+                  "./ path and kept "
+                  "the physical target source; generic path matching is "
+                  "insufficient proof."},
+        {.case_id = "supported-esm-control-remains-required",
+         .site = {.file = "control.js",
+                  .caller = "control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "control.js",
+                    .suffix = "control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 1; }"}}};
+    /* Expansion establishes the basename actual.sh, but the source captures
+     * no runtime working directory. Do not infer that it imports the repository
+     * actual.sh or count an invented source-relative obligation. The literal
+     * ${name}.sh decoy is nevertheless wrong for every working directory. */
+    static const RQ_Forbidden forbidden = {
+        .case_id = "shell-expanded-variable-never-names-literal-dollar-file",
+        .site = {.file = "main.sh",
+                 .caller = "main.sh.__file__",
+                 .needle = "source \"./${name}.sh\""},
+        .relation = "IMPORTS",
+        .target = {.file = "${name}.sh",
+                   .suffix = "${name}.sh.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "readonly decoy=1"}};
+    for (int driver = 0; driver < 2; driver++) {
+        const char *root = th_mktempdir("cbm_unsupported_imports");
+        ASSERT_NOT_NULL(root);
+        char repo[768], database[768];
+        snprintf(repo, sizeof(repo), "%s/repo", root);
+        snprintf(database, sizeof(database), "%s/index.db", root);
+        bool ok = cbm_mkdir_p(repo, 0755);
+        for (size_t i = 0; ok && i < sizeof(sources) / sizeof(sources[0]); i++)
+            ok = th_write_file(TH_PATH(repo, sources[i].path), sources[i].text) == 0;
+        for (int i = 0; ok && i < 55; i++) {
+            char path[32];
+            snprintf(path, sizeof(path), "filler%02d.py", i);
+            ok = th_write_file(TH_PATH(repo, path), "# unrelated source\n") == 0;
+        }
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+        ok = ok && (!old_workers || saved_workers);
+        cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+        cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+        ok = pipeline && cbm_pipeline_set_project_name(pipeline, "unsupported-imports") &&
+             cbm_pipeline_run(pipeline) == 0;
+        cbm_pipeline_free(pipeline);
+        if (saved_workers) {
+            cbm_setenv("CBM_WORKERS", saved_workers, 1);
+            free(saved_workers);
+        } else
+            cbm_unsetenv("CBM_WORKERS");
+        cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+        RQ_Report report = {0};
+        ok = store &&
+             rq_check(store, "unsupported-imports", "unsupported-import-path-gate", sources,
+                      sizeof(sources) / sizeof(sources[0]), expected,
+                      sizeof(expected) / sizeof(expected[0]), &forbidden, 1, &report, stderr) &&
+             report.genuine == 3 && report.found == 1 && report.missing == 2 &&
+             !report.required_missing && !report.wrong && ok;
+        if (store) {
+            /* Capture survives abstention, so unavailable adapters are visible
+             * in quality data instead of silently losing the import carriers. */
+            ok = generic_count(store, "SELECT count(*) FROM resolver_occurrences WHERE "
+                                      "project='unsupported-imports' "
+                                      "AND relation='IMPORTS' AND emitted=0 AND target='' "
+                                      "AND reason='unsupported_import_language' AND file_path IN "
+                                      "('main.jsonnet','main.ncl','main.sh')") == 3 &&
+                 ok;
+            ok = generic_count(store,
+                               "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                               "WHERE e.type='IMPORTS' AND s.file_path IN "
+                               "('main.jsonnet','main.ncl','main.sh')") == 0 &&
+                 ok;
+            cbm_store_close(store);
+        }
+        th_cleanup(root);
+        if (!ok)
+            fprintf(stderr,
+                    "Unsupported import gate driver=%d genuine=%zu found=%zu missing=%zu "
+                    "wrong=%zu required_missing=%zu\n",
+                    driver, report.genuine, report.found, report.missing, report.wrong,
+                    report.required_missing);
+        ASSERT(ok);
+    }
+    PASS();
+}
+
+TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
+    static const RQ_Source sources[] = {
+        {.path = "direct.dart", .text = "import './stub.dart';\n"},
+        {.path = "conditional.dart",
+         .text = "import './stub.dart' if (dart.library.io) './real.dart';\n"},
+        {.path = "exported.dart", .text = "export './stub.dart';\n"},
+        {.path = "escaped.dart", .text = "import './\\u0073tub.dart';\n"},
+        {.path = "stub.dart", .text = "int value = 1;\n"},
+        {.path = "real.dart", .text = "int value = 2;\n"},
+        {.path = "control.js",
+         .text = "export function target() { return 1; }\n"
+                 "export function caller() { return target(); }\n"}};
+    static const char *const raw_paths[] = {"./stub.dart", "./stub.dart", "./stub.dart",
+                                            "./\\u0073tub.dart"};
+    for (size_t i = 0; i < 4; i++) {
+        CBMFileResult *file =
+            cbm_extract_file(sources[i].text, (int)strlen(sources[i].text), CBM_LANG_DART,
+                             "dart-uri", sources[i].path, 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        ASSERT(!file->has_error && !file->parse_incomplete && !file->parse_unusable);
+        ASSERT_EQ(file->imports.count, 1);
+        ASSERT_STR_EQ(file->imports.items[0].module_path, raw_paths[i]);
+        if (i)
+            ASSERT_EQ(file->imports.items[0].kind, CBM_IMPORT_KIND_DEFAULT);
+        cbm_free_result(file);
+    }
+    static const RQ_Expected expected[] = {
+        {.case_id = "dart-export-dependency-remains-a-counted-gap",
+         .site = {.file = "exported.dart",
+                  .caller = "exported.dart.__file__",
+                  .needle = "export './stub.dart';"},
+         .relation = "IMPORTS",
+         .target = {.file = "stub.dart",
+                    .suffix = "stub.dart.__file__",
+                    .label = "File",
+                    .declaration_line = 1,
+                    .declaration_text = "int value = 1;"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "dart-export-dependency-proof-missing",
+         .why = "The exported library is a genuine dependency, but the audited "
+                "adapter covers "
+                "direct imports only; export namespace and occurrence proofs "
+                "remain absent.",
+         .tried = "Preserved the export carrier and exact physical file. A "
+                  "descendant string "
+                  "must not borrow the direct-import proof."},
+        {.case_id = "dart-escaped-uri-dependency-remains-a-counted-gap",
+         .site = {.file = "escaped.dart",
+                  .caller = "escaped.dart.__file__",
+                  .needle = "import './\\u0073tub.dart';"},
+         .relation = "IMPORTS",
+         .target = {.file = "stub.dart",
+                    .suffix = "stub.dart.__file__",
+                    .label = "File",
+                    .declaration_line = 1,
+                    .declaration_text = "int value = 1;"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "dart-uri-escape-decoding-proof-missing",
+         .why = "Dart's Unicode escape spells stub.dart, but this adapter has no "
+                "escape-decoding "
+                "certificate and must retain the raw token as unproven.",
+         .tried = "Kept the complete escaped URI and the decoded source target. "
+                  "No substring "
+                  "or raw-backslash filename is accepted as an equivalent URI."},
+        {.case_id = "required-same-pipeline-esm-control",
+         .site = {.file = "control.js",
+                  .caller = "control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "control.js",
+                    .suffix = "control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 1; }"}}};
+    static const RQ_Forbidden forbidden = {
+        .case_id = "conditional-import-does-not-select-a-default-without-configuration",
+        .site = {.file = "conditional.dart",
+                 .caller = "conditional.dart.__file__",
+                 .needle = "import './stub.dart' if (dart.library.io) './real.dart';"},
+        .relation = "IMPORTS",
+        .any_target = true};
+    for (int driver = 0; driver < 2; driver++) {
+        const char *root = th_mktempdir("cbm_dart_uri_proof");
+        ASSERT_NOT_NULL(root);
+        char repo[768], database[768];
+        snprintf(repo, sizeof(repo), "%s/repo", root);
+        snprintf(database, sizeof(database), "%s/index.db", root);
+        bool ok = cbm_mkdir_p(repo, 0755);
+        for (size_t i = 0; ok && i < sizeof(sources) / sizeof(sources[0]); i++)
+            ok = th_write_file(TH_PATH(repo, sources[i].path), sources[i].text) == 0;
+        for (int i = 0; ok && i < 55; i++) {
+            char path[32];
+            snprintf(path, sizeof(path), "filler%02d.py", i);
+            ok = th_write_file(TH_PATH(repo, path), "# unrelated source\n") == 0;
+        }
+        const char *old_workers = getenv("CBM_WORKERS");
+        char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+        ok = ok && (!old_workers || saved_workers);
+        cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+        cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+        ok = pipeline && cbm_pipeline_set_project_name(pipeline, "dart-uri") &&
+             cbm_pipeline_run(pipeline) == 0;
+        cbm_pipeline_free(pipeline);
+        if (saved_workers) {
+            cbm_setenv("CBM_WORKERS", saved_workers, 1);
+            free(saved_workers);
+        } else
+            cbm_unsetenv("CBM_WORKERS");
+        cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+        RQ_Report report = {0};
+        ok = store &&
+             rq_check(store, "dart-uri", "dart-import-uri-proof", sources,
+                      sizeof(sources) / sizeof(sources[0]), expected,
+                      sizeof(expected) / sizeof(expected[0]), &forbidden, 1, &report, stderr) &&
+             report.genuine == 3 && report.found == 1 && report.missing == 2 &&
+             !report.required_missing && !report.wrong && ok;
+        if (store) {
+            /* The required direct IMPORTS control has legacy 0/0 coordinates.
+             * Check exact physical endpoints and row/edge agreement without
+             * claiming that those coordinates identify an exact raw site. */
+            ok = generic_count(store,
+                               "SELECT count(*) FROM resolver_occurrences r JOIN nodes s ON "
+                               "s.project=r.project AND s.qualified_name=r.scope JOIN nodes t "
+                               "ON "
+                               "t.project=r.project AND t.qualified_name=r.target JOIN edges e "
+                               "ON "
+                               "e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
+                               "WHERE r.project='dart-uri' AND r.relation='IMPORTS' AND "
+                               "r.emitted=1 "
+                               "AND r.start_byte=0 AND r.end_byte=0 AND "
+                               "s.file_path='direct.dart' "
+                               "AND s.label='File' AND t.file_path='stub.dart' AND "
+                               "t.label='File'") == 1 &&
+                 ok;
+            ok = generic_count(store, "SELECT count(*) FROM resolver_occurrences WHERE "
+                                      "project='dart-uri' "
+                                      "AND relation='IMPORTS' AND emitted=0 AND target='' "
+                                      "AND file_path IN "
+                                      "('conditional.dart','exported.dart','escaped.dart')") == 3 &&
+                 ok;
+            ok = generic_count(store,
+                               "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                               "WHERE e.type='IMPORTS' AND s.file_path IN "
+                               "('conditional.dart','exported.dart','escaped.dart')") == 0 &&
+                 ok;
+            cbm_store_close(store);
+        }
+        th_cleanup(root);
+        if (!ok)
+            fprintf(stderr,
+                    "Dart URI proof driver=%d genuine=%zu found=%zu missing=%zu "
+                    "wrong=%zu\n",
+                    driver, report.genuine, report.found, report.missing, report.wrong);
+        ASSERT(ok);
+    }
+    PASS();
+}
+
 SUITE(resolver_binding_generic) {
+    RUN_TEST(resolver_binding_dart_import_requires_complete_direct_uri);
+    RUN_TEST(resolver_binding_unsupported_import_carriers_do_not_authorize_paths);
+    RUN_TEST(resolver_binding_python_annotation_containers_and_parameter_separators);
+    RUN_TEST(resolver_binding_python_distribution_name_is_not_import_root);
     RUN_TEST(resolver_binding_component_scripts_exact_local_scope);
     RUN_TEST(resolver_binding_component_scripts_scope_and_write_barriers);
     RUN_TEST(resolver_binding_python_annotation_only_raw_roles);

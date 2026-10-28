@@ -17833,8 +17833,7 @@ TEST(pipeline_native_fetch_template_base_url_makes_route) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
     int http_call_count = cbm_store_count_edges_by_type(s, project, "HTTP_CALLS");
-    int matching_route_count =
-        http_calls_to_route(s, project, "createPayment", "/v1/payments");
+    int matching_route_count = http_calls_to_route(s, project, "createPayment", "/v1/payments");
 
     cbm_store_close(s);
     cbm_pipeline_free(p);

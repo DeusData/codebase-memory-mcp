@@ -712,9 +712,9 @@ TEST(contract_chialisp_constant_resolves_across_files) {
         all[0] = f[0];
         all[1] = f[1];
         all[2] = (LangFile){"decoy/condition_codes.clib", "(\n  (defconstant CREATE_COIN 99)\n)\n"};
-        all[3] = (LangFile){"chialisp_control.mjs",
-            "export function target() { return 1; }\n"
-            "export function caller() { return target(); }\n"};
+        all[3] =
+            (LangFile){"chialisp_control.mjs", "export function target() { return 1; }\n"
+                                               "export function caller() { return target(); }\n"};
         char names[PADDING][64], texts[PADDING][64];
         for (int i = 0; parallel && i < PADDING; i++) {
             snprintf(names[i], sizeof(names[i]), "padding/pad_%02d.mjs", i);
@@ -728,17 +728,25 @@ TEST(contract_chialisp_constant_resolves_across_files) {
             {.case_id = "included-chialisp-constant",
              .site = {.file = "puzzle.clsp", .caller = "puzzle.run", .needle = "CREATE_COIN"},
              .relation = "USAGE",
-             .target = {.file = "condition_codes.clib", .suffix = "CREATE_COIN", .label = "Constant",
+             .target = {.file = "condition_codes.clib",
+                        .suffix = "CREATE_COIN",
+                        .label = "Constant",
                         .declaration_line = 2,
                         .declaration_text = "  (defconstant CREATE_COIN 51)"},
-             .mode = RQ_KNOWN_GAP, .gap_id = "chialisp-include-constant-scope",
+             .mode = RQ_KNOWN_GAP,
+             .gap_id = "chialisp-include-constant-scope",
              .why = "The Chialisp include binding has no audited source-proof bridge.",
-             .tried = "Preserved include and Constant nodes; exact occurrence and foreign decoy checked."},
+             .tried = "Preserved include and Constant nodes; exact occurrence and foreign decoy "
+                      "checked."},
             {.case_id = "required-control",
-             .site = {.file = "chialisp_control.mjs", .caller = "caller", .needle = "target()",
+             .site = {.file = "chialisp_control.mjs",
+                      .caller = "caller",
+                      .needle = "target()",
                       .occurrence_index = 1},
              .relation = "CALLS",
-             .target = {.file = "chialisp_control.mjs", .suffix = "target", .label = "Function",
+             .target = {.file = "chialisp_control.mjs",
+                        .suffix = "target",
+                        .label = "Function",
                         .declaration_line = 1,
                         .declaration_text = "export function target() { return 1; }"},
              .mode = RQ_REQUIRED}};
@@ -746,8 +754,11 @@ TEST(contract_chialisp_constant_resolves_across_files) {
             .case_id = "unloaded-constant-is-not-a-binding",
             .site = {.file = "puzzle.clsp", .caller = "puzzle.run", .needle = "CREATE_COIN"},
             .relation = "USAGE",
-            .target = {.file = "decoy/condition_codes.clib", .suffix = "CREATE_COIN", .label = "Constant",
-                       .declaration_line = 2, .declaration_text = "  (defconstant CREATE_COIN 99)"}};
+            .target = {.file = "decoy/condition_codes.clib",
+                       .suffix = "CREATE_COIN",
+                       .label = "Constant",
+                       .declaration_line = 2,
+                       .declaration_text = "  (defconstant CREATE_COIN 99)"}};
         LangProj lp;
         cbm_store_t *store = lang_index_files(&lp, all, 4 + parallel * PADDING);
         RQ_Report report;
@@ -755,8 +766,8 @@ TEST(contract_chialisp_constant_resolves_across_files) {
                                                 expected, 2, &forbidden, 1, &report, stderr);
         cbm_node_t *constants = NULL;
         int constant_count = 0, exact = 0;
-        if (store && cbm_store_find_nodes_by_name(store, lp.project, "CREATE_COIN",
-                                                 &constants, &constant_count) == CBM_STORE_OK) {
+        if (store && cbm_store_find_nodes_by_name(store, lp.project, "CREATE_COIN", &constants,
+                                                  &constant_count) == CBM_STORE_OK) {
             for (int i = 0; i < constant_count; i++)
                 if (constants[i].file_path && constants[i].label &&
                     !strcmp(constants[i].file_path, "condition_codes.clib") &&
