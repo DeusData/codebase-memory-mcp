@@ -1553,6 +1553,39 @@ TEST(contract_edge_infra_routes_from_deploy_configs_still_minted) {
     PASS();
 }
 
+/* #2388: the YAML key-path walk kept its pending mappings in a 256-frame stack
+ * and stopped pushing once full. A `data:` payload block with more nested
+ * entries than that lost the full `data.<entry>.webhook_url` path of every entry
+ * past the cap; only the shorter per-mapping refs survived, the payload deny
+ * never saw them, and each of those values minted an infra Route (44 of 300
+ * here). Every payload value must stay unminted however wide the block is. */
+enum { WIDE_PAYLOAD_ENTRIES = 300 };
+
+TEST(contract_edge_no_infra_routes_from_wide_payload_block_issue2388) {
+    size_t cap = (size_t)WIDE_PAYLOAD_ENTRIES * 64 + 16;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "data:\n");
+    for (int i = 0; i < WIDE_PAYLOAD_ENTRIES; i++) {
+        pos +=
+            (size_t)snprintf(src + pos, cap - pos,
+                             "  svc%d:\n    webhook_url: https://h%d.payload.example/hook\n", i, i);
+    }
+    LangProj lp;
+    LangFile f[] = {{"service.yaml", src}};
+    cbm_store_t *store = lang_index_files(&lp, f, 1);
+    ASSERT_NOT_NULL(store);
+    int routes = count_infra_routes_matching(store, lp.project, "payload.example");
+    if (routes != 0) {
+        fprintf(stderr, "  [2388] FAIL wide payload block minted %d infra routes (expected 0)\n",
+                routes);
+    }
+    ASSERT_EQ(routes, 0);
+    lang_cleanup(&lp, store);
+    free(src);
+    PASS();
+}
+
 /* A config URL becomes an infra Route only under a key that names an endpoint
  * this service exposes. Reference links are not: across 17 infra repositories
  * the infra Routes were changelog `pull_request` links (deckhouse 6,240),
@@ -1945,6 +1978,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
     RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
     RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
+    RUN_TEST(contract_edge_no_infra_routes_from_wide_payload_block_issue2388);
     RUN_TEST(contract_edge_no_infra_routes_from_reference_links);
     RUN_TEST(contract_edge_infra_routes_from_endpoint_key_spellings);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);

@@ -2581,10 +2581,12 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
         cbm_mcp_auto_index_within_file_limit(root_path, auto_index_limit, &tracked_files);
     if (auto_index_candidate && !within_auto_index_limit) {
         char files[32];
+        char limit[32];
         (void)snprintf(files, sizeof(files), "%d", tracked_files);
+        (void)snprintf(limit, sizeof(limit), "%d", auto_index_limit);
         cbm_log_warn("daemon.autoindex.skipped", "project", project, "reason",
                      tracked_files >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files);
+                     files, "limit", limit);
     }
     bool args_required = auto_index_candidate && within_auto_index_limit;
     char *args = args_required ? application_auto_index_args(application, root_path) : NULL;

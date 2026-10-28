@@ -22,6 +22,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/sha256.h"
@@ -4198,7 +4199,8 @@ enum { COPILOT_HOOK_TIMEOUT_SEC = 5 };
 static int cbm_build_copilot_hook_command(const char *binary_path, const char *event,
                                           bool powershell, char *out, size_t out_size) {
     if (!binary_path || !event || !out ||
-        (strcmp(event, "SessionStart") != 0 && strcmp(event, "SubagentStart") != 0)) {
+        (strcmp(event, "SessionStart") != 0 && strcmp(event, "SubagentStart") != 0 &&
+         strcmp(event, "PostToolUse") != 0)) {
         return CLI_ERR;
     }
     char quoted[CLI_BUF_8K];
@@ -4215,11 +4217,12 @@ static int cbm_build_copilot_hook_command(const char *binary_path, const char *e
 }
 
 static bool cbm_copilot_add_hook_event(yyjson_mut_doc *doc, yyjson_mut_val *hooks,
-                                       const char *event_key, const char *bash_command,
-                                       const char *powershell_command) {
+                                       const char *event_key, const char *matcher,
+                                       const char *bash_command, const char *powershell_command) {
     yyjson_mut_val *entries = yyjson_mut_arr(doc);
     yyjson_mut_val *entry = yyjson_mut_obj(doc);
     if (!entries || !entry || !yyjson_mut_obj_add_str(doc, entry, "type", "command") ||
+        (matcher && !yyjson_mut_obj_add_str(doc, entry, "matcher", matcher)) ||
         !yyjson_mut_obj_add_str(doc, entry, "bash", bash_command) ||
         !yyjson_mut_obj_add_str(doc, entry, "powershell", powershell_command) ||
         !yyjson_mut_obj_add_int(doc, entry, "timeoutSec", COPILOT_HOOK_TIMEOUT_SEC) ||
@@ -4230,11 +4233,25 @@ static bool cbm_copilot_add_hook_event(yyjson_mut_doc *doc, yyjson_mut_val *hook
     return true;
 }
 
-static char *cbm_build_copilot_hook_manifest(const char *binary_path) {
+/* Copilot CLI's preToolUse cannot add model context (its output is only a
+ * permission decision) and fails closed on hook errors, so searches are
+ * augmented after they run: postToolUse additionalContext is appended to the
+ * tool result the model sees. The PascalCase event name selects the
+ * Claude-format payload (tool_name Bash/Grep/Glob, tool_input), and the matcher
+ * names the Claude and the runtime tool names so either matcher reading fires. */
+#define COPILOT_SEARCH_MATCHER "Bash|Grep|Glob|bash|powershell|grep|rg|glob"
+
+/* include_posttool renders the current manifest; without it the function
+ * renders the previous lifecycle-only manifest, which installs up to v0.12 wrote
+ * and which upgrades and uninstalls must still recognize as owned. The result is
+ * released with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
+static char *cbm_build_copilot_hook_manifest(const char *binary_path, bool include_posttool) {
     char session_bash[CLI_BUF_8K];
     char session_powershell[CLI_BUF_8K];
     char subagent_bash[CLI_BUF_8K];
     char subagent_powershell[CLI_BUF_8K];
+    char post_bash[CLI_BUF_8K];
+    char post_powershell[CLI_BUF_8K];
     if (cbm_build_copilot_hook_command(binary_path, "SessionStart", false, session_bash,
                                        sizeof(session_bash)) != CLI_OK ||
         cbm_build_copilot_hook_command(binary_path, "SessionStart", true, session_powershell,
@@ -4242,7 +4259,11 @@ static char *cbm_build_copilot_hook_manifest(const char *binary_path) {
         cbm_build_copilot_hook_command(binary_path, "SubagentStart", false, subagent_bash,
                                        sizeof(subagent_bash)) != CLI_OK ||
         cbm_build_copilot_hook_command(binary_path, "SubagentStart", true, subagent_powershell,
-                                       sizeof(subagent_powershell)) != CLI_OK) {
+                                       sizeof(subagent_powershell)) != CLI_OK ||
+        cbm_build_copilot_hook_command(binary_path, "PostToolUse", false, post_bash,
+                                       sizeof(post_bash)) != CLI_OK ||
+        cbm_build_copilot_hook_command(binary_path, "PostToolUse", true, post_powershell,
+                                       sizeof(post_powershell)) != CLI_OK) {
         return NULL;
     }
 
@@ -4256,39 +4277,59 @@ static char *cbm_build_copilot_hook_manifest(const char *binary_path) {
         return NULL;
     }
     yyjson_mut_doc_set_root(doc, root);
-    bool ok =
-        yyjson_mut_obj_add_int(doc, root, "version", 1) &&
-        cbm_copilot_add_hook_event(doc, hooks, "sessionStart", session_bash, session_powershell) &&
-        cbm_copilot_add_hook_event(doc, hooks, "subagentStart", subagent_bash,
-                                   subagent_powershell) &&
-        yyjson_mut_obj_add_val(doc, root, "hooks", hooks);
-    char *manifest = ok ? yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL) : NULL;
+    bool ok = yyjson_mut_obj_add_int(doc, root, "version", 1) &&
+              cbm_copilot_add_hook_event(doc, hooks, "sessionStart", NULL, session_bash,
+                                         session_powershell) &&
+              cbm_copilot_add_hook_event(doc, hooks, "subagentStart", NULL, subagent_bash,
+                                         subagent_powershell) &&
+              (!include_posttool ||
+               cbm_copilot_add_hook_event(doc, hooks, "PostToolUse", COPILOT_SEARCH_MATCHER,
+                                          post_bash, post_powershell)) &&
+              yyjson_mut_obj_add_val(doc, root, "hooks", hooks);
+    char *manifest = ok ? yyjson_mut_write_opts(doc, YYJSON_WRITE_PRETTY,
+                                                cbm_json_writer_allocator(), NULL, NULL)
+                        : NULL;
     yyjson_mut_doc_free(doc);
     return manifest;
 }
 
+#ifdef CBM_CLI_ENABLE_TEST_API
+char *cbm_build_copilot_hook_manifest_for_testing(const char *binary_path, bool include_posttool) {
+    return cbm_build_copilot_hook_manifest(binary_path, include_posttool);
+}
+#endif
+
 /* Copilot loads every manifest in $COPILOT_HOME/hooks. Treat our dedicated
- * filename as an exact-owned document: a foreign collision fails closed, and
- * uninstall accepts only the complete generated lifecycle schema. */
+ * filename as an exact-owned document: a foreign collision fails closed. The
+ * current manifest or the exact previous one is ours, so install upgrades the
+ * previous one in place and uninstall removes either. */
 static int cbm_upsert_copilot_hooks(const char *binary_path, const char *manifest_path) {
-    char *manifest = cbm_build_copilot_hook_manifest(binary_path);
-    if (!manifest || !manifest_path) {
-        free(manifest);
+    char *manifest = cbm_build_copilot_hook_manifest(binary_path, true);
+    char *previous = cbm_build_copilot_hook_manifest(binary_path, false);
+    if (!manifest || !previous || !manifest_path) {
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
         return CLI_ERR;
     }
-    int rc = cbm_text_ensure_owned_document(manifest_path, manifest);
-    free(manifest);
+    const char *const released[] = {previous};
+    int rc = cbm_text_migrate_owned_document(manifest_path, manifest, released, 1U);
+    cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     return rc == 0 ? CLI_OK : CLI_ERR;
 }
 
 static int cbm_remove_copilot_hooks(const char *manifest_path, const char *binary_path) {
-    char *manifest = cbm_build_copilot_hook_manifest(binary_path);
-    if (!manifest || !manifest_path) {
-        free(manifest);
+    char *manifest = cbm_build_copilot_hook_manifest(binary_path, true);
+    char *previous = cbm_build_copilot_hook_manifest(binary_path, false);
+    if (!manifest || !previous || !manifest_path) {
+        cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+        cbm_free(CBM_MEM_CLASS_OTHER, previous);
         return CLI_ERR;
     }
-    int rc = cbm_text_remove_owned_document(manifest_path, manifest);
-    free(manifest);
+    const char *const released[] = {previous};
+    int rc = cbm_text_remove_owned_document_any(manifest_path, manifest, released, 1U);
+    cbm_free(CBM_MEM_CLASS_OTHER, manifest);
+    cbm_free(CBM_MEM_CLASS_OTHER, previous);
     return rc >= 0 ? CLI_OK : CLI_ERR;
 }
 
@@ -4620,7 +4661,10 @@ static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config
 /* Search augmentation runs before Grep/Glob/Bash; exact coverage context runs after
  * Read. Both adapters are context-only and fail open. */
 #define CMM_HOOK_SEARCH_MATCHER "Grep|Glob|Bash"
-#define CMM_HOOK_READ_MATCHER "Read"
+/* The PostToolUse entry also matches the graph tools (mcp__<server>__<tool>,
+ * or mcp__plugin_<plugin>_<server>__<tool>), whose calls reset the drift
+ * reminder's search count (#509). */
+#define CMM_HOOK_READ_MATCHER "Read|mcp__.*codebase-memory-mcp__.*"
 /* Basename only; the full command path is resolved at install time via
  * cbm_resolve_hook_command so $CLAUDE_CONFIG_DIR is honored. */
 #ifdef _WIN32
@@ -4641,6 +4685,11 @@ static const char *const cmm_claude_exec_args[] = {"hook-augment"};
 /* Old matcher values from previous versions — recognized during upgrade so
  * upsert/remove can clean them up before inserting the current matcher.
  * Per-agent lists (no shared global): each caller passes its own. */
+/* Installs up to v0.12 matched only Read in PostToolUse. */
+static const char *const cmm_claude_old_read_matchers[] = {
+    "Read",
+    NULL,
+};
 static const char *const cmm_claude_old_matchers[] = {
     "Grep|Glob|Read|Search",
     "Grep|Glob|Read",
@@ -5418,7 +5467,7 @@ static int cbm_upsert_claude_hooks_with_binary(const char *settings_path, const 
     if (cbm_remove_previous_claude_exec_hook(settings_path, "PreToolUse", CMM_HOOK_SEARCH_MATCHER,
                                              cmm_claude_old_matchers, binary_path) != CLI_OK ||
         cbm_remove_previous_claude_exec_hook(settings_path, "PostToolUse", CMM_HOOK_READ_MATCHER,
-                                             NULL, binary_path) != CLI_OK) {
+                                             cmm_claude_old_read_matchers, binary_path) != CLI_OK) {
         return CLI_ERR;
     }
     int search_result = upsert_hooks_json((hooks_upsert_args_t){
@@ -5437,6 +5486,7 @@ static int cbm_upsert_claude_hooks_with_binary(const char *settings_path, const 
         .settings_path = settings_path,
         .hook_event = "PostToolUse",
         .matcher_str = CMM_HOOK_READ_MATCHER,
+        .old_matchers = cmm_claude_old_read_matchers,
         .command_str = command,
         .command_args = command_args,
         .command_arg_count = command_arg_count,
@@ -5491,6 +5541,7 @@ static int cbm_remove_claude_hooks_with_binary(const char *settings_path, const 
         .settings_path = settings_path,
         .hook_event = "PostToolUse",
         .matcher_str = CMM_HOOK_READ_MATCHER,
+        .old_matchers = cmm_claude_old_read_matchers,
         .old_commands = old_commands,
         .match_command_exact = command,
         .match_args = command_args,
@@ -9193,7 +9244,8 @@ static void install_copilot_durable_context(const char *home, const char *binary
         record_agent_config_error(false, "Copilot", "lifecycle_hook_install", hook_path);
     }
     if (hook_ok) {
-        printf("  hooks: SessionStart + SubagentStart (dynamic graph context)\n");
+        printf("  hooks: SessionStart + SubagentStart + PostToolUse searches (dynamic graph "
+               "context)\n");
     }
 }
 
