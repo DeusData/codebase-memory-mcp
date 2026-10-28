@@ -169,6 +169,8 @@ static const MKC_Golden mkc_goldens[] = {
      "    int& operator[](int i) { return data[i]; }", "Method", 3, 0, false},
     {"mkc_c2_python_dunder_add", "__add__", "Vec(self.x + other.x, self.y + other.y)", "__init__",
      "    def __init__(self, x, y):", "Method", 2, 0, false},
+    {"mkc_c2_python_dunder_add", "__add__", "Vec(self.x + other.x, self.y + other.y)", "Vec",
+     "class Vec:", "Class", 1, 0, true},
     {"mkc_c2_python_dunder_getitem", "run", "s[0]", "__getitem__",
      "    def __getitem__(self, i):", "Method", 5, 0, false},
     {"mkc_c2_rust_add_trait", "run", "a + b", "add", "    fn add(self, rhs: Self) -> Self {",
@@ -332,6 +334,11 @@ static bool mkc_quality(const MKC_File *original, int count, const char *test) {
                      "Preserved fixture bytes and replaced that floor with exact source "
                      "occurrences/declarations. Direct make calls remain required source "
                      "obligations; an old aggregate count does not establish exact admission."};
+        /* The expression names the class and invokes its initialization
+         * protocol. Keep the unresolved __init__ dispatch as a separate
+         * obligation alongside the proved class binding. */
+        if (!strcmp(test, "mkc_c2_python_dunder_add"))
+            expected[n].dispatch_group = "python-class-initialization";
         required += g->required;
         n++;
     }

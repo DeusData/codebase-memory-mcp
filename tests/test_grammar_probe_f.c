@@ -1302,8 +1302,8 @@ TEST(probe_k8s_rbac_ingress_hpa_webhook_references) {
     PASS();
 }
 
-/* A custom resource is an instance of the CRD that declares its group and
- * kind; a reference to an object that is not in the repo draws nothing. */
+/* A custom resource uses its selected CRD declaration. Without an explicit
+ * build, repository co-location alone does not select the deployed CRD. */
 TEST(probe_k8s_cr_uses_its_crd_and_unresolved_draws_nothing) {
     static const GpfFile files[] = {
         {"crd.yaml", "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n"
@@ -1313,8 +1313,42 @@ TEST(probe_k8s_cr_uses_its_crd_and_unresolved_draws_nothing) {
                         "---\n"
                         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: lonely\nspec:\n"
                         "  template:\n    spec:\n      serviceAccountName: not-in-repo\n"}};
-    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"crd\""), 1);
-    ASSERT_EQ(gpf_resource_edges(files, 2, "USAGE", "\"ref\":\"serviceAccountName\""), 0);
+    const RQ_Forbidden unconfigured = {.case_id = "crd-unconfigured-no-build",
+                                       .site = {.file = "widget.yaml",
+                                                .caller = "widget.yaml::example.com/Widget/-/w1",
+                                                .needle = "Widget"},
+                                       .relation = "USAGE",
+                                       .any_target = true};
+    ASSERT_TRUE(gpf_infra_quality(files, 2, "probe_k8s_cr_uses_its_crd/unconfigured", NULL, 0,
+                                  &unconfigured, 1));
+    const GpfFile configured[] = {
+        files[0], files[1], {"kustomization.yaml", "resources:\n  - crd.yaml\n  - widget.yaml\n"}};
+    const RQ_Expected expected = {
+        .case_id = "crd-selected-declaration",
+        .site = {.file = "widget.yaml",
+                 .caller = "widget.yaml::example.com/Widget/-/w1",
+                 .needle = "Widget"},
+        .relation = "USAGE",
+        .target = {.file = "crd.yaml",
+                   .suffix = "crd.yaml::apiextensions.k8s.io/CustomResourceDefinition/-/"
+                             "widgets.example.com",
+                   .label = "Resource",
+                   .declaration_line = 4,
+                   .declaration_text = "  name: widgets.example.com"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "k8s_crd_declaration_source_scope_missing",
+        .why = "The explicit build selects the unique CRD for the resource group/kind; the "
+               "immutable CRD binding adapter is still missing.",
+        .tried = "Preserved the original resource and declaration; added explicit build "
+                 "membership and run exact endpoints with both pipeline drivers."};
+    const RQ_Forbidden unresolved = {.case_id = "service-account-absent",
+                                     .site = {.file = "widget.yaml",
+                                              .caller = "widget.yaml::apps/Deployment/-/lonely",
+                                              .needle = "not-in-repo"},
+                                     .relation = "USAGE",
+                                     .any_target = true};
+    ASSERT_TRUE(gpf_infra_quality(configured, 3, "probe_k8s_cr_uses_its_crd/configured", &expected,
+                                  1, &unresolved, 1));
     PASS();
 }
 
@@ -5718,6 +5752,66 @@ TEST(probe_helmrelease_chartref_deploys_its_oci_chart) {
     PASS();
 }
 
+/* A chartRef may deploy only the unique OCI source in every explicit build.
+ * Nearby files, competing declarations and a namespace mismatch are not proof. */
+TEST(probe_helmrelease_chartref_requires_unique_explicit_source) {
+    static const GpfFile release = {"app/release.yaml",
+                                    "apiVersion: helm.toolkit.fluxcd.io/v2\nkind: HelmRelease\n"
+                                    "metadata:\n  name: web\n  namespace: web\nspec:\n  chartRef:\n"
+                                    "    kind: OCIRepository\n    name: chart\n"};
+    static const GpfFile source = {"app/source.yaml",
+                                   "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                                   "metadata:\n  name: chart\n  namespace: web\nspec:\n"
+                                   "  url: oci://registry.example.test/charts/web\n"};
+    static const GpfFile alternative = {
+        "app/alternative.yaml", "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                                "metadata:\n  name: chart\n  namespace: web\nspec:\n"
+                                "  url: oci://other.example.test/charts/web\n"};
+    const GpfFile unconfigured[] = {release, source};
+    GPF_ASSERT_DEPLOYS(unconfigured, 2, "");
+    const GpfFile selected[] = {
+        release,
+        source,
+        alternative,
+        {"app/kustomization.yaml", GPF_KUST "resources:\n  - release.yaml\n  - source.yaml\n"}};
+    GPF_ASSERT_DEPLOYS(selected, 4, "HelmRelease/web -> chart:web(ext) (helmrelease)");
+    const GpfFile ambiguous[] = {release,
+                                 source,
+                                 alternative,
+                                 {"app/kustomization.yaml",
+                                  GPF_KUST "resources:\n  - release.yaml\n  - source.yaml\n"
+                                           "  - alternative.yaml\n"}};
+    GPF_ASSERT_DEPLOYS(ambiguous, 4, "");
+    const GpfFile wrong_namespace[] = {
+        release,
+        {"app/source.yaml", "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                            "metadata:\n  name: chart\n  namespace: other\nspec:\n"
+                            "  url: oci://registry.example.test/charts/web\n"},
+        selected[3]};
+    GPF_ASSERT_DEPLOYS(wrong_namespace, 3, "");
+    const GpfFile duplicate[] = {release,
+                                 {"app/source.yaml",
+                                  "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                                  "metadata:\n  name: chart\n  namespace: web\nspec:\n"
+                                  "  url: oci://registry.example.test/charts/web\n---\n"
+                                  "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                                  "metadata:\n  name: chart\n  namespace: web\nspec:\n"
+                                  "  url: oci://other.example.test/charts/web\n"},
+                                 selected[3]};
+    GPF_ASSERT_DEPLOYS(duplicate, 3, "");
+    const GpfFile unread_duplicate[] = {
+        release,
+        {"app/source.yaml", "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                            "metadata:\n  name: chart\n  namespace: web\nspec:\n"
+                            "  url: oci://registry.example.test/charts/web\n---\n"
+                            "apiVersion: source.toolkit.fluxcd.io/v1\nkind: OCIRepository\n"
+                            "metadata:\n  name: chart\n  namespace: web\nspec:\n"
+                            "  url: oci://other.example.test/charts/${CHART}\n"},
+        selected[3]};
+    GPF_ASSERT_DEPLOYS(unread_duplicate, 3, "");
+    PASS();
+}
+
 /* kubectl apply -f deploys a manifest, a directory's manifests (-R: below
  * it too; not a file holding no objects), a glob's; -k and a kustomize build
  * piped into kubectl a Kustomization. The source is the function running the
@@ -6627,6 +6721,32 @@ TEST(probe_helm_chart_deploys_its_objects) {
         fprintf(stderr, "chart edges got:\n%s\nwant:\n%s\n", got ? got : "(null)", want);
         free(got);
         FAIL("Chart DEPLOYS / CONFIGURES edge set");
+    }
+    free(got);
+    PASS();
+}
+
+/* A literal in a transformed template still needs the render context: an
+ * enabled literal survives, while a false conditional contributes no image. */
+TEST(probe_helm_chart_literal_images_follow_rendered_condition) {
+    static const GpfFile files[] = {
+        {"chart/Chart.yaml", "apiVersion: v2\nname: app\nversion: 1.0.0\n"},
+        {"chart/values.yaml", "sidecar: false\n"},
+        {"chart/templates/deploy.yaml",
+         "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n"
+         "  template:\n    spec:\n      containers:\n        - name: main\n"
+         "          image: ghcr.io/acme/main:1\n"
+         "{{- if .Values.sidecar }}\n        - name: hidden\n"
+         "          image: ghcr.io/acme/hidden:1\n{{- end }}\n"}};
+    char *got = gpf_chart_edges(files, 3);
+    static const char want[] = "app -> Image:ghcr.io/acme/main (DEPLOYS image)\n"
+                               "app -> Resource:Deployment/app (DEPLOYS)\n"
+                               "chart/values.yaml -> Chart:app (CONFIGURES)";
+    if (!got || strcmp(got, want)) {
+        fprintf(stderr, "conditional chart edges got:\n%s\nwant:\n%s\n", got ? got : "(null)",
+                want);
+        free(got);
+        FAIL("Chart literal images must respect rendered conditions");
     }
     free(got);
     PASS();
@@ -9365,16 +9485,37 @@ TEST(probe_nix_let_binding) {
     PASS();
 }
 
-/* Nix: `import` in two-file fixture → IMPORTS edge.
- * RED: Nix import expressions are not resolved into IMPORTS graph edges. */
+/* The literal Nix dependency is genuine; its missing binding is quality debt,
+ * while any guessed import target is a bug. */
 TEST(probe_nix_import_edge) {
     static const GpfFile files[] = {{"utils.nix", "{ double = x: x * 2; }\n"},
                                     {"default.nix", "let utils = import ./utils.nix;\n"
                                                     "in { result = utils.double 21; }\n"}};
-    GpfMetrics m = gpf_metrics_files(files, 2);
-    ASSERT_TRUE(m.ok);
-    /* RED: Nix `import` not resolved into IMPORTS edges by the grammar-only pipeline. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — no Nix import resolver */
+    const RQ_Source sources[] = {{.path = "utils.nix", .text = files[0].content},
+                                 {.path = "default.nix", .text = files[1].content}};
+    const RQ_Expected gap = {
+        .case_id = "nix-literal-import",
+        .site = {.file = "default.nix",
+                 .caller = "default.nix.__file__",
+                 .needle = "import ./utils.nix"},
+        .relation = "IMPORTS",
+        .target = {.file = "utils.nix",
+                   .suffix = "utils.nix.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "{ double = x: x * 2; }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "nix_literal_import_binding_unproven",
+        .why = "The literal import names the sibling Nix source, but Nix IMPORTS has no audited "
+               "language-binding adapter.",
+        .tried = "Kept the original import and target unchanged. The capability row explicitly "
+                 "abstains; basename and global symbol matches cannot establish the binding."};
+    RQ_Report report;
+    ASSERT_TRUE(
+        gpf_literal_import_quality(files, sources, "probe_nix_import_edge", &gap, NULL, &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -10133,16 +10274,34 @@ TEST(probe_meson_options_node) {
     PASS();
 }
 
-/* Meson: subdir() across two files → IMPORTS edge.
- * RED: Meson subdir() not resolved into IMPORTS edges. */
+/* A complete first project() declaration preserves the unconditional subdir.
+ * Require the physical File target and persisted outcome/edge agreement. */
 TEST(probe_meson_subdir_edge) {
     static const GpfFile files[] = {{"meson.build", "project('root', 'c')\n"
                                                     "subdir('lib')\n"},
                                     {"lib/meson.build", "static_library('mylib', 'mylib.c')\n"}};
-    GpfMetrics m = gpf_metrics_files(files, 2);
-    ASSERT_TRUE(m.ok);
-    /* RED: Meson subdir() not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — no Meson subdir resolver */
+    GpfProj lp;
+    cbm_store_t *store = gpf_index_files(&lp, files, 2);
+    bool ok = store != NULL;
+    sqlite3_stmt *row = NULL;
+    /* This import carrier retains legacy 0/0 coordinates; this assertion does
+     * not claim raw occurrence-span accuracy from those coordinates. */
+    const char *sql = "SELECT count(*) FROM resolver_occurrences r JOIN nodes s ON "
+                      "s.project=r.project AND s.qualified_name=r.scope JOIN nodes t ON "
+                      "t.project=r.project AND t.qualified_name=r.target JOIN edges e ON "
+                      "e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
+                      "WHERE r.project=?1 AND r.relation='IMPORTS' AND r.emitted=1 "
+                      "AND r.start_byte=0 AND r.end_byte=0 AND s.file_path='meson.build' "
+                      "AND s.label='File' AND t.file_path='lib/meson.build' AND t.label='File'";
+    if (ok) {
+        ok = sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &row, NULL) == SQLITE_OK &&
+             sqlite3_bind_text(row, 1, lp.project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+             sqlite3_step(row) == SQLITE_ROW && sqlite3_column_int(row, 0) == 1 &&
+             cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == 1;
+    }
+    sqlite3_finalize(row);
+    gpf_cleanup(&lp, store);
+    ASSERT_TRUE(ok);
     PASS();
 }
 
@@ -10683,10 +10842,12 @@ SUITE(grammar_probe_f) {
     RUN_TEST(probe_make_targets_spawn_their_rules);
     RUN_TEST(probe_make_rules_have_a_node_per_target);
     RUN_TEST(probe_helmrelease_chartref_deploys_its_oci_chart);
+    RUN_TEST(probe_helmrelease_chartref_requires_unique_explicit_source);
     RUN_TEST(probe_go_installer_deploys_charts);
     RUN_TEST(probe_terraform_helm_release_deploys_its_chart);
     RUN_TEST(probe_helm_templated_objects_are_resources);
     RUN_TEST(probe_helm_chart_deploys_its_objects);
+    RUN_TEST(probe_helm_chart_literal_images_follow_rendered_condition);
     RUN_TEST(probe_helm_chart_crds_and_werf_chart);
     RUN_TEST(probe_docker_default_images_marked_and_overrides);
     RUN_TEST(probe_helm_template_images_render_with_defaults);

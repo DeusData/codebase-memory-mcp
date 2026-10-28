@@ -94,6 +94,8 @@ bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *, 
  * These facts describe one library file only; parts/re-exports fail closed. */
 typedef struct {
     const char *uri;
+    /* Exact raw URI token identity for the audited extraction bridge. */
+    uint32_t uri_start_byte, uri_end_byte;
     const char *prefix;
     const char *const *show;
     size_t show_count;

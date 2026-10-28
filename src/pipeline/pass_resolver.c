@@ -2075,6 +2075,8 @@ static bool prepare_source_imports(file_resolver_t *resolver) {
     cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(resolver->bindings);
     if (!context)
         return false;
+    const CBMImportArray *extracted = &resolver->file->result->imports;
+    size_t extracted_at = 0;
     for (size_t i = 0; i < resolver->import_count; i++) {
         source_import_t *import = &resolver->imports[i];
         import->source = cbm_resolve_binding_import_at(resolver->bindings, i);
@@ -2100,7 +2102,26 @@ static bool prepare_source_imports(file_resolver_t *resolver) {
                 uri[0] == '.' ? uri : cbm_arena_sprintf(resolver->arena, "./%s", uri);
             if (!path)
                 return false;
-            CBMImport request = {.module_path = path};
+            /* Both source walks are ordered. Match this exact token once;
+             * another valid import of the same URI cannot lend its authority
+             * to a conditional, deferred or escaped occurrence. */
+            while (extracted_at < (size_t)extracted->count &&
+                   extracted->items[extracted_at].site_start_byte < import->source->uri_start_byte)
+                extracted_at++;
+            const CBMImport *captured =
+                extracted_at < (size_t)extracted->count ? &extracted->items[extracted_at] : NULL;
+            bool audited = captured &&
+                           captured->site_start_byte == import->source->uri_start_byte &&
+                           captured->site_end_byte == import->source->uri_end_byte &&
+                           captured->site_end_byte > captured->site_start_byte &&
+                           captured->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+                           captured->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH &&
+                           captured->module_path && !strcmp(captured->module_path, uri);
+            CBMImport request = {.module_path = path,
+                                 .kind = audited ? CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH
+                                                 : CBM_IMPORT_KIND_DEFAULT};
+            if (captured && captured->site_start_byte == import->source->uri_start_byte)
+                extracted_at++;
             const cbm_gbuf_node_t *target = NULL;
             outcome = cbm_pipeline_resolve_import_result(
                 resolver->file->ctx, resolver->file->rel_path,

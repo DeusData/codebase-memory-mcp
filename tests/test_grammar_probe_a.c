@@ -737,8 +737,7 @@ TEST(probe_crystal_module_node) {
     PASS();
 }
 
-/* Crystal: require in two-file fixture → IMPORTS edge.
- * RED: grammar-only Crystal has no `require` resolver in the pipeline. */
+/* Crystal: the exact relative dependency remains a counted proof gap. */
 TEST(probe_crystal_imports_edge) {
     static const GpaFile files[] = {{"util.cr", "def double(x : Int32) : Int32\n"
                                                 "  x * 2\n"
@@ -750,8 +749,41 @@ TEST(probe_crystal_imports_edge) {
                                                 "end\n"}};
     GpaMetrics m = gpa_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Crystal `require` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+    const GpaFile quality_files[] = {files[0], files[1], {"decoy/util.cr", files[0].content}};
+    RQ_Source sources[sizeof(quality_files) / sizeof(quality_files[0])];
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        sources[i] = (RQ_Source){.path = quality_files[i].name, .text = quality_files[i].content};
+    const RQ_Expected expected = {
+        .case_id = "probe_crystal_imports_edge-exact-dependency",
+        .site = {.file = "main.cr", .caller = "main.cr.__file__", .needle = "require \"./util\""},
+        .relation = "IMPORTS",
+        .target = {.file = "util.cr",
+                   .suffix = "util.cr.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "def double(x : Int32) : Int32"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "crystal-relative-require-proof",
+        .why = "The relative require names util.cr; Crystal literal and search-domain proofs are "
+               "not implemented.",
+        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
+                 "control, and required ESM call use full production indexing."};
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_crystal_imports_edge-invalid-target",
+        .site = {.file = "main.cr", .caller = "main.cr.__file__", .needle = "require \"./util\""},
+        .relation = "IMPORTS",
+        .target = {.file = "decoy/util.cr",
+                   .suffix = "decoy.util.cr.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "def double(x : Int32) : Int32"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpa_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_crystal_imports_edge", &expected, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 

@@ -1111,11 +1111,7 @@ TEST(probe_vue_script_imports) {
     PASS();
 }
 
-/* Vue: two-file cross-component import → IMPORTS graph edge.
- * The JS/TS resolver handles .vue imports via the same path-resolution
- * logic used for TypeScript.  With matching files on disk the resolver
- * should produce an IMPORTS edge.
- * RED: .vue extension may not be handled by the JS/TS import resolver. */
+/* Vue: the source-defined component dependency is a counted embedded-proof gap. */
 TEST(probe_vue_cross_component_import) {
     static const GpeFile files[] = {
         {"BaseButton.vue", "<template><button><slot /></button></template>\n"
@@ -1128,8 +1124,46 @@ TEST(probe_vue_cross_component_import) {
                     "<template><BaseButton label=\"Click\" /></template>\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: .vue cross-component IMPORTS edge not confirmed by the pipeline. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — .vue paths not in JS resolver */
+    const GpeFile quality_files[] = {
+        files[0], files[1], {"decoy/BaseButton.vue", files[0].content}};
+    RQ_Source sources[sizeof(quality_files) / sizeof(quality_files[0])];
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        sources[i] = (RQ_Source){.path = quality_files[i].name, .text = quality_files[i].content};
+    const RQ_Expected expected = {
+        .case_id = "probe_vue_cross_component_import-exact-dependency",
+        .site = {.file = "App.vue",
+                 .caller = "App.vue.__file__",
+                 .needle = "import BaseButton from './BaseButton.vue'"},
+        .relation = "IMPORTS",
+        .target = {.file = "BaseButton.vue",
+                   .suffix = "BaseButton.vue.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "<template><button><slot /></button></template>"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "vue-embedded-component-import-proof",
+        .why = "Vue script imports need an audited embedded-source origin and raw literal proof.",
+        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
+                 "control, and required ESM call use full production indexing."};
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_vue_cross_component_import-invalid-target",
+        .site = {.file = "App.vue",
+                 .caller = "App.vue.__file__",
+                 .needle = "import BaseButton from './BaseButton.vue'"},
+        .relation = "IMPORTS",
+        .target = {.file = "decoy/BaseButton.vue",
+                   .suffix = "decoy.BaseButton.vue.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "<template><button><slot /></button></template>"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpe_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_vue_cross_component_import", &expected, &forbidden,
+                                   &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -1172,8 +1206,7 @@ TEST(probe_svelte_script_imports) {
     PASS();
 }
 
-/* Svelte: two-file cross-component import → IMPORTS graph edge.
- * RED: .svelte extension may not be handled by the JS/TS import resolver. */
+/* Svelte: the exact component dependency is a counted embedded-proof gap. */
 TEST(probe_svelte_cross_component_import) {
     static const GpeFile files[] = {{"Button.svelte", "<script>\n"
                                                       "  export let label = 'Click';\n"
@@ -1185,8 +1218,45 @@ TEST(probe_svelte_cross_component_import) {
                                                    "<Button label=\"Go\" />\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: .svelte cross-component IMPORTS edge not confirmed by the pipeline. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — .svelte paths not in JS resolver */
+    const GpeFile quality_files[] = {files[0], files[1], {"decoy/Button.svelte", files[0].content}};
+    RQ_Source sources[sizeof(quality_files) / sizeof(quality_files[0])];
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        sources[i] = (RQ_Source){.path = quality_files[i].name, .text = quality_files[i].content};
+    const RQ_Expected expected = {
+        .case_id = "probe_svelte_cross_component_import-exact-dependency",
+        .site = {.file = "App.svelte",
+                 .caller = "App.svelte.__file__",
+                 .needle = "import Button from './Button.svelte';"},
+        .relation = "IMPORTS",
+        .target = {.file = "Button.svelte",
+                   .suffix = "Button.svelte.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "<script>"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "svelte-embedded-component-import-proof",
+        .why =
+            "Svelte script imports need an audited embedded-source origin and raw literal proof.",
+        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
+                 "control, and required ESM call use full production indexing."};
+    const RQ_Forbidden forbidden = {.case_id = "probe_svelte_cross_component_import-invalid-target",
+                                    .site = {.file = "App.svelte",
+                                             .caller = "App.svelte.__file__",
+                                             .needle = "import Button from './Button.svelte';"},
+                                    .relation = "IMPORTS",
+                                    .target = {.file = "decoy/Button.svelte",
+                                               .suffix = "decoy.Button.svelte.__file__",
+                                               .label = "File",
+                                               .declaration_line = 1,
+                                               .declaration_text = "<script>"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpe_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_svelte_cross_component_import", &expected, &forbidden,
+                                   &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -1229,8 +1299,7 @@ TEST(probe_astro_frontmatter_imports) {
     PASS();
 }
 
-/* Astro: two-file cross-component import → IMPORTS graph edge.
- * RED: .astro extension may not be handled by the JS/TS import resolver. */
+/* Astro: the exact frontmatter dependency is a counted embedded-proof gap. */
 TEST(probe_astro_cross_component_import) {
     static const GpeFile files[] = {{"Card.astro", "---\n"
                                                    "const { title } = Astro.props;\n"
@@ -1242,8 +1311,45 @@ TEST(probe_astro_cross_component_import) {
                                                     "<Card title=\"Hello\" />\n"}};
     GpeMetrics m = gpe_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: .astro cross-component IMPORTS edge not confirmed by the pipeline. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED — .astro paths not in JS resolver */
+    const GpeFile quality_files[] = {files[0], files[1], {"decoy/Card.astro", files[0].content}};
+    RQ_Source sources[sizeof(quality_files) / sizeof(quality_files[0])];
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        sources[i] = (RQ_Source){.path = quality_files[i].name, .text = quality_files[i].content};
+    const RQ_Expected expected = {
+        .case_id = "probe_astro_cross_component_import-exact-dependency",
+        .site = {.file = "index.astro",
+                 .caller = "index.astro.__file__",
+                 .needle = "import Card from './Card.astro';"},
+        .relation = "IMPORTS",
+        .target = {.file = "Card.astro",
+                   .suffix = "Card.astro.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "---"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "astro-frontmatter-component-import-proof",
+        .why = "Astro frontmatter imports need an audited embedded-source origin and raw literal "
+               "proof.",
+        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
+                 "control, and required ESM call use full production indexing."};
+    const RQ_Forbidden forbidden = {.case_id = "probe_astro_cross_component_import-invalid-target",
+                                    .site = {.file = "index.astro",
+                                             .caller = "index.astro.__file__",
+                                             .needle = "import Card from './Card.astro';"},
+                                    .relation = "IMPORTS",
+                                    .target = {.file = "decoy/Card.astro",
+                                               .suffix = "decoy.Card.astro.__file__",
+                                               .label = "File",
+                                               .declaration_line = 1,
+                                               .declaration_text = "---"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpe_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_astro_cross_component_import", &expected, &forbidden,
+                                   &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 

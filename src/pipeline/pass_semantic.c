@@ -1075,7 +1075,6 @@ const char *cbm_semantic_class_base(const cbm_semantic_bindings_t *bindings,
         return NULL;
     if (candidate && candidate->file_path && definition->file_path &&
         !strcmp(candidate->file_path, definition->file_path) &&
-        (!declaration_source || !semantic_typed_language(declaration_source->language)) &&
         (!owner || !semantic_ecma(owner->source->language) ||
          !cbm_ht_has(owner->source->imports, base)))
         return candidate->qualified_name;

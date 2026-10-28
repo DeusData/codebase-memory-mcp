@@ -723,8 +723,7 @@ TEST(probe_func_function) {
     PASS();
 }
 
-/* FunC: `#include` in two-file fixture → IMPORTS edge.
- * RED: grammar-only FunC has no include-resolver in the pipeline. */
+/* FunC: incomplete directives abstain; complete literal includes stay required. */
 TEST(probe_func_imports_edge) {
     static const GpdFile files[] = {{"utils.fc", "int double_val(int n) {\n"
                                                  "    return n * 2;\n"
@@ -736,8 +735,28 @@ TEST(probe_func_imports_edge) {
                                                 "}\n"}};
     GpdMetrics m = gpd_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: FunC #include not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+    /* The original directive lacks FunC's required semicolon. */
+    ASSERT_EQ(m.imports, 0);
+    const GpdFile valid[] = {files[0], {"valid.fc", "#include \"utils.fc\";\n() valid() {}\n"}};
+    GpdProj lp;
+    cbm_store_t *store = gpd_index_files(&lp, valid, 2);
+    sqlite3_stmt *query = NULL;
+    /* Legacy import records have 0/0 spans. Require exact physical endpoints
+     * and matching persisted evidence without claiming an occurrence span. */
+    const char *sql = "SELECT count(*) FROM resolver_occurrences r "
+                      "JOIN nodes s ON s.project=r.project AND s.qualified_name=r.scope "
+                      "JOIN nodes t ON t.project=r.project AND t.qualified_name=r.target "
+                      "JOIN edges e ON e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
+                      "WHERE r.project=?1 AND r.relation='IMPORTS' AND r.emitted=1 "
+                      "AND r.start_byte=0 AND r.end_byte=0 AND s.file_path='valid.fc' "
+                      "AND s.label='File' AND t.file_path='utils.fc' AND t.label='File'";
+    bool ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == 1 &&
+              sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(query, 1, lp.project, -1, SQLITE_STATIC) == SQLITE_OK &&
+              sqlite3_step(query) == SQLITE_ROW && sqlite3_column_int(query, 0) == 1;
+    sqlite3_finalize(query);
+    gpd_cleanup(&lp, store);
+    ASSERT_TRUE(ok);
     PASS();
 }
 
@@ -1390,8 +1409,7 @@ TEST(probe_pony_trait_node) {
     PASS();
 }
 
-/* Pony: `use` in two-file fixture → IMPORTS edge.
- * RED: grammar-only Pony has no use-statement resolver in the pipeline. */
+/* Pony imports package directories, never a same-named sibling source file. */
 TEST(probe_pony_imports_edge) {
     static const GpdFile files[] = {{"util.pony", "primitive MathUtil\n"
                                                   "  fun double(n: U64): U64 =>\n"
@@ -1404,8 +1422,41 @@ TEST(probe_pony_imports_edge) {
                                                   "    env.out.print(r.string())\n"}};
     GpdMetrics m = gpd_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: Pony `use` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+    const GpdFile quality_files[] = {files[0], files[1], {"util/math.pony", files[0].content}};
+    RQ_Source sources[sizeof(quality_files) / sizeof(quality_files[0])];
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        sources[i] = (RQ_Source){.path = quality_files[i].name, .text = quality_files[i].content};
+    const RQ_Expected expected = {
+        .case_id = "probe_pony_imports_edge-exact-dependency",
+        .site = {.file = "main.pony", .caller = "main.pony.__file__", .needle = "use \"./util\""},
+        .relation = "IMPORTS",
+        .target = {.file = "util/math.pony",
+                   .suffix = "util.math.pony.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "primitive MathUtil"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "pony-relative-package-membership-proof",
+        .why = "Pony use selects a package directory. Its sole source member is util/math.pony; "
+               "sibling util.pony is not that package. Package-membership proof is unsupported.",
+        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
+                 "control, and required ESM call use full production indexing."};
+    const RQ_Forbidden forbidden = {
+        .case_id = "probe_pony_imports_edge-invalid-target",
+        .site = {.file = "main.pony", .caller = "main.pony.__file__", .needle = "use \"./util\""},
+        .relation = "IMPORTS",
+        .target = {.file = "util.pony",
+                   .suffix = "util.pony.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "primitive MathUtil"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpd_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_pony_imports_edge", &expected, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 
@@ -1598,8 +1649,7 @@ TEST(probe_qml_function) {
     PASS();
 }
 
-/* QML: `import` → IMPORTS edge.
- * RED: grammar-only QML has no import-resolver in the pipeline. */
+/* QML: distinguish invalid quoted QML files from genuine aliased JS resources. */
 TEST(probe_qml_imports_edge) {
     static const GpdFile files[] = {{"Utils.qml", "import QtQuick 2.15\n"
                                                   "\n"
@@ -1614,8 +1664,49 @@ TEST(probe_qml_imports_edge) {
                                                  "}\n"}};
     GpdMetrics m = gpd_metrics_files(files, 2);
     ASSERT_TRUE(m.ok);
-    /* RED: QML `import` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
+    const GpdFile quality_files[] = {
+        files[0],
+        files[1],
+        {"valid.qml", "import QtQuick 2.15\nimport \"./utils.js\" as Utils\nRectangle {}\n"},
+        {"utils.js", "function double(n) { return n * 2; }\n"}};
+    RQ_Source sources[sizeof(quality_files) / sizeof(quality_files[0])];
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        sources[i] = (RQ_Source){.path = quality_files[i].name, .text = quality_files[i].content};
+    const RQ_Expected expected = {
+        .case_id = "probe_qml_imports_edge-exact-dependency",
+        .site = {.file = "valid.qml",
+                 .caller = "valid.qml.__file__",
+                 .needle = "import \"./utils.js\" as Utils"},
+        .relation = "IMPORTS",
+        .target = {.file = "utils.js",
+                   .suffix = "utils.js.__file__",
+                   .label = "File",
+                   .declaration_line = 1,
+                   .declaration_text = "function double(n) { return n * 2; }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "qml-relative-javascript-resource-proof",
+        .why = "A quoted JavaScript resource imported with an alias is a genuine dependency. The "
+               "original quoted QML file is neither a directory nor a JavaScript resource. No "
+               "audited QML import adapter exists.",
+        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
+                 "control, and required ESM call use full production indexing."};
+    const RQ_Forbidden forbidden = {.case_id = "probe_qml_imports_edge-invalid-target",
+                                    .site = {.file = "Main.qml",
+                                             .caller = "Main.qml.__file__",
+                                             .needle = "import \"./Utils.qml\""},
+                                    .relation = "IMPORTS",
+                                    .target = {.file = "Utils.qml",
+                                               .suffix = "Utils.qml.__file__",
+                                               .label = "File",
+                                               .declaration_line = 1,
+                                               .declaration_text = "import QtQuick 2.15"}};
+    RQ_Report report;
+    ASSERT_TRUE(gpd_import_quality(quality_files, sizeof(quality_files) / sizeof(quality_files[0]),
+                                   sources, sizeof(sources) / sizeof(sources[0]),
+                                   "probe_qml_imports_edge", &expected, &forbidden, &report));
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.found, 1);
+    ASSERT_EQ(report.missing, 1);
     PASS();
 }
 

@@ -4515,12 +4515,14 @@ typedef struct {
     int edges;
 } k8s_helm_t;
 
-/* The templated images of the facts, kept past them. */
+/* Containers whose image needs rendering, kept past the facts. A literal in a
+ * transformed manifest must also be rendered: an unrelated template field
+ * invalidates raw USAGE provenance, but must not erase chart DEPLOYS. */
 static void k8s_helm_collect(cbm_pipeline_ctx_t *ctx, const k8s_facts_t *f, k8s_helm_t *h) {
     for (int i = 0; i < f->img_n; i++) {
         const k8s_img_t *im = &f->imgs[i];
         const cbm_gbuf_node_t *n =
-            strchr(im->image, '<') ? cbm_gbuf_find_by_id(ctx->gbuf, im->node) : NULL;
+            (strchr(im->image, '<') || !im->site) ? cbm_gbuf_find_by_id(ctx->gbuf, im->node) : NULL;
         if (!n || !n->file_path || im->start_line <= 0) {
             continue;
         }
@@ -5705,11 +5707,10 @@ static void k8s_link_chart_images(cbm_pipeline_ctx_t *ctx) {
     cbm_free(CBM_MEM_CLASS_OTHER, v);
 }
 
-/* A HelmRelease whose chartRef names OCIRepository `oci` (its USAGE edge
- * {"ref":"chartRef"}, resolved with the references) deploys the chart that
- * repository fetches: the external Chart of that OCI reference (its last
- * segment the chart, the rest its repository). */
-static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
+/* A captured OCI URL identifies the published chart independently of whether
+ * its intermediate USAGE relation has an immutable source proof. */
+static void k8s_deploy_chart_ref(k8s_dep_link_t *l, const k8s_hr_t *oci,
+                                 const cbm_gbuf_node_t *hr) {
     const char *url = oci->chart;
     size_t end = strlen(url);
     while (end > 0 && url[end - SKIP_ONE] == '/') {
@@ -5734,20 +5735,113 @@ static void k8s_link_chart_refs(k8s_dep_link_t *l, const k8s_hr_t *oci) {
              esc_name, esc_url);
     char repo[CBM_SZ_1K];
     const char *repo_url = cbm_chart_ref_repo(url, repo, sizeof(repo)) ? repo : NULL;
-    const cbm_gbuf_edge_t **in = NULL;
-    int n = 0;
-    if (cbm_gbuf_find_edges_by_target_type(l->ctx->gbuf, oci->node, "USAGE", &in, &n) != 0) {
+    char normalized[CBM_SZ_1K];
+    if (!cbm_chart_repo_url(repo_url, normalized, sizeof(normalized)))
         return;
-    }
-    for (int i = 0; i < n; i++) {
-        atomic_fetch_add_explicit(&g_k8s_candidates, SKIP_ONE, memory_order_relaxed);
-        const char *p = in[i]->properties_json;
-        const cbm_gbuf_node_t *hr = cbm_gbuf_find_by_id(l->ctx->gbuf, in[i]->source_id);
-        if (p && strstr(p, "\"ref\":\"chartRef\"") && hr && hr->file_path) {
-            k8s_deploys_edge(l, hr->id, k8s_external_chart(l, name, repo_url, hr->file_path),
-                             props);
+    k8s_deploys_edge(l, hr->id, k8s_external_chart(l, name, normalized, hr->file_path), props);
+}
+
+/* Only explicit Kustomization memberships select this noncontrolled deploy
+ * relation. Every selected build must agree on one same-namespace object;
+ * directory proximity and own-file preference never break a tie. */
+static const cbm_gbuf_node_t *k8s_chart_ref_target(k8s_dep_link_t *l, k8s_bundles_t *b,
+                                                   CBMHashTable *objects, const k8s_facts_t *facts,
+                                                   const k8s_ref_t *ref,
+                                                   const cbm_gbuf_node_t *hr) {
+    const k8s_members_t *source = cbm_ht_get(b->members, hr->file_path);
+    if (!source || !source->count)
+        return NULL;
+    char declared[K8S_LABEL_LEN], name[CBM_SZ_1K];
+    k8s_declared_ns(hr->qualified_name, declared, sizeof(declared));
+    int length = snprintf(name, sizeof(name), "OCIRepository/%s", ref->name);
+    if (length < 0 || (size_t)length >= sizeof(name))
+        return NULL;
+    const cbm_gbuf_node_t *selected = NULL;
+    for (int s = 0; s < source->count; s++) {
+        const k8s_member_t *scope = &source->items[s];
+        const char prefix[] = "kustomize:";
+        const k8s_raw_config_t *config =
+            !strncmp(scope->bundle, prefix, sizeof(prefix) - 1)
+                ? cbm_ht_get(facts->raw_config_paths, scope->bundle + sizeof(prefix) - 1)
+                : NULL;
+        if (!config || !config->memberships_complete || !config->objects)
+            return NULL;
+        const char *want = ref->ns ? ref->ns : scope->ns ? scope->ns : declared;
+        char key[CBM_SZ_1K];
+        k8s_bkey(key, sizeof(key), scope->bundle, name);
+        const k8s_ids_t *ids = cbm_ht_get(objects, key);
+        const cbm_gbuf_node_t *local = NULL;
+        for (int i = 0; ids && i < ids->count; i++) {
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(l->ctx->gbuf, ids->items[i]);
+            if (!target || !target->file_path || !target->qualified_name ||
+                !strstr(target->qualified_name, "::source.toolkit.fluxcd.io/OCIRepository/"))
+                continue;
+            const k8s_members_t *members = cbm_ht_get(b->members, target->file_path);
+            char target_ns[K8S_LABEL_LEN];
+            k8s_declared_ns(target->qualified_name, target_ns, sizeof(target_ns));
+            char identity[CBM_SZ_1K];
+            int written =
+                snprintf(identity, sizeof(identity), "source.toolkit.fluxcd.io/OCIRepository/%s/%s",
+                         target_ns, ref->name);
+            const k8s_raw_bucket_t *declarations = written > 0 && (size_t)written < sizeof(identity)
+                                                       ? cbm_ht_get(config->objects, identity)
+                                                       : NULL;
+            if (!declarations || declarations->count != 1 || !declarations->first->supported ||
+                !declarations->first->file->supported || declarations->first->node != target->id)
+                return NULL;
+            bool matches = false;
+            for (int m = 0; members && m < members->count; m++) {
+                const char *have = members->items[m].ns ? members->items[m].ns : target_ns;
+                matches |= members->items[m].bundle == scope->bundle &&
+                           !strcmp(want[0] ? want : "default", have[0] ? have : "default");
+            }
+            atomic_fetch_add_explicit(&g_k8s_candidates, SKIP_ONE, memory_order_relaxed);
+            if (matches) {
+                if (local && local != target)
+                    return NULL;
+                local = target;
+            }
         }
+        if (!local || (selected && selected != local))
+            return NULL;
+        selected = local;
     }
+    return selected;
+}
+
+static void k8s_link_chart_refs(k8s_dep_link_t *l, k8s_bundles_t *b, const k8s_facts_t *f) {
+    CBMHashTable *objects = k8s_index_objects(l->ctx, b, false);
+    CBMHashTable *urls = cbm_ht_create(0);
+    CBMHashTable *refs = cbm_ht_create(0);
+    for (int s = 0; urls && s < f->src_n; s++) {
+        const cbm_gbuf_node_t *node = cbm_gbuf_find_by_id(l->ctx->gbuf, f->srcs[s].node);
+        if (node && node->qualified_name)
+            k8s_index_add(urls, node->qualified_name, s + SKIP_ONE);
+    }
+    for (int r = 0; refs && r < f->ref_n; r++) {
+        const k8s_ref_t *ref = &f->refs[r];
+        const cbm_gbuf_node_t *hr = cbm_gbuf_find_by_id(l->ctx->gbuf, ref->src);
+        if (ref->via && !strcmp(ref->via, "chartRef") && hr && hr->qualified_name)
+            k8s_index_add(refs, hr->qualified_name, r + SKIP_ONE);
+    }
+    for (int r = 0; objects && urls && refs && r < f->ref_n; r++) {
+        const k8s_ref_t *ref = &f->refs[r];
+        const cbm_gbuf_node_t *hr = cbm_gbuf_find_by_id(l->ctx->gbuf, ref->src);
+        if (!ref->via || strcmp(ref->via, "chartRef") || !ref->name || !ref->kind ||
+            strcmp(ref->kind, "OCIRepository") || !hr || !hr->file_path || !hr->qualified_name ||
+            !strstr(hr->qualified_name, "::helm.toolkit.fluxcd.io/HelmRelease/"))
+            continue;
+        const k8s_ids_t *references = cbm_ht_get(refs, hr->qualified_name);
+        const cbm_gbuf_node_t *target = references && references->count == 1
+                                            ? k8s_chart_ref_target(l, b, objects, f, ref, hr)
+                                            : NULL;
+        const k8s_ids_t *sources = target ? cbm_ht_get(urls, target->qualified_name) : NULL;
+        if (sources && sources->count == 1)
+            k8s_deploy_chart_ref(l, &f->srcs[sources->items[0] - SKIP_ONE], hr);
+    }
+    k8s_free_index(objects);
+    k8s_free_index(urls);
+    k8s_free_index(refs);
 }
 
 /* `, "<key>":"<val>"` (escaped) at out + *w when `val` is set. */
@@ -6504,9 +6598,8 @@ static void k8s_link_deploys(cbm_pipeline_ctx_t *ctx, k8s_kusts_t *ks, k8s_bundl
                              props);
         }
     }
-    for (int s = 0; l.files && l.charts && s < f->src_n; s++) {
-        k8s_link_chart_refs(&l, &f->srcs[s]);
-    }
+    if (l.files && l.charts && f->src_n)
+        k8s_link_chart_refs(&l, b, f);
     if (l.files && l.kusts) {
         k8s_link_kcharts(&l, b, f);
     }

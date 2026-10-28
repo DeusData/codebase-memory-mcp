@@ -2460,11 +2460,23 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
         }
         TSNode uri = node;
         if (find_first_descendant_of(node, "string_literal", &uri)) {
-            if (dart_direct_import(node, uri) && push_literal_relative_import(ctx, uri))
+            int previous_count = ctx->result->imports.count;
+            if (dart_direct_import(node, uri) && push_literal_relative_import(ctx, uri)) {
+                if (ctx->result->imports.count <= previous_count)
+                    continue;
+                CBMImport *import = &ctx->result->imports.items[previous_count];
+                import->site_start_byte = ts_node_start_byte(uri);
+                import->site_end_byte = ts_node_end_byte(uri);
+                import->source_origin = CBM_SOURCE_ORIGIN_RAW;
                 continue;
+            }
             char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
             if (path && path[0]) {
-                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                CBMImport imp = {.local_name = path_last(a, path),
+                                 .module_path = path,
+                                 .site_start_byte = ts_node_start_byte(uri),
+                                 .site_end_byte = ts_node_end_byte(uri),
+                                 .source_origin = CBM_SOURCE_ORIGIN_RAW};
                 cbm_imports_push(&ctx->result->imports, a, imp);
             }
         }
@@ -2710,8 +2722,10 @@ static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
  * searched through include_path/CWD, neither of which this snapshot captures.
  * This deliberately small constant subset has no escapes or interpolation. */
 static const char *php_dir_include_path(CBMExtractCtx *ctx, TSNode expression) {
+    const char *kind = ts_node_type(expression);
     if (ts_node_has_error(ctx->root) || ts_node_has_error(expression) ||
-        strcmp(ts_node_type(expression), "require_once_expression") ||
+        (strcmp(kind, "include_expression") && strcmp(kind, "include_once_expression") &&
+         strcmp(kind, "require_expression") && strcmp(kind, "require_once_expression")) ||
         ts_node_named_child_count(expression) != 1)
         return NULL;
     TSNode value = ts_node_named_child(expression, 0);
@@ -4175,10 +4189,68 @@ static void meson_legacy_imports(CBMExtractCtx *ctx, TSNode root, TSNodeStack *s
     }
 }
 
+/* Meson's first project() declaration initializes the build. Literal
+ * positional strings contain no user calls or control flow. Keyword/default
+ * expressions and all later calls remain outside this execution prefix. */
+static bool meson_literal_project(CBMExtractCtx *ctx, TSNode call) {
+    if (strcmp(ts_node_type(call), "normal_command") || ts_node_has_error(call))
+        return false;
+    uint32_t first = ts_node_start_byte(call), last = ts_node_end_byte(call);
+    if (last <= first || last > (uint32_t)ctx->source_len || last - first > CBM_SZ_512)
+        return false;
+    const char *p = ctx->source + first, *end = ctx->source + last;
+    if (end - p < 7 || memcmp(p, "project", 7))
+        return false;
+    p += 7;
+    while (p < end && isspace((unsigned char)*p))
+        p++;
+    if (p == end || *p++ != '(')
+        return false;
+    unsigned arguments = 0;
+    for (;;) {
+        while (p < end && isspace((unsigned char)*p))
+            p++;
+        if (p == end || *p != '\'')
+            return false;
+        const char *value = ++p;
+        while (p < end && *p != '\'') {
+            if ((unsigned char)*p < ' ' || *p == '\\')
+                return false;
+            p++;
+        }
+        if (p == end || p == value)
+            return false;
+        if (arguments++) {
+            static const char *const languages[] = {
+                "c",    "cpp", "cuda",  "cython", "d",    "objc",      "objcpp", "fortran",
+                "java", "cs",  "swift", "nasm",   "masm", "linearasm", "vala",   "rust"};
+            bool language = false;
+            for (size_t i = 0; i < sizeof(languages) / sizeof(languages[0]); i++)
+                language |= strlen(languages[i]) == (size_t)(p - value) &&
+                            !memcmp(value, languages[i], (size_t)(p - value));
+            if (!language)
+                return false;
+        }
+        p++;
+        while (p < end && isspace((unsigned char)*p))
+            p++;
+        if (p == end)
+            return false;
+        if (*p == ')') {
+            p++;
+            while (p < end && isspace((unsigned char)*p))
+                p++;
+            return p == end;
+        }
+        if (*p++ != ',')
+            return false;
+    }
+}
+
 static void parse_meson_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
-    bool unconditional = true;
+    bool unconditional = true, first_statement = true;
     uint32_t count = ts_node_named_child_count(ctx->root);
     for (uint32_t i = 0; i < count; i++) {
         TSNode root = ts_node_named_child(ctx->root, i), call = root;
@@ -4187,6 +4259,10 @@ static void parse_meson_imports(CBMExtractCtx *ctx) {
         if (!strcmp(ts_node_type(root), "expression_statement") &&
             ts_node_named_child_count(root) == 1)
             call = ts_node_named_child(root, 0);
+        bool project = first_statement && meson_literal_project(ctx, call);
+        first_statement = false;
+        if (project)
+            continue;
         TSNode token = {0};
         bool audited = unconditional && !strcmp(ts_node_type(call), "normal_command") &&
                        find_first_descendant_of(call, "string", &token) &&

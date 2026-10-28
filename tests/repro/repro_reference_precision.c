@@ -160,12 +160,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 4,
                  .declaration_text = "def actual() -> int:"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "python_callable_alias_invocation_targets_exact_value-2",
-      .why = "Callable assignment and indirect invocation require exact target flow through a "
-             "local alias; ordinary name lookup must not recover the shadowed declaration.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_rust_callable_alias_invocation_targets_exact_value",
      {.case_id = "rust_callable_alias_invocation_targets_exact_value-1",
       .site = {.file = "aliases.rs", .caller = "aliasCaller", .start_byte = 122, .end_byte = 132},

@@ -269,8 +269,11 @@ static inline bool rq_target(const RQ_Target *target, const char *file, const ch
                rq_equal(label, "Folder") && rq_suffix(qn, name, target->suffix) && first == 0 &&
                last == 0;
     bool source_range = first <= target->declaration_line && last >= target->declaration_line;
-    bool structural_file =
-        rq_equal(target->label, "File") && rq_equal(label, "File") && first == 0 && last == 0;
+    /* File and file-level Module nodes identify the whole source, so their
+     * persisted range is 0/0. Exact file, qualified identity, label and the
+     * independently checked source anchor still bind the expected target. */
+    bool structural_file = (rq_equal(target->label, "File") || rq_equal(target->label, "Module")) &&
+                           rq_equal(target->label, label) && first == 0 && last == 0;
     return target->domain == RQ_TARGET_PROJECT && !target->external_identity &&
            !target->configuration_file && rq_equal(target->file, file) &&
            rq_suffix(qn, name, target->suffix) &&

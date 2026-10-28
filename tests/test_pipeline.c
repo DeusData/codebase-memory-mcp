@@ -1506,12 +1506,7 @@ static bool terraform_reference_quality(cbm_store_t *store, const char *project,
                     .suffix = "resource.aws_instance.web",
                     .declaration_line = 1,
                     .declaration_text = "resource \"aws_instance\" \"web\" {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TERRAFORM-REFERENCE-OCCURRENCE-PROOF",
-         .why = "Literal HCL reference and block identity are known, but the specialty pass does "
-                "not publish a sealed source occurrence and complete lookup domain.",
-         .tried = "Preserved the resource traversal and declaration; direct legacy graph insertion "
-                  "is removed by strict projection and cannot authorize its replacement."}};
+         .mode = RQ_REQUIRED}};
     RQ_Forbidden forbidden = {0};
     if (module) {
         expected[0].case_id = "terraform.local-module-reference";
@@ -1646,26 +1641,29 @@ static void write_temp_file(const char *dir, const char *name, const char *conte
  * edited file's re-index: an edge into a node the repair re-creates would be
  * lost (the Terraform layer needed closure_terraform_decline for that). */
 static bool ansible_include_quality(cbm_store_t *store, const char *project, const char *root) {
-    static const char *const files[] = {"roles/app/tasks/main.yml", "roles/app/tasks/setup.yml"};
-    static const RQ_Expected expected = {
-        .case_id = "ansible.literal-include",
-        .site = {.file = "roles/app/tasks/main.yml",
-                 .caller = "roles.app.tasks.main.yml.__file__",
-                 .needle = "setup.yml"},
-        .relation = "IMPORTS",
-        .target = {.file = "roles/app/tasks/setup.yml",
-                   .suffix = "roles.app.tasks.setup.yml.__file__",
-                   .label = "File",
-                   .declaration_line = 1,
-                   .declaration_text = "- name: s"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "ANSIBLE-LITERAL-INCLUDE-PROOF",
-        .why = "The relative include names a real task file, but the specialty pass has no sealed "
-               "source occurrence/path-domain proof.",
-        .tried = "Preserved both original files and the incremental body edit; legacy IMPORTS "
-                 "insertion alone does not supply shared resolver evidence."};
-    return pipeline_quality_files(store, project, "ansible-literal-include", root, files, 2,
-                                  &expected, 1, NULL, 0);
+    static const char *const files[] = {"roles/app/tasks/main.yml", "roles/app/tasks/setup.yml",
+                                        "roles/other/tasks/setup.yml"};
+    static const RQ_Expected expected = {.case_id = "ansible.literal-include",
+                                         .site = {.file = "roles/app/tasks/main.yml",
+                                                  .caller = "roles.app.tasks.main.yml.__file__",
+                                                  .needle = "include_tasks: setup.yml"},
+                                         .relation = "IMPORTS",
+                                         .target = {.file = "roles/app/tasks/setup.yml",
+                                                    .suffix = "roles.app.tasks.setup",
+                                                    .label = "Module",
+                                                    .declaration_line = 1,
+                                                    .declaration_text = "- name: s"},
+                                         .mode = RQ_REQUIRED};
+    RQ_Forbidden forbidden = {.case_id = "ansible.other-role-include-forbidden",
+                              .site = expected.site,
+                              .relation = "IMPORTS",
+                              .target = {.file = "roles/other/tasks/setup.yml",
+                                         .suffix = "roles.other.tasks.setup",
+                                         .label = "Module",
+                                         .declaration_line = 1,
+                                         .declaration_text = "- name: decoy"}};
+    return pipeline_quality_files(store, project, "ansible-literal-include", root, files, 3,
+                                  &expected, 1, &forbidden, 1);
 }
 
 TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
@@ -1675,6 +1673,8 @@ TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
     write_temp_file(g_tmpdir, "roles/app/tasks/main.yml",
                     "- name: setup\n  include_tasks: setup.yml\n");
     write_temp_file(g_tmpdir, "roles/app/tasks/setup.yml", "- name: s\n  debug:\n    msg: one\n");
+    write_temp_file(g_tmpdir, "roles/other/tasks/setup.yml",
+                    "- name: decoy\n  debug:\n    msg: other role\n");
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test_incr_ansible.db", g_tmpdir);
 
@@ -1713,24 +1713,18 @@ TEST(pipeline_incremental_keeps_ansible_includes_of_an_edited_file) {
 static bool ansible_notify_quality(cbm_store_t *store, const char *project, const char *root,
                                    int step) {
     static const char *const files[] = {"roles/app/tasks/main.yml", "roles/app/handlers/main.yml"};
-    RQ_Expected expected[2] = {
-        {.case_id = "ansible.configure-handler-one",
-         .site = {.file = "roles/app/tasks/main.yml",
-                  .caller = "roles.app.tasks.main.yml::task/1",
-                  .needle = "restart app"},
-         .relation = "CALLS",
-         .target = {.file = "roles/app/handlers/main.yml",
-                    .suffix = "roles.app.handlers.main.yml::handler/1",
-                    .label = "Function",
-                    .declaration_line = 1,
-                    .declaration_text = "- name: h1"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "ANSIBLE-NOTIFY-DISPATCH-PROOF",
-         .why = "The literal notify topic has known same-role handlers, but source occurrence and "
-                "complete dispatch-domain proofs are not published.",
-         .tried = "Kept both independently declared handlers and the exact incremental topic "
-                  "edits; every genuine dispatch is counted, with removed subscriptions forbidden.",
-         .dispatch_group = step == 0 ? "ansible-configure-topic" : NULL}};
+    RQ_Expected expected[2] = {{.case_id = "ansible.configure-handler-one",
+                                .site = {.file = "roles/app/tasks/main.yml",
+                                         .caller = "roles.app.tasks.main.yml::task/1",
+                                         .needle = "restart app"},
+                                .relation = "CALLS",
+                                .target = {.file = "roles/app/handlers/main.yml",
+                                           .suffix = "roles.app.handlers.main.yml::handler/1",
+                                           .label = "Function",
+                                           .declaration_line = 1,
+                                           .declaration_text = "- name: h1"},
+                                .mode = RQ_REQUIRED,
+                                .dispatch_group = step == 0 ? "ansible-configure-topic" : NULL}};
     expected[1] = expected[0];
     expected[1].case_id =
         step == 0 ? "ansible.configure-handler-two" : "ansible.reconfigure-handler-one";
@@ -3464,21 +3458,16 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                   "required separately."},
         {.case_id = "callback-java-package-access",
          .site = {.file = "JavaParity.java",
-                  .caller = "JavaParity.JavaParity.javaReferenceSite",
+                  .caller = "JavaParity.javaReferenceSite",
                   .needle = "javaReferenceTarget",
                   .occurrence_index = 1},
          .relation = "CALL_REFERENCE",
          .target = {.file = "JavaParity.java",
-                    .suffix = "JavaParity.JavaParity.javaReferenceTarget",
+                    .suffix = "JavaParity.javaReferenceTarget",
                     .label = "Method",
                     .declaration_line = 3,
                     .declaration_text = "  static void javaReferenceTarget() {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "callback-java-package-access",
-         .why = "Same-class package-private access is not yet represented by the public-member "
-                "proof bridge.",
-         .tried = "Focused pipeline probe: exact reference absent; public imported reference "
-                  "control remains required in resolver_java."},
+         .mode = RQ_REQUIRED},
         {.case_id = "callback-php-first-class-free",
          .site = {.file = "parity.php",
                   .caller = "parity.phpReferenceSite",
@@ -6743,9 +6732,8 @@ TEST(pipeline_incremental_root_path_refreshed_across_directories) {
     ASSERT_NOT_NULL(cbm_mkdtemp(dir_b));
     closure_probe_repo(dir_a);
     closure_probe_repo(dir_b);
-    /* Body edit only, same exported names: the shape the closure route
-     * repairs without falling back to a full rebuild (mirrors
-     * pipeline_closure_repair_body_edit_converges_with_fresh_full above). */
+    /* Body edit only, same exported names. Resolver negative dependencies
+     * conservatively require a fresh generation for this manifest change. */
     write_temp_file(dir_b, "lib.ts",
                     "export function closureProbeHelper(x: number): string {\n"
                     "  const doubled = x + x;\n"
@@ -6771,10 +6759,9 @@ TEST(pipeline_incremental_root_path_refreshed_across_directories) {
     ASSERT_EQ(cbm_pipeline_run(second), 0);
     cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(second);
-    /* The bug is specific to the closure/delta route; confirm we actually
-     * exercised it rather than a silent fall-back to a full rebuild, which
-     * would pass even with the fix reverted. */
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Current resolver generations rebuild after a manifest change so
+     * missing bindings cannot retain stale negative lookup dependencies. */
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 
     /* cbm_pipeline_repo_path()/cbm_store_upsert_project() never call
      * realpath(): the stored root_path is whatever was passed to
@@ -11968,12 +11955,7 @@ static bool php_receiver_quality(cbm_store_t *store, const char *project, const 
                     .label = "Method",
                     .declaration_line = 19,
                     .declaration_text = "    private function localHelper(): int"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PHP-IMPLICIT-THIS-PRIVATE-MEMBER",
-         .why = "The current class and private method determine the target, but the PHP proof "
-                "subset does not seed implicit this or attest private-member visibility.",
-         .tried = "Kept the original private declaration and zero-argument call; explicit typed "
-                  "public receiver controls remain required."},
+         .mode = RQ_REQUIRED},
         {.case_id = "php.typed-public-project-member",
          .site = {.file = "src/ChainListener.php",
                   .caller = "ChainListener.projectCall",
@@ -14874,15 +14856,15 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 18,
                     .declaration_text = "    int count;"},
-         .mode = RQ_REQUIRED,
-         .expected_recovered = true,
-         .gap_id = "C-FIELD-GUARDED-OWNER",
-         .why = "The selected default transform exposes the same literal named owner. Its "
-                "expanded content/configuration and exact raw-to-expanded field span are "
-                "independently pinned by this fixture.",
-         .tried = "Retained the original include guard and all 19 fixture files. Raw count "
-                  "bytes 512-517 map only to expanded bytes 352-357 on the same source line; "
-                  "wrong transformed bytes, configuration or origin remain hard failures."},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "C-PP-HEADER-CERTIFICATE",
+         .why = "The genuine field access needs the included header dependency closure. "
+                "Expanded bytes, configuration and matching spans do not prove that "
+                "omitted headers preserve the named owner or member.",
+         .tried = "Retained the original guards, both included headers and all 19 fixture "
+                  "files. Raw bytes 512-517 map to expanded bytes 352-357, but no retained "
+                  "header certificate authorizes that transform. Independent supported "
+                  "field and preprocessing controls remain required."},
         {.case_id = "c.field.header-beta-write",
          /* Literal source: b->count */
          .site =

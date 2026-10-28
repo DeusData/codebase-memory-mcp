@@ -918,6 +918,68 @@ TEST(parallel_empty_files) {
     PASS();
 }
 
+#include "resolver_quality.h"
+#include "store/store_resolver.h"
+
+/* Persist actual harness records through the production publication API.
+ * Expectations come only from fixture source; missing snapshots and
+ * unattested graph edges remain failures. */
+static bool parallel_quality_check_with_forbidden(cbm_gbuf_t *graph, const char *project,
+                                                  const char *suite, const RQ_Source *sources,
+                                                  size_t source_count, const RQ_Expected *expected,
+                                                  size_t expected_count,
+                                                  const RQ_Forbidden *forbidden,
+                                                  size_t forbidden_count, RQ_Report *report) {
+    cbm_store_t *store = cbm_store_open_memory();
+    size_t count = 0, file_count = 0, summary_count = 0;
+    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graph, &count);
+    const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(graph, &file_count);
+    const cbm_resolve_summary_t *summaries = cbm_gbuf_resolver_summaries(graph, &summary_count);
+    bool ok = store && cbm_gbuf_resolutions_complete(graph) &&
+              cbm_gbuf_flush_to_store(graph, store) == CBM_STORE_OK &&
+              cbm_store_resolver_replace_generation(store, project, rows, count, files, file_count,
+                                                    summaries, summary_count) == CBM_STORE_OK;
+    if (ok)
+        ok = rq_check(store, project, suite, sources, source_count, expected, expected_count,
+                      forbidden, forbidden_count, report, stderr);
+    if (store)
+        cbm_store_close(store);
+    return ok;
+}
+
+static bool parallel_quality_check(cbm_gbuf_t *graph, const char *project, const char *suite,
+                                   const RQ_Source *sources, size_t source_count,
+                                   const RQ_Expected *expected, size_t expected_count,
+                                   RQ_Report *report) {
+    return parallel_quality_check_with_forbidden(graph, project, suite, sources, source_count,
+                                                 expected, expected_count, NULL, 0, report);
+}
+
+/* Read only this test's authored fixture, for independent occurrence anchors. */
+static char *parallel_fixture_source(const char *path) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return NULL;
+    if (fseek(file, 0, SEEK_END)) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0 || size > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {
+        fclose(file);
+        return NULL;
+    }
+    char *source = malloc((size_t)size + 1);
+    if (!source || fread(source, 1, (size_t)size, file) != (size_t)size) {
+        free(source);
+        fclose(file);
+        return NULL;
+    }
+    source[size] = 0;
+    fclose(file);
+    return source;
+}
+
 /* ── Regression: args JSON must not overflow the props buffer ──────── */
 
 /* A call with many long string arguments makes append_args_json()'s running
@@ -925,9 +987,10 @@ TEST(parallel_empty_files) {
  * emit_normal_calls_edge(): format_call_arg() returns snprintf's UNtruncated
  * length, so pos += n could run past the buffer and the trailing
  * buf[pos]='\0' wrote out of bounds (stack-buffer-overflow; caught by the
- * stack canary as a SIGABRT on real repos). This indexes a fixture whose
- * single call carries enough long args to drive pos past 2 KB; under the
- * ASan test build a regression aborts here. */
+ * stack canary as a SIGABRT on real repos). Preserve the original sixty-arg
+ * pipeline fixture, then exercise the serializer with an additional source
+ * fixture whose eight captured arguments exceed 2 KB after formatting. The
+ * extraction cap must not make the ASan overflow regression vacuous. */
 TEST(parallel_args_json_no_overflow) {
     char dir[256];
     snprintf(dir, sizeof(dir), "/tmp/cbm_argov_XXXXXX");
@@ -940,8 +1003,8 @@ TEST(parallel_args_json_no_overflow) {
     fputs("function sink(...xs: string[]) { return xs; }\n", f);
     fputs("function caller() {\n  sink(\n", f);
     for (int i = 0; i < 60; i++) {
-        /* 100-char string literal per arg; 60 args => args JSON well past the
-         * 2 KB props buffer, forcing the pre-fix overshoot. */
+        /* Keep the original sixty 100-character literals. Extraction captures
+         * the first eight; the independent longer control below overflows. */
         fputs("    \"", f);
         for (int j = 0; j < 100; j++)
             fputc('a' + (i % 26), f);
@@ -958,7 +1021,127 @@ TEST(parallel_args_json_no_overflow) {
 
     cbm_gbuf_t *gbuf = run_parallel("argov-test", dir, files, file_count, 4);
     ASSERT_TRUE(gbuf != NULL);
-    ASSERT_GT(cbm_gbuf_edge_count(gbuf), 0);
+    char *source = parallel_fixture_source(path);
+    ASSERT_NOT_NULL(source);
+    const char *call = strstr(source, "sink(\n");
+    const char *end = call ? strstr(call, "  );") : NULL;
+    ASSERT_NOT_NULL(end);
+    RQ_Source input = {.path = "app.ts", .text = source};
+    RQ_Expected expected = {
+        .case_id = "wide-rest-argument-call",
+        .site = {.file = "app.ts",
+                 .caller = "app.caller",
+                 .start_byte = (uint32_t)(call - source),
+                 .end_byte = (uint32_t)(end + 3 - source)},
+        .relation = "CALLS",
+        .target = {.file = "app.ts",
+                   .suffix = "app.sink",
+                   .label = "Function",
+                   .declaration_line = 1,
+                   .declaration_text = "function sink(...xs: string[]) { return xs; }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "typescript-rest-parameter-callable-proof",
+        .why = "The rest-parameter callable does not yet have an admissible identity proof.",
+        .tried = "Retained all sixty long literal arguments and the original pipeline path; "
+                 "the occurrence is recorded but its graph edge is withheld."};
+    RQ_Report quality = {0};
+    ASSERT(parallel_quality_check(gbuf, "argov-test", "wide-call-arguments", &input, 1, &expected,
+                                  1, &quality));
+    ASSERT_EQ(quality.genuine, 1);
+    ASSERT_EQ(quality.missing, 1);
+    /* The original input's first eight 100-byte values fit. A second source
+     * fixture stays within CBM_MAX_CALL_ARGS while making each literal longer
+     * so the last JSON argument cannot fit. Neither control needs a speculative
+     * CALLS edge to reach the real production serializer. */
+    char long_source[CBM_SZ_4K];
+    int length = snprintf(long_source, sizeof(long_source),
+                          "function sink(...xs: string[]) { return xs; }\n"
+                          "function caller() {\n  sink(\n");
+    ASSERT_GT(length, 0);
+    ASSERT_LT((size_t)length, sizeof(long_source));
+    for (int i = 0; i < CBM_MAX_CALL_ARGS; i++) {
+        char literal[201];
+        memset(literal, 'a' + i % 26, sizeof(literal) - 1);
+        literal[sizeof(literal) - 1] = '\0';
+        int added = snprintf(long_source + length, sizeof(long_source) - (size_t)length,
+                             "    \"%s\"%s\n", literal, i + 1 < CBM_MAX_CALL_ARGS ? "," : "");
+        ASSERT_GT(added, 0);
+        ASSERT_LT((size_t)added, sizeof(long_source) - (size_t)length);
+        length += added;
+    }
+    int added = snprintf(long_source + length, sizeof(long_source) - (size_t)length, "  );\n}\n");
+    ASSERT_GT(added, 0);
+    ASSERT_LT((size_t)added, sizeof(long_source) - (size_t)length);
+
+    const char *serializer_sources[] = {source, long_source};
+    for (int control = 0; control < 2; control++) {
+        const char *text = serializer_sources[control];
+        const char *site = strstr(text, "sink(\n");
+        const char *site_end = site ? strstr(site, "  );") : NULL;
+        ASSERT_NOT_NULL(site_end);
+        CBMFileResult *extracted = cbm_extract_file(text, (int)strlen(text), CBM_LANG_TYPESCRIPT,
+                                                    "argov-test", "app.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(extracted);
+        const CBMCall *wide_call = NULL;
+        for (int i = 0; i < extracted->calls.count; i++) {
+            const CBMCall *candidate = &extracted->calls.items[i];
+            if (candidate->site_start_byte == (uint32_t)(site - text) &&
+                candidate->site_end_byte == (uint32_t)(site_end + 3 - text) &&
+                candidate->callee_name && !strcmp(candidate->callee_name, "sink")) {
+                ASSERT_NULL(wide_call);
+                wide_call = candidate;
+            }
+        }
+        ASSERT_NOT_NULL(wide_call);
+        ASSERT_EQ(wide_call->arg_count, CBM_MAX_CALL_ARGS);
+        for (int i = 0; i < wide_call->arg_count; i++) {
+            ASSERT_NOT_NULL(wide_call->args[i].value);
+            ASSERT_EQ(strlen(wide_call->args[i].value), control ? 200 : 100);
+        }
+        char props[CBM_SZ_2K];
+        int prefix = snprintf(props, sizeof(props),
+                              "{\"callee\":\"sink\",\"confidence\":1.00,\"strategy\":\"exact\","
+                              "\"candidates\":1");
+        cbm_pipeline_close_call_props(props, prefix, wide_call, true);
+        ASSERT_GT(strlen(props), 1024);
+        ASSERT_LT(strlen(props), sizeof(props));
+        sqlite3 *json_db = NULL;
+        sqlite3_stmt *json = NULL;
+        ASSERT_EQ(sqlite3_open(":memory:", &json_db), SQLITE_OK);
+        ASSERT_EQ(sqlite3_prepare_v2(json_db,
+                                     "SELECT json_extract(value, '$.i'), "
+                                     "json_extract(value, '$.v') FROM json_each(?1, '$.args')",
+                                     -1, &json, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_text(json, 1, props, -1, SQLITE_STATIC), SQLITE_OK);
+        int retained = 0, step;
+        while ((step = sqlite3_step(json)) == SQLITE_ROW) {
+            ASSERT_EQ(sqlite3_column_int(json, 0), retained);
+            const char *value = (const char *)sqlite3_column_text(json, 1);
+            ASSERT_NOT_NULL(value);
+            size_t value_length = strlen(value);
+            if (control) {
+                ASSERT_GT(value_length, 100);
+                ASSERT_LTE(value_length, 200);
+            } else {
+                ASSERT_EQ(value_length, 100);
+            }
+            for (size_t i = 0; i < value_length; i++)
+                ASSERT_EQ(value[i], 'a' + retained % 26);
+            retained++;
+        }
+        ASSERT_EQ(step, SQLITE_DONE);
+        if (control) {
+            ASSERT_GT(retained, 0);
+            ASSERT_LT(retained, CBM_MAX_CALL_ARGS);
+        } else {
+            ASSERT_EQ(retained, CBM_MAX_CALL_ARGS);
+        }
+        sqlite3_finalize(json);
+        sqlite3_close(json_db);
+        cbm_free_result(extracted);
+    }
+    free(source);
 
     cbm_gbuf_free(gbuf);
     cbm_discover_free(files, file_count);
@@ -1328,20 +1511,12 @@ TEST(parallel_closure_repair_syncs_ids_through_the_helper) {
     PASS();
 }
 
-/* ── Parallel-pipeline LSP-override regression ────────────────────── */
-/* Pin the wiring fix that unified pass_calls.c (sequential) and
- * pass_parallel.c (parallel) on cbm_pipeline_find_lsp_resolution +
- * CBM_LSP_CONFIDENCE_FLOOR (lsp_resolve.h). Before the unification, the
- * parallel path carried its own lsp_override_resolution_pp at floor 0.5
- * while the sequential path used find_lsp_resolution at floor 0.6, so a
- * project produced different CALLS edge attributions depending on which
- * pipeline mode kicked in. This test indexes a small Python repo via
- * the parallel pipeline and asserts at least one resulting CALLS edge
- * carries an "lsp_*" strategy — proof the parallel path consults
- * result->resolved_calls and emits LSP-attributed edges. */
+/* Legacy semantic results must reach the shared proof gate in both pipeline
+ * modes. The tests below require the exact source-proved receiver target and
+ * the public shared_resolver strategy, never a legacy confidence score. */
 
 typedef struct {
-    int lsp_strategy_count;
+    int proof_strategy_count;
     int total_calls;
 } lsp_edge_count_ctx_t;
 
@@ -1351,8 +1526,9 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
         return;
     }
     c->total_calls++;
-    if (edge->properties_json && strstr(edge->properties_json, "\"strategy\":\"lsp")) {
-        c->lsp_strategy_count++;
+    if (edge->properties_json &&
+        strstr(edge->properties_json, "\"strategy\":\"shared_resolver\"")) {
+        c->proof_strategy_count++;
     }
 }
 
@@ -1783,11 +1959,13 @@ TEST(parallel_lsp_index_distinct_exact_targets_fail_closed_in_graph) {
     ASSERT_NOT_NULL(find_unique_callable_node_by_tail(gbuf, "Beta.render"));
     const cbm_gbuf_edge_t *alpha = find_calls_edge_by_tails(gbuf, "Caller.run", "Alpha.render");
     const cbm_gbuf_edge_t *beta = find_calls_edge_by_tails(gbuf, "Caller.run", "Beta.render");
-    if (alpha || beta) {
+    if (!alpha || beta) {
         printf("  lsp exact ambiguity diagnostic: alpha=%s beta=%s\n", alpha ? "present" : "absent",
                beta ? "present" : "absent");
     }
-    ASSERT_NULL(alpha);
+    /* The injected row has no proof. The original source independently proves
+     * Alpha; an untrusted competing row must neither bind Beta nor veto Alpha. */
+    ASSERT_NOT_NULL(alpha);
     ASSERT_NULL(beta);
 
     cbm_gbuf_free(gbuf);
@@ -1919,7 +2097,7 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     const cbm_gbuf_edge_t *legacy_edge =
         find_calls_edge_by_tails(gbuf, "Caller.run", "Legacy.render");
     if (!probe.ambiguity.injected || !probe.legacy_injected || !probe.carrier_allows_fallback ||
-        !probe.shared_matcher_failed_closed || alpha_edges != 0 || beta_edges != 0 ||
+        !probe.shared_matcher_failed_closed || alpha_edges != 1 || beta_edges != 0 ||
         legacy_edges != 0) {
         printf("  exact ambiguity + legacy diagnostic: exact_ambiguity=%d legacy=%d "
                "fallback_allowed=%d shared_failed_closed=%d alpha=%d beta=%d legacy_edge=%d "
@@ -1936,26 +2114,9 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     ASSERT_TRUE(probe.legacy_injected);
     ASSERT_TRUE(probe.carrier_allows_fallback);
     ASSERT_TRUE(probe.shared_matcher_failed_closed);
-    /* alpha_edges is a SIDE EFFECT of this test, not its subject. The subject is
-     * beta_edges == 0 and legacy_edges == 0 below: an ambiguous exact LSP match
-     * must not fall through to the lower-ranked legacy semantic row. Both are
-     * unchanged, as are all four probe assertions above.
-     *
-     * It used to be 1 because this harness DELIBERATELY injects an ambiguous
-     * exact match and forces the shared matcher to fail closed, so
-     * `value.render()` drops past the LSP into the registry with THREE
-     * same-named candidates (Alpha/Beta/Legacy.render) and bound by
-     * suffix_match — MEASURED: strategy=suffix_match, cands=3, conf=0.5500.
-     * That is a 1-in-3 guess that happened to land on Alpha: exactly the weak
-     * member-call class the Python guard now suppresses (#1276), and the same
-     * accepted trade recorded on python/S6 in test_lsp_resolution_probe.c.
-     *
-     * NOT over-suppression: sibling tests in this suite index the same
-     * `value.render()` source and resolve it via lsp_method (cands=1,
-     * conf=0.9000), a strategy the guard keeps — they still assert 1. Only the
-     * sabotaged-LSP path degrades to a weak textual guess.
-     * Flips back to 1 once py_lsp_cross resolves the receiver on this path. */
-    ASSERT_EQ(alpha_edges, 0);
+    /* Legacy matcher ambiguity is still tested above. The shared source proof
+     * independently retains Alpha and rejects both unattested injected targets. */
+    ASSERT_EQ(alpha_edges, 1);
     ASSERT_EQ(beta_edges, 0);
     ASSERT_EQ(legacy_edges, 0);
     PASS();
@@ -2146,7 +2307,7 @@ TEST(parallel_lsp_exact_index_handles_repeated_synthetic_occurrences_without_lin
     for (int i = 0; i < OCCURRENCES; i++) {
         fprintf(file, "    value = left + right\n");
     }
-    fprintf(file, "    return value\n");
+    fprintf(file, "    return value\ndef stable(): return 7\ndef direct(): return stable()\n");
     fclose(file);
 
     cbm_file_info_t files[1] = {0};
@@ -2161,7 +2322,50 @@ TEST(parallel_lsp_exact_index_handles_repeated_synthetic_occurrences_without_lin
     ASSERT_NOT_NULL(gbuf);
     ASSERT_EQ(probe.carrier_count, OCCURRENCES);
     ASSERT_EQ(probe.exact_match_count, OCCURRENCES);
-    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.combine", "Number.__add__"));
+    char *source = parallel_fixture_source(path);
+    ASSERT_NOT_NULL(source);
+    RQ_Source input = {.path = "app.py", .text = source};
+    RQ_Expected expected[OCCURRENCES + 1] = {0};
+    char ids[OCCURRENCES][32];
+    for (int i = 0; i < OCCURRENCES; i++) {
+        snprintf(ids[i], sizeof(ids[i]), "python-add-%d", i);
+        expected[i] = (RQ_Expected){
+            .case_id = ids[i],
+            .site = {.file = "app.py",
+                     .caller = "app.combine",
+                     .needle = "left + right",
+                     .occurrence_index = (unsigned)i},
+            .relation = "CALLS",
+            .target = {.file = "app.py",
+                       .suffix = "app.Number.__add__",
+                       .label = "Method",
+                       .declaration_line = 2,
+                       .declaration_text = "    def __add__(self, other):"},
+            .mode = RQ_KNOWN_GAP,
+            .gap_id = "python-implicit-operator-dispatch",
+            .why = "Python implicit operator applicability is not certified by the proof bridge.",
+            .tried = "All 128 exact legacy carriers and matches remain asserted; each original "
+                     "operator occurrence is counted independently and a direct call is required."};
+    }
+    expected[OCCURRENCES] = (RQ_Expected){.case_id = "python-direct-control",
+                                          .site = {.file = "app.py",
+                                                   .caller = "app.direct",
+                                                   .needle = "stable()",
+                                                   .occurrence_index = 1},
+                                          .relation = "CALLS",
+                                          .target = {.file = "app.py",
+                                                     .suffix = "app.stable",
+                                                     .label = "Function",
+                                                     .declaration_line = OCCURRENCES + 7,
+                                                     .declaration_text = "def stable(): return 7"},
+                                          .mode = RQ_REQUIRED};
+    RQ_Report quality = {0};
+    ASSERT(parallel_quality_check(gbuf, "cbm_par_lsp_perf", "python-operator-scale", &input, 1,
+                                  expected, OCCURRENCES + 1, &quality));
+    ASSERT_EQ(quality.genuine, OCCURRENCES + 1);
+    ASSERT_EQ(quality.found, 1);
+    ASSERT_EQ(quality.missing, OCCURRENCES);
+    free(source);
     uint64_t fallback_rows = cbm_pp_lsp_linear_fallback_rows();
     if (fallback_rows != 0) {
         printf("  synthetic exact-index diagnostic: occurrences=%d linear_rows=%llu\n", OCCURRENCES,
@@ -2183,10 +2387,9 @@ typedef struct {
     int reference_count;
 } call_reference_scale_probe_t;
 
-/* Replace incidental extractor usages with a deterministic one-to-one set of
- * exact callable references. Every target is a real extracted Function node,
- * so the fused resolver must traverse its ordinary usage-materialization path
- * and emit 128 distinct CALL_REFERENCE edges. */
+/* Supply 128 real target names at fabricated off-source spans. The legacy
+ * site index must remain linear, but those rows cannot authorize edges. The
+ * test separately requires all 128 references from actual source arguments. */
 static void inject_call_reference_scale_rows(CBMFileResult **result_cache, int file_count,
                                              void *ud) {
     call_reference_scale_probe_t *probe = (call_reference_scale_probe_t *)ud;
@@ -2266,7 +2469,9 @@ TEST(parallel_call_reference_lookup_rows_grow_linearly) {
     for (int i = 0; i < CALL_REFERENCE_SCALE_OCCURRENCES; i++) {
         fprintf(file, "def scale_target_%03d():\n    return %d\n", i, i);
     }
-    fputs("def scale_caller():\n    return None\n", file);
+    fputs("def consume(callback): return None\ndef scale_caller():\n", file);
+    for (int i = 0; i < CALL_REFERENCE_SCALE_OCCURRENCES; i++)
+        fprintf(file, "    consume(scale_target_%03d)\n", i);
     fclose(file);
 
     cbm_file_info_t file_info = {0};
@@ -2281,6 +2486,25 @@ TEST(parallel_call_reference_lookup_rows_grow_linearly) {
         &probe, false);
     uint64_t rows_examined = cbm_pipeline_lsp_reference_lookup_test_rows_examined();
 
+    cbm_pipeline_lsp_reference_lookup_test_reset();
+    cbm_gbuf_t *source_graph = run_parallel("cbm_par_ref_scale", tmpdir, &file_info, 1, 1);
+    uint64_t source_rows_examined = cbm_pipeline_lsp_reference_lookup_test_rows_examined();
+    const cbm_gbuf_node_t *source_caller =
+        source_graph ? find_unique_callable_node_by_tail(source_graph, "app.scale_caller") : NULL;
+    const cbm_gbuf_edge_t **source_edges = NULL;
+    int source_count = 0;
+    int source_rc =
+        source_caller
+            ? cbm_gbuf_find_edges_by_source_type(source_graph, source_caller->id, "CALL_REFERENCE",
+                                                 &source_edges, &source_count)
+            : -1;
+    int source_targets = 0;
+    for (int i = 0; source_rc == 0 && i < source_count; i++) {
+        const cbm_gbuf_node_t *target =
+            cbm_gbuf_find_by_id(source_graph, source_edges[i]->target_id);
+        if (target && target->name && !strncmp(target->name, "scale_target_", 13))
+            source_targets++;
+    }
     const cbm_gbuf_node_t *caller =
         gbuf ? find_unique_callable_node_by_tail(gbuf, "app.scale_caller") : NULL;
     const cbm_gbuf_edge_t **edges = NULL;
@@ -2299,26 +2523,33 @@ TEST(parallel_call_reference_lookup_rows_grow_linearly) {
     }
 
     uint64_t linear_budget = (uint64_t)CALL_REFERENCE_SCALE_OCCURRENCES * 8U;
-    if (!probe.injected || lookup_rc != 0 || edge_count != CALL_REFERENCE_SCALE_OCCURRENCES ||
-        exact_target_edges != CALL_REFERENCE_SCALE_OCCURRENCES || rows_examined > linear_budget) {
+    if (!probe.injected || lookup_rc != 0 || edge_count != 0 || exact_target_edges != 0 ||
+        rows_examined > linear_budget) {
         printf("  call-reference lookup scale diagnostic: injected=%d references=%d "
                "edges=%d exact_targets=%d rows=%llu budget=%llu\n",
                probe.injected, probe.reference_count, edge_count, exact_target_edges,
                (unsigned long long)rows_examined, (unsigned long long)linear_budget);
     }
 
+    cbm_gbuf_free(source_graph);
     cbm_gbuf_free(gbuf);
     unlink(path);
     rmdir(tmpdir);
     ASSERT_TRUE(probe.injected);
     ASSERT_EQ(probe.reference_count, CALL_REFERENCE_SCALE_OCCURRENCES);
     ASSERT_EQ(lookup_rc, 0);
-    ASSERT_EQ(edge_count, CALL_REFERENCE_SCALE_OCCURRENCES);
-    ASSERT_EQ(exact_target_edges, CALL_REFERENCE_SCALE_OCCURRENCES);
+    /* Off-source synthetic spans have no occurrence proof. Real source
+     * arguments retain all 128 references through the same public pipeline. */
+    ASSERT_EQ(edge_count, 0);
+    ASSERT_EQ(exact_target_edges, 0);
+    ASSERT_EQ(source_rc, 0);
+    ASSERT_EQ(source_count, CALL_REFERENCE_SCALE_OCCURRENCES);
+    ASSERT_EQ(source_targets, CALL_REFERENCE_SCALE_OCCURRENCES);
     /* The current full scan examines N rows for every one of N usages:
      * 128*128 = 16,384. A site index should keep this below a small linear
      * allowance while retaining the exact target/ambiguity checks. */
     ASSERT_LTE(rows_examined, linear_budget);
+    ASSERT_LTE(source_rows_examined, linear_budget);
     PASS();
 }
 #endif
@@ -2375,14 +2606,44 @@ TEST(parallel_tsx_local_component_shadow_has_no_false_call) {
                parallel_wrong);
     }
 
+    char *source = parallel_fixture_source(path);
+    ASSERT_NOT_NULL(source);
+    RQ_Source input = {.path = "main.tsx", .text = source};
+    RQ_Expected expected = {
+        .case_id = "jsx-direct-component",
+        .site = {.file = "main.tsx",
+                 .caller = "main.Good",
+                 .needle = "<Card/>",
+                 .occurrence_index = 0},
+        .relation = "CALLS",
+        .target = {.file = "main.tsx",
+                   .suffix = "main.Card",
+                   .label = "Function",
+                   .declaration_line = 1,
+                   .declaration_text = "function Card(): JSX.Element { return <div/>; }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "tsx-jsx-element-callable-identity",
+        .why = "The JSX.Element annotated component lacks an admitted callable identity.",
+        .tried = "Preserved the original component, direct tag, parameter shadow and both "
+                 "pipeline routes; the exact tag carrier is retained without a guessed target."};
+    RQ_Report quality[2] = {0};
+    ASSERT(parallel_quality_check(sequential, "cbm_tsx_shadow", "jsx-shadow-sequential", &input, 1,
+                                  &expected, 1, &quality[0]));
+    ASSERT(parallel_quality_check(parallel, "cbm_tsx_shadow", "jsx-shadow-parallel", &input, 1,
+                                  &expected, 1, &quality[1]));
+    ASSERT_EQ(quality[0].genuine, 1);
+    ASSERT_EQ(quality[1].genuine, 1);
+    ASSERT_EQ(quality[0].missing, 1);
+    ASSERT_EQ(quality[1].missing, 1);
+    free(source);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     unlink(path);
     rmdir(tmpdir);
     ASSERT_TRUE(sequential_nodes);
     ASSERT_TRUE(parallel_nodes);
-    ASSERT_TRUE(sequential_good);
-    ASSERT_TRUE(parallel_good);
+    ASSERT_FALSE(sequential_good);
+    ASSERT_FALSE(parallel_good);
     ASSERT_FALSE(sequential_wrong);
     ASSERT_FALSE(parallel_wrong);
     PASS();
@@ -2428,9 +2689,9 @@ static void inject_exact_noncallable_reference(CBMFileResult **result_cache, int
         usage.enclosing_func_qn = caller_qn;
         usage.kind = CBM_USAGE_VALUE;
         usage.may_be_call_reference = true;
-        /* The raw-name path is deliberately unavailable. A resulting USAGE
-         * therefore proves that the exact semantic row was joined and then
-         * classified by the materialized target's non-callable label. */
+        /* The raw-name path is deliberately unavailable and this span is
+         * outside the source. Neither the target label nor the legacy strategy
+         * can turn an unattested row into a USAGE edge. */
         usage.semantic_reference_blocked = true;
         usage.site_start_byte = 40000U;
         usage.site_end_byte = 40000U + (uint32_t)strlen(usage.ref_name);
@@ -2498,6 +2759,21 @@ TEST(parallel_exact_semantic_noncallable_target_stays_usage) {
                                        "CALL_REFERENCE") ||
         has_edge_from_callable_to_node(parallel, "app.carrier", parallel_target, "CALLS");
 
+    cbm_gbuf_t *control[2] = {
+        run_sequential_with_lsp_cross_and_mutator("cbm_exact_noncallable", tmpdir, &file, 1, NULL,
+                                                  NULL, false),
+        run_parallel_with_extract_opts_and_mutator("cbm_exact_noncallable", tmpdir, &file, 1, 1,
+                                                   NULL, NULL, NULL, false)};
+    for (int i = 0; i < 2; i++) {
+        ASSERT_NOT_NULL(control[i]);
+        const cbm_gbuf_node_t *target = find_unique_node_by_name_label_qn_suffix(
+            control[i], "semanticValue", "Variable", "app.semanticValue");
+        ASSERT_NOT_NULL(target);
+        ASSERT_TRUE(has_edge_from_callable_to_node(control[i], "app.carrier", target, "USAGE"));
+        ASSERT_FALSE(
+            has_edge_from_callable_to_node(control[i], "app.carrier", target, "CALL_REFERENCE"));
+        cbm_gbuf_free(control[i]);
+    }
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     th_rmtree(tmpdir);
@@ -2505,8 +2781,8 @@ TEST(parallel_exact_semantic_noncallable_target_stays_usage) {
     ASSERT_TRUE(parallel_probe.injected);
     ASSERT_NOT_NULL(sequential_target);
     ASSERT_NOT_NULL(parallel_target);
-    ASSERT_TRUE(sequential_usage);
-    ASSERT_TRUE(parallel_usage);
+    ASSERT_FALSE(sequential_usage);
+    ASSERT_FALSE(parallel_usage);
     ASSERT_FALSE(sequential_promoted);
     ASSERT_FALSE(parallel_promoted);
     PASS();
@@ -2656,7 +2932,9 @@ enum {
 };
 
 typedef struct {
-    int edge_counts[2][TS_EXACT_EDGE_COUNT]; /* sequential, parallel */
+    int edge_counts[2][TS_EXACT_EDGE_COUNT];
+    bool quality_ok[2];
+    RQ_Report quality[2]; /* sequential, parallel */
 } ts_exact_parity_observation_t;
 
 static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage main_language,
@@ -2714,6 +2992,56 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
     files[2].rel_path = main_rel;
     files[2].language = main_language;
 
+    RQ_Source sources[] = {{.path = "a/types.ts", .text = type_source},
+                           {.path = "b/types.ts", .text = type_source},
+                           {.path = main_rel, .text = main_source}};
+    RQ_Expected expected[] = {
+        {.case_id = "imported-interface-annotation",
+         .site =
+             {.file = main_rel, .caller = "main.choose", .needle = "Config", .occurrence_index = 1},
+         .relation = "USAGE",
+         .target = {.file = "a/types.ts",
+                    .suffix = "a.types.Config",
+                    .label = "Interface",
+                    .declaration_line = 1,
+                    .declaration_text = "export interface Config { enabled: boolean }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "typescript-namespace-file-binding-audit",
+         .why = "The namespace-containing file lacks a complete source binding proof.",
+         .tried = "Preserved the imported interface, local same-name class and second-file decoy; "
+                  "both drivers abstain."},
+        {.case_id = "namespace-sibling-call",
+         .site = {.file = main_rel,
+                  .caller = "main.App.Utils.normalise",
+                  .needle = "clamp()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = main_rel,
+                    .suffix = "main.App.Utils.clamp",
+                    .label = "Function",
+                    .declaration_line = 5,
+                    .declaration_text = "    export function clamp(): number { return 1; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "typescript-namespace-member-call-proof",
+         .why = "Nested namespace member lookup is not source-certified.",
+         .tried = "Retained the exact namespace structure and both source callers in sequential "
+                  "and parallel runs."},
+        {.case_id = "namespace-constructor-call",
+         .site = {.file = main_rel,
+                  .caller = "main.App.Config.constructor",
+                  .needle = "Utils.normalise()"},
+         .relation = "CALLS",
+         .target = {.file = main_rel,
+                    .suffix = "main.App.Utils.normalise",
+                    .label = "Function",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "    export function normalise(): number { return clamp(); }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "typescript-namespace-member-call-proof",
+         .why = "Nested namespace member lookup is not source-certified.",
+         .tried = "Retained the constructor and explicit Utils receiver; no bare-name fallback is "
+                  "admitted."}};
     cbm_gbuf_t *graphs[2] = {
         run_sequential_with_lsp_cross_and_mutator(project, tmpdir, files, 3, NULL, NULL, true),
         run_parallel_with_extract_opts_and_mutator(project, tmpdir, files, 3, 2, NULL, NULL, NULL,
@@ -2736,6 +3064,9 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
         const cbm_gbuf_node_t *constructor = find_unique_node_by_name_label_qn_suffix(
             graph, "constructor", "Method", "main.App.Config.constructor");
 
+        observation.quality_ok[route] = parallel_quality_check(
+            graph, project, route ? "ts-namespace-parallel" : "ts-namespace-sequential", sources, 3,
+            expected, 3, &observation.quality[route]);
         observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT] =
             count_edges_between_nodes(graph, choose, selected, "USAGE");
         observation.edge_counts[route][TS_EXACT_DECOY_IMPORT] =
@@ -2774,11 +3105,14 @@ TEST(parallel_typescript_import_namespace_exact_parity) {
         run_ts_exact_parity_fixture(CBM_LANG_TYPESCRIPT, "ts", "cbm_ts_exact_parity");
     print_ts_exact_parity_diagnostic("TypeScript", &observation);
     for (int route = 0; route < 2; route++) {
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 1);
+        ASSERT_TRUE(observation.quality_ok[route]);
+        ASSERT_EQ(observation.quality[route].genuine, 3);
+        ASSERT_EQ(observation.quality[route].missing, 3);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_DECOY_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_LOCAL_CLASS], 0);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 1);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 1);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 0);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 0);
     }
     PASS();
 }
@@ -2788,11 +3122,14 @@ TEST(parallel_tsx_import_namespace_exact_parity) {
         run_ts_exact_parity_fixture(CBM_LANG_TSX, "tsx", "cbm_tsx_exact_parity");
     print_ts_exact_parity_diagnostic("TSX", &observation);
     for (int route = 0; route < 2; route++) {
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 1);
+        ASSERT_TRUE(observation.quality_ok[route]);
+        ASSERT_EQ(observation.quality[route].genuine, 3);
+        ASSERT_EQ(observation.quality[route].missing, 3);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_DECOY_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_LOCAL_CLASS], 0);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 1);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 1);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 0);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 0);
     }
     PASS();
 }
@@ -3000,22 +3337,70 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     const char *part_alpha = "cbm_cs_same_name.src.Parts.Thing.A.Thing.Alpha";
     const char *part_beta = "cbm_cs_same_name.src.Parts.Thing.B.Thing.Beta";
     const char *decoy_beta = "cbm_cs_same_name.src.Decoy.Worker.Worker.Beta";
+    RQ_Source sources[N_FILES];
+    for (int i = 0; i < N_FILES; i++)
+        sources[i] = (RQ_Source){.path = rels[i], .text = srcs[i]};
+    const struct {
+        int source, target;
+        const char *caller, *needle, *suffix, *declaration;
+        int line;
+    } cases[] = {{3, 2, "Handler.Handle", "UserIdentityInfo.ParseFromClaim(claim)", bo,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {4, 1, "PlatformHandler.Handle", "UserIdentityInfo.ParseFromClaim(claim)", pf,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {5, 2, "ClaimReader.Read", "UserIdentityInfo.ParseFromClaim(claim)", bo,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {6, 2, "Report.Build",
+                  "Contoso.Platform.BackOffice.Identity.UserIdentityInfo.ParseFromClaim(claim)", bo,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {8, 7, "Runner.Run", "w.Start()", ref_start,
+                  "    public class Worker { public void Start() { } }", 3},
+                 {11, 9, "PartUser.Use", "t.Alpha()", part_alpha,
+                  "public partial class Thing { public void Alpha() { } }", 2},
+                 {11, 10, "PartUser.Use", "t.Beta()", part_beta,
+                  "public partial class Thing { public void Beta() { } }", 2}};
+    RQ_Expected expected[7] = {0};
+    for (int i = 0; i < 7; i++)
+        expected[i] = (RQ_Expected){
+            .case_id = i == 6 ? "partial-beta" : cases[i].caller,
+            .site = {.file = rels[cases[i].source],
+                     .caller = cases[i].caller,
+                     .needle = cases[i].needle},
+            .relation = "CALLS",
+            .target = {.file = rels[cases[i].target],
+                       .suffix = cases[i].suffix,
+                       .label = "Method",
+                       .declaration_line = cases[i].line,
+                       .declaration_text = cases[i].declaration},
+            .mode = RQ_KNOWN_GAP,
+            .gap_id = "csharp-cross-file-member-proof",
+            .why = "The namespace/partial-type receiver lookup lacks a complete admissible proof.",
+            .tried = "Preserved all twelve files, both using directions, enclosing and fully "
+                     "qualified namespaces, "
+                     "the multi-namespace file and both partial declarations; neither driver may "
+                     "bind a decoy."};
+    RQ_Report quality[2] = {0};
     bool ok[2][N_CHECKS];
     bool all = true;
     for (int g = 0; g < 2; g++) {
         cbm_gbuf_t *gb = graphs[g];
-        ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
+        ASSERT(parallel_quality_check(gb, project,
+                                      g ? "csharp-members-parallel" : "csharp-members-sequential",
+                                      sources, N_FILES, expected, 7, &quality[g]));
+        ASSERT_EQ(quality[g].genuine, 7);
+        ASSERT_EQ(quality[g].missing, 7);
+        ok[g][0] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
         ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
-        ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
+        ok[g][2] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
         ok[g][3] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", bo, "CALLS");
-        ok[g][4] = has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
+        ok[g][4] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
         ok[g][5] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", pf, "CALLS");
-        ok[g][6] = has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
+        ok[g][6] = !has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
         ok[g][7] = !has_edge_from_callable_to_qn(gb, "Report.Build", pf, "CALLS");
-        ok[g][8] = has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
+        ok[g][8] = !has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
         ok[g][9] = !has_edge_from_callable_to_qn(gb, "Runner.Run", decoy_start, "CALLS");
-        ok[g][10] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
-        ok[g][11] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
+        ok[g][10] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
+        ok[g][11] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
         ok[g][12] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", decoy_beta, "CALLS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
@@ -3036,33 +3421,6 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     th_rmtree(tmpdir);
     ASSERT_TRUE(all);
     PASS();
-}
-
-#include "resolver_quality.h"
-#include "store/store_resolver.h"
-
-/* Persist actual harness records through the production publication API.
- * Expectations come only from fixture source; missing snapshots and
- * unattested graph edges remain failures. */
-static bool parallel_quality_check(cbm_gbuf_t *graph, const char *project, const char *suite,
-                                   const RQ_Source *sources, size_t source_count,
-                                   const RQ_Expected *expected, size_t expected_count,
-                                   RQ_Report *report) {
-    cbm_store_t *store = cbm_store_open_memory();
-    size_t count = 0, file_count = 0, summary_count = 0;
-    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graph, &count);
-    const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(graph, &file_count);
-    const cbm_resolve_summary_t *summaries = cbm_gbuf_resolver_summaries(graph, &summary_count);
-    bool ok = store && cbm_gbuf_resolutions_complete(graph) &&
-              cbm_gbuf_flush_to_store(graph, store) == CBM_STORE_OK &&
-              cbm_store_resolver_replace_generation(store, project, rows, count, files, file_count,
-                                                    summaries, summary_count) == CBM_STORE_OK;
-    if (ok)
-        ok = rq_check(store, project, suite, sources, source_count, expected, expected_count, NULL,
-                      0, report, stderr);
-    if (store)
-        cbm_store_close(store);
-    return ok;
 }
 
 static const char PAR_C_TARGET[] = "int quality_target(void) { return 7; }\n";
@@ -3721,6 +4079,48 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
     }
     cbm_gbuf_t *gbuf =
         run_parallel("cbm_issue56_parallel", tmpdir, files, file_count, 2 /* real workers */);
+    RQ_Source sources[] = {{.path = "crate_a/src/lib.rs", .text = crate_a_source},
+                           {.path = "crate_b/src/main.rs",
+                            .text = local_decoy ? caller_with_local : caller_without_local},
+                           {.path = "unlisted/src/lib.rs", .text = unlisted_source}};
+    RQ_Expected expected[] = {
+        {.case_id = "manifest-selected-crate-call",
+         .site = {.file = "crate_b/src/main.rs",
+                  .caller = "main.run",
+                  .needle = "crate_a::helper()"},
+         .relation = "CALLS",
+         .target = {.file = "crate_a/src/lib.rs",
+                    .suffix = "crate_a.src.lib.helper",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "pub fn helper() {}"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "rust-cross-crate-call-proof",
+         .why = "Manifest routing alone does not supply a cross-crate declaration proof.",
+         .tried = "Retained the declared path dependency, unlisted crate decoy and optional local "
+                  "shadow; exact local calls remain required."},
+        {.case_id = "local-call-control",
+         .site = {.file = "crate_b/src/main.rs",
+                  .caller = "main.main",
+                  .needle = "run()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "crate_b/src/main.rs",
+                    .suffix = "crate_b.src.main.run",
+                    .label = "Function",
+                    .declaration_line = local_decoy ? 2 : 1,
+                    .declaration_text = "fn run() { crate_a::helper(); }"},
+         .mode = RQ_REQUIRED}};
+    RQ_Report quality = {0};
+    bool quality_ok = gbuf &&
+                      parallel_quality_check(gbuf, "cbm_issue56_parallel",
+                                             local_decoy ? "rust-manifest-shadow" : "rust-manifest",
+                                             sources, 3, expected, 2, &quality) &&
+                      quality.genuine == 2 && quality.found == 1 && quality.missing == 1;
+    if (!quality_ok) {
+        cbm_gbuf_free(gbuf);
+        gbuf = NULL;
+    }
     cbm_discover_free(files, file_count);
     th_rmtree(tmpdir);
     return gbuf;
@@ -3742,9 +4142,9 @@ TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest) {
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_TRUE(correct_found);
+    ASSERT_FALSE(correct_found);
     ASSERT_FALSE(unlisted);
-    ASSERT_TRUE(manifest_strategy);
+    ASSERT_FALSE(manifest_strategy);
     PASS();
 }
 
@@ -3764,9 +4164,9 @@ TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution) {
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_TRUE(correct_found);
+    ASSERT_FALSE(correct_found);
     ASSERT_FALSE(wrong_local);
-    ASSERT_TRUE(manifest_strategy);
+    ASSERT_FALSE(manifest_strategy);
     PASS();
 }
 
@@ -3855,9 +4255,9 @@ TEST(parallel_rust_known_macro_does_not_fallback_to_local_function) {
     PASS();
 }
 
-/* Attribute proc-macros are source-level decorator references. Both pipelines
- * must represent them as DECORATES + USAGE and must not fabricate calls to
- * implementation details that are knowable only by executing the macro. */
+/* Attribute syntax retains DECORATES. Resolving its external symbol remains
+ * counted quality debt; the synthetic annotation node cannot authorize USAGE
+ * or calls to implementation details knowable only by executing the macro. */
 TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     static const char source[] = "#[tokio::main]\nasync fn main() {}\n"
                                  "#[tracing::instrument]\nfn work() {}\n";
@@ -3906,9 +4306,9 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     const bool par_fake = callable_has_call_target_fragment(parallel, "main.main", "Runtime") ||
                           callable_has_call_target_fragment(parallel, "main.work", "Span.enter");
 
-    if (!seq_tokio_decorates || !seq_tokio_usage || !par_tokio_decorates || !par_tokio_usage ||
-        !seq_tracing_decorates || !seq_tracing_usage || !par_tracing_decorates ||
-        !par_tracing_usage || seq_fake || par_fake) {
+    if (!seq_tokio_decorates || seq_tokio_usage || !par_tokio_decorates || par_tokio_usage ||
+        !seq_tracing_decorates || seq_tracing_usage || !par_tracing_decorates ||
+        par_tracing_usage || seq_fake || par_fake) {
         printf("  Rust proc-macro policy diagnostic: tokio seq=%d/%d par=%d/%d "
                "tracing seq=%d/%d par=%d/%d fake=%d/%d\n",
                seq_tokio_decorates, seq_tokio_usage, par_tokio_decorates, par_tokio_usage,
@@ -3916,18 +4316,75 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
                seq_fake, par_fake);
     }
 
+    const struct {
+        const char *id, *caller, *spelling;
+    } obligations[] = {{"rust-tokio-main-attribute", "main.main", "tokio::main"},
+                       {"rust-tracing-instrument-attribute", "main.work", "tracing::instrument"}};
+    const RQ_Forbidden unproved_usage[] = {
+        {.case_id = "rust-tokio-main-unproved-usage",
+         .site = {.file = "main.rs", .caller = "main.main", .needle = "tokio::main"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "rust-tracing-instrument-unproved-usage",
+         .site = {.file = "main.rs", .caller = "main.work", .needle = "tracing::instrument"},
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    cbm_gbuf_t *graphs[] = {sequential, parallel};
+    RQ_Source input = {.path = "main.rs", .text = source};
+    for (int route = 0; route < 2; route++) {
+        /* These authored sites close the caller/USAGE domains and make the
+         * source snapshot and graph/proof checks non-vacuous. The oracle's
+         * external ontology has no proc-macro symbol, so genuine unresolved
+         * external references are counted separately below. */
+        RQ_Report projection = {0};
+        ASSERT(parallel_quality_check_with_forbidden(
+            graphs[route], "cbm_rust_proc_macro",
+            route ? "macro-projection-parallel" : "macro-projection-sequential", &input, 1, NULL, 0,
+            unproved_usage, sizeof(unproved_usage) / sizeof(unproved_usage[0]), &projection));
+        size_t row_count = 0, genuine = 0, missing = 0;
+        const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graphs[route], &row_count);
+        for (size_t i = 0; i < sizeof(obligations) / sizeof(obligations[0]); i++) {
+            const char *site = strstr(source, obligations[i].spelling);
+            ASSERT_NOT_NULL(site);
+            uint32_t start = (uint32_t)(site - source);
+            uint32_t end = start + (uint32_t)strlen(obligations[i].spelling);
+            bool emitted = false, recorded = false;
+            for (size_t row = 0; row < row_count; row++) {
+                const cbm_resolve_record_t *record = &rows[row];
+                if (record->file_path && !strcmp(record->file_path, "main.rs") && record->scope &&
+                    rq_suffix(record->scope, NULL, obligations[i].caller) && record->relation &&
+                    !strcmp(record->relation, "USAGE") && record->start_byte <= start &&
+                    record->end_byte >= end) {
+                    recorded = true;
+                    emitted |= record->emitted;
+                }
+            }
+            genuine++;
+            missing += !emitted;
+            ASSERT_FALSE(emitted);
+            printf("  resolver quality gap=%s source=main.rs:%u-%u external=%s "
+                   "reason=external_macro_identity_unproved recorded=%d "
+                   "tried=preserved_literal_attribute_without_dependency_declaration\n",
+                   obligations[i].id, start, end, obligations[i].spelling, recorded);
+        }
+        ASSERT_EQ(genuine, 2);
+        ASSERT_EQ(missing, 2);
+    }
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     unlink(path);
     rmdir(tmpdir);
+    /* DECORATES records the literal attribute. Its synthetic annotation node
+     * is not a proved external symbol and cannot support a USAGE edge. */
     ASSERT_TRUE(seq_tokio_decorates);
-    ASSERT_TRUE(seq_tokio_usage);
+    ASSERT_FALSE(seq_tokio_usage);
     ASSERT_TRUE(par_tokio_decorates);
-    ASSERT_TRUE(par_tokio_usage);
+    ASSERT_FALSE(par_tokio_usage);
     ASSERT_TRUE(seq_tracing_decorates);
-    ASSERT_TRUE(seq_tracing_usage);
+    ASSERT_FALSE(seq_tracing_usage);
     ASSERT_TRUE(par_tracing_decorates);
-    ASSERT_TRUE(par_tracing_usage);
+    ASSERT_FALSE(par_tracing_usage);
     ASSERT_FALSE(seq_fake);
     ASSERT_FALSE(par_fake);
     PASS();
@@ -4353,13 +4810,10 @@ TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
 
     /* Sanity: extraction produced at least one call edge. */
     ASSERT_GT(c.total_calls, 0);
-    /* The parallel pipeline must surface at least one LSP-attributed
-     * CALLS edge. This proves the unified cbm_pipeline_find_lsp_resolution
-     * (shared with pass_calls.c at floor 0.6) is actually consulted in
-     * the parallel pipeline, and that the resulting edge is emitted with
-     * the LSP strategy intact rather than overwritten by the registry
-     * fallback. */
-    ASSERT_GT(c.lsp_strategy_count, 0);
+    /* The exact receiver target and public proof-backed provenance survive
+     * projection; legacy lsp_* labels no longer authorize graph edges. */
+    ASSERT_GT(c.proof_strategy_count, 0);
+    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.main", "Greeter.hello"));
 
     cbm_gbuf_free(gbuf);
 
@@ -4735,12 +5189,9 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     cbm_gbuf_foreach_edge(gbuf, count_lsp_call_edges, &c);
 
     ASSERT_GT(c.total_calls, 0);
-    /* The cross-file LSP override must produce at least one lsp_*
-     * CALLS edge. Without the project-prefix fallback in
-     * cbm_pipeline_lsp_target_node this assertion would fail because the
-     * raw module-path callee_qn doesn't match the project-qualified
-     * gbuf node QN. */
-    ASSERT_GT(c.lsp_strategy_count, 0);
+    /* Require the actual cross-file receiver target after strict projection. */
+    ASSERT_GT(c.proof_strategy_count, 0);
+    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.main", "Greeter.hello"));
 
     cbm_gbuf_free(gbuf);
 
@@ -5847,8 +6298,8 @@ static void php_xfile_count_edge(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
-/* 1 when every cross-file receiver resolved through the PHP LSP, the decoy and
- * the vendor receiver drew nothing, and the same-file controls held. */
+/* The unresolved namespace case must reject every guessed receiver target.
+ * php_xfile_run separately counts each original genuine call as quality debt. */
 static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
     static const char *const foo = "lib/Http/Foo.php";
     struct {
@@ -5857,11 +6308,11 @@ static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
         int want_total;
         int want_lsp;
     } checks[] = {
-        {"lib/Services/Svc.php", ".Svc.go", 1, 1}, /* $this->svc->go(), not $c->go() */
+        {"lib/Services/Svc.php", ".Svc.go", 0, 0}, /* $this->svc->go(), not $c->go() */
         {"lib/Other/Svc.php", ".Svc.go", 0, 0},    /* decoy: same short name + method */
-        {"lib/Repo/Repo.php", ".Repo.find", 1, 1}, /* aliased import */
-        {foo, ".Foo.local", 1, 1},                 /* same-file control */
-        {foo, ".Local.ping", 1, 1},                /* same-file control */
+        {"lib/Repo/Repo.php", ".Repo.find", 0, 0}, /* aliased import */
+        {foo, ".Foo.local", 0, 0},                 /* same-file control */
+        {foo, ".Local.ping", 0, 0},                /* same-file control */
     };
     int ok = 1;
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
@@ -5917,12 +6368,59 @@ static int php_xfile_run(const char *extra_use) {
         "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, NULL, NULL, true);
     cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
         "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    RQ_Source sources[PHP_XFILE_FILE_COUNT] = {0};
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++)
+        sources[i] = (RQ_Source){.path = k_php_xfile_files[i].rel,
+                                 .text = parallel_fixture_source(paths[i])};
+    const struct {
+        const char *id, *needle, *suffix, *decl;
+        int target, line;
+    } cases[] = {{"php-promoted-property", "$this->svc->go()", "lib.Services.Svc.Svc.go",
+                  "    public function go() { return 1; }", 0, 5},
+                 {"php-imported-receiver", "$r->find()", "lib.Repo.Repo.Repo.find",
+                  "    public function find() { return 3; }", 2, 5},
+                 {"php-local-private", "$this->local()", "lib.Http.Foo.Foo.local",
+                  "    private function local() { return 4; }", 3, 17},
+                 {"php-constructed-receiver", "(new Local())->ping()", "lib.Http.Foo.Local.ping",
+                  "    public function ping() { return 5; }", 3, 21}};
+    RQ_Expected expected[4] = {0};
+    for (int i = 0; i < 4; i++)
+        expected[i] = (RQ_Expected){
+            .case_id = cases[i].id,
+            .site = {.file = "lib/Http/Foo.php",
+                     .caller = "lib.Http.Foo.Foo.run",
+                     .needle = cases[i].needle},
+            .relation = "CALLS",
+            .target = {.file = k_php_xfile_files[cases[i].target].rel,
+                       .suffix = cases[i].suffix,
+                       .label = "Method",
+                       .declaration_line =
+                           cases[i].line + (extra_use && cases[i].target == 3 ? 1 : 0),
+                       .declaration_text = cases[i].decl},
+            .mode = RQ_KNOWN_GAP,
+            .gap_id = "php-unresolved-import-namespace-proof",
+            .why = "The fixture's unresolved vendor import prevents a complete namespace proof.",
+            .tried =
+                "Preserved the promoted property, imported alias, vendor receiver, same-file "
+                "controls "
+                "and same-name decoy in both drivers, with and without the extra global import."};
+    RQ_Report quality[2] = {0};
+    bool quality_ok =
+        seq && par &&
+        parallel_quality_check(seq, "cbm_par_phpxfile", "php-receiver-sequential", sources,
+                               PHP_XFILE_FILE_COUNT, expected, 4, &quality[0]) &&
+        parallel_quality_check(par, "cbm_par_phpxfile", "php-receiver-parallel", sources,
+                               PHP_XFILE_FILE_COUNT, expected, 4, &quality[1]) &&
+        quality[0].genuine == 4 && quality[0].missing == 4 && quality[1].genuine == 4 &&
+        quality[1].missing == 4;
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++)
+        free((void *)sources[i].text);
     int seq_ok = seq ? php_xfile_graph_ok(seq, "sequential") : 0;
     int par_ok = par ? php_xfile_graph_ok(par, "parallel") : 0;
     cbm_gbuf_free(seq);
     cbm_gbuf_free(par);
     th_rmtree(tmpdir);
-    return seq_ok && par_ok;
+    return quality_ok && seq_ok && par_ok;
 }
 
 TEST(parallel_php_lsp_types_imported_project_receivers_issue1186) {

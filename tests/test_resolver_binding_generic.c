@@ -34,6 +34,72 @@ static bool dart_presence_observation(const cbm_resolve_proof_t *proof, void *co
     return true;
 }
 
+typedef struct {
+    bool absent, invalid;
+} binding_absence_t;
+
+static bool binding_absence_observation(const cbm_resolve_proof_t *proof, void *context) {
+    binding_absence_t *seen = context;
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(proof);
+    if (!view->key.lookup_domain || strcmp(view->key.lookup_domain, "source_occurrences"))
+        return true;
+    seen->absent = true;
+    seen->invalid |= !view->key.detail || strcmp(view->key.detail, "exact_occurrence_absent") ||
+                     !view->key.lookup_key || strcmp(view->key.lookup_key, "target") ||
+                     !view->key.lookup_closed ||
+                     view->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE ||
+                     view->outcome.binding != CBM_RESOLVE_BINDING_UNRESOLVED ||
+                     view->outcome.target || view->outcome.candidate_count;
+    return true;
+}
+
+/* Imports and declaration names create bindings, not source occurrences.
+ * An empty occurrence index must still retain closed negative observations. */
+TEST(resolver_binding_python_empty_occurrences_preserve_negative_evidence) {
+    const char *source = "import requests\n\ndef target():\n    pass\n";
+    CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test",
+                                           "main.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, file, CBM_LANG_PYTHON, source, strlen(source));
+    ASSERT_STR_EQ(cbm_resolve_binding_status(index), "binding_complete_supported_subset");
+    ASSERT(cbm_resolve_binding_name_present(index, "target"));
+    ASSERT(cbm_resolve_binding_import(index, "requests"));
+    const char *declaration = strstr(source, "target");
+    ASSERT_NOT_NULL(declaration);
+    uint32_t start = (uint32_t)(declaration - source), end = start + 6;
+    cbm_resolve_result_t candidate = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                      .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                      .rule = CBM_RESOLVE_RULE_SCOPE_BINDING,
+                                      .facts = CBM_RESOLVE_FACT_EXACT_TARGET,
+                                      .target = "test.main.target",
+                                      .candidate_count = 1};
+    cbm_resolve_result_t results[] = {
+        cbm_resolve_binding_local(index, "target", start, end, CBM_SOURCE_ORIGIN_RAW),
+        cbm_resolve_binding_validate(index, "target", start, end, CBM_SOURCE_ORIGIN_RAW,
+                                     candidate)};
+    ASSERT_STR_EQ(results[1].reason, "binding_occurrence_missing");
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+        ASSERT(!cbm_resolve_admit(&results[i]));
+        ASSERT_NOT_NULL(results[i].proof);
+        binding_absence_t seen = {0};
+        ASSERT(cbm_resolve_proof_visit(results[i].proof, 128, binding_absence_observation, &seen));
+        ASSERT(seen.absent && !seen.invalid);
+    }
+    CBMCall forged = {.callee_name = "requests.get",
+                      .enclosing_func_qn = "test.main.target",
+                      .first_string_arg = "https://example.test",
+                      .source_origin = CBM_SOURCE_ORIGIN_RAW,
+                      .site_start_byte = start,
+                      .site_end_byte = end};
+    ASSERT(!cbm_resolve_binding_import_occurrence(index, &forged, "requests"));
+    cbm_arena_destroy(&arena);
+    cbm_free_result(file);
+    PASS();
+}
+
 TEST(resolver_binding_dart_source_namespace_and_privacy) {
     const char *source = "int target() => 1;\nint _private() => 2;\n"
                          "void caller() { target(); }\n";
@@ -95,6 +161,60 @@ TEST(resolver_binding_dart_import_source_combinators) {
     ASSERT_STR_EQ(second->prefix, "tools");
     cbm_arena_destroy(&arena);
     cbm_free_result(result);
+    PASS();
+}
+
+/* A complete URI in one declaration is not proof of another occurrence. */
+TEST(resolver_binding_dart_duplicate_uri_preserves_occurrence_authority) {
+    const char *suffixes[] = {"import 'lib.dart' if (dart.library.io) 'other.dart';\n",
+                              "import 'lib.dart' deferred as delayed;\n",
+                              "import '\\u006cib.dart';\n"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char source[256];
+        snprintf(source, sizeof(source), "import 'lib.dart';\n%s", suffixes[i]);
+        CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_DART, "test",
+                                               "main.dart", 0, NULL, NULL);
+        ASSERT_NOT_NULL(file);
+        ASSERT_EQ(file->imports.count, 2);
+        ASSERT_EQ(file->imports.items[0].kind, CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH);
+        ASSERT_EQ(file->imports.items[1].kind, CBM_IMPORT_KIND_DEFAULT);
+        ASSERT(file->imports.items[0].site_end_byte < file->imports.items[1].site_start_byte);
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        cbm_resolve_binding_index_t *index =
+            cbm_resolve_binding_build(&arena, file, CBM_LANG_DART, source, strlen(source));
+        ASSERT(!cbm_resolve_binding_namespace_complete(index));
+        /* An incomplete library namespace exposes no binding import list,
+         * including an individually literal declaration before the blocker. */
+        ASSERT_EQ(cbm_resolve_binding_import_count(index), 0);
+        ASSERT_NULL(cbm_resolve_binding_import_at(index, 0));
+        cbm_arena_destroy(&arena);
+        cbm_free_result(file);
+    }
+    /* Supported duplicate URI occurrences retain distinct source authority. */
+    const char *source = "import 'lib.dart' as first;\nimport 'lib.dart' as second;\n";
+    CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_DART, "test",
+                                           "main.dart", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(file->imports.count, 2);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, file, CBM_LANG_DART, source, strlen(source));
+    ASSERT(cbm_resolve_binding_namespace_complete(index));
+    ASSERT_EQ(cbm_resolve_binding_import_count(index), 2);
+    for (size_t i = 0; i < 2; i++) {
+        const cbm_resolve_source_import_t *import = cbm_resolve_binding_import_at(index, i);
+        ASSERT_NOT_NULL(import);
+        ASSERT_STR_EQ(import->uri, "lib.dart");
+        ASSERT_STR_EQ(import->prefix, i ? "second" : "first");
+        ASSERT_EQ(import->uri_start_byte, file->imports.items[i].site_start_byte);
+        ASSERT_EQ(import->uri_end_byte, file->imports.items[i].site_end_byte);
+        ASSERT_EQ(file->imports.items[i].kind, CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH);
+    }
+    ASSERT(file->imports.items[0].site_end_byte < file->imports.items[1].site_start_byte);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(file);
     PASS();
 }
 
@@ -329,7 +449,10 @@ TEST(resolver_binding_dart_cross_file_conflicts_and_missing_namespace) {
         {"import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
          "var target = 2;\n", GENERIC_PROJECT ".lib.target", false},
         {"import 'lib.dart';\nvoid caller() { _target(); }\n", NULL, GENERIC_PROJECT ".lib._target",
-         false}};
+         false},
+        {"import 'lib.dart';\nimport 'lib.dart' if (dart.library.io) 'other.dart';\n"
+         "void caller() { target(); }\n",
+         "int target() => 2;\n", GENERIC_PROJECT ".lib.target", false}};
     for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++)
         ASSERT(dart_pipeline_golden(&fixtures[i], 0));
     PASS();
@@ -2287,6 +2410,7 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
 }
 
 SUITE(resolver_binding_generic) {
+    RUN_TEST(resolver_binding_python_empty_occurrences_preserve_negative_evidence);
     RUN_TEST(resolver_binding_dart_import_requires_complete_direct_uri);
     RUN_TEST(resolver_binding_unsupported_import_carriers_do_not_authorize_paths);
     RUN_TEST(resolver_binding_python_annotation_containers_and_parameter_separators);
@@ -2315,6 +2439,7 @@ SUITE(resolver_binding_generic) {
     RUN_TEST(resolver_binding_rust_exact_names_and_blockers);
     RUN_TEST(resolver_binding_dart_source_namespace_and_privacy);
     RUN_TEST(resolver_binding_dart_import_source_combinators);
+    RUN_TEST(resolver_binding_dart_duplicate_uri_preserves_occurrence_authority);
     RUN_TEST(resolver_binding_generic_unmodeled_library_context_is_not_complete);
     RUN_TEST(resolver_binding_dart_cross_file_exact_namespace_and_decoy);
     RUN_TEST(resolver_binding_dart_cross_file_parallel_namespace);

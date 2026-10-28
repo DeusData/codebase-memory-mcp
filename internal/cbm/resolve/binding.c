@@ -1385,6 +1385,8 @@ static void note_dart_import(cbm_resolve_binding_index_t *index, TSNode node) {
                 fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "dart_import_uri_required");
                 break;
             }
+            import.uri_start_byte = ts_node_start_byte(child);
+            import.uri_end_byte = ts_node_end_byte(child);
         }
         if (strcmp(kind, "identifier") == 0 &&
             kind_is(ts_node_parent(child), "import_specification")) {
@@ -2722,7 +2724,9 @@ bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *in
     binding_site_t key = {
         .name = call->callee_name, .start = call->site_start_byte, .end = call->site_end_byte};
     const binding_site_t *site =
-        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+        index->sites && index->site_count
+            ? bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site)
+            : NULL;
     const binding_name_t *binding = find_name(index, local_name, strlen(local_name));
     const binding_name_t *visible =
         site ? find_lexical_name(index, local_name, strlen(local_name), site->scope, NULL) : NULL;
@@ -2764,7 +2768,9 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
     }
     binding_site_t site = {.name = name, .start = start, .end = end};
     const binding_site_t *located =
-        bsearch(&site, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+        index->sites && index->site_count
+            ? bsearch(&site, index->sites, index->site_count, sizeof(*index->sites), compare_site)
+            : NULL;
     (void)cbm_resolve_lookup_observe(
         &query, "source_occurrences", name, located ? name : NULL,
         located ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
@@ -2837,7 +2843,9 @@ cbm_resolve_result_t cbm_resolve_binding_local(const cbm_resolve_binding_index_t
         return binding_query_finish(index, &query, result);
     binding_site_t site = {.name = name, .start = start, .end = end};
     const binding_site_t *located =
-        bsearch(&site, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+        index->sites && index->site_count
+            ? bsearch(&site, index->sites, index->site_count, sizeof(*index->sites), compare_site)
+            : NULL;
     (void)cbm_resolve_lookup_observe(
         &query, "source_occurrences", name, located ? name : NULL,
         located ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,

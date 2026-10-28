@@ -755,17 +755,11 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "confidence "
      "matches "
      "cannot supply the missing source facts."},
-    {"lrp_c_s1_crossfile_call", "main.c", "run", "add(x, 1)", 0, "main.c", "add", "CALLS", 1,
-     "int add(int a, int b);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
+    {"lrp_c_s1_crossfile_call", "main.c", "run", "add(x, 1)", 0, "util.c", "add", "CALLS", 1,
+     "int add(int a, int b) { return a + b; }", true, false, NULL,
+     "The visible external prototype and the unique project definition have identical builtin "
+     "signatures and C linkage. The source-audited external-definition bridge supports this "
+     "cross-file call; prototype materialization is not required."},
     {"lrp_c_s2_funcptr_in_struct", "main.c", "run", "make_ops()", 0, "main.c", "make_ops", "CALLS",
      2, "Ops make_ops(void);", false, false,
      "The visible prototype is a source declaration, but C extraction registers only function "
@@ -788,17 +782,11 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "resolver_c "
      "source-prototype unit controls inject declaration identities and therefore do not test "
      "materialization."},
-    {"lrp_c_s4_static_local", "main.c", "run", "exported(n)", 0, "main.c", "exported", "CALLS", 1,
-     "int exported(int x);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
+    {"lrp_c_s4_static_local", "main.c", "run", "exported(n)", 0, "util.c", "exported", "CALLS", 3,
+     "int exported(int x) { return helper(x); }", true, false, NULL,
+     "The visible external prototype binds the unique compatible external definition in util.c. "
+     "The separate same-file helper call remains required, and main.run to the static helper "
+     "remains explicitly forbidden."},
     {"lrp_c_s5_chained_deref", "main.c", "run", "node_val(head->next)", 0, "main.c", "node_val",
      "CALLS", 2, "int node_val(const Node *n);", false, false,
      "The visible prototype is a source declaration, but C extraction registers only function "
@@ -868,14 +856,11 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "Source audit persisted the direct int_cmp call and value occurrence but no fn CALLS "
      "row. "
      "c_callable_proof can track exact local pointer targets once their declarations exist."},
-    {"lrp_cpp_s1_crossfile_call", "main.cpp", "run", "square(n)", 0, "main.cpp", "square", "CALLS",
-     1, "int square(int x);", false, false,
-     "C++ prototype wrapper has no extracted function name/node. Separately, c_proof_call_domain "
-     "excludes identifier argument n even though it is declared int; the current no-ADL rule only "
-     "accepts literals. Definition linkage remains unproved.",
-     "Reviewed extract_defs.c resolve_func_name_c_family, c_lsp.c c_proof_call_domain and Prior "
-     "source audit "
-     "binding_not_found."},
+    {"lrp_cpp_s1_crossfile_call", "main.cpp", "run", "square(n)", 0, "util.cpp", "square", "CALLS",
+     1, "int square(int x) { return x * x; }", true, false, NULL,
+     "The visible prototype and unique definition have matching C++ linkage, namespace and "
+     "builtin signatures. The exact lexical int parameter n has no associated user-defined "
+     "type, so the builtin-argument proof closes the ADL domain."},
     {"lrp_cpp_s2_method_dispatch", "main.cpp", "run", "c.inc()", 0, "counter.hpp", "Counter.inc",
      "CALLS", 5, "    void inc() { n++; }", true, false, NULL,
      "Corrected header fixture uses the existing direct zero-argument member subset; "
