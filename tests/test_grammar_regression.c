@@ -16,6 +16,72 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "grammar_cases.h"
+#include <string.h>
+
+typedef void *(*grammar_scanner_create_fn)(void);
+typedef unsigned (*grammar_scanner_serialize_fn)(void *payload, char *buffer);
+typedef void (*grammar_scanner_deserialize_fn)(void *payload, const char *buffer, unsigned length);
+typedef void (*grammar_scanner_destroy_fn)(void *payload);
+
+extern void *tree_sitter_objectscript_routine_external_scanner_create(void);
+extern unsigned tree_sitter_objectscript_routine_external_scanner_serialize(void *payload,
+                                                                            char *buffer);
+extern void tree_sitter_objectscript_routine_external_scanner_deserialize(void *payload,
+                                                                          const char *buffer,
+                                                                          unsigned length);
+extern void tree_sitter_objectscript_routine_external_scanner_destroy(void *payload);
+extern void *tree_sitter_objectscript_udl_external_scanner_create(void);
+extern unsigned tree_sitter_objectscript_udl_external_scanner_serialize(void *payload,
+                                                                        char *buffer);
+extern void tree_sitter_objectscript_udl_external_scanner_deserialize(void *payload,
+                                                                      const char *buffer,
+                                                                      unsigned length);
+extern void tree_sitter_objectscript_udl_external_scanner_destroy(void *payload);
+
+static bool grammar_scanner_empty_deserialize_and_roundtrip(
+    grammar_scanner_create_fn create, grammar_scanner_serialize_fn serialize,
+    grammar_scanner_deserialize_fn deserialize, grammar_scanner_destroy_fn destroy) {
+    char reference_state[4096];
+    char empty_state[4096];
+    char roundtrip_state[4096];
+    void *reference = create();
+    void *empty = create();
+    void *roundtrip = create();
+    bool passed = false;
+
+    if (!reference || !empty || !roundtrip) {
+        goto done;
+    }
+
+    unsigned reference_length = serialize(reference, reference_state);
+    if (reference_length == 0 || reference_length > sizeof(reference_state)) {
+        goto done;
+    }
+
+    deserialize(empty, NULL, 0);
+    unsigned empty_length = serialize(empty, empty_state);
+    if (reference_length != empty_length ||
+        memcmp(reference_state, empty_state, reference_length) != 0) {
+        goto done;
+    }
+
+    deserialize(roundtrip, reference_state, reference_length);
+    unsigned roundtrip_length = serialize(roundtrip, roundtrip_state);
+    passed = reference_length == roundtrip_length &&
+             memcmp(reference_state, roundtrip_state, reference_length) == 0;
+
+done:
+    if (reference) {
+        destroy(reference);
+    }
+    if (empty) {
+        destroy(empty);
+    }
+    if (roundtrip) {
+        destroy(roundtrip);
+    }
+    return passed;
+}
 
 static int reg_has_def_any(CBMFileResult *r, const char *name) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -416,6 +482,26 @@ TEST(grammar_regression_all) {
     PASS();
 }
 
+TEST(grammar_objectscript_routine_scanner_empty_deserialize_and_roundtrip) {
+    ASSERT_TRUE(grammar_scanner_empty_deserialize_and_roundtrip(
+        tree_sitter_objectscript_routine_external_scanner_create,
+        tree_sitter_objectscript_routine_external_scanner_serialize,
+        tree_sitter_objectscript_routine_external_scanner_deserialize,
+        tree_sitter_objectscript_routine_external_scanner_destroy));
+    PASS();
+}
+
+TEST(grammar_objectscript_udl_scanner_empty_deserialize_and_roundtrip) {
+    ASSERT_TRUE(grammar_scanner_empty_deserialize_and_roundtrip(
+        tree_sitter_objectscript_udl_external_scanner_create,
+        tree_sitter_objectscript_udl_external_scanner_serialize,
+        tree_sitter_objectscript_udl_external_scanner_deserialize,
+        tree_sitter_objectscript_udl_external_scanner_destroy));
+    PASS();
+}
+
 void suite_grammar_regression(void) {
+    RUN_TEST(grammar_objectscript_routine_scanner_empty_deserialize_and_roundtrip);
+    RUN_TEST(grammar_objectscript_udl_scanner_empty_deserialize_and_roundtrip);
     RUN_TEST(grammar_regression_all);
 }

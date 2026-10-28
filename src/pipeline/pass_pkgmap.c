@@ -2391,6 +2391,10 @@ static int compile_root_compare(const void *left, const void *right) {
     return strcmp((*a)->canonical, (*b)->canonical);
 }
 
+static bool explicit_relative_path(const char *p) {
+    return strncmp(p, "./", PAIR_LEN) == 0 || strncmp(p, "../", PAIR_LEN + SKIP_ONE) == 0;
+}
+
 /* A directory supplied as both -I and -isystem remains in the system group.
  * Compare canonical directory identities, including spellings containing ..,
  * without sorting the search order itself. The auxiliary sort keeps a command
@@ -3171,8 +3175,7 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
 static const cbm_gbuf_node_t *resolve_relative_file(const cbm_pipeline_ctx_t *ctx,
                                                     const char *source_rel, const char *module_path,
                                                     bool php_only) {
-    if (!source_rel || !module_path || module_path[0] != '.' ||
-        !(module_path[1] == '/' || (module_path[1] == '.' && module_path[2] == '/'))) {
+    if (!source_rel || !module_path || !explicit_relative_path(module_path)) {
         return NULL;
     }
     char dir[PKGMAP_PATH_BUF];
