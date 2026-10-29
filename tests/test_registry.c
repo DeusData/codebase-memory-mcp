@@ -1245,17 +1245,36 @@ TEST(go_bare_ref_never_binds_field) {
      * trailing name; is_reference_node records the inner field_identifier),
      * so the selector-vs-bare distinction arrives as the recorded
      * is_member_access signal, never as a dot in the reference text. */
-    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, false, "Field"));
+    ASSERT_TRUE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, "Field"));
     /* The member half of a selector may bind a field. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, true, "Field"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, true, "Field"));
     /* Bare references to non-fields are untouched. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Variable"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Function"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, "Variable"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, "Function"));
     /* Other languages reference their own members bare inside methods —
      * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_CSHARP, false, "Field"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_JAVA, false, "Field"));
     /* Degenerate input → nothing to judge. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, NULL));
+    PASS();
+}
+
+TEST(c_bare_ref_never_binds_field) {
+    /* #2666: a C struct member is named only as the member half of `a.b`,
+     * `a->b` or a designator `.b` (field_identifier → is_member_access). A
+     * bare C identifier — a macro argument like RUN_SELECTED_SUITE(mcp) — is
+     * never one, so it must not bind a same-named Field. */
+    ASSERT_TRUE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Field"));
+    /* The member half still binds (through the C owner rows upstream). */
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, true, "Field"));
+    /* A bare C name keeps binding globals, functions and types. */
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Variable"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Function"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Type"));
+    /* C++ (and every `.h`, parsed as C++): a method body names its own
+     * members bare, so the bind is kept. */
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_CPP, false, "Field"));
     PASS();
 }
 
@@ -2571,6 +2590,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(c_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);
