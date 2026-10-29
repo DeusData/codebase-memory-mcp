@@ -7403,6 +7403,200 @@ TEST(tool_index_status_includes_git_metadata) {
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
 
+/* #2816: stored recursion must remain visible even when the CALLS graph has
+ * no self-edges. Removing metadata emission must fail these assertions. */
+TEST(tool_trace_path_recursion_metadata_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion"), CBM_STORE_OK);
+    const struct {
+        const char *name;
+        const char *props;
+        const char *self;
+        const char *recursive;
+    } cases[] = {
+        {"countdown", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"visit", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"mutual", "{\"self_recursive\":false,\"recursive\":true}", "false", "true"},
+        {"leaf", "{\"self_recursive\":false,\"recursive\":false}", "false", "false"},
+        {"legacy", "{}", "null", "null"},
+        {"partial", "{\"self_recursive\":true}", "true", "null"},
+        {"invalid", "{\"self_recursive\":\"true\",\"recursive\":1}", "null", "null"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "%s.%s", proj, cases[i].name);
+        cbm_node_t n = {.project = proj,
+                        .label = i == 1 ? "Method" : "Function",
+                        .name = cases[i].name,
+                        .qualified_name = qn,
+                        .file_path = "recursion.ts",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = cases[i].props};
+        ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+        for (int json = 0; json < 2; json++) {
+            for (int inbound = 0; inbound < 2; inbound++) {
+                char args[512];
+                snprintf(args, sizeof(args),
+                         "{\"project\":\"%s\",\"function_name\":\"%s\","
+                         "\"direction\":\"%s\",\"format\":\"%s\"}",
+                         proj, cases[i].name, inbound ? "inbound" : "outbound",
+                         json ? "json" : "tree");
+                char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                char *inner = extract_text_content(response);
+                ASSERT_NOT_NULL(inner);
+                char expected[128];
+                snprintf(expected, sizeof(expected),
+                         json ? "\"self_recursive\":%s" : "self_recursive: %s\n", cases[i].self);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                         cases[i].recursive);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                                   : "self_call_policy: omitted\n"));
+                snprintf(expected, sizeof(expected), json ? "\"%s_total\":0" : "%s_total: 0\n",
+                         inbound ? "callers" : "callees");
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                free(inner);
+                free(response);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_union_and_edges_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-union";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-union"), CBM_STORE_OK);
+    cbm_node_t def = {.project = proj,
+                      .label = "Function",
+                      .name = "countdown",
+                      .qualified_name = "recursion-union.impl.countdown",
+                      .file_path = "impl.ts",
+                      .start_line = 1,
+                      .end_line = 10,
+                      .properties_json = "{\"self_recursive\":false,\"recursive\":false}"};
+    int64_t def_id = cbm_store_upsert_node(st, &def);
+    ASSERT_GT(def_id, 0);
+    cbm_node_t stub = def;
+    stub.qualified_name = "recursion-union.stub.countdown";
+    stub.file_path = "stub.d.ts";
+    stub.end_line = 1;
+    stub.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+    cbm_node_t leaf = def;
+    leaf.name = "leaf";
+    leaf.qualified_name = "recursion-union.impl.leaf";
+    leaf.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    int64_t leaf_id = cbm_store_upsert_node(st, &leaf);
+    ASSERT_GT(leaf_id, 0);
+    cbm_edge_t edge = {.project = proj, .source_id = def_id, .target_id = leaf_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    const char *expected_flags[] = {"true", "null", "false", "true"};
+    for (int state = 0; state < 4; state++) {
+        def.properties_json = state == 3 ? "{\"self_recursive\":true,\"recursive\":true}"
+                                         : "{\"self_recursive\":false,\"recursive\":false}";
+        stub.properties_json = state == 0   ? "{\"self_recursive\":true,\"recursive\":true}"
+                               : state == 2 ? "{\"self_recursive\":false,\"recursive\":false}"
+                                            : "{}";
+        ASSERT_GT(cbm_store_upsert_node(st, &def), 0);
+        ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+        for (int json = 0; json < 2; json++) {
+            char args[512];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                     "\"direction\":\"outbound\",\"format\":\"%s\"}",
+                     proj, json ? "json" : "tree");
+            char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"callees_total\":1" : "callees_total: 1\n"));
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"leaf\"" : ".leaf"));
+            char expected[128];
+            snprintf(expected, sizeof(expected),
+                     json ? "\"self_recursive\":%s" : "self_recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            free(inner);
+            free(response);
+        }
+    }
+    /* Recursion is root metadata, but the omission policy concerns CALLS only. */
+    char *response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"recursion-union\",\"function_name\":\"countdown\","
+                            "\"edge_types\":[\"IMPORTS\"],\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NULL(strstr(inner, "self_call_policy"));
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_survives_budget_floor_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-budget";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-budget"), CBM_STORE_OK);
+    char huge[4096];
+    memset(huge, 'x', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = '\0';
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "countdown",
+                    .qualified_name = "recursion-budget.countdown",
+                    .file_path = "recursion.ts",
+                    .start_line = 1,
+                    .end_line = 10,
+                    .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    int64_t root_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(root_id, 0);
+    n.name = huge;
+    n.qualified_name = huge;
+    int64_t callee_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {
+        .project = proj, .source_id = root_id, .target_id = callee_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    for (int json = 0; json < 2; json++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                 "\"direction\":\"outbound\",\"format\":\"%s\",\"max_output_tokens\":128}",
+                 proj, json ? "json" : "tree");
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "output_budget"));
+        ASSERT_NULL(strstr(inner, huge));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_recursive\":true" : "self_recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"recursive\":true" : "recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                           : "self_call_policy: omitted\n"));
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_trace_call_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -8100,7 +8294,8 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                       .qualified_name = "trace-budget-cursor.hub",
                       .file_path = "src/hub.c",
                       .start_line = 1,
-                      .end_line = 2};
+                      .end_line = 2,
+                      .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
     cbm_node_t short_node = {.project = project,
                              .label = "Function",
                              .name = "short_row",
@@ -8140,6 +8335,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                             "\"format\":\"json\"}");
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NOT_NULL(strstr(inner, "short_row"));
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
@@ -8160,6 +8358,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, long_qn));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -8179,6 +8380,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, "short_row"));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -25961,6 +26165,9 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
+    RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
+    RUN_TEST(tool_trace_path_recursion_union_and_edges_issue2816);
+    RUN_TEST(tool_trace_path_recursion_survives_budget_floor_issue2816);
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);

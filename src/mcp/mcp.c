@@ -10137,6 +10137,72 @@ static void trace_call_coverage(cbm_store_t *store, const char *project,
     cbm_ht_free(match.targets);
 }
 
+enum { TRACE_RECURSION_FLAG_COUNT = 2 };
+typedef enum {
+    TRACE_RECURSION_UNKNOWN = -1,
+    TRACE_RECURSION_FALSE,
+    TRACE_RECURSION_TRUE,
+} trace_recursion_flag_t;
+static const char *const trace_recursion_keys[TRACE_RECURSION_FLAG_COUNT] = {"self_recursive",
+                                                                             "recursive"};
+typedef struct {
+    /* -1: unknown, 0: all roots record false, 1: at least one records true. */
+    trace_recursion_flag_t flags[TRACE_RECURSION_FLAG_COUNT];
+} trace_recursion_t;
+
+static trace_recursion_t trace_recursion_metadata(const cbm_node_t *nodes, int node_count) {
+    trace_recursion_t metadata = {0};
+    /* Use the same roots as bfs_union_same_name, rather than borrowing a
+     * callee's flag or selecting just one definition/stub. These are stored
+     * analysis signals, not evidence that a resolved self-call was dropped. */
+    for (int i = 0; i < node_count; i++) {
+        const char *properties = nodes[i].properties_json;
+        yyjson_doc *doc = properties ? yyjson_read(properties, strlen(properties), 0) : NULL;
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        for (int j = 0; j < TRACE_RECURSION_FLAG_COUNT; j++) {
+            yyjson_val *value = yyjson_obj_get(root, trace_recursion_keys[j]);
+            if (yyjson_is_bool(value) && yyjson_get_bool(value)) {
+                metadata.flags[j] = TRACE_RECURSION_TRUE;
+            } else if (!yyjson_is_bool(value) && metadata.flags[j] != TRACE_RECURSION_TRUE) {
+                metadata.flags[j] = TRACE_RECURSION_UNKNOWN;
+            }
+        }
+        yyjson_doc_free(doc);
+    }
+    return metadata;
+}
+
+static void trace_recursion_tree(cbm_sb_t *sb, const trace_recursion_t *metadata,
+                                 bool includes_calls) {
+    for (int i = 0; i < TRACE_RECURSION_FLAG_COUNT; i++) {
+        if (metadata->flags[i] == TRACE_RECURSION_UNKNOWN) {
+            cbm_sb_append(sb, trace_recursion_keys[i]);
+            cbm_sb_append(sb, ": null\n");
+        } else {
+            cbm_tree_scalar_bool(sb, trace_recursion_keys[i],
+                                 metadata->flags[i] == TRACE_RECURSION_TRUE);
+        }
+    }
+    if (includes_calls) {
+        cbm_tree_scalar_str(sb, "self_call_policy", "omitted");
+    }
+}
+
+static void trace_recursion_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                 const trace_recursion_t *metadata, bool includes_calls) {
+    for (int i = 0; i < TRACE_RECURSION_FLAG_COUNT; i++) {
+        if (metadata->flags[i] == TRACE_RECURSION_UNKNOWN) {
+            yyjson_mut_obj_add_null(doc, root, trace_recursion_keys[i]);
+        } else {
+            yyjson_mut_obj_add_bool(doc, root, trace_recursion_keys[i],
+                                    metadata->flags[i] == TRACE_RECURSION_TRUE);
+        }
+    }
+    if (includes_calls) {
+        yyjson_mut_obj_add_str(doc, root, "self_call_policy", "omitted");
+    }
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
@@ -10491,6 +10557,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                                              .do_inbound = do_inbound};
     trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
                         &unresolved_in);
+    trace_recursion_t recursion = trace_recursion_metadata(nodes, node_count);
     const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
     const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
 
@@ -10574,6 +10641,7 @@ render_trace_output:;
         if (mode) {
             cbm_tree_scalar_str(&sb, "mode", mode);
         }
+        trace_recursion_tree(&sb, &recursion, trace_includes_calls);
         /* Grouped tree is THE default; risk_labels/data_flow keep the flat
          * table (extra columns) in the same tree syntax. */
         bool render_risk = risk_labels && emit_optional_fields;
@@ -10657,6 +10725,7 @@ render_trace_output:;
         if (mode) {
             yyjson_mut_obj_add_str(doc, root, "mode", mode);
         }
+        trace_recursion_json(doc, root, &recursion, trace_includes_calls);
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
             yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
@@ -10724,6 +10793,7 @@ render_trace_output:;
             if (!trace_legacy_json) {
                 cbm_sb_t floor;
                 cbm_sb_init(&floor);
+                trace_recursion_tree(&floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
                     cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
@@ -10752,6 +10822,7 @@ render_trace_output:;
                 yyjson_mut_doc *floor_doc = yyjson_mut_doc_new(NULL);
                 yyjson_mut_val *floor = yyjson_mut_obj(floor_doc);
                 yyjson_mut_doc_set_root(floor_doc, floor);
+                trace_recursion_json(floor_doc, floor, &recursion, trace_includes_calls);
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
