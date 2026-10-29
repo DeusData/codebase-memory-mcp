@@ -118,7 +118,9 @@ CLIENT_HOME_OVERRIDES = (
 # so it needs the same neutralization — otherwise a green run on a developer
 # machine only proves the ambient config happened to be writable.
 test_main = read("tests/test_main.c")
-for variable in CLIENT_HOME_OVERRIDES:
+for variable in CLIENT_HOME_OVERRIDES + (
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"
+):
     require(
         f'"{variable}"' in test_main,
         f"tests/test_main.c must neutralize ambient {variable}",

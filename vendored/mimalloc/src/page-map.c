@@ -25,7 +25,10 @@ static void mi_page_map_cannot_commit(void) {
 // A full 256 TiB address space (48 bit) needs a 4 GiB page map.
 // A full 4 GiB address space (32 bit) needs only a 64 KiB page map.
 
-mi_decl_cache_align uint8_t* _mi_page_map = NULL;
+// Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341)
+static uint8_t mi_page_map_empty[1] = { 1 };      // _mi_ptr_page(NULL) == NULL
+
+mi_decl_cache_align uint8_t* _mi_page_map = mi_page_map_empty;
 static void*        mi_page_map_max_address = NULL;
 static mi_memid_t   mi_page_map_memid;
 
@@ -198,7 +201,11 @@ mi_decl_nodiscard mi_decl_export bool mi_is_in_heap_region(const void* p) mi_att
 #define MI_PAGE_MAP_SUB_SIZE          (MI_PAGE_MAP_SUB_COUNT * sizeof(mi_page_t*))
 #define MI_PAGE_MAP_ENTRIES_PER_CBIT  (MI_PAGE_MAP_COUNT < MI_BFIELD_BITS ? 1 : (MI_PAGE_MAP_COUNT / MI_BFIELD_BITS))
 
-mi_decl_cache_align _Atomic(mi_submap_t)* _mi_page_map;
+// Use an initial empty page map so `free(NULL)` works even if mimalloc is not yet initialized (issue #1341)
+static mi_page_t*            mi_submap_empty[1]   = { NULL };
+static _Atomic(mi_submap_t)  mi_page_map_empty[1] = { MI_ATOMIC_VAR_INIT(mi_submap_empty) };
+
+mi_decl_cache_align _Atomic(mi_submap_t)* _mi_page_map = mi_page_map_empty;
 static size_t       mi_page_map_count;
 static void*        mi_page_map_max_address;
 static mi_memid_t   mi_page_map_memid;
@@ -261,6 +268,7 @@ bool _mi_page_map_init(void) {
   _mi_page_map = (_Atomic(mi_page_t**)*)_mi_os_alloc_aligned(reserve_size, 1, commit, true /* allow large */, &mi_page_map_memid);
   if (_mi_page_map==NULL) {
     _mi_error_message(ENOMEM, "unable to reserve virtual memory for the page map (%zu KiB)\n", page_map_size / MI_KiB);
+    _mi_page_map = mi_page_map_empty;
     return false;
   }
   if (mi_page_map_memid.initially_committed && !mi_page_map_memid.initially_zero) {

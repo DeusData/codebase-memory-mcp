@@ -19402,13 +19402,17 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
+                 "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
+                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " \"%s\" \"%s\" -- 2>NUL && "
+                 "git -C \"%s\" " CBM_TEST_IMPACT_GIT_PINS
+                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>NUL",
                  root_path, merge_base, head_oid, root_path);
 #else
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
+                 "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
+                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " '%s' '%s' -- 2>/dev/null && "
+                 "git -C '%s' " CBM_TEST_IMPACT_GIT_PINS
+                 " diff --relative " CBM_TEST_IMPACT_DIFF_FLAGS " -- 2>/dev/null",
                  root_path, merge_base, head_oid, root_path);
 #endif
         char hunk_output_path[CBM_SZ_2K] = {0};

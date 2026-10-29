@@ -1053,10 +1053,12 @@ MIMALLOC_OBJ_TEST = $(BUILD_DIR)/mimalloc.o
 MIMALLOC_OBJ_TSAN = $(BUILD_DIR)/tsan_mimalloc.o
 MIMALLOC_OBJ_PROD = $(BUILD_DIR)/prod_mimalloc.o
 
-$(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/mimalloc.o: $(MIMALLOC_SRC) $(wildcard vendored/mimalloc/src/*.c) \
+                         $(wildcard vendored/mimalloc/include/*.h) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
+$(BUILD_DIR)/tsan_mimalloc.o: $(MIMALLOC_SRC) $(wildcard vendored/mimalloc/src/*.c) \
+                              $(wildcard vendored/mimalloc/include/*.h) Makefile.cbm | $(BUILD_DIR)
 	$(CC) $(MIMALLOC_CFLAGS_TEST) $(TSAN_SANITIZE) -c -o $@ $<
 
 # static.c is an AMALGAMATION: it #includes options.c and friends, none of which

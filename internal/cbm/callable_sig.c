@@ -79,7 +79,9 @@ static void sig_raw(sig_ctx_t *c, const char *s, size_t n) {
             c->overflow = true;
             return;
         }
-        memcpy(grown, c->buf, c->len);
+        if (c->len != 0) {
+            memcpy(grown, c->buf, c->len);
+        }
         c->buf = grown;
         c->cap = cap;
     }

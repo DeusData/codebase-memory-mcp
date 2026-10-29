@@ -1538,6 +1538,9 @@ static int pl_pkg_order_cmp(const void *a, const void *b) {
 /* Give every declaration the index of its name's P record (names in order of
  * their first declaration) and write the P records. */
 static void pl_number_packages(pl_walk_t *w, pl_sb_t *sb) {
+    if (w->npkgs == 0) {
+        return;
+    }
     qsort(w->pkgs, (size_t)w->npkgs, sizeof(pl_pkg_t), pl_pkg_name_cmp);
     for (int i = 0; i < w->npkgs; i++) { /* index = order of the name's first declaration */
         bool repeat =
@@ -1572,7 +1575,9 @@ static int pl_subdecl_cmp(const void *a, const void *b) {
 /* One S record per sub definition of the file, with the package the tree
  * places it in. */
 static void pl_put_subs(CBMExtractCtx *ctx, pl_walk_t *w, pl_sb_t *sb) {
-    qsort(w->subs, (size_t)w->nsubs, sizeof(pl_subdecl_t), pl_subdecl_cmp);
+    if (w->nsubs > SKIP_ONE) {
+        qsort(w->subs, (size_t)w->nsubs, sizeof(pl_subdecl_t), pl_subdecl_cmp);
+    }
     const CBMDefArray *defs = &ctx->result->defs;
     for (int i = 0; i < defs->count; i++) {
         const CBMDefinition *d = &defs->items[i];

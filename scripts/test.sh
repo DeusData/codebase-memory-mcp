@@ -492,6 +492,7 @@ fi
 # release artifacts free of it; scripts/ci/check-binary-composition.sh proves
 # they stay that way.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
+CC="$CC" bash "$ROOT/tests/test_mimalloc_preinit.sh"
 make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"

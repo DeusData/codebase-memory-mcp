@@ -10470,6 +10470,12 @@ TEST(doc_perl_module_doc_is_the_pod_no_sub_holds) {
     ASSERT_NOT_NULL(r);
     ASSERT_NULL(r->module_doc);
     cbm_free_result(r);
+    /* POD without any declarations leaves both scope sort inputs empty. */
+    r = extract("=head1 NAME\n\nStandalone module.\n\n=cut\n", CBM_LANG_PERL, "t", "Standalone.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+    ASSERT_STR_EQ(r->module_doc, "=head1 NAME\n\nStandalone module.\n\n=cut");
+    cbm_free_result(r);
     PASS();
 }
 

@@ -18414,7 +18414,8 @@ static bool dc_walk_fixture_open(dc_walk_fixture_t *fx) {
     }
     /* Same git invocation rules as the #1363 fixture above. */
     char cmd[1200];
-    const char *steps[] = {"init -q", "add -A", "commit -q -m init"};
+    const char *steps[] = {"init -q", "config diff.mnemonicPrefix true", "add -A",
+                           "commit -q -m init"};
     for (size_t s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
         snprintf(cmd, sizeof(cmd),
                  "git -C \"%s\" -c user.name=t -c user.email=t@t.io -c init.defaultBranch=main "
