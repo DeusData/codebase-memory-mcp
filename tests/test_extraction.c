@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/platform.h"
 #include "foundation/constants.h"     /* CBM_SZ_* */
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
@@ -5424,6 +5425,24 @@ TEST(extract_python_bare_decorator_route_rules) {
     ASSERT_STR_EQ(index->route_path, "/");
     ASSERT_STR_EQ(index->route_method, "ANY");
 
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #2090: Solidity modifier_invocation tracked as decorator. */
+TEST(solidity_modifier_decorator) {
+    CBMFileResult *r = extract("pragma solidity ^0.8.0;\n"
+                               "contract Vault {\n"
+                               "    modifier onlyOwner() { _; }\n"
+                               "    function withdraw() public onlyOwner {\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SOLIDITY, "t", "Vault.sol");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "withdraw");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "onlyOwner"));
     cbm_free_result(r);
     PASS();
 }
@@ -13321,7 +13340,42 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
     PASS();
 }
 
+#ifdef _WIN32
+/* The supervisor sets this path through cbm_setenv. Exercise the actual
+ * journal writer, which must read it as UTF-8 before calling cbm_fopen. */
+TEST(extraction_marker_round_trips_non_ascii_environment_path) {
+    char dir[512] = "/tmp/cbm-marker-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char marker[640];
+    snprintf(marker, sizeof(marker), "%s/marker-\xce\x94-\xe4\xb8\x81.log", dir);
+    char saved[4096];
+    const char *previous = cbm_safe_getenv("CBM_INDEX_MARKER_FILE", saved, sizeof(saved), NULL);
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_MARKER_FILE", marker, 1), 0);
+    cbm_index_mark_start("synthetic.cpp");
+    cbm_index_mark_done("synthetic.cpp");
+    if (previous) {
+        (void)cbm_setenv("CBM_INDEX_MARKER_FILE", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_INDEX_MARKER_FILE");
+    }
+    FILE *file = cbm_fopen(marker, "rb");
+    char contents[128] = {0};
+    if (file) {
+        (void)fread(contents, 1, sizeof(contents) - 1, file);
+        (void)fclose(file);
+    }
+    (void)cbm_unlink(marker);
+    (void)cbm_rmdir(dir);
+    ASSERT_NOT_NULL(file);
+    ASSERT_STR_EQ(contents, "S synthetic.cpp\nD synthetic.cpp\n");
+    PASS();
+}
+#endif
+
 SUITE(extraction) {
+#ifdef _WIN32
+    RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
+#endif
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
@@ -13712,6 +13766,7 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_python_bare_decorator_route_rules);
+    RUN_TEST(solidity_modifier_decorator);
     RUN_TEST(arkts_component_struct);
     RUN_TEST(arkts_exported_struct_decorators);
     RUN_TEST(arkts_member_decorators);

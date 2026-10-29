@@ -9743,6 +9743,104 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
     PASS();
 }
 
+/* Issue #2297: a call through `import { foo as fooShared }` produced no CALLS
+ * edge, so trace_path(foo, inbound) missed the caller. End to end through the
+ * real pipeline: the renamed call, an app-local wrapper that shares the
+ * exported name, and a method on a renamed class import all reach the
+ * exported member, while the plain named import control keeps lsp_ts_import. */
+TEST(pipeline_ts_renamed_import_call_issue2297) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ts_2297_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/lib.ts",
+                    "export function fooUniqueQrs(x: number): number {\n"
+                    "  return x + 1;\n"
+                    "}\n"
+                    "export function buildHealthUniqueQrs(input: { a: number }): number {\n"
+                    "  return input.a;\n"
+                    "}\n"
+                    "export class ConnUniqueQrs {\n"
+                    "  pingUniqueQrs(): number {\n"
+                    "    return 1;\n"
+                    "  }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/plain.ts",
+                    "import { fooUniqueQrs } from './lib';\n"
+                    "export function callsPlain(): number {\n"
+                    "  return fooUniqueQrs(1);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/renamed.ts",
+                    "import { fooUniqueQrs as fooShared } from './lib';\n"
+                    "export function callsRenamed(): number {\n"
+                    "  return fooShared(1);\n"
+                    "}\n");
+    write_temp_file(tmp, "src/wrapper.ts",
+                    "import { buildHealthUniqueQrs as buildShared } from './lib';\n"
+                    "export function buildHealthUniqueQrs(input: { a: number }): number {\n"
+                    "  return buildShared({ ...input });\n"
+                    "}\n");
+    write_temp_file(tmp, "src/klass.ts",
+                    "import { ConnUniqueQrs as Connection } from './lib';\n"
+                    "export function viaRenamedClass(): number {\n"
+                    "  return new Connection().pingUniqueQrs();\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ts_2297.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    bool plain =
+        cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "lsp_ts_import");
+    bool renamed = cross_file_call_has_strategy(s, project, "callsRenamed", "fooUniqueQrs",
+                                                "lsp_import_alias");
+    char wrapper_qn[512];
+    char exported_qn[512];
+    snprintf(wrapper_qn, sizeof(wrapper_qn), "%s.src.wrapper.buildHealthUniqueQrs", project);
+    snprintf(exported_qn, sizeof(exported_qn), "%s.src.lib.buildHealthUniqueQrs", project);
+    cbm_node_t wrapper_node = {0};
+    cbm_node_t exported_node = {0};
+    bool wrapper = false;
+    bool recursive = false;
+    if (cbm_store_find_node_by_qn(s, project, wrapper_qn, &wrapper_node) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, exported_qn, &exported_node) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        cbm_store_find_edges_by_source_type(s, wrapper_node.id, "CALLS", &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == exported_node.id && edges[i].properties_json &&
+                strstr(edges[i].properties_json, "lsp_import_alias"))
+                wrapper = true;
+            if (edges[i].target_id == wrapper_node.id)
+                recursive = true;
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_node_free_fields(&wrapper_node);
+    cbm_node_free_fields(&exported_node);
+    bool renamed_class = cross_file_call_has_strategy(s, project, "viaRenamedClass",
+                                                      "pingUniqueQrs", "lsp_ts_method");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(plain);
+    ASSERT_TRUE(renamed);
+    ASSERT_TRUE(wrapper);
+    ASSERT_FALSE(recursive);
+    ASSERT_TRUE(renamed_class);
+    PASS();
+}
+
 /* A query failure is distinct from a valid zero-edge result. */
 static int ts514_pipeline_count(cbm_store_t *store, const char *sql, const char **values,
                                 int value_count) {
@@ -11514,6 +11612,93 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     cbm_pipeline_free(p);
     th_rmtree(tmp);
     PASS();
+}
+
+/* #2666: tests/test_main.c runs every suite through a macro,
+ * RUN_SELECTED_SUITE(mcp); the argument is a bare C identifier that names no
+ * declaration, and the registry fallback bound it to whichever struct member
+ * was called `mcp`. toggle() writes a bare name the extractor cannot see
+ * declared (a macro-made global, say) that a struct member also carries.
+ * state.c holds the genuine member uses that must keep their edges.
+ * pad_files pushes the run past MIN_FILES_FOR_PARALLEL for the parallel twin. */
+static void write_c_bare_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "include/suite.h",
+                    "typedef struct suite_state {\n"
+                    "    char mcp[64];\n"
+                    "    int count;\n"
+                    "    int enabled;\n"
+                    "} suite_state_t;\n");
+    write_temp_file(tmp, "tests/main.c",
+                    "#include \"suite.h\"\n"
+                    "#define RUN_SELECTED_SUITE(name) run_suite(#name)\n"
+                    "int run_suite(const char *name);\n"
+                    "int main(void) {\n"
+                    "    RUN_SELECTED_SUITE(mcp);\n"
+                    "    RUN_SELECTED_SUITE(count);\n"
+                    "    return 0;\n"
+                    "}\n"
+                    "void toggle(void) {\n"
+                    "    enabled = 1;\n"
+                    "}\n");
+    write_temp_file(tmp, "src/state.c",
+                    "#include \"suite.h\"\n"
+                    "int state_count(const suite_state_t *s) { return s->count; }\n"
+                    "void state_reset(suite_state_t *s) { s->enabled = 0; }\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.c", i);
+        snprintf(body, sizeof(body), "int filler%d(void) { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int run_c_bare_field_case(const char *tmpl, int pad_files) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", tmpl);
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_c_bare_field_fixture(tmp, pad_files);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/c_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* The fields must exist for the probes to mean anything. */
+    ASSERT_GTE(fixture_node_count(s, project, "include/suite.h", "mcp", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "include/suite.h", "count", "Field"), 1);
+    ASSERT_GTE(fixture_node_count(s, project, "include/suite.h", "enabled", "Field"), 1);
+    /* Reproduce-first: RED before the fix — the macro arguments bind the
+     * same-named struct members, and the bare write binds `enabled`. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "main", "mcp", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "main", "count", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "toggle", "enabled", "WRITES"));
+    /* The member half of `s->count` / `s->enabled = 0` still binds the field. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "state_count", "count", "USAGE"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "state_reset", "enabled", "WRITES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_c_bare_ref_never_binds_field) {
+    /* Sequential path: resolve_usage_edges / resolve_rw_edges. */
+    return run_c_bare_field_case("/tmp/cbm_c_bare_XXXXXX", 0);
+}
+
+TEST(pipeline_c_bare_ref_never_binds_field_parallel) {
+    /* Parallel twin: resolve_file_usages / resolve_file_rw must consult the
+     * same predicate (#1928's lesson). */
+    return run_c_bare_field_case("/tmp/cbm_c_barep_XXXXXX", 52);
 }
 
 /* A C caller of a header function that shares its name with a struct member
@@ -28663,6 +28848,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916);
     RUN_TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354);
+    RUN_TEST(pipeline_ts_renamed_import_call_issue2297);
     RUN_TEST(pipeline_ts_param_property_injection_issue514);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_php_receiver_suppresses_weak_method_edge);
@@ -28686,6 +28872,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
+    RUN_TEST(pipeline_c_bare_ref_never_binds_field);
+    RUN_TEST(pipeline_c_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_c_call_reaches_header_function_beside_field);
     RUN_TEST(pipeline_c_call_reaches_header_function_beside_field_parallel);
     RUN_TEST(pipeline_c_member_access_binds_field_by_object_type);
