@@ -255,7 +255,8 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            CBMLanguage lang);
 /* The CALLS variant: as cbm_registry_resolve_lang, except that a bare C call
  * (no `.` / `->`) does not consider Field or Method nodes, which it can never
- * call. */
+ * call, and that in a C# file a built-in type keyword root (`int.TryParse`)
+ * names a type for the receiver chain check (#2121). */
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,

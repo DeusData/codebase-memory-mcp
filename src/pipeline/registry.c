@@ -443,6 +443,7 @@ typedef struct {
     cbm_resolution_t res;
     size_t scope_len;  /* raw and Python-scoped requests may share one file cache */
     bool skip_members; /* a C call and a C reference to the same name share it too */
+    bool cs_keywords;  /* a C# call and a C# reference to the same name share it too */
 } resolve_cache_entry_t;
 
 static CBM_TLS CBMHashTable *_resolve_cache = NULL;
@@ -1996,6 +1997,25 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* True when the first segment of the dotted chain `dotted` is one of C#'s
+ * built-in type keywords (int, string, bool, ...; nint and nuint since C# 9).
+ * Closed list: these words are grammar, not a naming heuristic. */
+static bool cs_type_keyword_root(const char *dotted) {
+    static const char *const keywords[] = {
+        "bool",   "byte", "char",  "decimal", "double", "dynamic", "float",
+        "int",    "long", "nint",  "nuint",   "object", "sbyte",   "short",
+        "string", "uint", "ulong", "ushort",  "void",
+    };
+    const char *dot = strchr(dotted, '.');
+    size_t len = dot ? (size_t)(dot - dotted) : strlen(dotted);
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strlen(keywords[i]) == len && strncmp(dotted, keywords[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
  * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
  * throw away, and throwing it away binds Foundation's URLSession.shared.data to
@@ -2009,9 +2029,17 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  * show, so the chain proves nothing there and the call passes through
  * unchanged. A callee with no separator passes through as well.
  *
- * Language agnostic by design: the registry holds no language, and every
- * language that writes receiver chains gains the same protection. */
-static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+ * One exception, for C# CALLS only (#2121): C# spells its built-in types as
+ * lower-case keywords, so in `int.TryParse` or `string.Join` the root names a
+ * type and gets the same check (cs_type_keyword_root). `lang` is the calling
+ * file's language on the CALLS path (cbm_registry_resolve_call_lang) and
+ * CBM_LANG_COUNT on every other resolve. In Python, JS or Go these words are
+ * ordinary identifiers, so a variable named `object` stays a value root there.
+ *
+ * Otherwise language agnostic by design: every language that writes receiver
+ * chains gains the same protection. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn,
+                                  CBMLanguage lang) {
     /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
      * the same way qualified_suffix_match does. */
     char dotted[CBM_SZ_512];
@@ -2030,7 +2058,8 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
     if (!last_dot) {
         return true; /* bare name — no receiver chain to judge */
     }
-    if (dotted[0] < 'A' || dotted[0] > 'Z') {
+    if ((dotted[0] < 'A' || dotted[0] > 'Z') &&
+        !(lang == CBM_LANG_CSHARP && cs_type_keyword_root(dotted))) {
         return true; /* lower-case root names a value, not a type */
     }
     /* A name written in capitals with underscores is a constant holding a
@@ -2118,10 +2147,12 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
                          .lang = side ? lang : NULL};
 }
 
-/* Strategies 3.5, 3 and 4 over one same-name candidate set. */
+/* Strategies 3.5, 3 and 4 over one same-name candidate set. `lang` reaches
+ * receiver_chain_admits only (see there). */
 static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
                                                 const char *callee_name, const char *module_qn,
-                                                const char **import_vals, int import_count) {
+                                                const char **import_vals, int import_count,
+                                                CBMLanguage lang) {
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -2134,7 +2165,7 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
-        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+        if (!receiver_chain_admits(callee_name, arr->items[0], lang)) {
             return empty_result();
         }
         double conf = CONF_UNIQUE_NAME;
@@ -2152,7 +2183,7 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
     const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
                                                qn_lang_flags(arr), arr->count, module_qn);
     if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
+        if (!receiver_chain_admits(callee_name, best, lang)) {
             return empty_result();
         }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
@@ -2170,7 +2201,7 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
  * libc `read()` the unique name of a C++ adapter's Method instead. */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
-                                            int import_count, bool skip_members) {
+                                            int import_count, bool skip_members, CBMLanguage lang) {
     const char *lookup = simple_name(callee_name);
     const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -2188,17 +2219,20 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         if (view.count == 0) {
             return empty_result();
         }
-        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count);
+        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count,
+                                       lang);
     }
-    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count);
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count, lang);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
- * cbm_registry_resolve owns the per-file cache). */
+ * cbm_registry_resolve owns the per-file cache). `lang`: see
+ * receiver_chain_admits. */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
-                                               size_t scope_len, bool skip_members) {
+                                               size_t scope_len, bool skip_members,
+                                               CBMLanguage lang) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -2236,7 +2270,7 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
         res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
-                                  skip_members);
+                                  skip_members, lang);
     }
     return res;
 }
@@ -2284,25 +2318,31 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
                                            registry_entry_language(r, res->qualified_name));
 }
 
+/* call_lang: the calling file's language for a CALLS resolve, CBM_LANG_COUNT
+ * for every other one (see receiver_chain_admits). */
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
-                                                size_t scope_len, bool skip_members) {
+                                                size_t scope_len, bool skip_members,
+                                                CBMLanguage call_lang) {
     if (!r || !callee_name) {
         return empty_result();
     }
 
     /* Per-file cache: same callee_name in N call sites → 1 chain walk
      * + N-1 O(1) hash hits. module_qn is constant per file so the
-     * cache key only needs callee_name. */
+     * cache key only needs callee_name. The chain reads call_lang only as
+     * "is it C#", so that one bit is all the entry has to record. */
+    bool cs_keywords = call_lang == CBM_LANG_CSHARP;
     resolve_cache_entry_t *cached =
         _resolve_cache ? (resolve_cache_entry_t *)cbm_ht_get(_resolve_cache, callee_name) : NULL;
-    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members)
+    if (cached && cached->scope_len == scope_len && cached->skip_members == skip_members &&
+        cached->cs_keywords == cs_keywords)
         return cached->res;
 
     cbm_resolution_t res =
         registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                               import_map_count, scope_len, skip_members);
+                               import_map_count, scope_len, skip_members, call_lang);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2323,12 +2363,14 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
         cached->res = res;
         cached->scope_len = scope_len;
         cached->skip_members = skip_members;
+        cached->cs_keywords = cs_keywords;
     } else if (_resolve_cache) {
         resolve_cache_entry_t *e = (resolve_cache_entry_t *)malloc(sizeof(*e));
         if (e) {
             e->res = res;
             e->scope_len = scope_len;
             e->skip_members = skip_members;
+            e->cs_keywords = cs_keywords;
             char *kdup = strdup(callee_name);
             if (kdup) {
                 cbm_ht_set(_resolve_cache, kdup, e);
@@ -2344,7 +2386,8 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
+                                   import_map_count, module_qn ? strlen(module_qn) : 0, false,
+                                   CBM_LANG_COUNT);
 }
 
 static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
@@ -2357,7 +2400,8 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false);
+                                   import_map_count, lang_scope_len(module_qn, lang), false,
+                                   CBM_LANG_COUNT);
 }
 
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
@@ -2371,7 +2415,8 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
+                                   import_map_count, lang_scope_len(module_qn, lang), skip_members,
+                                   lang);
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
@@ -2539,7 +2584,8 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false,
+                                  CBM_LANG_COUNT);
 }
 
 /* Python looks a bare name up in the calling def's own scope, then in each
