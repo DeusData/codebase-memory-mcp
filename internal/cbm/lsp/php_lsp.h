@@ -5,6 +5,7 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
+#include "../resolve/imports.h"
 #include "go_lsp.h" /* CBMLSPDef reused across languages */
 
 /* Per-file typed import evidence. NULL targets means unknown; otherwise
@@ -17,6 +18,9 @@ typedef struct {
     /* Independently validated positive bindings from a fresh partial snapshot.
      * NULL slots carry no absence/external proof. Owned separately from targets. */
     const char **proven_targets;
+    /* Immutable normalized facts own the actual import proof predecessors.
+     * Borrowed for the resolution phase; projection properties are unrelated. */
+    const cbm_resolve_import_snapshot_t *facts;
 } CBMPHPImportBindings;
 
 /* PHPLSPContext — per-file state for PHP type-aware call resolution.

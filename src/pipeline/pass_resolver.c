@@ -13,6 +13,7 @@
 #include "resolve/policy.h"
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
+#include "lsp/go_stabilize.h"
 #include "result_spill.h"
 #include "service_patterns.h"
 
@@ -131,6 +132,7 @@ struct cbm_shared_resolver {
     bool http_domain_complete;
     cbm_resolve_proof_pool_t proofs;
     cbm_resolve_solver_t *solver;
+    cbm_go_stabilization_t *go_types;
     cbm_shared_resolver_export_summary_t *summary;
     size_t summary_count;
     const char *project;
@@ -1664,6 +1666,64 @@ static bool prepare_python_queries(cbm_shared_resolver_t *resolver, const cbm_pi
     return true;
 }
 
+static bool collect_go_types(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
+                             const CBMFileResult *result, const cbm_file_info_t *file) {
+    if (file->language != CBM_LANG_GO)
+        return true;
+    size_t length = result->source_len > 0 ? (size_t)result->source_len : 0;
+    char *owned = result->source ? NULL : load_source(file->path, &length);
+    const char *source = result->source ? result->source : owned;
+    if (!cbm_result_source_matches(result, source, length, CBM_SOURCE_ORIGIN_RAW)) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
+        resolver->complete = false;
+        return true;
+    }
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    char *path = cbm_arena_strdup(&arena, file->rel_path);
+    if (path)
+        cbm_normalize_path_sep(path);
+    const char *module =
+        path ? cbm_fqn_module_source_lang(&arena, ctx->project_name, path, CBM_LANG_GO) : NULL;
+    bool ok = module && cbm_pipeline_capture_go_imports(ctx, file->rel_path, result);
+    cbm_resolve_proof_source_t snapshot = {.project = resolver->project,
+                                           .file = file->rel_path,
+                                           .module = module,
+                                           .scope = module,
+                                           .content_identity = result->source_content_id[0],
+                                           .configuration_identity =
+                                               result->source_configuration_id};
+    if (ok)
+        ok = cbm_go_stabilization_collect(resolver->go_types, result, source, length, &snapshot,
+                                          module, cbm_gbuf_imports(ctx->gbuf, file->rel_path));
+    cbm_arena_destroy(&arena);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
+    return ok;
+}
+
+static char *solver_summary_payload(const cbm_resolve_solver_result_t *binding) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc)
+        return NULL;
+    yyjson_mut_val *object = yyjson_mut_obj(doc), *dependencies = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, object);
+    bool ok =
+        object && dependencies &&
+        yyjson_mut_obj_add_uint(doc, object, "fact_kind", binding->value.fact_kind) &&
+        yyjson_mut_obj_add_uint(doc, object, "binding_version", binding->value.binding_version) &&
+        yyjson_mut_obj_add_str(doc, object, "type_identity",
+                               binding->value.type_identity ? binding->value.type_identity : "") &&
+        yyjson_mut_obj_add_str(
+            doc, object, "declaration_identity",
+            binding->value.declaration_identity ? binding->value.declaration_identity : "") &&
+        yyjson_mut_obj_add_val(doc, object, "dependencies", dependencies);
+    for (size_t i = 0; ok && i < binding->dependency_count; i++)
+        ok = yyjson_mut_arr_add_str(doc, dependencies, binding->dependencies[i]);
+    char *json = ok ? yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL) : NULL;
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
 cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
                                                  const cbm_file_info_t *files, int file_count,
                                                  CBMFileResult **cache) {
@@ -1689,11 +1749,13 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
                                 UINT64_C(64000000));
     resolver->solver = cbm_resolve_solver_new(&resolver->arena, &resolver->proofs,
                                               (cbm_resolve_solver_limits_t){0});
+    resolver->go_types =
+        cbm_go_stabilization_new(&resolver->arena, &resolver->proofs, resolver->solver);
     resolver->complete = true;
     if (!resolver->exports || !resolver->targets || !resolver->namespaces ||
         !resolver->python_queries || !resolver->python_namespaces || !resolver->http_defaults ||
         !resolver->http_sites || !resolver->http_unsafe || !resolver->http_candidates ||
-        !resolver->http_veto || !resolver->project || !resolver->solver) {
+        !resolver->http_veto || !resolver->project || !resolver->solver || !resolver->go_types) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -1724,6 +1786,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         }
         if (ok)
             ok = export_file(resolver, ctx, result, &files[f]);
+        if (ok)
+            ok = collect_go_types(resolver, ctx, result, &files[f]);
         cbm_pipeline_result_release(result, loaded);
         if (!ok) {
             cbm_shared_resolver_free(resolver);
@@ -1731,7 +1795,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         }
     }
     if (!settle_python_imports(resolver) || !http_finalize_veto(resolver) ||
-        !stabilize_exports(resolver) ||
+        !cbm_go_stabilization_register(resolver->go_types) || !stabilize_exports(resolver) ||
+        !cbm_go_stabilization_seal(resolver->go_types) ||
         !prepare_python_queries(resolver, ctx, files, file_count, cache)) {
         cbm_shared_resolver_free(resolver);
         return NULL;
@@ -1745,7 +1810,32 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
                                          .closed = item->binding.predecessors_closed,
                                          .proof_borrowed = item->binding.proof != NULL,
                                          .result = python_binding_outcome(&item->binding)};
-        if (!cbm_gbuf_record_resolver_summary(ctx->gbuf, &summary)) {
+        char *payload = solver_summary_payload(&item->binding);
+        summary.payload_json = payload;
+        bool written = payload && cbm_gbuf_record_resolver_summary(ctx->gbuf, &summary);
+        cbm_free(CBM_MEM_CLASS_OTHER, payload);
+        if (!written) {
+            cbm_shared_resolver_free(resolver);
+            return NULL;
+        }
+    }
+    for (size_t i = 0; i < cbm_resolve_solver_count(resolver->solver); i++) {
+        const cbm_resolve_solver_result_t *binding = cbm_resolve_solver_at(resolver->solver, i);
+        if (strncmp(binding->key, "go/", 3))
+            continue;
+        const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(binding->proof);
+        char *payload = solver_summary_payload(binding);
+        cbm_resolve_summary_t summary = {.file_path = proof ? proof->source.file : "",
+                                         .key = binding->key,
+                                         .kind = binding->value.kind,
+                                         .module = binding->value.module,
+                                         .closed = binding->predecessors_closed,
+                                         .proof_borrowed = binding->proof != NULL,
+                                         .payload_json = payload,
+                                         .result = python_binding_outcome(binding)};
+        bool written = payload && cbm_gbuf_record_resolver_summary(ctx->gbuf, &summary);
+        cbm_free(CBM_MEM_CLASS_OTHER, payload);
+        if (!written) {
             cbm_shared_resolver_free(resolver);
             return NULL;
         }
@@ -1831,6 +1921,11 @@ bool cbm_shared_resolver_exports_complete(const cbm_shared_resolver_t *resolver)
     return resolver && resolver->complete && cbm_resolve_solver_complete(resolver->solver);
 }
 
+void cbm_shared_resolver_fact(const cbm_shared_resolver_t *resolver, const char *key,
+                              cbm_resolve_solver_result_t *out) {
+    cbm_resolve_solver_get(resolver ? resolver->solver : NULL, key, out);
+}
+
 bool cbm_shared_resolver_owns_proof(const cbm_shared_resolver_t *resolver,
                                     const cbm_resolve_proof_t *proof) {
     return resolver && cbm_resolve_proof_pool_owns(&resolver->proofs, proof);
@@ -1849,6 +1944,7 @@ void cbm_shared_resolver_free(cbm_shared_resolver_t *resolver) {
     cbm_ht_free(resolver->http_unsafe);
     cbm_ht_free(resolver->http_candidates);
     cbm_ht_free(resolver->http_veto);
+    cbm_go_stabilization_dispose(resolver->go_types);
     cbm_arena_destroy(&resolver->arena);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, resolver);
 }
@@ -2650,6 +2746,11 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
                 : generic_result(resolver, call->callee_name, call->enclosing_func_qn,
                                  call->site_start_byte, call->site_end_byte, call->source_origin,
                                  true);
+        if (resolver->file->language == CBM_LANG_GO && resolver->source_matches &&
+            call->source_origin == CBM_SOURCE_ORIGIN_RAW)
+            (void)cbm_go_stabilization_call(resolver->shared->go_types, resolver->file->rel_path,
+                                            call->enclosing_func_qn, call->site_start_byte,
+                                            call->site_end_byte, &outcome);
         if (!record_result(resolver, call->enclosing_func_qn, call->callee_name, "CALLS",
                            call->site_start_byte, call->site_end_byte, call->source_origin, outcome,
                            call))

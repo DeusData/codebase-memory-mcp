@@ -13,6 +13,9 @@ int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *projec
                                           const cbm_resolve_file_t *files, size_t file_count,
                                           const cbm_resolve_summary_t *summaries,
                                           size_t summary_count);
+/* Fixed-size schema/receipt check, independent of occurrence count. Missing or
+ * subsequently modified generation metadata is unavailable and needs rebuild. */
+int cbm_store_resolver_current(cbm_store_t *store, const char *project, bool *present);
 int cbm_store_resolver_summary(cbm_store_t *store, const char *project,
                                cbm_resolve_counts_t *counts, bool *present);
 /* Ordered, bounded diagnostics for abstained occurrences. Borrowed row strings

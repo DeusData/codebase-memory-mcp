@@ -147,7 +147,7 @@ static const gd_column_t gd_resolver_derived_bindings[] = {
     {"project", GD_T, 0, 1}, {"file_path", GD_T, 0, 2}, {"key", GD_T, 0, 3},
     {"kind", GD_I, 0, 4},    {"module", GD_I, 0, 0},    {"closed", GD_I, 0, 0},
     {"binding", GD_I, 0, 0}, {"domain", GD_I, 0, 0},    {"analysis", GD_I, 0, 0},
-    {"target", GD_T, 0, 0},  {"proof", GD_I, 0, 0},
+    {"target", GD_T, 0, 0},  {"proof", GD_I, 0, 0},     {"payload_json", GD_T, 0, 0},
 };
 
 /* These descriptors and SQL strings are immutable; all other state is local. */
@@ -223,7 +223,9 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
     {"resolver_derived_bindings", gd_resolver_derived_bindings,
      GD_COLUMNS(gd_resolver_derived_bindings),
      "PRAGMA main.table_xinfo('resolver_derived_bindings');",
-     "SELECT project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof FROM "
+     "SELECT "
+     "project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof,payload_json "
+     "FROM "
      "main.resolver_derived_bindings "
      "ORDER BY CAST(project AS BLOB) ASC,CAST(file_path AS BLOB) ASC,CAST(key AS BLOB) ASC,kind "
      "ASC;"}};

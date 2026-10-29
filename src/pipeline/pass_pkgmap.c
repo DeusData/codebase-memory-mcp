@@ -4356,18 +4356,18 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
         return NULL;
     }
     *reason = "supported_import_path";
-    return resolve_import_strategies(ctx, source_rel, imp, namespace_map, lang, false, ambiguous);
+    const cbm_gbuf_node_t *target =
+        resolve_import_strategies(ctx, source_rel, imp, namespace_map, lang, false, ambiguous);
+    if (lang == CBM_LANG_GO && target &&
+        !cbm_pipeline_go_import_owned(ctx, source_rel, imp, target)) {
+        *reason = "go_module_dependency_authority_unproven";
+        return NULL;
+    }
+    return target;
 }
 
-/* Only this audited adapter currently captures import occurrence spans. Do
- * not consume new struct fields from legacy producers or invent coordinates. */
-static bool php_include_occurrence(CBMLanguage language, const CBMImport *import) {
-    return language == CBM_LANG_PHP && import &&
-           import->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH;
-}
-
-static bool php_include_occurrence_valid(const CBMFileResult *result, const CBMImport *import) {
-    return result && import->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+static bool import_occurrence_valid(const CBMFileResult *result, const CBMImport *import) {
+    return result && import && import->source_origin == CBM_SOURCE_ORIGIN_RAW &&
            import->site_end_byte > import->site_start_byte &&
            import->site_end_byte <= result->source_content_length[CBM_SOURCE_ORIGIN_RAW];
 }
@@ -4377,7 +4377,8 @@ static cbm_resolve_result_t resolve_import_observed(
     const CBMImport *imp, CBMHashTable *namespace_map, const cbm_gbuf_node_t **out,
     cbm_resolve_lookup_context_t *context, CBMLanguage language) {
     cbm_resolve_lookup_t query;
-    bool site = php_include_occurrence(language, imp);
+    bool site = imp && imp->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+                imp->site_end_byte > imp->site_start_byte;
     cbm_resolve_lookup_begin(&query, context, "import.path_resolution",
                              imp ? imp->module_path : NULL, site ? imp->site_start_byte : 0,
                              site ? imp->site_end_byte : 0, CBM_SOURCE_ORIGIN_RAW);
@@ -4411,6 +4412,8 @@ static cbm_resolve_result_t resolve_import_observed(
         result.candidate_count = 1;
         result.facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
                        CBM_RESOLVE_FACT_PATH_BOUND;
+        if (site)
+            result.facts |= CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
     }
     if (context) {
         cbm_resolve_result_t symbolic = result;
@@ -4463,7 +4466,7 @@ static void import_lookup_context(const cbm_pipeline_ctx_t *ctx, const CBMFileRe
 static cbm_resolve_record_t import_record(const CBMFileResult *result, const char *file,
                                           const char *scope, const CBMImport *import,
                                           cbm_resolve_result_t proof, bool emitted) {
-    bool site = php_include_occurrence(result->cached_lang, import);
+    bool site = import_occurrence_valid(result, import);
     return (cbm_resolve_record_t){.file_path = file,
                                   .scope = scope,
                                   .relation = "IMPORTS",
@@ -4476,6 +4479,153 @@ static cbm_resolve_record_t import_record(const CBMFileResult *result, const cha
                                   .configuration_identity = result->source_configuration_id,
                                   .result = proof,
                                   .emitted = emitted};
+}
+
+/* Module discovery is inventory, not dependency authority. This bounded Go
+ * rule proves only an import within the source's nearest module, with no
+ * nested go.mod boundary at the destination. Workspace/replacement mappings
+ * remain unknown until their source directives have an exact model. */
+static bool go_module_declaration(char *source, char *module, size_t capacity) {
+    if (strstr(source, "/*"))
+        return false; /* Block-comment stripping is outside this finite reader. */
+    bool found = false;
+    for (char *line = source; line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        while (*line == ' ' || *line == '\t' || *line == '\r')
+            line++;
+        if (!strncmp(line, "module", 6) && isspace((unsigned char)line[6])) {
+            if (found)
+                return false;
+            line += 6;
+            while (isspace((unsigned char)*line))
+                line++;
+            char *end = line;
+            while (*end && !isspace((unsigned char)*end))
+                end++;
+            size_t size = (size_t)(end - line);
+            if (!size || size >= capacity || memchr(line, '"', size) || memchr(line, '`', size) ||
+                memchr(line, '\\', size))
+                return false;
+            memcpy(module, line, size);
+            module[size] = '\0';
+            while (isspace((unsigned char)*end))
+                end++;
+            if (*end && strncmp(end, "//", 2))
+                return false;
+            found = true;
+        }
+        line = next;
+    }
+    return found;
+}
+static bool go_module_owner(const cbm_pipeline_ctx_t *ctx, const char *path, bool directory,
+                            char *owner, char *module, size_t capacity) {
+    if (!ctx->repo_path || !path || !cbm_repo_rel_join("", path, owner, capacity))
+        return false;
+    if (!directory) {
+        char *slash = strrchr(owner, '/');
+        if (slash)
+            *slash = '\0';
+        else
+            owner[0] = '\0';
+    }
+    for (;;) {
+        char relative[PKGMAP_PATH_BUF], absolute[PKGMAP_PATH_BUF];
+        if (!cbm_repo_rel_join(owner, "go.mod", relative, sizeof(relative)) ||
+            !import_absolute_path(ctx->repo_path, relative, absolute, sizeof(absolute)))
+            return false;
+        struct stat info;
+        if (stat(absolute, &info) == 0) {
+            if (!S_ISREG(info.st_mode))
+                return false;
+            int length = 0;
+            char *source = pkgmap_read_file(absolute, &length);
+            bool valid = source && !memchr(source, '\0', (size_t)length) &&
+                         go_module_declaration(source, module, capacity);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+            return valid;
+        }
+        if ((errno != ENOENT && errno != ENOTDIR) || !*owner)
+            return false;
+        char *slash = strrchr(owner, '/');
+        if (slash)
+            *slash = '\0';
+        else
+            owner[0] = '\0';
+    }
+}
+bool cbm_pipeline_go_import_owned(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                  const CBMImport *import, const cbm_gbuf_node_t *target) {
+    if (!ctx || !source_rel || !import || !import->module_path || !target || !target->file_path ||
+        !target->label || strcmp(target->label, "Folder"))
+        return false;
+    char source_owner[PKGMAP_PATH_BUF], source_module[PKGMAP_PATH_BUF],
+        target_owner[PKGMAP_PATH_BUF], target_module[PKGMAP_PATH_BUF], expected[PKGMAP_PATH_BUF];
+    if (!go_module_owner(ctx, source_rel, false, source_owner, source_module,
+                         sizeof(source_owner)) ||
+        !go_module_owner(ctx, target->file_path, true, target_owner, target_module,
+                         sizeof(target_owner)) ||
+        strcmp(source_owner, target_owner) || strcmp(source_module, target_module))
+        return false;
+    size_t size = strlen(source_module);
+    if (strncmp(import->module_path, source_module, size) ||
+        (import->module_path[size] && import->module_path[size] != '/'))
+        return false;
+    const char *suffix = import->module_path + size;
+    if (*suffix)
+        suffix++;
+    if (!cbm_repo_rel_join(source_owner, suffix, expected, sizeof(expected)))
+        return false;
+    return !strcmp(expected, target->file_path);
+}
+
+/* Coordinator normalization before shared semantic resolution. The ordinary
+ * dependency projection may already exist, but neither it nor its properties
+ * is read: repeat the source/path lookup against the frozen project registry. */
+bool cbm_pipeline_capture_go_imports(const cbm_pipeline_ctx_t *ctx, const char *rel,
+                                     const CBMFileResult *result) {
+    if (!ctx || !rel || !result || result->imports.count < 0)
+        return false;
+    cbm_gbuf_forget_imports(ctx->gbuf, rel);
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+    if (!file_qn)
+        return false;
+    CBMArena arena;
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_lookup_context_t context;
+    import_lookup_context(ctx, result, rel, file_qn, &arena, &pool, &context);
+    size_t count = (size_t)result->imports.count;
+    cbm_resolve_import_fact_t *facts =
+        count ? cbm_arena_calloc(&arena, count * sizeof(*facts)) : NULL;
+    bool ok = !count || facts;
+    for (size_t i = 0; ok && i < count; i++) {
+        const CBMImport *import = &result->imports.items[i];
+        const cbm_gbuf_node_t *target = NULL;
+        cbm_resolve_result_t dependency = resolve_import_observed(ctx, rel, file_qn, import, NULL,
+                                                                  &target, &context, CBM_LANG_GO);
+        facts[i] = (cbm_resolve_import_fact_t){.local_name = import->local_name,
+                                               .module_path = import->module_path,
+                                               .member = import->member,
+                                               .kind = import->kind,
+                                               .is_default = import->is_default,
+                                               .type_checking_only = import->type_checking_only,
+                                               .start_byte = import->site_start_byte,
+                                               .end_byte = import->site_end_byte,
+                                               .source_origin = import->source_origin,
+                                               .dependency = dependency,
+                                               .closed = dependency.analysis ==
+                                                         CBM_RESOLVE_ANALYSIS_COMPLETE};
+        ok = dependency.proof != NULL;
+    }
+    cbm_resolve_import_snapshot_t snapshot = {
+        .source = context.source, .items = facts, .count = count, .complete = ok};
+    if (ok)
+        ok = cbm_gbuf_capture_imports(ctx->gbuf, &snapshot);
+    cbm_arena_destroy(&arena);
+    free(file_qn);
+    return ok;
 }
 
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
@@ -4575,33 +4725,6 @@ static bool php_import_known_absent(const cbm_gbuf_t *gbuf, const char *rel, con
     return cbm_ht_get(namespace_map, key) == NULL;
 }
 
-static bool php_json_string_eq(yyjson_val *value, const char *text) {
-    return text ? yyjson_is_str(value) && yyjson_get_len(value) == strlen(text) &&
-                      strcmp(yyjson_get_str(value), text) == 0
-                : yyjson_is_null(value);
-}
-
-static size_t php_json_key_count(yyjson_val *obj, const char *name) {
-    size_t idx, max, count = 0;
-    yyjson_val *key, *value;
-    yyjson_obj_foreach(obj, idx, max, key, value) {
-        (void)value;
-        if (php_json_string_eq(key, name))
-            count++;
-    }
-    return count;
-}
-
-static bool php_binding_identity(yyjson_val *value, const CBMImport *imp) {
-    yyjson_val *kind = yyjson_obj_get(value, "kind");
-    yyjson_val *def = yyjson_obj_get(value, "is_default");
-    return yyjson_is_obj(value) && yyjson_obj_size(value) == 5 && yyjson_is_int(kind) &&
-           yyjson_get_int(kind) == (int)imp->kind && yyjson_is_bool(def) &&
-           yyjson_get_bool(def) == imp->is_default &&
-           php_json_string_eq(yyjson_obj_get(value, "local_name"), imp->local_name) &&
-           php_json_string_eq(yyjson_obj_get(value, "module_path"), imp->module_path);
-}
-
 static bool php_json_add_string(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
                                 const char *text) {
     return text ? yyjson_mut_obj_add_strcpy(doc, obj, key, text)
@@ -4621,115 +4744,98 @@ static yyjson_mut_val *php_binding_json(yyjson_mut_doc *doc, const CBMImport *im
     return obj;
 }
 
-/* Validate the entire snapshot, including bindings that coalesced into one
- * (source, target, local_name) edge. A positive insertion ID alone is not
- * evidence that all properties and secondary indexes were stored. */
-static bool php_read_binding_snapshot(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *file,
-                                      const CBMFileResult *result, const char *json,
-                                      cbm_php_vendor_names_t *out, bool require_complete) {
-    if (!json || (require_complete &&
-                  strncmp(json, php_import_complete, sizeof(php_import_complete) - 1) != 0))
+static bool php_import_text_equal(const char *left, const char *right) {
+    return left && right ? strcmp(left, right) == 0 : left == right;
+}
+
+/* Semantic binding consumes normalized source facts. Graph edges and their
+ * properties can be absent, coalesced or rebuilt without changing this input. */
+static bool php_read_binding_snapshot(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                      const CBMFileResult *result, cbm_php_vendor_names_t *out,
+                                      bool require_complete) {
+    const cbm_resolve_import_snapshot_t *snapshot = cbm_gbuf_imports(gbuf, rel);
+    if (!snapshot || !result || result->imports.count < 0 ||
+        (result->imports.count && !result->imports.items) ||
+        snapshot->count != (size_t)result->imports.count ||
+        (require_complete && !snapshot->complete) ||
+        !php_import_text_equal(snapshot->source.project, project) ||
+        !php_import_text_equal(snapshot->source.file, rel) ||
+        !php_import_text_equal(snapshot->source.module, result->module_qn) ||
+        !php_import_text_equal(snapshot->source.content_identity,
+                               result->source_content_id[CBM_SOURCE_ORIGIN_RAW]) ||
+        !php_import_text_equal(snapshot->source.configuration_identity,
+                               result->source_configuration_id))
         return false;
-    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
-    if (!doc)
+    size_t slots = snapshot->count ? snapshot->count : 1;
+    if (slots > SIZE_MAX / sizeof(const char *))
         return false;
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *manifest = yyjson_obj_get(root, "php_import_bindings");
-    int count = result->imports.count;
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    const char **targets = NULL;
-    int *seen = NULL;
-    bool ok =
-        count >= 0 && (count == 0 || result->imports.items) &&
-        (require_complete || (php_json_key_count(root, "php_imports_proven") == 1 &&
-                              yyjson_is_int(yyjson_obj_get(root, "php_imports_proven")) &&
-                              yyjson_get_int(yyjson_obj_get(root, "php_imports_proven")) == 1)) &&
-        php_json_key_count(root, "php_imports_complete") == 1 &&
-        yyjson_is_int(yyjson_obj_get(root, "php_imports_complete")) &&
-        (yyjson_get_int(yyjson_obj_get(root, "php_imports_complete")) == 0 ||
-         yyjson_get_int(yyjson_obj_get(root, "php_imports_complete")) == 1) &&
-        php_json_key_count(root, "php_import_bindings") == 1 && yyjson_is_arr(manifest) &&
-        yyjson_arr_size(manifest) == (size_t)count &&
-        cbm_gbuf_find_edges_by_source_type(gbuf, file->id, "IMPORTS", &edges, &edge_count) == 0 &&
-        edge_count >= 0 && (edge_count == 0 || edges);
-    if (!ok)
-        goto done;
-    size_t slots = count > 0 ? (size_t)count : 1;
-    if (slots > SIZE_MAX / sizeof(*targets) || slots > SIZE_MAX / sizeof(*seen)) {
-        ok = false;
-        goto done;
+    const char **targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
+    if (!targets)
+        return false;
+    for (size_t i = 0; i < snapshot->count; i++) {
+        const cbm_resolve_import_fact_t *fact = &snapshot->items[i];
+        const CBMImport *import = &result->imports.items[i];
+        if (!php_import_text_equal(fact->local_name, import->local_name) ||
+            !php_import_text_equal(fact->module_path, import->module_path) ||
+            !php_import_text_equal(fact->member, import->member) ||
+            fact->kind != (uint32_t)import->kind || fact->is_default != import->is_default ||
+            fact->type_checking_only != import->type_checking_only ||
+            fact->start_byte != import->site_start_byte ||
+            fact->end_byte != import->site_end_byte ||
+            fact->source_origin != import->source_origin) {
+            cbm_free(CBM_MEM_CLASS_OTHER, targets);
+            return false;
+        }
+        if (fact->dependency.proof && cbm_resolve_admit(&fact->dependency))
+            targets[i] = fact->dependency.target;
     }
-    targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
-    seen = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*seen));
-    if (!targets || !seen) {
-        ok = false;
-        goto done;
-    }
-    for (int i = 0; ok && i < count; i++) {
-        yyjson_val *entry = yyjson_arr_get(manifest, (size_t)i);
-        yyjson_val *target = yyjson_obj_get(entry, "target");
-        ok = php_binding_identity(entry, &result->imports.items[i]);
-        if (yyjson_is_str(target)) {
-            const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, yyjson_get_str(target));
-            ok = ok && node && node->id != file->id && node->qualified_name &&
-                 php_json_string_eq(target, node->qualified_name);
-            if (ok)
-                targets[i] = node->qualified_name;
-        } else if (!yyjson_is_null(target)) {
-            ok = false;
+    out->imports = &result->imports;
+    out->facts = snapshot;
+    if (require_complete)
+        out->targets = targets;
+    else
+        out->proven_targets = targets;
+    return true;
+}
+
+static bool php_import_sites_unique(const CBMImportArray *imports) {
+    CBMHashTable *sites = cbm_ht_create((uint32_t)(imports->count ? imports->count : 1));
+    if (!sites)
+        return false;
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    bool unique = true;
+    for (int i = 0; unique && i < imports->count; i++) {
+        const CBMImport *import = &imports->items[i];
+        char *key = cbm_arena_sprintf(&arena, "%u:%u:%u", import->source_origin,
+                                      import->site_start_byte, import->site_end_byte);
+        unique = key && !cbm_ht_get(sites, key);
+        if (unique) {
+            cbm_ht_set(sites, key, (void *)import);
+            unique = cbm_ht_get(sites, key) == import;
         }
     }
-    for (int e = 0; ok && e < edge_count; e++) {
-        const cbm_gbuf_edge_t *edge = edges[e];
-        if (!edge) {
-            ok = false;
-            break;
-        }
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edge->target_id);
-        yyjson_doc *edoc = edge->properties_json ? yyjson_read(edge->properties_json,
-                                                               strlen(edge->properties_json), 0)
-                                                 : NULL;
-        yyjson_val *obj = edoc ? yyjson_doc_get_root(edoc) : NULL;
-        yyjson_val *local = yyjson_obj_get(obj, "local_name");
-        yyjson_val *bindings = yyjson_obj_get(obj, "php_import_bindings");
-        ok = target && target->qualified_name && yyjson_is_obj(obj) && yyjson_obj_size(obj) == 2 &&
-             yyjson_is_str(local) && yyjson_is_arr(bindings) && yyjson_arr_size(bindings) > 0;
-        for (size_t b = 0; ok && b < yyjson_arr_size(bindings); b++) {
-            yyjson_val *binding = yyjson_arr_get(bindings, b);
-            int match = -1;
-            for (int i = 0; i < count; i++) {
-                if (targets[i] && strcmp(targets[i], target->qualified_name) == 0 &&
-                    php_binding_identity(binding, &result->imports.items[i]) &&
-                    php_json_string_eq(local, result->imports.items[i].local_name) &&
-                    php_json_string_eq(yyjson_obj_get(binding, "target"), targets[i])) {
-                    if (match != -1) {
-                        ok = false;
-                        break;
-                    }
-                    match = i;
-                }
-            }
-            if (match < 0 || ++seen[match] != 1)
-                ok = false;
-        }
-        yyjson_doc_free(edoc);
+    cbm_ht_free(sites);
+    cbm_arena_destroy(&arena);
+    return unique;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static _Thread_local bool php_test_fail_projection;
+
+void cbm_pipeline_php_test_fail_projection_once(void) {
+    php_test_fail_projection = true;
+}
+#endif
+
+static yyjson_mut_val *php_import_edge_object(yyjson_mut_doc *doc) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (php_test_fail_projection) {
+        php_test_fail_projection = false;
+        return NULL;
     }
-    for (int i = 0; ok && i < count; i++)
-        ok = seen[i] == (targets[i] ? 1 : 0);
-done:
-    if (ok) {
-        out->imports = &result->imports;
-        if (require_complete)
-            out->targets = targets;
-        else
-            out->proven_targets = targets;
-        targets = NULL;
-    }
-    cbm_free(CBM_MEM_CLASS_OTHER, targets);
-    cbm_free(CBM_MEM_CLASS_OTHER, seen);
-    yyjson_doc_free(doc);
-    return ok;
+#endif
+    return yyjson_mut_obj(doc);
 }
 
 /* Shared by the sequential and parallel PHP IMPORTS writers. Other languages
@@ -4737,6 +4843,7 @@ done:
 int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                          const char *rel, const char *file_qn,
                                          const cbm_gbuf_node_t *file, CBMHashTable *namespace_map) {
+    cbm_gbuf_forget_imports(ctx->gbuf, rel);
     char *old_json = file->properties_json;
     if (old_json && strncmp(old_json, php_import_complete, sizeof(php_import_complete) - 1) == 0)
         old_json[sizeof(php_import_complete) - 3] = '0';
@@ -4748,7 +4855,8 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
         old_positive[sizeof(positive_marker) - 2] = '0';
 
     int count = result->imports.count;
-    if (count < 0 || (count > 0 && !result->imports.items))
+    if (count < 0 || (count > 0 && !result->imports.items) ||
+        !php_import_sites_unique(&result->imports))
         return 0;
     size_t slots = count > 0 ? (size_t)count : 1;
     if (slots > SIZE_MAX / sizeof(const cbm_gbuf_node_t *))
@@ -4759,6 +4867,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     import_lookup_context(ctx, result, rel, file_qn, &proof_arena, &proof_pool, &lookup_context);
     const cbm_gbuf_node_t **targets = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*targets));
     cbm_resolve_result_t *proofs = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*proofs));
+    cbm_resolve_import_fact_t *facts = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*facts));
     bool *emitted = cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*emitted));
     const char **edge_properties =
         cbm_calloc(CBM_MEM_CLASS_OTHER, slots * sizeof(*edge_properties));
@@ -4766,7 +4875,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
     yyjson_mut_val *manifest = doc ? yyjson_mut_arr(doc) : NULL;
-    bool ok = targets && proofs && emitted && edge_properties && root && manifest &&
+    bool ok = targets && proofs && facts && emitted && edge_properties && root && manifest &&
               (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
               yyjson_mut_obj_add_int(doc, root, "php_imports_complete", 1) &&
               yyjson_mut_obj_add_int(doc, root, "php_imports_proven", 1) &&
@@ -4793,25 +4902,46 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     }
     for (int i = 0; i < count; i++) {
         const CBMImport *imp = &result->imports.items[i];
-        if (php_include_occurrence(result->cached_lang, imp) &&
-            !php_include_occurrence_valid(result, imp)) {
+        if (!import_occurrence_valid(result, imp)) {
             proofs[i] = (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
                                                .rule = CBM_RESOLVE_RULE_MODULE_PATH,
-                                               .reason = "php_import_occurrence_invalid"};
+                                               .reason = "import_occurrence_invalid"};
         } else {
             proofs[i] = resolve_import_observed(ctx, rel, file_qn, imp, namespace_map, &targets[i],
                                                 &lookup_context, result->cached_lang);
         }
         if (targets[i] && targets[i]->id == file->id)
             targets[i] = NULL;
-        if (!targets[i] && !php_import_known_absent(ctx->gbuf, rel, imp, namespace_map))
+        bool closed = targets[i] || php_import_known_absent(ctx->gbuf, rel, imp, namespace_map);
+        if (!closed)
             complete = false;
+        facts[i] = (cbm_resolve_import_fact_t){.local_name = imp->local_name,
+                                               .module_path = imp->module_path,
+                                               .member = imp->member,
+                                               .kind = (uint32_t)imp->kind,
+                                               .is_default = imp->is_default,
+                                               .type_checking_only = imp->type_checking_only,
+                                               .start_byte = imp->site_start_byte,
+                                               .end_byte = imp->site_end_byte,
+                                               .source_origin = imp->source_origin,
+                                               .dependency = proofs[i],
+                                               .closed = closed};
+        if (!targets[i])
+            facts[i].dependency.target = NULL;
         yyjson_mut_val *entry =
             php_binding_json(doc, imp, targets[i] ? targets[i]->qualified_name : NULL);
         if (!entry || !yyjson_mut_arr_add_val(manifest, entry)) {
             ok = false;
             goto done;
         }
+    }
+    cbm_resolve_import_snapshot_t snapshot = {.source = lookup_context.source,
+                                              .items = facts,
+                                              .count = (size_t)count,
+                                              .complete = complete};
+    if (!cbm_gbuf_capture_imports(ctx->gbuf, &snapshot)) {
+        ok = false;
+        goto done;
     }
     for (int i = 0; ok && i < count; i++) {
         if (!targets[i])
@@ -4833,7 +4963,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
                 prior = true;
         if (prior)
             continue;
-        yyjson_mut_val *edge = yyjson_mut_obj(doc);
+        yyjson_mut_val *edge = php_import_edge_object(doc);
         yyjson_mut_val *bindings = yyjson_mut_arr(doc);
         ok = edge && bindings && yyjson_mut_obj_add_strcpy(doc, edge, "local_name", local) &&
              yyjson_mut_obj_add_val(doc, edge, "php_import_bindings", bindings);
@@ -4866,15 +4996,13 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
         if (!complete)
             yyjson_mut_set_int(yyjson_mut_obj_get(root, "php_imports_complete"), 0);
         char *props = yyjson_mut_write(doc, 0, NULL);
-        cbm_php_vendor_names_t check = {0};
-        if (props && php_read_binding_snapshot(ctx->gbuf, file, result, props, &check, complete)) {
-            /* Failure leaves the earlier completion bit disabled. */
+        if (props)
             (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, props);
-        }
-        cbm_pipeline_php_vendor_names_free(&check);
         free(props);
     }
 done:
+    if (!ok)
+        cbm_gbuf_fail_resolutions(ctx->gbuf);
     for (int i = 0; i < count; i++) {
         cbm_resolve_result_t proof = proofs ? proofs[i] : (cbm_resolve_result_t){0};
         if (!proof.reason) {
@@ -4886,6 +5014,7 @@ done:
         row.properties_json = edge_properties ? edge_properties[i] : NULL;
         (void)cbm_gbuf_record_resolution(ctx->gbuf, &row);
     }
+    cbm_free(CBM_MEM_CLASS_OTHER, facts);
     cbm_free(CBM_MEM_CLASS_OTHER, proofs);
     cbm_free(CBM_MEM_CLASS_OTHER, emitted);
     cbm_free(CBM_MEM_CLASS_OTHER, edge_properties);
@@ -4904,28 +5033,129 @@ static const char c_binding_marker[] = "{\"c_includes_proven\":1,";
 /* Source binding snapshots retain the exact dependency identity independently
  * of the aggregate IMPORTS edges. C includes name a file's declaration scope;
  * Rust use declarations name an exported item within a proved module tree. */
+static cbm_resolve_result_t source_import_binding(const cbm_pipeline_ctx_t *ctx, const char *rel,
+                                                  const CBMImport *import,
+                                                  CBMHashTable *namespace_map, bool c_family,
+                                                  const cbm_gbuf_node_t *dependency,
+                                                  cbm_resolve_result_t dependency_proof,
+                                                  cbm_resolve_lookup_context_t *context) {
+    cbm_resolve_result_t result = {.analysis = CBM_RESOLVE_ANALYSIS_UNKNOWN,
+                                   .rule = CBM_RESOLVE_RULE_IMPORT_BINDING,
+                                   .reason = "source_import_binding_unresolved"};
+    const cbm_gbuf_node_t *member = NULL;
+    bool ambiguous = false;
+    char *namespace = NULL;
+    const char *target = NULL;
+    if (cbm_resolve_admit(&dependency_proof) && dependency) {
+        if (c_family && dependency->label && !strcmp(dependency->label, "File") &&
+            dependency->file_path) {
+            namespace = cbm_pipeline_fqn_module(ctx->project_name, dependency->file_path);
+            target = namespace;
+        } else if (!c_family && import->module_path) {
+            const cbm_gbuf_node_t *observed =
+                resolve_rust_import(ctx, rel, import, namespace_map, &ambiguous, &member);
+            if (observed == dependency && member && !ambiguous)
+                target = member->qualified_name;
+        }
+    }
+    if (target) {
+        result = (cbm_resolve_result_t){
+            .binding = CBM_RESOLVE_BINDING_UNIQUE,
+            .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+            .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+            .rule = CBM_RESOLVE_RULE_IMPORT_BINDING,
+            .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                     CBM_RESOLVE_FACT_IMPORT_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+            .target = target,
+            .candidate_count = 1,
+            .reason = c_family ? "source_include_namespace" : "source_rust_exported_member"};
+    }
+    cbm_resolve_lookup_t lookup;
+    const char *domain = c_family ? "c-source-include-namespace" : "rust-source-exported-member";
+    cbm_resolve_lookup_begin(&lookup, context, domain, import->module_path, import->site_start_byte,
+                             import->site_end_byte, import->source_origin);
+    (void)cbm_resolve_lookup_support(&lookup, dependency_proof.proof);
+    (void)cbm_resolve_lookup_observe(&lookup, domain, import->module_path, target, result.binding,
+                                     result.analysis, result.facts, target != NULL,
+                                     c_family ? "exact-header-file-declaration-scope"
+                                              : "audited-crate-module-export");
+    lookup.key.binding_identity = target;
+    lookup.key.declaration_identity = member ? member->qualified_name : NULL;
+    const cbm_resolve_proof_t *proof =
+        cbm_resolve_lookup_finish(&lookup, CBM_PROOF_EXPORT_BINDING, result);
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(proof);
+    if (view) {
+        result = view->outcome;
+        result.proof = proof;
+    } else {
+        result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+        result.facts = 0;
+        result.target = NULL;
+    }
+    free(namespace);
+    return result;
+}
+
 static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                           const char *rel, const char *file_qn,
                                           CBMHashTable *namespace_map, bool c_family) {
+    cbm_gbuf_forget_imports(ctx->gbuf, rel);
+    CBMArena arena;
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_lookup_context_t context;
+    import_lookup_context(ctx, result, rel, file_qn, &arena, &pool, &context);
+    size_t count = (size_t)result->imports.count;
+    cbm_resolve_import_fact_t *facts =
+        count ? cbm_arena_calloc(&arena, count * sizeof(*facts)) : NULL;
+    bool captured = !count || facts;
+    for (size_t i = 0; captured && i < count; i++) {
+        const CBMImport *import = &result->imports.items[i];
+        if (!import_occurrence_valid(result, import)) {
+            captured = false;
+            break;
+        }
+        const cbm_gbuf_node_t *dependency = NULL;
+        cbm_resolve_result_t proof = resolve_import_observed(
+            ctx, rel, file_qn, import, namespace_map, &dependency, &context, result->cached_lang);
+        facts[i] = (cbm_resolve_import_fact_t){
+            .local_name = import->local_name,
+            .module_path = import->module_path,
+            .member = import->member,
+            .kind = import->kind,
+            .is_default = import->is_default,
+            .type_checking_only = import->type_checking_only,
+            .start_byte = import->site_start_byte,
+            .end_byte = import->site_end_byte,
+            .source_origin = import->source_origin,
+            .dependency = proof,
+            .binding = source_import_binding(ctx, rel, import, namespace_map, c_family, dependency,
+                                             proof, &context),
+            .closed = proof.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE};
+        captured = facts[i].dependency.proof && facts[i].binding.proof;
+    }
+    cbm_resolve_import_snapshot_t snapshot = {
+        .source = context.source, .items = facts, .count = count, .complete = captured};
+    captured = captured && cbm_gbuf_capture_imports(ctx->gbuf, &snapshot);
+
+    /* Compatibility projection only. No semantic consumer reads this JSON. */
     const char *marker = c_family ? c_binding_marker : rust_binding_marker;
     const char *proof_key = c_family ? "c_includes_proven" : "rust_imports_proven";
     const char *bindings_key = c_family ? "c_include_bindings" : "rust_import_bindings";
     const cbm_gbuf_node_t *file = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!file)
-        return;
-    char *old_json = file->properties_json;
+    char *old_json = file ? file->properties_json : NULL;
     if (old_json && !strncmp(old_json, marker, strlen(marker)))
         old_json[strlen(marker) - 2] = '0';
     yyjson_doc *old = old_json ? yyjson_read(old_json, strlen(old_json), 0) : NULL;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
     yyjson_mut_val *array = doc ? yyjson_mut_arr(doc) : NULL;
-    bool ok = root && array && (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
+    bool ok = captured && file && root && array &&
+              (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
               yyjson_mut_obj_add_int(doc, root, proof_key, 1) &&
               yyjson_mut_obj_add_val(doc, root, bindings_key, array);
     if (ok)
         yyjson_mut_doc_set_root(doc, root);
-    if (old) {
+    if (ok && old) {
         size_t index, maximum;
         yyjson_val *key, *value;
         yyjson_obj_foreach(yyjson_doc_get_root(old), index, maximum, key, value) {
@@ -4939,34 +5169,23 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
             }
         }
     }
-    for (int i = 0; ok && i < result->imports.count; i++) {
-        bool ambiguous = false;
-        const cbm_gbuf_node_t *member = NULL;
-        const CBMImport *imp = &result->imports.items[i];
-        const cbm_gbuf_node_t *dependency = NULL;
-        const char *target = NULL;
-        if (c_family) {
-            cbm_resolve_result_t proof = cbm_pipeline_resolve_import_result(
-                ctx, rel, file_qn, imp, namespace_map, &dependency);
-            if (cbm_resolve_admit(&proof) && dependency && dependency->label &&
-                !strcmp(dependency->label, "File"))
-                target = dependency->qualified_name;
-        } else {
-            dependency = imp->module_path ? resolve_rust_import(ctx, rel, imp, namespace_map,
-                                                                &ambiguous, &member)
-                                          : NULL;
-            if (dependency && member && !ambiguous)
-                target = member->qualified_name;
-        }
-        yyjson_mut_val *entry = php_binding_json(doc, imp, target);
+    for (size_t i = 0; ok && i < count; i++) {
+        const cbm_resolve_result_t *proof = c_family ? &facts[i].dependency : &facts[i].binding;
+        const char *target = cbm_resolve_admit(proof) ? proof->target : NULL;
+        yyjson_mut_val *entry = php_binding_json(doc, &result->imports.items[i], target);
         ok = entry && yyjson_mut_arr_add_val(array, entry);
     }
     char *json = ok ? yyjson_mut_write(doc, 0, NULL) : NULL;
     if (json)
-        (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, json);
+        ok = cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, json) == 0;
+    else
+        ok = false;
+    if (!ok)
+        cbm_gbuf_fail_resolutions(ctx->gbuf);
     free(json);
     yyjson_mut_doc_free(doc);
     yyjson_doc_free(old);
+    cbm_arena_destroy(&arena);
 }
 
 int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
@@ -4994,8 +5213,13 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
         for (int i = 0; i < result->imports.count; i++) {
             const CBMImport *imp = &result->imports.items[i];
             const cbm_gbuf_node_t *target = NULL;
-            cbm_resolve_result_t proof = resolve_import_observed(
-                ctx, rel, file_qn, imp, namespace_map, &target, &lookup_context, lang);
+            cbm_resolve_result_t proof =
+                import_occurrence_valid(result, imp)
+                    ? resolve_import_observed(ctx, rel, file_qn, imp, namespace_map, &target,
+                                              &lookup_context, lang)
+                    : (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                                             .rule = CBM_RESOLVE_RULE_MODULE_PATH,
+                                             .reason = "import_occurrence_invalid"};
             cbm_resolve_record_t row = import_record(result, rel, file_qn, imp, proof, false);
             yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
             yyjson_mut_val *properties = doc ? yyjson_mut_obj(doc) : NULL;
@@ -5036,11 +5260,8 @@ void cbm_pipeline_php_vendor_names_build(const cbm_gbuf_t *gbuf, const char *pro
     memset(out, 0, sizeof(*out));
     if (!gbuf || !result || !rel || cbm_language_for_filename(path_leaf(rel)) != CBM_LANG_PHP)
         return;
-    char *qn = cbm_pipeline_fqn_compute(project_name, rel, "__file__");
-    const cbm_gbuf_node_t *file = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
-    free(qn);
-    if (file && !php_read_binding_snapshot(gbuf, file, result, file->properties_json, out, true))
-        (void)php_read_binding_snapshot(gbuf, file, result, file->properties_json, out, false);
+    if (!php_read_binding_snapshot(gbuf, project_name, rel, result, out, true))
+        (void)php_read_binding_snapshot(gbuf, project_name, rel, result, out, false);
 }
 
 void cbm_pipeline_php_vendor_names_free(cbm_php_vendor_names_t *value) {
@@ -5373,9 +5594,40 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map) {
     cbm_ht_free(map);
 }
 
-int cbm_pipeline_rust_import_map(const cbm_gbuf_t *graph, const char *project,
-                                 const char *source_rel, const CBMFileResult *result,
-                                 const char ***out_keys, const char ***out_values, int *out_count) {
+const cbm_resolve_import_snapshot_t *cbm_pipeline_import_snapshot(const cbm_gbuf_t *graph,
+                                                                  const char *project,
+                                                                  const char *rel,
+                                                                  const CBMFileResult *result) {
+    const cbm_resolve_import_snapshot_t *snapshot = cbm_gbuf_imports(graph, rel);
+    if (!snapshot || !result || result->imports.count < 0 || !snapshot->complete ||
+        snapshot->count != (size_t)result->imports.count ||
+        !php_import_text_equal(snapshot->source.project, project) ||
+        !php_import_text_equal(snapshot->source.file, rel) ||
+        !php_import_text_equal(snapshot->source.module, result->module_qn) ||
+        !php_import_text_equal(snapshot->source.content_identity,
+                               result->source_content_id[CBM_SOURCE_ORIGIN_RAW]) ||
+        !php_import_text_equal(snapshot->source.configuration_identity,
+                               result->source_configuration_id))
+        return NULL;
+    for (size_t i = 0; i < snapshot->count; i++) {
+        const cbm_resolve_import_fact_t *fact = &snapshot->items[i];
+        const CBMImport *import = &result->imports.items[i];
+        if (!import_occurrence_valid(result, import) ||
+            !php_import_text_equal(fact->local_name, import->local_name) ||
+            !php_import_text_equal(fact->module_path, import->module_path) ||
+            !php_import_text_equal(fact->member, import->member) || fact->kind != import->kind ||
+            fact->is_default != import->is_default ||
+            fact->type_checking_only != import->type_checking_only ||
+            fact->start_byte != import->site_start_byte ||
+            fact->end_byte != import->site_end_byte || fact->source_origin != import->source_origin)
+            return NULL;
+    }
+    return snapshot;
+}
+
+static int source_import_map(const cbm_gbuf_t *graph, const char *project, const char *source_rel,
+                             const CBMFileResult *result, bool c_family, const char ***out_keys,
+                             const char ***out_values, int *out_count) {
     *out_keys = NULL;
     *out_values = NULL;
     *out_count = 0;
@@ -5385,38 +5637,22 @@ int cbm_pipeline_rust_import_map(const cbm_gbuf_t *graph, const char *project,
     const char **keys = calloc((size_t)capacity, sizeof(*keys));
     const char **values = calloc((size_t)capacity, sizeof(*values));
     CBMHashTable *locals = cbm_ht_create((uint32_t)capacity);
-    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(graph, project, source_rel);
-    yyjson_doc *doc = file && file->properties_json
-                          ? yyjson_read(file->properties_json, strlen(file->properties_json), 0)
-                          : NULL;
-    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-    yyjson_val *array = yyjson_obj_get(root, "rust_import_bindings");
-    bool valid = yyjson_is_obj(root) && php_json_key_count(root, "rust_imports_proven") == 1 &&
-                 php_json_key_count(root, "rust_import_bindings") == 1 &&
-                 yyjson_is_int(yyjson_obj_get(root, "rust_imports_proven")) &&
-                 yyjson_get_int(yyjson_obj_get(root, "rust_imports_proven")) == 1 &&
-                 yyjson_is_arr(array) && yyjson_arr_size(array) == (size_t)capacity;
+    const cbm_resolve_import_snapshot_t *snapshot =
+        cbm_pipeline_import_snapshot(graph, project, source_rel, result);
     bool ok = keys && values && locals;
-    for (int i = 0; valid && i < capacity; i++)
-        valid = php_binding_identity(yyjson_arr_get(array, (size_t)i), &result->imports.items[i]);
     int count = 0;
     for (int i = 0; ok && i < capacity; i++) {
-        const CBMImport *imp = &result->imports.items[i];
-        if (!imp->local_name || !imp->local_name[0])
+        const CBMImport *import = &result->imports.items[i];
+        const char *key = c_family ? import->module_path : import->local_name;
+        if (!key || !key[0])
             continue;
-        yyjson_val *value =
-            valid ? yyjson_obj_get(yyjson_arr_get(array, (size_t)i), "target") : NULL;
-        const cbm_gbuf_node_t *target =
-            yyjson_is_str(value) ? cbm_gbuf_find_by_qn(graph, yyjson_get_str(value)) : NULL;
-        /* The current source manifest already proves this exact item through
-         * its crate/module tree. Aggregate dependency edges are projections,
-         * not inputs to symbol binding. */
-        bool proven = target && target->file_path && target->label &&
-                      strcmp(target->label, "File") && strcmp(target->label, "Module");
-        char *binding = strdup(proven ? target->qualified_name : "");
-        ok = python_map_put(locals, keys, values, &count, imp->local_name, binding);
+        const cbm_resolve_import_fact_t *fact = snapshot ? &snapshot->items[i] : NULL;
+        bool proven = fact && cbm_resolve_admit(&fact->dependency) &&
+                      cbm_resolve_admit(&fact->binding) && fact->dependency.proof &&
+                      fact->binding.proof;
+        char *binding = strdup(proven ? fact->binding.target : "");
+        ok = python_map_put(locals, keys, values, &count, key, binding);
     }
-    yyjson_doc_free(doc);
     cbm_ht_free(locals);
     if (!ok) {
         for (int i = 0; i < count; i++) {
@@ -5433,62 +5669,16 @@ int cbm_pipeline_rust_import_map(const cbm_gbuf_t *graph, const char *project,
     return 0;
 }
 
-/* Include spelling is the lookup key; a proved dependency File supplies its
- * symbol namespace. Neither local_name nor an aggregate edge can prove it. */
+int cbm_pipeline_rust_import_map(const cbm_gbuf_t *graph, const char *project,
+                                 const char *source_rel, const CBMFileResult *result,
+                                 const char ***out_keys, const char ***out_values, int *out_count) {
+    return source_import_map(graph, project, source_rel, result, false, out_keys, out_values,
+                             out_count);
+}
+
 int cbm_pipeline_c_include_map(const cbm_gbuf_t *graph, const char *project, const char *source_rel,
                                const CBMFileResult *result, const char ***out_keys,
                                const char ***out_values, int *out_count) {
-    *out_keys = NULL;
-    *out_values = NULL;
-    *out_count = 0;
-    int capacity = result ? result->imports.count : 0;
-    if (capacity <= 0)
-        return 0;
-    const char **keys = calloc((size_t)capacity, sizeof(*keys));
-    const char **values = calloc((size_t)capacity, sizeof(*values));
-    CBMHashTable *includes = cbm_ht_create((uint32_t)capacity);
-    const cbm_gbuf_node_t *file = cbm_pipeline_file_node(graph, project, source_rel);
-    yyjson_doc *doc = file && file->properties_json
-                          ? yyjson_read(file->properties_json, strlen(file->properties_json), 0)
-                          : NULL;
-    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
-    yyjson_val *array = yyjson_obj_get(root, "c_include_bindings");
-    bool valid = yyjson_is_obj(root) && php_json_key_count(root, "c_includes_proven") == 1 &&
-                 php_json_key_count(root, "c_include_bindings") == 1 &&
-                 yyjson_is_int(yyjson_obj_get(root, "c_includes_proven")) &&
-                 yyjson_get_int(yyjson_obj_get(root, "c_includes_proven")) == 1 &&
-                 yyjson_is_arr(array) && yyjson_arr_size(array) == (size_t)capacity;
-    for (int i = 0; valid && i < capacity; i++)
-        valid = php_binding_identity(yyjson_arr_get(array, (size_t)i), &result->imports.items[i]);
-    bool ok = keys && values && includes;
-    int count = 0;
-    for (int i = 0; ok && i < capacity; i++) {
-        const CBMImport *import = &result->imports.items[i];
-        if (!import->module_path || !import->module_path[0])
-            continue;
-        yyjson_val *value =
-            valid ? yyjson_obj_get(yyjson_arr_get(array, (size_t)i), "target") : NULL;
-        const cbm_gbuf_node_t *target =
-            yyjson_is_str(value) ? cbm_gbuf_find_by_qn(graph, yyjson_get_str(value)) : NULL;
-        char *module =
-            target && target->label && !strcmp(target->label, "File") && target->file_path
-                ? cbm_pipeline_fqn_module(project, target->file_path)
-                : strdup("");
-        ok = python_map_put(includes, keys, values, &count, import->module_path, module);
-    }
-    yyjson_doc_free(doc);
-    cbm_ht_free(includes);
-    if (!ok) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
-            free((void *)values[i]);
-        }
-        free(keys);
-        free(values);
-        return -1;
-    }
-    *out_keys = keys;
-    *out_values = values;
-    *out_count = count;
-    return 0;
+    return source_import_map(graph, project, source_rel, result, true, out_keys, out_values,
+                             out_count);
 }

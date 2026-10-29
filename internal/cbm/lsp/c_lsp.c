@@ -260,9 +260,84 @@ static void c_add_ns_alias(CLSPContext *ctx, const char *alias, const char *full
     ctx->ns_alias_count++;
 }
 
+/* Parentheses preserve one expression's storage identity. Ignore comments,
+ * never peel casts/comma expressions, and fail closed at the finite bound. */
+static TSNode c_fp_unwrap_parentheses(CLSPContext *ctx, TSNode node) {
+    for (unsigned depth = 0;
+         !ts_node_is_null(node) && !strcmp(ts_node_type(node), "parenthesized_expression");
+         depth++) {
+        if (depth == 64 || ts_node_has_error(node)) {
+            ctx->binding_failed = true;
+            return (TSNode){0};
+        }
+        TSNode expression = {0};
+        TSTreeCursor cursor = ts_tree_cursor_new(node);
+        bool valid = true;
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            do {
+                TSNode child = ts_tree_cursor_current_node(&cursor);
+                if (!ts_node_is_named(child) || !strcmp(ts_node_type(child), "comment"))
+                    continue;
+                if (!ts_node_is_null(expression)) {
+                    valid = false;
+                    break;
+                }
+                expression = child;
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        ts_tree_cursor_delete(&cursor);
+        if (!valid || ts_node_is_null(expression)) {
+            ctx->binding_failed = true;
+            return (TSNode){0};
+        }
+        node = expression;
+    }
+    return node;
+}
+
+/* Follow only declaration wrappers, preserving whether storage is an alias.
+ * The same exact leaf is used when finalizing an initializer after its RHS. */
+static TSNode c_fp_declarator_name(CLSPContext *ctx, TSNode node, bool *reference) {
+    for (unsigned depth = 0; !ts_node_is_null(node); depth++) {
+        if (depth == 64) {
+            ctx->binding_failed = true;
+            return (TSNode){0};
+        }
+        const char *kind = ts_node_type(node);
+        if (!strcmp(kind, "identifier"))
+            return node;
+        bool is_reference = !strcmp(kind, "reference_declarator");
+        if (reference && is_reference)
+            *reference = true;
+        if (strcmp(kind, "function_declarator") && strcmp(kind, "pointer_declarator") &&
+            strcmp(kind, "parenthesized_declarator") && !is_reference)
+            return (TSNode){0};
+        TSNode inner = ts_node_child_by_field_name(node, "declarator", 10);
+        if (ts_node_is_null(inner)) {
+            TSTreeCursor cursor = ts_tree_cursor_new(node);
+            bool single = true;
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                do {
+                    TSNode child = ts_tree_cursor_current_node(&cursor);
+                    if (!ts_node_is_named(child) || !strcmp(ts_node_type(child), "comment"))
+                        continue;
+                    if (!ts_node_is_null(inner)) {
+                        single = false;
+                        break;
+                    }
+                    inner = child;
+                } while (ts_tree_cursor_goto_next_sibling(&cursor));
+            ts_tree_cursor_delete(&cursor);
+            if (!single)
+                return (TSNode){0};
+        }
+        node = inner;
+    }
+    return (TSNode){0};
+}
+
 // --- Helper: track function pointer target ---
 static void c_add_fp_target(CLSPContext *ctx, const char *var_name, const char *target_qn,
-                            bool proven) {
+                            const cbm_resolve_proof_t *origin) {
     if (ctx->fp_count >= ctx->fp_cap) {
         int new_cap = ctx->fp_cap == 0 ? 16 : ctx->fp_cap * 2;
         const char **new_names =
@@ -272,7 +347,10 @@ static void c_add_fp_target(CLSPContext *ctx, const char *var_name, const char *
         const CBMScope **new_scopes =
             (const CBMScope **)cbm_arena_alloc(ctx->arena, new_cap * sizeof(const CBMScope *));
         bool *new_proven = cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*new_proven));
-        if (!new_names || !new_qns || !new_scopes || !new_proven) {
+        bool *new_escaped = cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*new_escaped));
+        const cbm_resolve_proof_t **new_proofs =
+            cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*new_proofs));
+        if (!new_names || !new_qns || !new_scopes || !new_proven || !new_escaped || !new_proofs) {
             ctx->binding_failed = true;
             return;
         }
@@ -281,17 +359,24 @@ static void c_add_fp_target(CLSPContext *ctx, const char *var_name, const char *
             memcpy(new_qns, ctx->fp_target_qns, ctx->fp_count * sizeof(const char *));
             memcpy(new_scopes, ctx->fp_binding_scopes, ctx->fp_count * sizeof(const CBMScope *));
             memcpy(new_proven, ctx->fp_target_proven, (size_t)ctx->fp_count * sizeof(*new_proven));
+            memcpy(new_escaped, ctx->fp_storage_escaped,
+                   (size_t)ctx->fp_count * sizeof(*new_escaped));
+            memcpy(new_proofs, ctx->fp_target_proofs, (size_t)ctx->fp_count * sizeof(*new_proofs));
         }
         ctx->fp_var_names = new_names;
         ctx->fp_target_qns = new_qns;
         ctx->fp_binding_scopes = new_scopes;
         ctx->fp_target_proven = new_proven;
+        ctx->fp_storage_escaped = new_escaped;
+        ctx->fp_target_proofs = new_proofs;
         ctx->fp_cap = new_cap;
     }
     ctx->fp_var_names[ctx->fp_count] = cbm_arena_strdup(ctx->arena, var_name);
     ctx->fp_target_qns[ctx->fp_count] = target_qn ? cbm_arena_strdup(ctx->arena, target_qn) : NULL;
     ctx->fp_binding_scopes[ctx->fp_count] = ctx->current_scope;
-    ctx->fp_target_proven[ctx->fp_count] = proven && target_qn;
+    ctx->fp_target_proven[ctx->fp_count] = origin && target_qn;
+    ctx->fp_storage_escaped[ctx->fp_count] = false;
+    ctx->fp_target_proofs[ctx->fp_count] = origin;
     ctx->fp_count++;
 }
 
@@ -333,16 +418,36 @@ static const char *c_lookup_fp_target(CLSPContext *ctx, const char *var_name) {
     return index >= 0 ? ctx->fp_target_qns[index] : NULL;
 }
 
-// Reassignment updates the nearest visible fp binding. `target_qn == NULL`
-// records an explicit unknown state rather than leaking the previous target.
-static void c_update_fp_target(CLSPContext *ctx, const char *var_name, const char *target_qn) {
+// Reassignment replaces the whole proof-bearing version. NULL clears both
+// target and provenance; a later use cannot reconstruct authority from a name.
+// An escaped binding remains unknown even after an exact-looking assignment:
+// aliases or deferred writes can still change the same storage afterward.
+static void c_update_fp_target(CLSPContext *ctx, const char *var_name,
+                               const cbm_resolve_proof_t *origin) {
     if (!ctx || !var_name)
         return;
     int index = c_find_fp_binding_index(ctx, var_name);
     if (index >= 0) {
+        if (ctx->fp_storage_escaped[index])
+            origin = NULL;
+        const char *target_qn = origin ? origin->value.outcome.target : NULL;
         ctx->fp_target_qns[index] = target_qn ? cbm_arena_strdup(ctx->arena, target_qn) : NULL;
-        ctx->fp_target_proven[index] = target_qn != NULL;
+        ctx->fp_target_proven[index] = origin && target_qn;
+        ctx->fp_target_proofs[index] = origin;
     }
+}
+
+/* This is a property of the nearest lexical storage binding, not its current
+ * value version. Shadow declarations have independent state; popping their
+ * scope leaves any outer binding's escape state intact. */
+static void c_escape_fp_storage(CLSPContext *ctx, const char *var_name) {
+    int index = c_find_fp_binding_index(ctx, var_name);
+    if (index < 0)
+        return;
+    ctx->fp_storage_escaped[index] = true;
+    ctx->fp_target_qns[index] = NULL;
+    ctx->fp_target_proven[index] = false;
+    ctx->fp_target_proofs[index] = NULL;
 }
 
 // --- Helper: extract function name from DLL/dynamic resolver call ---
@@ -945,6 +1050,7 @@ typedef struct CProofInclude {
     const char *path;
     const char *module;
     uint32_t at;
+    const cbm_resolve_proof_t *binding_proof;
 } CProofInclude;
 
 typedef struct CProofUsing {
@@ -1273,14 +1379,35 @@ static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
             ctx->binding_failed = true;
             return;
         }
+        CBMHashTable *facts = ctx->import_facts ? cbm_ht_create(16) : NULL;
+        if (ctx->import_facts && !facts) {
+            ctx->binding_failed = true;
+            return;
+        }
+        for (size_t i = 0; ctx->import_facts && i < ctx->import_facts->count; i++) {
+            const cbm_resolve_import_fact_t *fact = &ctx->import_facts->items[i];
+            if (fact->module_path && !cbm_ht_get(facts, fact->module_path)) {
+                cbm_ht_set(facts, fact->module_path, (void *)fact);
+                if (cbm_ht_get(facts, fact->module_path) != fact)
+                    ctx->binding_failed = true;
+            }
+        }
         for (int i = 0; i < ctx->include_count; i++) {
             if (!ctx->include_paths[i] || !ctx->include_ns_qns[i]) {
                 ctx->binding_failed = true;
+                cbm_ht_free(facts);
                 return;
             }
-            ctx->proof_includes[i] =
-                (CProofInclude){ctx->include_paths[i], ctx->include_ns_qns[i], UINT32_MAX};
+            CProofInclude include = {
+                .path = ctx->include_paths[i], .module = ctx->include_ns_qns[i], .at = UINT32_MAX};
+            const cbm_resolve_import_fact_t *fact = facts ? cbm_ht_get(facts, include.path) : NULL;
+            if (fact && cbm_resolve_admit(&fact->dependency) && cbm_resolve_admit(&fact->binding) &&
+                fact->dependency.proof && fact->binding.proof &&
+                !strcmp(fact->binding.target, include.module))
+                include.binding_proof = fact->binding.proof;
+            ctx->proof_includes[i] = include;
         }
+        cbm_ht_free(facts);
         qsort(ctx->proof_includes, (size_t)ctx->include_count, sizeof(*ctx->proof_includes),
               c_proof_include_compare);
     }
@@ -1365,6 +1492,43 @@ static cbm_resolve_result_t c_proof_query(CLSPContext *ctx, const char *qn,
         .classify = c_proof_classify,
         .context = ctx};
     return cbm_resolve_function(&query).result;
+}
+
+static cbm_resolve_result_t c_proof_import_join(CLSPContext *ctx, cbm_resolve_result_t result,
+                                                const cbm_resolve_proof_t *dependency,
+                                                cbm_resolve_proof_kind_t kind) {
+    if (!ctx->require_import_proofs)
+        return result;
+    if (!dependency)
+        return c_proof_missing("c_source_import_predecessor_missing");
+    if (!cbm_resolve_admit(&result))
+        return result;
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(result.proof);
+    if (!view)
+        return c_proof_missing("c_source_import_result_missing");
+    const cbm_resolve_proof_t *premises[] = {result.proof, dependency};
+    const cbm_resolve_proof_t *proof = cbm_resolve_proof_derive(
+        &ctx->field_types.proofs, kind, &view->source, &view->key, &result, premises, 2, true);
+    view = cbm_resolve_proof_view(proof);
+    if (!view)
+        return c_proof_missing("c_source_import_join_failed");
+    result = view->outcome;
+    result.proof = proof;
+    return result;
+}
+
+static cbm_resolve_result_t c_proof_type_import(CLSPContext *ctx, const char *qn, uint32_t at,
+                                                cbm_resolve_result_t result) {
+    const char *key = cbm_arena_sprintf(ctx->arena, "$type:%s", qn);
+    if (!ctx->require_import_proofs || (key && c_proof_declared(ctx, key, at)))
+        return result;
+    for (int i = 0; i < ctx->include_count; i++) {
+        const CProofInclude *include = &ctx->proof_includes[i];
+        size_t size = strlen(include->module);
+        if (include->at < at && size && !strncmp(qn, include->module, size) && qn[size] == '.')
+            return c_proof_import_join(ctx, result, include->binding_proof, CBM_PROOF_TYPE_BIND);
+    }
+    return c_proof_missing("c_type_import_predecessor_missing");
 }
 
 static bool c_proof_merge(cbm_resolve_result_t *result, cbm_resolve_result_t next) {
@@ -1534,7 +1698,10 @@ static cbm_resolve_result_t c_proof_domain(CLSPContext *ctx, const char *relativ
              strcmp(include->module, ctx->proof_includes[i + 1].module)))
             return c_proof_missing("c_include_mapping_conflict");
         const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", include->module, relative);
-        if (!c_proof_merge(&result, c_proof_query(ctx, qn, CBM_RESOLVE_RULE_IMPORT_BINDING)))
+        cbm_resolve_result_t imported = c_proof_query(ctx, qn, CBM_RESOLVE_RULE_IMPORT_BINDING);
+        imported =
+            c_proof_import_join(ctx, imported, include->binding_proof, CBM_PROOF_IMPORT_BINDING);
+        if (!c_proof_merge(&result, imported))
             return result;
     }
     return result;
@@ -1617,11 +1784,15 @@ static cbm_resolve_result_t c_callable_proof(CLSPContext *ctx, TSNode expr) {
     if (!ctx || ts_node_is_null(expr) || ctx->binding_failed || ts_node_has_error(expr) ||
         ts_node_end_byte(expr) > ctx->proof_syntax_limit)
         return c_proof_missing("c_callable_expression_unknown");
+    expr = c_fp_unwrap_parentheses(ctx, expr);
+    if (ts_node_is_null(expr) || ctx->binding_failed)
+        return c_proof_missing("c_callable_parentheses_unproven");
     const char *kind = ts_node_type(expr);
     bool address = !strcmp(kind, "pointer_expression") || !strcmp(kind, "unary_expression");
     TSNode name_node = expr;
     if (address) {
-        TSNode operand = ts_node_child_by_field_name(expr, "argument", 8);
+        TSNode operand =
+            c_fp_unwrap_parentheses(ctx, ts_node_child_by_field_name(expr, "argument", 8));
         TSNode operator= ts_node_child_by_field_name(expr, "operator", 8);
         const char *op = ts_node_is_null(operator) ? NULL : c_node_text(ctx, operator);
         if (!op || strcmp(op, "&") || ts_node_is_null(operand))
@@ -1641,13 +1812,19 @@ static cbm_resolve_result_t c_callable_proof(CLSPContext *ctx, TSNode expr) {
             return c_proof_missing("c_callable_flow_join_unknown");
         if (!ctx->fp_binding_scopes[fp] || !ctx->fp_binding_scopes[fp]->parent)
             return c_proof_missing("c_global_callable_mutability_unknown");
+        if (ctx->fp_storage_escaped[fp])
+            return c_proof_missing("c_callable_storage_escaped");
         if (address || !ctx->fp_target_proven[fp] || !ctx->fp_target_qns[fp])
             return c_proof_missing("c_callable_binding_unknown");
-        const char *target = ctx->fp_target_qns[fp];
-        const char *base = cbm_arena_strndup(ctx->arena, target, cbm_qn_callable_base_len(target));
-        cbm_resolve_result_t proof = c_proof_query(ctx, base, CBM_RESOLVE_RULE_CALLABLE_BINDING);
-        if (!cbm_resolve_admit(&proof) || strcmp(proof.target, target))
-            return c_proof_missing("c_callable_declaration_changed");
+        const cbm_resolve_proof_t *origin = ctx->fp_target_proofs[fp];
+        const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(origin);
+        if (!view || !view->predecessors_closed || !cbm_resolve_admit(&view->outcome) ||
+            strcmp(view->outcome.target, ctx->fp_target_qns[fp]))
+            return c_proof_missing("c_callable_binding_origin_missing");
+        cbm_resolve_result_t proof = view->outcome;
+        proof.proof = origin;
+        proof.rule = CBM_RESOLVE_RULE_CALLABLE_BINDING;
+        proof.facts |= CBM_RESOLVE_FACT_CALLABLE_TYPED | CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
         return cbm_lsp_proof_rule(
             &ctx->field_types, proof, name_node, "c-lexical-function-pointer", name,
             "nearest-local-binding;tracked-exact-target;no-unsupported-flow", NULL);
@@ -1655,9 +1832,17 @@ static cbm_resolve_result_t c_callable_proof(CLSPContext *ctx, TSNode expr) {
     return c_proof_name_lookup(ctx, name, ts_node_start_byte(expr));
 }
 
-static const char *c_exact_function_target_from_expr(CLSPContext *ctx, TSNode expr) {
+static const cbm_resolve_proof_t *c_exact_function_binding_from_expr(CLSPContext *ctx, TSNode expr,
+                                                                     TSNode binding,
+                                                                     const char *name) {
     cbm_resolve_result_t proof = c_callable_proof(ctx, expr);
-    return cbm_resolve_admit(&proof) ? proof.target : NULL;
+    if (!cbm_resolve_admit(&proof) || !proof.proof)
+        return NULL;
+    proof =
+        cbm_lsp_proof_rule(&ctx->field_types, proof, binding, "c-function-pointer-binding-version",
+                           name, "exact-source-callable-assignment", NULL);
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(proof.proof);
+    return cbm_resolve_admit(&proof) && view && view->predecessors_closed ? proof.proof : NULL;
 }
 
 /* Unqualified C++ calls can add ADL candidates. Until associated namespaces
@@ -4331,6 +4516,7 @@ static void c_observe_declared_binding(CLSPContext *ctx, const char *name, const
         &ctx->field_types, c_node_text(ctx, site), site, "c-written-declaration-type",
         owner->qualified_name, owner->declaration_identity, owner->graph_qualified_name,
         owner->source_flags, "visible-exact-source-type;complete-direct-domain");
+    proof = c_proof_type_import(ctx, owner->qualified_name, ts_node_start_byte(site), proof);
     if (!cbm_resolve_admit(&proof))
         return;
     const CBMType *canonical = c_proof_annotation_type(ctx, type, owner->qualified_name, 0);
@@ -4627,23 +4813,27 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                         bool function_pointer_like =
                             var_type &&
                             (var_type->kind == CBM_TYPE_FUNC || var_type->kind == CBM_TYPE_POINTER);
-                        const char *fp_target = ts_node_is_null(value)
-                                                    ? NULL
-                                                    : c_exact_function_target_from_expr(ctx, value);
-
-                        bool fp_proven = fp_target != NULL;
+                        const cbm_resolve_proof_t *fp_origin =
+                            ts_node_is_null(value)
+                                ? NULL
+                                : c_exact_function_binding_from_expr(ctx, value, child, var_name);
+                        const char *fp_target = fp_origin ? fp_origin->value.outcome.target : NULL;
                         /* Reference aliases share mutable storage. Until that
                          * alias relation is tracked, neither name proves a
                          * stable callable value. */
-                        if (var_type && var_type->kind == CBM_TYPE_REFERENCE) {
-                            if (!ts_node_is_null(value) &&
-                                !strcmp(ts_node_type(value), "identifier"))
-                                c_update_fp_target(ctx, c_node_text(ctx, value), NULL);
-                            fp_proven = false;
+                        bool reference_storage = false;
+                        (void)c_fp_declarator_name(ctx, decl, &reference_storage);
+                        reference_storage |= var_type && var_type->kind == CBM_TYPE_REFERENCE;
+                        if (reference_storage) {
+                            TSNode storage = c_fp_unwrap_parentheses(ctx, value);
+                            if (!ts_node_is_null(storage) &&
+                                !strcmp(ts_node_type(storage), "identifier"))
+                                c_escape_fp_storage(ctx, c_node_text(ctx, storage));
+                            fp_origin = NULL;
                         }
                         const char *declaration_text = c_node_text(ctx, node);
                         if (!declaration_text || strstr(declaration_text, "volatile"))
-                            fp_proven = false;
+                            fp_origin = NULL;
 
                         // DLL/dynamic resolver heuristic: fp =
                         // (FuncType)Resolve("FuncName") If RHS is a call (possibly
@@ -4664,7 +4854,9 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                             }
                         }
                         if (function_pointer_like || fp_target) {
-                            c_add_fp_target(ctx, var_name, fp_target, fp_proven);
+                            c_add_fp_target(ctx, var_name, fp_target, fp_origin);
+                            if (reference_storage)
+                                c_escape_fp_storage(ctx, var_name);
                         }
                     }
                 }
@@ -4717,7 +4909,7 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                             if (var_name && var_name[0]) {
                                 const CBMType *var_type = cbm_type_pointer(ctx->arena, base_type);
                                 c_scope_bind(ctx, var_name, var_type);
-                                c_add_fp_target(ctx, var_name, NULL, false);
+                                c_add_fp_target(ctx, var_name, NULL, NULL);
                             }
                         }
                         break;
@@ -4761,15 +4953,23 @@ void c_process_statement(CLSPContext *ctx, TSNode node) {
                 }
             }
         }
-        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        TSNode left = c_fp_unwrap_parentheses(ctx, ts_node_child_by_field_name(node, "left", 4));
         TSNode right = ts_node_child_by_field_name(node, "right", 5);
         if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "identifier") == 0) {
             char *var_name = c_node_text(ctx, left);
             if (var_name && c_find_fp_binding_index(ctx, var_name) >= 0) {
-                const char *target_qn = simple_assignment && !ts_node_is_null(right)
-                                            ? c_exact_function_target_from_expr(ctx, right)
-                                            : NULL;
-                c_update_fp_target(ctx, var_name, ctx->control_flow_depth == 0 ? target_qn : NULL);
+                if (ctx->callable_flow_depth) {
+                    /* Walking a delayed body does not execute its assignment.
+                     * A captured write can happen later, so no subsequent
+                     * assignment may reestablish this storage's exact value. */
+                    c_escape_fp_storage(ctx, var_name);
+                } else {
+                    const cbm_resolve_proof_t *origin =
+                        simple_assignment && !ts_node_is_null(right) && ctx->control_flow_depth == 0
+                            ? c_exact_function_binding_from_expr(ctx, right, node, var_name)
+                            : NULL;
+                    c_update_fp_target(ctx, var_name, origin);
+                }
             }
         }
         return;
@@ -5444,6 +5644,8 @@ static bool c_field_receiver_proven(CLSPContext *ctx, TSNode expression, const C
             &ctx->field_types, c_node_text(ctx, expression), expression,
             "c-explicit-expression-type", owner->qualified_name, owner->declaration_identity,
             owner->graph_qualified_name, owner->source_flags, "explicit-cast-or-compound-type");
+        proof =
+            c_proof_type_import(ctx, owner->qualified_name, ts_node_start_byte(expression), proof);
         *canonical_type = owner->qualified_name;
         *receiver_proof = proof.proof;
         return cbm_resolve_admit(&proof);
@@ -5833,16 +6035,19 @@ static void c_resolve_callable_argument_references(CLSPContext *ctx, TSNode call
     for (uint32_t i = 0; i < count; i++) {
         TSNode argument = ts_node_named_child(arguments, i);
         const char *kind = ts_node_type(argument);
-        if (strcmp(kind, "identifier") && strcmp(kind, "qualified_identifier") &&
-            strcmp(kind, "scoped_identifier"))
-            continue;
-        cbm_resolve_result_t proof = c_callable_proof(ctx, argument);
-        c_emit_proven(ctx, &proof, c_node_text(ctx, argument), CBM_RESOLVED_CALL_REFERENCE,
-                      argument);
+        if (!strcmp(kind, "identifier") || !strcmp(kind, "qualified_identifier") ||
+            !strcmp(kind, "scoped_identifier")) {
+            cbm_resolve_result_t proof = c_callable_proof(ctx, argument);
+            c_emit_proven(ctx, &proof, c_node_text(ctx, argument), CBM_RESOLVED_CALL_REFERENCE,
+                          argument);
+        }
         /* A C++ parameter may bind a reference to the pointer's storage.
-         * An unmodelled parameter contract invalidates that flow fact. */
-        if (ctx->cpp_mode && !strcmp(kind, "identifier"))
-            c_update_fp_target(ctx, c_node_text(ctx, argument), NULL);
+         * Parentheses do not change that storage or establish a value-copy
+         * parameter contract. The reference occurrence role stays unchanged. */
+        TSNode storage = c_fp_unwrap_parentheses(ctx, argument);
+        if (ctx->cpp_mode && !ts_node_is_null(storage) &&
+            !strcmp(ts_node_type(storage), "identifier"))
+            c_escape_fp_storage(ctx, c_node_text(ctx, storage));
     }
 }
 
@@ -5919,8 +6124,21 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
         }
     }
 
-    // Process statements for scope building
-    c_process_statement(ctx, node);
+    /* Declarations establish scope before their initializer. Assignments
+     * take effect after their operands, never before a nested RHS write. */
+    bool assignment = !strcmp(kind, "assignment_expression");
+    if (!assignment)
+        c_process_statement(ctx, node);
+    int initializer_fp = -1;
+    const cbm_resolve_proof_t *initializer_origin = NULL;
+    if (!strcmp(kind, "init_declarator")) {
+        TSNode name =
+            c_fp_declarator_name(ctx, ts_node_child_by_field_name(node, "declarator", 10), NULL);
+        if (!ts_node_is_null(name))
+            initializer_fp = c_find_fp_binding_index(ctx, c_node_text(ctx, name));
+        if (initializer_fp >= 0)
+            initializer_origin = ctx->fp_target_proofs[initializer_fp];
+    }
 
     // --- Initializers: hand the initialized type down to the list ---
     if (strcmp(kind, "initializer_list") == 0) {
@@ -5939,12 +6157,13 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
     /* Taking a callable variable's address exposes its storage to writes
      * that this local assignment tracker cannot see. */
     if (!strcmp(kind, "pointer_expression") || !strcmp(kind, "unary_expression")) {
-        TSNode operand = ts_node_child_by_field_name(node, "argument", 8);
+        TSNode operand =
+            c_fp_unwrap_parentheses(ctx, ts_node_child_by_field_name(node, "argument", 8));
         TSNode operator= ts_node_child_by_field_name(node, "operator", 8);
         const char *op = ts_node_is_null(operator) ? NULL : c_node_text(ctx, operator);
         if (op && !strcmp(op, "&") && !ts_node_is_null(operand) &&
             !strcmp(ts_node_type(operand), "identifier"))
-            c_update_fp_target(ctx, c_node_text(ctx, operand), NULL);
+            c_escape_fp_storage(ctx, c_node_text(ctx, operand));
     }
 
     c_resolve_callable_value_reference(ctx, node);
@@ -6787,12 +7006,30 @@ recurse:;
                         // Try field-based access first (name field = 4 chars)
                         TSNode name_node = ts_node_child_by_field_name(cap, "name", 4);
                         TSNode val_node = ts_node_child_by_field_name(cap, "value", 5);
+                        if (ts_node_is_null(name_node))
+                            name_node = ts_node_child_by_field_name(cap, "left", 4);
+                        if (ts_node_is_null(val_node))
+                            val_node = ts_node_child_by_field_name(cap, "right", 5);
                         // Fallback: positional — first named child is name, second is value
                         if (ts_node_is_null(name_node) && ts_node_named_child_count(cap) >= 2) {
                             name_node = ts_node_named_child(cap, 0);
                             val_node = ts_node_named_child(cap, 1);
                         }
                         if (!ts_node_is_null(name_node) && !ts_node_is_null(val_node)) {
+                            bool reference_capture = false;
+                            TSTreeCursor capture = ts_tree_cursor_new(cap);
+                            if (ts_tree_cursor_goto_first_child(&capture))
+                                do {
+                                    TSNode part = ts_tree_cursor_current_node(&capture);
+                                    reference_capture |= !strcmp(ts_node_type(part), "&");
+                                } while (ts_tree_cursor_goto_next_sibling(&capture));
+                            ts_tree_cursor_delete(&capture);
+                            if (reference_capture) {
+                                TSNode storage = c_fp_unwrap_parentheses(ctx, val_node);
+                                if (!ts_node_is_null(storage) &&
+                                    !strcmp(ts_node_type(storage), "identifier"))
+                                    c_escape_fp_storage(ctx, c_node_text(ctx, storage));
+                            }
                             char *cap_name = c_node_text(ctx, name_node);
                             const CBMType *cap_type = c_eval_expr_type(ctx, val_node);
                             if (cap_name && !cbm_type_is_unknown(cap_type)) {
@@ -6822,6 +7059,14 @@ recurse:;
         ts_tree_cursor_delete(&cursor);
     }
 
+    if (assignment)
+        c_process_statement(ctx, node);
+    if (initializer_fp >= 0 && ctx->fp_target_proofs[initializer_fp] != initializer_origin) {
+        /* A nested write inside an unsupported initializer is not its final
+         * value. Keep only the initializer's original proof; escaped storage
+         * remains unknown when c_update_fp_target observes its persistent bit. */
+        c_update_fp_target(ctx, ctx->fp_var_names[initializer_fp], initializer_origin);
+    }
     if (delayed_callable)
         ctx->callable_flow_depth--;
     if (push_scope) {
@@ -8534,14 +8779,13 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
  * configured owner proof cannot be applied (see c_lsp.h); *status reports a
  * memo or depth failure of the walk (#1527), which dropped the walk's output.
  */
-static bool c_lsp_cross_with_registry_run(CBMArena *arena, const char *source, int source_len,
-                                          const char *module_qn, bool cpp_mode,
-                                          CBMTypeRegistry *reg, const char **include_paths,
-                                          const char **include_ns_qns, int include_count,
-                                          TSTree *cached_tree, CBMResolvedCallArray *out,
-                                          CBMSourceOrigin source_origin,
-                                          const CBMFileResult *test_owners, CBMLSPStatus *status,
-                                          const cbm_resolve_proof_source_t *source_context) {
+static bool c_lsp_cross_with_registry_run(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *reg, const char **include_paths, const char **include_ns_qns,
+    int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    CBMSourceOrigin source_origin, const CBMFileResult *test_owners, CBMLSPStatus *status,
+    const cbm_resolve_proof_source_t *source_context, const cbm_resolve_import_snapshot_t *imports,
+    bool require_import_proofs) {
     *status = CBM_LSP_COMPLETE;
     if ((test_owners && test_owners->has_test_definition_owners &&
          source_origin != CBM_SOURCE_ORIGIN_RAW) ||
@@ -8573,6 +8817,8 @@ static bool c_lsp_cross_with_registry_run(CBMArena *arena, const char *source, i
     CLSPContext ctx;
     c_lsp_init(&ctx, arena, source, source_len, reg, module_qn, cpp_mode, out);
     ctx.source_origin = source_origin;
+    ctx.import_facts = imports;
+    ctx.require_import_proofs = require_import_proofs;
     if (source_context || test_owners) {
         cbm_resolve_proof_source_t proof_source =
             source_context ? *source_context
@@ -8626,7 +8872,7 @@ CBMLSPStatus cbm_run_c_lsp_cross_with_registry_status_with_source(
         arena, source, source_len, module_qn, cpp_mode, reg, include_paths, include_ns_qns,
         include_count, cached_tree, out,
         (source_context ? (CBMSourceOrigin)source_context->source_origin : CBM_SOURCE_ORIGIN_RAW),
-        NULL, &status, source_context);
+        NULL, &status, source_context, NULL, false);
     return status;
 }
 
@@ -8641,7 +8887,7 @@ bool cbm_run_c_lsp_cross_with_registry_with_test_owners(
     CBMLSPStatus status;
     bool owners_ok = c_lsp_cross_with_registry_run(
         arena, source, source_len, module_qn, cpp_mode, reg, include_paths, include_ns_qns,
-        include_count, cached_tree, out, source_origin, test_owners, &status, NULL);
+        include_count, cached_tree, out, source_origin, test_owners, &status, NULL, NULL, false);
     return owners_ok && status == CBM_LSP_COMPLETE;
 }
 
@@ -8652,8 +8898,9 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
                             const char **include_paths, const char **include_ns_qns,
                             int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
                             CBMSourceOrigin source_origin, const CBMFileResult *test_owners,
-                            CBMLSPStatus *status,
-                            const cbm_resolve_proof_source_t *source_context) {
+                            CBMLSPStatus *status, const cbm_resolve_proof_source_t *source_context,
+                            const cbm_resolve_import_snapshot_t *imports,
+                            bool require_import_proofs) {
     *status = CBM_LSP_COMPLETE;
     if ((test_owners && test_owners->has_test_definition_owners &&
          source_origin != CBM_SOURCE_ORIGIN_RAW) ||
@@ -8704,6 +8951,8 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
     CLSPContext ctx;
     c_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, cpp_mode, out);
     ctx.source_origin = source_origin;
+    ctx.import_facts = imports;
+    ctx.require_import_proofs = require_import_proofs;
     if (source_context || test_owners) {
         cbm_resolve_proof_source_t proof_source =
             source_context ? *source_context
@@ -8759,7 +9008,7 @@ CBMLSPStatus cbm_run_c_lsp_cross_status_with_source(
         arena, source, source_len, module_qn, cpp_mode, defs, def_count, include_paths,
         include_ns_qns, include_count, cached_tree, out,
         (source_context ? (CBMSourceOrigin)source_context->source_origin : CBM_SOURCE_ORIGIN_RAW),
-        NULL, &status, source_context);
+        NULL, &status, source_context, NULL, false);
     return status;
 }
 
@@ -8772,10 +9021,43 @@ bool cbm_run_c_lsp_cross_with_test_owners(CBMArena *arena, const char *source, i
                                           CBMSourceOrigin source_origin,
                                           const CBMFileResult *test_owners) {
     CBMLSPStatus status;
-    bool owners_ok = c_lsp_cross_run(arena, source, source_len, module_qn, cpp_mode, defs,
-                                     def_count, include_paths, include_ns_qns, include_count,
-                                     cached_tree, out, source_origin, test_owners, &status, NULL);
+    bool owners_ok =
+        c_lsp_cross_run(arena, source, source_len, module_qn, cpp_mode, defs, def_count,
+                        include_paths, include_ns_qns, include_count, cached_tree, out,
+                        source_origin, test_owners, &status, NULL, NULL, false);
     return owners_ok && status == CBM_LSP_COMPLETE;
+}
+
+bool cbm_run_c_lsp_cross_with_imports(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, bool cpp_mode, CBMLSPDef *defs,
+                                      int def_count, const char **paths, const char **modules,
+                                      int count, TSTree *tree, CBMResolvedCallArray *out,
+                                      const CBMFileResult *file,
+                                      const cbm_resolve_import_snapshot_t *imports,
+                                      CBMLSPStatus *status) {
+    cbm_resolve_proof_source_t context =
+        cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, module_qn);
+    if (!cbm_resolve_import_source_matches(imports, &context))
+        imports = NULL;
+    bool owners_ok = c_lsp_cross_run(arena, source, source_len, module_qn, cpp_mode, defs,
+                                     def_count, paths, modules, count, tree, out,
+                                     CBM_SOURCE_ORIGIN_RAW, file, status, &context, imports, true);
+    return owners_ok && *status == CBM_LSP_COMPLETE;
+}
+
+bool cbm_run_c_lsp_cross_with_registry_with_imports(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool cpp_mode,
+    CBMTypeRegistry *registry, const char **paths, const char **modules, int count, TSTree *tree,
+    CBMResolvedCallArray *out, const CBMFileResult *file,
+    const cbm_resolve_import_snapshot_t *imports, CBMLSPStatus *status) {
+    cbm_resolve_proof_source_t context =
+        cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, module_qn);
+    if (!cbm_resolve_import_source_matches(imports, &context))
+        imports = NULL;
+    bool owners_ok = c_lsp_cross_with_registry_run(
+        arena, source, source_len, module_qn, cpp_mode, registry, paths, modules, count, tree, out,
+        CBM_SOURCE_ORIGIN_RAW, file, status, &context, imports, true);
+    return owners_ok && *status == CBM_LSP_COMPLETE;
 }
 
 // --- Batch cross-file LSP ---

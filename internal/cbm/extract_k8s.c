@@ -169,6 +169,16 @@ static void k8s_fact_site(CBMK8sFact *fact, TSNode node, const char *source) {
     fact->proof_supported = k8s_proof_scalar(node, source);
 }
 
+static void k8s_import_push(CBMExtractCtx *ctx, TSNode node, CBMImport import) {
+    import.source_origin = CBM_SOURCE_ORIGIN_RAW;
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    if (!ts_node_is_null(node) && end > start && end <= ctx->source_len) {
+        import.site_start_byte = start;
+        import.site_end_byte = end;
+    }
+    cbm_imports_push(&ctx->result->imports, ctx->arena, import);
+}
+
 // Return true if the key text of a block_mapping_pair matches one of the
 // Kustomize resource-list field names.
 static int is_kustomize_list_key(const char *key) {
@@ -203,7 +213,7 @@ static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const c
                 .local_name = cbm_arena_strdup(a, key_name),
                 .module_path = cbm_arena_strdup(a, scalar),
             };
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            k8s_import_push(ctx, val, imp);
         }
     }
 }
@@ -445,6 +455,7 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
             continue;
         }
         const char *path = NULL;
+        TSNode path_node = {0};
         const char *inline_text = NULL;
         kust_target_t t = {0};
         bool has_target = false;
@@ -461,6 +472,7 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
             }
             if (strcmp(key, "path") == 0) {
                 path = get_scalar_text(a, v, ctx->source);
+                path_node = v;
             } else if (strcmp(key, "patch") == 0) {
                 inline_text = kust_inline_text(ctx, v);
             } else if (strcmp(key, "target") == 0 &&
@@ -472,7 +484,7 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
         if (path && path[0]) {
             CBMImport imp = {.local_name = cbm_arena_strdup(a, "patches"),
                              .module_path = cbm_arena_strdup(a, path)};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            k8s_import_push(ctx, path_node, imp);
         }
         CBMK8sFact base = {.fact = CBM_K8S_FACT_PATCH,
                            .def_index = -1,
@@ -513,6 +525,7 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
         if (ts_node_is_null(map)) {
             continue;
         }
+        TSNode path_node = {0};
         CBMK8sFact f = {.fact = CBM_K8S_FACT_DEPLOY,
                         .def_index = -1,
                         .via = "kustomize",
@@ -543,6 +556,7 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
                 f.ns = val;
             } else if (strcmp(key, "valuesFile") == 0) {
                 f.path = val;
+                path_node = v;
             }
         }
         if (!f.name) {
@@ -551,7 +565,7 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
         if (f.path) {
             CBMImport imp = {.local_name = cbm_arena_strdup(a, "valuesFile"),
                              .module_path = cbm_arena_strdup(a, f.path)};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            k8s_import_push(ctx, path_node, imp);
         }
         cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
     }

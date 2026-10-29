@@ -4007,20 +4007,12 @@ static bool incr_doc_links_current(cbm_store_t *store, const char *project) {
     return current;
 }
 
-/* Rules can change independently of the semantic manifest or coverage version.
- * Read only the project marker; counting every occurrence would make an unchanged
- * repository's no-op proportional to the size of its resolver output. */
+/* Rules and required resolver metadata can change independently of source.
+ * The generation receipt is invalidated by row writes and checked together
+ * with the required schema, without scanning resolver output on every no-op. */
 static bool incr_resolver_current(cbm_store_t *store, const char *project) {
-    sqlite3_stmt *statement = NULL;
-    bool current =
-        sqlite3_prepare_v2(cbm_store_get_db(store),
-                           "SELECT rules_version FROM resolver_generations WHERE project=?", -1,
-                           &statement, NULL) == SQLITE_OK &&
-        sqlite3_bind_text(statement, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_step(statement) == SQLITE_ROW &&
-        sqlite3_column_int(statement, 0) == CBM_RESOLVER_RULES_VERSION &&
-        sqlite3_step(statement) == SQLITE_DONE;
-    return sqlite3_finalize(statement) == SQLITE_OK && current;
+    bool present = false;
+    return cbm_store_resolver_current(store, project, &present) == CBM_STORE_OK && present;
 }
 
 /* The exact no-op test: the stored generation's metadata is current for this

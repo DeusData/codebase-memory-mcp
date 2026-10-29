@@ -2185,6 +2185,15 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
                                        int source_len, const char *module_qn, CBMLSPDef *defs,
                                        int def_count, const char **imp_names, const char **imp_qns,
                                        int imp_count, const CBMPHPImportBindings *bindings) {
+    cbm_pxc_run_one_with_imports(lang, r, source, source_len, module_qn, defs, def_count, imp_names,
+                                 imp_qns, imp_count, bindings, NULL);
+}
+
+void cbm_pxc_run_one_with_imports(CBMLanguage lang, CBMFileResult *r, const char *source,
+                                  int source_len, const char *module_qn, CBMLSPDef *defs,
+                                  int def_count, const char **imp_names, const char **imp_qns,
+                                  int imp_count, const CBMPHPImportBindings *bindings,
+                                  const cbm_resolve_import_snapshot_t *imports) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
     cbm_resolve_proof_source_t proof_source =
         cbm_result_proof_source(r, CBM_SOURCE_ORIGIN_RAW, module_qn);
@@ -2207,21 +2216,17 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         bool cpp_mode = (lang != CBM_LANG_C);
         /* The source-audited include map retains header spelling separately
          * from the target file's declaration namespace. */
-        if (r->has_test_definition_owners) {
-            if (!cbm_run_c_lsp_cross_with_test_owners(
-                    &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, imp_names,
-                    imp_qns, imp_count, tree, &out, CBM_SOURCE_ORIGIN_RAW, r)) {
-                cbm_pipeline_test_owner_error(r);
-                pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
-                return; /* out may be partial: never append it */
-            }
-        } else {
-            CBMLSPStatus status = cbm_run_c_lsp_cross_status_with_source(
-                &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, imp_names,
-                imp_qns, imp_count, tree, &out, &proof_source);
-            if (status != CBM_LSP_COMPLETE)
-                cbm_c_lsp_record_failure(r, status);
+        CBMLSPStatus status = CBM_LSP_COMPLETE;
+        bool owners_ok = cbm_run_c_lsp_cross_with_imports(
+            &scratch, source, source_len, module_qn, cpp_mode, defs, def_count, imp_names, imp_qns,
+            imp_count, tree, &out, r, imports, &status);
+        if (r->has_test_definition_owners && !owners_ok) {
+            cbm_pipeline_test_owner_error(r);
+            pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
+            return;
         }
+        if (status != CBM_LSP_COMPLETE)
+            cbm_c_lsp_record_failure(r, status);
         break;
     }
     case CBM_LANG_PYTHON: {
@@ -2273,8 +2278,8 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
                                              g_pxc_rust_manifest, &out, &synthetic_calls);
         CBMTypeRegistry *proof_registry = cbm_rust_build_cross_registry(&scratch, defs, def_count);
         if (proof_registry)
-            cbm_rust_proof_resolve(&scratch, source, source_len, proof_registry, r, imp_names,
-                                   imp_qns, imp_count, &out);
+            cbm_rust_proof_resolve_with_imports(&scratch, source, source_len, proof_registry, r,
+                                                imp_names, imp_qns, imp_count, &out, imports);
         break;
     }
     default:
@@ -2378,6 +2383,21 @@ void cbm_pxc_dispatch_file_with_php_bindings(
     const char **imp_keys, const char **imp_vals, int imp_count,
     CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
     const CBMPHPImportBindings *bindings) {
+    cbm_pxc_dispatch_file_with_imports(lang, result, source, source_len, rel, def_module,
+                                       cross_registries, module_def_index, all_defs, all_def_count,
+                                       imp_keys, imp_vals, imp_count, rust_shared_get,
+                                       rust_shared_ctx, bindings, NULL);
+}
+
+void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result, const char *source,
+                                        int source_len, const char *rel, const char *def_module,
+                                        const CBMCrossLspRegistries *cross_registries,
+                                        const CBMModuleDefIndex *module_def_index,
+                                        CBMLSPDef *all_defs, int all_def_count,
+                                        const char **imp_keys, const char **imp_vals, int imp_count,
+                                        CBMTypeRegistry *(*rust_shared_get)(void *),
+                                        void *rust_shared_ctx, const CBMPHPImportBindings *bindings,
+                                        const cbm_resolve_import_snapshot_t *imports) {
     if (result && result->lsp_skipped) {
         if (result->has_test_definition_owners) {
             cbm_pipeline_test_owner_error(result);
@@ -2439,23 +2459,19 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             break;
         case CBM_LANG_C:
         case CBM_LANG_CPP:
-        case CBM_LANG_CUDA:
-            if (result->has_test_definition_owners) {
-                if (!cbm_run_c_lsp_cross_with_registry_with_test_owners(
-                        &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                        imp_keys, imp_vals, imp_count, result->cached_tree, &out,
-                        CBM_SOURCE_ORIGIN_RAW, result)) {
-                    cbm_pipeline_test_owner_error(result);
-                    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
-                    return; /* no append and no fallback on an invalid proof */
-                }
-            } else {
-                CBMLSPStatus status = cbm_run_c_lsp_cross_with_registry_status_with_source(
-                    &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay,
-                    imp_keys, imp_vals, imp_count, result->cached_tree, &out, &proof_source);
-                if (status != CBM_LSP_COMPLETE)
-                    cbm_c_lsp_record_failure(result, status);
+        case CBM_LANG_CUDA: {
+            CBMLSPStatus status = CBM_LSP_COMPLETE;
+            bool owners_ok = cbm_run_c_lsp_cross_with_registry_with_imports(
+                &scratch, source, source_len, def_module, (lang != CBM_LANG_C), &overlay, imp_keys,
+                imp_vals, imp_count, result->cached_tree, &out, result, imports, &status);
+            if (result->has_test_definition_owners && !owners_ok) {
+                cbm_pipeline_test_owner_error(result);
+                pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
+                return;
             }
+            if (status != CBM_LSP_COMPLETE)
+                cbm_c_lsp_record_failure(result, status);
+        }
             used_prebuilt = true;
             break;
         case CBM_LANG_CSHARP:
@@ -2557,15 +2573,15 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             cbm_run_rust_lsp_cross_with_registry(
                 &scratch, source, source_len, def_module, shared, imp_keys, imp_vals, imp_count,
                 result->cached_tree, cbm_pxc_get_rust_manifest(), &out, &synthetic_calls);
-            cbm_rust_proof_resolve(&scratch, source, source_len, shared, result, imp_keys, imp_vals,
-                                   imp_count, &out);
+            cbm_rust_proof_resolve_with_imports(&scratch, source, source_len, shared, result,
+                                                imp_keys, imp_vals, imp_count, &out, imports);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
         } else {
-            cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module,
-                                              file_defs, file_def_count, imp_keys, imp_vals,
-                                              imp_count, bindings);
+            cbm_pxc_run_one_with_imports(lang, result, source, source_len, def_module, file_defs,
+                                         file_def_count, imp_keys, imp_vals, imp_count, bindings,
+                                         imports);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -2575,8 +2591,9 @@ void cbm_pxc_dispatch_file_with_php_bindings(
         cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module, file_defs,
-                                          file_def_count, imp_keys, imp_vals, imp_count, bindings);
+        cbm_pxc_run_one_with_imports(lang, result, source, source_len, def_module, file_defs,
+                                     file_def_count, imp_keys, imp_vals, imp_count, bindings,
+                                     imports);
     }
     free(filtered);
 }
@@ -2795,10 +2812,12 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_php_vendor_names_t php_bindings;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, files[i].rel_path,
                                             cache[i], &php_bindings);
-        cbm_pxc_dispatch_file_with_php_bindings(
+        cbm_pxc_dispatch_file_with_imports(
             lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
             &cross_registries, module_def_index, all_defs, def_count, imp_keys, imp_vals, imp_count,
-            NULL, NULL, &php_bindings);
+            NULL, NULL, &php_bindings,
+            cbm_pipeline_import_snapshot(ctx->gbuf, ctx->project_name, files[i].rel_path,
+                                         cache[i]));
         cbm_pipeline_php_vendor_names_free(&php_bindings);
         cbm_index_mark_done(files[i].rel_path);
         if (!had_error && cache[i]->has_error && ctx->pipeline)

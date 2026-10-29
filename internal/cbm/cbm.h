@@ -411,8 +411,8 @@ typedef struct {
     bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
                              // binds the name for annotations, never at runtime (#1277)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
-    /* Exact syntax coordinates where an adapter captures them. Legacy import
-     * adapters leave zero spans; consumers must opt into a proven adapter. */
+    /* Exact parsed import clause/path in the original source. Zero spans retain
+     * an extraction-quality gap and can never authorize a dependency edge. */
     uint32_t site_start_byte, site_end_byte, source_origin;
 } CBMImport;
 

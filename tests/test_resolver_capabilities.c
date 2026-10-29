@@ -99,7 +99,37 @@ TEST(resolver_capability_relation_query_rejects_invalid_input) {
     PASS();
 }
 
+TEST(resolver_capabilities_match_existing_bounded_producers) {
+    cbm_resolve_capabilities_t capability;
+    ASSERT(cbm_resolve_capabilities(CBM_LANG_KOTLIN, &capability));
+    ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_USAGE].availability,
+              CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
+    ASSERT(cbm_resolve_capabilities(CBM_LANG_K8S, &capability));
+    ASSERT_STR_EQ(capability.adapter, "kubernetes_infrastructure");
+    ASSERT(capability.proof_subsets & CBM_RESOLVE_CAP_SCOPE);
+    ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_USAGE].availability,
+              CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
+    ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_CALLS].availability, CBM_RESOLVE_EDGE_UNSUPPORTED);
+    const CBMLanguage embedded[] = {CBM_LANG_VUE, CBM_LANG_SVELTE};
+    for (size_t i = 0; i < sizeof(embedded) / sizeof(embedded[0]); i++) {
+        ASSERT(cbm_resolve_capabilities(embedded[i], &capability));
+        ASSERT_STR_EQ(capability.adapter, "embedded_javascript_lexical");
+        ASSERT_EQ(capability.proof_subsets, CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_CALLABLE);
+        ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_CALLS].availability,
+                  CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
+        ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_CALL_REFERENCE].availability,
+                  CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
+        ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_IMPORTS].availability,
+                  CBM_RESOLVE_EDGE_UNSUPPORTED);
+        ASSERT_NOT_NULL(strstr(capability.limitation, "inline script"));
+    }
+    ASSERT(cbm_resolve_capabilities(CBM_LANG_YAML, &capability));
+    ASSERT_NOT_NULL(strstr(capability.edges[CBM_RESOLVE_EDGE_USAGE].limitation, "Compose"));
+    PASS();
+}
+
 SUITE(resolver_capabilities) {
+    RUN_TEST(resolver_capabilities_match_existing_bounded_producers);
     RUN_TEST(resolver_capabilities_cover_every_relation_for_every_language);
     RUN_TEST(resolver_capabilities_report_supported_subsets_and_quality_gaps);
     RUN_TEST(resolver_capability_relation_query_rejects_invalid_input);

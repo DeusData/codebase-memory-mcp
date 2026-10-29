@@ -273,6 +273,7 @@ bool cbm_php_collect_source_facts(CBMArena *arena, const char *source, int sourc
 
 typedef struct {
     const CBMLSPDef *definition;
+    const cbm_resolve_proof_t *import_proof;
     bool ambiguous;
 } php_proof_type_t;
 typedef struct {
@@ -352,6 +353,10 @@ static bool php_proof_indexes(php_proof_context_t *context, const CBMPHPImportBi
         }
         if (!php_proof_type_put(context, context->imports, import->local_name, definition))
             return false;
+        php_proof_type_t *entry = cbm_ht_get(context->imports, import->local_name);
+        if (entry && !entry->ambiguous && bindings->facts &&
+            bindings->facts->count == (size_t)bindings->imports->count)
+            entry->import_proof = bindings->facts->items[i].dependency.proof;
     }
     return true;
 }
@@ -372,12 +377,33 @@ static cbm_resolve_result_t php_proof_type_evidence(php_proof_context_t *context
                                                     const CBMLSPDef *definition, TSNode site) {
     if (!definition)
         return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
-    return cbm_lsp_proof_type_lookup(
-        &context->type_map, php_proof_text(&context->source, site), site,
-        "php_proof-type-name-domain", definition->qualified_name, definition->declaration_identity,
+    const char *spelling = php_proof_text(&context->source, site);
+    const php_proof_type_t *import = spelling ? cbm_ht_get(context->imports, spelling) : NULL;
+    if (import && (import->ambiguous || import->definition != definition || !import->import_proof))
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNKNOWN,
+                                      .reason = "php_import_predecessor_missing"};
+    cbm_resolve_result_t result = cbm_lsp_proof_type_lookup(
+        &context->type_map, spelling, site, "php_proof-type-name-domain",
+        definition->qualified_name, definition->declaration_identity,
         definition->graph_qualified_name ? definition->graph_qualified_name
                                          : definition->qualified_name,
         definition->source_flags, "php_proof-complete-source-type-lookup");
+    if (!import || !cbm_resolve_admit(&result))
+        return result;
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(result.proof);
+    const cbm_resolve_proof_t *dependency =
+        cbm_resolve_proof_clone(&context->type_map.proofs, import->import_proof);
+    if (!view || !dependency)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_FAILED,
+                                      .reason = "php_import_predecessor_clone_failed"};
+    const cbm_resolve_proof_t *premises[] = {result.proof, dependency};
+    result.proof = cbm_resolve_proof_derive(&context->type_map.proofs, CBM_PROOF_TYPE_BIND,
+                                            &view->source, &view->key, &result, premises, 2, true);
+    if (!result.proof) {
+        result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+        result.facts = 0;
+    }
+    return result;
 }
 static const char *php_proof_occurrence_spelling(php_proof_context_t *context, TSNode site,
                                                  CBMResolvedKind kind) {

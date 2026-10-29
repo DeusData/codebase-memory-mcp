@@ -1,3 +1,4 @@
+#include "resolve/stats.h"
 #include "types.h"
 #include "policy.h"
 #include <limits.h>
@@ -124,6 +125,7 @@ static size_t binding_hash(const CBMVarBinding *binding) {
 }
 
 static cbm_resolve_type_slot_t *find_slot(CBMResolveTypeMap *map, const CBMVarBinding *binding) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
     if (!map->capacity) {
         return NULL;
     }
@@ -401,6 +403,8 @@ static bool record_fact(CBMResolveTypeMap *map, CBMScope *scope, const char *nam
             return false;
         }
     }
+    if (slot->fact.binding)
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_INVALIDATIONS, 1);
     slot->witness->binding = binding;
     slot->witness->observed_type = binding->type;
     slot->witness->version = version;

@@ -1,3 +1,4 @@
+#include "stats.h"
 #include "lookup.h"
 #include <string.h>
 
@@ -69,6 +70,7 @@ bool cbm_resolve_lookup_observe(cbm_resolve_lookup_t *query, const char *domain,
         return true; /* Existing non-observed callers retain their contract. */
     if (query->failed)
         return false;
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
     cbm_resolve_proof_key_t observation = query->key;
     observation.lookup_domain = domain;
     observation.lookup_key = key;

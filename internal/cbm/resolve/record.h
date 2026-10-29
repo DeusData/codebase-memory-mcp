@@ -47,6 +47,7 @@ typedef struct {
     const char *key;
     unsigned kind;
     bool module, closed, proof_borrowed;
+    const char *payload_json; /* Structured type/version and named dependency set. */
     cbm_resolve_result_t result;
 } cbm_resolve_summary_t;
 

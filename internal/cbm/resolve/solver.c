@@ -1,4 +1,5 @@
 #include "solver.h"
+#include "stats.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -6,7 +7,13 @@
 enum { SOLVER_DEFAULT_NODES = 1000000, SOLVER_DEFAULT_EDGES = 4000000 };
 #define SOLVER_DEFAULT_STEPS UINT64_C(16000000)
 
-typedef enum { SOLVER_LEAF, SOLVER_COPY, SOLVER_JOIN } solver_operation_t;
+typedef enum {
+    SOLVER_LEAF,
+    SOLVER_COPY,
+    SOLVER_JOIN,
+    SOLVER_SELECT,
+    SOLVER_TYPE
+} solver_operation_t;
 typedef struct {
     cbm_resolve_solver_result_t result;
     solver_operation_t operation;
@@ -16,6 +23,10 @@ typedef struct {
     size_t *dependency_indices;
     size_t remaining;
     size_t reverse_head;
+    const char *selector, *prefix, *suffix;
+    bool selected, select_type;
+    CBMTypeKind wrapper;
+    uint32_t version;
 } solver_node_t;
 typedef struct {
     size_t dependent;
@@ -27,7 +38,7 @@ struct cbm_resolve_solver {
     cbm_resolve_proof_pool_t *pool;
     cbm_resolve_solver_limits_t limits;
     solver_node_t **nodes;
-    size_t count, capacity, edge_count;
+    size_t count, capacity, edge_count, selections;
     cbm_resolve_solver_status_t failure;
     bool solved;
     uint64_t steps;
@@ -74,6 +85,44 @@ static bool reserve_node(cbm_resolve_solver_t *solver) {
     return true;
 }
 
+/* Deep copy the bounded shared transfer vocabulary. Unsupported structures
+ * remain unknown rather than borrowing a hybrid arena or normalizing away an
+ * unknown union arm. The identity preserves each structured wrapper. */
+static const CBMType *owned_type(CBMArena *arena, const CBMType *type, unsigned depth,
+                                 const char **identity) {
+    if (!type || depth >= 64)
+        return NULL;
+    const CBMType *result = NULL;
+    const char *inner = NULL;
+    if (type->kind == CBM_TYPE_NAMED || type->kind == CBM_TYPE_BUILTIN) {
+        const char *name = type->kind == CBM_TYPE_NAMED ? type->data.named.qualified_name
+                                                        : type->data.builtin.name;
+        if (!name || !*name)
+            return NULL;
+        char *copy = cbm_arena_strdup(arena, name);
+        if (!copy)
+            return NULL;
+        result = type->kind == CBM_TYPE_NAMED ? cbm_type_named(arena, copy)
+                                              : cbm_type_builtin(arena, copy);
+        *identity = cbm_arena_sprintf(arena, "%u:%zu:%s", (unsigned)type->kind, strlen(name), name);
+    } else if (type->kind == CBM_TYPE_POINTER || type->kind == CBM_TYPE_SLICE) {
+        const CBMType *child =
+            type->kind == CBM_TYPE_POINTER ? type->data.pointer.elem : type->data.slice.elem;
+        const CBMType *copy = owned_type(arena, child, depth + 1, &inner);
+        if (!copy)
+            return NULL;
+        result = type->kind == CBM_TYPE_POINTER ? cbm_type_pointer(arena, copy)
+                                                : cbm_type_slice(arena, copy);
+        *identity = cbm_arena_sprintf(arena, "%u:(%s)", (unsigned)type->kind, inner);
+    }
+    return result && *identity ? result : NULL;
+}
+
+const char *cbm_resolve_solver_type_identity(CBMArena *arena, const CBMType *type) {
+    const char *identity = NULL;
+    return arena && owned_type(arena, type, 0, &identity) ? identity : NULL;
+}
+
 static bool add_node(cbm_resolve_solver_t *solver, const char *key, solver_operation_t operation,
                      cbm_resolve_solver_status_t status, cbm_resolve_solver_value_t value,
                      const char *const *dependencies, size_t count,
@@ -98,10 +147,24 @@ static bool add_node(cbm_resolve_solver_t *solver, const char *key, solver_opera
     }
     node->result.key = cbm_arena_strdup(solver->arena, key);
     node->leaf_value = value;
+    /* Identities are derived from owned structure, never caller-provided text. */
+    node->leaf_value.type_identity = NULL;
+    if (value.type) {
+        node->leaf_value.type =
+            owned_type(solver->arena, value.type, 0, &node->leaf_value.type_identity);
+        if (!node->leaf_value.type) {
+            node->leaf_value = (cbm_resolve_solver_value_t){0};
+            status = CBM_SOLVER_UNSUPPORTED;
+        }
+    }
+    if (value.declaration_identity)
+        node->leaf_value.declaration_identity =
+            cbm_arena_strdup(solver->arena, value.declaration_identity);
     if (value.target)
         node->leaf_value.target = cbm_arena_strdup(solver->arena, value.target);
     node->audit = cbm_resolve_proof_clone(solver->pool, audit);
-    if (!node->result.key || (value.target && !node->leaf_value.target) || !node->audit) {
+    if (!node->result.key || (value.target && !node->leaf_value.target) ||
+        (value.declaration_identity && !node->leaf_value.declaration_identity) || !node->audit) {
         solver_fail(solver, solver->pool->failure == CBM_RESOLVE_ANALYSIS_LIMITED
                                 ? CBM_SOLVER_LIMITED
                                 : CBM_SOLVER_FAILED);
@@ -161,6 +224,56 @@ bool cbm_resolve_solver_join(cbm_resolve_solver_t *solver, const char *key,
                     dependencies, count, audit);
 }
 
+bool cbm_resolve_solver_select(cbm_resolve_solver_t *solver, const char *key, const char *selector,
+                               const char *prefix, const char *suffix,
+                               const cbm_resolve_proof_t *audit) {
+    if (!prefix || !suffix) {
+        solver_fail(solver, CBM_SOLVER_FAILED);
+        return false;
+    }
+    if (!add_node(solver, key, SOLVER_SELECT, CBM_SOLVER_PENDING, (cbm_resolve_solver_value_t){0},
+                  &selector, 1, audit))
+        return false;
+    if (solver->failure != CBM_SOLVER_PENDING)
+        return solver->failure != CBM_SOLVER_FAILED;
+    solver_node_t *node = solver->nodes[solver->count - 1];
+    node->selector = node->result.dependencies[0];
+    node->prefix = cbm_arena_strdup(solver->arena, prefix);
+    node->suffix = cbm_arena_strdup(solver->arena, suffix);
+    if (!node->prefix || !node->suffix) {
+        solver_fail(solver, CBM_SOLVER_FAILED);
+        return false;
+    }
+    if (solver->selections >= solver->limits.edges - solver->edge_count)
+        solver_fail(solver, CBM_SOLVER_LIMITED);
+    else
+        solver->selections++;
+    return true;
+}
+
+bool cbm_resolve_solver_select_type(cbm_resolve_solver_t *solver, const char *key,
+                                    const char *selector, const char *prefix, const char *suffix,
+                                    const cbm_resolve_proof_t *audit) {
+    bool ok = cbm_resolve_solver_select(solver, key, selector, prefix, suffix, audit);
+    if (ok && solver->failure == CBM_SOLVER_PENDING)
+        solver->nodes[solver->count - 1]->select_type = true;
+    return ok;
+}
+
+bool cbm_resolve_solver_type(cbm_resolve_solver_t *solver, const char *key, const char *dependency,
+                             CBMTypeKind wrapper, uint32_t version,
+                             const cbm_resolve_proof_t *audit) {
+    if (!add_node(solver, key, SOLVER_TYPE, CBM_SOLVER_PENDING, (cbm_resolve_solver_value_t){0},
+                  &dependency, 1, audit))
+        return false;
+    if (solver->failure == CBM_SOLVER_PENDING) {
+        solver_node_t *node = solver->nodes[solver->count - 1];
+        node->wrapper = wrapper;
+        node->version = version;
+    }
+    return solver->failure != CBM_SOLVER_FAILED;
+}
+
 static int compare_nodes(const void *left, const void *right) {
     return strcmp((*(solver_node_t *const *)left)->result.key,
                   (*(solver_node_t *const *)right)->result.key);
@@ -170,6 +283,7 @@ static size_t find_node(const cbm_resolve_solver_t *solver, const char *key) {
     size_t low = 0, high = solver->count;
     while (low < high) {
         size_t middle = low + (high - low) / 2;
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         int order = strcmp(solver->nodes[middle]->result.key, key);
         if (order < 0)
             low = middle + 1;
@@ -255,7 +369,12 @@ static cbm_resolve_result_t outcome(const cbm_resolve_solver_result_t *result) {
 
 static bool same_value(cbm_resolve_solver_value_t left, cbm_resolve_solver_value_t right) {
     return left.target && right.target && !strcmp(left.target, right.target) &&
-           left.kind == right.kind && left.module == right.module;
+           left.kind == right.kind && left.module == right.module &&
+           left.fact_kind == right.fact_kind &&
+           !strcmp(left.type_identity ? left.type_identity : "",
+                   right.type_identity ? right.type_identity : "") &&
+           !strcmp(left.declaration_identity ? left.declaration_identity : "",
+                   right.declaration_identity ? right.declaration_identity : "");
 }
 
 static const cbm_resolve_proof_t *missing_proof(cbm_resolve_solver_t *solver,
@@ -296,6 +415,7 @@ static bool settle(cbm_resolve_solver_t *solver, solver_node_t *node, bool cycle
     bool have_value = false;
     for (size_t i = 0; i < count; i++) {
         solver->steps++;
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_PROPAGATED_FACTS, 1);
         size_t index = node->dependency_indices[i];
         const cbm_resolve_solver_result_t *dependency =
             index == SIZE_MAX ? NULL : &solver->nodes[index]->result;
@@ -310,6 +430,9 @@ static bool settle(cbm_resolve_solver_t *solver, solver_node_t *node, bool cycle
         if (status != CBM_SOLVER_KNOWN) {
             if (status > result->status)
                 result->status = status;
+        } else if (node->operation == SOLVER_SELECT &&
+                   !strcmp(result->dependencies[i], node->selector)) {
+            continue; /* Selector proves the domain, not the selected value. */
         } else if (!have_value) {
             result->value = dependency->value;
             have_value = true;
@@ -318,11 +441,35 @@ static bool settle(cbm_resolve_solver_t *solver, solver_node_t *node, bool cycle
             result->status = CBM_SOLVER_AMBIGUOUS;
         }
     }
+    if (node->operation == SOLVER_TYPE && result->status == CBM_SOLVER_KNOWN && have_value) {
+        const CBMType *type = result->value.type;
+        if (!type || (node->wrapper != CBM_TYPE_NAMED && node->wrapper != CBM_TYPE_POINTER &&
+                      node->wrapper != CBM_TYPE_SLICE)) {
+            result->status = CBM_SOLVER_UNSUPPORTED;
+        } else {
+            if (node->wrapper == CBM_TYPE_POINTER)
+                type = cbm_type_pointer(solver->arena, type);
+            else if (node->wrapper == CBM_TYPE_SLICE)
+                type = cbm_type_slice(solver->arena, type);
+            if (node->wrapper != CBM_TYPE_NAMED)
+                result->value.type_identity = cbm_arena_sprintf(
+                    solver->arena, "%u:(%s)", (unsigned)node->wrapper, result->value.type_identity);
+            if (!type || !result->value.type_identity)
+                return false;
+            result->value.type = type;
+            result->value.fact_kind = CBM_SOLVER_FACT_TYPE;
+            result->value.binding_version = node->version;
+        }
+    }
+    if (!have_value && result->status == CBM_SOLVER_KNOWN)
+        result->status = CBM_SOLVER_UNKNOWN;
     if (result->status != CBM_SOLVER_KNOWN || !have_value)
         result->value = (cbm_resolve_solver_value_t){0};
     cbm_resolve_proof_key_t key = {.lookup_domain = "named_dependency_solver",
                                    .lookup_key = result->key,
                                    .binding_identity = result->key,
+                                   .type_identity = result->value.type_identity,
+                                   .declaration_identity = result->value.declaration_identity,
                                    .detail = cycle ? "unsettled_cycle" : "closed_dependency_set",
                                    .flags = result->value.kind};
     cbm_resolve_result_t resolved = outcome(result);
@@ -351,10 +498,14 @@ bool cbm_resolve_solver_solve(cbm_resolve_solver_t *solver) {
     if (!solver || solver->solved)
         return false;
     solver->solved = true;
+    if (solver->selections > solver->limits.edges - solver->edge_count)
+        solver_fail(solver, CBM_SOLVER_LIMITED);
+    size_t reserved_edges = solver->edge_count + solver->selections;
     if (solver->count > SIZE_MAX / sizeof(size_t) ||
-        solver->edge_count > SIZE_MAX / sizeof(solver_reverse_edge_t) ||
-        solver->edge_count > (UINT64_MAX - solver->count) / 3 ||
-        solver->count + (uint64_t)solver->edge_count * 3 > solver->limits.steps)
+        reserved_edges > SIZE_MAX / sizeof(solver_reverse_edge_t) ||
+        reserved_edges > (UINT64_MAX - solver->count) / 4 ||
+        solver->count + (uint64_t)solver->edge_count * 3 + (uint64_t)solver->selections * 4 >
+            solver->limits.steps)
         solver_fail(solver, CBM_SOLVER_LIMITED);
     if (solver->failure != CBM_SOLVER_PENDING) {
         fail_results(solver);
@@ -372,9 +523,8 @@ bool cbm_resolve_solver_solve(cbm_resolve_solver_t *solver) {
     size_t *heap =
         solver->count ? cbm_arena_alloc(solver->arena, solver->count * sizeof(*heap)) : NULL;
     solver_reverse_edge_t *reverse =
-        solver->edge_count ? cbm_arena_alloc(solver->arena, solver->edge_count * sizeof(*reverse))
-                           : NULL;
-    if ((solver->count && !heap) || (solver->edge_count && !reverse)) {
+        reserved_edges ? cbm_arena_alloc(solver->arena, reserved_edges * sizeof(*reverse)) : NULL;
+    if ((solver->count && !heap) || (reserved_edges && !reverse)) {
         solver_fail(solver, CBM_SOLVER_FAILED);
         fail_results(solver);
         return false;
@@ -406,6 +556,46 @@ bool cbm_resolve_solver_solve(cbm_resolve_solver_t *solver) {
     while (ready && solver->failure == CBM_SOLVER_PENDING) {
         size_t n = heap_pop(heap, &ready);
         solver_node_t *node = solver->nodes[n];
+        if (node->operation == SOLVER_SELECT && !node->selected) {
+            node->selected = true;
+            size_t selector_index = node->dependency_indices[0];
+            const cbm_resolve_solver_result_t *selector =
+                selector_index == SIZE_MAX ? NULL : &solver->nodes[selector_index]->result;
+            const char *identity = selector ? (node->select_type ? selector->value.type_identity
+                                                                 : selector->value.target)
+                                            : NULL;
+            if (selector && selector->status == CBM_SOLVER_KNOWN && identity && *identity) {
+                const char *selected = cbm_arena_sprintf(solver->arena, "%s%s%s", node->prefix,
+                                                         identity, node->suffix);
+                const char **keys = cbm_arena_alloc(solver->arena, 2 * sizeof(*keys));
+                size_t *indices = cbm_arena_alloc(solver->arena, 2 * sizeof(*indices));
+                if (!selected || !keys || !indices) {
+                    solver_fail(solver, CBM_SOLVER_FAILED);
+                    break;
+                }
+                keys[0] = node->selector;
+                keys[1] = selected;
+                if (strcmp(keys[0], keys[1]) > 0) {
+                    const char *swap = keys[0];
+                    keys[0] = keys[1];
+                    keys[1] = swap;
+                }
+                indices[0] = find_node(solver, keys[0]);
+                indices[1] = find_node(solver, keys[1]);
+                node->result.dependencies = keys;
+                node->result.dependency_count = 2;
+                node->dependency_indices = indices;
+                size_t target = find_node(solver, selected);
+                solver->steps++;
+                if (target != SIZE_MAX &&
+                    solver->nodes[target]->result.status == CBM_SOLVER_PENDING) {
+                    reverse[edge] = (solver_reverse_edge_t){n, solver->nodes[target]->reverse_head};
+                    solver->nodes[target]->reverse_head = edge++;
+                    node->remaining = 1;
+                    continue;
+                }
+            }
+        }
         if (!settle(solver, node, false)) {
             solver_fail(solver, solver->pool->failure == CBM_RESOLVE_ANALYSIS_LIMITED
                                     ? CBM_SOLVER_LIMITED

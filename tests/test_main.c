@@ -1779,11 +1779,13 @@ extern void suite_git_context(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
+extern void suite_resolver_import_authority(void);
 extern void suite_resolver_lookup(void);
 extern void suite_resolver_proof_ownership(void);
 extern void suite_resolver_generation(void);
 extern void suite_resolver_proof(void);
 extern void suite_resolver_solver(void);
+extern void suite_resolver_stabilization(void);
 extern void suite_resolver_k8s(void);
 extern void suite_resolver_variants(void);
 extern void suite_resolver_infra(void);
@@ -2374,11 +2376,13 @@ int main(int argc, char **argv) {
 
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
+    RUN_SELECTED_SUITE(resolver_import_authority);
     RUN_SELECTED_SUITE(resolver_lookup);
     RUN_SELECTED_SUITE(resolver_proof_ownership);
     RUN_SELECTED_SUITE(resolver_generation);
     RUN_SELECTED_SUITE(resolver_proof);
     RUN_SELECTED_SUITE(resolver_solver);
+    RUN_SELECTED_SUITE(resolver_stabilization);
     RUN_SELECTED_SUITE(resolver_k8s);
     RUN_SELECTED_SUITE(resolver_variants);
     RUN_SELECTED_SUITE(resolver_infra);

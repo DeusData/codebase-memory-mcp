@@ -2,6 +2,7 @@
 #define CBM_RESOLVE_SOLVER_H
 
 #include "proof.h"
+#include "../lsp/type_rep.h"
 
 typedef enum {
     CBM_SOLVER_PENDING = 0,
@@ -13,10 +14,23 @@ typedef enum {
     CBM_SOLVER_FAILED
 } cbm_resolve_solver_status_t;
 
+typedef enum {
+    CBM_SOLVER_FACT_BINDING = 0,
+    CBM_SOLVER_FACT_TYPE,
+    CBM_SOLVER_FACT_RETURN,
+    CBM_SOLVER_FACT_MEMBER
+} cbm_resolve_solver_fact_kind_t;
+
 typedef struct {
     const char *target;
     uint32_t kind;
     bool module;
+    cbm_resolve_solver_fact_kind_t fact_kind;
+    const CBMType *type;
+    /* Output: canonical identity is derived from type, never accepted as input. */
+    const char *type_identity;
+    const char *declaration_identity;
+    uint32_t binding_version;
 } cbm_resolve_solver_value_t;
 
 typedef struct {
@@ -62,6 +76,27 @@ bool cbm_resolve_solver_copy(cbm_resolve_solver_t *solver, const char *key, cons
                              const cbm_resolve_proof_t *audit);
 bool cbm_resolve_solver_join(cbm_resolve_solver_t *solver, const char *key,
                              const char *const *dependencies, size_t count,
+                             const cbm_resolve_proof_t *audit);
+/* SELECT waits for selector, then subscribes to prefix + its exact target + suffix.
+ * This one additional dependency is reserved at registration. It is never read
+ * while pending. Missing selected keys, cycles and terminal uncertainty abstain.
+ * A type-member adapter must first establish selector's structured type. */
+bool cbm_resolve_solver_select(cbm_resolve_solver_t *solver, const char *key, const char *selector,
+                               const char *prefix, const char *suffix,
+                               const cbm_resolve_proof_t *audit);
+/* The same dependency selection keyed by the complete structured type identity,
+ * rather than only its named declaration. Adapters supply exact applicability
+ * domains (for example addressable vs temporary receivers). */
+bool cbm_resolve_solver_select_type(cbm_resolve_solver_t *solver, const char *key,
+                                    const char *selector, const char *prefix, const char *suffix,
+                                    const cbm_resolve_proof_t *audit);
+const char *cbm_resolve_solver_type_identity(CBMArena *, const CBMType *);
+/* A finite transfer over a proved type. UNKNOWN is an explicit unsupported
+ * operation; no arbitrary inference callback can smuggle unsettled facts in.
+ * NAMED copies an already resolved type (including its wrappers), POINTER and
+ * SLICE add one wrapper. Immutable lexical writes carry distinct keys/versions. */
+bool cbm_resolve_solver_type(cbm_resolve_solver_t *solver, const char *key, const char *dependency,
+                             CBMTypeKind wrapper, uint32_t version,
                              const cbm_resolve_proof_t *audit);
 bool cbm_resolve_solver_solve(cbm_resolve_solver_t *solver);
 

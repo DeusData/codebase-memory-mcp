@@ -52,10 +52,8 @@ bool cbm_resolve_record_candidate(const cbm_resolve_record_t *record) {
         !proof->predecessors_closed || !proof->outcome.target ||
         strcmp(proof->outcome.target, record->result.target))
         return false;
-    if (strcmp(record->relation, "IMPORTS") == 0)
-        return true;
-    static const char *const relations[] = {"CALLS", "USAGE",  "CALL_REFERENCE",
-                                            "READS", "WRITES", "USES_TYPE"};
+    static const char *const relations[] = {"IMPORTS", "CALLS",  "USAGE",    "CALL_REFERENCE",
+                                            "READS",   "WRITES", "USES_TYPE"};
     bool known = false;
     for (size_t i = 0; i < sizeof(relations) / sizeof(relations[0]); i++) {
         if (strcmp(record->relation, relations[i]) == 0) {
@@ -91,10 +89,8 @@ bool cbm_resolve_record_site_proof(const cbm_resolve_record_t *record,
         view->outcome.rule != record->result.rule ||
         !same_text(view->outcome.target, record->result.target))
         return false;
-    bool dependency = same_text(record->relation, "IMPORTS");
-    return (dependency || ((view->outcome.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT) &&
-                           record->end_byte > record->start_byte)) &&
-           same_text(view->source.project, project) &&
+    return (view->outcome.facts & CBM_RESOLVE_FACT_OCCURRENCE_EXACT) &&
+           record->end_byte > record->start_byte && same_text(view->source.project, project) &&
            same_text(view->source.file, record->file_path) &&
            same_text(view->source.scope, record->scope) &&
            same_text(view->source.content_identity, record->content_identity) &&

@@ -1,3 +1,4 @@
+#include "resolve/stats.h"
 #include "symbols.h"
 #include "foundation/mem_core.h"
 #include "policy.h"
@@ -448,6 +449,7 @@ static bool symbol_key_matches(const symbol_lookup_t *lookup, const CBMRegistere
 }
 
 static bool symbol_registry(symbol_lookup_t *lookup, const CBMTypeRegistry *registry) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
     if (!symbol_index_ready(lookup, registry)) {
         return false;
     }
@@ -483,6 +485,8 @@ static bool symbol_registry(symbol_lookup_t *lookup, const CBMTypeRegistry *regi
             return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED,
                                "symbol_registry_index_invalid");
         }
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_CANDIDATE_VISITS, 1);
         const CBMRegistryHashEntry *entry = &entries[index];
         if (entry->payload_index < 0 || entry->payload_index >= registry->func_count) {
             return symbol_fail(lookup, CBM_RESOLVE_ANALYSIS_FAILED,

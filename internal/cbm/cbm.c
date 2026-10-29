@@ -3368,7 +3368,9 @@ static void cpp_view_drop_seen(CBMFileResult *r, int defs_before, int imports_be
         bool seen = false;
         for (int j = 0; j < w && !seen; j++) {
             const CBMImport *e = &r->imports.items[j];
-            seen = e->local_name && m->local_name && e->module_path && m->module_path &&
+            seen = e->site_start_byte == m->site_start_byte &&
+                   e->site_end_byte == m->site_end_byte && e->source_origin == m->source_origin &&
+                   e->local_name && m->local_name && e->module_path && m->module_path &&
                    strcmp(e->local_name, m->local_name) == 0 &&
                    strcmp(e->module_path, m->module_path) == 0;
         }

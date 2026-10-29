@@ -830,7 +830,134 @@ TEST(resolver_generation_snapshot_partial_extraction_revokes_completeness) {
     PASS();
 }
 
+static bool generation_corruption_is_unavailable(const char *sql) {
+    generation_fixture_t f;
+    if (!generation_fixture_init(&f))
+        return false;
+    cbm_gbuf_t *gb = generation_graph(&f, false);
+    cbm_store_t *store = cbm_store_open_memory();
+    size_t count = 0;
+    const cbm_resolve_record_t *rows = gb ? cbm_gbuf_resolutions(gb, &count) : NULL;
+    /* A persisted unresolved summary is still required generation metadata. */
+    cbm_resolve_summary_t summary = {
+        .file_path = "flow.py", .key = "unresolved-export", .kind = CBM_PROOF_EXPORT_BINDING};
+    cbm_resolve_counts_t counts;
+    bool present = false;
+    bool ok = gb && store &&
+              cbm_store_resolver_replace_generation(store, "proj", rows, count, &f.file, 1,
+                                                    &summary, 1) == CBM_STORE_OK &&
+              cbm_store_resolver_summary(store, "proj", &counts, &present) == CBM_STORE_OK &&
+              present && counts.occurrences == 2;
+    if (ok)
+        ok = sqlite3_exec(cbm_store_get_db(store), sql, NULL, NULL, NULL) == SQLITE_OK &&
+             cbm_store_resolver_summary(store, "proj", &counts, &present) == CBM_STORE_OK &&
+             !present && counts.occurrences == 0;
+    if (store)
+        cbm_store_close(store);
+    cbm_gbuf_free(gb);
+    generation_fixture_destroy(&f);
+    return ok;
+}
+
+TEST(resolver_generation_missing_metadata_tables_are_unavailable) {
+    const char *tables[] = {"resolver_occurrences",
+                            "resolver_facts",
+                            "resolver_supports",
+                            "resolver_lookups",
+                            "resolver_occurrence_evidence",
+                            "resolver_file_summaries",
+                            "resolver_derived_bindings"};
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "DROP TABLE %s", tables[i]);
+        ASSERT(generation_corruption_is_unavailable(sql));
+    }
+    PASS();
+}
+
+TEST(resolver_generation_missing_metadata_rows_are_unavailable) {
+    const char *tables[] = {"resolver_occurrences",
+                            "resolver_facts",
+                            "resolver_supports",
+                            "resolver_lookups",
+                            "resolver_occurrence_evidence",
+                            "resolver_file_summaries",
+                            "resolver_derived_bindings"};
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        char sql[160];
+        snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE project='proj'", tables[i]);
+        ASSERT(generation_corruption_is_unavailable(sql));
+    }
+    PASS();
+}
+
+TEST(resolver_generation_modified_metadata_is_unavailable) {
+    ASSERT(generation_corruption_is_unavailable(
+        "UPDATE resolver_occurrence_evidence SET proof=0 WHERE project='proj'"));
+    ASSERT(generation_corruption_is_unavailable(
+        "UPDATE resolver_file_summaries SET derived_summary='lost' WHERE project='proj'"));
+    ASSERT(generation_corruption_is_unavailable(
+        "UPDATE resolver_derived_bindings SET target='wrong' WHERE project='proj'"));
+    PASS();
+}
+
+TEST(resolver_generation_empty_project_has_complete_metadata) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_resolver_replace_generation(store, "empty", NULL, 0, NULL, 0, NULL, 0),
+              CBM_STORE_OK);
+    cbm_resolve_counts_t counts;
+    bool present = false;
+    int rc = cbm_store_resolver_summary(store, "empty", &counts, &present);
+    cbm_store_close(store);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT(present);
+    ASSERT_EQ(counts.occurrences, 0);
+    PASS();
+}
+
+TEST(resolver_generation_missing_guard_cannot_revive_other_project_receipts) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_resolver_replace(store, "first", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_resolver_replace(store, "second", NULL, 0), CBM_STORE_OK);
+    bool present = false;
+    ASSERT_EQ(cbm_store_resolver_current(store, "first", &present), CBM_STORE_OK);
+    ASSERT(present);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(store),
+                           "DROP TRIGGER resolver_guard_resolver_facts_DELETE", NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(cbm_store_resolver_current(store, "first", &present), CBM_STORE_OK);
+    ASSERT_FALSE(present);
+    ASSERT_EQ(cbm_store_resolver_current(store, "second", &present), CBM_STORE_OK);
+    ASSERT_FALSE(present);
+    ASSERT_EQ(cbm_store_resolver_replace(store, "first", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_resolver_current(store, "first", &present), CBM_STORE_OK);
+    ASSERT(present);
+    ASSERT_EQ(cbm_store_resolver_current(store, "second", &present), CBM_STORE_OK);
+    ASSERT_FALSE(present);
+    ASSERT_EQ(cbm_store_resolver_replace(store, "second", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_resolver_current(store, "second", &present), CBM_STORE_OK);
+    ASSERT(present);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(resolver_generation_replaced_guard_is_not_trusted) {
+    ASSERT(generation_corruption_is_unavailable(
+        "DROP TRIGGER resolver_guard_resolver_facts_DELETE;"
+        "CREATE TRIGGER resolver_guard_resolver_facts_DELETE AFTER DELETE ON resolver_facts "
+        "BEGIN SELECT 1; END"));
+    PASS();
+}
+
 SUITE(resolver_generation) {
+    RUN_TEST(resolver_generation_missing_guard_cannot_revive_other_project_receipts);
+    RUN_TEST(resolver_generation_replaced_guard_is_not_trusted);
+    RUN_TEST(resolver_generation_missing_metadata_tables_are_unavailable);
+    RUN_TEST(resolver_generation_missing_metadata_rows_are_unavailable);
+    RUN_TEST(resolver_generation_modified_metadata_is_unavailable);
+    RUN_TEST(resolver_generation_empty_project_has_complete_metadata);
     RUN_TEST(resolver_generation_persists_independent_facts_and_all_join_supports);
     RUN_TEST(resolver_generation_ids_ignore_occurrence_insertion_order);
     RUN_TEST(resolver_generation_source_mismatch_rolls_back_every_metadata_table);

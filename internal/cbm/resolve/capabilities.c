@@ -49,7 +49,7 @@ static const edge_row_t edge_rows[] = {
      "abstain."},
     {CBM_LANG_JAVA, EDGE(IMPORTS) | CALLABLE_EDGES,
      "Exact declared package members; incomplete or competing namespace candidates abstain."},
-    {CBM_LANG_KOTLIN, TYPED_EDGES | EDGE(CALL_REFERENCE),
+    {CBM_LANG_KOTLIN, TYPED_EDGES | EDGE(CALL_REFERENCE) | EDGE(USAGE),
      "Exact declared packages and aliases; incomplete or competing namespace candidates abstain."},
     {CBM_LANG_CSHARP, TYPED_EDGES,
      "Exact declared namespace members; unproved aliases and competing candidates abstain."},
@@ -89,6 +89,7 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_YAML, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
      "Ansible literal task/playbook paths and repository role paths only; dynamic directives "
      "and unsupported YAML values abstain."},
+    {CBM_LANG_K8S, EDGE(USAGE), NULL},
     {CBM_LANG_KUSTOMIZE, EDGE(IMPORTS),
      "Literal relative resource paths only; transformed or generated resources are unsupported."},
 };
@@ -146,6 +147,10 @@ static void edge_capabilities(cbm_resolve_capabilities_t *out) {
             "Terraform/OpenTofu exact declarations within a module directory and declared outputs "
             "of a literal local module source; duplicate declarations and unsupported inputs "
             "abstain.";
+    if (out->language == CBM_LANG_KOTLIN)
+        out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
+            "Exact source-bound value references, including composite callable-reference "
+            "arguments; unproved receiver identity and dynamic values abstain.";
     if (out->language == CBM_LANG_YAML) {
         out->edges[CBM_RESOLVE_EDGE_CALLS].limitation =
             "Ansible exact handlers in the current play or default role handlers/main.yml or "
@@ -155,8 +160,16 @@ static void edge_capabilities(cbm_resolve_capabilities_t *out) {
             "Kubernetes raw literal image repositories and core Secret, ConfigMap, ServiceAccount "
             "and PersistentVolumeClaim references in explicit flat Kustomize resource lists; exact "
             "namespaces and unique raw declarations are required. Aliases, duplicate keys, nested "
-            "builds and transformed manifests abstain.";
+            "builds and transformed manifests abstain. Compose image repository references "
+            "require exact source spans and a captured environment input; unsupported images "
+            "abstain.";
     }
+    if (out->language == CBM_LANG_K8S)
+        out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
+            "Kubernetes raw literal image repositories and core Secret, ConfigMap, ServiceAccount "
+            "and PersistentVolumeClaim references in explicit flat Kustomize resource lists; "
+            "unique declarations and exact namespaces are required. Aliases, duplicate keys, "
+            "nested builds and transformed manifests abstain.";
     if (out->language == CBM_LANG_GO)
         out->edges[CBM_RESOLVE_EDGE_WRITES].limitation =
             "No admitted Go field/write bridge; assignment extraction remains a resolver quality "
@@ -191,6 +204,24 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
         out->limitation = "Audited infrastructure occurrences only; dynamic values and "
                           "unsupported source mappings abstain.";
+        break;
+    case CBM_LANG_K8S:
+        out->adapter = "kubernetes_infrastructure";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE;
+        out->limitation = "Audited Kubernetes image and object references only; transformed "
+                          "manifests, dynamic values and ambiguous resource names abstain.";
+        break;
+    case CBM_LANG_VUE:
+    case CBM_LANG_SVELTE:
+        out->adapter = "embedded_javascript_lexical";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_CALLABLE;
+        out->limitation = language == CBM_LANG_VUE
+                              ? "One inline script with audited lexical bindings and an inert "
+                                "template; multiple scripts, template effects and external script "
+                                "sources abstain."
+                              : "One inline script with audited lexical bindings; static markup "
+                                "and bare-identifier event references only. Multiple script "
+                                "contexts and template effects abstain.";
         break;
     case CBM_LANG_GO:
         out->adapter = "go";

@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include "resolve/record.h"
+#include "resolve/imports.h"
 #include "foundation/sha256.h"
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
@@ -27,6 +28,8 @@ typedef struct cbm_store cbm_store_t;
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record);
 const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count);
 bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
+/* Analysis/publication failure prevents sealing this generation. */
+void cbm_gbuf_fail_resolutions(cbm_gbuf_t *gb);
 /* Deterministic proof clone/intern work, including repeated existing facts. */
 uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb);
 /* Begin/end bound memo lifetime to immutable source arenas (one file or merged
@@ -38,6 +41,13 @@ bool cbm_gbuf_record_resolver_file(cbm_gbuf_t *gb, const cbm_resolve_file_t *fil
 const cbm_resolve_file_t *cbm_gbuf_resolver_files(const cbm_gbuf_t *gb, size_t *count);
 bool cbm_gbuf_record_resolver_summary(cbm_gbuf_t *gb, const cbm_resolve_summary_t *summary);
 const cbm_resolve_summary_t *cbm_gbuf_resolver_summaries(const cbm_gbuf_t *gb, size_t *count);
+
+/* Resolver-owned immutable import facts, indexed by source file. These are
+ * semantic inputs independent of graph nodes, edges and their JSON properties.
+ * A replacement invalidates the preceding snapshot before it is constructed. */
+void cbm_gbuf_forget_imports(cbm_gbuf_t *gb, const char *file);
+bool cbm_gbuf_capture_imports(cbm_gbuf_t *gb, const cbm_resolve_import_snapshot_t *snapshot);
+const cbm_resolve_import_snapshot_t *cbm_gbuf_imports(const cbm_gbuf_t *gb, const char *file);
 
 /* Supplemental semantic inputs retain only presence, exact byte length and
  * SHA-256 of the analyzed buffer. Paths must be canonical project-relative

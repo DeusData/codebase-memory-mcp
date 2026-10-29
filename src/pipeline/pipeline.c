@@ -193,6 +193,7 @@ typedef enum {
 } pipeline_doc_candidates_t;
 
 struct cbm_pipeline {
+    cbm_resolve_stats_t resolver_stats;
     cbm_pipeline_frozen_t *frozen; /* NULL for every ordinary caller */
     char *repo_path;
     char *db_path;
@@ -4018,7 +4019,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
-static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
+static int cbm_pipeline_run_staged_impl(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
@@ -4198,6 +4199,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     cbm_pipeline_ctx_t ctx = {
         .project_name = p->project_name,
         .repo_path = p->repo_path,
+        .resolver_stats = &p->resolver_stats,
         .gbuf = p->gbuf,
         .registry = p->registry,
         .cancelled = p->cancelled,
@@ -4256,6 +4258,20 @@ cleanup:
      * both immutable owners for the outer final source comparison. */
     cbm_set_user_lang_config(NULL);
     return rc;
+}
+
+static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
+    if (!p)
+        return CBM_NOT_FOUND;
+    cbm_resolve_stats_reset(&p->resolver_stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&p->resolver_stats);
+    int result = cbm_pipeline_run_staged_impl(p);
+    cbm_resolve_stats_bind(previous);
+    return result;
+}
+
+cbm_resolve_stats_snapshot_t cbm_pipeline_resolver_stats(const cbm_pipeline_t *p) {
+    return cbm_resolve_stats_snapshot(p ? &p->resolver_stats : NULL);
 }
 
 static void cleanup_staging_db(const char *path) {
@@ -4783,6 +4799,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    cbm_resolve_stats_reset(&p->resolver_stats);
     /* Debug-level setup markers up to discovery, the first info line: a run
      * that stops before it is named by the last step printed. */
     cbm_log_debug("pipeline.setup", "step", "stage");

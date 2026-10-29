@@ -23,6 +23,7 @@
 #include "foundation/constants.h"  /* CBM_SZ_512 */
 #include "foundation/hash_table.h" /* CBMHashTable (#1355 pkgmap lookup) */
 #include "resolve/model.h"
+#include "resolve/stats.h"
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -31,6 +32,9 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_pipeline cbm_pipeline_t;
+
+/* Last run's resolver work; snapshot after cbm_pipeline_run returns. */
+cbm_resolve_stats_snapshot_t cbm_pipeline_resolver_stats(const cbm_pipeline_t *pipeline);
 
 /* ── Index mode ─────────────────────────────────────────────────── */
 

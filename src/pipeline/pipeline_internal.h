@@ -453,6 +453,7 @@ typedef struct {
     CBMFileResult **result_cache;
     /* Immutable export proofs shared by all resolution workers. */
     cbm_shared_resolver_t *shared_resolver;
+    cbm_resolve_stats_t *resolver_stats; /* run-owned; workers borrow until join */
     _Atomic bool resolver_failed;
 
     /* Run-owned immutable snapshot; direct borrow also works for probe contexts
@@ -904,6 +905,9 @@ bool cbm_pipeline_php_vendor_call(const cbm_php_vendor_names_t *value, const CBM
                                   const CBMCall *call);
 bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
                                    const CBMUsage *usage);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_php_test_fail_projection_once(void);
+#endif
 int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                          const char *rel, const char *file_qn,
                                          const cbm_gbuf_node_t *file, CBMHashTable *namespace_map);

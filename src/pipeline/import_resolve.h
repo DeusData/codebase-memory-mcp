@@ -11,6 +11,14 @@ cbm_resolve_result_t cbm_pipeline_resolve_import_result(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
     const CBMImport *imp, CBMHashTable *namespace_map, const cbm_gbuf_node_t **target);
 
+/* Exact same-module ownership; discovery of another go.mod is insufficient. */
+bool cbm_pipeline_go_import_owned(const cbm_pipeline_ctx_t *, const char *, const CBMImport *,
+                                  const cbm_gbuf_node_t *);
+
+/* Source/path facts for Go hybrid consumers, independently of dependency edges. */
+bool cbm_pipeline_capture_go_imports(const cbm_pipeline_ctx_t *, const char *,
+                                     const CBMFileResult *);
+
 /* Shared coordinator writer used by full sequential and parallel extraction. */
 int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                      const char *rel, CBMHashTable *namespace_map);
@@ -48,6 +56,12 @@ int cbm_pipeline_ecma_import_map(const cbm_pipeline_ctx_t *, const char *, const
 int cbm_pipeline_php_import_map(const cbm_gbuf_t *graph, const char *project,
                                 const char *source_rel, const CBMFileResult *result,
                                 const char ***keys, const char ***values, int *count);
+
+/* Immutable facts matching the current captured source and configuration.
+ * Returned storage belongs to graph; invalid or incomplete snapshots return NULL. */
+const cbm_resolve_import_snapshot_t *cbm_pipeline_import_snapshot(const cbm_gbuf_t *, const char *,
+                                                                  const char *,
+                                                                  const CBMFileResult *);
 
 /* Source-audited Rust use bindings, separate from dependency File targets. */
 int cbm_pipeline_rust_import_map(const cbm_gbuf_t *, const char *, const char *,

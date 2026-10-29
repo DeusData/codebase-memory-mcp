@@ -127,6 +127,8 @@ struct cbm_gbuf {
     cbm_resolve_proof_pool_t proof_pool;
     cbm_resolve_proof_clone_session_t proof_session;
     bool proof_session_active;
+    CBM_DYN_ARRAY(const cbm_resolve_import_snapshot_t *) import_snapshots;
+    CBMHashTable *imports_by_file;
     CBM_DYN_ARRAY(cbm_resolve_file_t) resolver_files;
     CBM_DYN_ARRAY(cbm_resolve_summary_t) resolver_summaries;
     cbm_gbuf_captured_input_t *captured_inputs;
@@ -314,6 +316,83 @@ static const cbm_resolve_proof_t *gb_copy_proof(cbm_gbuf_t *gb, const cbm_resolv
                                     : cbm_resolve_proof_clone(&gb->proof_pool, proof);
 }
 
+void cbm_gbuf_forget_imports(cbm_gbuf_t *gb, const char *file) {
+    if (gb && gb->imports_by_file && file)
+        (void)cbm_ht_delete(gb->imports_by_file, file);
+}
+
+const cbm_resolve_import_snapshot_t *cbm_gbuf_imports(const cbm_gbuf_t *gb, const char *file) {
+    return gb && !gb->resolution_failed && gb->imports_by_file && file
+               ? cbm_ht_get(gb->imports_by_file, file)
+               : NULL;
+}
+
+static const char *gb_import_text(cbm_gbuf_t *gb, const char *text) {
+    const char *copy = text ? gb_intern(gb, text) : NULL;
+    if (text && !copy)
+        gb->resolution_failed = true;
+    return copy;
+}
+
+bool cbm_gbuf_capture_imports(cbm_gbuf_t *gb, const cbm_resolve_import_snapshot_t *snapshot) {
+    if (!gb || !snapshot || !snapshot->source.file || gb->resolution_failed)
+        return false;
+    cbm_gbuf_forget_imports(gb, snapshot->source.file);
+    if ((snapshot->count && !snapshot->items) ||
+        snapshot->count > SIZE_MAX / sizeof(cbm_resolve_import_fact_t)) {
+        gb->resolution_failed = true;
+        return false;
+    }
+    if (!gb->imports_by_file)
+        gb->imports_by_file = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, 16);
+    cbm_resolve_import_snapshot_t *copy = cbm_arena_alloc(&gb->proof_arena, sizeof(*copy));
+    cbm_resolve_import_fact_t *items =
+        snapshot->count ? cbm_arena_alloc(&gb->proof_arena, snapshot->count * sizeof(*items))
+                        : NULL;
+    if (!gb->imports_by_file || !copy || (snapshot->count && !items)) {
+        gb->resolution_failed = true;
+        return false;
+    }
+    *copy = *snapshot;
+    copy->items = items;
+#define IMPORT_SOURCE(field) copy->source.field = gb_import_text(gb, snapshot->source.field)
+    IMPORT_SOURCE(project);
+    IMPORT_SOURCE(file);
+    IMPORT_SOURCE(scope);
+    IMPORT_SOURCE(module);
+    IMPORT_SOURCE(content_identity);
+    IMPORT_SOURCE(configuration_identity);
+#undef IMPORT_SOURCE
+    for (size_t i = 0; i < snapshot->count; i++) {
+        const cbm_resolve_import_fact_t *fact = &snapshot->items[i];
+        items[i] = *fact;
+        items[i].local_name = gb_import_text(gb, fact->local_name);
+        items[i].module_path = gb_import_text(gb, fact->module_path);
+        items[i].member = gb_import_text(gb, fact->member);
+        items[i].dependency.target = gb_import_text(gb, fact->dependency.target);
+        items[i].dependency.reason = gb_import_text(gb, fact->dependency.reason);
+        items[i].dependency.proof = gb_copy_proof(gb, fact->dependency.proof);
+        if (fact->dependency.proof && !items[i].dependency.proof)
+            gb->resolution_failed = true;
+        items[i].binding.target = gb_import_text(gb, fact->binding.target);
+        items[i].binding.reason = gb_import_text(gb, fact->binding.reason);
+        items[i].binding.proof = gb_copy_proof(gb, fact->binding.proof);
+        if (fact->binding.proof && !items[i].binding.proof)
+            gb->resolution_failed = true;
+    }
+    if (gb->resolution_failed)
+        return false;
+    int before = gb->import_snapshots.count;
+    cbm_da_push(&gb->import_snapshots, copy);
+    if (gb->import_snapshots.count != before + 1) {
+        gb->resolution_failed = true;
+        return false;
+    }
+    cbm_ht_set(gb->imports_by_file, copy->source.file, copy);
+    gb->resolution_failed |= cbm_ht_get(gb->imports_by_file, copy->source.file) != copy;
+    return !gb->resolution_failed;
+}
+
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record) {
     if (!gb || !record || gb->resolution_failed)
         return false;
@@ -375,6 +454,11 @@ const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *c
 
 bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb) {
     return gb && !gb->resolution_failed;
+}
+
+void cbm_gbuf_fail_resolutions(cbm_gbuf_t *gb) {
+    if (gb)
+        gb->resolution_failed = true;
 }
 
 uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb) {
@@ -510,12 +594,13 @@ bool cbm_gbuf_record_resolver_summary(cbm_gbuf_t *gb, const cbm_resolve_summary_
     cbm_resolve_summary_t row = *summary;
     row.file_path = gb_intern(gb, row.file_path ? row.file_path : "");
     row.key = gb_intern(gb, row.key ? row.key : "");
+    row.payload_json = gb_intern(gb, row.payload_json ? row.payload_json : "{}");
     row.result.target = gb_intern(gb, row.result.target ? row.result.target : "");
     row.result.reason = gb_intern(gb, row.result.reason ? row.result.reason : "");
     if (row.result.proof && !row.proof_borrowed)
         row.result.proof = gb_copy_proof(gb, row.result.proof);
-    if (!row.file_path || !row.key || !row.result.target || !row.result.reason ||
-        (summary->result.proof && !row.result.proof)) {
+    if (!row.file_path || !row.key || !row.payload_json || !row.result.target ||
+        !row.result.reason || (summary->result.proof && !row.result.proof)) {
         gb->resolution_failed = true;
         return false;
     }
@@ -1052,6 +1137,8 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     }
     cbm_gbuf_resolution_end(gb);
     cbm_arena_destroy(&gb->proof_arena);
+    cbm_da_free(&gb->import_snapshots);
+    cbm_ht_free(gb->imports_by_file);
     cbm_da_free(&gb->resolver_files);
     cbm_da_free(&gb->resolver_summaries);
     cbm_free(CBM_MEM_CLASS_GBUF_INDEX, gb->resolutions);
@@ -2577,6 +2664,11 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
     if (!cbm_gbuf_resolution_begin(dst))
         return CBM_NOT_FOUND;
     bool resolver_ok = true;
+    for (int i = 0; resolver_ok && i < src->import_snapshots.count; i++) {
+        const cbm_resolve_import_snapshot_t *snapshot = src->import_snapshots.items[i];
+        if (cbm_gbuf_imports(src, snapshot->source.file) == snapshot)
+            resolver_ok = cbm_gbuf_capture_imports(dst, snapshot);
+    }
     for (size_t i = 0; resolver_ok && i < src->resolution_count; i++)
         resolver_ok = cbm_gbuf_record_resolution(dst, &src->resolutions[i]);
     for (int i = 0; resolver_ok && i < src->resolver_files.count; i++)

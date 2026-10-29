@@ -81,6 +81,22 @@ static void parse_wit_imports(CBMExtractCtx *ctx);
 static void parse_smithy_imports(CBMExtractCtx *ctx);
 static void parse_hyprlang_imports(CBMExtractCtx *ctx);
 
+/* Import occurrence identity comes from the parsed syntax, never a text search
+ * or an aggregate dependency edge. Embedded parsers retain absolute ranges in
+ * the original buffer; branch-view parsers retain the same raw byte offsets. */
+static void push_import_at(CBMExtractCtx *ctx, TSNode site, CBMImport import) {
+    import.site_start_byte = 0;
+    import.site_end_byte = 0;
+    import.source_origin = CBM_SOURCE_ORIGIN_RAW;
+    if (!ts_node_is_null(site) && ctx->source_len >= 0 &&
+        ts_node_end_byte(site) > ts_node_start_byte(site) &&
+        ts_node_end_byte(site) <= (uint32_t)ctx->source_len) {
+        import.site_start_byte = ts_node_start_byte(site);
+        import.site_end_byte = ts_node_end_byte(site);
+    }
+    cbm_imports_push(&ctx->result->imports, ctx->arena, import);
+}
+
 // Helper: strip quotes from a string literal
 static char *strip_quotes(CBMArena *a, const char *s) {
     if (!s) {
@@ -172,7 +188,7 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
         !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source) : path_last(a, path);
 
     CBMImport imp = {.local_name = local_name, .module_path = path};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, path_node, imp);
 }
 
 static void parse_go_imports(CBMExtractCtx *ctx) {
@@ -230,41 +246,26 @@ static void emit_py_aliased_import(CBMExtractCtx *ctx, TSNode child, const char 
                      .module_path = full,
                      .kind = mod_prefix ? CBM_IMPORT_KIND_PYTHON_FROM
                                         : CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, child, imp);
 }
 
 // Process a single Python import_statement node (import X, import X as Y).
 static void process_py_import_stmt(CBMExtractCtx *ctx, TSNode node) {
     CBMArena *a = ctx->arena;
-    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    if (ts_node_is_null(name_node)) {
-        uint32_t nc = ts_node_child_count(node);
-        for (uint32_t j = 0; j < nc; j++) {
-            TSNode child = ts_node_child(node, j);
-            const char *ck = ts_node_type(child);
-            if (strcmp(ck, "dotted_name") == 0 || strcmp(ck, "identifier") == 0) {
-                char *mod = cbm_node_text(a, child, ctx->source);
-                if (mod && mod[0]) {
-                    CBMImport imp = {.local_name = python_import_root(a, mod),
-                                     .module_path = mod,
-                                     .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ROOT};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
-                }
-            } else if (strcmp(ck, "aliased_import") == 0) {
-                emit_py_aliased_import(ctx, child, NULL);
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *kind = ts_node_type(child);
+        if (strcmp(kind, "aliased_import") == 0) {
+            emit_py_aliased_import(ctx, child, NULL);
+        } else if (strcmp(kind, "dotted_name") == 0 || strcmp(kind, "identifier") == 0) {
+            char *module = cbm_node_text(a, child, ctx->source);
+            if (module && module[0]) {
+                CBMImport import = {.local_name = python_import_root(a, module),
+                                    .module_path = module,
+                                    .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ROOT};
+                push_import_at(ctx, child, import);
             }
-        }
-    } else if (strcmp(ts_node_type(name_node), "aliased_import") == 0) {
-        /* `import util as u` — the import_statement's `name` field points at the
-         * aliased_import; extract its real module name (not "util as u"). */
-        emit_py_aliased_import(ctx, name_node, NULL);
-    } else {
-        char *mod = cbm_node_text(a, name_node, ctx->source);
-        if (mod && mod[0]) {
-            CBMImport imp = {.local_name = python_import_root(a, mod),
-                             .module_path = mod,
-                             .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ROOT};
-            cbm_imports_push(&ctx->result->imports, a, imp);
         }
     }
 }
@@ -293,7 +294,7 @@ static void emit_py_import_from_name(CBMExtractCtx *ctx, TSNode child, const cha
         const char *full = mod_path ? python_join_from_import(a, mod_path, name) : name;
         CBMImport imp = {
             .local_name = name, .module_path = full, .kind = CBM_IMPORT_KIND_PYTHON_FROM};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, child, imp);
     }
 }
 
@@ -306,7 +307,7 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     if (strcmp(ts_node_type(node), "future_import_statement") == 0) {
         CBMImport imp = {.local_name = cbm_arena_strdup(a, "__future__"),
                          .module_path = cbm_arena_strdup(a, "__future__")};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, node, imp);
         return;
     }
     TSNode module_node = resolve_py_module_node(node);
@@ -332,7 +333,7 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
             // `from os.path import *` — the module itself is the import.
             if (mod_path && mod_path[0]) {
                 CBMImport imp = {.local_name = path_last(a, mod_path), .module_path = mod_path};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, child, imp);
                 emitted = true;
             }
         }
@@ -341,7 +342,7 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     // (grammar variant) still records the module as an import.
     if (!emitted && mod_path && mod_path[0]) {
         CBMImport imp = {.local_name = path_last(a, mod_path), .module_path = mod_path};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, module_node, imp);
     }
 }
 
@@ -1685,7 +1686,7 @@ static bool process_named_imports(CBMExtractCtx *ctx, TSNode sub, const char *pa
             /* The member the local binds survives an alias: a call through
              * `navigate` from `{ get as navigate }` is the module's `get`. */
             CBMImport imp = {.local_name = local_name, .module_path = path, .member = member};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            push_import_at(ctx, imp_spec, imp);
             found = true;
         }
     }
@@ -1703,7 +1704,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
         if (strcmp(sk, "identifier") == 0) {
             char *name = cbm_node_text(a, sub, ctx->source);
             CBMImport imp = {.local_name = name, .module_path = path, .is_default = true};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            push_import_at(ctx, sub, imp);
             found = true;
         } else if (strcmp(sk, "namespace_import") == 0) {
             TSNode as_name = ts_node_child_by_field_name(sub, TS_FIELD("name"));
@@ -1713,7 +1714,7 @@ static bool process_import_clause(CBMExtractCtx *ctx, TSNode clause, const char 
             if (!ts_node_is_null(as_name)) {
                 char *name = cbm_node_text(a, as_name, ctx->source);
                 CBMImport imp = {.local_name = name, .module_path = path};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, sub, imp);
                 found = true;
             }
         } else if (strcmp(sk, "named_imports") == 0) {
@@ -1744,7 +1745,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
         if (strcmp(ck, "identifier") == 0) {
             char *name = cbm_node_text(a, child, ctx->source);
             CBMImport imp = {.local_name = name, .module_path = path};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            push_import_at(ctx, child, imp);
             found = true;
         } else if (strcmp(ck, "import_clause") == 0) {
             if (process_import_clause(ctx, child, path)) {
@@ -1754,7 +1755,7 @@ static bool process_es_import_statement(CBMExtractCtx *ctx, TSNode node) {
     }
     if (!found) {
         CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, source_node, imp);
     }
     return true;
 }
@@ -1821,7 +1822,7 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
     }
 
     CBMImport imp = {.local_name = local_name, .module_path = path};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, call, imp);
     return true;
 }
 
@@ -1849,7 +1850,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
                 if (path && path[0]) {
                     CBMImport imp = {.local_name = path_last(ctx->arena, path),
                                      .module_path = path};
-                    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+                    push_import_at(ctx, src, imp);
                 }
             }
         } else if (strcmp(kind, "call_expression") == 0) {
@@ -1896,7 +1897,7 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
                 char *path = cbm_node_text(a, child, ctx->source);
                 if (path && path[0]) {
                     CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, child, imp);
                 }
                 break;
             }
@@ -1926,7 +1927,7 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
                 CBMImport imp = {.local_name = module,
                                  .module_path = module,
                                  .kind = CBM_IMPORT_KIND_MODULE_DECLARATION};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, name, imp);
             }
             continue;
         }
@@ -1954,7 +1955,7 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
                 ? cbm_node_text(a, alias, ctx->source)
                 : path_last(a, full);
         CBMImport imp = {.local_name = local, .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, argument, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -2035,7 +2036,7 @@ static void parse_c_imports_in(CBMExtractCtx *ctx, TSNode parent, int depth) {
                          .kind = strcmp(ts_node_type(path_node), "string_literal") == 0
                                      ? CBM_IMPORT_KIND_INCLUDE_QUOTED
                                      : CBM_IMPORT_KIND_INCLUDE_SYSTEM};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, path_node, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -2111,7 +2112,7 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
         }
 
         CBMImport imp = {.local_name = path_last(a, arg_text), .module_path = arg_text};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, node, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -2172,7 +2173,7 @@ static void parse_lua_imports(CBMExtractCtx *ctx) {
 
         char *mod = cbm_arena_strndup(a, start, (size_t)(end - start));
         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, node, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -2181,7 +2182,7 @@ static void parse_lua_imports(CBMExtractCtx *ctx) {
 
 // Emit an IMPORTS edge for a module path string (strips a trailing [symbols]
 // list and surrounding quotes; uses the last path segment as the local name).
-static void r_push_import(CBMExtractCtx *ctx, const char *raw) {
+static void r_push_import(CBMExtractCtx *ctx, TSNode node, const char *raw) {
     CBMArena *a = ctx->arena;
     if (!raw || !raw[0]) {
         return;
@@ -2204,7 +2205,7 @@ static void r_push_import(CBMExtractCtx *ctx, const char *raw) {
         return;
     }
     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, node, imp);
 }
 
 // Recursively scan R for import-producing calls.
@@ -2231,7 +2232,7 @@ static void r_collect_imports(CBMExtractCtx *ctx, TSNode node) { // NOLINT(misc-
                         }
                         TSNode val = ts_node_child_by_field_name(arg, TS_FIELD("value"));
                         if (!ts_node_is_null(val)) {
-                            r_push_import(ctx, cbm_node_text(ctx->arena, val, ctx->source));
+                            r_push_import(ctx, val, cbm_node_text(ctx->arena, val, ctx->source));
                         }
                     }
                 }
@@ -2251,7 +2252,7 @@ static void r_collect_imports(CBMExtractCtx *ctx, TSNode node) { // NOLINT(misc-
                         }
                         TSNode val = ts_node_child_by_field_name(arg, TS_FIELD("value"));
                         if (!ts_node_is_null(val)) {
-                            r_push_import(ctx, cbm_node_text(ctx->arena, val, ctx->source));
+                            r_push_import(ctx, val, cbm_node_text(ctx->arena, val, ctx->source));
                         }
                         break; // first positional argument only
                     }
@@ -2281,7 +2282,7 @@ static bool try_generic_path_fields(CBMExtractCtx *ctx, TSNode node) {
             char *path = strip_quotes(a, cbm_node_text(a, path_node, ctx->source));
             if (path && path[0]) {
                 CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, path_node, imp);
             }
             return true;
         }
@@ -2309,7 +2310,7 @@ static void generic_import_from_text(CBMExtractCtx *ctx, TSNode node) {
     text = strip_quotes(a, text);
     if (text && text[0]) {
         CBMImport imp = {.local_name = path_last(a, text), .module_path = text};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, node, imp);
     }
 }
 
@@ -2477,7 +2478,7 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
                                  .site_start_byte = ts_node_start_byte(uri),
                                  .site_end_byte = ts_node_end_byte(uri),
                                  .source_origin = CBM_SOURCE_ORIGIN_RAW};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, uri, imp);
             }
         }
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
@@ -2535,7 +2536,7 @@ static void parse_zig_imports(CBMExtractCtx *ctx) {
                     char *path = strip_quotes(a, cbm_node_text(a, str, ctx->source));
                     if (path && path[0]) {
                         CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, str, imp);
                     }
                 }
             }
@@ -2560,7 +2561,7 @@ static void process_wolfram_get_top(CBMExtractCtx *ctx, TSNode node) {
             if (text && text[0]) {
                 char *path = strip_quotes(a, text);
                 CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, child, imp);
             }
             break;
         }
@@ -2586,7 +2587,7 @@ static void process_wolfram_needs(CBMExtractCtx *ctx, TSNode node) {
     if (text && text[0]) {
         char *path = strip_quotes(a, text);
         CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, arg, imp);
     }
 }
 
@@ -2670,7 +2671,7 @@ static void emit_php_use_clause(CBMExtractCtx *ctx, TSNode clause, const char *g
         !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
     CBMImportKind kind = decl_kind != CBM_IMPORT_KIND_DEFAULT ? decl_kind : php_use_kind(clause);
     CBMImport imp = {.local_name = local, .module_path = path, .kind = kind};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, clause, imp);
 }
 
 static void emit_php_use_decl(CBMExtractCtx *ctx, TSNode decl) {
@@ -2775,7 +2776,7 @@ static void emit_php_include(CBMExtractCtx *ctx, TSNode statement) {
                             .site_start_byte = ts_node_start_byte(expression),
                             .site_end_byte = ts_node_end_byte(expression),
                             .source_origin = CBM_SOURCE_ORIGIN_RAW};
-        cbm_imports_push(&ctx->result->imports, ctx->arena, import);
+        push_import_at(ctx, expression, import);
         return;
     }
     /* Preserve the legacy carrier spelling while preventing a bare include
@@ -2852,7 +2853,7 @@ static void parse_csharp_imports(CBMExtractCtx *ctx) {
         const char *local =
             !ts_node_is_null(alias) ? cbm_node_text(a, alias, ctx->source) : path_last(a, path);
         CBMImport imp = {.local_name = local, .module_path = path};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, node, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -3381,7 +3382,7 @@ static void parse_hare_imports(CBMExtractCtx *ctx) {
                     char *mod = cbm_node_text(a, c, ctx->source);
                     if (mod && mod[0]) {
                         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, c, imp);
                     }
                     break;
                 }
@@ -3414,7 +3415,7 @@ static void parse_pascal_imports(CBMExtractCtx *ctx) {
                 char *mod = cbm_node_text(a, c, ctx->source);
                 if (mod && mod[0]) {
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, c, imp);
                 }
             }
             continue;
@@ -3446,6 +3447,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                 ts_nstack_init(&inner, ctx, CBM_SZ_512);
                 ts_nstack_push(&inner, node);
                 const char *last_tok = NULL;
+                TSNode last_node = {0};
                 uint32_t last_start = 0;
                 while (inner.count > 0) {
                     TSNode c = ts_nstack_pop(&inner);
@@ -3455,6 +3457,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                         if (t && t[0] && strcmp(t, "module") != 0 && strcmp(t, "namespace") != 0 &&
                             strcmp(t, "assembly") != 0 && (last_tok == NULL || sb > last_start)) {
                             last_tok = t;
+                            last_node = c;
                             last_start = sb;
                         }
                     }
@@ -3463,7 +3466,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                 if (last_tok && last_tok[0]) {
                     CBMImport imp = {.local_name = path_last(a, last_tok),
                                      .module_path = (char *)last_tok};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, last_node, imp);
                 }
             }
             continue; /* commands don't nest imports further */
@@ -3505,7 +3508,7 @@ static void lisp_push_module(CBMExtractCtx *ctx, TSNode mod_node) {
     }
     if (mod && mod[0]) {
         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        push_import_at(ctx, mod_node, imp);
     }
 }
 
@@ -3737,7 +3740,7 @@ static void parse_starlark_imports(CBMExtractCtx *ctx) {
                         }
                         if (path && path[0]) {
                             CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                            cbm_imports_push(&ctx->result->imports, a, imp);
+                            push_import_at(ctx, str, imp);
                         }
                     }
                 }
@@ -3770,7 +3773,7 @@ static void parse_tcl_imports(CBMExtractCtx *ctx) {
                         char *mod = strip_quotes(a, cbm_node_text(a, c, ctx->source));
                         if (mod && mod[0]) {
                             CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                            cbm_imports_push(&ctx->result->imports, a, imp);
+                            push_import_at(ctx, c, imp);
                             break;
                         }
                     }
@@ -3808,7 +3811,7 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
                     }
                     if (mod && mod[0]) {
                         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, str, imp);
                     }
                 }
             }
@@ -3842,7 +3845,7 @@ static void parse_shell_source_imports(CBMExtractCtx *ctx) {
                     char *mod = strip_quotes(a, cbm_node_text(a, arg, ctx->source));
                     if (mod && mod[0]) {
                         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, arg, imp);
                     }
                 }
             }
@@ -3865,7 +3868,7 @@ static void push_make_include(CBMExtractCtx *ctx, TSNode word) {
     }
     const char *slash = strrchr(path, '/');
     CBMImport imp = {.local_name = slash ? slash + SKIP_ONE : path, .module_path = path};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, word, imp);
 }
 
 static void parse_make_imports(CBMExtractCtx *ctx) {
@@ -3923,7 +3926,7 @@ static bool push_literal_relative_import(CBMExtractCtx *ctx, TSNode node) {
     CBMImport imp = {.local_name = path_last(ctx->arena, path),
                      .module_path = path,
                      .kind = CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH};
-    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+    push_import_at(ctx, node, imp);
     return true;
 }
 
@@ -3980,7 +3983,7 @@ static void css_push_import_from_stmt(CBMExtractCtx *ctx, TSNode stmt) {
         return;
     }
     CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, sv, imp);
 }
 
 static void parse_css_imports(CBMExtractCtx *ctx) {
@@ -4050,7 +4053,7 @@ static void html_extract_tag_src(CBMExtractCtx *ctx, TSNode tag) {
         }
         if (path && path[0]) {
             CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            push_import_at(ctx, val, imp);
         }
     }
 }
@@ -4092,7 +4095,7 @@ static void push_path_import(CBMExtractCtx *ctx, TSNode node) {
         return;
     }
     CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-    cbm_imports_push(&ctx->result->imports, a, imp);
+    push_import_at(ctx, node, imp);
 }
 
 // Shared: find a node's clean string path — prefers an inner unquoted content
@@ -4181,7 +4184,7 @@ static void meson_legacy_imports(CBMExtractCtx *ctx, TSNode root, TSNodeStack *s
                 if (path && path[0]) {
                     CBMImport imp = {.local_name = path_last(ctx->arena, path),
                                      .module_path = path};
-                    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+                    push_import_at(ctx, token, imp);
                 }
             }
         }
@@ -4506,7 +4509,7 @@ static void parse_dlang_imports(CBMExtractCtx *ctx) {
                 char *mod = cbm_node_text(a, fqn, ctx->source);
                 if (mod && mod[0]) {
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, fqn, imp);
                 }
             }
             continue;
@@ -4563,7 +4566,7 @@ static void parse_fsharp_imports(CBMExtractCtx *ctx) {
                 char *mod = cbm_node_text(a, id, ctx->source);
                 if (mod && mod[0]) {
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, id, imp);
                 }
             }
             continue;
@@ -4590,7 +4593,7 @@ static void parse_ada_imports(CBMExtractCtx *ctx) {
                     char *mod = cbm_node_text(a, c, ctx->source);
                     if (mod && mod[0]) {
                         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, c, imp);
                     }
                 }
             }
@@ -4625,7 +4628,7 @@ static void parse_elm_imports(CBMExtractCtx *ctx) {
                         }
                     }
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, name, imp);
                 }
             }
             continue;
@@ -4655,7 +4658,7 @@ static void parse_move_imports(CBMExtractCtx *ctx) {
             }
             if (mod && mod[0]) {
                 CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, arg, imp);
             }
             continue;
         }
@@ -4704,7 +4707,7 @@ static void parse_smali_imports(CBMExtractCtx *ctx) {
                 char *mod = smali_demangle_descriptor(a, cbm_node_text(a, cid, ctx->source));
                 if (mod && mod[0]) {
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, cid, imp);
                 }
             }
             continue;
@@ -4733,7 +4736,7 @@ static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
                     char *mod = cbm_node_text(a, c, ctx->source);
                     if (mod && mod[0]) {
                         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, c, imp);
                     }
                 }
             }
@@ -4765,7 +4768,7 @@ static void parse_vhdl_imports(CBMExtractCtx *ctx) {
                 }
                 if (mod && mod[0]) {
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, pkg, imp);
                 }
             }
             continue;
@@ -4793,7 +4796,7 @@ static void parse_wit_imports(CBMExtractCtx *ctx) {
                     char *mod = cbm_node_text(a, idn, ctx->source);
                     if (mod && mod[0]) {
                         CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                        cbm_imports_push(&ctx->result->imports, a, imp);
+                        push_import_at(ctx, idn, imp);
                     }
                 }
             }
@@ -4828,7 +4831,7 @@ static void parse_smithy_imports(CBMExtractCtx *ctx) {
                         }
                     }
                     CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-                    cbm_imports_push(&ctx->result->imports, a, imp);
+                    push_import_at(ctx, sid, imp);
                 }
             }
             continue;
@@ -4857,7 +4860,7 @@ static void parse_hyprlang_imports(CBMExtractCtx *ctx) {
             }
             if (path && path[0]) {
                 CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
-                cbm_imports_push(&ctx->result->imports, a, imp);
+                push_import_at(ctx, str, imp);
             }
             continue;
         }

@@ -78,10 +78,10 @@ static const char *const gd_inserts[] = {
     "TEXT),CAST(X'636f6d706c657465' AS TEXT),-1,0,1,1);",
 };
 static const unsigned char gd_golden_sha[32] = {
-    0xd4, 0x21, 0x40, 0x6b, 0xf1, 0x73, 0x0e, 0x37, 0x62, 0x4e, 0xb0, 0x35, 0x98, 0xe1, 0x96, 0xb7,
-    0xc7, 0xab, 0xc3, 0xf3, 0xb3, 0x8d, 0x4c, 0xfd, 0x50, 0xb5, 0x5a, 0x59, 0xbc, 0x6f, 0x09, 0x87};
+    0xf1, 0x51, 0x51, 0x78, 0x92, 0x34, 0xf8, 0x4e, 0xf0, 0xa2, 0x9d, 0x64, 0x28, 0x97, 0xbd, 0x0e,
+    0xc6, 0x8d, 0xd8, 0xa3, 0x5e, 0xab, 0x5c, 0x91, 0xcd, 0x11, 0x6d, 0xb5, 0x1e, 0x9b, 0x18, 0x81};
 #define GD_GOLDEN_ROWS UINT64_C(17)
-#define GD_GOLDEN_BYTES UINT64_C(5812)
+#define GD_GOLDEN_BYTES UINT64_C(5835)
 
 static const cbm_store_graph_digest_limits_t gd_room = {UINT64_C(100000), UINT64_C(8388608)};
 static int gd_sql(sqlite3 *db, const char *sql) {
@@ -1020,7 +1020,8 @@ static const char *const gd_resolver_schema[] = {
     "CREATE TABLE resolver_derived_bindings(project TEXT NOT NULL,file_path TEXT NOT NULL,key TEXT "
     "NOT NULL,kind INTEGER NOT NULL,module INTEGER NOT NULL,closed INTEGER NOT NULL,binding "
     "INTEGER NOT NULL,domain INTEGER NOT NULL,analysis INTEGER NOT NULL,target TEXT NOT NULL,proof "
-    "INTEGER NOT NULL,PRIMARY KEY(project,file_path,key,kind))",
+    "INTEGER NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}',PRIMARY "
+    "KEY(project,file_path,key,kind))",
 };
 
 static const char *const gd_resolver_inserts[] = {
@@ -1048,8 +1049,10 @@ static const char *const gd_resolver_inserts[] = {
     "INSERT INTO resolver_file_summaries "
     "VALUES('q','file_path2','module2',2,'raw_content_identity2','preprocessed_content_identity2','"
     "configuration_identity2',2,2,'extracted_summary2','derived_summary2',2)",
-    "INSERT INTO resolver_derived_bindings VALUES('p','file_path1','key1',1,1,1,1,1,1,'target1',1)",
-    "INSERT INTO resolver_derived_bindings VALUES('q','file_path2','key2',2,2,2,2,2,2,'target2',2)",
+    "INSERT INTO resolver_derived_bindings "
+    "VALUES('p','file_path1','key1',1,1,1,1,1,1,'target1',1,'{}')",
+    "INSERT INTO resolver_derived_bindings "
+    "VALUES('q','file_path2','key2',2,2,2,2,2,2,'target2',2,'{}')",
 };
 
 static cbm_store_t *gd_resolver_fixture(bool reverse) {
@@ -1145,6 +1148,7 @@ TEST(store_graph_digest_resolver_values_and_removals_are_bound) {
         "UPDATE resolver_derived_bindings SET analysis=99 WHERE project='q'",
         "UPDATE resolver_derived_bindings SET target='changed' WHERE project='q'",
         "UPDATE resolver_derived_bindings SET proof=99 WHERE project='q'",
+        "UPDATE resolver_derived_bindings SET payload_json='changed' WHERE project='q'",
         "DELETE FROM resolver_derived_bindings WHERE project='q'",
     };
 
@@ -1164,10 +1168,10 @@ TEST(store_graph_digest_resolver_values_and_removals_are_bound) {
 }
 
 TEST(store_graph_digest_resolver_canonical_golden_and_order) {
-    static const unsigned char expected[32] = {0x85, 0xb6, 0x33, 0x2a, 0xb5, 0x64, 0x61, 0x96,
-                                               0xb1, 0x12, 0x31, 0x8a, 0x1c, 0x34, 0x24, 0x52,
-                                               0xbb, 0x36, 0xa7, 0x87, 0x9a, 0x4c, 0x65, 0xe0,
-                                               0xf4, 0x1e, 0xb9, 0x34, 0x4b, 0x1d, 0x9d, 0xd1};
+    static const unsigned char expected[32] = {0xd4, 0x3d, 0x48, 0x8d, 0x5d, 0x6b, 0xe8, 0x7f,
+                                               0x15, 0x08, 0x16, 0xf5, 0x66, 0x19, 0xe7, 0xb7,
+                                               0x9f, 0x7d, 0xe8, 0x97, 0x1d, 0x19, 0xdc, 0x86,
+                                               0xc7, 0x66, 0x35, 0x62, 0x88, 0xe4, 0x60, 0x61};
     cbm_store_t *a = gd_resolver_fixture(false), *b = gd_resolver_fixture(true);
     cbm_store_graph_digest_t x = {0}, y = {0};
     bool ok = a && b && gd_p(a, &x) && gd_p(b, &y);
@@ -1176,7 +1180,7 @@ TEST(store_graph_digest_resolver_canonical_golden_and_order) {
     ASSERT_TRUE(ok);
     ASSERT_EQ(x.version, 2);
     ASSERT_TRUE(x.rows == UINT64_C(33));
-    ASSERT_TRUE(x.framed_bytes == UINT64_C(10401));
+    ASSERT_TRUE(x.framed_bytes == UINT64_C(10486));
     ASSERT_TRUE(memcmp(x.sha256, expected, sizeof(expected)) == 0);
     ASSERT_TRUE(gd_equal(&x, &y));
     PASS();
@@ -1267,12 +1271,20 @@ TEST(store_graph_digest_resolver_live_schema_and_explicit_absence) {
     bool before = seeded && gd_p(s, &absent);
     bool replaced = before && cbm_store_resolver_replace(s, "p", NULL, 0) == CBM_STORE_OK;
     bool after = replaced && gd_p(s, &present);
+    bool added_rows = after &&
+                      gd_int(cbm_store_get_db(s),
+                             "SELECT count(*) FROM resolver_generations WHERE project='p'", 1) &&
+                      gd_int(cbm_store_get_db(s),
+                             "SELECT count(*) FROM store_meta WHERE k='resolver_receipt:p' "
+                             "AND v='1'",
+                             1);
     cbm_store_close(s);
     ASSERT_TRUE(before);
     ASSERT_TRUE(replaced);
     ASSERT_TRUE(after);
     ASSERT_TRUE(gd_different(&absent, &present));
-    ASSERT_EQ(present.rows, absent.rows + 1);
+    ASSERT_TRUE(added_rows);
+    ASSERT_EQ(present.rows, absent.rows + 2);
     PASS();
 }
 

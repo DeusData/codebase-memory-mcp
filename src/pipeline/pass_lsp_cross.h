@@ -221,6 +221,10 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
                                        int source_len, const char *module_qn, CBMLSPDef *defs,
                                        int def_count, const char **imp_names, const char **imp_qns,
                                        int imp_count, const CBMPHPImportBindings *bindings);
+void cbm_pxc_run_one_with_imports(CBMLanguage, CBMFileResult *, const char *, int, const char *,
+                                  CBMLSPDef *, int, const char **, const char **, int,
+                                  const CBMPHPImportBindings *,
+                                  const cbm_resolve_import_snapshot_t *);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
@@ -249,6 +253,12 @@ void cbm_pxc_dispatch_file_with_php_bindings(
     const char **imp_keys, const char **imp_vals, int imp_count,
     CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
     const CBMPHPImportBindings *bindings);
+void cbm_pxc_dispatch_file_with_imports(CBMLanguage, CBMFileResult *, const char *, int,
+                                        const char *, const char *, const CBMCrossLspRegistries *,
+                                        const CBMModuleDefIndex *, CBMLSPDef *, int, const char **,
+                                        const char **, int, CBMTypeRegistry *(*)(void *), void *,
+                                        const CBMPHPImportBindings *,
+                                        const cbm_resolve_import_snapshot_t *);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Exercise the production append/supersede ownership boundary with exact

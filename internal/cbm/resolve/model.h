@@ -5,7 +5,7 @@
 
 /* Bump when binding or admission semantics change; persisted resolver facts
  * from a different version must be rebuilt, never silently reclassified. */
-#define CBM_RESOLVER_RULES_VERSION 2
+#define CBM_RESOLVER_RULES_VERSION 3
 
 typedef enum {
     CBM_RESOLVE_BINDING_UNRESOLVED = 0,

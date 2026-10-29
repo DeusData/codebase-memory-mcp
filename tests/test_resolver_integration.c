@@ -406,6 +406,7 @@ typedef struct {
     bool setup_ok;
     int run_rc;
     bool forced_full;
+    bool damaged_metadata_unavailable;
     int summary_rc;
     bool present;
     bool golden;
@@ -413,7 +414,8 @@ typedef struct {
     bool digest_equal;
 } generation_refresh_result_t;
 
-static generation_refresh_result_t generation_refresh_case(const char *invalidate) {
+static generation_refresh_result_t generation_refresh_case(const char *invalidate,
+                                                           bool erase_projection) {
     generation_refresh_result_t result = {.run_rc = -1, .summary_rc = CBM_STORE_ERR};
     resolver_fixture_t fixture;
     if (!fixture_init(&fixture, IMPORT_SOURCE, true, 0))
@@ -436,14 +438,19 @@ static generation_refresh_result_t generation_refresh_case(const char *invalidat
         sqlite3 *db = cbm_store_get_db(store);
         result.setup_ok =
             sqlite3_exec(db, invalidate, NULL, NULL, NULL) == SQLITE_OK &&
-            sqlite3_exec(db,
-                         "DELETE FROM resolver_occurrences WHERE project='" RESOLVER_PROJECT
-                         "';DELETE FROM edges WHERE project='" RESOLVER_PROJECT
-                         "' AND type IN ('CALLS','USAGE');",
-                         NULL, NULL, NULL) == SQLITE_OK &&
-            cbm_store_resolver_summary(store, RESOLVER_PROJECT, &counts, &present) ==
-                CBM_STORE_OK &&
-            !present && cbm_store_seal_for_atomic_publish(store) == CBM_STORE_OK;
+            (!erase_projection ||
+             sqlite3_exec(db,
+                          "DELETE FROM resolver_occurrences WHERE project='" RESOLVER_PROJECT
+                          "';DELETE FROM edges WHERE project='" RESOLVER_PROJECT
+                          "' AND type IN ('CALLS','USAGE');",
+                          NULL, NULL, NULL) == SQLITE_OK);
+        if (result.setup_ok) {
+            result.damaged_metadata_unavailable =
+                cbm_store_resolver_summary(store, RESOLVER_PROJECT, &counts, &present) ==
+                    CBM_STORE_OK &&
+                !present;
+            result.setup_ok = cbm_store_seal_for_atomic_publish(store) == CBM_STORE_OK;
+        }
     }
     if (store)
         cbm_store_close(store);
@@ -479,10 +486,12 @@ static generation_refresh_result_t generation_refresh_case(const char *invalidat
 TEST(resolver_integration_old_rules_version_rebuilds_unchanged_source) {
     generation_refresh_result_t result =
         generation_refresh_case("UPDATE resolver_generations SET rules_version=rules_version-1 "
-                                "WHERE project='" RESOLVER_PROJECT "';");
+                                "WHERE project='" RESOLVER_PROJECT "';",
+                                true);
     ASSERT(result.setup_ok);
     ASSERT_EQ(result.run_rc, 0);
     ASSERT(result.forced_full);
+    ASSERT(result.damaged_metadata_unavailable);
     ASSERT_EQ(result.summary_rc, CBM_STORE_OK);
     ASSERT(result.present);
     ASSERT(result.golden);
@@ -493,10 +502,41 @@ TEST(resolver_integration_old_rules_version_rebuilds_unchanged_source) {
 
 TEST(resolver_integration_missing_generation_rebuilds_unchanged_source) {
     generation_refresh_result_t result =
-        generation_refresh_case("DROP TABLE resolver_generations;");
+        generation_refresh_case("DROP TABLE resolver_generations;", true);
     ASSERT(result.setup_ok);
     ASSERT_EQ(result.run_rc, 0);
     ASSERT(result.forced_full);
+    ASSERT(result.damaged_metadata_unavailable);
+    ASSERT_EQ(result.summary_rc, CBM_STORE_OK);
+    ASSERT(result.present);
+    ASSERT(result.golden);
+    ASSERT(result.rows_equal);
+    ASSERT(result.digest_equal);
+    PASS();
+}
+
+TEST(resolver_integration_missing_facts_rebuilds_unchanged_source) {
+    generation_refresh_result_t result =
+        generation_refresh_case("DROP TABLE resolver_facts;", false);
+    ASSERT(result.setup_ok);
+    ASSERT_EQ(result.run_rc, 0);
+    ASSERT(result.forced_full);
+    ASSERT(result.damaged_metadata_unavailable);
+    ASSERT_EQ(result.summary_rc, CBM_STORE_OK);
+    ASSERT(result.present);
+    ASSERT(result.golden);
+    ASSERT(result.rows_equal);
+    ASSERT(result.digest_equal);
+    PASS();
+}
+
+TEST(resolver_integration_missing_evidence_rebuilds_unchanged_source) {
+    generation_refresh_result_t result = generation_refresh_case(
+        "DELETE FROM resolver_occurrence_evidence WHERE project='" RESOLVER_PROJECT "';", false);
+    ASSERT(result.setup_ok);
+    ASSERT_EQ(result.run_rc, 0);
+    ASSERT(result.forced_full);
+    ASSERT(result.damaged_metadata_unavailable);
     ASSERT_EQ(result.summary_rc, CBM_STORE_OK);
     ASSERT(result.present);
     ASSERT(result.golden);
@@ -997,6 +1037,8 @@ TEST(resolver_integration_arkts_escaped_module_paths_never_bind_raw_decoys) {
 }
 
 SUITE(resolver_integration) {
+    RUN_TEST(resolver_integration_missing_facts_rebuilds_unchanged_source);
+    RUN_TEST(resolver_integration_missing_evidence_rebuilds_unchanged_source);
     RUN_TEST(resolver_integration_js_escaped_module_paths_never_bind_raw_decoys);
     RUN_TEST(resolver_integration_ts_escaped_module_paths_never_bind_raw_decoys);
     RUN_TEST(resolver_integration_tsx_escaped_module_paths_never_bind_raw_decoys);

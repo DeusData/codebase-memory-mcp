@@ -273,6 +273,7 @@ bool cbm_rust_collect_source_facts(CBMArena *arena, const char *source, int leng
 
 typedef struct {
     const char *target;
+    const cbm_resolve_proof_t *import_proof;
     bool ambiguous;
 } rsp_name_t;
 typedef struct {
@@ -283,6 +284,7 @@ typedef struct {
     cbm_resolve_binding_index_t *bindings;
     CBMResolveTypeMap types;
     CBMHashTable *imports, *callers, *local_types;
+    bool require_import_proofs;
     const CBMRegisteredType *enclosing_type;
     cbm_resolve_result_t enclosing_type_proof;
 } rsp_context_t;
@@ -316,7 +318,8 @@ static const CBMRegisteredType *rsp_type(rsp_context_t *context, const char *nam
     const rsp_name_t *import = cbm_ht_get(context->imports, name);
     const rsp_name_t *binding = local ? local : import;
     if ((local && import) || (!local && !cbm_resolve_binding_import(context->bindings, name)) ||
-        !binding || binding->ambiguous || !binding->target || !binding->target[0])
+        !binding || binding->ambiguous || !binding->target || !binding->target[0] ||
+        (!local && context->require_import_proofs && !binding->import_proof))
         return NULL;
     if (local) {
         const char *module = context->file->module_qn;
@@ -346,12 +349,34 @@ static cbm_resolve_result_t rsp_type_evidence(rsp_context_t *context, const CBMR
                                               TSNode site) {
     if (!type)
         return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED};
-    return cbm_lsp_proof_type_lookup(
-        &context->types, rsp_text(&context->source, site), site, "rust_proof-type-name-domain",
-        type->qualified_name, type->declaration_identity,
+    const char *spelling = rsp_text(&context->source, site);
+    const rsp_name_t *import = spelling ? cbm_ht_get(context->imports, spelling) : NULL;
+    if (import && context->require_import_proofs && (import->ambiguous || !import->import_proof))
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNKNOWN,
+                                      .reason = "rust_import_predecessor_missing"};
+    cbm_resolve_result_t result = cbm_lsp_proof_type_lookup(
+        &context->types, spelling, site, "rust_proof-type-name-domain", type->qualified_name,
+        type->declaration_identity,
         type->graph_qualified_name ? type->graph_qualified_name : type->qualified_name,
         type->source_flags, "rust_proof-complete-source-type-lookup");
+    if (!import || !context->require_import_proofs || !cbm_resolve_admit(&result))
+        return result;
+    const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(result.proof);
+    if (!view)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_FAILED};
+    const cbm_resolve_proof_t *premises[] = {result.proof, import->import_proof};
+    const cbm_resolve_proof_t *proof =
+        cbm_resolve_proof_derive(&context->types.proofs, CBM_PROOF_TYPE_BIND, &view->source,
+                                 &view->key, &result, premises, 2, true);
+    view = cbm_resolve_proof_view(proof);
+    if (!view)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_FAILED,
+                                      .reason = "rust_import_predecessor_join_failed"};
+    result = view->outcome;
+    result.proof = proof;
+    return result;
 }
+
 static const char *rsp_occurrence_spelling(rsp_context_t *context, TSNode site,
                                            CBMResolvedKind kind) {
     TSNode expression = site;
@@ -788,10 +813,12 @@ static void rsp_function(rsp_context_t *context, TSNode node) {
     ts_tree_cursor_delete(&cursor);
     rsp_statements(context, body, caller->target, scope);
 }
-void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
-                            const CBMTypeRegistry *registry, const CBMFileResult *file,
-                            const char **import_names, const char **import_qns, int import_count,
-                            CBMResolvedCallArray *out) {
+static void rust_proof_resolve(CBMArena *arena, const char *source, int length,
+                               const CBMTypeRegistry *registry, const CBMFileResult *file,
+                               const char **import_names, const char **import_qns, int import_count,
+                               CBMResolvedCallArray *out,
+                               const cbm_resolve_import_snapshot_t *imports,
+                               bool require_import_proofs) {
     if (!arena || !source || length <= 0 || !registry || !file || !out || file->has_error ||
         file->parse_incomplete || file->parse_unusable)
         return;
@@ -814,7 +841,8 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
                                         .failed = ts_node_has_error(root)},
                              .registry = registry,
                              .file = file,
-                             .out = &staged};
+                             .out = &staged,
+                             .require_import_proofs = require_import_proofs};
     context.bindings =
         cbm_resolve_binding_build(arena, file, CBM_LANG_RUST, source, (size_t)length);
     context.source.primitive_domain = rsp_primitive_domain(&context.source, root);
@@ -827,6 +855,8 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
     cbm_resolve_types_init(&context.types, arena, 0);
     cbm_resolve_proof_source_t proof_source =
         cbm_result_proof_source(file, CBM_SOURCE_ORIGIN_RAW, file->module_qn);
+    if (!cbm_resolve_import_source_matches(imports, &proof_source))
+        imports = NULL;
     if (!cbm_lsp_proof_context(&context.types, &proof_source, file->module_qn))
         context.source.failed = true;
     if (context.imports && context.callers && context.local_types && context.bindings) {
@@ -834,6 +864,16 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
             if (import_names && import_names[i] && import_qns && import_qns[i])
                 if (!rsp_put(&context, context.imports, import_names[i], import_qns[i]))
                     context.source.failed = true;
+        for (size_t i = 0; imports && i < imports->count; i++) {
+            const cbm_resolve_import_fact_t *fact = &imports->items[i];
+            rsp_name_t *binding =
+                fact->local_name ? cbm_ht_get(context.imports, fact->local_name) : NULL;
+            if (binding && !binding->ambiguous && binding->target &&
+                cbm_resolve_admit(&fact->dependency) && cbm_resolve_admit(&fact->binding) &&
+                fact->dependency.proof && fact->binding.proof &&
+                !strcmp(binding->target, fact->binding.target))
+                binding->import_proof = fact->binding.proof;
+        }
         for (int i = 0; i < file->defs.count; i++) {
             const CBMDefinition *def = &file->defs.items[i];
             if (!def->name || !def->qualified_name || !def->label)
@@ -883,4 +923,21 @@ void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
     cbm_ht_free(context.callers);
     cbm_ht_free(context.local_types);
     ts_tree_delete(tree);
+}
+
+void cbm_rust_proof_resolve(CBMArena *arena, const char *source, int length,
+                            const CBMTypeRegistry *registry, const CBMFileResult *file,
+                            const char **names, const char **targets, int count,
+                            CBMResolvedCallArray *out) {
+    rust_proof_resolve(arena, source, length, registry, file, names, targets, count, out, NULL,
+                       false);
+}
+
+void cbm_rust_proof_resolve_with_imports(CBMArena *arena, const char *source, int length,
+                                         const CBMTypeRegistry *registry, const CBMFileResult *file,
+                                         const char **names, const char **targets, int count,
+                                         CBMResolvedCallArray *out,
+                                         const cbm_resolve_import_snapshot_t *imports) {
+    rust_proof_resolve(arena, source, length, registry, file, names, targets, count, out, imports,
+                       true);
 }

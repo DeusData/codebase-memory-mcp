@@ -1,3 +1,4 @@
+#include "stats.h"
 #include "proof.h"
 #include "foundation/mem_core.h"
 #include "policy.h"
@@ -338,6 +339,9 @@ static bool memo_grow(proof_walk_t *walk) {
 }
 static const cbm_resolve_proof_t *walk_node(proof_walk_t *walk, const cbm_resolve_proof_t *proof,
                                             unsigned depth) {
+    /* Count actual predecessor visits, including cache hits, so repeated
+     * ancestor walks remain visible even when interning emits no new node. */
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_PROPAGATED_FACTS, 1);
     if (!proof || !proof->value.depth || (proof->value.premise_count && !proof->value.premises)) {
         walk->failure = CBM_RESOLVE_ANALYSIS_FAILED;
         return NULL;

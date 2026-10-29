@@ -6,6 +6,7 @@
 #include "type_registry.h"
 #include "../cbm.h"
 #include "../resolve/types.h"
+#include "../resolve/imports.h"
 #include "go_lsp.h" // for CBMLSPDef, CBMResolvedCallArray
 
 // CLSPContext holds state for C/C++ expression type evaluation within a file.
@@ -23,6 +24,8 @@ typedef struct {
     struct CProofDeclaration *proof_declarations;
     int proof_declaration_count, proof_declaration_cap;
     struct CProofInclude *proof_includes;
+    const cbm_resolve_import_snapshot_t *import_facts;
+    bool require_import_proofs;
     struct CProofBuiltinBinding *proof_builtins;
     int proof_builtin_count, proof_builtin_cap;
     struct CProofUsing *proof_usings;
@@ -105,6 +108,10 @@ typedef struct {
     const char **fp_target_qns;
     const CBMScope **fp_binding_scopes;
     bool *fp_target_proven;
+    // Storage escape persists for this lexical binding, across assignments.
+    bool *fp_storage_escaped;
+    // Immutable assignment/copy origin, owned by this context's arena.
+    const cbm_resolve_proof_t **fp_target_proofs;
     int fp_count;
     int fp_cap;
 
@@ -310,5 +317,18 @@ CBMLSPStatus cbm_run_c_lsp_cross_status_with_source(
     CBMLSPDef *defs, int def_count, const char **include_paths, const char **include_ns_qns,
     int include_count, TSTree *cached_tree, CBMResolvedCallArray *out,
     const cbm_resolve_proof_source_t *source_context);
+
+/* Production entry points retain normalized dependency predecessors. The bool
+ * result is the configured test-owner validation; status reports walk failure. */
+bool cbm_run_c_lsp_cross_with_imports(CBMArena *, const char *, int, const char *, bool,
+                                      CBMLSPDef *, int, const char **, const char **, int, TSTree *,
+                                      CBMResolvedCallArray *, const CBMFileResult *,
+                                      const cbm_resolve_import_snapshot_t *, CBMLSPStatus *);
+bool cbm_run_c_lsp_cross_with_registry_with_imports(CBMArena *, const char *, int, const char *,
+                                                    bool, CBMTypeRegistry *, const char **,
+                                                    const char **, int, TSTree *,
+                                                    CBMResolvedCallArray *, const CBMFileResult *,
+                                                    const cbm_resolve_import_snapshot_t *,
+                                                    CBMLSPStatus *);
 
 #endif // CBM_LSP_C_LSP_H

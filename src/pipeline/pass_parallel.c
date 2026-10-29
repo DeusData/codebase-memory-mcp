@@ -1173,7 +1173,7 @@ static void pp_charge_probe(extract_ctx_t *ec, bool over) {
     cbm_mem_class_log(first_over ? "charge.first_over" : "charge.step");
 }
 
-static void extract_worker(int worker_id, void *ctx_ptr) {
+static void extract_worker_impl(int worker_id, void *ctx_ptr) {
     extract_ctx_t *ec = ctx_ptr;
     extract_worker_state_t *ws = &ec->workers[worker_id];
 
@@ -1566,6 +1566,14 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
     cbm_slab_destroy_thread();
     cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset
                                      cache */
+}
+
+static void extract_worker(int worker_id, void *ctx_ptr) {
+    extract_ctx_t *context = ctx_ptr;
+    cbm_resolve_stats_t *previous =
+        cbm_resolve_stats_bind(context->pctx ? context->pctx->resolver_stats : NULL);
+    extract_worker_impl(worker_id, ctx_ptr);
+    cbm_resolve_stats_bind(previous);
 }
 
 static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_entries,
@@ -4230,7 +4238,7 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
     return unowned;
 }
 
-static void resolve_worker(int worker_id, void *ctx_ptr) {
+static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
@@ -4440,12 +4448,13 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                                                     &lsp_vals, &lsp_count) != 0)
                         atomic_store(&rc->pctx->resolver_failed, true);
                 }
-                cbm_pxc_dispatch_file_with_php_bindings(
+                cbm_pxc_dispatch_file_with_imports(
                     lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
                     rc->module_def_index, rc->all_defs, rc->def_count,
                     own_lsp_map ? lsp_keys : imp_keys, own_lsp_map ? lsp_vals : imp_vals,
                     own_lsp_map ? lsp_count : imp_count, pp_rust_shared_registry_get, rc,
-                    &php_vendor);
+                    &php_vendor,
+                    cbm_pipeline_import_snapshot(rc->main_gbuf, rc->project_name, rel, result));
                 if (own_lsp_map) {
                     cbm_pxc_free_import_map(lsp_keys, lsp_vals, lsp_count);
                 }
@@ -4585,6 +4594,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_service_pattern_cache_end();
     cbm_pxc_thread_scratch_end();
     file_node_cache_clear();
+}
+
+static void resolve_worker(int worker_id, void *ctx_ptr) {
+    resolve_ctx_t *context = ctx_ptr;
+    cbm_resolve_stats_t *previous =
+        cbm_resolve_stats_bind(context->pctx ? context->pctx->resolver_stats : NULL);
+    resolve_worker_impl(worker_id, ctx_ptr);
+    cbm_resolve_stats_bind(previous);
 }
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,

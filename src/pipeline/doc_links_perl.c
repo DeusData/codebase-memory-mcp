@@ -244,7 +244,9 @@ static bool pr_index_packages(pr_index_t *ix, const cbm_doclink_build_in_t *in) 
     if (ix->oom) {
         return false;
     }
-    qsort(ix->decls, (size_t)ix->ndecls, sizeof(pr_decl_t), pr_decl_cmp);
+    if (ix->ndecls > 1) {
+        qsort(ix->decls, (size_t)ix->ndecls, sizeof(pr_decl_t), pr_decl_cmp);
+    }
     ix->pkg = cbm_ht_create_in(CBM_MEM_CLASS_OTHER, (uint32_t)(ix->ndecls + SKIP_ONE));
     if (!ix->pkg) {
         return false;

@@ -53,6 +53,7 @@
 #include <pipeline/pipeline.h>
 #include <pipeline/pipeline_internal.h>
 #include <pipeline/import_resolve.h>
+#include <pipeline/shared_resolver.h>
 #include "resolve/policy.h"
 #include <foundation/log.h>
 #include <foundation/win_utf8.h>
@@ -2637,16 +2638,154 @@ TEST(ei_php_binding_snapshot_requires_current_complete_evidence) {
         cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, "{\"php_imports_complete\":1}"),
         0);
     cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
-    ASSERT_NULL(names.targets);
+    ASSERT_NOT_NULL(names.targets); /* projection properties are not semantic evidence */
     cbm_pipeline_php_vendor_names_free(&names);
     ASSERT_EQ(cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, "{invalid"), 0);
     cbm_pipeline_php_vendor_names_build(gb, "p", "main.php", r, &names);
-    ASSERT_NULL(names.targets);
+    ASSERT_NOT_NULL(names.targets);
     cbm_pipeline_php_vendor_names_free(&names);
     cbm_pipeline_namespace_map_free(ns);
     free(file_qn);
     cbm_gbuf_free(gb);
     cbm_free_result(r);
+    PASS();
+}
+
+TEST(ei_import_occurrences_survive_aggregate_projection) {
+    const char *source = "import library\nimport library\n"
+                         "import library as first, library as second\nimport missing\n";
+    const char *sources[] = {"def target():\n    return 1\n", source};
+    const char *rels[] = {"library.py", "main.py"};
+    const char *anchors[] = {"library", "library", "library as first", "library as second",
+                             "missing"};
+    CBMFileResult *results[2] = {0};
+    cbm_gbuf_t *graph = cbm_gbuf_new("p", "/tmp");
+    ASSERT_NOT_NULL(graph);
+    for (int i = 0; i < 2; i++) {
+        results[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_PYTHON, "p",
+                                      rels[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(results[i]);
+        ASSERT(ei_php_seed_result(graph, "p", rels[i], results[i]));
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build("p", results, rels, 2);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t context = {.project_name = "p", .gbuf = graph};
+    (void)cbm_pipeline_create_import_edges(&context, results[1], rels[1], map);
+    bool projected = cbm_gbuf_resolutions_own_shared(graph) && cbm_shared_resolver_project(graph);
+    size_t count = 0;
+    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graph, &count);
+    bool exact = count == 5;
+    int emitted = 0;
+    const char *cursor = source;
+    for (size_t i = 0; exact && i < count; i++) {
+        const char *site = strstr(cursor, anchors[i]);
+        exact = site && rows[i].start_byte == (uint32_t)(site - source) &&
+                rows[i].end_byte == (uint32_t)(site - source + strlen(anchors[i])) &&
+                rows[i].source_origin == CBM_SOURCE_ORIGIN_RAW &&
+                strcmp(rows[i].content_identity, results[1]->source_content_id[0]) == 0;
+        emitted += rows[i].emitted;
+        if (rows[i].emitted)
+            exact = exact && cbm_resolve_record_admit(&rows[i]);
+        if (site)
+            cursor = site + strlen(anchors[i]);
+    }
+    int aggregate = cbm_gbuf_edge_count_by_type(graph, "IMPORTS");
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(graph);
+    cbm_free_result(results[0]);
+    cbm_free_result(results[1]);
+    ASSERT(projected);
+    ASSERT_EQ(count, 5);
+    ASSERT(exact);
+    ASSERT_EQ(emitted, 4);
+    /* Repeated identical sites collapse; distinct local aliases remain distinct. */
+    ASSERT_EQ(aggregate, 3);
+    PASS();
+}
+
+TEST(ei_php_normalized_bindings_ignore_projection) {
+    const char *source = "<?php\nuse App\\Thing;\nfunction run(Thing $x) { $x->go(); }\n";
+    const char *library = "<?php\nnamespace App;\nclass Thing { function go() {} }\n";
+    const char *rels[] = {"main.php", "lib/Thing.php"};
+    const char *sources[] = {source, library};
+    CBMFileResult *results[2] = {0};
+    cbm_gbuf_t *graph = cbm_gbuf_new("p", "/tmp");
+    ASSERT_NOT_NULL(graph);
+    for (int i = 0; i < 2; i++) {
+        results[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_PHP, "p",
+                                      rels[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(results[i]);
+        ASSERT(ei_php_seed_result(graph, "p", rels[i], results[i]));
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build("p", results, rels, 2);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t context = {.project_name = "p", .gbuf = graph};
+    ASSERT_EQ(cbm_pipeline_create_import_edges(&context, results[0], rels[0], map), 1);
+    char *file_qn = cbm_pipeline_fqn_compute("p", rels[0], "__file__");
+    char *target_qn = cbm_pipeline_fqn_compute("p", rels[1], "__file__");
+    const cbm_gbuf_node_t *file = cbm_gbuf_find_by_qn(graph, file_qn);
+    ASSERT_NOT_NULL(file);
+    ASSERT_EQ(cbm_gbuf_delete_edges_by_type(graph, "IMPORTS"), 0);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(graph, "IMPORTS"), 0);
+    ASSERT_EQ(cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, "{}"), 0);
+    cbm_php_vendor_names_t names = {0};
+    cbm_pipeline_php_vendor_names_build(graph, "p", rels[0], results[0], &names);
+    bool preserved = names.targets && names.targets[0] && strcmp(names.targets[0], target_qn) == 0;
+    cbm_pipeline_php_vendor_names_free(&names);
+    CBMFileResult changed = *results[0];
+    snprintf(changed.source_configuration_id, sizeof(changed.source_configuration_id), "%s",
+             "changed-configuration");
+    cbm_pipeline_php_vendor_names_build(graph, "p", rels[0], &changed, &names);
+    bool stale_rejected = !names.targets && !names.proven_targets;
+    cbm_pipeline_php_vendor_names_free(&names);
+    cbm_pipeline_namespace_map_free(map);
+    free(file_qn);
+    free(target_qn);
+    cbm_gbuf_free(graph);
+    cbm_free_result(results[0]);
+    cbm_free_result(results[1]);
+    ASSERT(preserved);
+    ASSERT(stale_rejected);
+    PASS();
+}
+
+TEST(ei_php_projection_failure_invalidates_generation) {
+    const char *sources[] = {"<?php\nuse App\\Thing;\nfunction run(Thing $x) { $x->go(); }\n",
+                             "<?php\nnamespace App;\nclass Thing { function go() {} }\n"};
+    const char *rels[] = {"main.php", "lib/Thing.php"};
+    CBMFileResult *results[2] = {0};
+    cbm_gbuf_t *graph = cbm_gbuf_new("p", "/tmp");
+    ASSERT_NOT_NULL(graph);
+    for (int i = 0; i < 2; i++) {
+        results[i] = cbm_extract_file(sources[i], (int)strlen(sources[i]), CBM_LANG_PHP, "p",
+                                      rels[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(results[i]);
+        ASSERT(ei_php_seed_result(graph, "p", rels[i], results[i]));
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build("p", results, rels, 2);
+    ASSERT_NOT_NULL(map);
+    cbm_pipeline_ctx_t context = {.project_name = "p", .gbuf = graph};
+    int initial = cbm_pipeline_create_import_edges(&context, results[0], rels[0], map);
+    bool initial_complete = cbm_gbuf_resolutions_complete(graph);
+    (void)cbm_gbuf_delete_edges_by_type(graph, "IMPORTS");
+    cbm_pipeline_php_test_fail_projection_once();
+    int written = cbm_pipeline_create_import_edges(&context, results[0], rels[0], map);
+    bool complete = cbm_gbuf_resolutions_complete(graph);
+    cbm_php_vendor_names_t names = {0};
+    cbm_pipeline_php_vendor_names_build(graph, "p", rels[0], results[0], &names);
+    bool authority_survived = names.targets || names.proven_targets;
+    cbm_pipeline_php_vendor_names_free(&names);
+    bool projected = cbm_shared_resolver_project(graph);
+    cbm_pipeline_namespace_map_free(map);
+    cbm_gbuf_free(graph);
+    cbm_free_result(results[0]);
+    cbm_free_result(results[1]);
+    ASSERT_EQ(initial, 1);
+    ASSERT(initial_complete);
+    ASSERT_EQ(written, 0);
+    ASSERT(!complete);
+    ASSERT(!authority_survived);
+    ASSERT(!projected);
     PASS();
 }
 
@@ -3270,6 +3409,9 @@ SUITE(edge_imports) {
     RUN_TEST(ei_php_null_namespace_map_does_not_guess_issue1186);
     RUN_TEST(ei_php_require_path_keeps_generic_resolution_issue1186);
     RUN_TEST(ei_php_vendor_types_never_bind_by_name_issue1186);
+    RUN_TEST(ei_import_occurrences_survive_aggregate_projection);
+    RUN_TEST(ei_php_normalized_bindings_ignore_projection);
+    RUN_TEST(ei_php_projection_failure_invalidates_generation);
     RUN_TEST(ei_php_binding_snapshot_requires_current_complete_evidence);
     RUN_TEST(ei_php_binding_snapshot_groups_kinds_and_invalidates_failed_rebuild);
     RUN_TEST(ei_php_psr4_missing_class_leaves_type_evidence_unknown);

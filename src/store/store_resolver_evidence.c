@@ -1,3 +1,4 @@
+#include "resolve/stats.h"
 #include "store_resolver_evidence.h"
 #include "foundation/json_writer.h"
 #include "resolve/proof.h"
@@ -29,6 +30,8 @@ static bool bind_text(sqlite3_stmt *s, int col, const char *value) {
 }
 static bool finish_row(sqlite3_stmt *s, bool ok) {
     ok = ok && sqlite3_step(s) == SQLITE_DONE;
+    if (ok)
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_STORED_RECORDS, 1);
     sqlite3_reset(s);
     sqlite3_clear_bindings(s);
     return ok;
@@ -227,8 +230,26 @@ static bool reset_tables(sqlite3 *db, const char *project) {
         "NOT NULL,"
         "key TEXT NOT NULL,kind INTEGER NOT NULL,module INTEGER NOT NULL,closed INTEGER NOT NULL,"
         "binding INTEGER NOT NULL,domain INTEGER NOT NULL,analysis INTEGER NOT NULL,"
-        "target TEXT NOT NULL,proof INTEGER NOT NULL,PRIMARY KEY(project,file_path,key,kind));";
+        "target TEXT NOT NULL,proof INTEGER NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}',"
+        "PRIMARY KEY(project,file_path,key,kind));";
     if (sqlite3_exec(db, schema, NULL, NULL, NULL) != SQLITE_OK)
+        return false;
+    sqlite3_stmt *columns = NULL;
+    bool payload = false;
+    if (sqlite3_prepare_v2(db, "PRAGMA table_info(resolver_derived_bindings)", -1, &columns,
+                           NULL) != SQLITE_OK)
+        return false;
+    int step;
+    while ((step = sqlite3_step(columns)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(columns, 1);
+        payload |= name && !strcmp(name, "payload_json");
+    }
+    sqlite3_finalize(columns);
+    if (step != SQLITE_DONE ||
+        (!payload && sqlite3_exec(db,
+                                  "ALTER TABLE resolver_derived_bindings ADD COLUMN payload_json "
+                                  "TEXT NOT NULL DEFAULT '{}'",
+                                  NULL, NULL, NULL) != SQLITE_OK))
         return false;
     const char *deletes[] = {"DELETE FROM resolver_facts WHERE project=?",
                              "DELETE FROM resolver_supports WHERE project=?",
@@ -288,8 +309,8 @@ static bool write_summaries(evidence_write_t *w, const cbm_resolve_summary_t *co
                             size_t count) {
     sqlite3_stmt *s = NULL;
     bool ok = sqlite3_prepare_v2(
-                  w->db, "INSERT INTO resolver_derived_bindings VALUES(?,?,?,?,?,?,?,?,?,?,?)", -1,
-                  &s, NULL) == SQLITE_OK;
+                  w->db, "INSERT INTO resolver_derived_bindings VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  -1, &s, NULL) == SQLITE_OK;
     for (size_t i = 0; ok && i < count; i++) {
         const cbm_resolve_summary_t *row = rows[i];
         evidence_id_t *proof = find_id(w, row->result.proof);
@@ -304,7 +325,8 @@ static bool write_summaries(evidence_write_t *w, const cbm_resolve_summary_t *co
                                sqlite3_bind_int(s, 9, row->result.analysis) == SQLITE_OK &&
                                bind_text(s, 10, row->result.target) &&
                                sqlite3_bind_int64(s, 11, proof ? (sqlite3_int64)proof->id : 0) ==
-                                   SQLITE_OK);
+                                   SQLITE_OK &&
+                               bind_text(s, 12, row->payload_json));
     }
     sqlite3_finalize(s);
     return ok;
@@ -334,6 +356,7 @@ static bool write_files(evidence_write_t *w, const cbm_resolve_summary_t *const 
             cbm_resolve_hash_number(&hash, row->result.domain);
             cbm_resolve_hash_number(&hash, row->result.analysis);
             cbm_resolve_hash_text(&hash, row->result.target);
+            cbm_resolve_hash_text(&hash, row->payload_json);
             cbm_resolve_hash_text(&hash, proof ? proof->digest : "");
         }
         /* Observed type states are derived facts too. The indexed per-file
