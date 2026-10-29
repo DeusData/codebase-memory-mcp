@@ -963,6 +963,59 @@ TEST(repro_python_global_assignment_is_module_binding) {
     PASS();
 }
 
+/* A global/nonlocal name is a directive, not a read (each name of `global a,
+ * b`), and the rebinding lands where it says: the module from that point on,
+ * or the enclosing function. Source 1 is an error tree, whose directive and
+ * default-value checks take the ts_node_parent fallback. */
+TEST(repro_python_scope_directives_bind_the_named_scope) {
+    static const char *const sources[] = {
+        "def handler():\n    pass\n"
+        "def outer():\n    handler = None\n"
+        "    def inner():\n        nonlocal handler\n        handler = outer\n"
+        "def early():\n    accept_early(handler)\n"
+        "def caller():\n    def nested():\n        global handler, other\n"
+        "        handler = outer\n    accept_outer(handler)\n"
+        "def sibling():\n    accept_sibling(handler)\n",
+        "def handler():\n    pass\n"
+        "def make(handler=handler):\n    return handler\n"
+        "def caller():\n    global handler other\n    handler = make\n    make(handler)\n",
+    };
+    static const struct {
+        int source;
+        const char *marker, *name;
+        int count, blocked, shadow;
+    } sites[] = {
+        {0, "global handler", "handler", 0, 0, 0},
+        {0, ", other", "other", 0, 0, 0},
+        {0, "nonlocal handler", "handler", 0, 0, 0},
+        {0, "accept_early(handler)", "handler", 1, 0, 0},
+        {0, "accept_outer(handler)", "handler", 1, 1, 0},
+        {0, "accept_sibling(handler)", "handler", 1, 1, 0},
+        {1, "global handler", "handler", 0, 0, 0},
+        {1, "=handler", "handler", 1, 0, 0},
+        {1, "make(handler)", "handler", 1, 1, 0},
+    };
+    int failures = 0;
+    for (int i = 0; i < (int)(sizeof(sites) / sizeof(sites[0])); i++) {
+        const char *source = sources[sites[i].source];
+        uint32_t start = lb_identifier_offset(source, sites[i].marker, sites[i].name);
+        ASSERT_NEQ(start, UINT32_MAX);
+        CBMFileResult *result = lb_extract(source, CBM_LANG_PYTHON, "directives.py");
+        ASSERT_NOT_NULL(result);
+        ASSERT_EQ(result->parse_incomplete, sites[i].source);
+        LBBindingSite got = lb_binding_site(result, NULL, sites[i].name, start);
+        cbm_free_result(result);
+        if (got.count != sites[i].count || got.blocked_count != sites[i].blocked ||
+            got.local_shadow_count != sites[i].shadow) {
+            printf("  %s: count %d blocked %d shadow %d\n", sites[i].marker, got.count,
+                   got.blocked_count, got.local_shadow_count);
+            failures++;
+        }
+    }
+    ASSERT_EQ(failures, 0);
+    PASS();
+}
+
 /* Module assignments participate in name lookup too. A later function must
  * not raw-name-fallback through a module variable to an older same-named
  * callable declaration. */
@@ -1055,6 +1108,7 @@ SUITE(repro_lexical_binding_precision) {
     RUN_TEST(repro_objectscript_udl_set_target_binds_method_local);
     RUN_TEST(repro_python_default_expression_uses_enclosing_namespace);
     RUN_TEST(repro_python_global_assignment_is_module_binding);
+    RUN_TEST(repro_python_scope_directives_bind_the_named_scope);
     RUN_TEST(repro_python_module_assignment_blocks_callable_fallback);
     RUN_TEST(repro_go_function_literal_parameter_does_not_leak);
 }

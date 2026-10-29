@@ -1656,12 +1656,20 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      (pass_ansible.c). An external Chart is keyed by its publisher URL.
  *      An index built before holds none of them, so it rebuilds once on
  *      upgrade.
- *  10: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *  10: combine the platform variants, stem disambiguation and infrastructure
+ *      layers above with unresolved-call evidence capture and its candidate
+ *      index. Both upstream version 9 and this branch's earlier version 9
+ *      lack part of these semantics, so unchanged files rebuild once.
+ *  11: Python local defs and classes bind through their enclosing lexical
+ *      scope, including app-factory route handlers. Published version 10
+ *      predates this resolution, so unchanged files rebuild once on upgrade.
+ *  12: a Next.js App Router route handler, the HTTP verb Function a route.ts
  *      / route.js under app/ or src/app/ exports, carries the route_path its
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
- *      so it rebuilds once on upgrade. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 10 };
+ *      so it rebuilds once on upgrade.
+ * The unresolved-call coverage threshold remains independent. */
+enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1819,6 +1827,19 @@ void cbm_pipeline_discard_stage(const char *stage_path);
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+/* One entry per call, owned by the current file's resolve pass. Candidate
+ * strings are borrowed from the graph and copied by coverage capture. */
+typedef struct {
+    const char *candidate_qn;
+    bool calls_emitted;
+} CBMCallEvidence;
+void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
+                                          const CBMFileResult *result,
+                                          const CBMCallEvidence *evidence);
+void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p);
+void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
+                                       bool *complete);
+
 /* The run's doc_link_unresolved rows and failure flag (doc_links.h), taken
  * over by the pipeline (set replaces and frees earlier rows; NULL p frees).
  * A full run publishes them from dump_and_persist_hashes; an incremental

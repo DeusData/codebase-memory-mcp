@@ -8299,6 +8299,15 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
     }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    // Go identity alias `type A = B` (#2033): keep the aliased type text so the
+    // cross-file registries can set alias_of. A defined type `type A B` is a
+    // type_spec and never gets here with this kind.
+    if (ctx->language == CBM_LANG_GO && strcmp(kind, "type_alias") == 0) {
+        TSNode target = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        if (!ts_node_is_null(target)) {
+            def.alias_target = cbm_node_text(a, target, ctx->source);
+        }
+    }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
 

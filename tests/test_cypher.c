@@ -3484,6 +3484,160 @@ TEST(cypher_exec_where_func_arg_on_unbound_target) {
     PASS();
 }
 
+/* #2591: a WHERE comparison whose RHS is another property (a.file_path =
+ * b.file_path) failed to parse with "expected value at pos N". Fixture: Caller
+ * calls Helper in the same file and Remote in another one. */
+static cbm_store_t *setup_issue2591_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t caller = {.project = "test",
+                         .label = "Function",
+                         .name = "Caller",
+                         .qualified_name = "test.Caller",
+                         .file_path = "a.go",
+                         .start_line = 1,
+                         .end_line = 3};
+    cbm_node_t helper = {.project = "test",
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = "test.Helper",
+                         .file_path = "a.go",
+                         .start_line = 5,
+                         .end_line = 7};
+    cbm_node_t remote = {.project = "test",
+                         .label = "Function",
+                         .name = "Remote",
+                         .qualified_name = "test.Remote",
+                         .file_path = "b.go",
+                         .start_line = 1,
+                         .end_line = 2};
+    int64_t id_caller = cbm_store_upsert_node(s, &caller);
+    int64_t id_helper = cbm_store_upsert_node(s, &helper);
+    int64_t id_remote = cbm_store_upsert_node(s, &remote);
+    cbm_edge_t e1 = {
+        .project = "test", .source_id = id_caller, .target_id = id_helper, .type = "CALLS"};
+    cbm_edge_t e2 = {
+        .project = "test", .source_id = id_caller, .target_id = id_remote, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e1);
+    cbm_store_insert_edge(s, &e2);
+    return s;
+}
+
+/* Run `query` on the #2591 fixture and expect exactly one row whose last
+ * column is `want`. */
+static int issue2591_expect_one(const char *query, const char *want) {
+    cbm_store_t *s = setup_issue2591_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    int ok = rc == 0 && r.row_count == 1 && r.col_count > 0 &&
+             strcmp(r.rows[0][r.col_count - 1], want) == 0;
+    if (!ok) {
+        printf("  query: %s\n  rc=%d rows=%d err=%s\n", query, rc, r.row_count,
+               r.error ? r.error : "(none)");
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    return ok;
+}
+
+TEST(cypher_issue2591_parse_where_property_rhs) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (a)-[:CALLS]->(b) WHERE a.file_path <> b.file_path RETURN a",
+                              &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->where);
+    ASSERT_NOT_NULL(q->where->root);
+    ASSERT_EQ(q->where->root->type, EXPR_CONDITION);
+    ASSERT_STR_EQ(q->where->root->cond.variable, "a");
+    ASSERT_STR_EQ(q->where->root->cond.property, "file_path");
+    ASSERT_STR_EQ(q->where->root->cond.op, "<>");
+    ASSERT_STR_EQ(q->where->root->cond.rhs_variable, "b");
+    ASSERT_STR_EQ(q->where->root->cond.rhs_property, "file_path");
+    ASSERT_NULL(q->where->root->cond.value);
+    cbm_query_free(q);
+    PASS();
+}
+
+TEST(cypher_issue2591_where_property_eq_and_neq) {
+    ASSERT_TRUE(issue2591_expect_one("MATCH (a)-[:CALLS]->(b) WHERE a.file_path = b.file_path "
+                                     "RETURN a.name, b.name",
+                                     "Helper"));
+    ASSERT_TRUE(issue2591_expect_one("MATCH (a)-[:CALLS]->(b) WHERE a.file_path <> b.file_path "
+                                     "RETURN a.name, b.name",
+                                     "Remote"));
+    /* Operand order does not matter, and the RHS can sit inside an AND chain
+     * next to a literal comparison. */
+    ASSERT_TRUE(issue2591_expect_one("MATCH (a)-[:CALLS]->(b) WHERE b.file_path = a.file_path "
+                                     "AND a.name = \"Caller\" RETURN b.name",
+                                     "Helper"));
+    PASS();
+}
+
+TEST(cypher_issue2591_where_property_after_with) {
+    ASSERT_TRUE(issue2591_expect_one("MATCH (a)-[:CALLS]->(b) WITH a, b "
+                                     "WHERE a.file_path = b.file_path RETURN b.name",
+                                     "Helper"));
+    /* Bare projected aliases on both sides. */
+    ASSERT_TRUE(issue2591_expect_one("MATCH (a)-[:CALLS]->(b) WITH a.file_path AS af, "
+                                     "b.file_path AS bf, b.name AS callee "
+                                     "WHERE af <> bf RETURN callee",
+                                     "Remote"));
+    PASS();
+}
+
+/* The early WHERE pass binds only the seed alias a. The RHS b is not bound
+ * there, so the leaf must be UNKNOWN; reading it as a match would let the
+ * outer NOT prune every seed before CALLS expansion. */
+TEST(cypher_issue2591_where_property_rhs_unbound_in_early_pass) {
+    ASSERT_TRUE(issue2591_expect_one(
+        "MATCH (a)-[:CALLS]->(b) WHERE NOT (a.file_path = b.file_path) RETURN b.name", "Remote"));
+    ASSERT_TRUE(issue2591_expect_one(
+        "MATCH (a)-[:CALLS]->(b) WHERE NOT a.file_path = b.file_path RETURN b.name", "Remote"));
+    PASS();
+}
+
+TEST(cypher_issue2591_where_property_numeric) {
+    /* Caller starts on line 1, Helper on 5, Remote on 1. */
+    ASSERT_TRUE(issue2591_expect_one(
+        "MATCH (a)-[:CALLS]->(b) WHERE a.start_line < b.start_line RETURN b.name", "Helper"));
+    ASSERT_TRUE(issue2591_expect_one(
+        "MATCH (a)-[:CALLS]->(b) WHERE a.start_line >= b.start_line RETURN b.name", "Remote"));
+    PASS();
+}
+
+/* A missing property is NULL, and a comparison with NULL never matches: two
+ * absent properties must not compare equal. */
+TEST(cypher_issue2591_where_property_missing_is_null) {
+    const char *queries[] = {
+        "MATCH (a)-[:CALLS]->(b) WHERE a.no_such_prop = b.no_such_prop RETURN b.name",
+        "MATCH (a)-[:CALLS]->(b) WHERE a.no_such_prop <> b.file_path RETURN b.name",
+    };
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
+        cbm_store_t *s = setup_issue2591_store();
+        cbm_cypher_result_t r = {0};
+        int rc = cbm_cypher_execute(s, queries[i], "test", 0, &r);
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(r.row_count, 0);
+        cbm_cypher_result_free(&r);
+        cbm_store_close(s);
+    }
+    PASS();
+}
+
+TEST(cypher_issue2591_where_function_rhs_unsupported) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    const char *query = "MATCH (a)-[:CALLS]->(b) WHERE a.name = toLower(b.name) RETURN a";
+    int rc = cbm_cypher_parse(query, &q, &err);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(err);
+    ASSERT_TRUE(strstr(err, "unsupported function 'toLower' on the right side of a WHERE "
+                            "comparison") != NULL);
+    free(err);
+    PASS();
+}
+
 TEST(cypher_exec_where_in) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -6456,6 +6610,13 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_not_source_node);
     RUN_TEST(cypher_exec_where_not_target_node_count);
     RUN_TEST(cypher_exec_where_func_arg_on_unbound_target);
+    RUN_TEST(cypher_issue2591_parse_where_property_rhs);
+    RUN_TEST(cypher_issue2591_where_property_eq_and_neq);
+    RUN_TEST(cypher_issue2591_where_property_after_with);
+    RUN_TEST(cypher_issue2591_where_property_rhs_unbound_in_early_pass);
+    RUN_TEST(cypher_issue2591_where_property_numeric);
+    RUN_TEST(cypher_issue2591_where_property_missing_is_null);
+    RUN_TEST(cypher_issue2591_where_function_rhs_unsupported);
     RUN_TEST(cypher_exec_where_in);
     RUN_TEST(cypher_exec_where_not_in);
     RUN_TEST(cypher_exec_where_is_null);

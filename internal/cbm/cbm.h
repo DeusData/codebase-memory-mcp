@@ -313,6 +313,12 @@ typedef struct {
      * change of all, store_impact.h follow_variant_keys). NULL on every other
      * definition. Tail field: zero-init stays valid. */
     const char *variant_key;
+    /* Go only (#2033): the raw aliased type text of an identity alias
+     * `type A = B` ("B"). Carried to the cross-file registries so a method
+     * call on A from another file follows the alias to B's method set. NULL
+     * for a defined type `type A B` (its method set is its own) and in every
+     * other language. Tail field: zero-init stays valid. */
+    const char *alias_target;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
