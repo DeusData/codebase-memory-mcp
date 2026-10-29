@@ -5428,6 +5428,24 @@ TEST(extract_python_bare_decorator_route_rules) {
     PASS();
 }
 
+/* Issue #2090: Solidity modifier_invocation tracked as decorator. */
+TEST(solidity_modifier_decorator) {
+    CBMFileResult *r = extract("pragma solidity ^0.8.0;\n"
+                               "contract Vault {\n"
+                               "    modifier onlyOwner() { _; }\n"
+                               "    function withdraw() public onlyOwner {\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SOLIDITY, "t", "Vault.sol");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "withdraw");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "onlyOwner"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
@@ -13712,6 +13730,7 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_python_bare_decorator_route_rules);
+    RUN_TEST(solidity_modifier_decorator);
     RUN_TEST(arkts_component_struct);
     RUN_TEST(arkts_exported_struct_decorators);
     RUN_TEST(arkts_member_decorators);
