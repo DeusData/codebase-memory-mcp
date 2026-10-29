@@ -1276,7 +1276,8 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
     return true;
 }
 
-bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label) {
+bool cbm_suppress_bare_field_ref(CBMLanguage lang, bool is_member_access,
+                                 const char *target_label) {
     /* #1942/#1962: a bare Go identifier can never denote a struct field —
      * field access is always a selector expression (x.f). The extractor
      * strips the receiver before the resolver runs (resolve_lhs_write_name
@@ -1284,10 +1285,20 @@ bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const cha
      * field_identifier), so the reference TEXT is always dot-less and cannot
      * carry the distinction — the recorded is_member_access shape can. Only a
      * reference that was never the member half of a selector is refused a
-     * Field bind. Go-gated: a C#/Java/C++/Python method body legitimately
+     * Field bind.
+     *
+     * #2666: C has the same rule. A struct member is named only as the member
+     * half of `a.b`, `a->b` or a designator `.b`, all recorded as
+     * field_identifier; a bare C identifier (a macro argument such as
+     * RUN_SELECTED_SUITE(mcp), a stray name in an unexpanded macro body) is
+     * never one. The call path already drops a bare C call onto a Field
+     * (cbm_call_onto_field_policy).
+     *
+     * Go- and C-gated: a C#/Java/C++/Python method body legitimately
      * references its own members bare (cp_reads_writes_cs_static_field pins
-     * that shape as required), so a global veto would break those languages. */
-    if (!is_go || is_member_access || !target_label) {
+     * that shape as required), so a global veto would break those languages.
+     * A `.h` is parsed as C++ and keeps that behavior. */
+    if ((lang != CBM_LANG_GO && lang != CBM_LANG_C) || is_member_access || !target_label) {
         return false;
     }
     return strcmp(target_label, "Field") == 0;

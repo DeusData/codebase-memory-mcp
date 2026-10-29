@@ -35,6 +35,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/limits.h" /* cbm_max_file_bytes */
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "result_spill.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1581,7 +1582,12 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
  *     change to it is GLOBAL (it sets the global usings of a whole project);
  *   - a REMOVED name can make another file's unresolved reference resolve (an
  *     overload group shrinks) or change its reason: the files whose rows
- *     mention it re-resolve with the closure. */
+ *     mention it re-resolve with the closure;
+ *   - an unresolved `path::member` row (missing, ambiguous) depends on the
+ *     member's file as a whole, its text included (a member the file writes
+ *     without a definition is no missing member, doc_links_md.c) and the size
+ *     of a same-named group: the files whose such rows name a changed or
+ *     deleted file, by its base name, re-resolve with the closure. */
 
 /* Add s[0..n) to a heap-keyed name set. false when it cannot be recorded (too
  * long for a key, or out of memory): callers fail closed. */
@@ -1727,6 +1733,58 @@ static void doc_row_name_dependents(const cbm_doc_link_row_t *rows, int n,
             }
         }
     }
+}
+
+/* Is an unresolved row's reason one a member lookup gives (doc_links_md.c)? */
+static bool doc_row_member_reason(const char *reason) {
+    return reason && (strcmp(reason, "missing") == 0 || strcmp(reason, "ambiguous") == 0);
+}
+
+/* Files whose unresolved `path::member` rows name a member of one of `paths`
+ * (the changed and deleted files), and no edge leads from such a row to the
+ * file: a body edit can write or drop a missing member's name without
+ * changing a definition, and a same-named group can shrink to one without
+ * removing its name. Matched by the base name before "::", since a
+ * reference may be written relative to the document or to the root. When
+ * memory runs out every such row's file is added: re-resolving a file that did
+ * not need it costs time, keeping a stale row costs correctness. Keys are
+ * borrowed from `rows`. */
+static void doc_row_member_dependents(const cbm_doc_link_row_t *rows, int n, char *const *paths,
+                                      int npaths, CBMHashTable *out_paths) {
+    if (npaths <= 0) {
+        return;
+    }
+    CBMHashTable *bases = cbm_ht_create(CBM_SZ_64); /* NULL: fail closed, every member row */
+    for (int i = 0; bases && i < npaths; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *base = slash ? slash + SKIP_ONE : paths[i];
+        cbm_ht_set(bases, base, (void *)base); /* borrowed from `paths` */
+    }
+    for (int i = 0; i < n; i++) {
+        const char *raw = rows[i].raw;
+        const char *rel = rows[i].rel_path;
+        const char *sep = raw ? strstr(raw, "::") : NULL;
+        if (!sep || !rel || !rel[0] || !doc_row_member_reason(rows[i].reason) ||
+            cbm_ht_get(out_paths, rel)) {
+            continue;
+        }
+        const char *base = sep;
+        while (base > raw && base[-1] != '/') {
+            base--;
+        }
+        char key[CBM_SZ_512];
+        size_t bl = (size_t)(sep - base);
+        bool hit = !bases || bl >= sizeof(key);
+        if (!hit && bl > 0) {
+            memcpy(key, base, bl);
+            key[bl] = '\0';
+            hit = cbm_ht_get(bases, key) != NULL;
+        }
+        if (hit) {
+            cbm_ht_set(out_paths, rel, (void *)rel);
+        }
+    }
+    cbm_ht_free(bases);
 }
 
 /* Doc-link carry-forward state of the legacy partial route: the previous
@@ -3177,8 +3235,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         }
     }
     /* Files whose unresolved doc-link references name something a changed or
-     * deleted file no longer declares re-resolve too. */
+     * deleted file no longer declares re-resolve too, and so do the files
+     * whose unresolved `path::member` rows name a changed or deleted file. */
     doc_row_name_dependents(plan->doc_rows, plan->doc_row_count, removed_names, row_deps);
+    doc_row_member_dependents(plan->doc_rows, plan->doc_row_count, changed_paths,
+                              n_changed + n_deleted, row_deps);
     {
         row_dep_walk_t walk = {.closure = closure_set, .files = files_by_path, .added = 0};
         cbm_ht_foreach(row_deps, row_dep_visitor, &walk);
@@ -3244,6 +3305,31 @@ done:
     return 1;
 }
 
+static bool incremental_metadata_current(int meta_rc, const cbm_coverage_meta_t *meta,
+                                         const char *mode_name) {
+    return meta_rc == CBM_STORE_OK && meta->coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
+           meta->unresolved_calls_complete && meta->hash_records_complete && meta->index_mode &&
+           strcmp(meta->index_mode, mode_name) == 0;
+}
+
+static bool incremental_retained_capture_complete(cbm_store_t *store, const char *project) {
+    cbm_coverage_meta_t meta = {0};
+    bool complete = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
+                    meta.coverage_version >= CBM_UNRESOLVED_CALL_COVERAGE_VERSION &&
+                    meta.unresolved_calls_complete;
+    cbm_store_coverage_meta_clear(&meta);
+    return complete;
+}
+
+static bool incremental_coverage_rows_available(int count, const cbm_coverage_row_t *rows) {
+    return count == 0 || rows != NULL;
+}
+
+static bool incremental_capture_complete(bool rows_available, bool run_complete,
+                                         bool retained_complete) {
+    return rows_available && run_complete && retained_complete;
+}
+
 /* ── Delta-repair orchestration (closure route) ──────────────────
  *
  * The closure route's executor: clone the live generation, repair the
@@ -3260,8 +3346,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                              closure_plan_t *plan, cbm_file_info_t *changed_files, int ci,
                              char **deleted, int deleted_count, cbm_file_hash_t *mode_skipped,
                              int mode_skipped_count, cbm_coverage_row_t *old_cov, int old_cov_count,
-                             cbm_store_t *route_store, const cbm_file_info_t *files, int file_count,
-                             struct timespec t0) {
+                             bool retained_unresolved_complete, cbm_store_t *route_store,
+                             const cbm_file_info_t *files, int file_count, struct timespec t0) {
     struct timespec t;
     cbm_store_close(route_store);
 
@@ -3637,7 +3723,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int run_ignored_count = 0;
     int run_ignored_total = 0;
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    cbm_coverage_row_t *run_unresolved = NULL;
+    int run_unresolved_count = 0;
+    bool unresolved_complete = false;
+    cbm_pipeline_get_unresolved_calls(p, &run_unresolved, &run_unresolved_count,
+                                      &unresolved_complete);
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count +
+                  run_unresolved_count;
     bool coverage_rows_available = cov_cap == 0;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
@@ -3656,6 +3748,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             cov[cov_n].kind = run_errs[i].phase;
             cov[cov_n].detail = run_errs[i].reason;
             cov_n++;
+        }
+        for (int i = 0; i < run_unresolved_count; i++) {
+            cov[cov_n++] = run_unresolved[i];
         }
         for (int i = 0; i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
@@ -3753,6 +3848,8 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                     .ignored_files_total = run_ignored_total,
                     .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                     .hash_records_complete = true,
+                    .unresolved_calls_complete = incremental_capture_complete(
+                        coverage_rows_available, unresolved_complete, retained_unresolved_complete),
                 },
             .surface_rows = NULL,
             .surface_row_count = 0,
@@ -3862,9 +3959,7 @@ static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const c
     cbm_coverage_meta_t meta = {0};
     int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
     const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
-    bool metadata_current =
-        meta_rc == CBM_STORE_OK && meta.coverage_version == CBM_SEMANTIC_INDEX_VERSION &&
-        meta.hash_records_complete && meta.index_mode && strcmp(meta.index_mode, mode_name) == 0;
+    bool metadata_current = incremental_metadata_current(meta_rc, &meta, mode_name);
     /* A generation whose doc-link layer is missing or failed is not
      * current even with identical inputs: index_status tells the user to
      * re-run, and the re-run has to rebuild. */
@@ -4054,6 +4149,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_store_free_file_hashes(stored, stored_count);
 
+    /* A subset repair cannot recover unresolved evidence omitted by an older
+     * attempt. Normal routing rebuilds such baselines; the legacy test route
+     * also preserves their incomplete signal when it retains unchanged files. */
+    bool retained_unresolved_complete = incremental_retained_capture_complete(store, project);
+
     /* Coverage rows (#963): the dump below rebuilds the DB file, wiping the
      * separate index_coverage table — capture the previous rows now (store
      * still open) so entries for files NOT re-extracted this run survive. */
@@ -4097,8 +4197,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * live database; its every failure falls back to a full rebuild. */
         return run_closure_delta(p, db_path, project, baseline_manifest, baseline_count,
                                  &closure_plan, changed_files, ci, deleted, deleted_count,
-                                 mode_skipped, mode_skipped_count, old_cov, old_cov_count, store,
-                                 files, file_count, t0);
+                                 mode_skipped, mode_skipped_count, old_cov, old_cov_count,
+                                 retained_unresolved_complete, store, files, file_count, t0);
     }
 
     struct timespec t;
@@ -4370,11 +4470,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    cbm_coverage_row_t *run_unresolved = NULL;
+    int run_unresolved_count = 0;
+    bool unresolved_complete = false;
+    cbm_pipeline_get_unresolved_calls(p, &run_unresolved, &run_unresolved_count,
+                                      &unresolved_complete);
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count +
+                  run_unresolved_count;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
     }
-    bool coverage_rows_available = cov_cap == 0 || cov != NULL;
+    bool coverage_rows_available = incremental_coverage_rows_available(cov_cap, cov);
     if (cov) {
         CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
         for (int i = 0; i < ci; i++) {
@@ -4393,6 +4499,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cov[cov_n].kind = run_errs[i].phase;
             cov[cov_n].detail = run_errs[i].reason;
             cov_n++;
+        }
+        for (int i = 0; i < run_unresolved_count; i++) {
+            cov[cov_n++] = run_unresolved[i];
         }
         for (int i = 0; i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
@@ -4461,6 +4570,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
         .hash_records_complete = true,
+        .unresolved_calls_complete = incremental_capture_complete(
+            coverage_rows_available, unresolved_complete, retained_unresolved_complete),
     };
     /* Publish surfaces: the surviving previous rows plus this run's fresh
      * ones (closure route). The legacy test route publishes none — its

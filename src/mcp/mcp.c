@@ -74,6 +74,7 @@ enum {
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
+#include "foundation/hash_table.h"
 #include "foundation/json_writer.h"
 #include "foundation/arena.h"
 #include "foundation/diagnostics.h"
@@ -1901,6 +1902,8 @@ struct cbm_mcp_server {
     void *auto_index_count_test_context;
     cbm_mcp_snapshot_read_test_hook_fn snapshot_read_test_hook;
     void *snapshot_read_test_context;
+    cbm_mcp_snippet_capture_test_hook_fn snippet_capture_test_hook;
+    void *snippet_capture_test_context;
 #endif
     bool read_batch_tool; /* this request's store reads run in a read batch */
     size_t search_output_limit_override;
@@ -2270,6 +2273,16 @@ void cbm_mcp_server_set_snapshot_read_test_hook(cbm_mcp_server_t *srv,
     }
     srv->snapshot_read_test_hook = hook;
     srv->snapshot_read_test_context = context;
+}
+
+void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
+                                                  cbm_mcp_snippet_capture_test_hook_fn hook,
+                                                  void *context) {
+    if (!srv) {
+        return;
+    }
+    srv->snippet_capture_test_hook = hook;
+    srv->snippet_capture_test_context = context;
 }
 #endif
 
@@ -6835,11 +6848,13 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
 
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *pu_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *unresolved_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_files = yyjson_mut_arr(doc);
     int pp_n = 0;
     int pu_n = 0;
+    int unresolved_n = 0;
     int sk_n = 0;
     int ni_dir_n = 0;
     int ni_file_n = 0;
@@ -6869,6 +6884,11 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
                 yyjson_mut_arr_add_val(pu_files, fe);
             }
             pu_n++;
+        } else if (strcmp(kind, "unresolved_calls") == 0) {
+            if (unresolved_n < sample_limit) {
+                yyjson_mut_arr_add_strcpy(doc, unresolved_files, rows[i].rel_path);
+            }
+            unresolved_n++;
         } else if (strcmp(kind, "not_indexed_dir") == 0) {
             if (ni_dir_n < sample_limit) {
                 yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
@@ -6926,6 +6946,12 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     yyjson_mut_obj_add_bool(doc, pu, "truncated", pu_n > COVERAGE_FILE_CAP);
     yyjson_mut_obj_add_val(doc, root, "parse_unusable", pu);
 
+    yyjson_mut_val *unresolved = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, unresolved, "files", unresolved_files);
+    yyjson_mut_obj_add_int(doc, unresolved, "count", unresolved_n);
+    yyjson_mut_obj_add_bool(doc, unresolved, "truncated", unresolved_n > sample_limit);
+    yyjson_mut_obj_add_val(doc, root, "unresolved_calls", unresolved);
+
     yyjson_mut_val *sk = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
     yyjson_mut_obj_add_int(doc, sk, "count", sk_n);
@@ -6963,7 +6989,7 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     }
     yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
 
-    if (sample_limit > 0 && (pp_n > 0 || sk_n > 0)) {
+    if (sample_limit > 0 && (pp_n > 0 || sk_n > 0 || unresolved_n > 0)) {
         yyjson_mut_obj_add_str(
             doc, root, "coverage_note",
             "Best-effort signal, not a completeness guarantee: parse_partial files WERE indexed, "
@@ -6971,7 +6997,9 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
             "(tree-sitter error recovery still salvages some). skipped files were not indexed at "
             "all. Prefer text search (grep) for flagged files/ranges. Files absent from this list "
             "are NOT guaranteed to be fully indexed. (not_indexed entries are a separate, "
-            "BY-DESIGN class — deliberate ignore rules, not failures.)");
+            "BY-DESIGN class — deliberate ignore rules, not failures.) "
+            "Unresolved callsites need source verification because CALLS totals may be "
+            "incomplete.");
     }
 }
 
@@ -7047,10 +7075,161 @@ static coverage_path_result_t coverage_normalize_rel(const char *input, bool all
     return written > 0U || allow_root ? COVERAGE_PATH_OK : COVERAGE_PATH_INVALID;
 }
 
-static const char *coverage_path_freshness(cbm_store_t *store, const char *project,
-                                           const char *root_path, const char *rel_path,
-                                           bool *outside) {
+/* #2585: the store generation ("u<db_uid>g<mutation_gen>") advances on every
+ * index run, incremental ones included, and on every publication. It is read
+ * when the response is built and names the publication current then; it does
+ * not make the response one atomic read of that publication.
+ * metadata.generation names the coverage-recording run and stays fixed across
+ * incremental re-indexes. Empty when unreadable. */
+static void mcp_add_store_generation(yyjson_mut_doc *doc, yyjson_mut_val *obj, cbm_store_t *store) {
+    char generation[QUERY_GRAPH_GENERATION_CAP] = "";
+    if (!store || cbm_store_generation(store, generation, sizeof(generation)) != CBM_STORE_OK) {
+        generation[0] = '\0';
+    }
+    yyjson_mut_obj_add_strcpy(doc, obj, "store_generation", generation);
+}
+
+/* #2585: file_hashes.sha256 is the SHA-256 of the raw bytes the indexer read
+ * (pipeline_incremental.c semantic_manifest_hash_file). Recomputing it is the
+ * only way to say the bytes on disk are the bytes that were indexed: mtime and
+ * size miss a same-size edit whose timestamp was preserved (cp -p, rsync -t,
+ * archive extraction), and go stale when identical bytes are rewritten. */
+static bool mcp_file_sha256_hex(const char *abs_path, char out[CBM_SHA256_HEX_LEN + 1]) {
+    FILE *file = cbm_fopen(abs_path, "rb");
+    if (!file) {
+        return false;
+    }
+    cbm_sha256_ctx sha;
+    cbm_sha256_init(&sha);
+    unsigned char buf[CBM_SZ_4K];
+    size_t len;
+    while ((len = fread(buf, 1, sizeof(buf), file)) > 0) {
+        cbm_sha256_update(&sha, buf, len);
+    }
+    bool valid = !ferror(file);
+    if (fclose(file) != 0) {
+        valid = false;
+    }
+    if (!valid) {
+        return false;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&sha, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[CBM_SHA256_HEX_LEN] = '\0';
+    return true;
+}
+
+/* True when the recorded content hash is a well-formed SHA-256 the current
+ * bytes can be compared against. */
+static bool mcp_recorded_sha256(const char *sha) {
+    if (!sha || strlen(sha) != CBM_SHA256_HEX_LEN) {
+        return false;
+    }
+    for (int i = 0; i < CBM_SHA256_HEX_LEN; i++) {
+        if (!((sha[i] >= '0' && sha[i] <= '9') || (sha[i] >= 'a' && sha[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* #2585: read a whole file into *bytes (released with cbm_sb_free), so that
+ * the bytes a response serves are the bytes whose hash was checked. */
+static bool mcp_read_file_bytes(const char *abs_path, cbm_sb_t *bytes) {
+    cbm_sb_init(bytes);
+    FILE *file = cbm_fopen(abs_path, "rb");
+    if (!file) {
+        return false;
+    }
+    char buf[CBM_SZ_4K];
+    size_t len;
+    while ((len = fread(buf, 1, sizeof(buf), file)) > 0) {
+        cbm_sb_append_n(bytes, buf, len);
+    }
+    bool valid = !ferror(file) && !bytes->oom;
+    if (fclose(file) != 0) {
+        valid = false;
+    }
+    if (!valid) {
+        cbm_sb_free(bytes);
+    }
+    return valid;
+}
+
+/* Lines [start, end] of an in-memory file, with read_file_lines' semantics
+ * (text-mode line endings, NULL when the range is empty). */
+static char *mcp_slice_lines(cbm_sb_t *bytes, int start, int end) {
+    size_t begin = bytes->len;
+    size_t stop = bytes->len;
+    int lineno = 1;
+    for (size_t i = 0; i < bytes->len; i++) {
+        if (lineno >= start && begin == bytes->len) {
+            begin = i;
+        }
+        if (bytes->buf[i] == '\n') {
+            if (lineno >= end) {
+                stop = i + 1;
+                break;
+            }
+            lineno++;
+        }
+    }
+    if (begin >= stop) {
+        return NULL;
+    }
+    char saved = bytes->buf[stop];
+    bytes->buf[stop] = '\0';
+    char *slice = heap_strdup(bytes->buf + begin);
+    bytes->buf[stop] = saved;
+#ifdef _WIN32
+    /* read_file_lines opens in text mode. */
+    if (slice) {
+        char *out = slice;
+        for (const char *in = slice; *in; in++) {
+            if (!(in[0] == '\r' && in[1] == '\n')) {
+                *out++ = *in;
+            }
+        }
+        *out = '\0';
+    }
+#endif
+    return slice;
+}
+
+/* A path is current when its bytes were verified to be the indexed bytes,
+ * whatever its recorded metadata says. A metadata match whose content could not
+ * be verified is not: it is the verdict the hash check exists to replace. */
+static bool coverage_freshness_current(const char *freshness, bool content_verified) {
+    return content_verified && freshness &&
+           (strcmp(freshness, "metadata_match") == 0 || strcmp(freshness, "content_match") == 0);
+}
+
+/* Freshness of one tracked path. With a recorded content hash the verdict is
+ * by content: "metadata_match" (metadata and bytes agree), "content_changed"
+ * (metadata agrees, bytes differ), "content_match" (metadata is stale, bytes
+ * are identical) or "metadata_changed" (both differ). Without one it falls
+ * back to metadata alone and *content_verified stays false.
+ *
+ * When captured is non-NULL, the file is read once into it (released with
+ * cbm_sb_free) and the verdict is about exactly those bytes, so a caller
+ * serving them cannot race a concurrent write. *captured_ok stays false when
+ * the path never reached the file (missing, outside, not tracked,
+ * unreadable). */
+static const char *coverage_path_freshness_capture(cbm_store_t *store, const char *project,
+                                                   const char *root_path, const char *rel_path,
+                                                   bool *outside, bool *content_verified,
+                                                   cbm_sb_t *captured, bool *captured_ok) {
     *outside = false;
+    *content_verified = false;
+    if (captured) {
+        cbm_sb_init(captured);
+        *captured_ok = false;
+    }
     if (!root_path || !root_path[0]) {
         return "unavailable";
     }
@@ -7083,8 +7262,35 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
         return "unavailable";
     }
     bool matches = hash.mtime_ns == info.mtime_ns && hash.size == info.size;
+    char current[CBM_SHA256_HEX_LEN + 1] = "";
+    bool hashed = false;
+    if (captured) {
+        *captured_ok = mcp_read_file_bytes(abs_path, captured);
+        if (*captured_ok) {
+            cbm_sha256_hex(captured->buf ? captured->buf : "", captured->len, current);
+            hashed = true;
+        }
+    } else {
+        hashed = mcp_recorded_sha256(hash.sha256) && mcp_file_sha256_hex(abs_path, current);
+    }
+    bool verifiable = mcp_recorded_sha256(hash.sha256) && hashed;
+    bool same_bytes = verifiable && strcmp(current, hash.sha256) == 0;
     cbm_store_clear_file_hash(&hash);
-    return matches ? "metadata_match" : "metadata_changed";
+    if (!verifiable) {
+        return matches ? "metadata_match" : "metadata_changed";
+    }
+    *content_verified = true;
+    if (matches) {
+        return same_bytes ? "metadata_match" : "content_changed";
+    }
+    return same_bytes ? "content_match" : "metadata_changed";
+}
+
+static const char *coverage_path_freshness(cbm_store_t *store, const char *project,
+                                           const char *root_path, const char *rel_path,
+                                           bool *outside, bool *content_verified) {
+    return coverage_path_freshness_capture(store, project, root_path, rel_path, outside,
+                                           content_verified, NULL, NULL);
 }
 
 /* Read an "start-end,start-end,...[,+<N>]" string into a JSON ranges array.
@@ -7183,6 +7389,43 @@ static void coverage_add_row_json(yyjson_mut_doc *doc, yyjson_mut_val *array,
     yyjson_mut_arr_add_val(array, item);
 }
 
+enum { COVERAGE_EXCLUDED_PREFIX_LENGTH = 11 };
+
+enum {
+    COVERAGE_STATUS_PARSE,
+    COVERAGE_STATUS_EXCLUDED,
+    COVERAGE_STATUS_SKIPPED,
+    COVERAGE_STATUS_UNRESOLVED,
+    COVERAGE_STATUS_PASSES
+};
+
+static const char *coverage_row_status(const char *kind, int pass) {
+    kind = kind ? kind : "";
+    if (pass == COVERAGE_STATUS_PARSE) {
+        if (strcmp(kind, "parse_unusable") == 0) {
+            return "unusable";
+        }
+        if (strcmp(kind, "parse_partial") == 0) {
+            return "partial";
+        }
+    }
+    if (pass == COVERAGE_STATUS_EXCLUDED &&
+        strncmp(kind, "not_indexed", COVERAGE_EXCLUDED_PREFIX_LENGTH) == 0) {
+        return "excluded";
+    }
+    if (pass == COVERAGE_STATUS_SKIPPED && kind[0] && strcmp(kind, "unresolved_calls") != 0) {
+        return "skipped";
+    }
+    if (pass == COVERAGE_STATUS_UNRESOLVED && strcmp(kind, "unresolved_calls") == 0) {
+        return "unresolved_calls";
+    }
+    return NULL;
+}
+
+static bool coverage_unresolved_complete(bool have_meta, const cbm_coverage_meta_t *meta) {
+    return have_meta && meta->unresolved_calls_complete;
+}
+
 static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
                                    const char *requested_path, const char *recording_status,
                                    bool generation_matches, bool lookup_ok,
@@ -7197,26 +7440,14 @@ static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
             break;
         }
     }
-    for (int pass = 0; pass < 3; pass++) {
+    for (int pass = 0; pass < COVERAGE_STATUS_PASSES; pass++) {
         for (int i = 0; i < count; i++) {
             if (exact && (!rows[i].rel_path || strcmp(rows[i].rel_path, requested_path) != 0)) {
                 continue;
             }
-            const char *kind = rows[i].kind ? rows[i].kind : "";
-            /* "parse_unusable" must be named here. Without its own case it
-             * falls through to the catch-all below and reports "skipped",
-             * which is wrong in the way that matters: the file WAS indexed. */
-            if (pass == 0 && strcmp(kind, "parse_unusable") == 0) {
-                return "unusable";
-            }
-            if (pass == 0 && strcmp(kind, "parse_partial") == 0) {
-                return "partial";
-            }
-            if (pass == 1 && strncmp(kind, "not_indexed", 11) == 0) {
-                return "excluded";
-            }
-            if (pass == 2 && kind[0]) {
-                return "skipped";
+            const char *status = coverage_row_status(rows[i].kind, pass);
+            if (status) {
+                return status;
             }
         }
     }
@@ -7229,12 +7460,16 @@ static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
     return "no_recorded_issue";
 }
 
-static const char *coverage_recommended_action(const char *status, const char *freshness) {
-    if (!freshness || strcmp(freshness, "metadata_match") != 0) {
+static const char *coverage_recommended_action(const char *status, const char *freshness,
+                                               bool content_verified) {
+    if (!coverage_freshness_current(freshness, content_verified)) {
         return "read_source_and_reindex";
     }
     if (strcmp(status, "partial") == 0) {
         return "read_ranges_and_verify_scope";
+    }
+    if (strcmp(status, "unresolved_calls") == 0) {
+        return "read_source_and_verify_calls";
     }
     if (strcmp(status, "unusable") == 0) {
         /* The ranges cover nearly the whole file, so sending a reader to them
@@ -7319,9 +7554,12 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                            have_meta ? meta.ignored_files_total : 0);
     yyjson_mut_obj_add_bool(doc, meta_obj, "hash_records_complete",
                             have_meta && meta.hash_records_complete);
+    yyjson_mut_obj_add_bool(doc, meta_obj, "unresolved_calls_complete",
+                            coverage_unresolved_complete(have_meta, &meta));
     yyjson_mut_obj_add_int(doc, meta_obj, "coverage_version",
                            have_meta ? meta.coverage_version : 0);
     yyjson_mut_obj_add_bool(doc, meta_obj, "generation_matches", generation_matches);
+    mcp_add_store_generation(doc, meta_obj, store);
     yyjson_mut_obj_add_val(doc, root, "metadata", meta_obj);
 
     yyjson_mut_val *path_results = yyjson_mut_arr(doc);
@@ -7361,18 +7599,22 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
                 yyjson_mut_obj_add_str(doc, item, "coverage_lookup", "error");
             }
             bool outside = false;
-            const char *freshness = coverage_path_freshness(
-                store, project, have_project ? proj.root_path : NULL, rel, &outside);
-            bool exact_path_verified =
-                have_meta && meta.hash_records_complete && strcmp(freshness, "metadata_match") == 0;
+            bool content_verified = false;
+            const char *freshness =
+                coverage_path_freshness(store, project, have_project ? proj.root_path : NULL, rel,
+                                        &outside, &content_verified);
+            bool exact_path_verified = have_meta && meta.hash_records_complete &&
+                                       coverage_freshness_current(freshness, content_verified);
             const char *status =
                 outside ? "outside_project"
                         : coverage_status(rows, row_count, rel, recording_status,
                                           generation_matches, lookup_ok, exact_path_verified);
             yyjson_mut_obj_add_strcpy(doc, item, "status", status);
             yyjson_mut_obj_add_strcpy(doc, item, "freshness", freshness);
-            yyjson_mut_obj_add_strcpy(doc, item, "recommended_action",
-                                      coverage_recommended_action(status, freshness));
+            yyjson_mut_obj_add_bool(doc, item, "content_verified", content_verified);
+            yyjson_mut_obj_add_strcpy(
+                doc, item, "recommended_action",
+                coverage_recommended_action(status, freshness, content_verified));
             yyjson_mut_val *coverage = yyjson_mut_arr(doc);
             for (int i = 0; i < row_count; i++) {
                 coverage_add_row_json(doc, coverage, &rows[i], rel, diagnostics_full);
@@ -9890,6 +10132,207 @@ static int clamp_mcp_depth(int depth, const char *tool) {
     return depth;
 }
 
+typedef struct {
+    const cbm_node_t *roots;
+    int root_count;
+    const cbm_traverse_result_t *outbound;
+    const cbm_traverse_result_t *inbound;
+    bool include_tests;
+    bool do_outbound;
+    bool do_inbound;
+} trace_coverage_scope_t;
+
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+    CBMHashTable *callers;
+    CBMHashTable *targets;
+    bool unresolved_out;
+    bool unresolved_in;
+} trace_coverage_match_t;
+
+static bool trace_coverage_add_node(CBMHashTable *table, const cbm_node_t *node) {
+    if (!table || !node->qualified_name) {
+        return true;
+    }
+    cbm_ht_set(table, node->qualified_name, (void *)node);
+    return cbm_ht_has(table, node->qualified_name);
+}
+
+static bool trace_coverage_add_visited(CBMHashTable *table, const cbm_traverse_result_t *tr,
+                                       bool include_tests) {
+    if (!table) {
+        return true;
+    }
+    for (int i = 0; i < tr->visited_count; i++) {
+        const cbm_node_t *node = &tr->visited[i].node;
+        if ((include_tests || !is_test_file(node->file_path)) &&
+            !trace_coverage_add_node(table, node)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool trace_coverage_build_sets(trace_coverage_match_t *match,
+                                      const trace_coverage_scope_t *scope) {
+    for (int i = 0; i < scope->root_count; i++) {
+        if (!trace_coverage_add_node(match->callers, &scope->roots[i]) ||
+            !trace_coverage_add_node(match->targets, &scope->roots[i])) {
+            return false;
+        }
+    }
+    return trace_coverage_add_visited(match->callers, scope->outbound, scope->include_tests) &&
+           trace_coverage_add_visited(match->targets, scope->inbound, scope->include_tests);
+}
+
+static bool trace_coverage_may_target_project(const trace_coverage_match_t *match,
+                                              const char *name) {
+    if (!name || !name[0]) {
+        return true;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_name(match->store, match->project, name, &nodes, &count);
+    /* An unsuccessful lookup cannot prove that the callee is outside the
+     * project. Free the allocated result even when it contains zero rows. */
+    bool possible = rc != CBM_STORE_OK;
+    for (int i = 0; i < count && !possible; i++) {
+        const char *label = nodes[i].label;
+        possible = label && strcmp(label, "File") != 0 && strcmp(label, "Folder") != 0 &&
+                   strcmp(label, "Project") != 0 && strcmp(label, "Module") != 0 &&
+                   strcmp(label, "Package") != 0 && strcmp(label, "Section") != 0;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return possible;
+}
+
+static void trace_coverage_match_site(trace_coverage_match_t *match, const char *rel_path,
+                                      yyjson_val *site) {
+    const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+    const char *leaf = yyjson_get_str(yyjson_obj_get(site, "leaf"));
+    const cbm_node_t *caller_node =
+        match->callers && caller ? cbm_ht_get(match->callers, caller) : NULL;
+    int line = yyjson_get_int(yyjson_obj_get(site, "line"));
+    /* The producer joins the exact byte span to the extractor's innermost
+     * caller. Check its file and source range too; never match a containing
+     * factory merely because its range overlaps. */
+    if (caller_node && caller_node->file_path && strcmp(caller_node->file_path, rel_path) == 0 &&
+        (line <= 0 || (line >= caller_node->start_line && line <= caller_node->end_line)) &&
+        trace_coverage_may_target_project(match, leaf)) {
+        match->unresolved_out = true;
+    }
+}
+
+static void trace_coverage_match_row(trace_coverage_match_t *match, const cbm_coverage_row_t *row) {
+    yyjson_doc *detail = yyjson_read(row->detail, strlen(row->detail), 0);
+    yyjson_val *sites = detail ? yyjson_doc_get_root(detail) : NULL;
+    if (!yyjson_is_arr(sites)) {
+        match->unresolved_out = true;
+    } else {
+        size_t idx;
+        size_t max;
+        yyjson_val *site;
+        yyjson_arr_foreach(sites, idx, max, site) {
+            if (!yyjson_is_obj(site) || yyjson_get_bool(yyjson_obj_get(site, "truncated"))) {
+                match->unresolved_out = true;
+                break;
+            }
+            trace_coverage_match_site(match, row->rel_path, site);
+        }
+    }
+    if (detail) {
+        yyjson_doc_free(detail);
+    }
+}
+
+typedef struct {
+    trace_coverage_match_t *match;
+    CBMHashTable *files;
+    bool ok;
+} trace_coverage_query_t;
+
+static void trace_coverage_query_file(const char *key, void *value, void *userdata) {
+    (void)key;
+    const cbm_node_t *caller = value;
+    trace_coverage_query_t *query = userdata;
+    const char *path = caller->file_path;
+    if (!query->ok || query->match->unresolved_out || !path || cbm_ht_has(query->files, path)) {
+        return;
+    }
+    cbm_ht_set(query->files, path, value);
+    if (!cbm_ht_has(query->files, path)) {
+        query->ok = false;
+        return;
+    }
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    query->ok = cbm_store_coverage_get_unresolved_path(query->match->store, query->match->project,
+                                                       path, &rows, &count) == CBM_STORE_OK;
+    for (int i = 0; query->ok && i < count; i++) {
+        trace_coverage_match_row(query->match, &rows[i]);
+    }
+    cbm_store_free_coverage(rows, count);
+}
+
+static void trace_coverage_query_candidate(const char *key, void *value, void *userdata) {
+    (void)value;
+    trace_coverage_query_t *query = userdata;
+    if (!query->ok || query->match->unresolved_in) {
+        return;
+    }
+    query->ok =
+        cbm_store_coverage_has_unresolved_candidate(query->match->store, query->match->project, key,
+                                                    &query->match->unresolved_in) == CBM_STORE_OK;
+}
+
+static bool trace_coverage_query_evidence(trace_coverage_match_t *match,
+                                          const trace_coverage_scope_t *scope) {
+    trace_coverage_query_t query = {.match = match, .ok = true};
+    if (scope->do_outbound) {
+        query.files = cbm_ht_create(0);
+        if (!query.files) {
+            return false;
+        }
+        cbm_ht_foreach(match->callers, trace_coverage_query_file, &query);
+        cbm_ht_free(query.files);
+    }
+    if (scope->do_inbound) {
+        cbm_ht_foreach(match->targets, trace_coverage_query_candidate, &query);
+    }
+    return query.ok;
+}
+
+static bool trace_coverage_meta_available(cbm_store_t *store, const char *project) {
+    cbm_coverage_meta_t meta = {0};
+    int rc = cbm_store_coverage_meta_get(store, project, &meta);
+    bool available = rc == CBM_STORE_OK &&
+                     meta.coverage_version >= CBM_UNRESOLVED_CALL_COVERAGE_VERSION &&
+                     meta.unresolved_calls_complete;
+    cbm_store_coverage_meta_clear(&meta);
+    return available;
+}
+
+static void trace_call_coverage(cbm_store_t *store, const char *project,
+                                const trace_coverage_scope_t *scope, bool includes_calls,
+                                bool *unresolved_out, bool *unresolved_in) {
+    if (!includes_calls) {
+        return;
+    }
+    trace_coverage_match_t match = {.store = store,
+                                    .project = project,
+                                    .callers = scope->do_outbound ? cbm_ht_create(0) : NULL,
+                                    .targets = scope->do_inbound ? cbm_ht_create(0) : NULL};
+    bool ok = trace_coverage_meta_available(store, project) &&
+              (!scope->do_outbound || match.callers) && (!scope->do_inbound || match.targets) &&
+              trace_coverage_build_sets(&match, scope) &&
+              trace_coverage_query_evidence(&match, scope);
+    *unresolved_out = ok ? match.unresolved_out : scope->do_outbound;
+    *unresolved_in = ok ? match.unresolved_in : scope->do_inbound;
+    cbm_ht_free(match.callers);
+    cbm_ht_free(match.targets);
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
@@ -10226,6 +10669,27 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     bool optional_fields_omitted = false;
     char *json = NULL;
 
+    bool trace_includes_calls = false;
+    for (int i = 0; i < edge_type_count; i++) {
+        if (strcmp(edge_types[i], "CALLS") == 0) {
+            trace_includes_calls = true;
+            break;
+        }
+    }
+    bool unresolved_out = false;
+    bool unresolved_in = false;
+    trace_coverage_scope_t coverage_scope = {.roots = nodes,
+                                             .root_count = node_count,
+                                             .outbound = &tr_out,
+                                             .inbound = &tr_in,
+                                             .include_tests = include_tests,
+                                             .do_outbound = do_outbound,
+                                             .do_inbound = do_inbound};
+    trace_call_coverage(store, project, &coverage_scope, trace_includes_calls, &unresolved_out,
+                        &unresolved_in);
+    const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
+    const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
+
 render_trace_output:;
     int rows_left = row_target;
     out_len = requested_out_len < rows_left ? requested_out_len : rows_left;
@@ -10314,7 +10778,7 @@ render_trace_output:;
         bool flat_trace = render_risk || render_data_flow;
         if (do_outbound) {
             cbm_tree_scalar_int(&sb, "callees_total", out_total);
-            cbm_tree_scalar_str(&sb, "callees_total_relation", tr_out.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callees_total_relation", out_relation);
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callees", &view_out, render_risk, include_tests,
                                   render_data_flow, render_evidence, &out_edge_ctx);
@@ -10325,7 +10789,7 @@ render_trace_output:;
         }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
-            cbm_tree_scalar_str(&sb, "callers_total_relation", tr_in.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callers_total_relation", in_relation);
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callers", &view_in, render_risk, include_tests,
                                   render_data_flow, render_evidence, &in_edge_ctx);
@@ -10391,8 +10855,7 @@ render_trace_output:;
         }
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
-            yyjson_mut_obj_add_str(doc, root, "callees_total_relation",
-                                   tr_out.truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
             yyjson_mut_obj_add_val(
                 doc, root, "callees",
                 bfs_to_tree_json(doc, &view_out, risk_labels && emit_optional_fields, include_tests,
@@ -10401,8 +10864,7 @@ render_trace_output:;
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
-            yyjson_mut_obj_add_str(doc, root, "callers_total_relation",
-                                   tr_in.truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_str(doc, root, "callers_total_relation", in_relation);
             yyjson_mut_obj_add_val(
                 doc, root, "callers",
                 bfs_to_tree_json(doc, &view_in, risk_labels && emit_optional_fields, include_tests,
@@ -10460,13 +10922,11 @@ render_trace_output:;
                 cbm_sb_init(&floor);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
-                    cbm_tree_scalar_str(&floor, "callees_total_relation",
-                                        tr_out.truncated ? "gte" : "eq");
+                    cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
                 }
                 if (do_inbound) {
                     cbm_tree_scalar_int(&floor, "callers_total", in_total);
-                    cbm_tree_scalar_str(&floor, "callers_total_relation",
-                                        tr_in.truncated ? "gte" : "eq");
+                    cbm_tree_scalar_str(&floor, "callers_total_relation", in_relation);
                 }
                 cbm_tree_scalar_bool(&floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -10491,12 +10951,11 @@ render_trace_output:;
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
-                                           tr_out.truncated ? "gte" : "eq");
+                                           out_relation);
                 }
                 if (do_inbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callers_total", in_total);
-                    yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation",
-                                           tr_in.truncated ? "gte" : "eq");
+                    yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation", in_relation);
                 }
                 yyjson_mut_obj_add_bool(floor_doc, floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -11012,11 +11471,12 @@ static bool is_parse_unusable(const cbm_file_error_t *e) {
     return e->phase && strcmp(e->phase, "parse_unusable") == 0;
 }
 
-/* Either coverage phase. Both mean the file WAS indexed, so both must stay out
+/* All coverage phases mean the file WAS indexed, so they must stay out
  * of skipped[] — a reader who sees a file there believes it is absent from the
  * graph entirely. */
-static bool is_parse_coverage(const cbm_file_error_t *e) {
-    return is_parse_partial(e) || is_parse_unusable(e);
+static bool is_indexed_coverage(const cbm_file_error_t *e) {
+    return is_parse_partial(e) || is_parse_unusable(e) ||
+           (e->phase && strcmp(e->phase, "unresolved_calls") == 0);
 }
 
 /* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
@@ -11026,17 +11486,20 @@ static bool is_parse_coverage(const cbm_file_error_t *e) {
  * and, if a per-run logfile was written, "logfile": "<path>".
  * The run status stays "indexed" — a skipped file is the expected handled
  * outcome, not a failure. errs[] is borrowed (copied into doc) and may contain
- * parse_partial and parse_unusable entries, which are filtered out here (both
- * reported separately by add_parse_partial_summary). */
+ * parse_partial, parse_unusable, and unresolved_calls entries. These describe
+ * indexed files and are counted separately from skips. */
 static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_file_error_t *errs, int count, const char *logfile) {
     int skips = 0;
+    int unresolved = 0;
     for (int i = 0; i < count; i++) {
-        if (!is_parse_coverage(&errs[i])) {
+        unresolved += errs[i].phase && strcmp(errs[i].phase, "unresolved_calls") == 0;
+        if (!is_indexed_coverage(&errs[i])) {
             skips++;
         }
     }
     yyjson_mut_obj_add_int(doc, root, "skipped_count", skips);
+    yyjson_mut_obj_add_int(doc, root, "unresolved_calls_count", unresolved);
     if (logfile && logfile[0]) {
         yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
     }
@@ -11047,7 +11510,7 @@ static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_val *files = yyjson_mut_arr(doc);
     int shown = 0;
     for (int i = 0; i < count && shown < INDEX_SKIPPED_FILE_CAP; i++) {
-        if (is_parse_coverage(&errs[i])) {
+        if (is_indexed_coverage(&errs[i])) {
             continue;
         }
         yyjson_mut_val *fe = yyjson_mut_obj(doc);
@@ -13060,8 +13523,10 @@ static char *snippet_pdf_text(const cbm_node_t *node) {
     return out;
 }
 
+/* #2585: when captured is non-NULL the lines come from those already-read
+ * bytes instead of a fresh read of the file. */
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
+                                    int end, cbm_sb_t *captured, char **out_abs_path) {
     *out_abs_path = NULL;
     if (!root_path || !file_path) {
         return NULL;
@@ -13072,7 +13537,8 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
 
     *out_abs_path = abs_path;
     if (cbm_path_within_root(root_path, abs_path)) {
-        return read_file_lines(abs_path, start, end);
+        return captured ? mcp_slice_lines(captured, start, end)
+                        : read_file_lines(abs_path, start, end);
     }
     return NULL;
 }
@@ -13557,15 +14023,44 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     if (!outline && end < original_end) {
         snippet_clipped = true;
     }
+    /* #2585: start/end are indexed line numbers. Slice the file only when its
+     * bytes are the indexed bytes; otherwise the same range can hold another
+     * symbol's code. The file is read once: the slice comes from the same
+     * bytes whose hash was checked, so a concurrent write cannot slip in
+     * between. Unverifiable files keep the previous behavior and say so
+     * through content_verified. */
+    const char *source_freshness = NULL;
+    bool source_content_verified = false;
+    bool source_drift = false;
+    cbm_sb_t captured;
+    cbm_sb_init(&captured);
+    bool captured_ok = false;
+    if (!outline && !snippet_is_pdf(node->file_path) && root_path && node->file_path) {
+        bool outside = false;
+        source_freshness = coverage_path_freshness_capture(
+            srv->store, node->project, root_path, node->file_path, &outside,
+            &source_content_verified, &captured, &captured_ok);
+        source_drift = source_content_verified &&
+                       !coverage_freshness_current(source_freshness, source_content_verified);
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (srv->snippet_capture_test_hook) {
+            srv->snippet_capture_test_hook(srv->snippet_capture_test_context, node->file_path);
+        }
+#endif
+    }
     char *abs_path = NULL;
     char *source = NULL;
-    if (outline) {
+    if (outline || source_drift) {
         source = NULL;
     } else if (snippet_is_pdf(node->file_path)) {
         source = snippet_pdf_text(node); /* never the file's bytes */
     } else {
-        source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+        /* Without captured bytes (not tracked, unreadable) the file is read
+         * here, and the snippet is never content-verified. */
+        source = resolve_snippet_source(root_path, node->file_path, start, end,
+                                        captured_ok ? &captured : NULL, &abs_path);
     }
+    cbm_sb_free(&captured);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -13585,6 +14080,13 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
+    mcp_add_store_generation(doc, root_obj, srv->store);
+    yyjson_mut_obj_add_bool(doc, root_obj, "content_verified", source_content_verified);
+    if (source_drift) {
+        yyjson_mut_obj_add_bool(doc, root_obj, "source_drift", true);
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "freshness", source_freshness);
+        yyjson_mut_obj_add_str(doc, root_obj, "recommended_action", "reindex_then_retry");
+    }
     if (snippet_clipped) {
         yyjson_mut_obj_add_bool(doc, root_obj, "source_truncated", true);
         yyjson_mut_obj_add_bool(doc, root_obj, "source_clipped", true); /* compatibility */

@@ -148,38 +148,36 @@ static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *d
 
     if (type_str && strcmp(type_str, "string") == 0 && enum_val && yyjson_is_arr(enum_val) &&
         yyjson_arr_size(enum_val) > 0) {
-        sb_append(sb, "Type.Union([");
         size_t enum_idx = 0;
         size_t enum_max = yyjson_arr_size(enum_val);
-        bool first_enum = true;
+        size_t valid_count = 0;
         for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
-            yyjson_val *enum_item = yyjson_arr_get(enum_val, enum_idx);
-            const char *enum_str = yyjson_get_str(enum_item);
-            if (!enum_str) {
-                continue;
+            if (yyjson_get_str(yyjson_arr_get(enum_val, enum_idx))) {
+                valid_count++;
             }
-            if (!first_enum) {
-                sb_append(sb, ", ");
-            }
-            first_enum = false;
-            sb_append(sb, "Type.Literal(");
-            sb_append_js_string(sb, enum_str);
-            sb_append(sb, ")");
         }
-        if (first_enum) {
-            sb_append(sb, "Type.String()");
-        } else {
+        if (valid_count > 0) {
+            sb_append(sb, "Type.String({ enum: [");
+            bool first_enum = true;
+            for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+                const char *enum_str = yyjson_get_str(yyjson_arr_get(enum_val, enum_idx));
+                if (!enum_str) {
+                    continue;
+                }
+                if (!first_enum) {
+                    sb_append(sb, ", ");
+                }
+                first_enum = false;
+                sb_append_js_string(sb, enum_str);
+            }
             sb_append(sb, "]");
             if (include_description && description) {
-                sb_append(sb, ", { description: ");
+                sb_append(sb, ", description: ");
                 sb_append_js_string(sb, description);
-                sb_append(sb, " }");
             }
-            sb_append(sb, ")");
+            sb_append(sb, " })");
             return;
         }
-        sb_append(sb, ")");
-        return;
     }
 
     const char *typebox_name = "Any";
