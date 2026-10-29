@@ -1228,6 +1228,7 @@ static bool dg_word_at(dg_str_t s, const char *word) {
  * an id, or `[*]`; its id in *id; the position after it (i when none). */
 static size_t dg_puml_operand(dg_str_t s, size_t i, dg_str_t *id, dg_str_t *label) {
     i = dg_skip_ws(s, i);
+    *id = dg_s(NULL, 0);
     *label = dg_s(NULL, 0);
     if (i + CBM_SZ_3 <= s.n && memcmp(s.p + i, "[*]", CBM_SZ_3) == 0) {
         *id = dg_s(s.p + i, CBM_SZ_3);

@@ -329,6 +329,66 @@ TEST(diagrams_plantuml) {
     PASS();
 }
 
+/* Missing endpoints must not reuse an uninitialized operand (#2818). */
+TEST(diagrams_plantuml_edge_messages) {
+    static const char *const messages[] = {"Alice ->: x", "Alice <-: x", "[-> Alice: x"};
+    for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); i++) {
+        char src[512];
+        snprintf(src, sizeof(src),
+                 "@startuml\n!include header.puml\nparticipant Alice\nparticipant Bob\n"
+                 "%s\nAlice -> Bob : hello\n@enduml\n",
+                 messages[i]);
+        CBMFileResult *r = dg_file(src, "docs/edge.puml");
+        ASSERT_NOT_NULL(r);
+        ASSERT_NOT_NULL(dg_def(r, "edge#diagram-1.Alice"));
+        ASSERT_NOT_NULL(dg_def(r, "edge#diagram-1.Bob"));
+        ASSERT_EQ(r->diagram_arrows.count, 1);
+        ASSERT_EQ(dg_arrows(r, "#diagram-1.Alice", "#diagram-1.Bob", "message", "hello"), 1);
+        ASSERT_EQ(dm_count_tokens(r, "header.puml"), 1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(diagrams_plantuml_unterminated_operands) {
+    static const char *const lines[] = {"[Missing -> Bob",
+                                        "(Missing -> Bob",
+                                        ":Missing -> Bob",
+                                        "\"Missing -> Bob",
+                                        "Alice -> [Missing",
+                                        "Alice -> (Missing",
+                                        "Alice -> :Missing",
+                                        "Alice -> \"Missing",
+                                        "participant [Missing",
+                                        "participant (Missing",
+                                        "participant :Missing",
+                                        "participant \"Missing",
+                                        "participant \"Label\" as [Missing",
+                                        "participant \"Label\" as (Missing",
+                                        "participant \"Label\" as :Missing",
+                                        "participant \"Label\" as \"Missing"};
+    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
+        char src[512];
+        snprintf(src, sizeof(src),
+                 "@startuml\nparticipant Alice\nparticipant Bob\n%s\n"
+                 "Alice -> Bob : hello\n@enduml\n",
+                 lines[i]);
+        CBMFileResult *r = dg_file(src, "docs/invalid.puml");
+        ASSERT_NOT_NULL(r);
+        int elements = 0;
+        for (int j = 0; j < r->defs.count; j++) {
+            elements += strcmp(r->defs.items[j].label, "DiagramElement") == 0;
+        }
+        ASSERT_EQ(elements, 2);
+        ASSERT_NOT_NULL(dg_def(r, "invalid#diagram-1.Alice"));
+        ASSERT_NOT_NULL(dg_def(r, "invalid#diagram-1.Bob"));
+        ASSERT_EQ(r->diagram_arrows.count, 1);
+        ASSERT_EQ(dg_arrows(r, "#diagram-1.Alice", "#diagram-1.Bob", "message", "hello"), 1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
 TEST(diagrams_dot) {
     CBMFileResult *r =
         dg_file("digraph G {\n"
@@ -1101,6 +1161,8 @@ SUITE(diagrams) {
     RUN_TEST(diagrams_mermaid_kinds);
     RUN_TEST(diagrams_other_fences);
     RUN_TEST(diagrams_plantuml);
+    RUN_TEST(diagrams_plantuml_edge_messages);
+    RUN_TEST(diagrams_plantuml_unterminated_operands);
     RUN_TEST(diagrams_dot);
     RUN_TEST(diagrams_d2);
     RUN_TEST(diagrams_drawio);
