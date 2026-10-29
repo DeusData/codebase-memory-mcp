@@ -1,0 +1,15 @@
+m# >>> codebase-memory-mcp MCP >>>
+[mcp_servers.codebase-memory-mcp]
+command = "/old/codebase-memory-mcp"
+args = []
+startup_timeout_sec = 90
+[mcp_servers.codebase-memory-mcp.env]
+RECOVERY_SENTINEL = "kept"
+# >>> codebase-memory-mcp SessionStart >>>
+[[hooks.SessionStart]]
+matcher = "startup|resume|clear|compact"
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/old/codebase-memory-mcp hook-augment"
+timeout = 5
+# <<< codebase-memory-mcp SessionStart <<<
