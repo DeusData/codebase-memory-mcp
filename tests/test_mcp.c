@@ -10,6 +10,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
 #include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
+#include "../src/foundation/sha256.h"
 #include "../src/foundation/str_util.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
@@ -7183,7 +7184,16 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
      * metadata_match contract below would fail. */
     cbm_path_info_t path_info;
     ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+    /* The real content hash, as the indexer records it: a path counts as
+     * current only when its bytes are verified (#2585). */
+    char content[4096];
+    FILE *source = fopen(source_path, "rb");
+    ASSERT_NOT_NULL(source);
+    size_t content_len = fread(content, 1, sizeof(content), source);
+    fclose(source);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(content, content_len, sha);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", sha, path_info.mtime_ns,
                                          path_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
@@ -7334,6 +7344,286 @@ TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed) {
 
     free(inner);
     free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* #2585 fixtures: record main.go's hash row with its real size and either its
+ * real or a shifted mtime, and either its real content hash or another
+ * file's. This reaches each freshness state without touching file times, which
+ * some platforms cannot set precisely. */
+static int record_main_go_hash(cbm_store_t *store, const char *tmp, bool real_content,
+                               bool real_mtime) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != 0) {
+        return CBM_STORE_ERR;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return CBM_STORE_ERR;
+    }
+    char bytes[4096];
+    size_t len = fread(bytes, 1, sizeof(bytes), fp);
+    fclose(fp);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    if (real_content) {
+        cbm_sha256_hex(bytes, len, sha);
+    } else {
+        cbm_sha256_hex("other bytes", strlen("other bytes"), sha);
+    }
+    int64_t mtime_ns = real_mtime ? info.mtime_ns : info.mtime_ns - (int64_t)CBM_NSEC_PER_SEC;
+    return cbm_store_upsert_file_hash(store, "test-project", "main.go", sha, mtime_ns, info.size);
+}
+
+static yyjson_val *coverage_first_path(cbm_mcp_server_t *srv, yyjson_doc **doc, char **inner) {
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                         "\"format\":\"json\"}");
+    *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = *inner ? yyjson_read(*inner, strlen(*inner), 0) : NULL;
+    return *doc ? yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(*doc), "paths"), 0) : NULL;
+}
+
+/* #2585: freshness judged by mtime and size passed a same-size edit whose
+ * timestamp was preserved, and stayed stale after identical bytes were
+ * rewritten. With a recorded content hash it now reports the bytes. */
+TEST(tool_check_index_coverage_freshness_verifies_content_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    ASSERT_EQ(write_coverage_meta(store, project.indexed_at, "complete"), CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+
+    static const struct {
+        bool real_content;
+        bool real_mtime;
+        const char *freshness;
+        const char *action;
+    } cases[] = {
+        /* Same metadata, different bytes: previously metadata_match. */
+        {false, true, "content_changed", "read_source_and_reindex"},
+        {true, true, "metadata_match", "use_graph_with_best_effort_caveat"},
+        /* Stale metadata, identical bytes: previously metadata_changed. */
+        {true, false, "content_match", "use_graph_with_best_effort_caveat"},
+        {false, false, "metadata_changed", "read_source_and_reindex"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(record_main_go_hash(store, tmp, cases[i].real_content, cases[i].real_mtime),
+                  CBM_STORE_OK);
+        yyjson_doc *doc = NULL;
+        char *inner = NULL;
+        yyjson_val *path = coverage_first_path(srv, &doc, &inner);
+        ASSERT_NOT_NULL(path);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), cases[i].freshness);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")), cases[i].action);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* A row without a usable content hash keeps the metadata verdict and says
+     * the content was not verified. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", 0, 0),
+              CBM_STORE_OK);
+    yyjson_doc *doc = NULL;
+    char *inner = NULL;
+    yyjson_val *path = coverage_first_path(srv, &doc, &inner);
+    ASSERT_NOT_NULL(path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_changed");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* Matching metadata alone is not evidence the bytes are current: without
+     * a usable hash, the path must not be recommended as if it were. */
+    char main_go[512];
+    snprintf(main_go, sizeof(main_go), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(main_go, &info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", info.mtime_ns,
+                                         info.size),
+              CBM_STORE_OK);
+    path = coverage_first_path(srv, &doc, &inner);
+    ASSERT_NOT_NULL(path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_match");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")),
+                  "read_source_and_reindex");
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+static char *snippet_process_order(cbm_mcp_server_t *srv, yyjson_doc **doc) {
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.ProcessOrder\",\"format\":\"json\"}");
+    char *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    return inner;
+}
+
+/* #2585 (and #1750): the snippet's line range is the indexed range. When the
+ * file's bytes are not the indexed bytes, the same range can hold another
+ * symbol's code, so the source is withheld rather than misattributed. */
+TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    /* Same metadata, different bytes: mtime/size cannot see this, and the
+     * indexed range would be sliced from bytes that were never indexed. */
+    ASSERT_EQ(record_main_go_hash(store, tmp, false, true), CBM_STORE_OK);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "freshness")), "content_changed");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "recommended_action")), "reindex_then_retry");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* The indexed bytes, with current or stale metadata, are served. */
+    for (int real_mtime = 1; real_mtime >= 0; real_mtime--) {
+        ASSERT_EQ(record_main_go_hash(store, tmp, true, real_mtime == 1), CBM_STORE_OK);
+        inner = snippet_process_order(srv, &doc);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_NOT_NULL(
+            strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func ProcessOrder"));
+        ASSERT_NULL(yyjson_obj_get(root, "source_drift"));
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* Without a usable hash the previous behavior holds, marked unverified. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", 0, 0), CBM_STORE_OK);
+    inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func ProcessOrder"));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Rewrites main.go so that the indexed ProcessOrder range holds other code. */
+static void snippet_capture_rewrite(void *context, const char *rel_path) {
+    (void)rel_path;
+    FILE *fp = fopen((const char *)context, "w");
+    if (fp) {
+        fputs("package main\n\n// a\n// b\n// c\n// d\nfunc Intruder() {\n}\n", fp);
+        fclose(fp);
+    }
+}
+
+/* #2585: the bytes get_code_snippet serves must be the bytes it verified. A
+ * write landing after the hash check and before the slice must not produce a
+ * content_verified snippet holding code that was never indexed. */
+TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+    char main_go[512];
+    snprintf(main_go, sizeof(main_go), "%s/project/main.go", tmp);
+
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, snippet_capture_rewrite, main_go);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_process_order(srv, &doc);
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    const char *source = yyjson_get_str(yyjson_obj_get(root, "source"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    ASSERT_NULL(strstr(source, "Intruder"));
+    ASSERT_NOT_NULL(strstr(source, "func ProcessOrder"));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* The write did land: the next call sees it and withholds the source. */
+    inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+#endif
+
+/* #2585: metadata.generation names the coverage-recording run and does not
+ * change on incremental re-index, so it cannot tell two publications apart.
+ * store_generation does, and every response that carries it agrees. */
+TEST(tool_responses_carry_store_generation_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(write_coverage_meta(store, "coverage-run-1", "complete"), CBM_STORE_OK);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+
+    char before[96];
+    ASSERT_EQ(cbm_store_generation(store, before, sizeof(before)), CBM_STORE_OK);
+    yyjson_doc *cdoc = NULL;
+    char *cinner = NULL;
+    ASSERT_NOT_NULL(coverage_first_path(srv, &cdoc, &cinner));
+    yyjson_val *meta = yyjson_obj_get(yyjson_doc_get_root(cdoc), "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "store_generation")), before);
+    yyjson_doc *sdoc = NULL;
+    char *sinner = snippet_process_order(srv, &sdoc);
+    ASSERT_NOT_NULL(sdoc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(sdoc), "store_generation")),
+                  before);
+    yyjson_doc_free(cdoc);
+    free(cinner);
+    yyjson_doc_free(sdoc);
+    free(sinner);
+
+    /* An index run advances the store generation, not the coverage one. */
+    char project_dir[512];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", tmp);
+    ASSERT_EQ(cbm_store_upsert_project(store, "test-project", project_dir), CBM_STORE_OK);
+    char after[96];
+    ASSERT_EQ(cbm_store_generation(store, after, sizeof(after)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(after, before);
+    ASSERT_NOT_NULL(coverage_first_path(srv, &cdoc, &cinner));
+    meta = yyjson_obj_get(yyjson_doc_get_root(cdoc), "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "store_generation")), after);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "generation")), "coverage-run-1");
+    yyjson_doc_free(cdoc);
+    free(cinner);
+
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -25957,6 +26247,12 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
+    RUN_TEST(tool_check_index_coverage_freshness_verifies_content_issue2585);
+    RUN_TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585);
+#endif
+    RUN_TEST(tool_responses_carry_store_generation_issue2585);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
