@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/platform.h"
 #include "foundation/constants.h"     /* CBM_SZ_* */
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
@@ -852,6 +853,57 @@ TEST(ruby_module) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def_any(r, "Greetable"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A Ruby `Const.new` call is rewritten to name the CONSTANT, not the method:
+ * the constructor body lives in `initialize`, so the call should link the class
+ * like every other language's `new T()`. The rewrite fired only for bare
+ * `constant` receivers, so a scope-resolved receiver kept the whole call text
+ * as its callee ("Admin::User.new"), which resolves to nothing and cannot join
+ * the Ruby LSP's constructor rows, whose callee is the class QN.
+ *
+ * Both spellings must land on the bare constant path; a retained ".new" suffix
+ * is the bug's signature. */
+TEST(ruby_constructor_callee_is_constant_path) {
+    CBMFileResult *r = extract("module Admin\n  class User\n  end\nend\n"
+                               "class Widget\nend\n"
+                               "class Maker\n"
+                               "  def build\n"
+                               "    Admin::User.new\n"
+                               "    Widget.new\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_RUBY, "t", "maker.rb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int scoped = 0, bare = 0, kept_new = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *callee = r->calls.items[i].callee_name;
+        if (strcmp(callee, "Admin::User") == 0)
+            scoped = 1;
+        if (strcmp(callee, "Widget") == 0)
+            bare = 1;
+        /* Either failure mode: the method name survived on its own, or the
+         * whole `Recv.new` expression did. */
+        size_t n = strlen(callee);
+        if (strcmp(callee, "new") == 0 || (n >= 4 && strcmp(callee + n - 4, ".new") == 0))
+            kept_new = 1;
+    }
+    if (!scoped || !bare || kept_new) {
+        printf("  ruby callees (%d):\n", r->calls.count);
+        for (int i = 0; i < r->calls.count; i++)
+            printf("    '%s'\n", r->calls.items[i].callee_name);
+    }
+    /* Scope-resolved receiver reduces to the constant path; its bare leaf is
+     * what resolution joins on. */
+    ASSERT(scoped);
+    /* Bare receiver: pre-existing behaviour, guarded against regression. */
+    ASSERT(bare);
+    ASSERT_FALSE(kept_new);
+
     cbm_free_result(r);
     PASS();
 }
@@ -5424,6 +5476,24 @@ TEST(extract_python_bare_decorator_route_rules) {
     ASSERT_STR_EQ(index->route_path, "/");
     ASSERT_STR_EQ(index->route_method, "ANY");
 
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #2090: Solidity modifier_invocation tracked as decorator. */
+TEST(solidity_modifier_decorator) {
+    CBMFileResult *r = extract("pragma solidity ^0.8.0;\n"
+                               "contract Vault {\n"
+                               "    modifier onlyOwner() { _; }\n"
+                               "    function withdraw() public onlyOwner {\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SOLIDITY, "t", "Vault.sol");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "withdraw");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "onlyOwner"));
     cbm_free_result(r);
     PASS();
 }
@@ -10863,6 +10933,49 @@ TEST(extract_rescript_let_bindings_use_the_walk_cursor) {
     ASSERT_EQ(big_fallbacks, 0);
     PASS();
 }
+
+/* Every Python usage asks whether it is a global/nonlocal name and whether it
+ * sits in a parameter default. Both climbed with ts_node_parent, which
+ * descends from the ROOT: O(d^2) for a usage d deep, so one deep expression
+ * went cubic (2.2 s / 17 s / >90 s at 500/1000/2000 terms). Count every such
+ * root-descending step at N and 2N terms. */
+TEST(extract_python_deep_default_parent_climbs_are_linear) {
+    enum { SMALL = 200 };
+    uint64_t slow_parents[2];
+    for (int round = 0; round < 2; round++) {
+        /* def f(x=x + x + ... + x): return x -- a binary_operator chain. */
+        int terms = SMALL << round;
+        size_t capacity = 32U + (size_t)terms * 4U;
+        char *source = malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        int length = snprintf(source, capacity, "def f(x=x");
+        for (int i = 1; i < terms; i++) {
+            length += snprintf(source + length, capacity - (size_t)length, " + x");
+        }
+        length += snprintf(source + length, capacity - (size_t)length, "):\n    return x\n");
+        cbm_usage_field_lookup_test_reset();
+        CBMFileResult *result =
+            cbm_extract_file(source, length, CBM_LANG_PYTHON, "proj", "deep.py", 0, NULL, NULL);
+        free(source);
+        ASSERT_NOT_NULL(result);
+        slow_parents[round] = cbm_usage_slow_parent_fallback_test_count();
+        /* Anti-vacuous: every default x climbed its chain to the parameter and
+         * reads the enclosing namespace; only `return x` is shadowed by it. */
+        int defaults = 0;
+        for (int i = 0; i < result->usages.count; i++) {
+            const CBMUsage *usage = &result->usages.items[i];
+            defaults += usage->ref_name && strcmp(usage->ref_name, "x") == 0 &&
+                        !usage->semantic_reference_local_shadow;
+        }
+        cbm_free_result(result);
+        ASSERT_EQ(defaults, terms);
+    }
+    fprintf(stderr, "  [python-deep-default] slow_parents(%d)=%llu slow_parents(%d)=%llu\n", SMALL,
+            (unsigned long long)slow_parents[0], 2 * SMALL, (unsigned long long)slow_parents[1]);
+    /* Twice the terms may cost about twice the steps; the cubic climb took 4x. */
+    ASSERT_LTE(slow_parents[1], slow_parents[0] * 3U + 64U);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -13321,7 +13434,42 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
     PASS();
 }
 
+#ifdef _WIN32
+/* The supervisor sets this path through cbm_setenv. Exercise the actual
+ * journal writer, which must read it as UTF-8 before calling cbm_fopen. */
+TEST(extraction_marker_round_trips_non_ascii_environment_path) {
+    char dir[512] = "/tmp/cbm-marker-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char marker[640];
+    snprintf(marker, sizeof(marker), "%s/marker-\xce\x94-\xe4\xb8\x81.log", dir);
+    char saved[4096];
+    const char *previous = cbm_safe_getenv("CBM_INDEX_MARKER_FILE", saved, sizeof(saved), NULL);
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_MARKER_FILE", marker, 1), 0);
+    cbm_index_mark_start("synthetic.cpp");
+    cbm_index_mark_done("synthetic.cpp");
+    if (previous) {
+        (void)cbm_setenv("CBM_INDEX_MARKER_FILE", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_INDEX_MARKER_FILE");
+    }
+    FILE *file = cbm_fopen(marker, "rb");
+    char contents[128] = {0};
+    if (file) {
+        (void)fread(contents, 1, sizeof(contents) - 1, file);
+        (void)fclose(file);
+    }
+    (void)cbm_unlink(marker);
+    (void)cbm_rmdir(dir);
+    ASSERT_NOT_NULL(file);
+    ASSERT_STR_EQ(contents, "S synthetic.cpp\nD synthetic.cpp\n");
+    PASS();
+}
+#endif
+
 SUITE(extraction) {
+#ifdef _WIN32
+    RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
+#endif
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
@@ -13350,6 +13498,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
     RUN_TEST(extract_rescript_let_bindings_use_the_walk_cursor);
+    RUN_TEST(extract_python_deep_default_parent_climbs_are_linear);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
@@ -13439,6 +13588,7 @@ SUITE(extraction) {
     RUN_TEST(php_function);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
+    RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
@@ -13712,6 +13862,7 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_python_bare_decorator_route_rules);
+    RUN_TEST(solidity_modifier_decorator);
     RUN_TEST(arkts_component_struct);
     RUN_TEST(arkts_exported_struct_decorators);
     RUN_TEST(arkts_member_decorators);

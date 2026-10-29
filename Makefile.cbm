@@ -45,8 +45,9 @@ endif
 
 # -Wdate-time: with -Werror, any use of __DATE__/__TIME__/__TIMESTAMP__ fails the
 # build. Build-time entropy is how one identical source tree produced a new hash
-# on every compile (see the local patch in vendored/mimalloc/src/options.c) —
-# once removed, it must not creep back through a new call site.
+# on every compile (mimalloc's version banner, patched locally until upstream
+# dropped the clock in v3.4.5; see vendored/mimalloc/PATCHES.md) — once
+# removed, it must not creep back through a new call site.
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Wno-unused-parameter -Wno-sign-compare -Wdate-time \
                 $(GCC_ONLY_FLAGS) \
@@ -182,8 +183,9 @@ endif
 ifeq ($(IS_MINGW),yes)
 # --no-insert-timestamp: the PE header otherwise carries the link wall clock, so
 # two Windows builds of identical source are never byte-identical and every
-# release is a brand-new file to a reputation system. Same motivation as the
-# mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
+# release is a brand-new file to a reputation system. Same motivation as
+# dropping mimalloc's __DATE__ banner; ELF and Mach-O have no equivalent field
+# to clear.
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -lbcrypt -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
@@ -644,6 +646,18 @@ ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
+# MI_MINGW_UCRT64: since 3.5.3, mimalloc treats a MinGW build as having a
+# process-attach hook only when this is defined (src/prim/windows/prim.c);
+# upstream's CMake sets it, this Makefile must too. Without it src/prim/prim.c
+# also compiles its constructor, so _mi_auto_process_init runs twice (that
+# constructor plus the CRT TLS callback) and the second options flush writes a
+# stray newline to stderr before main: a blank first line on every run, which
+# failed smoke-win's one-line --version check. Every MinGW toolchain we build
+# with (MSYS2 CLANG64/CLANGARM64) is UCRT. 3.3.2 had no such condition.
+MIMALLOC_WIN_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_DEFINE := -DMI_MINGW_UCRT64=1
+endif
 # MI_DEBUG=0: the production allocator is mimalloc's RELEASE build. Its header
 # defaults to MI_DEBUG=2 unless NDEBUG is defined, and nothing here defined it,
 # so every shipped binary up to v0.11.0 ran mimalloc's debug build: internal
@@ -653,15 +667,19 @@ endif
 # work inside the allocator (2026-09-17). Committed-bytes accounting, which the
 # memory budget reads, is kept in every build (subproc stats, not MI_STAT).
 # The TEST build below keeps mimalloc's debug checks.
+# MI_PROFILE=0: mimalloc 3.5.2+ compiles its allocation-sampling profiler in by
+# default, which puts a sample countdown on the allocation path. The product
+# never uses it, so the production allocator leaves it out (the contract in
+# tests/test_prod_allocator_contract.sh checks the banner has no profiling line).
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
-                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 \
-                  $(MIMALLOC_OVERRIDE_DEFINE)
+                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 -DMI_PROFILE=0 \
+                  $(MIMALLOC_OVERRIDE_DEFINE) $(MIMALLOC_WIN_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0
+                       -DMI_OVERRIDE=0 $(MIMALLOC_WIN_DEFINE)
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the

@@ -1582,7 +1582,12 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
  *     change to it is GLOBAL (it sets the global usings of a whole project);
  *   - a REMOVED name can make another file's unresolved reference resolve (an
  *     overload group shrinks) or change its reason: the files whose rows
- *     mention it re-resolve with the closure. */
+ *     mention it re-resolve with the closure;
+ *   - an unresolved `path::member` row (missing, ambiguous) depends on the
+ *     member's file as a whole, its text included (a member the file writes
+ *     without a definition is no missing member, doc_links_md.c) and the size
+ *     of a same-named group: the files whose such rows name a changed or
+ *     deleted file, by its base name, re-resolve with the closure. */
 
 /* Add s[0..n) to a heap-keyed name set. false when it cannot be recorded (too
  * long for a key, or out of memory): callers fail closed. */
@@ -1728,6 +1733,58 @@ static void doc_row_name_dependents(const cbm_doc_link_row_t *rows, int n,
             }
         }
     }
+}
+
+/* Is an unresolved row's reason one a member lookup gives (doc_links_md.c)? */
+static bool doc_row_member_reason(const char *reason) {
+    return reason && (strcmp(reason, "missing") == 0 || strcmp(reason, "ambiguous") == 0);
+}
+
+/* Files whose unresolved `path::member` rows name a member of one of `paths`
+ * (the changed and deleted files), and no edge leads from such a row to the
+ * file: a body edit can write or drop a missing member's name without
+ * changing a definition, and a same-named group can shrink to one without
+ * removing its name. Matched by the base name before "::", since a
+ * reference may be written relative to the document or to the root. When
+ * memory runs out every such row's file is added: re-resolving a file that did
+ * not need it costs time, keeping a stale row costs correctness. Keys are
+ * borrowed from `rows`. */
+static void doc_row_member_dependents(const cbm_doc_link_row_t *rows, int n, char *const *paths,
+                                      int npaths, CBMHashTable *out_paths) {
+    if (npaths <= 0) {
+        return;
+    }
+    CBMHashTable *bases = cbm_ht_create(CBM_SZ_64); /* NULL: fail closed, every member row */
+    for (int i = 0; bases && i < npaths; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *base = slash ? slash + SKIP_ONE : paths[i];
+        cbm_ht_set(bases, base, (void *)base); /* borrowed from `paths` */
+    }
+    for (int i = 0; i < n; i++) {
+        const char *raw = rows[i].raw;
+        const char *rel = rows[i].rel_path;
+        const char *sep = raw ? strstr(raw, "::") : NULL;
+        if (!sep || !rel || !rel[0] || !doc_row_member_reason(rows[i].reason) ||
+            cbm_ht_get(out_paths, rel)) {
+            continue;
+        }
+        const char *base = sep;
+        while (base > raw && base[-1] != '/') {
+            base--;
+        }
+        char key[CBM_SZ_512];
+        size_t bl = (size_t)(sep - base);
+        bool hit = !bases || bl >= sizeof(key);
+        if (!hit && bl > 0) {
+            memcpy(key, base, bl);
+            key[bl] = '\0';
+            hit = cbm_ht_get(bases, key) != NULL;
+        }
+        if (hit) {
+            cbm_ht_set(out_paths, rel, (void *)rel);
+        }
+    }
+    cbm_ht_free(bases);
 }
 
 /* Doc-link carry-forward state of the legacy partial route: the previous
@@ -3178,8 +3235,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         }
     }
     /* Files whose unresolved doc-link references name something a changed or
-     * deleted file no longer declares re-resolve too. */
+     * deleted file no longer declares re-resolve too, and so do the files
+     * whose unresolved `path::member` rows name a changed or deleted file. */
     doc_row_name_dependents(plan->doc_rows, plan->doc_row_count, removed_names, row_deps);
+    doc_row_member_dependents(plan->doc_rows, plan->doc_row_count, changed_paths,
+                              n_changed + n_deleted, row_deps);
     {
         row_dep_walk_t walk = {.closure = closure_set, .files = files_by_path, .added = 0};
         cbm_ht_foreach(row_deps, row_dep_visitor, &walk);
