@@ -1229,6 +1229,7 @@ static bool dg_word_at(dg_str_t s, const char *word) {
 static size_t dg_puml_operand(dg_str_t s, size_t i, dg_str_t *id, dg_str_t *label) {
     i = dg_skip_ws(s, i);
     *label = dg_s(NULL, 0);
+    *id = dg_s(NULL, 0);
     if (i + CBM_SZ_3 <= s.n && memcmp(s.p + i, "[*]", CBM_SZ_3) == 0) {
         *id = dg_s(s.p + i, CBM_SZ_3);
         return i + CBM_SZ_3;
@@ -1307,8 +1308,8 @@ static bool dg_puml_arrow_char(char c) {
 
 /* `A "1" -up-> "n" B : label`: false when the line holds no relation. */
 static bool dg_puml_relation(dg_t *dg, dg_str_t ln, uint32_t line, bool sequence) {
-    dg_str_t lid;
-    dg_str_t llab;
+    dg_str_t lid = dg_s(NULL, 0);
+    dg_str_t llab = dg_s(NULL, 0);
     size_t i = dg_puml_operand(ln, 0, &lid, &llab);
     if (!lid.n) {
         return false;
@@ -1340,8 +1341,8 @@ static bool dg_puml_relation(dg_t *dg, dg_str_t ln, uint32_t line, bool sequence
         const char *q = memchr(ln.p + i + SKIP_ONE, '"', ln.n - i - SKIP_ONE);
         i = q ? (size_t)(q - ln.p) + SKIP_ONE : i;
     }
-    dg_str_t rid;
-    dg_str_t rlab;
+    dg_str_t rid = dg_s(NULL, 0);
+    dg_str_t rlab = dg_s(NULL, 0);
     i = dg_puml_operand(ln, i, &rid, &rlab);
     if (!rid.n) {
         return false;
@@ -1427,13 +1428,13 @@ static bool dg_puml_decl(dg_t *dg, dg_str_t ln, uint32_t line, bool *members) {
         return false;
     }
     dg_str_t rest = dg_trim(dg_s(ln.p + strlen(kw), ln.n - strlen(kw)));
-    dg_str_t id;
-    dg_str_t label;
+    dg_str_t id = dg_s(NULL, 0);
+    dg_str_t label = dg_s(NULL, 0);
     size_t j = dg_puml_operand(rest, 0, &id, &label);
     dg_str_t after = dg_trim(dg_s(rest.p + j, rest.n - j));
     if (dg_starts(after, "as ")) {
-        dg_str_t aid;
-        dg_str_t alab;
+        dg_str_t aid = dg_s(NULL, 0);
+        dg_str_t alab = dg_s(NULL, 0);
         dg_puml_operand(dg_trim(dg_s(after.p + CBM_SZ_3, after.n - CBM_SZ_3)), 0, &aid, &alab);
         if (label.n || !alab.n) {
             label = label.n ? label : id;

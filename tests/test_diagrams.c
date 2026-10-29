@@ -329,6 +329,29 @@ TEST(diagrams_plantuml) {
     PASS();
 }
 
+TEST(diagrams_plantuml_edge_messages_issue2818) {
+    /* Sequence messages to/from diagram edges (#2818):
+     * - `Alice ->: to edge` (right operand starts with ':' without second ':')
+     * - `Alice <-: from edge`
+     * - `[-> Alice: in from edge` (left operand starts with '[' without ']')
+     * - `[<- Alice: out to edge`
+     * dg_puml_operand must not leave *id uninitialized on unmatched openers. */
+    CBMFileResult *r = dg_file("@startuml\n"
+                               "participant Alice\n"
+                               "Alice ->: to edge\n"
+                               "Alice <-: from edge\n"
+                               "[-> Alice: in from edge\n"
+                               "[<- Alice: out to edge\n"
+                               "@enduml\n",
+                               "docs/seq_edge.puml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = dg_def(r, "seq_edge#diagram-1");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(dg_prop(d, "diagram_kind"), "sequence");
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(diagrams_dot) {
     CBMFileResult *r =
         dg_file("digraph G {\n"
@@ -1101,6 +1124,7 @@ SUITE(diagrams) {
     RUN_TEST(diagrams_mermaid_kinds);
     RUN_TEST(diagrams_other_fences);
     RUN_TEST(diagrams_plantuml);
+    RUN_TEST(diagrams_plantuml_edge_messages_issue2818);
     RUN_TEST(diagrams_dot);
     RUN_TEST(diagrams_d2);
     RUN_TEST(diagrams_drawio);
