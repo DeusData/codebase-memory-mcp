@@ -6180,6 +6180,103 @@ TEST(cli_zed_mcp_jsonc_comments) {
     PASS();
 }
 
+TEST(cli_install_agent_config_symlinks_issue2671) {
+    /* Issue #2671: dotfiles checkout pattern where agent config directory or
+     * config file is a symlink into dotfiles under the user's home directory. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/Library/Application Support", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/Zed", parent_dir);
+    ASSERT_EQ(symlink(dotfiles_zed, zed_link), 0);
+#else
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/.config", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/zed", parent_dir);
+    ASSERT_EQ(symlink(dotfiles_zed, zed_link), 0);
+#endif
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    PASS();
+}
+
+TEST(cli_install_agent_config_file_symlink_issue2671) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-file-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/Library/Application Support/Zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#else
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/.config/zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#endif
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_settings_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  PATH management tests (port of TestCLI_InstallPATHAppend)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -19154,6 +19251,8 @@ SUITE(cli) {
     RUN_TEST(cli_zed_mcp_preserves_settings);
     RUN_TEST(cli_zed_mcp_uninstall);
     RUN_TEST(cli_zed_mcp_jsonc_comments);
+    RUN_TEST(cli_install_agent_config_symlinks_issue2671);
+    RUN_TEST(cli_install_agent_config_file_symlink_issue2671);
 
     /* PATH management (3 tests) */
     RUN_TEST(cli_ensure_path_append);

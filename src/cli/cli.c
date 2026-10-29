@@ -2719,11 +2719,7 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path) {
 
 static bool dir_exists(const char *path) {
     struct stat st;
-#ifndef _WIN32
-    return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#else
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
 }
 
 /* Resolve the Claude Code config dir.
@@ -9301,11 +9297,7 @@ static const char *cbm_agent_registry_env_path(const char *env_name, const char 
 static bool cbm_agent_registry_path_exists(const char *path, const void *context) {
     (void)context;
     struct stat state;
-#ifndef _WIN32
-    return path && path[0] && lstat(path, &state) == 0 && !S_ISLNK(state.st_mode);
-#else
     return path && path[0] && stat(path, &state) == 0;
-#endif
 }
 
 static bool cbm_agent_registry_command_exists(const char *command, const void *context) {
