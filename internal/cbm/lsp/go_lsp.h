@@ -102,6 +102,10 @@ typedef struct {
     /* Callable identity (#2061): signature suffix of this def's graph QN;
      * qualified_name stays the base QN. NULL = none (always, until enabled). */
     const char *sig;
+    /* Go only (#2033): raw aliased type text of `type A = B` ("B"), qualified
+     * by the registrar against def_module_qn like return_types. NULL = not an
+     * identity alias. */
+    const char *alias_target;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.
