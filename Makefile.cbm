@@ -680,6 +680,26 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
                        -DMI_OVERRIDE=0 $(MIMALLOC_WIN_DEFINE)
+# MI_WIN_INIT_USE_FLS (MinGW TEST build only) is an EXPERIMENT (R32) for the
+# Windows test leg's nondeterministic crash: 1-3 suites die in their first
+# test with 0xC0000005 and no sanitizer report, seen only on trees with
+# mimalloc 3.5.3. 3.5.3 is the first version whose loader hooks are live on
+# MinGW: TLS callbacks in .CRT$XLB/.CRT$XLY run _mi_auto_process_init under the
+# loader lock and _mi_thread_done on every thread detach. With FLS,
+# src/prim/windows/prim.c compiles none of those hooks; process init runs once,
+# from the constructor in src/prim/prim.c (no double init), and thread-done
+# goes through a fiber-local destructor. MI_DEBUG=1 is what FLS needs to run at
+# all: the first thread init (src/init.c) associates the main theap before the
+# FLS key exists, which trips an internal assertion in prim.c and aborts every
+# MI_DEBUG=2 process at startup. Level 1 keeps the fill patterns, padding and
+# double-free checks and drops only the internal assertions. The production
+# allocator (MIMALLOC_CFLAGS) is unchanged. Drop or promote this when the
+# experiment ends.
+MIMALLOC_WIN_TEST_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_TEST_DEFINE := -DMI_WIN_INIT_USE_FLS=1 -DMI_DEBUG=1
+MIMALLOC_CFLAGS_TEST += $(MIMALLOC_WIN_TEST_DEFINE)
+endif
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
