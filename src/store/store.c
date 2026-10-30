@@ -4165,10 +4165,18 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     bind_text(stmt, SKIP_ONE, project);
     sqlite3_bind_int(stmt, 2, max_edges > 0 ? max_edges + SKIP_ONE : CBM_NOT_FOUND);
 
+    /* Both arrays are STORE-class memory-core blocks: the caller releases them
+     * with cbm_store_free_call_edges, the only free that matches. */
     int cap = ST_INIT_CAP_16;
     int n = 0;
-    int64_t *src = malloc((size_t)cap * sizeof(int64_t));
-    int64_t *tgt = malloc((size_t)cap * sizeof(int64_t));
+    int64_t *src = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(int64_t));
+    int64_t *tgt = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(int64_t));
+    if (!src || !tgt) {
+        sqlite3_finalize(stmt);
+        cbm_store_free_call_edges(src, tgt);
+        store_set_error(s, "fetch_call_edges: out of memory");
+        return CBM_STORE_ERR;
+    }
     int scan_rc;
     while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (max_edges > 0 && n >= max_edges) {
@@ -4178,9 +4186,23 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
             break;
         }
         if (n >= cap) {
+            size_t grown_bytes = (size_t)cap * ST_GROWTH * sizeof(int64_t);
+            int64_t *grown_src = cbm_realloc(CBM_MEM_CLASS_STORE, src, grown_bytes);
+            if (grown_src) {
+                src = grown_src;
+            }
+            int64_t *grown_tgt =
+                grown_src ? cbm_realloc(CBM_MEM_CLASS_STORE, tgt, grown_bytes) : NULL;
+            if (grown_tgt) {
+                tgt = grown_tgt;
+            }
+            if (!grown_src || !grown_tgt) {
+                sqlite3_finalize(stmt);
+                cbm_store_free_call_edges(src, tgt);
+                store_set_error(s, "fetch_call_edges: out of memory");
+                return CBM_STORE_ERR;
+            }
             cap *= ST_GROWTH;
-            src = safe_realloc(src, (size_t)cap * sizeof(int64_t));
-            tgt = safe_realloc(tgt, (size_t)cap * sizeof(int64_t));
         }
         src[n] = sqlite3_column_int64(stmt, 0);
         tgt[n] = sqlite3_column_int64(stmt, 1);
@@ -4188,8 +4210,7 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     }
     sqlite3_finalize(stmt);
     if (scan_rc != SQLITE_DONE && scan_rc != SQLITE_ROW) {
-        free(src);
-        free(tgt);
+        cbm_store_free_call_edges(src, tgt);
         store_set_error_sqlite(s, "fetch_call_edges scan");
         return CBM_STORE_ERR;
     }
@@ -4197,6 +4218,11 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     *out_tgt = tgt;
     *count = n;
     return CBM_STORE_OK;
+}
+
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt) {
+    cbm_free(CBM_MEM_CLASS_STORE, src);
+    cbm_free(CBM_MEM_CLASS_STORE, tgt);
 }
 
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out,
@@ -10645,6 +10671,10 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count) {
     return cbm_leiden(nodes, node_count, edges, edge_count, 1.0, out, out_count);
+}
+
+void cbm_leiden_free(cbm_louvain_result_t *result) {
+    cbm_free(CBM_MEM_CLASS_OTHER, result); /* cbm_leiden allocates OTHER */
 }
 
 /* ── Architecture: community clusters via Leiden ───────────────── */

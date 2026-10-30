@@ -1353,6 +1353,12 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
+    /* A generated member stays out of the short-name index here as in the
+     * full index (pass_definitions.c); its node carries the mark. */
+    if (cbm_node_props_generated(node->properties_json)) {
+        cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
+        return;
+    }
     CBMLanguage lang = cbm_registry_synthetic_path_language(node->file_path);
     if (lang == CBM_LANG_COUNT && seed->lang_by_path && node->file_path) {
         void *v = cbm_ht_get(seed->lang_by_path, node->file_path);

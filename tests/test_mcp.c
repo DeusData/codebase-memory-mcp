@@ -2046,7 +2046,7 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
     char err[1024];
     bool approved =
         !approve_sensitive || cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root,
-                                                      true, err, sizeof(err));
+                                                      true, false, err, sizeof(err));
     cbm_config_t *cfg = approved ? cbm_config_open(cache) : NULL;
     cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
     int calls = -2;
