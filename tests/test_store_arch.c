@@ -1369,6 +1369,126 @@ TEST(adr_validate_keys_empty) {
     PASS();
 }
 
+/* ── cbm_store_fetch_call_edges / cbm_store_free_call_edges tests ─ */
+
+TEST(fetch_call_edges_basic) {
+    cbm_store_t *s = setup_arch_test_store();
+    ASSERT_NOT_NULL(s);
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "test", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    /* setup_arch_test_store() wires 5 CALLS edges among Function nodes. */
+    ASSERT_EQ(count, 5);
+    ASSERT_FALSE(truncated);
+    ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(tgt);
+
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(fetch_call_edges_truncated) {
+    cbm_store_t *s = setup_arch_test_store();
+    ASSERT_NOT_NULL(s);
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = false;
+    /* Only 5 CALLS edges exist; capping at 2 must set truncated. */
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "test", 2, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(truncated);
+
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(fetch_call_edges_empty_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "empty", "/tmp/empty");
+
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "empty", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    ASSERT_FALSE(truncated);
+
+    /* cbm_store_free_call_edges(NULL, NULL) must not crash. */
+    cbm_store_free_call_edges(src, tgt);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The two arrays cbm_store_fetch_call_edges hands out are memory-core blocks of
+ * the STORE class, and cbm_store_free_call_edges is what takes them back. Both
+ * halves are measured: the fetch adds exactly the two arrays and the paired free
+ * removes exactly those, so a raw allocation on either side fails. Thirty-six
+ * edges outgrow the initial capacity of 16, so the growth path is covered too. */
+TEST(fetch_call_edges_memory_core_ownership) {
+    enum { FN = 37 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "grow", "/tmp/grow");
+    int64_t ids[FN];
+    for (int i = 0; i < FN; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "f%d", i);
+        snprintf(qn, sizeof(qn), "grow.pkg.f%d", i);
+        cbm_node_t n = {.project = "grow",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "pkg/f.go"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_TRUE(ids[i] > 0);
+    }
+    for (int i = 0; i + 1 < FN; i++) {
+        cbm_edge_t e = {
+            .project = "grow", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+        ASSERT_TRUE(cbm_store_insert_edge(s, &e) > 0);
+    }
+
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_STORE);
+    int64_t *src = NULL;
+    int64_t *tgt = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_fetch_call_edges(s, "grow", 100, &src, &tgt, &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, FN - 1);
+    ASSERT_FALSE(truncated);
+    ASSERT_NOT_NULL(src);
+    ASSERT_NOT_NULL(tgt);
+    /* Ordered by (source_id, target_id): growth kept every pair in place. */
+    ASSERT_EQ(src[0], ids[0]);
+    ASSERT_EQ(tgt[0], ids[1]);
+    ASSERT_EQ(src[FN - 2], ids[FN - 2]);
+    ASSERT_EQ(tgt[FN - 2], ids[FN - 1]);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_STORE), blocks + 2);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE) >=
+                bytes + 2 * (size_t)count * sizeof(int64_t));
+
+    cbm_store_free_call_edges(src, tgt);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_STORE), blocks);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Louvain tests ──────────────────────────────────────────────── */
 
 TEST(louvain_basic) {
@@ -1394,7 +1514,7 @@ TEST(louvain_basic) {
     /* Triangle and pair different */
     ASSERT_TRUE(comm[1] != comm[4]);
 
-    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1403,7 +1523,7 @@ TEST(louvain_empty) {
     int count = 0;
     ASSERT_EQ(cbm_louvain(NULL, 0, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 0);
-    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1414,7 +1534,7 @@ TEST(louvain_single_node) {
     ASSERT_EQ(cbm_louvain(nodes, 1, NULL, 0, &result, &count), CBM_STORE_OK);
     ASSERT_EQ(count, 1);
     ASSERT_EQ(result[0].node_id, 42);
-    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1477,7 +1597,7 @@ TEST(louvain_converges) {
     }
     ASSERT_TRUE(same_count >= 8);
 
-    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1502,7 +1622,8 @@ TEST(leiden_result_memory_core_ownership) {
             ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
             ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) >=
                         bytes + 3 * sizeof(*result));
-            cbm_free(CBM_MEM_CLASS_OTHER, result);
+            /* Released through the exported pair, the way an FFI caller must. */
+            cbm_leiden_free(result);
             ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
             ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
         }
@@ -1649,7 +1770,7 @@ TEST(leiden_multilevel_collapses_noise) {
         }
         ASSERT_TRUE(same >= SZ - 1);
     }
-    cbm_free(CBM_MEM_CLASS_OTHER, result);
+    cbm_leiden_free(result);
     PASS();
 }
 
@@ -1681,8 +1802,8 @@ TEST(leiden_resolution_controls_granularity) {
     ASSERT_TRUE(n_hi > n_lo);
     ASSERT_TRUE(leiden_all_communities_connected(lo, N, edges, ne));
     ASSERT_TRUE(leiden_all_communities_connected(hi, N, edges, ne));
-    cbm_free(CBM_MEM_CLASS_OTHER, lo);
-    cbm_free(CBM_MEM_CLASS_OTHER, hi);
+    cbm_leiden_free(lo);
+    cbm_leiden_free(hi);
     PASS();
 }
 
@@ -1947,6 +2068,12 @@ SUITE(store_arch) {
     RUN_TEST(adr_splice_ignores_heading_inside_fence);
     RUN_TEST(adr_splice_refuses_unterminated_fence);
     RUN_TEST(adr_validate_keys_empty);
+
+    /* Call-edge fetch / free */
+    RUN_TEST(fetch_call_edges_basic);
+    RUN_TEST(fetch_call_edges_truncated);
+    RUN_TEST(fetch_call_edges_empty_project);
+    RUN_TEST(fetch_call_edges_memory_core_ownership);
 
     /* Louvain */
     RUN_TEST(louvain_basic);

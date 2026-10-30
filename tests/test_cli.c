@@ -15281,6 +15281,29 @@ TEST(cli_detect_agents_finds_zed_in_roaming_appdata) {
 }
 #endif
 
+#ifdef _WIN32
+/* #2145: a profile path outside the ANSI code page must stay visible to agent
+ * detection. The directory is created with th_mkdir_p, which goes through the
+ * wide-char API: test_mkdirp uses cbm_mkdir, the narrow _mkdir on Windows,
+ * which would create a code-page-mangled name instead of this one. Cursor is
+ * detected by its directory alone, so the assertion goes through dir_exists. */
+TEST(cli_detect_agents_handles_non_ascii_windows_profile) {
+    char home[1024];
+    snprintf(home, sizeof(home), "%s/cbm-用户-profile", cbm_tmpdir());
+    test_rmdir_r(home);
+    char cursor_dir[1024];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", home);
+    if (th_mkdir_p(cursor_dir) != 0)
+        FAIL("could not create non-ASCII Windows profile path");
+
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    test_rmdir_r(home);
+    if (!agents.cursor)
+        FAIL("agent detection must support non-ASCII Windows profile paths");
+    PASS();
+}
+#endif
+
 TEST(cli_detect_agents_finds_antigravity) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
@@ -19351,6 +19374,7 @@ SUITE(cli) {
 #endif
 #ifdef _WIN32
     RUN_TEST(cli_detect_agents_finds_zed_in_roaming_appdata);
+    RUN_TEST(cli_detect_agents_handles_non_ascii_windows_profile);
 #endif
     RUN_TEST(cli_detect_agents_finds_antigravity);
     RUN_TEST(cli_detect_agents_finds_kilocode);

@@ -2604,6 +2604,15 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                     if (import_candidate_is_python_local(ctx->gbuf, cand)) {
                         continue;
                     }
+                    /* Nor is a generated member (a Java record's implicit
+                     * accessor, an instance method no import can name). It is
+                     * registered by qualified name only, and a package segment
+                     * that merely spells it (`javax.crypto.spec` -> spec())
+                     * must not bind the import -- or every use of the
+                     * imported name -- to it. */
+                    if (cbm_node_props_generated(cand->properties_json)) {
+                        continue;
+                    }
                     if (source_file_qn && cand->qualified_name &&
                         strcmp(cand->qualified_name, source_file_qn) == 0) {
                         continue; /* self */
