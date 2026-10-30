@@ -245,6 +245,15 @@ root because they are too broad or too sensitive to index as a unit:
 - a credential directory at any depth — `.ssh`, `.aws`, `.gnupg`, `.kube`,
   `.docker`, `.netrc`, `.git-credentials`, `.password-store`, macOS `Keychains`.
 
+A single top-level directory can still be indexed as one root on purpose, for
+example a container or build machine that keeps its project in `/work`, `/app` or
+`/src`, by approving that exact path in a terminal:
+`codebase-memory-mcp allow-root --approve-broad /work`. The approval is recorded
+like any other allowed root, listed as `(approved broad)` by `allow-root --list`,
+and covers no other top-level directory; as with any recorded root, indexing is
+then confined to the recorded roots. Filesystem, drive and share roots cannot be
+approved.
+
 Two limits are worth stating plainly. This constrains *scope*, not
 *sensitivity*: inside a root that is allowed, every file the process can read may
 be indexed and later returned. And the credential list is a denylist, so it

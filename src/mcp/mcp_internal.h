@@ -115,6 +115,13 @@ void cbm_mcp_server_set_snapshot_read_test_hook(cbm_mcp_server_t *srv,
                                                 cbm_mcp_snapshot_read_test_hook_fn hook,
                                                 void *context);
 
+/* Runs after get_code_snippet has read and verified a file's bytes and before
+ * it slices them, so a test can write the file at exactly that point (#2585). */
+typedef void (*cbm_mcp_snippet_capture_test_hook_fn)(void *context, const char *rel_path);
+void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
+                                                  cbm_mcp_snippet_capture_test_hook_fn hook,
+                                                  void *context);
+
 /* Filesystem PATH_MAX prevents a portable end-to-end fixture for multi-KiB
  * stored paths. This seam drives the normal search result ownership,
  * directory aggregation, and renderer pipeline with synthetic identities. */

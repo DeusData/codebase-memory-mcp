@@ -770,6 +770,127 @@ TEST(parallel_post_extract_projection_spills_before_resolve) {
     PASS();
 }
 
+/* ── Sequential cache: held like the parallel one ─────────────────── */
+
+/* The parallel extract caches each result without its parse tree and
+ * compacted (pass_parallel.c). The sequential definitions pass cached the raw
+ * result, tree and working arena included, and that cache lives through every
+ * later pass: about 5x the memory per file, for every file of the repo. PHP
+ * keeps its tree: the vendor-import check reads its sites' syntax from it. */
+TEST(sequential_definitions_cache_drops_trees_and_compacts) {
+    if (ensure_parity_setup() != 0)
+        FAIL("setup failed");
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    ASSERT_EQ(cbm_discover(g_par_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("par-test", g_par_tmpdir);
+    cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **cache = (CBMFileResult **)calloc((size_t)file_count, sizeof(CBMFileResult *));
+    ASSERT_NOT_NULL(cache);
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "par-test",
+        .repo_path = g_par_tmpdir,
+        .gbuf = gbuf,
+        .registry = reg,
+        .cancelled = &cancelled,
+        .result_cache = cache,
+    };
+
+    cbm_init();
+    cbm_work_arena_release(); /* start from a thread that keeps nothing */
+    ASSERT_EQ(cbm_pipeline_pass_definitions(&ctx, files, file_count), 0);
+    ASSERT_FALSE(cbm_work_arena_keeping()); /* ...and end the pass that way */
+
+    int cached = 0;
+    int php_trees = 0;
+    for (int i = 0; i < file_count; i++) {
+        const CBMFileResult *r = cache[i];
+        if (!r) {
+            continue;
+        }
+        cached++;
+        if (files[i].language == CBM_LANG_PHP) {
+            ASSERT_NOT_NULL(r->cached_tree);
+            php_trees++;
+        } else {
+            ASSERT_NULL(r->cached_tree);
+        }
+        /* One exact block: capacity == bytes used, no dead headroom. */
+        ASSERT_EQ(r->arena.nblocks, 1);
+        ASSERT_EQ(cbm_arena_capacity(&r->arena), cbm_arena_total(&r->arena));
+    }
+    ASSERT_EQ(cached, file_count);
+    ASSERT_GT(php_trees, 0); /* app/Models.php and app/Services.php */
+
+    for (int i = 0; i < file_count; i++) {
+        cbm_free_result(cache[i]);
+    }
+    free(cache);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    cbm_discover_free(files, file_count);
+    PASS();
+}
+
+/* A configured C test convention whose file cannot be extracted aborts the
+ * sequential pass (CBM_PIPELINE_ABORT_PRESERVE_DB). The Python file compacted
+ * before it handed its working arena back to this thread, so that exit has to
+ * release it like the others. */
+TEST(sequential_definitions_configured_failure_releases_work_arena) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_seqcf_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char py_path[320];
+    char c_path[320];
+    snprintf(py_path, sizeof(py_path), "%s/a.py", dir);
+    snprintf(c_path, sizeof(c_path), "%s/z.c", dir);
+    ASSERT_EQ(th_write_file(py_path, "def first():\n    return 1\n"), 0);
+    ASSERT_EQ(th_write_file(c_path, "void second(void) {}\n"), 0);
+    cbm_file_info_t files[] = {
+        {.path = py_path, .rel_path = "a.py", .language = CBM_LANG_PYTHON},
+        {.path = c_path, .rel_path = "z.c", .language = CBM_LANG_C},
+    };
+    static const char config[] =
+        "{\"test_impact\":{\"version\":1,\"tests\":{\"conventions\":[{\"language\":\"c\","
+        "\"role\":\"case\",\"define_macro\":\"CHECK\",\"name_args\":[0]}]}}}";
+    cbm_test_declarations_t *declarations =
+        cbm_test_declarations_parse(config, sizeof(config) - 1, false);
+    ASSERT_NOT_NULL(declarations);
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("seq-cf", dir);
+    cbm_registry_t *reg = cbm_registry_new();
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "seq-cf",
+        .repo_path = dir,
+        .gbuf = gbuf,
+        .registry = reg,
+        .cancelled = &cancelled,
+        .test_declarations = declarations,
+        .test_fault_mask = CBM_PIPELINE_TEST_FAULT_EXTRACT_NULL, /* z.c extracts to NULL */
+    };
+
+    cbm_init();
+    cbm_work_arena_release(); /* start from a thread that keeps nothing */
+    int rc = cbm_pipeline_pass_definitions(&ctx, files, 2);
+    bool keeping = cbm_work_arena_keeping();
+    cbm_work_arena_release();
+
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    cbm_test_declarations_free(declarations);
+    rm_rf(dir);
+    ASSERT_EQ(rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_FALSE(keeping);
+    PASS();
+}
+
 /* ── Empty file list ──────────────────────────────────────────────── */
 
 TEST(parallel_empty_files) {
@@ -5599,6 +5720,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_spill_mode_builds_the_same_graph);
     RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
+    RUN_TEST(sequential_definitions_cache_drops_trees_and_compacts);
+    RUN_TEST(sequential_definitions_configured_failure_releases_work_arena);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
     RUN_TEST(parallel_wide_definition_keeps_fp_sp_bt_f14);

@@ -2705,6 +2705,27 @@ static const char **split_pipe_strings(CBMArena *a, const char *text) {
     return idx > 0 ? arr : NULL;
 }
 
+/* QN of the type an identity alias `type A = B` names, for the def-driven
+ * cross-file registries (#2033). The per-file AST scan sets alias_of only for
+ * the file it walks, so an alias declared in another file of the package
+ * reaches a call only through here. Only a bare identifier is qualified (B
+ * declared in A's package); a qualified, pointer, composite or generic target
+ * stays NULL rather than guessed. */
+static const char *go_alias_target_qn(CBMArena *arena, const char *target,
+                                      const char *def_module_qn) {
+    if (!target || !target[0] || !def_module_qn || !def_module_qn[0]) {
+        return NULL;
+    }
+    for (const unsigned char *p = (const unsigned char *)target; *p; p++) {
+        bool ident = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                     (*p >= '0' && *p <= '9') || *p == '_' || *p >= 0x80;
+        if (!ident) {
+            return NULL;
+        }
+    }
+    return cbm_arena_sprintf(arena, "%s.%s", def_module_qn, target);
+}
+
 // Helper: parse "|"-separated "name:type" field definitions and populate a registered type.
 // Format: "Binder:Binder|Name:string|Count:int"
 // type_text is resolved relative to def_module_qn.
@@ -3273,6 +3294,7 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = split_pipe_strings(arena, d->method_names_str);
             }
+            rt.alias_of = go_alias_target_qn(arena, d->alias_target, def_mod);
 
             cbm_registry_add_type(&reg, rt);
 
@@ -3569,6 +3591,7 @@ CBMTypeRegistry *cbm_go_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = split_pipe_strings(arena, d->method_names_str);
             }
+            rt.alias_of = go_alias_target_qn(arena, d->alias_target, def_mod);
             cbm_registry_add_type(reg, rt);
             GO_NOTE_NEW_TYPES();
             if (d->field_defs && d->field_defs[0]) {

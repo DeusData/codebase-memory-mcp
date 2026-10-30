@@ -133,18 +133,18 @@ defined, undefined, or not accessible at all:
 #endif
 
 
-#if MI_PADDING
+#if MI_PADDING_CHECK_BYTES && !MI_GUARDED
 #define mi_track_malloc(p,reqsize,zero) \
-  if ((p)!=NULL) { \
+  do { if ((p)!=NULL) { \
     mi_assert_internal(mi_usable_size(p)==(reqsize)); \
     mi_track_malloc_size(p,reqsize,reqsize,zero); \
-  }
+  } } while(0)
 #else
 #define mi_track_malloc(p,reqsize,zero) \
-  if ((p)!=NULL) { \
+  do { if ((p)!=NULL) { \
     mi_assert_internal(mi_usable_size(p)>=(reqsize)); \
     mi_track_malloc_size(p,reqsize,mi_usable_size(p),zero); \
-  }
+  } } while(0)
 #endif
 
 #endif // MI_TRACK_H
