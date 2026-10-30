@@ -857,6 +857,57 @@ TEST(ruby_module) {
     PASS();
 }
 
+/* A Ruby `Const.new` call is rewritten to name the CONSTANT, not the method:
+ * the constructor body lives in `initialize`, so the call should link the class
+ * like every other language's `new T()`. The rewrite fired only for bare
+ * `constant` receivers, so a scope-resolved receiver kept the whole call text
+ * as its callee ("Admin::User.new"), which resolves to nothing and cannot join
+ * the Ruby LSP's constructor rows, whose callee is the class QN.
+ *
+ * Both spellings must land on the bare constant path; a retained ".new" suffix
+ * is the bug's signature. */
+TEST(ruby_constructor_callee_is_constant_path) {
+    CBMFileResult *r = extract("module Admin\n  class User\n  end\nend\n"
+                               "class Widget\nend\n"
+                               "class Maker\n"
+                               "  def build\n"
+                               "    Admin::User.new\n"
+                               "    Widget.new\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_RUBY, "t", "maker.rb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int scoped = 0, bare = 0, kept_new = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *callee = r->calls.items[i].callee_name;
+        if (strcmp(callee, "Admin::User") == 0)
+            scoped = 1;
+        if (strcmp(callee, "Widget") == 0)
+            bare = 1;
+        /* Either failure mode: the method name survived on its own, or the
+         * whole `Recv.new` expression did. */
+        size_t n = strlen(callee);
+        if (strcmp(callee, "new") == 0 || (n >= 4 && strcmp(callee + n - 4, ".new") == 0))
+            kept_new = 1;
+    }
+    if (!scoped || !bare || kept_new) {
+        printf("  ruby callees (%d):\n", r->calls.count);
+        for (int i = 0; i < r->calls.count; i++)
+            printf("    '%s'\n", r->calls.items[i].callee_name);
+    }
+    /* Scope-resolved receiver reduces to the constant path; its bare leaf is
+     * what resolution joins on. */
+    ASSERT(scoped);
+    /* Bare receiver: pre-existing behaviour, guarded against regression. */
+    ASSERT(bare);
+    ASSERT_FALSE(kept_new);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C# --- */
 TEST(csharp_class) {
     CBMFileResult *r = extract("namespace App { public class Service { public void Run() {} public "
@@ -10882,6 +10933,49 @@ TEST(extract_rescript_let_bindings_use_the_walk_cursor) {
     ASSERT_EQ(big_fallbacks, 0);
     PASS();
 }
+
+/* Every Python usage asks whether it is a global/nonlocal name and whether it
+ * sits in a parameter default. Both climbed with ts_node_parent, which
+ * descends from the ROOT: O(d^2) for a usage d deep, so one deep expression
+ * went cubic (2.2 s / 17 s / >90 s at 500/1000/2000 terms). Count every such
+ * root-descending step at N and 2N terms. */
+TEST(extract_python_deep_default_parent_climbs_are_linear) {
+    enum { SMALL = 200 };
+    uint64_t slow_parents[2];
+    for (int round = 0; round < 2; round++) {
+        /* def f(x=x + x + ... + x): return x -- a binary_operator chain. */
+        int terms = SMALL << round;
+        size_t capacity = 32U + (size_t)terms * 4U;
+        char *source = malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        int length = snprintf(source, capacity, "def f(x=x");
+        for (int i = 1; i < terms; i++) {
+            length += snprintf(source + length, capacity - (size_t)length, " + x");
+        }
+        length += snprintf(source + length, capacity - (size_t)length, "):\n    return x\n");
+        cbm_usage_field_lookup_test_reset();
+        CBMFileResult *result =
+            cbm_extract_file(source, length, CBM_LANG_PYTHON, "proj", "deep.py", 0, NULL, NULL);
+        free(source);
+        ASSERT_NOT_NULL(result);
+        slow_parents[round] = cbm_usage_slow_parent_fallback_test_count();
+        /* Anti-vacuous: every default x climbed its chain to the parameter and
+         * reads the enclosing namespace; only `return x` is shadowed by it. */
+        int defaults = 0;
+        for (int i = 0; i < result->usages.count; i++) {
+            const CBMUsage *usage = &result->usages.items[i];
+            defaults += usage->ref_name && strcmp(usage->ref_name, "x") == 0 &&
+                        !usage->semantic_reference_local_shadow;
+        }
+        cbm_free_result(result);
+        ASSERT_EQ(defaults, terms);
+    }
+    fprintf(stderr, "  [python-deep-default] slow_parents(%d)=%llu slow_parents(%d)=%llu\n", SMALL,
+            (unsigned long long)slow_parents[0], 2 * SMALL, (unsigned long long)slow_parents[1]);
+    /* Twice the terms may cost about twice the steps; the cubic climb took 4x. */
+    ASSERT_LTE(slow_parents[1], slow_parents[0] * 3U + 64U);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -13404,6 +13498,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
     RUN_TEST(extract_rescript_let_bindings_use_the_walk_cursor);
+    RUN_TEST(extract_python_deep_default_parent_climbs_are_linear);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
@@ -13493,6 +13588,7 @@ SUITE(extraction) {
     RUN_TEST(php_function);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
+    RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);

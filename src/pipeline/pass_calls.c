@@ -997,6 +997,11 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return false;
     }
+    /* LSP textual fallbacks can also name data, as with static imports. The
+     * call is handled: no edge, and no registry fallback after it. */
+    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+        return true;
+    }
     cbm_resolution_t res = {0};
     /* Keep the canonical graph QN, including project prefixes added by fallback. */
     res.qualified_name = target_node->qualified_name;
@@ -1332,6 +1337,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
          * while POST (no `post` to collide with) survived. */
         return calls_emit_route_call(ctx, call, source_node, module_qn, imp_keys, imp_vals,
                                      imp_count, route_mount, lang, evidence);
+    }
+    /* A Java call never targets data — see cbm_java_suppress_call_to_data_member.
+     * The language gate lives here, as with the guards above, and MUST match
+     * pass_parallel.c exactly or the two resolvers diverge. */
+    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+        return 0;
     }
     evidence->candidate_qn = target_node->qualified_name;
     evidence->calls_emitted |=

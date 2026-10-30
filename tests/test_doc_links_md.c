@@ -388,6 +388,166 @@ TEST(doc_links_md_resolve) {
     PASS();
 }
 
+/* #2587: a `path::member` reference whose member the code file does not
+ * define was an exact edge to the file, so a renamed or deleted definition
+ * looked like a valid, coarser link. It is a missing reference; a member the
+ * file defines more than once, with no owner to pick one, is ambiguous. */
+TEST(doc_links_md_member_not_defined_issue2587) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "docs/members.md"),
+                  "# Members\n"
+                  "\n"
+                  "See `src/util/rounding.py::clamp` and "
+                  "`src/util/rounding.py::no_such_function`.\n"
+                  "Areas: `src/shapes.py::Square::area`, `src/shapes.py::area`.\n"
+                  "Notes: `docs/other.md::Intro`.\n");
+    th_write_file(TH_PATH(tmp, "docs/other.md"), "# Intro\n\nText.\n");
+    th_write_file(TH_PATH(tmp, "src/util/rounding.py"), "def clamp(x, lo, hi):\n"
+                                                        "    return max(lo, min(hi, x))\n");
+    th_write_file(TH_PATH(tmp, "src/shapes.py"), "class Circle:\n"
+                                                 "    def area(self):\n"
+                                                 "        return 3\n"
+                                                 "\n"
+                                                 "\n"
+                                                 "class Square:\n"
+                                                 "    def area(self):\n"
+                                                 "        return 4\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+    char props[512];
+    char reason[64];
+
+    /* a member the file defines, alone or through its owner */
+    ASSERT_EQ(md_edge(db, "Members", "rounding.clamp", props, sizeof(props)), 1);
+    ASSERT_EQ(md_edge(db, "Members", "Square.area", props, sizeof(props)), 1);
+    ASSERT_EQ(md_edge(db, "Members", "Circle.area", props, sizeof(props)), 0);
+
+    /* a member the file does not define: no edge to the file, a missing row */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+                           "AND s.qualified_name LIKE '%.Members' AND t.label = 'File' "
+                           "AND t.file_path = 'src/util/rounding.py'"),
+              0);
+    dm_row(db, "docs/members.md", "src/util/rounding.py::no_such_function", reason, sizeof(reason),
+           NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+
+    /* defined twice and no owner written: ambiguous, not the file */
+    dm_row(db, "docs/members.md", "src/shapes.py::area", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "ambiguous");
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+                           "AND s.qualified_name LIKE '%.Members' AND t.label = 'File' "
+                           "AND t.file_path = 'src/shapes.py'"),
+              0);
+
+    /* a document's headings are no definitions: the file edge stays */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+                           "AND s.qualified_name LIKE '%.Members' AND t.label = 'File' "
+                           "AND t.file_path = 'docs/other.md'"),
+              1);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* MENTIONS edges from the section whose qualified name ends with `section` to
+ * the File node of `file`. */
+static int md_file_edges(const char *db, const char *section, const char *file) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+             "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'MENTIONS' "
+             "AND s.qualified_name LIKE '%%.%s' AND t.label = 'File' AND t.file_path = '%s'",
+             section, file);
+    return dm_count(db, sql);
+}
+
+/* #2587, the members a code file has although the graph defines no node for
+ * them: a call form, a macro, a prototype, a namespace, an enum member, a
+ * class attribute. Each is there -- the file writes it -- so it keeps its
+ * edge; only a name the file does not write at all is missing. */
+static const struct {
+    const char *section;
+    const char *raw;
+    const char *file;
+    bool missing;
+} MD_WRITTEN[] = {
+    {"CallForm", "src/util.py::clamp()", NULL, false},
+    {"Macro", "include/limits.h::MAX_ITEMS", "include/limits.h", false},
+    {"FunctionMacro", "include/limits.h::SQUARE", "include/limits.h", false},
+    {"Prototype", "include/limits.h::limits_init", "include/limits.h", false},
+    {"Namespace", "src/ns.ts::Shapes", "src/ns.ts", false},
+    {"EnumMember", "src/color.py::Color::RED", "src/color.py", false},
+    {"Attribute", "src/model.py::Model::name", "src/model.py", false},
+    /* not written: `blue` and LIGHT_BLUE are no BLUE */
+    {"NotWritten", "src/color.py::Color::BLUE", "src/color.py", true},
+    {"NotDefined", "src/util.py::no_such_function", "src/util.py", true},
+};
+
+TEST(doc_links_md_member_written_issue2587) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char doc[2048] = "";
+    size_t used = 0;
+    for (size_t i = 0; i < sizeof(MD_WRITTEN) / sizeof(MD_WRITTEN[0]); i++) {
+        used += (size_t)snprintf(doc + used, sizeof(doc) - used, "# %s\n\nSee `%s`.\n\n",
+                                 MD_WRITTEN[i].section, MD_WRITTEN[i].raw);
+        ASSERT(used < sizeof(doc));
+    }
+    th_write_file(TH_PATH(tmp, "docs/written.md"), doc);
+    th_write_file(TH_PATH(tmp, "src/util.py"), "def clamp(x, lo, hi):\n"
+                                               "    return max(lo, min(hi, x))\n");
+    th_write_file(TH_PATH(tmp, "include/limits.h"), "#ifndef LIMITS_H\n"
+                                                    "#define LIMITS_H\n"
+                                                    "#define MAX_ITEMS 64\n"
+                                                    "#define SQUARE(x) ((x) * (x))\n"
+                                                    "int limits_init(void);\n"
+                                                    "#endif\n");
+    th_write_file(TH_PATH(tmp, "src/ns.ts"), "export namespace Shapes {\n"
+                                             "    export const unit = 1;\n"
+                                             "}\n");
+    th_write_file(TH_PATH(tmp, "src/color.py"), "from enum import Enum\n"
+                                                "\n"
+                                                "\n"
+                                                "class Color(Enum):\n"
+                                                "    RED = 1\n"
+                                                "    LIGHT_BLUE = 2  # blue\n");
+    th_write_file(TH_PATH(tmp, "src/model.py"), "class Model:\n"
+                                                "    name: str\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+    char props[512];
+    char reason[64];
+
+    /* every reference, under its own heading: an edge, or a missing row */
+    int wrong = 0;
+    for (size_t i = 0; i < sizeof(MD_WRITTEN) / sizeof(MD_WRITTEN[0]); i++) {
+        dm_row(db, "docs/written.md", MD_WRITTEN[i].raw, reason, sizeof(reason), NULL, 0);
+        int edges = MD_WRITTEN[i].file
+                        ? md_file_edges(db, MD_WRITTEN[i].section, MD_WRITTEN[i].file)
+                        : dm_mentions_from(db, MD_WRITTEN[i].section);
+        bool ok = MD_WRITTEN[i].missing ? strcmp(reason, "missing") == 0 && edges == 0
+                                        : reason[0] == '\0' && edges >= 1;
+        if (!ok) {
+            printf("  %s: row '%s', %d edge(s)\n", MD_WRITTEN[i].raw, reason, edges);
+            wrong++;
+        }
+    }
+    ASSERT_EQ(wrong, 0);
+    /* the call form binds the function itself */
+    ASSERT_EQ(md_edge(db, "CallForm", "util.clamp", props, sizeof(props)), 1);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── incremental == full ─────────────────────────────────────────── */
 
 TEST(doc_links_md_incremental) {
@@ -440,6 +600,76 @@ TEST(doc_links_md_incremental) {
                                                 "    return None\n");
     ASSERT_EQ(dm_step(repo, db, full_db, "missing name added", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
               0);
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* #2587 incremental == full: whether a `path::member` row is missing depends
+ * on the member file's text, and the row leads to that file by no edge. A
+ * body edit that writes the name (no definition added) turns the row into a
+ * file edge, one that drops it turns the edge back into the row; a same-named
+ * group that shrinks to one turns an ambiguous row into an edge. The group is
+ * Ruby: a Python file whose surface changes takes the full route (the Python
+ * namespace admission), and a language with a doc-link scope (Rust, Go, ...)
+ * reports the lost method as a removed name, so neither reaches the rule for
+ * ambiguous member rows. */
+TEST(doc_links_md_member_missing_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_inc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    th_write_file(TH_PATH(repo, "docs/helpers.md"), "# Helpers\n\nSee `src/tools.py::helper2`.\n");
+    th_write_file(TH_PATH(repo, "docs/areas.md"), "# Areas\n\nSee `src/shapes.rb::area`.\n");
+    th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
+                                                 "    return 1\n");
+    th_write_file(TH_PATH(repo, "src/shapes.rb"), "class Circle\n"
+                                                  "  def area\n"
+                                                  "    3\n"
+                                                  "  end\n"
+                                                  "end\n"
+                                                  "\n"
+                                                  "class Square\n"
+                                                  "  def area\n"
+                                                  "    4\n"
+                                                  "  end\n"
+                                                  "end\n");
+    char db[512];
+    char full_db[512];
+    snprintf(db, sizeof(db), "%s/inc.db", tmp);
+    snprintf(full_db, sizeof(full_db), "%s/full.db", tmp);
+    ASSERT_EQ(dm_index(repo, db, NULL), 0);
+    char reason[64];
+    dm_row(db, "docs/helpers.md", "src/tools.py::helper2", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+    dm_row(db, "docs/areas.md", "src/shapes.rb::area", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "ambiguous");
+
+    /* the body writes the name, no definition added: the row becomes an edge */
+    th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
+                                                 "    return 1  # helper2 follows\n");
+    ASSERT_EQ(dm_step(repo, db, full_db, "member written", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
+    ASSERT_EQ(md_file_edges(db, "Helpers", "src/tools.py"), 1);
+    /* and drops it again: missing again */
+    th_write_file(TH_PATH(repo, "src/tools.py"), "def helper():\n"
+                                                 "    return 1\n");
+    ASSERT_EQ(dm_step(repo, db, full_db, "member dropped", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+              0);
+    dm_row(db, "docs/helpers.md", "src/tools.py::helper2", reason, sizeof(reason), NULL, 0);
+    ASSERT_STR_EQ(reason, "missing");
+    /* one of two `area` methods goes, the name stays: the one left binds */
+    th_write_file(TH_PATH(repo, "src/shapes.rb"), "class Circle\n"
+                                                  "end\n"
+                                                  "\n"
+                                                  "class Square\n"
+                                                  "  def area\n"
+                                                  "    4\n"
+                                                  "  end\n"
+                                                  "end\n");
+    ASSERT_EQ(dm_step(repo, db, full_db, "group shrinks", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    char props[512];
+    ASSERT_EQ(md_edge(db, "Areas", "Square.area", props, sizeof(props)), 1);
     th_cleanup(tmp);
     PASS();
 }
@@ -914,7 +1144,10 @@ SUITE(doc_links_md) {
     RUN_TEST(doc_links_md_repeated_headings);
     RUN_TEST(doc_links_md_classify_span);
     RUN_TEST(doc_links_md_resolve);
+    RUN_TEST(doc_links_md_member_not_defined_issue2587);
+    RUN_TEST(doc_links_md_member_written_issue2587);
     RUN_TEST(doc_links_md_incremental);
+    RUN_TEST(doc_links_md_member_missing_incremental);
     RUN_TEST(doc_links_md_moved_directory_issue2588);
     RUN_TEST(doc_links_md_adr);
     RUN_TEST(doc_links_md_adr_label_choice);

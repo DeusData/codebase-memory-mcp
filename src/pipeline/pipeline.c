@@ -2559,7 +2559,7 @@ static void log_result_census(const char *tag, CBMFileResult **cache, int file_c
             str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
                             census_len(def->impl_trait) + census_len(def->http_base_url) +
                             census_list(def->extra_props) + census_len(def->decl_namespace) +
-                            census_len(def->variant_key);
+                            census_len(def->variant_key) + census_len(def->alias_target);
         }
         for (int c = 0; c < r->calls.count; c++) {
             const CBMCall *call = &r->calls.items[c];

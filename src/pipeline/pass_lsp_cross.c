@@ -715,6 +715,9 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         }
     }
     dst->lang = lang;
+    dst->alias_target = (lang == CBM_LANG_GO && src->alias_target)
+                            ? cbm_arena_strdup(arena, src->alias_target)
+                            : NULL;
     dst->decorators = NULL;
     if (src->decorators) {
         int n = 0;
