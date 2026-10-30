@@ -20192,6 +20192,423 @@ static int pipeline_legacy_c_identity_index_is_rebuilt(int legacy_version) {
     PASS();
 }
 
+/* #759: index a Next.js App Router tree as project "nextjs" (a full index, or
+ * the incremental route a stored index of the same tree takes). */
+static int nextjs_index(const char *repo, const char *db_path) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return -1;
+    }
+    (void)cbm_pipeline_set_project_name(p, "nextjs");
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+/* Every Route of a stored index with each handler that HANDLES it, one sorted
+ * line each: "METHOD path route_qn file_path handler_qn". A Route no handler
+ * reaches ends in "-". The properties are parsed (json_extract): a Route not
+ * from route metadata is marked "!source", a handler declared in another file
+ * "!file", a HANDLES edge whose handler property is not its handler's QN
+ * "!handler"; malformed JSON fails the query. */
+static bool nextjs_route_tuples(const char *db_path, char *out, size_t sz) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    bool ok = false;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(
+            db,
+            "SELECT coalesce(group_concat(t, char(10)), '') FROM (SELECT "
+            "json_extract(r.properties,'$.method') || ' ' || r.name || ' ' || r.qualified_name || "
+            "' ' || r.file_path || ' ' || coalesce(h.qualified_name, '-') || CASE WHEN "
+            "json_extract(r.properties,'$.source') = 'decorator' THEN '' ELSE ' !source' END || "
+            "CASE WHEN h.id IS NULL OR h.file_path = r.file_path THEN '' ELSE ' !file' END || "
+            "CASE WHEN e.id IS NULL OR json_extract(e.properties,'$.handler') = h.qualified_name "
+            "THEN '' ELSE ' !handler' END AS t FROM nodes r LEFT JOIN edges e ON "
+            "e.target_id=r.id AND e.type='HANDLES' LEFT JOIN nodes h ON h.id=e.source_id WHERE "
+            "r.label='Route' ORDER BY t)",
+            -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        snprintf(out, sz, "%s", (const char *)sqlite3_column_text(st, 0));
+        ok = true;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return ok;
+}
+
+static int nextjs_by_qn(const void *a, const void *b) {
+    return strcmp(((const cbm_search_result_t *)a)->node.qualified_name,
+                  ((const cbm_search_result_t *)b)->node.qualified_name);
+}
+
+/* The Routes a search by label Route and declaring-file glob finds, one
+ * "qualified_name file_path" line each in QN order. */
+static bool nextjs_found_routes(const char *db_path, const char *glob, char *out, size_t sz) {
+    cbm_store_t *s = cbm_store_open_path_existing(db_path);
+    if (!s) {
+        return false;
+    }
+    cbm_search_params_t params = {.project = "nextjs",
+                                  .label = "Route",
+                                  .file_pattern = glob,
+                                  .min_degree = -1,
+                                  .max_degree = -1,
+                                  .limit = 100};
+    cbm_search_output_t res = {0};
+    bool ok = cbm_store_search(s, &params, &res) == CBM_STORE_OK;
+    if (ok && res.count > 1) {
+        qsort(res.results, (size_t)res.count, sizeof(res.results[0]), nextjs_by_qn);
+    }
+    size_t len = 0;
+    out[0] = '\0';
+    for (int i = 0; ok && i < res.count; i++) {
+        int n = snprintf(out + len, sz - len, "%s%s %s", i ? "\n" : "",
+                         res.results[i].node.qualified_name, res.results[i].node.file_path);
+        ok = n >= 0 && (size_t)n < sz - len;
+        len += ok ? (size_t)n : 0;
+    }
+    cbm_store_search_free(&res);
+    cbm_store_close(s);
+    return ok;
+}
+
+/* One index of a Next.js tree: its result, the route it took and the stored
+ * Routes after it (nextjs_route_tuples). */
+typedef struct {
+    int rc;
+    cbm_incremental_route_t route;
+    bool read;
+    char tuples[1024];
+} nextjs_run_t;
+
+static void nextjs_run(const char *repo, const char *db_path, nextjs_run_t *run) {
+    run->rc = nextjs_index(repo, db_path);
+    run->route = cbm_pipeline_incremental_test_last_route();
+    run->read = nextjs_route_tuples(db_path, run->tuples, sizeof(run->tuples));
+}
+
+/* #759: the HTTP verb Functions a Next.js route file exports HANDLE the Routes
+ * its directories name, in the stored graph: a dynamic segment, a group, a
+ * catch-all and the root, under src/app/ and app/. Each Route is there once,
+ * with its file, from its own handler, whose HANDLES property is its QN. A
+ * search by label Route and the declaring file's glob finds them. `fillers`
+ * more files put the index on the parallel extraction path. */
+static int nextjs_persisted_contract(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_routes_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "lib/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+    write_temp_file(tmp, "src/app/api/users/[id]/route.ts",
+                    "export function GET() {\n  return 1;\n}\n"
+                    "export const POST = async () => 1;\n");
+    write_temp_file(tmp, "src/app/(public)/api/[org]/users/[id]/route.ts",
+                    "export async function GET() {\n  return 2;\n}\n");
+    write_temp_file(tmp, "app/api/[...slug]/route.ts", "export function GET() {\n  return 3;\n}\n");
+    write_temp_file(tmp, "app/route.js", "export function GET() {\n  return 4;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    char found[1024];
+    bool searched =
+        nextjs_found_routes(db_path, "src/app/api/users/*/route.ts", found, sizeof(found));
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_TRUE(full.read);
+    ASSERT_STR_EQ(
+        full.tuples,
+        "GET / __route__GET__/ app/route.js nextjs.app.route.GET\n"
+        "GET /api/*slug __route__GET__/api/*slug app/api/[...slug]/route.ts "
+        "nextjs.app.api.[...slug].route.GET\n"
+        "GET /api/:org/users/:id __route__GET__/api/{}/users/{} "
+        "src/app/(public)/api/[org]/users/[id]/route.ts "
+        "nextjs.src.app.(public).api.[org].users.[id].route.GET\n"
+        "GET /api/users/:id __route__GET__/api/users/{} src/app/api/users/[id]/route.ts "
+        "nextjs.src.app.api.users.[id].route.GET\n"
+        "POST /api/users/:id __route__POST__/api/users/{} src/app/api/users/[id]/route.ts "
+        "nextjs.src.app.api.users.[id].route.POST");
+    ASSERT_TRUE(searched);
+    ASSERT_STR_EQ(found, "__route__GET__/api/users/{} src/app/api/users/[id]/route.ts\n"
+                         "__route__POST__/api/users/{} src/app/api/users/[id]/route.ts");
+    PASS();
+}
+
+TEST(pipeline_nextjs_persisted_route_contract_issue759) {
+    return nextjs_persisted_contract(0);
+}
+
+TEST(pipeline_nextjs_persisted_route_contract_parallel_issue759) {
+    return nextjs_persisted_contract(52);
+}
+
+/* #759 over the life of a route file. Each step re-indexes the stored graph;
+ * after each, the file's current handlers are its only Routes, each once, and
+ * an unrelated route file keeps its Route. An unchanged tree is a no-op, and a
+ * change to another file rebuilds the unchanged route files' Routes from their
+ * stored handlers (pass_route_nodes.c), which a search still finds. */
+TEST(pipeline_nextjs_incremental_lifecycle_issue759) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_life_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app/api/items/route.ts",
+                    "export function GET() {\n  return 1;\n}\n"
+                    "export async function POST() {\n  return 2;\n}\n");
+    write_temp_file(tmp, "app/api/health/route.ts", "export const GET = () => 'ok';\n");
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 1;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    nextjs_run_t same;
+    nextjs_run(tmp, db_path, &same);
+    char found_same[1024];
+    bool searched_same =
+        nextjs_found_routes(db_path, "app/api/*/route.ts", found_same, sizeof(found_same));
+
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 2;\n}\n");
+    nextjs_run_t helper_only;
+    nextjs_run(tmp, db_path, &helper_only);
+    char found_repair[1024];
+    bool searched_repair =
+        nextjs_found_routes(db_path, "app/api/*/route.ts", found_repair, sizeof(found_repair));
+
+    write_temp_file(tmp, "app/api/items/route.ts", "export function GET() {\n  return 1;\n}\n");
+    nextjs_run_t no_post;
+    nextjs_run(tmp, db_path, &no_post);
+
+    write_temp_file(tmp, "app/api/items/route.ts",
+                    "export function GET() {\n  const n = 10;\n  return n;\n}\n");
+    nextjs_run_t new_body;
+    nextjs_run(tmp, db_path, &new_body);
+
+    write_temp_file(tmp, "app/api/items/route.ts", "export function PATCH() {\n  return 3;\n}\n");
+    nextjs_run_t patch;
+    nextjs_run(tmp, db_path, &patch);
+
+    write_temp_file(tmp, "app/api/products/route.ts",
+                    "export function PATCH() {\n  return 3;\n}\n");
+    stem_unlink(tmp, "app/api/items/route.ts");
+    nextjs_run_t moved;
+    nextjs_run(tmp, db_path, &moved);
+
+    write_temp_file(tmp, "app/api/products/[id]/route.ts",
+                    "export function PATCH() {\n  return 3;\n}\n");
+    stem_unlink(tmp, "app/api/products/route.ts");
+    nextjs_run_t dynamic;
+    nextjs_run(tmp, db_path, &dynamic);
+
+    stem_unlink(tmp, "app/api/products/[id]/route.ts");
+    nextjs_run_t deleted;
+    nextjs_run(tmp, db_path, &deleted);
+    th_rmtree(tmp);
+
+    static const char health[] = "GET /api/health __route__GET__/api/health "
+                                 "app/api/health/route.ts nextjs.app.api.health.route.GET";
+    static const char routes[] = "GET /api/health __route__GET__/api/health "
+                                 "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                 "GET /api/items __route__GET__/api/items app/api/items/route.ts "
+                                 "nextjs.app.api.items.route.GET\n"
+                                 "POST /api/items __route__POST__/api/items app/api/items/route.ts "
+                                 "nextjs.app.api.items.route.POST";
+    static const char get_only[] = "GET /api/health __route__GET__/api/health "
+                                   "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                   "GET /api/items __route__GET__/api/items app/api/items/route.ts "
+                                   "nextjs.app.api.items.route.GET";
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_TRUE(full.read);
+    ASSERT_STR_EQ(full.tuples, routes);
+    ASSERT_EQ(same.rc, 0);
+    ASSERT_EQ(same.route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_STR_EQ(same.tuples, routes);
+    ASSERT_TRUE(searched_same);
+    ASSERT_STR_EQ(found_same, "__route__GET__/api/health app/api/health/route.ts\n"
+                              "__route__GET__/api/items app/api/items/route.ts\n"
+                              "__route__POST__/api/items app/api/items/route.ts");
+    ASSERT_EQ(helper_only.rc, 0);
+    ASSERT_EQ(helper_only.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_STR_EQ(helper_only.tuples, routes);
+    ASSERT_TRUE(searched_repair);
+    ASSERT_STR_EQ(found_repair, found_same);
+    ASSERT_EQ(no_post.rc, 0);
+    ASSERT_EQ(no_post.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_STR_EQ(no_post.tuples, get_only);
+    ASSERT_EQ(new_body.rc, 0);
+    ASSERT_EQ(new_body.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_STR_EQ(new_body.tuples, get_only);
+    ASSERT_EQ(patch.rc, 0);
+    ASSERT_STR_EQ(patch.tuples, "GET /api/health __route__GET__/api/health "
+                                "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                "PATCH /api/items __route__PATCH__/api/items "
+                                "app/api/items/route.ts nextjs.app.api.items.route.PATCH");
+    ASSERT_EQ(moved.rc, 0);
+    ASSERT_STR_EQ(moved.tuples, "GET /api/health __route__GET__/api/health "
+                                "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                                "PATCH /api/products __route__PATCH__/api/products "
+                                "app/api/products/route.ts nextjs.app.api.products.route.PATCH");
+    ASSERT_EQ(dynamic.rc, 0);
+    ASSERT_STR_EQ(dynamic.tuples,
+                  "GET /api/health __route__GET__/api/health "
+                  "app/api/health/route.ts nextjs.app.api.health.route.GET\n"
+                  "PATCH /api/products/:id __route__PATCH__/api/products/{} "
+                  "app/api/products/[id]/route.ts nextjs.app.api.products.[id].route.PATCH");
+    ASSERT_EQ(deleted.rc, 0);
+    ASSERT_STR_EQ(deleted.tuples, health);
+    PASS();
+}
+
+/* CBM_SEMANTIC_INDEX_VERSION 12 (#759): an index version 11 wrote has no route
+ * metadata, Route or HANDLES for a Next.js route file, and an unchanged tree
+ * is otherwise a no-op, so the version is what makes the new binary rebuild
+ * it. The stored index is put back to the version-11 state by hand (metadata,
+ * the handlers' route properties, the Routes and their edges); the run after
+ * that must replace it in full, the next one is a no-op. */
+TEST(pipeline_nextjs_semantic_upgrade_issue759) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_upgrade_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app/api/items/route.ts",
+                    "export function GET() {\n  return 1;\n}\n"
+                    "export const POST = async () => 2;\n");
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 1;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+    static const char all_nodes[] = "SELECT COUNT(*) FROM nodes";
+    static const char all_edges[] = "SELECT COUNT(*) FROM edges";
+    static const char routed[] =
+        "SELECT COUNT(*) FROM nodes WHERE json_extract(properties,'$.route_path') IS NOT NULL";
+
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    int nodes_before = k8s_inc_count(db_path, all_nodes);
+    int edges_before = k8s_inc_count(db_path, all_edges);
+
+    /* Put the published index back to what version 11 wrote. */
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    int coverage_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, "nextjs", &coverage_rows, &coverage_count),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, "nextjs", &meta), CBM_STORE_OK);
+    cbm_coverage_meta_t old_meta = meta;
+    old_meta.coverage_version = 11;
+    ASSERT_EQ(
+        cbm_store_coverage_replace_ex(store, "nextjs", coverage_rows, coverage_count, &old_meta),
+        CBM_STORE_OK);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
+    cbm_store_coverage_meta_clear(&meta);
+    ASSERT_EQ(cbm_store_exec(store,
+                             "DELETE FROM edges WHERE source_id IN (SELECT id FROM nodes WHERE "
+                             "label = 'Route') OR target_id IN (SELECT id FROM nodes WHERE "
+                             "label = 'Route');"
+                             "DELETE FROM nodes WHERE label = 'Route';"
+                             "UPDATE nodes SET properties = json_remove(properties, "
+                             "'$.route_path', '$.route_method') "
+                             "WHERE json_extract(properties, '$.route_path') IS NOT NULL;"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+    nextjs_run_t version_11 = {0};
+    version_11.read = nextjs_route_tuples(db_path, version_11.tuples, sizeof(version_11.tuples));
+    int routed_11 = k8s_inc_count(db_path, routed);
+
+    /* Nothing in the tree changed: only the version says the index is stale. */
+    nextjs_run_t upgrade;
+    nextjs_run(tmp, db_path, &upgrade);
+    int nodes_after = k8s_inc_count(db_path, all_nodes);
+    int edges_after = k8s_inc_count(db_path, all_edges);
+    int routed_after = k8s_inc_count(db_path, routed);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_coverage_meta_t new_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(store, "nextjs", &new_meta), CBM_STORE_OK);
+    int stored_version = new_meta.coverage_version;
+    cbm_store_coverage_meta_clear(&new_meta);
+    cbm_store_close(store);
+    nextjs_run_t again;
+    nextjs_run(tmp, db_path, &again);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_STR_EQ(full.tuples, "GET /api/items __route__GET__/api/items app/api/items/route.ts "
+                               "nextjs.app.api.items.route.GET\n"
+                               "POST /api/items __route__POST__/api/items app/api/items/route.ts "
+                               "nextjs.app.api.items.route.POST");
+    ASSERT_TRUE(version_11.read);
+    ASSERT_STR_EQ(version_11.tuples, "");
+    ASSERT_EQ(routed_11, 0);
+    ASSERT_EQ(upgrade.rc, 0);
+    ASSERT_EQ(upgrade.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_STR_EQ(upgrade.tuples, full.tuples);
+    ASSERT_EQ(routed_after, 2);
+    ASSERT_EQ(nodes_after, nodes_before);
+    ASSERT_EQ(edges_after, edges_before);
+    ASSERT_EQ(stored_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_EQ(again.rc, 0);
+    ASSERT_EQ(again.route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_STR_EQ(again.tuples, full.tuples);
+    ASSERT_GTE(CBM_SEMANTIC_INDEX_VERSION, 12);
+    PASS();
+}
+
+/* #759: a quote is legal in a POSIX directory name, so a route path, its file
+ * and its handler's QN can hold one, escaped in the stored JSON. The route pass
+ * builds the Route from its handler's stored properties on every index
+ * (pass_route_nodes.c), so the full index and an incremental one after an
+ * unrelated edit must both store it intact. */
+TEST(pipeline_nextjs_quoted_route_round_trip_issue759) {
+#ifdef _WIN32
+    SKIP_PLATFORM("a quote is not a legal Windows path character");
+#else
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nextjs_quote_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "app/api/a\"b/route.ts", "export function GET() {\n  return 1;\n}\n");
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 1;\n}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/nextjs.db", tmp);
+
+    nextjs_run_t full;
+    nextjs_run(tmp, db_path, &full);
+    write_temp_file(tmp, "lib/helper.ts", "export function helper(): number {\n  return 2;\n}\n");
+    nextjs_run_t helper_only;
+    nextjs_run(tmp, db_path, &helper_only);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full.rc, 0);
+    ASSERT_TRUE(full.read);
+    ASSERT_STR_EQ(full.tuples, "GET /api/a\"b __route__GET__/api/a\"b app/api/a\"b/route.ts "
+                               "nextjs.app.api.a\"b.route.GET");
+    ASSERT_EQ(helper_only.rc, 0);
+    ASSERT_EQ(helper_only.route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_TRUE(helper_only.read);
+    ASSERT_STR_EQ(helper_only.tuples, full.tuples);
+    PASS();
+#endif
+}
+
 TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1) {
     return pipeline_legacy_c_identity_index_is_rebuilt(3);
 }
@@ -29114,6 +29531,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
     RUN_TEST(pipeline_semantic_version_3_index_is_rebuilt_in_full_c1);
     RUN_TEST(pipeline_semantic_version_5_index_is_rebuilt_in_full_c1);
+    RUN_TEST(pipeline_nextjs_persisted_route_contract_issue759);
+    RUN_TEST(pipeline_nextjs_persisted_route_contract_parallel_issue759);
+    RUN_TEST(pipeline_nextjs_incremental_lifecycle_issue759);
+    RUN_TEST(pipeline_nextjs_semantic_upgrade_issue759);
+    RUN_TEST(pipeline_nextjs_quoted_route_round_trip_issue759);
     RUN_TEST(pipeline_python_app_factory_routes_issue1548);
     RUN_TEST(pipeline_python_nested_def_is_function_local_issue1548);
     RUN_TEST(pipeline_python_local_classes_stay_in_their_def_issue1548);

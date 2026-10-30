@@ -1663,8 +1663,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *  11: Python local defs and classes bind through their enclosing lexical
  *      scope, including app-factory route handlers. Published version 10
  *      predates this resolution, so unchanged files rebuild once on upgrade.
+ *  12: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *      / route.js under app/ or src/app/ exports, carries the route_path its
+ *      directories name and HANDLES its Route (extract_nextjs.c). An index
+ *      built before has none of these Routes for its unchanged route files,
+ *      so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 11 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

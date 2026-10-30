@@ -1395,6 +1395,11 @@ void cbm_extract_diagram_file(CBMExtractCtx *ctx);
  * or JSON files whose root says `openapi` or `swagger`. */
 void cbm_extract_openapi(CBMExtractCtx *ctx);
 
+/* Next.js App Router route handlers (extract_nextjs.c): the HTTP verb Functions
+ * a route file exports carry the route path its directories name. Self-gated:
+ * TS / JS route.ts and route.js under app/ or src/app/. */
+void cbm_extract_nextjs_routes(CBMExtractCtx *ctx);
+
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites, server handlers
  * and OpenAPI operations rendezvous on the same Route QN regardless of
