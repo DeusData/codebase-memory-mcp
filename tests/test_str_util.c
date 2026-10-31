@@ -1,6 +1,9 @@
 /*
  * test_str_util.c — RED phase tests for foundation/str_util.
  */
+#include "foundation/json_writer.h"
+#include "foundation/mem_core.h"
+#include <stdlib.h>
 #include "test_framework.h"
 #include "../src/foundation/str_util.h"
 
@@ -504,7 +507,99 @@ TEST(snprintf_append_multiple_sequential) {
     PASS();
 }
 
+TEST(utf8_sequence_len_rejects_what_rfc3629_rejects) {
+    static const struct {
+        const char *bytes;
+        size_t expected;
+    } cases[] = {
+        {"a", 1},
+        {"\xc3\xa9", 2},
+        {"\xe2\x82\xac", 3},
+        {"\xf0\x9f\x98\x80", 4},
+        {"\xe9", 0},             /* lone latin-1 byte */
+        {"\xc0\xaf", 0},         /* overlong */
+        {"\xed\xa0\x80", 0},     /* surrogate */
+        {"\xf4\x90\x80\x80", 0}, /* above U+10FFFF */
+        {"\xe2\x82", 0},         /* truncated at end */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const unsigned char *p = (const unsigned char *)cases[i].bytes;
+        ASSERT_EQ((int)cbm_utf8_sequence_len(p, p + strlen(cases[i].bytes)),
+                  (int)cases[i].expected);
+    }
+    ASSERT(cbm_utf8_valid("caf\xc3\xa9", 5));
+    ASSERT_FALSE(cbm_utf8_valid("caf\xe9", 4));
+    ASSERT(cbm_utf8_valid("", 0));
+    PASS();
+}
+
+TEST(utf8_lossy_dup_replaces_only_undecodable_bytes) {
+    size_t length = 0;
+    const char *input = "caf\xe9 \xc3\xa9 \xfc\x92";
+    char *clean = cbm_utf8_lossy_dup(CBM_MEM_CLASS_OTHER, input, strlen(input), &length);
+    ASSERT_NOT_NULL(clean);
+    ASSERT_STR_EQ(clean, "caf\xef\xbf\xbd \xc3\xa9 \xef\xbf\xbd\xef\xbf\xbd");
+    ASSERT_EQ((int)length, (int)strlen(clean));
+    ASSERT(cbm_utf8_valid(clean, length));
+    cbm_free(CBM_MEM_CLASS_OTHER, clean);
+    ASSERT(cbm_utf8_lossy_dup(CBM_MEM_CLASS_OTHER, NULL, 0, NULL) == NULL);
+    PASS();
+}
+
+TEST(json_write_text_keeps_valid_documents_and_repairs_refused_ones) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    ASSERT(yyjson_mut_obj_add_strcpy(doc, root, "plain", "caf\xc3\xa9"));
+    char *json = cbm_json_write_text(doc, NULL, NULL);
+    ASSERT_STR_EQ(json, "{\"plain\":\"caf\xc3\xa9\"}");
+    free(json);
+
+    yyjson_mut_val *list = yyjson_mut_arr(doc);
+    ASSERT(yyjson_mut_obj_add_val(doc, root, "list", list));
+    ASSERT(yyjson_mut_arr_add_strcpy(doc, list, "x\xe9"));
+    ASSERT(yyjson_mut_obj_add_strcpy(doc, root, "k\xe9y", "v\xe9"));
+    ASSERT(yyjson_mut_write(doc, 0, NULL) == NULL);
+    size_t length = 0;
+    json = cbm_json_write_text(doc, NULL, &length);
+    ASSERT_NOT_NULL(json);
+    ASSERT_STR_EQ(json, "{\"plain\":\"caf\xc3\xa9\",\"list\":[\"x\xef\xbf\xbd\"],"
+                        "\"k\xef\xbf\xbdy\":\"v\xef\xbf\xbd\"}");
+    ASSERT_EQ((int)length, (int)strlen(json));
+    yyjson_doc *strict = yyjson_read(json, length, 0);
+    ASSERT_NOT_NULL(strict);
+    yyjson_doc_free(strict);
+    free(json);
+
+    yyjson_mut_val *inner = yyjson_mut_obj(doc);
+    ASSERT(yyjson_mut_obj_add_strcpy(doc, inner, "e", "bad\xfc"));
+    json = cbm_json_val_write_text(doc, inner, NULL, NULL);
+    ASSERT_STR_EQ(json, "{\"e\":\"bad\xef\xbf\xbd\"}");
+    free(json);
+
+    /* Wider than the walk's initial stack. */
+    yyjson_mut_val *wide = yyjson_mut_arr(doc);
+    for (int i = 0; i < 64; i++)
+        ASSERT(yyjson_mut_arr_add_strcpy(doc, wide, "w\xe9"));
+    json = cbm_json_val_write_text(doc, wide, NULL, NULL);
+    ASSERT_NOT_NULL(json);
+    int replaced = 0;
+    for (const char *at = json; (at = strstr(at, "w\xef\xbf\xbd")); at++)
+        replaced++;
+    ASSERT_EQ(replaced, 64);
+    free(json);
+    yyjson_mut_doc_free(doc);
+
+    yyjson_mut_doc *empty = yyjson_mut_doc_new(NULL);
+    ASSERT(cbm_json_write_text(empty, NULL, NULL) == NULL);
+    yyjson_mut_doc_free(empty);
+    PASS();
+}
+
 SUITE(str_util) {
+    RUN_TEST(utf8_sequence_len_rejects_what_rfc3629_rejects);
+    RUN_TEST(utf8_lossy_dup_replaces_only_undecodable_bytes);
+    RUN_TEST(json_write_text_keeps_valid_documents_and_repairs_refused_ones);
     RUN_TEST(path_join_basic);
     RUN_TEST(path_join_trailing_slash);
     RUN_TEST(path_join_leading_slash);

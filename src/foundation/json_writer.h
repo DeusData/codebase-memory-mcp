@@ -31,4 +31,14 @@ static inline const yyjson_alc *cbm_json_writer_allocator(void) {
     return &allocator;
 }
 
+/* yyjson's strict writer refuses a whole document over one undecodable byte. Text
+ * read from a source file can be in any encoding (a latin-1 string or identifier is
+ * ordinary in old C, Lua and Python), so these write valid documents unchanged and
+ * replace such bytes with U+FFFD only in one that the writer refused. The result is
+ * always strict JSON. NULL only for what the strict writer itself reports: a failed
+ * allocation or a missing root. alc and length mean what they do in yyjson. */
+char *cbm_json_write_text(yyjson_mut_doc *doc, const yyjson_alc *alc, size_t *length);
+char *cbm_json_val_write_text(yyjson_mut_doc *doc, yyjson_mut_val *value, const yyjson_alc *alc,
+                              size_t *length);
+
 #endif /* CBM_JSON_WRITER_H */

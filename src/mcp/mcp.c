@@ -13745,46 +13745,6 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
     return NULL;
 }
 
-static bool utf8_is_cont(unsigned char c) {
-    return (c & 0xC0) == 0x80;
-}
-
-static size_t utf8_sequence_len(const unsigned char *p, const unsigned char *end) {
-    size_t remaining = (size_t)(end - p);
-    unsigned char c = *p;
-    if (c < 0x80) {
-        return 1;
-    }
-    if (c >= 0xC2 && c <= 0xDF && remaining >= 2 && utf8_is_cont(p[1])) {
-        return 2;
-    }
-    if (c == 0xE0 && remaining >= 3 && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_cont(p[2])) {
-        return 3;
-    }
-    if (c >= 0xE1 && c <= 0xEC && remaining >= 3 && utf8_is_cont(p[1]) && utf8_is_cont(p[2])) {
-        return 3;
-    }
-    if (c == 0xED && remaining >= 3 && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_cont(p[2])) {
-        return 3;
-    }
-    if (c >= 0xEE && c <= 0xEF && remaining >= 3 && utf8_is_cont(p[1]) && utf8_is_cont(p[2])) {
-        return 3;
-    }
-    if (c == 0xF0 && remaining >= 4 && p[1] >= 0x90 && p[1] <= 0xBF && utf8_is_cont(p[2]) &&
-        utf8_is_cont(p[3])) {
-        return 4;
-    }
-    if (c >= 0xF1 && c <= 0xF3 && remaining >= 4 && utf8_is_cont(p[1]) && utf8_is_cont(p[2]) &&
-        utf8_is_cont(p[3])) {
-        return 4;
-    }
-    if (c == 0xF4 && remaining >= 4 && p[1] >= 0x80 && p[1] <= 0x8F && utf8_is_cont(p[2]) &&
-        utf8_is_cont(p[3])) {
-        return 4;
-    }
-    return 0;
-}
-
 static char *sanitize_utf8_lossy(const char *s) {
     enum { UTF8_REPLACEMENT_LEN = 3 };
     if (!s) {
@@ -13803,7 +13763,7 @@ static char *sanitize_utf8_lossy(const char *s) {
     const unsigned char *end = p + len;
     unsigned char *dst = (unsigned char *)out;
     while (p < end) {
-        size_t n = utf8_sequence_len(p, end);
+        size_t n = cbm_utf8_sequence_len(p, end);
 
         if (n > 0) {
             memcpy(dst, p, n);
@@ -16160,8 +16120,8 @@ static size_t search_utf8_page_start(const char *content, size_t total, size_t s
         if (search_utf8_continuation_byte((unsigned char)content[candidate])) {
             continue;
         }
-        size_t sequence = utf8_sequence_len((const unsigned char *)content + candidate,
-                                            (const unsigned char *)content + total);
+        size_t sequence = cbm_utf8_sequence_len((const unsigned char *)content + candidate,
+                                                (const unsigned char *)content + total);
         if (sequence > 1U && candidate + sequence > start) {
             return candidate + sequence;
         }
@@ -16180,8 +16140,8 @@ static size_t search_utf8_page_end(const char *content, size_t total, size_t end
         if (search_utf8_continuation_byte((unsigned char)content[candidate])) {
             continue;
         }
-        size_t sequence = utf8_sequence_len((const unsigned char *)content + candidate,
-                                            (const unsigned char *)content + total);
+        size_t sequence = cbm_utf8_sequence_len((const unsigned char *)content + candidate,
+                                                (const unsigned char *)content + total);
         if (sequence > 1U && candidate + sequence > end) {
             return candidate;
         }

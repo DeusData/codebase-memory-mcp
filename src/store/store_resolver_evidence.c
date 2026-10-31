@@ -140,7 +140,7 @@ static char *fact_json(const cbm_resolve_proof_view_t *v) {
     NUM("predecessors_closed", v->predecessors_closed);
 #undef STR
 #undef NUM
-    char *json = ok ? yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL) : NULL;
+    char *json = ok ? cbm_json_write_text(doc, cbm_json_writer_allocator(), NULL) : NULL;
     yyjson_mut_doc_free(doc);
     return json;
 }

@@ -1719,7 +1719,7 @@ static char *solver_summary_payload(const cbm_resolve_solver_result_t *binding) 
         yyjson_mut_obj_add_val(doc, object, "dependencies", dependencies);
     for (size_t i = 0; ok && i < binding->dependency_count; i++)
         ok = yyjson_mut_arr_add_str(doc, dependencies, binding->dependencies[i]);
-    char *json = ok ? yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL) : NULL;
+    char *json = ok ? cbm_json_write_text(doc, cbm_json_writer_allocator(), NULL) : NULL;
     yyjson_mut_doc_free(doc);
     return json;
 }
@@ -2630,8 +2630,7 @@ static char *record_properties(const char *name, const char *relation, uint32_t 
     }
     if (ok)
         yyjson_mut_doc_set_root(doc, root);
-    char *properties =
-        ok ? yyjson_mut_write_opts(doc, 0, cbm_json_writer_allocator(), NULL, NULL) : NULL;
+    char *properties = ok ? cbm_json_write_text(doc, cbm_json_writer_allocator(), NULL) : NULL;
     yyjson_mut_doc_free(doc);
     return properties;
 }

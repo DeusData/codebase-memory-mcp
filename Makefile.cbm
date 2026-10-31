@@ -348,6 +348,7 @@ FOUNDATION_SRCS = \
     src/foundation/str_intern.c \
     src/foundation/log.c \
     src/foundation/str_util.c \
+    src/foundation/json_writer.c \
     src/foundation/workspace.c \
     src/foundation/platform.c \
     src/foundation/path_syntax_internal.c \

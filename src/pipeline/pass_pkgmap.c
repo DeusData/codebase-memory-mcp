@@ -26,6 +26,7 @@
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
 #include "foundation/platform.h"
+#include "foundation/json_writer.h"
 #include "foundation/str_util.h"
 #include "foundation/win_utf8.h"
 #include "foundation/yaml.h"
@@ -4976,7 +4977,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
                 php_binding_json(doc, &result->imports.items[j], targets[j]->qualified_name);
             ok = entry && yyjson_mut_arr_add_val(bindings, entry);
         }
-        char *props = ok ? yyjson_mut_val_write(edge, 0, NULL) : NULL;
+        char *props = ok ? cbm_json_val_write_text(doc, edge, NULL, NULL) : NULL;
         const char *retained = props ? cbm_arena_strdup(&proof_arena, props) : NULL;
         ok = retained &&
              cbm_gbuf_insert_edge(ctx->gbuf, file->id, targets[i]->id, "IMPORTS", retained) > 0;
@@ -4995,7 +4996,7 @@ int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileR
     if (ok) {
         if (!complete)
             yyjson_mut_set_int(yyjson_mut_obj_get(root, "php_imports_complete"), 0);
-        char *props = yyjson_mut_write(doc, 0, NULL);
+        char *props = cbm_json_write_text(doc, NULL, NULL);
         if (props)
             (void)cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, props);
         free(props);
@@ -5175,7 +5176,7 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
         yyjson_mut_val *entry = php_binding_json(doc, &result->imports.items[i], target);
         ok = entry && yyjson_mut_arr_add_val(array, entry);
     }
-    char *json = ok ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    char *json = ok ? cbm_json_write_text(doc, NULL, NULL) : NULL;
     if (json)
         ok = cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, json) == 0;
     else
@@ -5228,7 +5229,7 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
                                                         imp->local_name ? imp->local_name : "");
             if (valid)
                 yyjson_mut_doc_set_root(doc, properties);
-            char *props = valid ? yyjson_mut_write(doc, 0, NULL) : NULL;
+            char *props = valid ? cbm_json_write_text(doc, NULL, NULL) : NULL;
             if (!props) {
                 row.result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
                 row.result.reason = "import_properties_allocation_failed";

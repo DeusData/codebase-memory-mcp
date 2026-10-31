@@ -39,6 +39,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/json_writer.h"
 #include "foundation/str_util.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
@@ -1378,7 +1379,7 @@ static void record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
     }
     ok = ok && unresolved_build_carriers(&capture) && unresolved_collect_sites(&capture);
     if (ok && yyjson_mut_arr_size(capture.sites) > 0) {
-        char *detail = yyjson_mut_write_opts(capture.doc, 0, &allocator, NULL, NULL);
+        char *detail = cbm_json_write_text(capture.doc, &allocator, NULL);
         char *path = cbm_mem_strdup(CBM_MEM_CLASS_RESOLVE, rel_path);
         /* The estimate reserves overhead and escaping. Enforce the serialized
          * limit as well, before any detail is transferred to persistence. */
@@ -1419,13 +1420,26 @@ static char *unresolved_publication_key(const char *file, const char *scope, con
                                         uint32_t start, uint32_t end, unsigned origin) {
     if (!file || !scope || !spelling || !content || !configuration)
         return NULL;
-    size_t cap = strlen(file) + strlen(scope) + strlen(spelling) + strlen(content) +
-                 strlen(configuration) + 192;
-    char *key = cbm_alloc(CBM_MEM_CLASS_RESOLVE, cap);
-    if (key)
-        snprintf(key, cap, "%zu:%s|%zu:%s|%zu:%s|%zu:%s|%zu:%s|%u:%u:%u", strlen(file), file,
-                 strlen(scope), scope, strlen(spelling), spelling, strlen(content), content,
-                 strlen(configuration), configuration, start, end, origin);
+    /* One side of this key is read back from the strict JSON of the pending row,
+     * where undecodable bytes are already U+FFFD. Both must name the occurrence alike. */
+    char *clean_file = cbm_utf8_lossy_dup(CBM_MEM_CLASS_RESOLVE, file, strlen(file), NULL);
+    char *clean_scope = cbm_utf8_lossy_dup(CBM_MEM_CLASS_RESOLVE, scope, strlen(scope), NULL);
+    char *clean_spelling =
+        cbm_utf8_lossy_dup(CBM_MEM_CLASS_RESOLVE, spelling, strlen(spelling), NULL);
+    char *key = NULL;
+    if (clean_file && clean_scope && clean_spelling) {
+        size_t cap = strlen(clean_file) + strlen(clean_scope) + strlen(clean_spelling) +
+                     strlen(content) + strlen(configuration) + 192;
+        key = cbm_alloc(CBM_MEM_CLASS_RESOLVE, cap);
+        if (key)
+            snprintf(key, cap, "%zu:%s|%zu:%s|%zu:%s|%zu:%s|%zu:%s|%u:%u:%u", strlen(clean_file),
+                     clean_file, strlen(clean_scope), clean_scope, strlen(clean_spelling),
+                     clean_spelling, strlen(content), content, strlen(configuration), configuration,
+                     start, end, origin);
+    }
+    cbm_free(CBM_MEM_CLASS_RESOLVE, clean_file);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, clean_scope);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, clean_spelling);
     return key;
 }
 

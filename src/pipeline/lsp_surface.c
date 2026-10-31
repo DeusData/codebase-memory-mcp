@@ -16,6 +16,7 @@
  *     serialization therefore IS surface equality, and the sha over the
  *     bytes is the early-cutoff key: a body edit reserializes identically.
  */
+#include "foundation/json_writer.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pipeline_internal.h"
 
@@ -470,7 +471,7 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_doc_free(doc);
         return NULL;
     }
-    char *json = yyjson_mut_write(doc, 0, out_len);
+    char *json = cbm_json_write_text(doc, NULL, out_len);
     yyjson_mut_doc_free(doc);
     return json;
 }

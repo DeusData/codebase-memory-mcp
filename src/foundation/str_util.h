@@ -2,11 +2,12 @@
  * str_util.h — Safe string operations.
  *
  * All functions that return char* allocate via the provided arena
- * (no malloc, no free needed).
+ * (no malloc, no free needed), unless the function says otherwise.
  */
 #ifndef CBM_STR_UTIL_H
 #define CBM_STR_UTIL_H
 
+#include "foundation/mem_core.h"
 #include "arena.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -112,6 +113,20 @@ bool cbm_is_project_index_db(const char *filename);
  * length. Complete sequences and ASCII are left untouched. Use after any
  * byte-count truncation of text that will be stored or serialised. */
 int cbm_utf8_trim_partial(char *buf);
+
+/* Length of the well-formed UTF-8 sequence at p (RFC 3629: no overlong forms, no
+ * surrogates, nothing above U+10FFFF), or 0 when the bytes at p are not one. Never
+ * reads at or past end; p must be below end. */
+size_t cbm_utf8_sequence_len(const unsigned char *p, const unsigned char *end);
+
+/* True when the len bytes at s are entirely well-formed UTF-8. */
+bool cbm_utf8_valid(const char *s, size_t len);
+
+/* NUL-terminated copy of the len bytes at s, each byte that does not start a
+ * well-formed sequence replaced by U+FFFD, so the result is always valid UTF-8.
+ * Allocated from the memory core in class cls; NULL for NULL input or a failed
+ * allocation. out_len, when given, receives the result's length. */
+char *cbm_utf8_lossy_dup(cbm_mem_class_t cls, const char *s, size_t len, size_t *out_len);
 
 /* Escape a string for safe embedding in JSON: escapes " \ and control chars.
  * Writes into buf (including NUL). Returns number of chars written (excl NUL).
