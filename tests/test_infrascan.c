@@ -173,6 +173,13 @@ TEST(infrascan_service_pattern_match_rejects_ids_inside_words) {
         {"kafkaesque.story.tell", CBM_SVC_NONE},
         /* "Axios" glued to a lowercase continuation */
         {"geo.Axiosphere.map", CBM_SVC_NONE},
+        /* Angular receiver rows end in a dot (#2768): a longer receiver that
+         * only starts with the same letters is not the HttpClient (NestJS
+         * route registration, AngularJS test double) */
+        {"this.httpAdapter.get", CBM_SVC_NONE},
+        {"this.httpServer.post", CBM_SVC_NONE},
+        {"$httpBackend.expectGET", CBM_SVC_NONE},
+        {"this.httpAdapter\n      .get", CBM_SVC_NONE},
         {NULL, CBM_SVC_NONE},
     };
     ASSERT_EQ(svc_case_mismatches(cases), 0);
@@ -202,6 +209,18 @@ TEST(infrascan_service_pattern_match_keeps_real_library_qns) {
         {"Axios.post", CBM_SVC_HTTP},
         {"AxiosInstance.get", CBM_SVC_HTTP},
         {"curl_exec", CBM_SVC_HTTP},
+        /* Angular HttpClient receivers (#2768); `_httpClient` is the common
+         * C# field spelling of the same client */
+        {"this.http.get", CBM_SVC_HTTP},
+        {"this.httpClient.post", CBM_SVC_HTTP},
+        {"httpClient.put", CBM_SVC_HTTP},
+        {"_httpClient.GetAsync", CBM_SVC_HTTP},
+        {"$http.get", CBM_SVC_HTTP},
+        /* a chain wrapped before the verb keeps the line break (LF / CRLF) */
+        {"this.http\n      .post", CBM_SVC_HTTP},
+        {"this.http\r\n      .delete", CBM_SVC_HTTP},
+        {"this.httpClient\n      .put", CBM_SVC_HTTP},
+        {"$http\n    .get", CBM_SVC_HTTP},
         {"surf.get", CBM_SVC_HTTP},
         {"hyper.Client.request", CBM_SVC_HTTP},
         {"phin.promisified", CBM_SVC_HTTP},
