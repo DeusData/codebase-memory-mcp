@@ -317,12 +317,20 @@ bool cbm_is_internal_cache_db(const char *filename) {
 
 bool cbm_is_project_index_db(const char *filename) {
     static const char db_ext[] = ".db";
+    static const char adr_ext[] = ".adr.db";
     const size_t ext_len = sizeof(db_ext) - 1;
+    const size_t adr_len = sizeof(adr_ext) - 1;
     if (!filename) {
         return false;
     }
     size_t len = strlen(filename);
     if (len <= ext_len || strcmp(filename + len - ext_len, db_ext) != 0) {
+        return false;
+    }
+    /* A per-project ADR sidecar ("<db>.adr.db") ends in ".db" but is not itself
+     * an index — exclude it from every index scan/count (MCP loops + the CLI's
+     * cbm_list_indexes / count_db_indexes all gate on this helper). */
+    if (len >= adr_len && strcmp(filename + len - adr_len, adr_ext) == 0) {
         return false;
     }
     return !cbm_is_internal_cache_db(filename);
