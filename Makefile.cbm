@@ -122,7 +122,8 @@ EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
 	-DCBM_CONFIG_EDIT_PATH_ENABLE_TEST_API=1 \
-	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1 \
+	-DCBM_SVN_STATE_ENABLE_TEST_API=1
 # The build system is the single source of truth for "is this binary
 # instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
 # clang's feature-check spelling and every non-ASan sanitizer, so the
@@ -585,7 +586,7 @@ UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 TRACES_SRCS = src/traces/traces.c
 
 # Watcher module (new)
-WATCHER_SRCS = src/watcher/watcher.c
+WATCHER_SRCS = src/watcher/watcher.c src/watcher/svn_state.c
 
 # Git context module (new)
 GIT_SRCS = src/git/git_context.c
@@ -847,7 +848,7 @@ TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
 TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
-TEST_WATCHER_SRCS = tests/test_watcher.c
+TEST_WATCHER_SRCS = tests/test_watcher.c tests/test_svn_state.c
 
 TEST_LZ4_SRCS = tests/test_lz4.c
 TEST_ZSTD_SRCS = tests/test_zstd.c
