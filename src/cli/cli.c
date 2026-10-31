@@ -7742,6 +7742,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
     {CBM_INDEX_CONFIG_MAX_FILES, "off", "Max accepted source files per index, or off"},
     {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
+    {CBM_INDEX_CONFIG_SECRET_FILES, "false",
+     "Index secret-bearing files (.env, private keys, credential files); skipped by default"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
@@ -7769,7 +7771,8 @@ static bool config_key_is_ui(const char *key) {
 
 static bool config_key_is_index_policy(const char *key) {
     return key && (strcmp(key, CBM_INDEX_CONFIG_MAX_FILES) == 0 ||
-                   strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0);
+                   strcmp(key, CBM_INDEX_CONFIG_MAX_SOURCE_MB) == 0 ||
+                   strcmp(key, CBM_INDEX_CONFIG_SECRET_FILES) == 0);
 }
 
 static int config_index_policy_write(cbm_config_t *config, const char *key, const char *value) {

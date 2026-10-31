@@ -1772,9 +1772,14 @@ static bool app_fake_worker_policy_equals(app_fake_worker_context_t *context, in
     yyjson_val *bytes = policy && yyjson_is_obj(policy)
                             ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_MAX_SOURCE_MB)
                             : NULL;
-    bool equal = files && bytes && yyjson_is_str(files) && yyjson_is_str(bytes) &&
+    yyjson_val *secret_files = policy && yyjson_is_obj(policy)
+                                   ? yyjson_obj_get(policy, CBM_INDEX_CONFIG_SECRET_FILES)
+                                   : NULL;
+    bool equal = files && bytes && secret_files && yyjson_is_str(files) && yyjson_is_str(bytes) &&
+                 yyjson_is_str(secret_files) &&
                  strcmp(yyjson_get_str(files), max_files) == 0 &&
-                 strcmp(yyjson_get_str(bytes), max_source_mb) == 0;
+                 strcmp(yyjson_get_str(bytes), max_source_mb) == 0 &&
+                 strcmp(yyjson_get_str(secret_files), "false") == 0;
     yyjson_doc_free(document);
     return equal;
 }

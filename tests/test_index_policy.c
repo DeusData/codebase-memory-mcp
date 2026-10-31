@@ -98,6 +98,48 @@ TEST(index_policy_format_round_trips_public_values) {
     PASS();
 }
 
+TEST(index_policy_secret_files_defaults_off_and_round_trips) {
+    cbm_index_resource_policy_t policy;
+    char error[256];
+    char out[16];
+    cbm_index_policy_init(&policy);
+    ASSERT_FALSE(policy.index_secret_files);
+    ASSERT_FALSE(cbm_index_policy_enabled(&policy));
+    ASSERT_STR_EQ(cbm_index_policy_default_value(CBM_INDEX_CONFIG_SECRET_FILES), "false");
+
+    ASSERT_TRUE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_SECRET_FILES, "true", error, sizeof(error)));
+    ASSERT_TRUE(policy.index_secret_files);
+    ASSERT_TRUE(cbm_index_policy_enabled(&policy));
+    ASSERT_TRUE(cbm_index_policy_format(&policy, CBM_INDEX_CONFIG_SECRET_FILES, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "true");
+
+    ASSERT_FALSE(
+        cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_SECRET_FILES, "yes", error, sizeof(error)));
+    ASSERT_TRUE(policy.index_secret_files); /* rejected value leaves the setting intact */
+    ASSERT_TRUE(cbm_index_policy_set(&policy, CBM_INDEX_CONFIG_SECRET_FILES, "false", error,
+                                     sizeof(error)));
+    ASSERT_FALSE(policy.index_secret_files);
+    PASS();
+}
+
+TEST(index_policy_secret_files_config_key_is_loaded) {
+    char *cache = th_mktempdir("cbm_index_policy_secret");
+    ASSERT_NOT_NULL(cache);
+    cbm_config_t *config = cbm_config_open(cache);
+    ASSERT_NOT_NULL(config);
+    cbm_index_resource_policy_t policy;
+    char error[256];
+    ASSERT_TRUE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
+    ASSERT_FALSE(policy.index_secret_files);
+    ASSERT_EQ(cbm_config_set(config, CBM_INDEX_CONFIG_SECRET_FILES, "true"), 0);
+    ASSERT_TRUE(cbm_config_load_index_policy(config, &policy, error, sizeof(error)));
+    ASSERT_TRUE(policy.index_secret_files);
+    cbm_config_close(config);
+    th_cleanup(cache);
+    PASS();
+}
+
 TEST(index_policy_violation_metadata_is_stable) {
     ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_FILES), "files");
     ASSERT_STR_EQ(cbm_index_resource_name(CBM_INDEX_RESOURCE_SOURCE_BYTES), "source_bytes");
@@ -329,7 +371,8 @@ TEST(index_policy_mcp_rejects_forged_override_and_preserves_serving_index) {
     (void)snprintf(args, sizeof(args),
                    "{\"repo_path\":\"%s\",\"name\":\"ResourcePolicyFixture\","
                    "\"mode\":\"fast\",\"_cbm_index_policy\":{"
-                   "\"index_max_files\":\"off\",\"index_max_source_mb\":\"off\"}}",
+                   "\"index_max_files\":\"off\",\"index_max_source_mb\":\"off\","
+                   "\"index_secret_files\":\"false\"}}",
                    repo);
     char *limited_response =
         configured && server ? cbm_mcp_handle_tool(server, "index_repository", args) : NULL;
@@ -393,6 +436,8 @@ SUITE(index_policy) {
     RUN_TEST(index_policy_source_limit_converts_mib_without_overflow);
     RUN_TEST(index_policy_invalid_value_is_rejected_atomically);
     RUN_TEST(index_policy_format_round_trips_public_values);
+    RUN_TEST(index_policy_secret_files_defaults_off_and_round_trips);
+    RUN_TEST(index_policy_secret_files_config_key_is_loaded);
     RUN_TEST(index_policy_violation_metadata_is_stable);
     RUN_TEST(index_policy_config_loads_defaults_values_and_rejects_corruption);
     RUN_TEST(index_policy_cli_lists_both_operator_keys);
