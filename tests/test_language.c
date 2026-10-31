@@ -1457,6 +1457,55 @@ static CBMLanguage classify_content(const char *name, const char *content, size_
 
 typedef CBMLanguage (*path_probe_fn)(const char *path);
 
+/* Exercise the shared classifier and both disk entry points. All sources are
+ * synthetic; the recipe bodies deliberately contain misleading C-like code. */
+TEST(lang_inc_c_family_and_existing_dialects) {
+    static const struct {
+        const char *content;
+        CBMLanguage expected;
+    } cases[] = {
+        {"#include \"sample.h\"\nextern \"C\" int sample_export() { return 0; }\n", CBM_LANG_CPP},
+        {"extern \"C\" __declspec(dllexport) int sample_export() { return 0; }\n", CBM_LANG_CPP},
+        {"#define SAMPLE_CALLBACK(T) T\nstatic SAMPLE_CALLBACK(int) sample() { return 0; }\n",
+         CBM_LANG_CPP},
+        {"/* in-function fragment */\n#ifdef SAMPLE_ENABLED\nif (check()) return 1;\n#endif\n",
+         CBM_LANG_CPP},
+        {"int sample(void) { return 0; }\n", CBM_LANG_CPP},
+        {" \t# include <stdint.h>\r\n", CBM_LANG_CPP},
+        {"/* example:\nextern \"C\" int example();\n*/\nSUMMARY = \"sample\"\n", CBM_LANG_BITBAKE},
+        {"// extern \"C\" example only\n", CBM_LANG_BITBAKE},
+        {"#include_extra \"sample.h\"\n", CBM_LANG_BITBAKE},
+        {"#define Value 1\n", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+        {"#ifndef SAMPLE\n#define SAMPLE 1\n#endif\n", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+        {"ROUTINE Sample [Type=INC]\n#define Value 1\n", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+        {"#def1arg Value(%x) %x\n", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+        {"#; ObjectScript comment\n", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+        {"#include <sample.h>\n#def1arg Value(%x) %x\n", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+        {"# recipe\nSUMMARY = \"sample\"\nrequire base.inc\n", CBM_LANG_BITBAKE},
+        {"SRC_URI += \"file://sample.c\"\ndo_compile() {\nif (check) { return; }\n}\n",
+         CBM_LANG_BITBAKE},
+        {"python do_generate() {\nif (ready):\n    pass\n}\n", CBM_LANG_BITBAKE},
+        {"do_compile() {\ncat <<'EOF'\n#include <stdio.h>\nstatic int sample;\nEOF\n}\n",
+         CBM_LANG_BITBAKE},
+        {"require base.inc\nextern \"C\" example in recipe text\n", CBM_LANG_BITBAKE},
+        {"", CBM_LANG_BITBAKE},
+    };
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_lang_inc_routing.inc", cbm_tmpdir());
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t len = strlen(cases[i].content);
+        ASSERT_EQ(classify_content("sample.inc", cases[i].content, len), cases[i].expected);
+        ASSERT_TRUE(write_exact(path, cases[i].content, len));
+        CBMLanguage by_probe = cbm_disambiguate_inc(path);
+        CBMLanguage by_file = cbm_language_for_file("sample.inc", path);
+        remove(path);
+        ASSERT_EQ(by_probe, cases[i].expected);
+        ASSERT_EQ(by_file, cases[i].expected);
+    }
+    ASSERT_EQ(cbm_disambiguate_inc(NULL), CBM_LANG_BITBAKE);
+    PASS();
+}
+
 TEST(lang_probe_bytes_follow_the_name) {
     ASSERT_EQ(cbm_language_probe_bytes("main.go"), 0);
     ASSERT_EQ(cbm_language_probe_bytes("Makefile"), 0);
@@ -1879,6 +1928,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_sosl);
 
     RUN_TEST(lang_all_have_names);
+    RUN_TEST(lang_inc_c_family_and_existing_dialects);
     RUN_TEST(lang_probe_bytes_follow_the_name);
     RUN_TEST(lang_classify_matches_every_content_rule);
     RUN_TEST(lang_classify_unreadable_content_keeps_the_name_default);

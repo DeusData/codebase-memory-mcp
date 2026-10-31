@@ -708,11 +708,15 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
 
 /* Fetch all CALLS edges among Function/Method nodes for a project as parallel
- * (source_id, target_id) arrays (caller frees both). For SCC / cycle analysis.
+ * (source_id, target_id) arrays, released together with
+ * cbm_store_free_call_edges. For SCC / cycle analysis.
  * Stops at max_edges and sets *truncated — never a silent cap. Returns
  * CBM_STORE_OK (or _ERR); *count is the number returned. */
 int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
                                int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated);
+
+/* Free the (source_id, target_id) arrays returned by cbm_store_fetch_call_edges. */
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
@@ -1306,13 +1310,16 @@ typedef struct {
  * reported community is internally connected. The resolution parameter
  * controls granularity (higher -> more, smaller communities); 1.0 is standard.
  * Allocates *out (length *out_count == node_count) in CBM_MEM_CLASS_OTHER;
- * the caller releases it with cbm_free(CBM_MEM_CLASS_OTHER, *out). */
+ * the caller releases it with cbm_leiden_free(*out). */
 int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
 
 /* Convenience wrapper: cbm_leiden with resolution 1.0. */
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count);
+
+/* Free the result array returned by cbm_leiden / cbm_louvain. */
+void cbm_leiden_free(cbm_louvain_result_t *result);
 
 /* ── Memory management helpers ──────────────────────────────────── */
 
