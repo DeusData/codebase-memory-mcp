@@ -97,14 +97,14 @@ jobs:
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" "$binary" ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-quick-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
           retention-days: 14
       - name: Upload query-leak metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-query-leak-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results-query-leak/
@@ -174,14 +174,14 @@ jobs:
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" "$binary" ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-quick-windows-amd64
           path: soak-results/
           retention-days: 14
       - name: Upload query-leak metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-query-leak-windows-amd64
           path: soak-results-query-leak/
@@ -252,14 +252,14 @@ jobs:
           scripts/soak-legs.sh --legs "${{ inputs.legs }}" "$binary" ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-quick-windows-arm64
           path: soak-results/
           retention-days: 14
       - name: Upload query-leak metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-query-leak-windows-arm64
           path: soak-results-query-leak/
@@ -303,14 +303,14 @@ jobs:
             ${{ inputs.duration_minutes }}
       - name: Upload metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-quick-linux-${{ matrix.arch }}-portable
           path: soak-results/
           retention-days: 14
       - name: Upload query-leak metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-query-leak-linux-${{ matrix.arch }}-portable
           path: soak-results-query-leak/
@@ -370,7 +370,7 @@ jobs:
         run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15
       - name: Upload metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-asan-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
@@ -410,7 +410,7 @@ jobs:
         run: scripts/soak-legs.sh --legs quick build/c/codebase-memory-mcp 15
       - name: Upload metrics
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: soak-asan-windows-amd64
           path: soak-results/
