@@ -11071,6 +11071,201 @@ TEST(pipeline_go_init_lsp_edges_per_file_parallel) {
     PASS();
 }
 
+/* Fixture for the bare-`init` probes (sequential and parallel twins), the
+ * shapes the kubernetes census found after #1915: a local closure `init :=
+ * func(ctx)` that is called, written and passed by value (the e2e storage
+ * suites), a parameter named init (`func sum(init func() ref.Val)`), and a
+ * `package init` directory. The decoys are a package init in the caller's
+ * own package (what same_module bound before #1915) and an unrelated
+ * Watcher.init method (what the name fallback binds after it). Watcher.Start
+ * and Boot call that method through a selector, the control that must keep
+ * resolving. pad_files > 0 adds filler Go files past MIN_FILES_FOR_PARALLEL. */
+static void write_go_bare_init_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxbareinit\n\ngo 1.22\n");
+    write_temp_file(tmp, "suites/suite.go",
+                    "package suites\n"
+                    "\n"
+                    "import \"context\"\n"
+                    "\n"
+                    "var registered []string\n"
+                    "\n"
+                    "func init() { registered = append(registered, \"volumes\") }\n"
+                    "\n"
+                    "func wrap(fn func(context.Context)) { _ = fn }\n"
+                    "\n"
+                    "func DefineTests(ctx context.Context) {\n"
+                    "\tinit := func(ctx context.Context) {\n"
+                    "\t\t_ = ctx\n"
+                    "\t}\n"
+                    "\tinit(ctx)\n"
+                    "\twrap(init)\n"
+                    "}\n"
+                    "\n"
+                    "func Sum(init func() int) int {\n"
+                    "\treturn init()\n"
+                    "}\n");
+    write_temp_file(tmp, "watcher/watcher.go",
+                    "package watcher\n"
+                    "\n"
+                    "type Watcher struct{ ready bool }\n"
+                    "\n"
+                    "func NewWatcher() *Watcher { return &Watcher{} }\n"
+                    "\n"
+                    "func (w *Watcher) init() { w.ready = true }\n"
+                    "\n"
+                    "func (w *Watcher) Start() {\n"
+                    "\tw.init()\n"
+                    "}\n"
+                    "\n"
+                    "func Boot() {\n"
+                    "\tw := NewWatcher()\n"
+                    "\tw.init()\n"
+                    "}\n");
+    write_temp_file(tmp, "boot/init/init.go",
+                    "// Package init installs defaults for its importers.\n"
+                    "package init\n"
+                    "\n"
+                    "func init() { setup() }\n"
+                    "\n"
+                    "func setup() {}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static bool bare_init_qn_ends_with(const char *qn, const char *suffix) {
+    size_t ql = strlen(qn);
+    size_t sl = strlen(suffix);
+    return ql >= sl && strcmp(qn + ql - sl, suffix) == 0;
+}
+
+/* Resolver edges into any node named `init` whose source is not one of the
+ * two selector controls. Every such edge in the fixture binds a bare `init`,
+ * which in Go is always a local name. */
+static int go_bare_init_false_edges(cbm_store_t *s, const char *project) {
+    static const char *const types[] = {"CALLS", "USAGE", "WRITES", "READS", "CALL_REFERENCE"};
+    int hits = 0;
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        cbm_store_find_edges_by_type(s, project, types[t], &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            cbm_node_t src = {0};
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                src.qualified_name && tgt.name && strcmp(tgt.name, "init") == 0 &&
+                !bare_init_qn_ends_with(src.qualified_name, ".watcher.Watcher.Start") &&
+                !bare_init_qn_ends_with(src.qualified_name, ".watcher.Boot")) {
+                printf("  bare init bound: %s %s -> %s\n", types[t], src.qualified_name,
+                       tgt.qualified_name ? tgt.qualified_name : "?");
+                hits++;
+            }
+            cbm_node_free_fields(&src);
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    return hits;
+}
+
+static int assert_go_bare_init_edges(cbm_store_t *s, const char *project) {
+    /* The decoys exist, so a zero below is a refused binding and not an
+     * absent target: two package inits and the Watcher method. */
+    cbm_node_t *inits = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_name(s, project, "init", &inits, &ic);
+    int functions = 0;
+    int methods = 0;
+    for (int i = 0; i < ic; i++) {
+        functions += inits[i].label && strcmp(inits[i].label, "Function") == 0;
+        methods += inits[i].label && strcmp(inits[i].label, "Method") == 0;
+    }
+    cbm_store_free_nodes(inits, ic);
+    ASSERT_EQ(functions, 2);
+    ASSERT_EQ(methods, 1);
+    /* NEGATIVE: no bare `init` (closure call, closure write, closure passed
+     * by value, parameter call, `package init`) binds a package init or the
+     * unrelated method. */
+    ASSERT_EQ(go_bare_init_false_edges(s, project), 0);
+    /* CONTROL: a selector call `w.init()` is not bare and still resolves to
+     * the method, from a method body and from a free function. */
+    ASSERT_GTE(
+        go_calls_between(s, project, ".watcher.Watcher.Start", ".watcher.Watcher.init", NULL), 1);
+    ASSERT_GTE(go_calls_between(s, project, ".watcher.Boot", ".watcher.Watcher.init", NULL), 1);
+    return 0;
+}
+
+/* R45 (follow-up to #1915): a bare Go `init` never binds a package init or,
+ * by name alone, an init method (cbm_go_suppress_bare_init_bind). */
+TEST(pipeline_go_bare_init_binds_nothing) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_init_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare_init.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_bare_init_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel twin: >= MIN_FILES_FOR_PARALLEL (50) files plus CBM_WORKERS=4
+ * take the parallel resolver, which carries its own copy of each guard. */
+TEST(pipeline_go_bare_init_binds_nothing_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_init_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_init_fixture(tmp, 52);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare_init_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_bare_init_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -29823,6 +30018,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_multi_init_nodes_survive);
     RUN_TEST(pipeline_go_init_lsp_edges_per_file);
     RUN_TEST(pipeline_go_init_lsp_edges_per_file_parallel);
+    RUN_TEST(pipeline_go_bare_init_binds_nothing);
+    RUN_TEST(pipeline_go_bare_init_binds_nothing_parallel);
     RUN_TEST(pipeline_go_crossfile_type_alias_method);
     RUN_TEST(pipeline_go_crossfile_type_alias_method_parallel);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
