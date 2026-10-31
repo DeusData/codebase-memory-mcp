@@ -1361,6 +1361,14 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
         return 0;
     }
+    /* A bare Go `init(...)` calls a local closure or parameter: never a
+     * package init (unreferable in Go) and never a same-named method found
+     * by name alone — see cbm_go_suppress_bare_init_bind. MUST match
+     * pass_parallel.c exactly. */
+    if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, call->is_method, call->callee_name,
+                                       res.strategy, target_node->label)) {
+        return 0;
+    }
     evidence->candidate_qn = target_node->qualified_name;
     evidence->calls_emitted |=
         emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
