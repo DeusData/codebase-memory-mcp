@@ -1342,18 +1342,59 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
     PASS();
 }
 
-/* #2077: OpenCode's V2 loader only reads the default export and needs an
- * id plus a setup()/effect() function; the old named export had neither. */
+/* #2077/#2089/#2204: the two OpenCode runtimes read different entries of the
+ * default export. 1.18.x dispatches the hooks returned by `server(ctx)`; 2.x
+ * ignores `server` and calls `setup(ctx)`, whose context provides the tool and
+ * session hook domains. Registrations fail open per domain, so the matching
+ * server() hook yields once its domain is registered. The post-compaction note
+ * goes through a keyed session instruction (a <context> entry that survives
+ * compaction), never the system prompt. */
 TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "export default {"));
     ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
-    /* Hooks live under server(), which the server runtime reads; setup()
-     * stays empty since the V2 config loader has no tool domain yet. */
-    ASSERT_NOT_NULL(strstr(js, "setup() {}"));
+    /* OpenCode 1.18.x server runtime. */
     ASSERT_NOT_NULL(strstr(js, "server: async (ctx) => {"));
-    ASSERT_NULL(strstr(js, "async setup(ctx) {"));
+    /* OpenCode 2 registers through the setup context; the domains exist on
+     * 2.x, so setup is no longer the empty placeholder #2089 pinned. */
+    ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.tool.hook('execute.after'"));
+    ASSERT_NOT_NULL(strstr(js, "ctx.session.hook('compaction'"));
+    ASSERT_NULL(strstr(js, "ctx.session.hook('context'"));
+    /* content is the surface the model reads; prefer it over output, and never
+     * synthesize content that would hide the tool's own result. */
+    const char *content_first = strstr(js, "if (typeof result.content === 'string') {");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(content_first);
+    ASSERT_NOT_NULL(output_fallback);
+    ASSERT_TRUE(content_first < output_fallback);
+    ASSERT_NULL(strstr(js, "if (result.content === undefined)"));
+    /* Compaction uses the durable session context channel, not the system
+     * prompt; older hosts without it skip reinjection. */
+    ASSERT_NOT_NULL(strstr(js, "event?.sessionID"));
+    ASSERT_NOT_NULL(strstr(js, "ctx?.session?.instructions?.entry"));
+    /* The plugin instance's location is not the session's location in a
+     * multi-project server: resolve each session's directory. */
+    ASSERT_NOT_NULL(strstr(js, "const dir = await dirFor("));
+    ASSERT_NOT_NULL(strstr(js, "ctx.session.get({ sessionID })"));
+    ASSERT_NOT_NULL(strstr(js, "dirs.has(sessionID)"));
+    ASSERT_NOT_NULL(strstr(js, "if (!dir) return;"));
+    /* No fallback to the plugin instance's location: that is not the session's
+     * location in a multi-project server. */
+    ASSERT_NULL(strstr(js, "ctx?.location?.directory"));
+    ASSERT_NOT_NULL(strstr(js, "key: 'codebase-memory-session-note'"));
+    ASSERT_NULL(strstr(js, "event.system.push"));
+    ASSERT_NULL(strstr(js, "pendingReinject"));
+    /* Registrations fail open per domain; the server() hooks yield per domain. */
+    ASSERT_NOT_NULL(strstr(js, "toolHooksRegistered = true;"));
+    ASSERT_NOT_NULL(strstr(js, "sessionHooksRegistered = true;"));
+    ASSERT_NOT_NULL(strstr(js, "if (toolHooksRegistered) return;"));
+    ASSERT_NOT_NULL(strstr(js, "if (sessionHooksRegistered) return;"));
+    ASSERT_NOT_NULL(strstr(js, "catch {"));
+    ASSERT_NOT_NULL(strstr(js, "event.result = appendResult(event.result, extra);"));
+    /* The empty setup placeholder and the old named export must both be gone. */
+    ASSERT_NULL(strstr(js, "setup() {}"));
     ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
     free(js);
     PASS();
