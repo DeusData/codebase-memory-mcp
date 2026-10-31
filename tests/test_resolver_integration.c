@@ -1206,7 +1206,114 @@ TEST(resolver_integration_call_diagnostics_follow_final_publication) {
     PASS();
 }
 
+/* Source files can be in any encoding. Each row is one route such bytes take to a
+ * strict JSON writer on the way to publication: redis deps/tre/tests/retest.c and
+ * neovim's legacy specs take the argument routes, and aborted their whole index. */
+static const struct {
+    const char *name;
+    const char *contents;
+} NON_UTF8_ROUTES[] = {
+    {"route_argument.c", "int helper(const char *text, int n) { return n; }\n"
+                         "int use(void) { return helper(\"caf\xe9 au lait\", 1); }\n"},
+    {"route_argument.lua", "local function keep(t) return t end\nkeep(\"one \xe4 byte\")\n"},
+    {"route_callee.py", "def go():\n    return \"caf\xe9\".upper()\n"},
+    {"route_import.py", "import mod\xe9.sub\n\ndef call():\n    return 1\n"},
+    {"route_import.rs", "use caf\xe9::thing;\nfn main() { thing(\"x\"); }\n"},
+    {"route_import.js", "import a from \"./caf\xe9\";\na(\"x\");\n"},
+};
+
+/* Rows a strict reader rejects, whether for syntax or for encoding. */
+static int count_rows_failing_strict_json(cbm_store_t *store, const char *sql) {
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) != SQLITE_OK)
+        return -1;
+    int failing = 0;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const char *json = (const char *)sqlite3_column_text(statement, 0);
+        int length = sqlite3_column_bytes(statement, 0);
+        yyjson_doc *doc = json ? yyjson_read(json, (size_t)length, 0) : NULL;
+        if (!doc)
+            failing++;
+        yyjson_doc_free(doc);
+    }
+    sqlite3_finalize(statement);
+    return failing;
+}
+
+/* The published generation is strict JSON throughout and the rest of the graph is
+ * intact: the fixture's ordinary import still resolves beside the undecodable bytes. */
+static bool non_utf8_generation_intact(const resolver_fixture_t *fixture) {
+    cbm_store_t *store = cbm_store_open_path_existing(fixture->database);
+    if (!store)
+        return false;
+    int edge_failures =
+        count_rows_failing_strict_json(store, "SELECT properties FROM edges "
+                                              "WHERE properties IS NOT NULL");
+    int occurrence_failures = count_rows_failing_strict_json(
+        store, "SELECT properties_json FROM resolver_occurrences");
+    int genuine = count_edge(store, RESOLVER_PROJECT ".main.caller", RESOLVER_PROJECT ".lib.target",
+                             "CALLS");
+    cbm_store_close(store);
+    if (edge_failures || occurrence_failures || genuine != 1)
+        fprintf(stderr, "  [non-utf8] edge_failures=%d occurrence_failures=%d genuine=%d\n",
+                edge_failures, occurrence_failures, genuine);
+    return !edge_failures && !occurrence_failures && genuine == 1;
+}
+
+TEST(resolver_integration_non_utf8_source_text_publishes_each_route) {
+    int failed_routes = 0;
+    for (size_t i = 0; i < sizeof(NON_UTF8_ROUTES) / sizeof(NON_UTF8_ROUTES[0]); i++) {
+        resolver_fixture_t fixture;
+        ASSERT(fixture_init(&fixture, IMPORT_SOURCE, true, 0));
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, NON_UTF8_ROUTES[i].name),
+                                NON_UTF8_ROUTES[i].contents),
+                  0);
+        int rc = run_fixture(&fixture, fixture.database, false);
+        bool intact = rc == 0 && non_utf8_generation_intact(&fixture);
+        if (!intact) {
+            fprintf(stderr, "  [non-utf8] route=%s rc=%d\n", NON_UTF8_ROUTES[i].name, rc);
+            failed_routes++;
+        }
+        th_rmtree(fixture.root);
+    }
+    ASSERT_EQ(failed_routes, 0);
+    PASS();
+}
+
+/* The parallel path is what real repositories take, and it keeps the argument text:
+ * the undecodable byte reaches the published CALLS edge as U+FFFD. Its surface rows
+ * are all serialized together, so one such byte must not cost every file its row. */
+TEST(resolver_integration_non_utf8_source_text_publishes_parallel) {
+    resolver_fixture_t fixture;
+    ASSERT(fixture_init(&fixture, IMPORT_SOURCE, true, 60));
+    for (size_t i = 0; i < sizeof(NON_UTF8_ROUTES) / sizeof(NON_UTF8_ROUTES[0]); i++)
+        ASSERT_EQ(th_write_file(TH_PATH(fixture.repo, NON_UTF8_ROUTES[i].name),
+                                NON_UTF8_ROUTES[i].contents),
+                  0);
+    int rc = run_fixture(&fixture, fixture.database, true);
+    if (rc != 0)
+        fprintf(stderr, "  [non-utf8] parallel rc=%d\n", rc);
+    bool intact = rc == 0 && non_utf8_generation_intact(&fixture);
+    int replaced = -1, surfaces = -1;
+    if (rc == 0) {
+        cbm_store_t *store = cbm_store_open_path_existing(fixture.database);
+        ASSERT_NOT_NULL(store);
+        replaced = count_sql(store, "SELECT count(*) FROM edges WHERE type='CALLS' AND "
+                                    "instr(properties, X'EFBFBD') > 0");
+        surfaces = count_sql(store, "SELECT count(*) FROM lsp_surface");
+        cbm_store_close(store);
+    }
+    th_rmtree(fixture.root);
+    ASSERT_EQ(rc, 0);
+    ASSERT(intact);
+    ASSERT_GT(replaced, 0);
+    ASSERT_GT(surfaces, 0);
+    PASS();
+}
+
 SUITE(resolver_integration) {
+    RUN_TEST(resolver_integration_non_utf8_source_text_publishes_each_route);
+    RUN_TEST(resolver_integration_non_utf8_source_text_publishes_parallel);
     RUN_TEST(resolver_integration_call_diagnostics_follow_final_publication);
     RUN_TEST(resolver_integration_missing_facts_rebuilds_unchanged_source);
     RUN_TEST(resolver_integration_missing_evidence_rebuilds_unchanged_source);
