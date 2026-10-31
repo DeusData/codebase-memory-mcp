@@ -2757,6 +2757,14 @@ TEST(elixir_complexity_and_fingerprint) {
                                "    label = String.upcase(currency) <> \" total\"\n"
                                "    %{label: label, sum: sum, count: count, average: average}\n"
                                "  end\n"
+                               "  def tally(items, unit) do\n"
+                               "    values = Enum.map(items, fn item -> item.price * item.qty end)\n"
+                               "    n = length(values)\n"
+                               "    total = Enum.reduce(values, 0, fn v, a -> a + v end)\n"
+                               "    mean = if n > 0, do: total / n, else: 0\n"
+                               "    tag = String.upcase(unit) <> \" total\"\n"
+                               "    %{tag: tag, total: total, n: n, mean: mean}\n"
+                               "  end\n"
                                "end\n",
                                CBM_LANG_ELIXIR, "t", "cx.ex");
     ASSERT_NOT_NULL(r);
@@ -2764,6 +2772,7 @@ TEST(elixir_complexity_and_fingerprint) {
     CBMDefinition *cls = NULL;
     CBMDefinition *plain = NULL;
     CBMDefinition *summarize = NULL;
+    CBMDefinition *tally = NULL;
     for (int i = 0; i < r->defs.count; i++) {
         if (strcmp(r->defs.items[i].name, "classify") == 0)
             cls = &r->defs.items[i];
@@ -2771,12 +2780,21 @@ TEST(elixir_complexity_and_fingerprint) {
             plain = &r->defs.items[i];
         if (strcmp(r->defs.items[i].name, "summarize") == 0)
             summarize = &r->defs.items[i];
+        if (strcmp(r->defs.items[i].name, "tally") == 0)
+            tally = &r->defs.items[i];
     }
     /* A body past the MinHash size gate gets a fingerprint (Elixir used to emit
      * none at all); a one-expression body stays below the gate and gets none. */
     ASSERT_NOT_NULL(summarize);
     ASSERT(summarize->fingerprint_k > 0);
     ASSERT_NOT_NULL(summarize->fingerprint);
+    /* Duplicate detection is what the fingerprint exists for: the same body
+     * shape under other function and variable names gets the same fingerprint. */
+    ASSERT_NOT_NULL(tally);
+    ASSERT_EQ(summarize->fingerprint_k, tally->fingerprint_k);
+    ASSERT_NOT_NULL(tally->fingerprint);
+    ASSERT(memcmp(summarize->fingerprint, tally->fingerprint,
+                  (size_t)summarize->fingerprint_k * sizeof(summarize->fingerprint[0])) == 0);
     ASSERT_NOT_NULL(cls);
     /* The `case` itself + its 3 arms + the second arm's own `when` guard. */
     ASSERT_EQ(5, cls->complexity);
