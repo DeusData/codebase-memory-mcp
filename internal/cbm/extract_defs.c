@@ -7400,13 +7400,15 @@ static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode head
 
 /* Push a config-language definition that carries prose. push_simple_class_def
  * delegates here with no docstring. */
-static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
-                                      const char *label, const char *docstring) {
+/* Push a definition whose qualified name ends with `qn_name` (already QN-safe)
+ * rather than with its name. */
+static void push_class_def_qn(CBMExtractCtx *ctx, TSNode node, char *name, const char *qn_name,
+                              const char *label, const char *docstring) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_safe_segment(a, name));
+    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_name);
     def.label = label;
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -7414,6 +7416,11 @@ static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *nam
     def.is_exported = true;
     def.docstring = docstring;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
+                                      const char *label, const char *docstring) {
+    push_class_def_qn(ctx, node, name, qn_safe_segment(ctx->arena, name), label, docstring);
 }
 
 static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
@@ -7487,6 +7494,49 @@ static char *extract_atx_heading_text(CBMArena *a, TSNode node, const char *sour
     return NULL;
 }
 
+/* Setext paragraphs include block-container markers between lines. Keep the
+ * whole inline text, excluding only the parser's continuation spans. */
+static char *extract_setext_heading_text(CBMArena *a, TSNode node, const char *source) {
+    TSNode content = ts_node_child_by_field_name(node, TS_FIELD("heading_content"));
+    if (ts_node_is_null(content)) {
+        return NULL;
+    }
+    TSNode inline_node = cbm_find_child_by_kind(content, "inline");
+    if (!ts_node_is_null(inline_node)) {
+        content = inline_node;
+    }
+    uint32_t start = ts_node_start_byte(content);
+    uint32_t end = ts_node_end_byte(content);
+    char *text = (char *)cbm_arena_alloc(a, (size_t)(end - start) + SKIP_ONE);
+    if (!text) {
+        return NULL;
+    }
+    size_t written = 0;
+    uint32_t previous = start;
+    TSTreeCursor cursor = ts_tree_cursor_new(content);
+    for (;;) {
+        TSNode child = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(child), "block_continuation") == 0) {
+            uint32_t marker_start = ts_node_start_byte(child);
+            uint32_t marker_end = ts_node_end_byte(child);
+            memcpy(text + written, source + previous, marker_start - previous);
+            written += marker_start - previous;
+            previous = marker_end;
+        } else if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                memcpy(text + written, source + previous, end - previous);
+                written += end - previous;
+                text[written] = '\0';
+                return text;
+            }
+        }
+    }
+}
+
 // Trim trailing whitespace/newlines from a heading name in-place.
 static char *trim_heading_name(char *name) {
     if (!name || !name[0]) {
@@ -7508,11 +7558,423 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
     if (strcmp(kind, "atx_heading") == 0) {
         name = extract_atx_heading_text(a, node, source);
     } else {
-        if (ts_node_child_count(node) > 0) {
-            name = cbm_node_text(a, ts_node_child(node, 0), source);
-        }
+        name = extract_setext_heading_text(a, node, source);
     }
     return trim_heading_name(name);
+}
+
+/* #2586: a heading name that repeats in a file (`## Implementation` under two
+ * parents) gave its Sections one qualified name, so the graph kept one node
+ * and the references under them fell back to the File. A repeated heading's
+ * qualified name therefore takes the names of the headings above it when
+ * those chains differ (`Service-A.Implementation`). Unique titles and repeats
+ * with only one parent chain keep their bare names. A heading text may itself
+ * hold dots, so a qualified name can equal another heading's final name (`# Service-A.
+ * Implementation`): the qualified one then takes `~2`, `~3`, ... until no
+ * other heading of the file has that name. Headings that repeat under the
+ * same parents too still share a name, as before. All final names are
+ * settled once per file, on the first heading. */
+typedef struct md_heading {
+    uint32_t start;       /* the heading node's first byte */
+    uint32_t scope_start; /* enclosing block container, excluding section wrappers */
+    uint32_t scope_end;
+    int level; /* ATX and Setext heading rank, 1–6 */
+    struct md_heading *parent;
+    const char *seg;          /* the heading's own QN-safe name */
+    const char *key;          /* repeated only: the chain's segments, '\n'-joined */
+    const char *qn_name;      /* the final QN segment */
+    bool qualified;           /* the name actually changed by adding parents */
+    struct md_heading *chain; /* first heading with this identity in a collision run */
+} md_heading_t;
+
+typedef struct {
+    md_heading_t *v; /* in document order */
+    int count;
+    uint64_t *checks;
+} md_headings_t;
+
+/* The QN-safe name of a heading node, or NULL. */
+static const char *md_heading_segment(CBMExtractCtx *ctx, CBMArena *a, TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (!is_markdown_heading_kind(kind)) {
+        return NULL;
+    }
+    char *name = extract_markdown_heading_name(a, node, kind, ctx->source);
+    return name ? qn_safe_segment(a, name) : NULL;
+}
+
+enum { MD_HEADING_LEVELS = 6 };
+
+/* Read the vendored grammar's explicit markers, including Setext headings:
+ * unlike ATX headings, those are not nested in section nodes by the parser. */
+static int md_heading_level(TSNode node) {
+    static const char *const atx_markers[MD_HEADING_LEVELS] = {
+        "atx_h1_marker", "atx_h2_marker", "atx_h3_marker",
+        "atx_h4_marker", "atx_h5_marker", "atx_h6_marker",
+    };
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *kind = ts_node_type(ts_node_child(node, i));
+        for (int level = 0; level < MD_HEADING_LEVELS; level++) {
+            if (strcmp(kind, atx_markers[level]) == 0) {
+                return level + SKIP_ONE;
+            }
+        }
+        if (strcmp(kind, "setext_h1_underline") == 0) {
+            return 1;
+        }
+        if (strcmp(kind, "setext_h2_underline") == 0) {
+            return PAIR_LEN;
+        }
+    }
+    return 0;
+}
+
+/* Scope frames follow cursor descent/ascent. Reuse popped frames so temporary
+ * storage grows with nesting depth, not with the number of blocks. */
+typedef struct md_scope {
+    uint32_t start;
+    uint32_t end;
+    int depth;
+    struct md_scope *previous;
+} md_scope_t;
+
+/* Visit every heading, including empty structural headings: count them (v
+ * NULL), or fill v. Never ask ts_node_parent to rediscover the path from the
+ * root: its preceding-sibling scan makes flat documents quadratic. */
+static int md_collect_headings(CBMExtractCtx *ctx, CBMArena *a, md_heading_t *v, int cap) {
+    int n = 0;
+    int depth = 0;
+    md_scope_t *scope = NULL;
+    md_scope_t *spare = NULL;
+    uint64_t *steps = &ctx->result->markdown_collection_steps;
+    if (ts_node_is_null(ctx->root)) {
+        return 0;
+    }
+    TSTreeCursor cur = ts_tree_cursor_new(ctx->root);
+    for (;;) {
+        (*steps)++;
+        TSNode node = ts_tree_cursor_current_node(&cur);
+        const char *kind = ts_node_type(node);
+        if (is_markdown_heading_kind(kind)) {
+            if (!v) {
+                n++;
+            } else if (n < cap) {
+                const char *seg = md_heading_segment(ctx, a, node);
+                v[n++] = (md_heading_t){.start = ts_node_start_byte(node),
+                                        .scope_start = scope ? scope->start : 0,
+                                        .scope_end = scope ? scope->end : 0,
+                                        .level = md_heading_level(node),
+                                        .seg = seg ? seg : "",
+                                        .qn_name = seg ? seg : ""};
+            }
+        } else {
+            (*steps)++;
+            if (ts_tree_cursor_goto_first_child(&cur)) {
+                if (v && strcmp(kind, "section") != 0) {
+                    md_scope_t *frame = spare;
+                    if (frame) {
+                        spare = frame->previous;
+                    } else {
+                        frame = (md_scope_t *)cbm_arena_alloc(a, sizeof(*frame));
+                    }
+                    if (!frame) {
+                        ts_tree_cursor_delete(&cur);
+                        return -1;
+                    }
+                    *frame = (md_scope_t){.start = ts_node_start_byte(node),
+                                          .end = ts_node_end_byte(node),
+                                          .depth = depth,
+                                          .previous = scope};
+                    scope = frame;
+                }
+                depth++;
+                continue;
+            }
+        }
+        for (;;) {
+            (*steps)++;
+            if (ts_tree_cursor_goto_next_sibling(&cur)) {
+                break;
+            }
+            (*steps)++;
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                ts_tree_cursor_delete(&cur);
+                return n;
+            }
+            depth--;
+            if (scope && scope->depth == depth) {
+                md_scope_t *previous = scope->previous;
+                scope->previous = spare;
+                spare = scope;
+                scope = previous;
+            }
+        }
+    }
+}
+
+static int md_by_seg(const void *x, const void *y) {
+    return strcmp((*(const md_heading_t *const *)x)->seg, (*(const md_heading_t *const *)y)->seg);
+}
+
+static int md_by_name(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    int c = strcmp(p->qn_name, q->qn_name);
+    return c ? c : (p->start > q->start) - (p->start < q->start);
+}
+
+static int md_by_scope(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    if (p->scope_start != q->scope_start) {
+        return (p->scope_start > q->scope_start) - (p->scope_start < q->scope_start);
+    }
+    if (p->scope_end != q->scope_end) {
+        return (p->scope_end > q->scope_end) - (p->scope_end < q->scope_end);
+    }
+    return (p->start > q->start) - (p->start < q->start);
+}
+
+/* Heading levels define hierarchy for both syntaxes. Each block container
+ * gets its own six-slot stack, so headings inside quotes or list items cannot
+ * become parents of headings outside them. Sorting by container and document
+ * position also restores the outer stack after a nested container ends. */
+static void md_assign_parents(md_heading_t **by, int n) {
+    qsort(by, (size_t)n, sizeof(*by), md_by_scope);
+    for (int i = 0; i < n;) {
+        int j = i;
+        md_heading_t *parents[MD_HEADING_LEVELS] = {0};
+        while (j < n && by[j]->scope_start == by[i]->scope_start &&
+               by[j]->scope_end == by[i]->scope_end) {
+            md_heading_t *h = by[j++];
+            if (h->level < 1 || h->level > MD_HEADING_LEVELS) {
+                continue;
+            }
+            for (int k = h->level - PAIR_LEN; k >= 0; k--) {
+                if (parents[k]) {
+                    h->parent = parents[k];
+                    break;
+                }
+            }
+            parents[h->level - SKIP_ONE] = h;
+            for (int k = h->level; k < MD_HEADING_LEVELS; k++) {
+                parents[k] = NULL;
+            }
+        }
+        i = j;
+    }
+}
+
+/* A repeated heading's chain: dot-joined for its QN and '\n'-joined for
+ * identity, since a QN-safe segment has no whitespace. At most six headings. */
+static bool md_heading_chain(CBMArena *a, md_heading_t *h) {
+    const char *dotted = h->seg;
+    const char *key = h->seg;
+    for (const md_heading_t *parent = h->parent; parent; parent = parent->parent) {
+        if (!parent->seg[0]) {
+            continue; /* unnamed headings reset levels but contribute no name */
+        }
+        dotted = cbm_arena_sprintf(a, "%s.%s", parent->seg, dotted);
+        key = cbm_arena_sprintf(a, "%s\n%s", parent->seg, key);
+        if (!dotted || !key) {
+            return false;
+        }
+    }
+    h->qn_name = dotted;
+    h->key = key;
+    return true;
+}
+
+/* The immutable, sorted initial names reserve both bare headings and parent
+ * chains before any suffix is assigned. Generated names from different bases
+ * cannot coincide: removing the final ~N recovers their distinct bases. */
+static bool md_name_taken(md_headings_t *hs, const char *const *reserved, int reserved_count,
+                          const char *name) {
+    int lo = 0;
+    int hi = reserved_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        (*hs->checks)++;
+        int c = strcmp(reserved[mid], name);
+        if (c == 0) {
+            return true;
+        }
+        if (c < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    return false;
+}
+
+static int md_by_key(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    int c = strcmp(p->key ? p->key : "", q->key ? q->key : "");
+    return c ? c : (p->start > q->start) - (p->start < q->start);
+}
+
+static int md_by_start(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    return (p->start > q->start) - (p->start < q->start);
+}
+
+/* Unchanged bare headings keep their names, including inseparable repeats.
+ * Otherwise the first chain keeps the name. Group identities once, then assign
+ * one suffix per chain in document order; no repeated scans of earlier chains
+ * and no restarting the suffix search at ~2. */
+static bool md_split_run(CBMArena *a, md_headings_t *hs, const char *const *reserved,
+                         int reserved_count, md_heading_t **run, int n) {
+    const char *base = run[0]->qn_name;
+    const char *keep = run[0]->key;
+    for (int i = 0; i < n; i++) {
+        if (!run[i]->qualified) {
+            keep = NULL;
+        }
+    }
+    qsort(run, (size_t)n, sizeof(*run), md_by_key);
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n) {
+            (*hs->checks)++;
+            if (strcmp(run[i]->key ? run[i]->key : "", run[j]->key ? run[j]->key : "") != 0) {
+                break;
+            }
+            j++;
+        }
+        for (int k = i; k < j; k++) {
+            run[k]->chain = run[i];
+        }
+        i = j;
+    }
+    qsort(run, (size_t)n, sizeof(*run), md_by_start);
+    int suffix = PAIR_LEN;
+    for (int i = 0; i < n; i++) {
+        md_heading_t *h = run[i];
+        if (!h->qualified || h->chain != h || (keep && strcmp(h->key, keep) == 0)) {
+            continue;
+        }
+        const char *name;
+        do {
+            name = cbm_arena_sprintf(a, "%s~%d", base, suffix++);
+            if (!name) {
+                return false;
+            }
+        } while (md_name_taken(hs, reserved, reserved_count, name));
+        h->qn_name = name;
+    }
+    for (int i = 0; i < n; i++) {
+        if (run[i]->qualified) {
+            run[i]->qn_name = run[i]->chain->qn_name;
+        }
+    }
+    return true;
+}
+
+static bool md_settle_names(CBMArena *a, md_headings_t *hs) {
+    int n = hs->count;
+    md_heading_t **by = (md_heading_t **)cbm_arena_alloc(a, (size_t)n * sizeof(*by));
+    const char **reserved = (const char **)cbm_arena_alloc(a, (size_t)n * sizeof(*reserved));
+    if (!by || !reserved) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        by[i] = &hs->v[i];
+    }
+    md_assign_parents(by, n);
+    /* Empty headings are structural events only, never reserved names. */
+    n = 0;
+    for (int i = 0; i < hs->count; i++) {
+        if (hs->v[i].seg[0]) {
+            by[n++] = &hs->v[i];
+        }
+    }
+    qsort(by, (size_t)n, sizeof(*by), md_by_seg);
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n && strcmp(by[j]->seg, by[i]->seg) == 0) {
+            j++;
+        }
+        if (j - i > SKIP_ONE) {
+            bool distinct = false;
+            for (int k = i; k < j; k++) {
+                if (!md_heading_chain(a, by[k])) {
+                    return false;
+                }
+                (*hs->checks)++;
+                distinct |= strcmp(by[k]->key, by[i]->key) != 0;
+            }
+            for (int k = i; k < j; k++) {
+                if (!distinct) {
+                    by[k]->qn_name = by[k]->seg;
+                }
+                by[k]->qualified = strcmp(by[k]->qn_name, by[k]->seg) != 0;
+            }
+        }
+        i = j;
+    }
+    qsort(by, (size_t)n, sizeof(*by), md_by_name);
+    for (int i = 0; i < n; i++) {
+        reserved[i] = by[i]->qn_name;
+    }
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n && strcmp(reserved[j], reserved[i]) == 0) {
+            j++;
+        }
+        if (j - i > SKIP_ONE && !md_split_run(a, hs, reserved, n, by + i, j - i)) {
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+static const md_headings_t *md_headings(CBMExtractCtx *ctx) {
+    if (ctx->md_headings) {
+        return (const md_headings_t *)ctx->md_headings;
+    }
+    CBMArena *a = doc_scratch(ctx);
+    md_headings_t *hs = (md_headings_t *)cbm_arena_alloc(a, sizeof(*hs));
+    if (!hs) {
+        return NULL;
+    }
+    hs->checks = &ctx->result->markdown_name_checks;
+    int cap = md_collect_headings(ctx, a, NULL, 0);
+    hs->v = cap > 0 ? (md_heading_t *)cbm_arena_alloc(a, (size_t)cap * sizeof(md_heading_t)) : NULL;
+    hs->count = hs->v ? md_collect_headings(ctx, a, hs->v, cap) : 0;
+    if (hs->count < 0) {
+        hs->count = 0;
+    }
+    if (hs->count > SKIP_ONE && !md_settle_names(a, hs)) {
+        hs->count = 0; /* every heading keeps its own name, as before */
+    }
+    ctx->md_headings = hs;
+    return hs;
+}
+
+/* The QN segment of a heading: its own name unless the file's names say
+ * otherwise. */
+static const char *md_heading_qn_name(CBMExtractCtx *ctx, TSNode heading, const char *seg) {
+    const md_headings_t *hs = md_headings(ctx);
+    uint32_t start = ts_node_start_byte(heading);
+    int lo = 0;
+    int hi = hs ? hs->count : 0;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (hs->v[mid].start < start) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    if (hs && lo < hs->count && hs->v[lo].start == start && strcmp(hs->v[lo].seg, seg) == 0) {
+        return hs->v[lo].qn_name;
+    }
+    return seg;
 }
 
 // INI: extract section name from section node.
@@ -7616,7 +8078,10 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         return false;
     }
 
-    if (name && name[0]) {
+    if (name && name[0] && ctx->language == CBM_LANG_MARKDOWN) {
+        const char *seg = qn_safe_segment(a, name);
+        push_class_def_qn(ctx, node, name, md_heading_qn_name(ctx, node, seg), label, docstring);
+    } else if (name && name[0]) {
         push_simple_class_def_doc(ctx, node, name, label, docstring);
     }
     return true;

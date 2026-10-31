@@ -18,8 +18,24 @@
 # that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
 # ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
 # leaving CC/CXX unchanged there.
-override CC := $(CC) $(ARCHFLAGS)
-override CXX := $(CXX) $(ARCHFLAGS)
+#
+# Minimum macOS version (Apple targets only). Without one, clang takes the
+# minimum from the SDK it compiles against (LC_BUILD_VERSION minos), so a
+# release built on a macos-15 runner would refuse to start on macOS 14. 14.0
+# keeps every macOS that could run a release built on the macos-14 runner
+# (retired 2026-11-02). A flag folded into the drivers like ARCHFLAGS, not an
+# exported MACOSX_DEPLOYMENT_TARGET: it reaches every compile AND link on every
+# build path (build.sh, test.sh, direct make) and is part of each command line.
+# Detected from the compiler's target, not the host, so a cross compiler run
+# on a Mac is left untouched.
+MACOS_MIN_VERSION := 14.0
+IS_APPLE_TARGET := $(shell echo | $(CC) $(ARCHFLAGS) -dM -E - 2>/dev/null | grep -q '__APPLE__' && echo yes || echo no)
+MACOS_MIN_FLAGS :=
+ifeq ($(IS_APPLE_TARGET),yes)
+MACOS_MIN_FLAGS := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+endif
+override CC := $(CC) $(ARCHFLAGS) $(MACOS_MIN_FLAGS)
+override CXX := $(CXX) $(ARCHFLAGS) $(MACOS_MIN_FLAGS)
 
 # ── Common flags ─────────────────────────────────────────────────
 

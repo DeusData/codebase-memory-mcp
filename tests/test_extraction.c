@@ -251,6 +251,29 @@ TEST(extract_c_macros_issue375) {
     PASS();
 }
 
+TEST(extract_cpp_inc_linkage_and_callback) {
+    CBMFileResult *r =
+        extract("#define SAMPLE_CALLBACK(type) type\n"
+                "extern \"C\" __declspec(dllexport) int sample_export() { return 0; }\n"
+                "static SAMPLE_CALLBACK(int) sample_callback() { return sample_export(); }\n",
+                CBM_LANG_CPP, "sample", "runtime/sample.inc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Function", "sample_export"));
+    ASSERT_TRUE(has_def(r, "Function", "sample_callback"));
+    ASSERT_FALSE(has_def_any(r, "extern"));
+    cbm_free_result(r);
+
+    /* A statement include has no enclosing function in the file. Keep any
+     * syntax coverage diagnostic rather than inventing a callable owner. */
+    r = extract("#ifdef ENABLE_SAMPLE\nif (sample_check()) return 1;\n#endif\n", CBM_LANG_CPP,
+                "sample", "runtime/guard.inc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(has_def_any(r, "extern"));
+    ASSERT_FALSE(has_def(r, "Function", "if"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_cpp_macros_issue375) {
     CBMFileResult *r = extract("#define MAX(a, b) ((a) > (b) ? (a) : (b))\n"
                                "#define PI 3.14159\n"
@@ -13559,6 +13582,7 @@ SUITE(extraction) {
     RUN_TEST(traversal_stack_not_in_result_arena_issue2010);
     RUN_TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010);
     RUN_TEST(extract_c_macros_issue375);
+    RUN_TEST(extract_cpp_inc_linkage_and_callback);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
     RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
