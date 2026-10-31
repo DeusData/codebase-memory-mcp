@@ -1130,6 +1130,28 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
 /* ── Import ──────────────────────────────────────────────────────── */
 
+/* Restore the imported ADR (carried in the graph DB's project_summaries) into
+ * the per-project sidecar so it arrives with the shared artifact — even for a
+ * teammate who already indexed the project (a marked sidecar with no ADR),
+ * which the marker-gated migrate-once would skip. INSERT OR IGNORE means a
+ * local ADR is never overwritten. Best-effort: the graph DB is already
+ * installed when this runs, so a failed restore never fails the import, but it
+ * is logged with the store's reason so a team ADR that did not arrive is
+ * diagnosable instead of silently missing. */
+static void artifact_import_restore_adr(const char *cache_db_path) {
+    cbm_store_t *restore = cbm_store_open_path_existing(cache_db_path);
+    if (!restore) {
+        cbm_log_warn("artifact.import", "err", "adr_restore", "detail", "reopen_imported_db",
+                     "path", cache_db_path);
+        return;
+    }
+    if (cbm_store_adr_restore_from_graph_if_absent(restore) != CBM_STORE_OK) {
+        cbm_log_warn("artifact.import", "err", "adr_restore", "detail", cbm_store_error(restore),
+                     "path", cache_db_path);
+    }
+    cbm_store_close(restore);
+}
+
 int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     if (!repo_path || !cache_db_path) {
         return CBM_NOT_FOUND;
@@ -1257,16 +1279,7 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
     cbm_unlink(wal);
     cbm_unlink(shm);
 
-    /* Restore the imported ADR (carried in the graph DB's project_summaries) into
-     * the per-project sidecar so it arrives with the shared artifact — even for a
-     * teammate who already indexed the project (a marked sidecar with no ADR),
-     * which the marker-gated migrate-once would skip. INSERT OR IGNORE means a
-     * local ADR is never overwritten. Best-effort. */
-    cbm_store_t *restore = cbm_store_open_path_existing(cache_db_path);
-    if (restore) {
-        (void)cbm_store_adr_restore_from_graph_if_absent(restore);
-        cbm_store_close(restore);
-    }
+    artifact_import_restore_adr(cache_db_path);
 
     cbm_log_info("artifact.import", "db", cache_db_path, "size_mb",
                  itoa_buf((int)((size_t)dlen / ART_BYTES_PER_MB)));
