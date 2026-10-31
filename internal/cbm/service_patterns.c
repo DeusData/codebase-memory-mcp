@@ -46,13 +46,25 @@ static const lib_pattern_t http_libraries[] = {
      * case-sensitive, so without this entry `Axios.get(url)` fell through to
      * the `.get` route-suffix fallback and became a route registration. */
     {"Axios", CBM_SVC_HTTP, NULL},
+    /* Angular HttpClient (#2768). The receiver rows end in a dot, like "gin.":
+     * a bare "this.http" / "$http" would also match this.httpAdapter.get
+     * (NestJS route registration) and $httpBackend.expectGET (an AngularJS test
+     * double), because an uppercase letter after an id counts as CamelCase
+     * glue. A chain wrapped before the verb keeps its line break in the callee
+     * text ("this.http\n      .post", prettier's style), so each receiver also
+     * has a line-break twin: LF, and CR for CRLF files. Java/C# HttpClient is
+     * already listed below. */
     {"@angular/common/http", CBM_SVC_HTTP, NULL},
     {"angular.common.http", CBM_SVC_HTTP, NULL},
-    {"HttpClient", CBM_SVC_HTTP, NULL},
-    {"httpClient", CBM_SVC_HTTP, NULL},
-    {"this.http", CBM_SVC_HTTP, NULL},
-    {"this.httpClient", CBM_SVC_HTTP, NULL},
-    {"$http", CBM_SVC_HTTP, NULL},
+    {"this.http.", CBM_SVC_HTTP, NULL},
+    {"this.http\n", CBM_SVC_HTTP, NULL},
+    {"this.http\r", CBM_SVC_HTTP, NULL},
+    {"httpClient.", CBM_SVC_HTTP, NULL},
+    {"httpClient\n", CBM_SVC_HTTP, NULL},
+    {"httpClient\r", CBM_SVC_HTTP, NULL},
+    {"$http.", CBM_SVC_HTTP, NULL},
+    {"$http\n", CBM_SVC_HTTP, NULL},
+    {"$http\r", CBM_SVC_HTTP, NULL},
     {"superagent", CBM_SVC_HTTP, NULL},
     {"needle", CBM_SVC_HTTP, NULL},
     {"node-fetch", CBM_SVC_HTTP, NULL},

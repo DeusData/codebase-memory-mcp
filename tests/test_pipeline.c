@@ -14972,6 +14972,11 @@ static int angular_http_client_typed_case(int fillers) {
                     "  deleteItem(id: string) {\n"
                     "    return this.http.delete(`/items/${id}`);\n"
                     "  }\n"
+                    "\n"
+                    "  updateItem(id: string, item: any) {\n"
+                    "    return this.http\n"
+                    "      .put(`/items/${id}`, item);\n"
+                    "  }\n"
                     "}\n");
 
     for (int i = 0; i < fillers; i++) {
@@ -15002,6 +15007,9 @@ static int angular_http_client_typed_case(int fillers) {
     ASSERT_EQ(http_calls_to_route(s, project, "getItem", "__route__GET__/items/{}"), 1);
     ASSERT_EQ(http_calls_to_route(s, project, "createItem", "__route__POST__/items"), 1);
     ASSERT_EQ(http_calls_to_route(s, project, "deleteItem", "__route__DELETE__/items/{}"), 1);
+    /* A chain wrapped before the verb (prettier style) is the same client call */
+    ASSERT_EQ(http_calls_to_route(s, project, "updateItem", "__route__PUT__/items/{}"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "updateItem", "__route__ANY__"), 0);
 
     /* Assert no ANY twins */
     ASSERT_EQ(http_calls_to_route(s, project, "getItems", "__route__ANY__"), 0);
