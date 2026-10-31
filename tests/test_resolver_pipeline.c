@@ -591,7 +591,132 @@ TEST(resolver_pipeline_changed_source_cannot_reuse_old_occurrence_proof) {
     PASS();
 }
 
+static bool go_shared_build_succeeds(size_t name_bytes) {
+    enum { FUNCTIONS = 400, LINE_BYTES = 80 };
+    char *project = malloc(name_bytes + 1);
+    char *source = malloc((size_t)FUNCTIONS * LINE_BYTES + 128);
+    if (!project || !source) {
+        free(project);
+        free(source);
+        return false;
+    }
+    memset(project, 'p', name_bytes);
+    project[name_bytes] = '\0';
+    size_t used = (size_t)snprintf(source, 128,
+                                   "package main\n\nimport \"fmt\"\n\n"
+                                   "func base(x int) int { return x }\n");
+    for (int i = 0; i < FUNCTIONS; i++)
+        used += (size_t)snprintf(source + used, LINE_BYTES,
+                                 "func f%d(a int) int { v := base(a); fmt.Println(v); return v }\n",
+                                 i);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)used, CBM_LANG_GO, project, "module.go", 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    bool built = false;
+    if (result && graph && registry) {
+        result->source = source;
+        result->source_len = (int)used;
+        for (int d = 0; d < result->defs.count; d++) {
+            const CBMDefinition *def = &result->defs.items[d];
+            if (!def->qualified_name || !def->name || !def->label)
+                continue;
+            cbm_gbuf_upsert_node(graph, def->label, def->name, def->qualified_name, "module.go",
+                                 def->start_line, def->end_line, "{}");
+            cbm_registry_add(registry, def->name, def->qualified_name, def->label);
+        }
+        cbm_file_info_t file = {
+            .path = "/tmp/module.go", .rel_path = "module.go", .language = CBM_LANG_GO};
+        cbm_pipeline_ctx_t ctx = {
+            .project_name = project, .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+        cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+        built = shared != NULL;
+        cbm_shared_resolver_free(shared);
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    free(project);
+    return built;
+}
+
+/* A project's proof work is its fact count times the text in each fact, including the
+ * project name. django's 7000 files reached 133M against a fixed 64M budget and lost
+ * publication entirely. The name buys the same work with one small file, and the short
+ * name is the control: only the amount of work differs between these two builds. */
+TEST(resolver_pipeline_shared_build_has_no_proof_work_budget) {
+    ASSERT(go_shared_build_succeeds(4));
+    ASSERT(go_shared_build_succeeds(4000));
+    PASS();
+}
+
+/* The graph-wide pool grows the same way. django used 1.36G of the 4G it was allowed,
+ * so a project three times that size lost publication. A generation past that point
+ * must keep recording; only the memory core may refuse it. */
+TEST(resolver_pipeline_graph_pool_has_no_proof_work_budget) {
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    ASSERT_NOT_NULL(graph);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &arena, 0, 0, 0);
+    cbm_resolve_proof_source_t source = {.project = "proj", .file = "main.py"};
+    cbm_resolve_proof_key_t key = {.lookup_domain = "proj.caller", .lookup_key = "target"};
+    cbm_resolve_result_t outcome = {.binding = CBM_RESOLVE_BINDING_UNRESOLVED,
+                                    .domain = CBM_RESOLVE_DOMAIN_UNKNOWN,
+                                    .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE};
+    const cbm_resolve_proof_t *proof =
+        cbm_resolve_proof_leaf(&pool, CBM_PROOF_ADAPTER_DOMAIN, &source, &key, &outcome);
+    ASSERT_NOT_NULL(proof);
+    cbm_gbuf_test_add_resolution_proof_work(graph, UINT64_C(4294967296));
+    outcome.proof = proof;
+    cbm_resolve_record_t record = {.file_path = "main.py",
+                                   .scope = "proj.caller",
+                                   .relation = "CALLS",
+                                   .spelling = "target",
+                                   .result = outcome};
+    bool recorded = cbm_gbuf_record_resolution(graph, &record);
+    bool complete = cbm_gbuf_resolutions_complete(graph);
+    cbm_gbuf_free(graph);
+    cbm_arena_destroy(&arena);
+    ASSERT(recorded);
+    ASSERT(complete);
+    PASS();
+}
+
+/* Infrastructure adapters keep one pool per project, not per file. kubernetes' 6456
+ * YAML files spent the 4M they were allowed, and every occurrence after that failed
+ * the whole generation. */
+TEST(resolver_pipeline_infra_adapter_pool_has_no_proof_work_budget) {
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    ASSERT_NOT_NULL(graph);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj", .repo_path = "/tmp", .gbuf = graph};
+    cbm_shared_resolver_adapter_t adapter;
+    ASSERT(cbm_shared_resolver_adapter_init(&adapter, &ctx, &arena));
+    adapter.proofs.work = UINT64_C(4194304);
+    cbm_resolve_proof_source_t source = {.project = "proj", .file = "manifest.yaml"};
+    cbm_resolve_proof_key_t key = {.lookup_domain = "manifest.yaml", .lookup_key = "credentials"};
+    cbm_resolve_result_t outcome = {.binding = CBM_RESOLVE_BINDING_UNRESOLVED,
+                                    .domain = CBM_RESOLVE_DOMAIN_UNKNOWN,
+                                    .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE};
+    const cbm_resolve_proof_t *proof =
+        cbm_resolve_proof_leaf(&adapter.proofs, CBM_PROOF_SOURCE_FACT, &source, &key, &outcome);
+    bool created = proof != NULL;
+    cbm_shared_resolver_adapter_dispose(&adapter);
+    cbm_gbuf_free(graph);
+    cbm_arena_destroy(&arena);
+    ASSERT(created);
+    PASS();
+}
+
 SUITE(resolver_pipeline) {
+    RUN_TEST(resolver_pipeline_shared_build_has_no_proof_work_budget);
+    RUN_TEST(resolver_pipeline_graph_pool_has_no_proof_work_budget);
+    RUN_TEST(resolver_pipeline_infra_adapter_pool_has_no_proof_work_budget);
     RUN_TEST(resolver_pipeline_changed_source_cannot_reuse_old_occurrence_proof);
     RUN_TEST(resolver_pipeline_duplicate_semantics_are_order_independent);
     RUN_TEST(resolver_pipeline_python_default_keeps_class_target_and_body_keeps_module_target);

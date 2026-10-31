@@ -465,6 +465,13 @@ uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb) {
     return gb ? gb->proof_pool.work : 0;
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+void cbm_gbuf_test_add_resolution_proof_work(cbm_gbuf_t *gb, uint64_t work) {
+    if (gb)
+        gb->proof_pool.work += work;
+}
+#endif
+
 bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
     if (!cbm_gbuf_resolution_begin(gb))
         return false;

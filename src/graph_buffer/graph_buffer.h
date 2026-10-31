@@ -32,6 +32,11 @@ bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
 void cbm_gbuf_fail_resolutions(cbm_gbuf_t *gb);
 /* Deterministic proof clone/intern work, including repeated existing facts. */
 uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Spend proof work up front, so a test reaches a large project's position without
+ * having to build one. */
+void cbm_gbuf_test_add_resolution_proof_work(cbm_gbuf_t *gb, uint64_t work);
+#endif
 /* Begin/end bound memo lifetime to immutable source arenas (one file or merged
  * worker buffer). Borrowed shared roots are sealed together before teardown. */
 bool cbm_gbuf_resolution_begin(cbm_gbuf_t *gb);
