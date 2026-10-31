@@ -11190,6 +11190,102 @@ TEST(pipeline_go_parallel_field_hint_requires_owner_segment) {
     PASS();
 }
 
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment);
+
+TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
+    /* #1927, non-Go twin. Go no longer runs try_field_type_hint (e554a2ab),
+     * but every other language on the parallel path still does, and C# is the
+     * hint's intended consumer (it strips the _ / m_ field prefixes). C#
+     * method names are PascalCase, so a one-letter receiver hints a letter
+     * that every candidate QN already contains in the METHOD name: `w.Write()`
+     * hints "W", and a raw substring test accepts "...FileStore.Write" and
+     * "...Conn.Write" alike, whichever the registry lists first. The hint must
+     * bind only a candidate whose OWNING segment equals the hinted type.
+     * >= 50 files forces pass_parallel.c, the only path with the hint. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cs_fth_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Two project methods named Write: an untyped receiver resolves as an
+     * ambiguous short-name match (candidate_count 2), the shape the hint
+     * upgrades. */
+    write_temp_file(tmp, "Storage/FileStore.cs",
+                    "namespace Storage {\n"
+                    "    public class FileStore {\n"
+                    "        private int written;\n"
+                    "        public void Write(int v) { written += v; }\n"
+                    "        public void Put(int v) { written = v; }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "Net/Conn.cs",
+                    "namespace Net {\n"
+                    "    public class Conn {\n"
+                    "        private int sent;\n"
+                    "        public void Write(int v) { sent += v; }\n"
+                    "    }\n"
+                    "}\n");
+    /* Two project methods named Put, one owned by Store: the receiver `store`
+     * names its type, the case the hint exists for. FileStore's QN also
+     * contains "Store", so only segment equality picks Store.Put whatever
+     * the candidate order. */
+    write_temp_file(tmp, "Repo/Store.cs",
+                    "namespace Repo {\n"
+                    "    public class Store {\n"
+                    "        private int held;\n"
+                    "        public void Put(int v) { held = v; }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "App/Worker.cs",
+                    "namespace App {\n"
+                    "    public class Worker {\n"
+                    "        public void Log(System.IO.StreamWriter w) {\n"
+                    "            w.Write(1);\n"
+                    "        }\n"
+                    "        public void Keep() {\n"
+                    "            var store = Services.Resolve();\n"
+                    "            store.Put(2);\n"
+                    "        }\n"
+                    "    }\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[192];
+        snprintf(name, sizeof(name), "Pad/Filler%d.cs", i);
+        snprintf(body, sizeof(body),
+                 "namespace Pad {\n    public class Filler%d {\n"
+                 "        public int Get%d() { return %d; }\n    }\n}\n",
+                 i, i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cs_fth.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Reproduce-first: RED before the fix. "W" is a substring of every
+     * Write candidate, so the old hint upgraded the StreamWriter call to an
+     * arbitrary project Write at PP_FIELD_HINT_CONF. No owner segment is "W",
+     * so the fixed hint must not fire at all. */
+    ASSERT_FALSE(cross_file_call_has_strategy(s, project, "Log", "Write", "field_type_hint"));
+    /* (2) The intended hint case binds the owner it names, never FileStore. */
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", "field_type_hint"), 1);
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".FileStore.Put", NULL), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -29738,6 +29834,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
     RUN_TEST(pipeline_go_parallel_field_hint_requires_owner_segment);
+    RUN_TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment);
     RUN_TEST(pipeline_go_multi_init_nodes_survive);
     RUN_TEST(pipeline_go_init_lsp_edges_per_file);
     RUN_TEST(pipeline_go_init_lsp_edges_per_file_parallel);
