@@ -1069,7 +1069,11 @@ static int cross_repo_count_edges_like(const cross_repo_fixture_t *fixture, cons
  *   POST   /items/{parentId}/{id} (seeded first in DB)
  *   GET    /items/job/{jobId} (seeded second in DB)
  * the fuzzy route matcher must enforce method compatibility, linking the GET calls
- * to their respective GET endpoints and never to DELETE or POST endpoints. */
+ * to their respective GET endpoints and never to DELETE or POST endpoints.
+ * getItem and getJob are seeded WITHOUT a method property (an edge written by an
+ * index that did not record the verb): the matcher must infer GET from the
+ * callee's verb suffix, or the method-less fuzzy match lands on the DELETE / POST
+ * route seeded first. getItems keeps its explicit "GET". */
 TEST(cross_repo_angular_http_client_exact_verb_matching_issue2768) {
     cross_repo_fixture_t fixture;
     bool setup = cross_repo_fixture_begin(&fixture) &&
@@ -1088,9 +1092,9 @@ TEST(cross_repo_angular_http_client_exact_verb_matching_issue2768) {
                  cross_repo_seed_client_call(&fixture, "angular-2768", "getItems",
                                              "this.http.get", "/items/list", "GET") &&
                  cross_repo_seed_client_call(&fixture, "angular-2768", "getItem",
-                                             "this.http.get", "/items/42", "GET") &&
+                                             "this.http.get", "/items/42", NULL) &&
                  cross_repo_seed_client_call(&fixture, "angular-2768", "getJob",
-                                             "this.http.get", "/items/job/10", "GET");
+                                             "this.http.get", "/items/job/10", NULL);
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed issue 2768 fixture");
