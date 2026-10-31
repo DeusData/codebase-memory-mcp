@@ -1334,40 +1334,38 @@ static bool c_proof_configured_wrapper(CLSPContext *ctx, TSNode node) {
            ts_node_end_byte(name) <= ts_node_end_byte(node);
 }
 
-static bool c_proof_syntax_complete(CLSPContext *ctx, TSNode node, unsigned depth,
-                                    uint32_t *visited) {
-    if (++*visited > 1000000 || depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
-        ctx->binding_failed = true;
-        return false;
-    }
-    if (!ts_node_has_error(node) && !ts_node_is_missing(node))
-        return true;
-    if (c_proof_configured_wrapper(ctx, node))
-        return true;
-    if (ts_node_is_error(node) || ts_node_is_missing(node)) {
-        ctx->proof_syntax_limit = ts_node_start_byte(node);
-        return false;
-    }
-    bool complete = true;
-    TSTreeCursor cursor = ts_tree_cursor_new(node);
-    if (ts_tree_cursor_goto_first_child(&cursor))
-        do {
-            if (!c_proof_syntax_complete(ctx, ts_tree_cursor_current_node(&cursor), depth + 1,
-                                         visited)) {
-                complete = false;
+/* The proof boundary is the first syntax error no configured wrapper accounts for:
+ * sites before it are audited complete and keep their proofs, sites at or after it
+ * do not. Only the spine of error-bearing nodes is descended, with a cursor rather
+ * than recursion, so how deeply the error is nested is not a property the answer can
+ * depend on. Real C nests that deep: an #ifdef inside an else-if chain puts redis
+ * src/defrag.c past 16 levels, and treating that as a failure of the whole file
+ * withheld every proof in it. */
+static void c_proof_audit_syntax(CLSPContext *ctx, TSNode root) {
+    ctx->proof_syntax_limit = ts_node_end_byte(root);
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool walking = true;
+    while (walking) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool faulty = ts_node_has_error(node) || ts_node_is_missing(node);
+        if (faulty && !c_proof_configured_wrapper(ctx, node)) {
+            if (ts_node_is_error(node) || ts_node_is_missing(node)) {
+                ctx->proof_syntax_limit = ts_node_start_byte(node);
                 break;
             }
-        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+        }
+        while (walking && !ts_tree_cursor_goto_next_sibling(&cursor))
+            walking = ts_tree_cursor_goto_parent(&cursor);
+    }
     ts_tree_cursor_delete(&cursor);
-    return complete;
 }
 
 static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
     ctx->proof_registry = c_proof_registry_snapshot(ctx, ctx->registry, 0);
     ctx->proof_preprocessor_unknown = cbm_c_preprocessor_domain_unsupported(root);
-    uint32_t visited = 0;
-    ctx->proof_syntax_limit = ts_node_end_byte(root);
-    (void)c_proof_syntax_complete(ctx, root, 0, &visited);
+    c_proof_audit_syntax(ctx, root);
     if (!ctx->proof_registry || !ctx->module_qn || ctx->binding_failed) {
         ctx->binding_failed = true;
         return;
@@ -5666,6 +5664,10 @@ static bool c_field_receiver_proven(CLSPContext *ctx, TSNode expression, const C
 }
 
 static bool c_proof_type_visible(CLSPContext *ctx, const char *qn, uint32_t at) {
+    /* A failed prepare stops before proof_includes exists, with include_count
+     * already set, and the file's ordinary processing carries on past it. */
+    if (ctx->binding_failed)
+        return false;
     const char *key = cbm_arena_sprintf(ctx->arena, "$type:%s", qn);
     if (!key)
         return false;
