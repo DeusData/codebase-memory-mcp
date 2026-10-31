@@ -2000,6 +2000,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                     cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, all_def_count);
                     cross_registries.java =
                         cbm_java_build_cross_registry(xa, all_defs, all_def_count);
+                    cross_registries.ruby =
+                        cbm_ruby_build_cross_registry(xa, all_defs, all_def_count);
                     registries_arg = &cross_registries;
                 }
             } else {
