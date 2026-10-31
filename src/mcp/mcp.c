@@ -769,7 +769,7 @@ static const tool_def_t TOOLS[] = {
      "\"offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0},"
      "\"metadata_only\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Compatibility: omit counts, size, and branch.\"}}}"},
-    {"delete_project", "Delete a project from the index",
+    {"delete_project", "Delete a project from the index, including its ADR store",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
 
@@ -7885,7 +7885,9 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
-/* delete_project: just erase the .db file (and WAL/SHM). */
+/* delete_project: erase the .db file (and WAL/SHM) plus the ADR sidecar
+ * "<db>.adr.db" (and its WAL/SHM/journal), so deleting a project removes its
+ * ADR store with it. */
 static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     char *name = get_project_arg(args);
     if (!name) {
@@ -7924,18 +7926,37 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     const char *error_detail = NULL;
     bool is_error = false;
 
+    /* ADR sidecar lives beside the graph DB as "<db>.adr.db" — remove it (and
+     * its own WAL/SHM/journal) whenever the project is deleted. Sized as the
+     * graph path plus the ".adr.db" suffix. */
+    char adr_path[CBM_SZ_1K + sizeof(".adr.db")];
+    int adr_n = snprintf(adr_path, sizeof(adr_path), "%s.adr.db", path);
+    bool have_adr_path = adr_n > 0 && (size_t)adr_n < sizeof(adr_path);
+
     if (exists) {
         int rc = cbm_unlink(path);
         (void)cbm_unlink(wal);
         (void)cbm_unlink(shm);
         if (rc == 0) {
             status = "deleted";
+            /* Only drop the ADR store once the graph DB is actually gone, so a
+             * failed graph delete leaves the project (and its ADR) intact. */
+            if (have_adr_path) {
+                (void)cbm_unlink(adr_path);
+                (void)cbm_remove_db_sidecars(adr_path);
+            }
         } else {
             status = "delete_failed";
             error_detail = strerror(errno);
             is_error = true;
         }
     } else {
+        /* No graph DB, but a sidecar could still linger (e.g. ADR written then
+         * the index deleted out of band) — best-effort clean it up. */
+        if (have_adr_path) {
+            (void)cbm_unlink(adr_path);
+            (void)cbm_remove_db_sidecars(adr_path);
+        }
         is_error = true;
     }
 
@@ -20814,9 +20835,10 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    /* ADRs are stored in the SQLite store (project_summaries), the SAME
-     * backend the UI /api/adr endpoints use — so writes via the MCP tool and
-     * the UI are visible to each other (#256). */
+    /* ADRs are stored in the per-project ADR sidecar DB ("<db>.adr.db"), the
+     * SAME backend the UI /api/adr endpoints use (via cbm_store_adr_*) — so
+     * writes via the MCP tool and the UI are visible to each other (#256), and
+     * a reindex of the graph DB never disturbs them. */
     store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
     cbm_store_t *resolved =
         resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status, true);
