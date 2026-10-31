@@ -2621,19 +2621,37 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, 
         if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
+        const char *method = cbm_service_pattern_http_method(call->callee_name);
+        const char *prefix = method ? method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s",
+        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix,
                  cbm_route_canon_path(norm, cpath, sizeof(cpath)));
-        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
-                                                "{\"source\":\"arg_url\"}");
+        char route_props[CBM_SZ_256];
+        if (method) {
+            snprintf(route_props, sizeof(route_props), "{\"source\":\"arg_url\",\"method\":\"%s\"}",
+                     method);
+        } else {
+            snprintf(route_props, sizeof(route_props), "{\"source\":\"arg_url\"}");
+        }
+        int64_t route_id =
+            cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0, route_props);
         char esc_c[CBM_SZ_256];
         char esc_n[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
         cbm_json_escape(esc_n, sizeof(esc_n), norm);
-        char eprops[CBM_SZ_512];
-        snprintf(eprops, sizeof(eprops),
-                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
+        /* Two escaped 255-byte strings plus the fixed keys and the verb: 1K
+         * never truncates the JSON (512 could, once the method was added). */
+        char eprops[CBM_SZ_1K];
+        if (method) {
+            snprintf(
+                eprops, sizeof(eprops),
+                "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\",\"method\":\"%s\"}",
+                esc_c, esc_n, method);
+        } else {
+            snprintf(eprops, sizeof(eprops),
+                     "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
+        }
         cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
         break;
     }
@@ -2985,6 +3003,29 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
 /* Field type hint resolution for obj.Method() with multiple candidates.
  * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
  * checks if TypeName.Method or ITypeName.Method exists among candidates. */
+/* #1927: the hint may only bind a candidate whose OWNING dot-segment — the
+ * segment immediately before the method name — EQUALS the hinted type. The
+ * previous raw strstr() accepted the hinted name anywhere in the QN, so a
+ * single-letter receiver (`f.Close()` → hint "F") matched nearly every
+ * candidate ("F" ⊂ "…FileStore.Close", the method name included) and rebound
+ * a call whose resolution had already failed to an arbitrary project symbol
+ * at PP_FIELD_HINT_CONF. Segment equality keeps the intended
+ * variable-named-after-its-type case (`repo.Find()` → `Repo.Find`,
+ * lrp_go_s8_field_type_hint) and picks the candidate whose owner actually
+ * carries the name instead of whichever QN contains the letters. */
+static bool fth_owner_segment_is(const char *candidate_qn, const char *type_name) {
+    const char *last_dot = strrchr(candidate_qn, '.');
+    if (!last_dot || last_dot == candidate_qn) {
+        return false;
+    }
+    const char *seg_start = last_dot;
+    while (seg_start > candidate_qn && seg_start[-1] != '.') {
+        seg_start--;
+    }
+    size_t seg_len = (size_t)(last_dot - seg_start);
+    return seg_len > 0 && strncmp(seg_start, type_name, seg_len) == 0 && type_name[seg_len] == '\0';
+}
+
 static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
                                 int64_t source_id) {
     if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
@@ -3024,7 +3065,8 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
-        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+        if (fth_owner_segment_is(cands[ci], type_name) ||
+            fth_owner_segment_is(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
                 res->qualified_name = cands[ci];
@@ -3661,6 +3703,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * Variable or a Field. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, call->is_method, call->callee_name,
+                                           res.strategy, target_node->label)) {
+            /* Same guard as pass_calls.c — a bare Go `init` is a local name,
+             * never a package init or a method found by name alone. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
@@ -3837,6 +3886,12 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_bare_field_ref(lang, usage->is_member_access, tgt->label)) {
                 continue;
             }
+            /* A bare Go `init` names a local (cbm_go_suppress_bare_init_bind).
+             * Mirrors the sequential twin (pass_usages.c). */
+            if (tgt && cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      usage->ref_name, res.strategy, tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -3963,6 +4018,12 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         /* #1942/#1962/#2666: a bare Go or C reference can never denote a
          * struct field; a selector-LHS write (`t.err = x`) may bind it. */
         if (cbm_suppress_bare_field_ref(lang, rw->is_member_access, tgt->label)) {
+            continue;
+        }
+        /* A bare Go `init` names a local (cbm_go_suppress_bare_init_bind).
+         * Mirrors the sequential twin (pass_usages.c). */
+        if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, rw->is_member_access, rw->var_name,
+                                           res.strategy, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
