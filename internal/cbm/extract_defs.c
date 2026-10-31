@@ -7061,6 +7061,24 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    /* Go allows any number of init() functions per package — even several in
+     * one file — and they all run at start-up. On the flat QN they all
+     * collided and the graph upsert kept ONE node per package, silently
+     * dropping the rest (#1910). Disambiguate with the #495 cfg-twin pattern:
+     * fold the file basename and the init's per-file ordinal into the QN.
+     * The ordinal (not the line) keeps the QN stable when code is edited
+     * above the function — the QN is node identity, and a line suffix would
+     * churn nodes on every unrelated insertion. Nothing ever joins on the
+     * plain QN — calling init explicitly is illegal in Go — and the
+     * call-scope side (compute_func_qn in extract_unified.c) and the Go LSP
+     * (process_function in lsp/go_lsp.c) name it through the same
+     * cbm_go_init_qn, so init-body calls keep their attribution. */
+    if (ctx->language == CBM_LANG_GO && strcmp(def.label, "Function") == 0 &&
+        strcmp(name, "init") == 0) {
+        def.qualified_name =
+            cbm_go_init_qn(a, def.qualified_name, ctx->rel_path, node, ctx->source);
+    }
+
     // C++/CUDA: out-of-line method definition (`Foo::bar` in a .cc/.cpp). The
     // class body in the header is declaration-only, so without this the
     // definition is recorded as a free Function. Promote it to a Method whose QN

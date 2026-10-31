@@ -287,6 +287,13 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang);
 // node being classified.
 bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
 
+/* QN of a Go `init` function_declaration (#1910): base_qn + "#<file basename>:<N>",
+ * N = its 1-based ordinal among the file's top-level `init`s. The ONE formula
+ * for the def extractor, compute_func_qn and the Go LSP's enclosing-function
+ * QN. A NULL base_qn or rel_path returns base_qn unchanged. */
+const char *cbm_go_init_qn(CBMArena *a, const char *base_qn, const char *rel_path, TSNode fn_node,
+                           const char *source);
+
 // --- FQN computation ---
 
 // Compute qualified name: project.rel_path_parts.name
