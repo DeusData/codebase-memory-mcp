@@ -2330,6 +2330,65 @@ int cbm_classify_string(const char *str, int len) {
     return NOT_FOUND;
 }
 
+/* 1-based source-order ordinal of a top-level Go `init` function_declaration
+ * among the file's `init`s. Unlike a line number, the ordinal is stable under
+ * edits above the function — QNs are node identity, and a line-based suffix
+ * would churn nodes on every unrelated insertion (the #495 cfg suffix and the
+ * GoogleTest derivation are both edit-stable for the same reason).
+ * One cursor pass over the top-level declarations: ts_node_named_child(root, i)
+ * is O(i), so an indexed loop is O(n^2) per init on a wide file, and generated
+ * Go (.pb.go, tables) carries thousands of top-level declarations next to its
+ * init(). */
+static int go_init_ordinal(TSNode fn_node, const char *source) {
+    TSNode root = fn_node;
+    for (TSNode p = ts_node_parent(root); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        root = p;
+    }
+    int ordinal = 0;
+    TSTreeCursor cur = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cur);
+            if (strcmp(ts_node_type(child), "function_declaration") != 0) {
+                continue;
+            }
+            TSNode name = ts_node_child_by_field_name(child, TS_FIELD("name"));
+            if (ts_node_is_null(name)) {
+                continue;
+            }
+            uint32_t start = ts_node_start_byte(name);
+            if (ts_node_end_byte(name) - start != 4 || memcmp(source + start, "init", 4) != 0) {
+                continue;
+            }
+            ordinal++;
+            if (ts_node_eq(child, fn_node)) {
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    return ordinal;
+}
+
+/* Qualified name of a Go `init` function (#1910). Go allows any number of
+ * init() per package — even several in one file — so the flat `pkg.init`
+ * collides and the graph upsert keeps one node. The QN folds in the file
+ * basename and the init's per-file ordinal: `pkg.init#file.go:N`. Every side
+ * that names an init calls this one function — the definition extractor, the
+ * call-scope side (compute_func_qn) and the Go LSP's enclosing-function QN —
+ * so the three cannot drift. A NULL base QN or path keeps base_qn as is. */
+const char *cbm_go_init_qn(CBMArena *a, const char *base_qn, const char *rel_path, TSNode fn_node,
+                           const char *source) {
+    if (!base_qn || !rel_path) {
+        return base_qn;
+    }
+    const char *base = strrchr(rel_path, '/');
+    base = base ? base + 1 : rel_path;
+    const char *qn =
+        cbm_arena_sprintf(a, "%s#%s:%d", base_qn, base, go_init_ordinal(fn_node, source));
+    return qn ? qn : base_qn;
+}
+
 /* Flatten a JS/TS `template_string` node into plain text (issue #1006).
  * String fragments are kept verbatim; each ${...} substitution becomes the
  * "{}" placeholder so client URLs built from template literals share the

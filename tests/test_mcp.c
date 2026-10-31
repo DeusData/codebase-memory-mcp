@@ -4787,6 +4787,156 @@ TEST(tool_search_graph_bm25_zero_hint_names_the_label) {
     PASS();
 }
 
+/* file_pattern, kind and namespace filter after the BM25 candidate window
+ * (they cannot be put into the MATCH like the label). 2001 same-label nodes
+ * with a short path fill the window ahead of 3 that rank strictly lower (long
+ * path) and are the only ones passing each filter, so a windowed search
+ * answered 0 rows. A saturated window under such a filter is ranked over
+ * every candidate: all 3 rows, an exact total, consistent offset pages. */
+static void bm25_post_window_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-post-window");
+    for (int i = 0; i < 2004; i++) {
+        bool rare = i >= 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-post-window.%s_%04d", rare ? "rare" : "fn", i);
+        cbm_node_t node = {
+            .project = project,
+            .label = "Function",
+            .name = "postneedle",
+            .qualified_name = qn,
+            .file_path = rare ? "deeply/nested/package/layout/registry.c" : "many.c",
+            .start_line = i + 1,
+            .end_line = i + 1,
+            .properties_json =
+                rare ? "{\"kind\":\"Deployment\",\"obj_key\":\"apps/Deployment/prod/web\"}" : NULL};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_post_window_search(cbm_mcp_server_t *srv, const char *filter_json, int limit,
+                                     int offset) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2424,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-post-window\",\"query\":\"postneedle\"%s,"
+             "\"limit\":%d,\"offset\":%d,\"format\":\"json\"}}}",
+             filter_json, limit, offset);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-post-window");
+    bm25_post_window_fixture(store, "bm25-post-window");
+
+    static const char *const filters[] = {
+        ",\"file_pattern\":\"deeply/nested\"",
+        ",\"kind\":\"Deployment\"",
+        ",\"namespace\":\"prod\"",
+    };
+    for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
+        char *inner = bm25_post_window_search(srv, filters[i], 10, 0);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2001\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2003\""));
+        ASSERT_NULL(strstr(inner, "\"bm25-post-window.fn_"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":3,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+        free(inner);
+    }
+
+    /* Offset pages over the exhaustive ranking are disjoint and complete. */
+    char *page1 = bm25_post_window_search(srv, filters[0], 2, 0);
+    char *page2 = bm25_post_window_search(srv, filters[0], 2, 2);
+    ASSERT_NOT_NULL(page1);
+    ASSERT_NOT_NULL(page2);
+    ASSERT_NOT_NULL(strstr(page1, "\"returned\":2,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"returned\":1,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"total\":3,"));
+    for (int i = 2001; i < 2004; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "\"bm25-post-window.rare_%04d\"", i);
+        ASSERT_TRUE((strstr(page1, qn) != NULL) != (strstr(page2, qn) != NULL));
+    }
+    free(page1);
+    free(page2);
+
+    /* Without a post-window filter the window stays and says so. */
+    char *inner = bm25_post_window_search(srv, "", 10, 0);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled query whose whole candidate window is File/Folder/Variable/
+ * Project rows (excluded from unlabelled ranking) found no row at all, while
+ * a matching definition sat just beyond the window: 2001 short Folder rows
+ * outrank one Function with a long path. A window with no row passing the
+ * filters is ranked over every candidate instead. */
+TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-empty-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-empty-window"), CBM_STORE_OK);
+    for (int i = 0; i < 2002; i++) {
+        bool def = i == 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-empty-window.%s_%04d", def ? "def" : "dir", i);
+        cbm_node_t node = {.project = project,
+                           .label = def ? "Function" : "Folder",
+                           .name = "foldneedle",
+                           .qualified_name = qn,
+                           .file_path = def ? "deeply/nested/package/layout/registry.c" : "d",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2425,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-empty-window\",\"query\":\"foldneedle\",\"limit\":10,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-empty-window.def_2001\",\"Function\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* The definition whose NAME is the query ranks first: the `Table` class above
  * its own methods and above test methods that repeat "table" three times; the
  * `get_object_or_404` function above the test methods that contain it. */
@@ -26301,6 +26451,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_bm25_label_scope_keeps_rank_order);
     RUN_TEST(tool_search_graph_bm25_serves_unranked_labels_when_named);
     RUN_TEST(tool_search_graph_bm25_zero_hint_names_the_label);
+    RUN_TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate);
+    RUN_TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);

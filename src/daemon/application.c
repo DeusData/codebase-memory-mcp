@@ -196,11 +196,11 @@ struct cbm_daemon_application_index_record {
     cbm_daemon_application_index_record_t *next;
 };
 
-/* A watcher-triggered physical job is owned by the exact live sessions that
- * currently subscribe to its project/root watch. The callback waiting for the
- * job is only a storage waiter; it is deliberately not an ownership
- * subscription, so the worker is cancelled when the last matching session
- * disconnects even while unrelated daemon sessions remain alive. */
+/* A watcher-triggered physical job is normally owned by the exact live
+ * sessions subscribed to its project/root watch. In permanent daemon mode the
+ * watcher itself additionally owns the physical job so background indexing can
+ * continue while no client session is connected. The callback remains a
+ * storage waiter in both modes and releases daemon ownership on completion. */
 struct cbm_daemon_application_watch_job_subscription {
     cbm_daemon_application_session_t *session;
     cbm_daemon_application_job_t *job;
@@ -564,8 +564,26 @@ static bool application_watches_disabled_locked(cbm_daemon_application_t *applic
     return true;
 }
 
-static void application_release_session_watch_locked(cbm_daemon_application_session_t *session) {
+static void application_release_session_watch_locked(cbm_daemon_application_session_t *session,
+                                                     bool session_ending) {
     application_watch_job_unsubscribe_session_locked(session, NULL);
+
+    /*
+     * A permanent daemon owns the physical project watch independently of
+     * individual client sessions. Session disconnect releases only that
+     * session's logical subscription; the watcher remains available for
+     * background change detection while the daemon generation is alive.
+     *
+     * Non-permanent applications retain the historical session-scoped
+     * lifecycle and remove the physical watch after the final subscriber.
+     * A release decided by workspace policy (session_ending false: the
+     * session's root is no longer allowed) is not a disconnect and removes
+     * the watch in both modes. Daemon shutdown and auto_watch=false remove
+     * persistent watches through their own paths; a deleted project's watch
+     * ends at its next watcher callback
+     * (application_permanent_watch_orphaned_locked).
+     */
+    bool daemon_keeps_watch = session_ending && session->application->permanent;
     while (session->watches) {
         application_watch_membership_t *membership = session->watches;
         cbm_daemon_application_watch_t *watch = membership->watch;
@@ -573,7 +591,7 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
         cbm_free(CBM_MEM_CLASS_OTHER, membership);
         if (watch->subscribers > 0) {
             watch->subscribers--;
-            if (watch->subscribers == 0) {
+            if (!daemon_keeps_watch && watch->subscribers == 0) {
                 application_remove_watch_locked(session->application, watch);
             }
         }
@@ -721,7 +739,7 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
         return;
     }
     if (!application_session_workspace_allowed(session, "watch")) {
-        application_release_session_watch_locked(session);
+        application_release_session_watch_locked(session, false);
         return;
     }
     application_register_watch_locked(session, cbm_mcp_server_session_project(session->mcp),
@@ -806,7 +824,9 @@ static const char *application_watch_strategy_name(cbm_watcher_strategy_t strate
 
 /* index_status watch visibility (#2167). The physical watcher is the truth for
  * "watched"; session roots and successful explicit targets stay watched while
- * at least one owning MCP session remains open. Takes the
+ * at least one owning MCP session remains open (under `daemon start`, also
+ * after the last one closes, until the daemon stops, the project is deleted,
+ * its root disappears, or auto_watch is switched off). Takes the
  * application mutex and the watcher lock one after the other, never nested. */
 static void application_watch_status(void *context, const char *project,
                                      cbm_mcp_watch_status_t *out) {
@@ -3649,7 +3669,7 @@ static void application_session_cancel(void *context,
             reap_update || (session->background_eligible && application->update_thread_started &&
                             application->update_owners == 0);
         application_index_watch_unsubscribe_locked(session, NULL);
-        application_release_session_watch_locked(session);
+        application_release_session_watch_locked(session, true);
         bool final_live_session = newly_cancelled;
         for (cbm_daemon_application_session_t *other = application->sessions;
              final_live_session && other; other = other->next) {
@@ -3709,7 +3729,7 @@ static void application_session_close(void *context,
         reap_update || (session->background_eligible && application->update_thread_started &&
                         application->update_owners == 0);
     application_index_watch_unsubscribe_locked(session, NULL);
-    application_release_session_watch_locked(session);
+    application_release_session_watch_locked(session, true);
     cbm_mutex_unlock(&application->mutex);
     application_auto_index_cancel_join(application, join_auto_index);
     application_jobs_reap_completed(application);
@@ -4256,11 +4276,27 @@ static void application_watch_encode_index_args_locked(const cbm_daemon_applicat
     *args = encoded ? yyjson_mut_write(document, 0, NULL) : NULL;
 }
 
+/* Under `daemon start` a watch outlives its last session, so delete_project
+ * from another session or the CLI can remove the project's DB while nothing
+ * owns the watch any more: daemon MCP sessions carry no watcher pointer and
+ * never unwatch it. Re-indexing such an orphan would resurrect the deleted
+ * project. A full reindex also unlinks the DB while it rebuilds it, so a
+ * missing DB means "deleted" only while no job for the project is running.
+ * Caller holds application->mutex. */
+static bool application_permanent_watch_orphaned_locked(cbm_daemon_application_t *application,
+                                                        const cbm_daemon_application_watch_t *watch,
+                                                        const char *project_key) {
+    return application->permanent && watch->subscribers == 0 &&
+           !application_find_active_job_locked(application, project_key) &&
+           !application_regular_db_exists(watch->project);
+}
+
 static cbm_daemon_application_job_t *application_background_index_admit(
     cbm_daemon_application_t *application, const char *project_name, const char *canonical_root,
     const char *project_key, yyjson_mut_doc *document, yyjson_mut_val *root, char **args,
-    bool require_live_watch, int *no_job_result) {
+    bool require_live_watch, bool *watcher_owns_job, int *no_job_result) {
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
+    *watcher_owns_job = false;
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     if (require_live_watch) {
@@ -4268,9 +4304,15 @@ static cbm_daemon_application_job_t *application_background_index_admit(
     }
     cbm_daemon_application_watch_t *watch =
         require_live_watch ? application_find_watch_locked(application, project_name) : NULL;
-    bool watch_live =
-        !require_live_watch || (watch && watch->subscribers > 0 &&
-                                application_watch_root_matches(watch->root, canonical_root));
+    if (watch && application_permanent_watch_orphaned_locked(application, watch, project_key)) {
+        /* End the orphan the way a session refresh ends a deleted project's
+         * watch; the callback below becomes a harmless skip. */
+        application_remove_watch_locked(application, watch);
+        watch = NULL;
+    }
+    bool watch_live = !require_live_watch ||
+                      (watch && application_watch_root_matches(watch->root, canonical_root) &&
+                       (watch->subscribers > 0 || application->permanent));
     if (require_live_watch && watch_live) {
         application_watch_encode_index_args_locked(watch, document, root, args);
     }
@@ -4284,16 +4326,28 @@ static cbm_daemon_application_job_t *application_background_index_admit(
     if (job && require_live_watch) {
         watch_subscriptions_ok = application_watch_job_subscribe_sessions_locked(
             application, watch, job, &watch_owner_count);
-        if (watch_subscriptions_ok && watch_owner_count > 0) {
-            job->watcher_waiters++;
-        } else if (!watch_subscriptions_ok) {
+
+        if (!watch_subscriptions_ok) {
             subscribe_status = APPLICATION_JOB_SUBSCRIBE_ALLOCATION_FAILED;
-        }
-        /* application_job_subscribe_locked() lends the caller one ordinary
-         * subscriber. A watcher callback is only a storage waiter: exact live
-         * session subscriptions above own the physical work. */
-        application_job_unsubscribe_locked(job);
-        if (!watch_subscriptions_ok || watch_owner_count == 0) {
+            application_job_unsubscribe_locked(job);
+            job = NULL;
+        } else if (application->permanent) {
+            /*
+             * The ordinary subscription acquired above is retained as daemon
+             * ownership. This allows the physical watcher to run indexing even
+             * while no client session currently owns the project watch.
+             */
+            *watcher_owns_job = true;
+            job->watcher_waiters++;
+        } else if (watch_owner_count > 0) {
+            /*
+             * Historical non-permanent behavior: exact live sessions own the
+             * physical work; the watcher callback itself is only a waiter.
+             */
+            job->watcher_waiters++;
+            application_job_unsubscribe_locked(job);
+        } else {
+            application_job_unsubscribe_locked(job);
             job = NULL;
         }
     }
@@ -4318,7 +4372,7 @@ static cbm_daemon_application_job_t *application_background_index_admit(
 
 static int application_background_index_wait(cbm_daemon_application_t *application,
                                              cbm_daemon_application_job_t *job,
-                                             bool require_live_watch) {
+                                             bool require_live_watch, bool watcher_owns_job) {
     bool successful = false;
     bool cancelled = false;
     for (;;) {
@@ -4330,6 +4384,9 @@ static int application_background_index_wait(cbm_daemon_application_t *applicati
                 application_watch_job_unsubscribe_job_locked(application, job);
                 if (job->watcher_waiters > 0) {
                     job->watcher_waiters--;
+                }
+                if (watcher_owns_job) {
+                    application_job_unsubscribe_locked(job);
                 }
             } else {
                 application_job_unsubscribe_locked(job);
@@ -4387,13 +4444,15 @@ static int application_background_index(cbm_daemon_application_t *application,
     }
 
     int no_job_result = APPLICATION_BACKGROUND_INDEX_FAILED;
+    bool watcher_owns_job = false;
     cbm_daemon_application_job_t *job = application_background_index_admit(
         application, project_name, canonical_root, project_key, document, root, &args,
-        require_live_watch, &no_job_result);
+        require_live_watch, &watcher_owns_job, &no_job_result);
     free(project_key);
     free(args);
     yyjson_mut_doc_free(document);
-    return job ? application_background_index_wait(application, job, require_live_watch)
+    return job ? application_background_index_wait(application, job, require_live_watch,
+                                                   watcher_owns_job)
                : no_job_result;
 }
 
