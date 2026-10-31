@@ -2,9 +2,12 @@
 #include "arena.h" // cbm_arena_sprintf
 #include "cbm.h"   // CBMExtractCtx
 #include "helpers.h"
-#include "lang_specs.h"      // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
-#include "tree_sitter/api.h" // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
+#include "extract_url_fold.h" // cbm_url_fold_record_constant (#706, #1147)
+#include "lang_specs.h"       // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
+#include "tree_sitter/api.h"  // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
 #include "foundation/constants.h"
+#include "foundation/compat.h" // cbm_thread_cpu_time_ns
+#include <stdlib.h>
 
 enum { MAX_INFRA_BINDINGS = 8 };
 
@@ -119,11 +122,196 @@ static uint32_t add_lexical_scope(WalkState *state, TSNode node, CBMLexicalScope
     return scope->id;
 }
 
+/* ── #1912: Python parameter bindings held live by the walk ───────────────────
+ *
+ * A bare Python call `run()` cannot honestly resolve to a project function by
+ * short name when `run` is bound as a parameter of an enclosing def or lambda:
+ * the parameter shadows any module-level `run` for the whole body, so the match
+ * is fabricated by construction.
+ *
+ * Deciding that per call by ASCENDING the tree is the trap this replaces. Both
+ * ts_node_parent() (O(depth) per hop) and a walk-cursor ascent (O(1) per hop,
+ * O(depth) per call) are per-call costs, and every level of f(f(f(...))) is
+ * itself a bare call, so the file-wide cost is quadratic or worse -- exactly
+ * what CBMWalkScope's comment records for the state it replaced. Scanning the
+ * frame stack has the same shape.
+ *
+ * So the walk carries the answer instead: a name -> active-count map, pushed
+ * when a Python function or lambda scope opens and unwound when it closes.
+ * Lookup is O(1), which is what removes the need for a hop cap.
+ *
+ * A COUNT, not a flag: `def outer(run): def inner(run):` binds one name twice,
+ * and leaving the inner scope must not unbind the outer one.
+ *
+ * Every failure path answers "not bound", which can only ever cost a
+ * suppression -- never a true edge. */
+
+static uint32_t py_param_hash(const char *s) {
+    uint32_t h = 2166136261u; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h = (h ^ *p) * 16777619u;
+    }
+    return h ? h : 1u; /* 0 marks an empty slot */
+}
+
+static CBMParamSlot *py_param_slot(WalkState *state, const char *name, uint32_t hash) {
+    int mask = state->py_param_slot_capacity - 1;
+    int i = (int)(hash & (uint32_t)mask);
+    for (;;) {
+        CBMParamSlot *slot = &state->py_param_slots[i];
+        if (slot->hash == 0) {
+            return slot; /* free slot -- caller decides whether to claim it */
+        }
+        if (slot->hash == hash && strcmp(slot->name, name) == 0) {
+            return slot;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static bool py_param_grow(WalkState *state) {
+    int new_capacity = state->py_param_slot_capacity * PAIR_LEN;
+    if (new_capacity <= state->py_param_slot_capacity) {
+        return false;
+    }
+    CBMParamSlot *grown =
+        (CBMParamSlot *)cbm_arena_alloc(state->arena, (size_t)new_capacity * sizeof(*grown));
+    if (!grown) {
+        return false;
+    }
+    memset(grown, 0, (size_t)new_capacity * sizeof(*grown));
+    CBMParamSlot *old = state->py_param_slots;
+    int old_capacity = state->py_param_slot_capacity;
+    state->py_param_slots = grown;
+    state->py_param_slot_capacity = new_capacity;
+    for (int i = 0; i < old_capacity; i++) {
+        if (old[i].hash != 0) {
+            *py_param_slot(state, old[i].name, old[i].hash) = old[i];
+        }
+    }
+    return true;
+}
+
+static bool py_param_stack_reserve(WalkState *state) {
+    if (state->py_param_stack_count < state->py_param_stack_capacity) {
+        return true;
+    }
+    int new_capacity = state->py_param_stack_capacity * PAIR_LEN;
+    if (new_capacity <= state->py_param_stack_capacity) {
+        return false;
+    }
+    const char **grown =
+        (const char **)cbm_arena_alloc(state->arena, (size_t)new_capacity * sizeof(*grown));
+    if (!grown) {
+        return false;
+    }
+    memcpy(grown, state->py_param_stack, (size_t)state->py_param_stack_count * sizeof(*grown));
+    state->py_param_stack = grown;
+    state->py_param_stack_capacity = new_capacity;
+    return true;
+}
+
+/* Bind one parameter name for the lifetime of the frame currently on top. */
+static void py_param_bind(WalkState *state, const char *name) {
+    if (state->py_param_tracking_failed || !name || !name[0]) {
+        return;
+    }
+    /* Grow before inserting: the probe below must always find a free slot, and
+     * a table above ~70% load degrades toward linear probing. */
+    if ((state->py_param_slot_used + 1) * 10 >= state->py_param_slot_capacity * 7) {
+        if (!py_param_grow(state)) {
+            state->py_param_tracking_failed = true;
+            return;
+        }
+    }
+    if (!py_param_stack_reserve(state)) {
+        state->py_param_tracking_failed = true;
+        return;
+    }
+    uint32_t hash = py_param_hash(name);
+    CBMParamSlot *slot = py_param_slot(state, name, hash);
+    if (slot->hash == 0) {
+        slot->hash = hash;
+        slot->name = name;
+        slot->count = 0;
+        state->py_param_slot_used++;
+    }
+    slot->count++;
+    state->py_param_stack[state->py_param_stack_count++] = name;
+}
+
+/* Unwind to a frame's entry height, undoing exactly what that frame bound. */
+static void py_param_unwind_to(WalkState *state, int base) {
+    if (state->py_param_tracking_failed) {
+        return;
+    }
+    while (state->py_param_stack_count > base) {
+        const char *name = state->py_param_stack[--state->py_param_stack_count];
+        CBMParamSlot *slot = py_param_slot(state, name, py_param_hash(name));
+        if (slot->hash != 0 && slot->count > 0) {
+            slot->count--;
+        }
+    }
+}
+
+bool cbm_walk_python_param_is_bound(const WalkState *state, const char *name) {
+    if (!state || !name || !name[0] || state->py_param_tracking_failed ||
+        state->py_param_slot_used == 0) {
+        return false;
+    }
+    const CBMParamSlot *slot = py_param_slot((WalkState *)state, name, py_param_hash(name));
+    return slot->hash != 0 && slot->count > 0;
+}
+
+/* The identifier a Python parameter node binds. Handles the bare, typed,
+ * defaulted, keyword-only, *args and **kwargs shapes. */
+static const char *py_parameter_name(CBMExtractCtx *ctx, TSNode param) {
+    if (ts_node_is_null(param)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(param), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, param, ctx->source);
+    }
+    TSNode name = ts_node_child_by_field_name(param, TS_FIELD("name"));
+    if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, name, ctx->source);
+    }
+    /* `*args` / `**kwargs`, and any typed shape without a `name` field: the
+     * bound identifier is the first named child. */
+    TSNode first = ts_node_named_child(param, 0);
+    if (!ts_node_is_null(first) && strcmp(ts_node_type(first), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, first, ctx->source);
+    }
+    return NULL;
+}
+
+/* Bind this node's parameters into the frame just pushed for it. Called after
+ * every push in push_boundary_scopes, so the top frame is this node's own and
+ * pop_expired_scopes unwinds them at exactly the right depth. */
+static void py_bind_scope_parameters(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if (ctx->language != CBM_LANG_PYTHON || state->scope_top == 0) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "function_definition") != 0 && strcmp(kind, "lambda") != 0) {
+        return;
+    }
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    if (ts_node_is_null(params)) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < count; i++) {
+        py_param_bind(state, py_parameter_name(ctx, ts_node_named_child(params, i)));
+    }
+}
+
 static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
     if (!ensure_scope_capacity(state)) {
         return false;
     }
     CBMWalkScope *f = &state->scopes[state->scope_top];
+    f->prev_py_param_stack_count = state->py_param_stack_count;
     f->kind = kind;
     f->depth = depth;
     f->qn = qn;
@@ -260,6 +448,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         state->inside_import = f->prev_inside_import;
         state->loop_depth = f->prev_loop_depth;
         state->branch_depth = f->prev_branch_depth;
+        py_param_unwind_to(state, f->prev_py_param_stack_count);
     }
 }
 
@@ -727,9 +916,31 @@ static const char *objectscript_get_method_qn(CBMExtractCtx *ctx, TSNode node,
     return NULL;
 }
 
+/* Python: the nearest named scope around the node -- a def or a class. A def
+ * or class nested in a def is qualified by that def (proj.mod.create_app.index),
+ * exactly as extract_defs.c mints it; enclosing_class_qn alone would skip the
+ * def and hand a def nested in a method its method's QN. Lambdas push no named
+ * frame, so they stay transparent. */
+static const char *py_nearest_scope_qn(const WalkState *state) {
+    for (int i = state->scope_top - SKIP_ONE; i >= 0; i--) {
+        const CBMWalkScope *f = &state->scopes[i];
+        if ((f->kind == SCOPE_FUNC || f->kind == SCOPE_CLASS) && f->qn) {
+            return f->qn;
+        }
+    }
+    return NULL;
+}
+
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
+    /* Raw configured definitions already own the canonical QN, including
+     * namespace scope. Never rederive it from the bare macro identifier. */
+    const char *configured_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_qn) {
+        return configured_qn;
+    }
+
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
@@ -913,7 +1124,11 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
             if (recv_type && recv_type[0]) {
                 const char *type_qn = cbm_fqn_compute_source_lang(
                     ctx->arena, ctx->project, ctx->rel_path, recv_type, ctx->language);
-                return cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, name);
+                /* NULL only on allocation failure: fall through to the flat
+                 * QN, as the def side does (extract_defs.c). */
+                if (type_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, name);
+                }
             }
         }
     }
@@ -921,17 +1136,18 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     /* Go init(): the def extractor folds the file basename and the init's
      * per-file ordinal into the QN so every init in a package survives the
      * upsert (#1910, the #495 cfg-twin pattern; ordinal, not line, so the QN
-     * is stable under edits above the function). Mirror the exact formula
-     * here, or init-body calls fall back to File-node attribution
+     * is stable under edits above the function). Name it through the same
+     * cbm_go_init_qn, or init-body calls fall back to File-node attribution
      * (calls_find_source). */
     if (ctx->language == CBM_LANG_GO && strcmp(name, "init") == 0 &&
         strcmp(ts_node_type(node), "function_declaration") == 0) {
         const char *base_qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
                                                           name, ctx->language);
-        const char *base = strrchr(ctx->rel_path, '/');
-        base = base ? base + 1 : ctx->rel_path;
-        return cbm_arena_sprintf(ctx->arena, "%s#%s:%d", base_qn, base,
-                                 cbm_go_init_ordinal(node, ctx->source));
+        /* NULL only on allocation failure: fall through to the flat QN, as
+         * the receiver branch above does. */
+        if (base_qn) {
+            return cbm_go_init_qn(ctx->arena, base_qn, ctx->rel_path, node, ctx->source);
+        }
     }
 
     /* Nix: a binding's own attrpath contributes scope (`a.b.fn = …`), and the def
@@ -946,8 +1162,10 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
-    if (state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, qn_name);
+    const char *outer_qn =
+        ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state) : state->enclosing_class_qn;
+    if (outer_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, qn_name);
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
@@ -998,12 +1216,32 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     if (!name || !name[0]) {
         return NULL;
     }
+    /* Rust: the impl's type text carries its generic arguments (`impl<T> Gen<T>`,
+     * `impl<'a> Parser<'a>`), which the def side strips before naming the type
+     * (extract_defs.c extract_rust_impl: `Buffer<T>` -> `Buffer`). Strip them the
+     * same way, or every method of a generic impl gets a scope QN no node carries
+     * and all its calls fall back to the File node. */
+    if (ctx->language == CBM_LANG_RUST && strcmp(ts_node_type(node), "impl_item") == 0) {
+        char *lt = strchr(name, '<');
+        if (lt == name) {
+            return NULL; /* `<T as Tr>`-style self type: no name to scope by */
+        }
+        if (lt) {
+            *lt = '\0';
+        }
+    }
 
     /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this
      * scope QN matches the def-side class QN (extract_defs.c compute_class_qn /
-     * extract_class_def), which the lsp_resolve join requires for nested types. */
-    if (state && state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+     * extract_class_def), which the lsp_resolve join requires for nested types.
+     * Python: a class inside a def is qualified by the def (py_nearest_scope_qn). */
+    const char *outer_qn = NULL;
+    if (state) {
+        outer_qn = ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state)
+                                                    : state->enclosing_class_qn;
+    }
+    if (outer_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", outer_qn, name);
     }
 
     /* Java/Go: directory-based module (see compute_func_qn). */
@@ -1052,6 +1290,14 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* Name must be an identifier */
     const char *name_kind = ts_node_type(name_node);
     if (strcmp(name_kind, "identifier") != 0 && strcmp(name_kind, "constant") != 0) {
+        return;
+    }
+
+    /* Python and JS/TS fold the value: `BASE + "/path"`, `${BASE}/path`,
+     * f"{BASE}/path" and object-literal endpoint maps (#706, #1147). */
+    if (cbm_url_fold_lang(ctx->language)) {
+        cbm_url_fold_record_constant(ctx, cbm_node_text(ctx->arena, name_node, ctx->source),
+                                     value_node);
         return;
     }
 
@@ -1434,27 +1680,39 @@ typedef struct {
     TSNode node;
     const char *prefix;
 } yaml_walk_frame_t;
-#define YAML_WALK_STACK_CAP CBM_SZ_256
+/* On-stack first chunk of the key-path walk; wider mappings spill to the heap
+ * through cbm_walk_stack_reserve instead of dropping frames (#2388). */
+#define YAML_WALK_STACK_INLINE CBM_SZ_256
 
-/* Push block_mapping children of a block_node/block_mapping value onto the walk stack. */
-static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_frame_t *stack,
-                                     int *top) {
+/* Push block_mapping children of a block_node/block_mapping value onto the walk
+ * stack, growing it as needed. False when the stack could not grow (logged by
+ * cbm_walk_stack_reserve as extract.walk_stack_alloc_failed). */
+static bool push_yaml_block_children(TSNode val, const char *path, yaml_walk_frame_t **stack,
+                                     int *cap, int *top, const yaml_walk_frame_t *inline_buf) {
     uint32_t vnc = ts_node_named_child_count(val);
-    for (int vi = (int)vnc - SKIP_ONE; vi >= 0 && *top < YAML_WALK_STACK_CAP; vi--) {
+    if (!cbm_walk_stack_reserve((void **)stack, cap, *top + (int)vnc, sizeof(yaml_walk_frame_t),
+                                inline_buf, "yaml_key_paths")) {
+        return false;
+    }
+    for (int vi = (int)vnc - SKIP_ONE; vi >= 0; vi--) {
         TSNode vc = ts_node_named_child(val, (uint32_t)vi);
         const char *vctype = ts_node_type(vc);
         if (strcmp(vctype, "block_mapping") == 0 || strcmp(vctype, "block_mapping_pair") == 0) {
-            stack[(*top)++] = (yaml_walk_frame_t){vc, path};
+            (*stack)[(*top)++] = (yaml_walk_frame_t){vc, path};
         }
     }
+    return true;
 }
 
 static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_prefix) {
-    yaml_walk_frame_t stack[YAML_WALK_STACK_CAP];
+    yaml_walk_frame_t inline_stack[YAML_WALK_STACK_INLINE];
+    yaml_walk_frame_t *stack = inline_stack;
+    int cap = YAML_WALK_STACK_INLINE;
     int top = 0;
     stack[top++] = (yaml_walk_frame_t){root, root_prefix};
+    bool grown = true;
 
-    while (top > 0) {
+    while (grown && top > 0) {
         yaml_walk_frame_t frame = stack[--top];
         TSNode node = frame.node;
         const char *prefix = frame.prefix;
@@ -1480,12 +1738,16 @@ static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_
             }
             const char *vk = ts_node_type(val);
             if (strcmp(vk, "block_node") == 0 || strcmp(vk, "block_mapping") == 0) {
-                push_yaml_block_children(val, path, stack, &top);
+                grown = push_yaml_block_children(val, path, &stack, &cap, &top, inline_stack);
+                if (!grown) {
+                    break;
+                }
                 continue;
             }
             emit_yaml_leaf_value(ctx, val, path);
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 /* ── Infrastructure binding extraction ─────────────────────────────
@@ -1644,9 +1906,13 @@ static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
     emit_infra_bindings(ctx, sources, source_keys, n_sources, targets, n_targets);
 }
 
-#define INFRA_SCAN_STACK_CAP CBM_SZ_512
+/* On-stack first chunk of the binding scan; wider subtrees spill to the heap
+ * through cbm_walk_stack_reserve instead of dropping nodes (#2388). */
+#define INFRA_SCAN_STACK_INLINE CBM_SZ_512
 static void scan_yaml_for_infra_bindings(CBMExtractCtx *ctx, TSNode root) {
-    TSNode stack[INFRA_SCAN_STACK_CAP];
+    TSNode inline_stack[INFRA_SCAN_STACK_INLINE];
+    TSNode *stack = inline_stack;
+    int cap = INFRA_SCAN_STACK_INLINE;
     int top = 0;
     stack[top++] = root;
     while (top > 0) {
@@ -1655,10 +1921,15 @@ static void scan_yaml_for_infra_bindings(CBMExtractCtx *ctx, TSNode root) {
             scan_mapping_for_bindings(ctx, node);
         }
         uint32_t nc = ts_node_named_child_count(node);
-        for (int i = (int)nc - SKIP_ONE; i >= 0 && top < INFRA_SCAN_STACK_CAP; i--) {
+        if (!cbm_walk_stack_reserve((void **)&stack, &cap, top + (int)nc, sizeof(TSNode),
+                                    inline_stack, "yaml_infra_bindings")) {
+            break;
+        }
+        for (int i = (int)nc - SKIP_ONE; i >= 0; i--) {
             stack[top++] = ts_node_named_child(node, (uint32_t)i);
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 /* ── HCL infrastructure binding extraction ───────────────────────────
@@ -2217,7 +2488,12 @@ static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth)
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth,
                                  const CBMInvocationDescriptor *invocation) {
-    if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
+    const char *configured_body_qn = NULL;
+    if (ctx->language == CBM_LANG_C && strcmp(ts_node_type(node), "compound_statement") == 0)
+        configured_body_qn = cbm_test_definition_qn(ctx, node);
+    if (configured_body_qn) {
+        (void)push_function_scope(state, depth, configured_body_qn, node);
+    } else if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
          * but the def walk does not descend into function bodies, so it emits no
          * node for it. Pushing a func scope here would attribute in-body calls to
@@ -2389,6 +2665,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     }
 
     push_lexical_boundary(node, state, depth);
+    py_bind_scope_parameters(ctx, node, state);
     push_call_scope(state, depth, invocation);
     if (is_actual_import_boundary(ctx, node, spec) && !is_export_of_declaration(node)) {
         push_scope(state, SCOPE_IMPORT, depth, NULL);
@@ -2422,6 +2699,14 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.scope_capacity = MAX_SCOPES;
     state.lexical_scopes = state.inline_lexical_scopes;
     state.lexical_scope_capacity = INLINE_LEXICAL_SCOPES;
+    state.py_param_slots = state.inline_py_param_slots;
+    state.py_param_slot_capacity = INLINE_PY_PARAM_SLOTS;
+    state.py_param_slot_used = 0;
+    memset(state.inline_py_param_slots, 0, sizeof(state.inline_py_param_slots));
+    state.py_param_stack = state.inline_py_param_stack;
+    state.py_param_stack_capacity = INLINE_PY_PARAM_STACK;
+    state.py_param_stack_count = 0;
+    state.py_param_tracking_failed = false;
     state.usage_start_index = ctx->result->usages.count;
     state.root_lexical_scope_id = add_lexical_scope(&state, ctx->root, CBM_LEXICAL_SCOPE_MODULE);
     /* Base walk-state tuple (previously established by the first
@@ -2436,9 +2721,39 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.branch_depth = 0;
 
     uint32_t depth = 0;
+    uint32_t visited = 0;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* CBM_TEST_WALK_BUDGET_NODES=<n>: spend the budget after n nodes. Production
+     * now counts nodes too, so this seam only shortens the budget; it no longer
+     * has to stand in for a mechanism of its own. */
+    uint32_t budget_nodes = ctx->walk_budget_nodes;
+    {
+        const char *seam = getenv("CBM_TEST_WALK_BUDGET_NODES");
+        if (seam && seam[0]) {
+            budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
+        }
+    }
+#else
+    const uint32_t budget_nodes = ctx->walk_budget_nodes;
+#endif
+    /* A Terraform / OpenTofu module file's references resolve inside its
+     * module directory (pass_terraform.c); a call or usage by name here would
+     * meet same-named blocks of any module and a builtin function's name. */
+    const char *ext = ctx->rel_path ? strrchr(ctx->rel_path, '.') : NULL;
+    bool tf_module = ctx->language == CBM_LANG_HCL && ext &&
+                     (strcmp(ext, ".tf") == 0 || strcmp(ext, ".tofu") == 0);
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        visited++;
+        /* The budget is spent in nodes, so the walk of a given file always ends
+         * on the same node — on any machine, under any load. A CPU deadline
+         * here made the graph differ between two runs on one machine; see
+         * CBM_WALK_MAX_NODES_DEFAULT (cbm.c). */
+        if (budget_nodes != 0 && visited > budget_nodes) {
+            ctx->walk_budget_exhausted = true;
+            break;
+        }
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred
@@ -2452,8 +2767,11 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             handle_string_constants(ctx, node, &state);
             handle_objectscript_type_map(ctx, node, &state);
             handle_url_builders(ctx, node, &state);
-            CBMInvocationDescriptor invocation = handle_calls(ctx, node, spec, &state);
-            handle_usages(ctx, node, spec, &state);
+            CBMInvocationDescriptor invocation =
+                tf_module ? (CBMInvocationDescriptor){0} : handle_calls(ctx, node, spec, &state);
+            if (!tf_module) {
+                handle_usages(ctx, node, spec, &state);
+            }
             handle_throws(ctx, node, spec, &state);
             handle_readwrites(ctx, node, spec, &state);
             handle_type_refs(ctx, node, spec, &state);
@@ -2492,6 +2810,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     cbm_finalize_lexical_usages(ctx, &state);
+    ctx->walk_nodes_visited = visited;
     ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);
 }

@@ -274,6 +274,118 @@ TEST(index_clean_run_no_logfile) {
     PASS();
 }
 
+/* INV(long-log-override): CBM_INDEX_LOG was copied into the 1 KiB logfile path
+ * with no length check and opened "wb", so an override longer than that
+ * created (or truncated) a file at its cut-off prefix and echoed the cut name
+ * as the run's logfile. A path that does not fit is no logfile: the index still
+ * completes and reports the skip, nothing is written at the cut name (its
+ * directory stays empty), and the response names no logfile. */
+TEST(index_long_log_override_writes_no_cut_path) {
+    enum { RI_PATH_CAP = 1024, RI_DIR_SEGMENTS = 4, RI_SEGMENT = 200, RI_NAME = 255 };
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+    ri_write_big(lp.tmpdir, "big.py", (size_t)2 * 1024 * 1024); /* ~2 MiB > 1 MiB cap */
+
+    /* Outside the indexed repo: <root>/ddd…(x4) is a real directory, and the
+     * override adds a 255-byte file name, so the whole path runs past 1 KiB and
+     * its first 1023 bytes end inside the file name, in that directory. The
+     * root has its links resolved: the kernel bounds the EXPANDED path, and
+     * under macOS's /tmp -> /private/tmp link a near-1 KiB path can be neither
+     * created nor probed, which would hide the cut-off file. */
+    /* cbm_mkdtemp writes the %TEMP%-expanded path back on Windows, so the
+     * template buffer needs the 256 bytes that compat.h asks for. */
+    char tmpl[256];
+    char logroot[4096];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/cbm_resil_log_XXXXXX");
+    if (!cbm_mkdtemp(tmpl)) {
+        rh_cleanup(&lp, NULL);
+        FAIL("mkdtemp failed");
+    }
+    if (!cbm_canonical_path(tmpl, logroot, sizeof(logroot))) {
+        th_rmtree(tmpl);
+        rh_cleanup(&lp, NULL);
+        FAIL("canonical log root failed");
+    }
+    rh_to_fwd_slashes(logroot);
+    char logdir[RI_PATH_CAP];
+    int root_len = snprintf(logdir, sizeof(logdir), "%s", logroot);
+    if (root_len <= 0 ||
+        (size_t)root_len + RI_DIR_SEGMENTS * (RI_SEGMENT + 1) + 2 >= sizeof(logdir)) {
+        th_rmtree(logroot);
+        rh_cleanup(&lp, NULL);
+        FAIL("log root too long for the fixture");
+    }
+    size_t at = (size_t)root_len;
+    for (int s = 0; s < RI_DIR_SEGMENTS; s++) {
+        logdir[at++] = '/';
+        memset(logdir + at, 'd', RI_SEGMENT);
+        at += RI_SEGMENT;
+    }
+    logdir[at] = '\0';
+    char name[RI_NAME + 1];
+    memset(name, 'x', RI_NAME);
+    memcpy(name, "skip-", 5);
+    name[RI_NAME] = '\0';
+    char override[2 * RI_PATH_CAP];
+    snprintf(override, sizeof(override), "%s/%s", logdir, name);
+    char cut[RI_PATH_CAP];
+    snprintf(cut, sizeof(cut), "%.*s", RI_PATH_CAP - 1, override);
+    bool made = cbm_mkdir_p(logdir, 0755) && strlen(override) >= RI_PATH_CAP &&
+                strlen(cut) > strlen(logdir) + 1;
+
+    cbm_setenv("CBM_MAX_FILE_BYTES", "1048576", 1); /* 1 MiB cap */
+    cbm_setenv("CBM_INDEX_LOG", override, 1);
+    char *resp = NULL;
+    cbm_store_t *store = made ? ri_index_capture(&lp, &resp) : NULL;
+    cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    cbm_unsetenv("CBM_INDEX_LOG");
+
+    bool cut_exists = cbm_file_exists(cut);
+    int entries = 0;
+    cbm_dir_t *d = cbm_opendir(logdir);
+    cbm_dirent_t *entry;
+    while (d && (entry = cbm_readdir(d)) != NULL) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            entries++;
+        }
+    }
+    if (d) {
+        cbm_closedir(d);
+    }
+    th_rmtree(logroot);
+
+    ASSERT_TRUE(made);
+    if (!resp) {
+        rh_cleanup(&lp, store);
+        FAIL("no MCP response");
+    }
+    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *sc = yyjson_obj_get(yyjson_doc_get_root(doc), "structuredContent");
+    ASSERT_NOT_NULL(sc);
+    const char *status = yyjson_get_str(yyjson_obj_get(sc, "status"));
+    ASSERT_NOT_NULL(status);
+    ASSERT_STR_EQ("indexed", status);
+    ASSERT_GTE(yyjson_get_int(yyjson_obj_get(sc, "skipped_count")), 1);
+    if (cut_exists) {
+        printf("  skip log written at the cut-off name ...%s\n", cut + strlen(cut) - 40);
+    }
+    ASSERT_FALSE(cut_exists);
+    ASSERT_EQ(entries, 0);
+    ASSERT_NULL(yyjson_obj_get(sc, "logfile"));
+
+    yyjson_doc_free(doc);
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 /* INV(parse-partial-reported, #963): a file whose parse tree contains
  * ERROR/MISSING regions (here: the preprocessor-blind #ifdef-split-brace C
  * pattern) is INDEXED — not skipped — and the best-effort coverage signal
@@ -337,8 +449,16 @@ TEST(index_parse_partial_reported) {
     ASSERT_STR_EQ("indexed", status);
     ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "skipped_count")), 0);
 
-    /* The coverage signal is surfaced with ranges + the best-effort note. */
+    /* The coverage signal is surfaced with ranges + the best-effort note.
+     * Both bounds matter. The floor catches the signal going missing. The
+     * ceiling catches the opposite failure: exactly one of the two files has
+     * a gap, so a count above 1 means the clean Python neighbour got flagged
+     * as well, which is how over-flagging looks from the outside. */
     ASSERT_GTE(yyjson_get_int(yyjson_obj_get(sc, "parse_partial_count")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "parse_partial_count")), 1);
+    /* A local gap is not a whole-file failure, so the other coverage kind
+     * must stay empty here. */
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "parse_unusable_count")), 0);
     yyjson_val *pp = yyjson_obj_get(sc, "parse_partial");
     ASSERT_NOT_NULL(pp);
     yyjson_val *files = yyjson_obj_get(pp, "files");
@@ -354,7 +474,13 @@ TEST(index_parse_partial_reported) {
             found_split = 1;
             ASSERT_NOT_NULL(ranges);
             ASSERT_GT((int)strlen(ranges), 0);
+            /* The gap is the two-header block, not the whole file. An
+             * 8-line file reported as 1-8 would be the old whole-file
+             * blame coming back. */
+            ASSERT_NULL(strstr(ranges, "1-8"));
         }
+        /* The clean file must not appear in the list at all. */
+        ASSERT_NULL(fp ? strstr(fp, "good.py") : NULL);
     }
     ASSERT_TRUE(found_split);
     const char *note = yyjson_get_str(yyjson_obj_get(pp, "note"));
@@ -392,7 +518,7 @@ TEST(index_parse_partial_reported) {
     ASSERT_TRUE(marked);
 
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *qresp = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(qresp);
     ASSERT_NOT_NULL(strstr(qresp, "split.c"));
@@ -474,6 +600,94 @@ TEST(index_parse_partial_reported) {
     PASS();
 }
 
+/* The whole-file class as index_status prints it, and what its number means.
+ *
+ * Each parse_unusable entry reports the END of the file's one range. The field
+ * was called "lines", which reads as the length of the file, and the two are
+ * not the same number — a grammar can end an error node past the last line,
+ * which this repo has already seen (a 326-line PowerShell file whose range
+ * ended at 327). "lines" also already means a definition's line span in the
+ * rest of this response, so the old name collided as well.
+ *
+ * The end line is checked against the persisted coverage row rather than a
+ * constant, so the test states the property and not a measurement. */
+TEST(index_parse_unusable_names_the_range_end) {
+    RProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_resil_XXXXXX");
+    if (!cbm_mkdtemp(lp.tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    rh_to_fwd_slashes(lp.tmpdir);
+
+    /* Python gets no C preprocessor refinement, so a root-level ERROR still
+     * reports one range over the whole file — the parse_unusable class. */
+    ri_write_text(lp.tmpdir, "unparseable.py", ")))\n((( \n]]] [[[\ndef x(:\n");
+    ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 1\n");
+
+    char *resp = NULL;
+    cbm_store_t *store = ri_index_capture(&lp, &resp);
+    if (!resp) {
+        FAIL("no MCP response");
+    }
+    if (!store) {
+        free(resp);
+        FAIL("store did not open");
+    }
+
+    /* The end line the report should be naming, read from the persisted row. */
+    cbm_coverage_row_t *rows = NULL;
+    int cov_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, lp.project, &rows, &cov_count), CBM_STORE_OK);
+    int want_end = 0;
+    for (int i = 0; i < cov_count; i++) {
+        if (rows[i].rel_path && strstr(rows[i].rel_path, "unparseable.py") && rows[i].detail) {
+            const char *dash = strchr(rows[i].detail, '-');
+            if (dash) {
+                want_end = atoi(dash + 1);
+            }
+        }
+    }
+    cbm_store_free_coverage(rows, cov_count);
+    ASSERT_GT(want_end, 0);
+
+    yyjson_doc *d = yyjson_read(resp, strlen(resp), 0);
+    ASSERT_NOT_NULL(d);
+    yyjson_val *sc = yyjson_obj_get(yyjson_doc_get_root(d), "structuredContent");
+    ASSERT_NOT_NULL(sc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(sc, "parse_unusable_count")), 1);
+
+    yyjson_val *pu = yyjson_obj_get(sc, "parse_unusable");
+    ASSERT_NOT_NULL(pu);
+    yyjson_val *files = yyjson_obj_get(pu, "files");
+    ASSERT_NOT_NULL(files);
+    int found = 0;
+    size_t idx = 0;
+    size_t fmax = 0;
+    yyjson_val *fe = NULL;
+    yyjson_arr_foreach(files, idx, fmax, fe) {
+        const char *fp = yyjson_get_str(yyjson_obj_get(fe, "path"));
+        /* The clean neighbour must not be listed at all. */
+        ASSERT_NULL(fp ? strstr(fp, "good.py") : NULL);
+        if (!fp || !strstr(fp, "unparseable.py")) {
+            continue;
+        }
+        found = 1;
+        yyjson_val *range_end = yyjson_obj_get(fe, "range_end");
+        ASSERT_NOT_NULL(range_end);
+        ASSERT_EQ(yyjson_get_int(range_end), want_end);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(fe, "whole_file")));
+        /* The old name is gone, not kept beside the new one. */
+        ASSERT_NULL(yyjson_obj_get(fe, "lines"));
+    }
+    ASSERT_TRUE(found);
+
+    yyjson_doc_free(d);
+    free(resp);
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
 /* INV(parse-partial-clears-on-fix, #963): the persisted coverage signal must
  * stay FRESH — after the broken file is fixed and the project re-indexed
  * (incremental route: the DB already exists), its parse_partial row is gone
@@ -516,7 +730,7 @@ TEST(index_parse_partial_clears_on_fix) {
 
     /* Flagged after the first (full) index. */
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *cov1 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(cov1);
     ASSERT_NOT_NULL(strstr(cov1, "flaky.c"));
@@ -635,7 +849,7 @@ TEST(index_not_indexed_by_design_reported) {
 
     /* index_status carries the persisted by-design section. */
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *sresp = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(sresp);
     ASSERT_NOT_NULL(strstr(sresp, "not_indexed"));
@@ -663,6 +877,7 @@ TEST(index_not_indexed_by_design_reported) {
     char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
     ASSERT_NOT_NULL(resp2);
     free(resp2);
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
     char *sresp2 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(sresp2);
     ASSERT_NOT_NULL(strstr(sresp2, "secret.py"));
@@ -796,8 +1011,10 @@ TEST(index_relative_repo_path_canonicalized) {
 SUITE(index_resilience) {
     RUN_TEST(index_oversized_file_reported);
     RUN_TEST(index_clean_run_no_logfile);
+    RUN_TEST(index_long_log_override_writes_no_cut_path);
     RUN_TEST(index_parse_partial_reported);
     RUN_TEST(index_parse_partial_clears_on_fix);
+    RUN_TEST(index_parse_unusable_names_the_range_end);
     RUN_TEST(index_not_indexed_by_design_reported);
     RUN_TEST(index_relative_repo_path_canonicalized);
 }

@@ -8,9 +8,13 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 
 #include <sys/stat.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <unistd.h> /* symlink for the checked-in artifact-dir link */
+#endif
 #include <stdarg.h>
 #include <string.h>
 
@@ -330,6 +334,82 @@ TEST(artifact_gitattributes_created) {
     PASS();
 }
 
+/* Read a small file through the UTF-8 path layer (wide on Windows), so a
+ * non-ASCII path is never misread by the test's own ANSI CRT call. Returns the
+ * byte count, or 0 when the file cannot be opened or is empty. */
+static size_t read_small_file_utf8(const char *path, char *buf, size_t cap) {
+    buf[0] = '\0';
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return 0;
+    }
+    size_t rd = fread(buf, 1, cap - 1, fp);
+    (void)fclose(fp);
+    buf[rd] = '\0';
+    return rd;
+}
+
+/* #1171: a repository (and a cache directory) under a non-ASCII path must
+ * export, report the artifact present, and import — also onto an existing
+ * cache db. On Windows the atomic writer used the ANSI CRT fopen + MoveFileExA
+ * and the existence check the ANSI stat, so CJK characters outside the active
+ * code page made every step fail. The same export also writes the
+ * .gitattributes merge=ours protection, which ensure_gitattributes created
+ * with the ANSI CRT open(): on Windows it was silently missing. The bytes are
+ * escaped UTF-8 for a CJK repo directory name and a CJK cache directory name
+ * (kept ASCII in source). */
+#define ART_CJK_REPO "\xe6\x8c\x81\xe4\xb9\x85\xe5\x8c\x96\xe5\xa4\x8d\xe7\x8e\xb0"
+#define ART_CJK_CACHE "\xe5\xaf\xbc\xe5\x85\xa5"
+TEST(artifact_roundtrip_non_ascii_paths) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char repo[1024];
+    snprintf(repo, sizeof(repo), "%s/cbm-" ART_CJK_REPO, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", repo);
+    ASSERT_TRUE(cbm_file_exists(zst));
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+
+    char ga[1024];
+    snprintf(ga, sizeof(ga), "%s/.codebase-memory/.gitattributes", repo);
+    char ga_content[512];
+    ASSERT_TRUE(read_small_file_utf8(ga, ga_content, sizeof(ga_content)) > 0);
+    ASSERT_NOT_NULL(strstr(ga_content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
+
+    /* Create-only-if-absent: a re-export never rewrites an existing
+     * .gitattributes the user may have edited. */
+    static const char user_ga[] = "# user-owned\n";
+    FILE *uga = cbm_fopen(ga, "wb");
+    ASSERT_NOT_NULL(uga);
+    ASSERT_TRUE(fputs(user_ga, uga) >= 0);
+    ASSERT_EQ(fclose(uga), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    ASSERT_EQ(read_small_file_utf8(ga, ga_content, sizeof(ga_content)), strlen(user_ga));
+    ASSERT_STR_EQ(ga_content, user_ga);
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/" ART_CJK_CACHE, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(cache_dir, 0755));
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", cache_dir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+    /* Re-import replaces the existing cache db (the second-session path). */
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+    cbm_store_close(s);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_export_rename_failure_logs_specific_error) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -390,6 +470,67 @@ TEST(pipeline_persistence_export_failure_returns_error) {
 
     cleanup_dir(g_tmpdir);
     PASS();
+}
+
+/* A checkout can ship `.codebase-memory` as a symlink. Git creates it owned by
+ * whoever cloned, so it is user-owned without being user-intended, and the
+ * export uses the plain walk that does not follow user-owned links: nothing
+ * may land behind the link, and the failure names the stage. With the link
+ * gone the same export succeeds, so the refusal was the link and nothing
+ * else. */
+TEST(artifact_export_refuses_symlinked_artifact_dir) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink contract");
+#else
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char outside[1024];
+    char artifact_link[1024];
+    snprintf(outside, sizeof(outside), "%s/outside", g_tmpdir);
+    snprintf(artifact_link, sizeof(artifact_link), "%s/%s", g_repo, CBM_ARTIFACT_DIR);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0755));
+    ASSERT_EQ(symlink(outside, artifact_link), 0);
+    /* Git creates the link owned by whoever cloned. A root run must model
+     * that account as non-root: root-owned links are trusted infrastructure
+     * for every walk, which is the pre-existing contract. */
+    if (geteuid() == 0) {
+        enum { CLONING_UID = 65533 };
+        ASSERT_EQ(lchown(artifact_link, CLONING_UID, CLONING_UID), 0);
+    }
+
+    int rc = cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST);
+    ASSERT_NEQ(rc, 0);
+    const char *err = cbm_artifact_export_last_error();
+    ASSERT_NOT_NULL(err);
+    ASSERT_NOT_NULL(strstr(err, "prepare_artifact_dir"));
+
+    /* Nothing landed behind the link: not the artifact, not its metadata,
+     * not the .gitattributes the export writes first, nothing at all. */
+    char leaked[1024];
+    snprintf(leaked, sizeof(leaked), "%s/%s", outside, CBM_ARTIFACT_FILENAME);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    snprintf(leaked, sizeof(leaked), "%s/%s", outside, CBM_ARTIFACT_META);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    snprintf(leaked, sizeof(leaked), "%s/.gitattributes", outside);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    cbm_dir_t *listing = cbm_opendir(outside);
+    ASSERT_NOT_NULL(listing);
+    int entries = 0;
+    for (cbm_dirent_t *entry = cbm_readdir(listing); entry; entry = cbm_readdir(listing)) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            entries++;
+        }
+    }
+    cbm_closedir(listing);
+    ASSERT_EQ(entries, 0);
+
+    ASSERT_EQ(cbm_unlink(artifact_link), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+#endif
 }
 
 TEST(artifact_null_safety) {
@@ -1037,9 +1178,11 @@ SUITE(artifact) {
     RUN_TEST(artifact_schema_version_mismatch);
     RUN_TEST(artifact_import_missing);
     RUN_TEST(artifact_gitattributes_created);
+    RUN_TEST(artifact_roundtrip_non_ascii_paths);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_import_rejects_size_mismatch);
+    RUN_TEST(artifact_export_refuses_symlinked_artifact_dir);
     RUN_TEST(artifact_null_safety);
     RUN_TEST(artifact_export_marks_clean_basis);
     RUN_TEST(artifact_reconcile_restamps_unchanged);

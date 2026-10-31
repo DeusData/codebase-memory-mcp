@@ -7,6 +7,8 @@
 #include "test_framework.h"
 #include "../src/pipeline/pipeline.h"
 #include "../src/foundation/str_util.h"
+#include "../src/foundation/arena.h"
+#include "helpers.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,25 @@
  * ================================================================ */
 
 /* ── Basic: project + path + name ─────────────────────────────── */
+
+/* A Dockerfile variant keeps its suffix in both QN implementations (the
+ * pipeline's fqn.c, the extractor's helpers.c) -- else it gets the QN of the
+ * plain Dockerfile beside it. */
+TEST(fqn_dockerfile_variant_keeps_suffix) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("p", "svc/Dockerfile.debug", "GOOS"),
+               "p.svc.Dockerfile.debug.GOOS");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/Containerfile.arm64"), "p.svc.Containerfile.arm64");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/Dockerfile"), "p.svc.Dockerfile");
+    ASSERT_FQN(cbm_pipeline_fqn_module("p", "svc/app.py"), "p.svc.app");
+    CBMArena a;
+    cbm_arena_init(&a);
+    ASSERT_STR_EQ(cbm_fqn_compute(&a, "p", "svc/Dockerfile.debug", "GOOS"),
+                  "p.svc.Dockerfile.debug.GOOS");
+    ASSERT_STR_EQ(cbm_fqn_module(&a, "p", "svc/Containerfile.arm64"), "p.svc.Containerfile.arm64");
+    ASSERT_STR_EQ(cbm_fqn_module(&a, "p", "svc/app.py"), "p.svc.app");
+    cbm_arena_destroy(&a);
+    PASS();
+}
 
 TEST(fqn_compute_basic_go) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("myproj", "main.go", "main"), "myproj.main.main");
@@ -81,6 +102,21 @@ TEST(fqn_module_qn_still_strips_extension) {
     /* The MODULE/symbol QN keeps stripping — unchanged by the File-QN fix. */
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "core.c", "init"), "proj.core.init");
     ASSERT_FQN(cbm_pipeline_fqn_module("proj", "NodeController.cpp"), "proj.NodeController");
+    PASS();
+}
+
+TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682) {
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import(
+            "packages/api/src/modules/consumer/consumer.service.ts", "../featureX/featureX.engine"),
+        "packages/api/src/modules/featureX/featureX.engine");
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import("packages/api/src/modules/moduleA/moduleA.service.ts",
+                                             "../moduleQ/moduleQ.service"),
+        "packages/api/src/modules/moduleQ/moduleQ.service");
+    ASSERT_FQN(cbm_pipeline_resolve_relative_import(
+                   "packages/api/src/modules/moduleA/moduleA.service.ts", "./create-thing.dto"),
+               "packages/api/src/modules/moduleA/create-thing.dto");
     PASS();
 }
 
@@ -658,6 +694,7 @@ TEST(project_name_length_capped_issue624) {
 SUITE(fqn) {
     /* fqn_compute: basic extensions */
     RUN_TEST(fqn_compute_basic_go);
+    RUN_TEST(fqn_dockerfile_variant_keeps_suffix);
     RUN_TEST(fqn_compute_basic_py);
     RUN_TEST(fqn_compute_basic_ts);
     RUN_TEST(fqn_compute_basic_js);
@@ -665,6 +702,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_file_qn_preserves_dotfile_variants_issue1077);
     RUN_TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964);
     RUN_TEST(fqn_module_qn_still_strips_extension);
+    RUN_TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682);
     RUN_TEST(fqn_compute_basic_rs);
     RUN_TEST(fqn_compute_file_sibling_distinct);
     RUN_TEST(fqn_compute_symbol_still_strips);

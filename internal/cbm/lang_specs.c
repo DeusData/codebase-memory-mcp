@@ -594,8 +594,9 @@ static const char *swift_decorator_types[] = {"attribute", NULL};
 // ==================== DART ====================
 static const char *dart_func_types[] = {"function_signature", "method_signature",
                                         "lambda_expression", NULL};
-static const char *dart_class_types[] = {"class_definition", "enum_declaration",
-                                         "mixin_declaration", "type_alias", NULL};
+static const char *dart_class_types[] = {"class_definition",  "enum_declaration",
+                                         "mixin_declaration", "extension_declaration",
+                                         "type_alias",        NULL};
 static const char *dart_field_types[] = {"declaration", NULL};
 static const char *dart_module_types[] = {"program", NULL};
 static const char *dart_call_types[] = {"selector", "new_expression", NULL};
@@ -890,8 +891,9 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // ==================== Embedded sub-languages ====================
 // Host grammars (Svelte/Vue/HTML/Astro) treat <script> bodies as raw_text and
 // do not recurse into them. Declaring the host's script-content node here lets
-// the generic embedded-imports walker re-parse that slice with the JS grammar
-// so the existing ES import extractor sees real import_statement nodes.
+// the generic embedded walker re-parse that slice with the declared grammar so
+// its definitions, imports and calls extract in host-file coordinates. The
+// declared language is the default; a <script lang=> attribute overrides it.
 // Terminator: an entry whose script_node_type is NULL.
 static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
     /* Tag-dialect CFML keeps <cfscript> bodies as opaque cf_script_content;
@@ -915,10 +917,12 @@ static const CBMEmbeddedLangSpec html_embedded_imports[] = {
 };
 static const CBMEmbeddedLangSpec astro_embedded_imports[] = {
     /* Astro component scripts live in the `---` frontmatter fence, which the
-     * grammar keeps as an unparsed frontmatter_js_block. Re-parse that slice
-     * with the JS grammar so `import X from './X.astro'` becomes a real edge. */
-    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT},
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
+     * grammar keeps as an unparsed frontmatter_js_block. Astro type-checks the
+     * fence and its <script> bodies as TypeScript without any lang= attribute
+     * saying so (the fence cannot carry one), so TypeScript is the deliberate
+     * default for both; it parses untyped JavaScript unchanged. */
+    {"frontmatter", "frontmatter_js_block", CBM_LANG_TYPESCRIPT},
+    {"script_element", "raw_text", CBM_LANG_TYPESCRIPT},
     {NULL, NULL, 0},
 };
 
@@ -1035,6 +1039,7 @@ static const char *solidity_field_types[] = {"state_variable_declaration", "stru
 static const char *solidity_call_types[] = {"call_expression", "call", "new_expression", NULL};
 static const char *solidity_import_types[] = {"import_directive", "import", "using_directive",
                                               NULL};
+static const char *solidity_decorator_types[] = {"modifier_invocation", NULL};
 static const char *solidity_branch_types[] = {"if_statement",    "for_statement",
                                               "while_statement", "do_while_statement",
                                               "try_statement",   NULL};
@@ -2112,7 +2117,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                            solidity_field_types, solidity_module_types, solidity_call_types,
                            solidity_import_types, empty_types, solidity_branch_types,
                            solidity_var_types, solidity_assign_types, solidity_throw_types, NULL,
-                           empty_types, NULL, NULL, tree_sitter_solidity, NULL},
+                           solidity_decorator_types, NULL, NULL, tree_sitter_solidity, NULL},
 
     // CBM_LANG_TYPST
     [CBM_LANG_TYPST] = {CBM_LANG_TYPST, typst_func_types, empty_types, empty_types,
@@ -2709,6 +2714,25 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                                        empty_types, NULL, NULL, tree_sitter_objectscript_routine,
                                        NULL},
 
+    // CBM_LANG_OPENAPI — openapi.json / swagger.json: the JSON grammar without
+    // JSON's node per key (thousands in a generated spec); cbm_extract_openapi
+    // (openapi.c) reads the operations from the tree.
+    [CBM_LANG_OPENAPI] = {CBM_LANG_OPENAPI, empty_types, empty_types, empty_types,
+                          json_module_types, empty_types, empty_types, empty_types, empty_types,
+                          empty_types, empty_types, empty_types, NULL, empty_types, NULL, NULL,
+                          tree_sitter_json, NULL},
+
+    // CBM_LANG_PDF — PDF documents. No grammar row: extraction reads the text
+    // layer itself (cbm_pdf_extract_document, doc_pdf.c) before any grammar is
+    // looked up, so this language never reaches cbm_lang_spec()/cbm_ts_language().
+    // Left as a zero spec.
+
+    // CBM_LANG_ASCIIDOC — AsciiDoc documents. No grammar row, as PDF: extraction
+    // reads the file itself (cbm_adoc_extract_document, doc_adoc.c). Zero spec.
+
+    // CBM_LANG_DIAGRAM — diagram files. No grammar row, as PDF: extraction reads
+    // the file itself (cbm_extract_diagram_file, diagram.c). Zero spec.
+
     // CBM_LANG_OBJECTSCRIPT_EXPORT — Studio Export XML. No grammar row: the
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
@@ -2732,6 +2756,28 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
 _Static_assert(sizeof(lang_specs) / sizeof(lang_specs[0]) == CBM_LANG_COUNT,
                "lang_specs array size must match CBM_LANG_COUNT");
+
+/* Conditional-compilation blocks per grammar (the `*_in_field_declaration_list`
+ * / `*_in_top_level` forms are aliased to these names by the grammars). */
+static const char *c_family_conditional_types[] = {
+    "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "preproc_elifdef", NULL};
+
+const char **cbm_conditional_block_types(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_GLSL:
+    case CBM_LANG_HLSL:
+    case CBM_LANG_ISPC:
+    case CBM_LANG_SLANG:
+        return c_family_conditional_types;
+    default:
+        return NULL;
+    }
+}
 
 const CBMLangSpec *cbm_lang_spec(CBMLanguage lang) {
     if (lang < 0 || lang >= CBM_LANG_COUNT) {

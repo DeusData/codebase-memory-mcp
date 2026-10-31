@@ -1,0 +1,2077 @@
+CODEATLAS
+v0.0.1
+Explore
+Galaxy
+Architecture
+Agents
+System
+Daemon
+Chat
+Search
+Tools
+Brief
+Explained
+cbm-pr2068
+⌄
+Project events · cbm-pr2068
+Last checked 11:11:01 PM
+History (30 retained)
+All daemon history
+Refresh events
+Inspect index coverage
+
+Index coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.
+
+Earlier events are in history; these records do not describe current frontend health.
+
+no file open
+EXPLORER
+▾
+cbm-pr2068/
+▸
+.git/
+●
+0
+▾
+.github/
+177
+▾
+ISSUE_TEMPLATE/
+16
+bug_report.yml
+6
+config.yml
+4
+feature_request.yml
+6
+▾
+workflows/
+136
+_build.yml
+6
+_lint.yml
+6
+_security.yml
+6
+_smoke.yml
+6
+_soak.yml
+6
+_test.yml
+6
+bug-repro.yml
+6
+cache-warm.yml
+6
+codeql.yml
+7
+dco.yml
+7
+dry-run.yml
+6
+fast-repro.yml
+6
+issue-labeler.yml
+6
+label-actions.yml
+6
+nightly-soak.yml
+6
+pages.yml
+7
+pr-acknowledgement.yml
+6
+pr.yml
+7
+release.yml
+6
+scorecard.yml
+6
+smoke.yml
+6
+stale.yml
+6
+dependabot.yml
+4
+issue-labeler.yml
+9
+label-actions.yml
+4
+pr-acknowledgement.md
+2
+pull_request_template.md
+4
+▸
+build/
+●
+0
+▾
+docs/
+●
+386
+▾
+development/
+37
+pr-2068-delivery.md
+9
+pr-2068-error-repro.md
+7
+pr-2068-research.md
+15
+pr-2068-worklog.md
+6
+BENCHMARK.md
+52
+cbmignore.md
+7
+CONFIGURATION.md
+14
+EVALUATION_PLAN.md
+209
+graph-ui-screenshot.png
+-
+0
+index.html
+2
+MEASURING_SAVINGS.md
+11
+RUNTIME_TRACE_MODEL.md
+37
+SECURITY-DISCLOSURE.md
+9
+sitemap.xml
+7
+▾
+graph-ui/
+●
+14168
+▾
+agents/
+33
+▸
+hooks/
+32
+▸
+design/
+●
+0
+▸
+dist/
+●
+0
+▾
+docs/
+15
+▸
+adr/
+14
+▾
+eval/
+9
+questions.json
+9
+▾
+fixtures/
+195
+▸
+agent-events/
+9
+▸
+atlas-sample/
+69
+▸
+atlas-sample-large/
+114
+▾
+llm/
+35
+fetch-model.sh
+10
+start.sh
+19
+stop.sh
+6
+▸
+node_modules/
+●
+0
+▾
+spike/
+12
+index.html
+2
+spike.js
+10
+▾
+src/
+●
+5236
+▸
+agents/
+312
+▸
+app/
+332
+▸
+architecture/
+98
+▸
+browser-ai/
+195
+▸
+chat/
+112
+▸
+checklist/
+35
+▸
+compiler/
+180
+▸
+core/
+113
+▸
+diagnostics/
+44
+▸
+entry/
+30
+▸
+galaxy/
+●
+463
+▸
+help/
+19
+▸
+i18n/
+82
+▸
+impact/
+204
+▸
+ir/
+55
+▸
+layout/
+82
+▸
+llm/
+91
+▸
+projects/
+103
+▸
+provider/
+341
+▸
+pseudocode/
+385
+▸
+reader/
+76
+▸
+search/
+107
+▸
+settings/
+61
+▸
+styles/
+6
+▸
+system/
+48
+▸
+test-support/
+32
+▸
+tours/
+111
+▸
+traces/
+136
+▸
+twin/
+1187
+▸
+ui/
+47
+▸
+why/
+53
+App.tsx
+62
+main.tsx
+3
+▾
+tests/
+180
+▸
+scaffold/
+179
+▾
+tools/
+1665
+▸
+lib/
+118
+agent-bridge.mjs
+21
+agent-bridge.test.mjs
+9
+capture-pr2068-baseline.mjs
+6
+capture-pr2068-current.mjs
+5
+eval-check.mjs
+20
+eval-llm.mjs
+20
+freshclone-check.mjs
+12
+net-deny-gate.mjs
+15
+net-deny-gate.test.mjs
+9
+pr-2068-agents-e2e.mjs
+21
+pr-2068-errors-e2e.mjs
+22
+pr-2068-map-e2e.mjs
+9
+promise-scan.mjs
+18
+record-demo.mjs
+56
+release-gate.mjs
+28
+smoke-spike.mjs
+32
+smoke-w1.mjs
+15
+smoke-w10.mjs
+87
+smoke-w10b.mjs
+49
+smoke-w11a.mjs
+58
+smoke-w11b.mjs
+72
+smoke-w12.mjs
+112
+smoke-w12a.mjs
+18
+smoke-w13.mjs
+36
+smoke-w14.mjs
+40
+smoke-w15.mjs
+21
+smoke-w1b.mjs
+18
+smoke-w2a.mjs
+25
+smoke-w2b.mjs
+25
+smoke-w3.mjs
+22
+smoke-w4a.mjs
+28
+smoke-w4b.mjs
+36
+smoke-w4c.mjs
+27
+smoke-w4d.mjs
+35
+smoke-w4e.mjs
+30
+smoke-w5a.mjs
+30
+smoke-w5b.mjs
+41
+smoke-w5c.mjs
+43
+smoke-w6-full.mjs
+53
+smoke-w7a.mjs
+29
+smoke-w7b.mjs
+37
+smoke-w7c.mjs
+45
+smoke-w8.mjs
+50
+smoke-w8b.mjs
+51
+smoke-w8c.mjs
+31
+smoke-w9.mjs
+48
+style-gate.mjs
+13
+verify-models.mjs
+18
+▸
+vendor/
+●
+0
+▾
+verification/
+●
+6693
+▸
+pr-2068/
+●
+558
+▸
+w0/
+●
+31
+▸
+w1/
+113
+▸
+w10/
+●
+448
+▸
+w10b/
+●
+215
+▸
+w11/
+●
+646
+▸
+w12/
+●
+567
+▸
+w12a/
+●
+44
+▸
+w13/
+●
+184
+▸
+w14/
+●
+106
+▸
+w15/
+●
+87
+▸
+w2/
+●
+199
+▸
+w3/
+●
+94
+▸
+w4/
+●
+729
+▸
+w5/
+●
+579
+▸
+w6/
+●
+732
+▸
+w7/
+●
+542
+▸
+w8/
+●
+219
+▸
+w8b/
+●
+244
+▸
+w8c/
+●
+158
+▸
+w9/
+●
+177
+index.html
+2
+INVENTAR.md
+12
+PLAN.md
+14
+README.md
+9
+THIRD_PARTY.md
+11
+tsconfig.node.json
+17
+tsconfig.node.tsbuildinfo
+-
+0
+tsconfig.tsbuildinfo
+-
+0
+UPSTREAM-ASKS.md
+11
+vite.config.ts
+9
+▾
+internal/
+●
+2917
+▾
+cbm/
+●
+2916
+▸
+lsp/
+●
+1256
+▸
+vendored/
+●
+0
+ac.c
+39
+ac.h
+2
+arena.c
+9
+arena.h
+4
+cbm.c
+96
+cbm.h
+43
+extract_calls.c
+139
+extract_channels.c
+42
+extract_dbt.c
+8
+extract_defs.c
+221
+extract_env_accesses.c
+9
+extract_imports.c
+105
+extract_k8s.c
+14
+extract_node_stack.h
+7
+extract_semantic.c
+15
+extract_type_assigns.c
+13
+extract_type_refs.c
+18
+extract_unified.c
+81
+extract_unified.h
+17
+extract_usages.c
+108
+grammar_ada.c
+2
+grammar_agda.c
+2
+grammar_apex.c
+2
+grammar_arkts.c
+2
+grammar_assembly.c
+2
+grammar_astro.c
+2
+grammar_awk.c
+2
+grammar_bash.c
+2
+grammar_beancount.c
+2
+grammar_bibtex.c
+2
+grammar_bicep.c
+2
+grammar_bitbake.c
+2
+grammar_blade.c
+2
+grammar_c_sharp.c
+2
+grammar_c.c
+2
+grammar_cairo.c
+2
+grammar_capnp.c
+2
+grammar_cfml.c
+2
+grammar_cfscript.c
+2
+grammar_chialisp.c
+2
+grammar_clojure.c
+2
+grammar_cmake.c
+2
+grammar_cobol.c
+2
+grammar_commonlisp.c
+2
+grammar_cpp.c
+2
+grammar_crystal.c
+2
+grammar_css.c
+2
+grammar_csv.c
+2
+grammar_cuda.c
+2
+grammar_d.c
+2
+grammar_dart.c
+2
+grammar_devicetree.c
+2
+grammar_diff.c
+2
+grammar_dockerfile.c
+2
+grammar_dotenv.c
+2
+grammar_elisp.c
+2
+grammar_elixir.c
+2
+grammar_elm.c
+2
+grammar_erlang.c
+2
+grammar_fennel.c
+2
+grammar_fish.c
+2
+grammar_form.c
+2
+grammar_fortran.c
+2
+grammar_fsharp.c
+2
+grammar_func.c
+2
+grammar_gdscript.c
+2
+grammar_gitattributes.c
+2
+grammar_gitignore.c
+2
+grammar_gleam.c
+2
+grammar_glsl.c
+2
+grammar_gn.c
+2
+grammar_go.c
+2
+grammar_gomod.c
+2
+grammar_gotemplate.c
+2
+grammar_graphql.c
+2
+grammar_groovy.c
+2
+grammar_hare.c
+2
+grammar_haskell.c
+2
+grammar_hcl.c
+2
+grammar_hlsl.c
+2
+grammar_html.c
+2
+grammar_hyprlang.c
+2
+grammar_ini.c
+2
+grammar_ispc.c
+2
+grammar_janet.c
+2
+grammar_java.c
+2
+grammar_javascript.c
+2
+grammar_jinja2.c
+2
+grammar_jsdoc.c
+2
+grammar_json.c
+2
+grammar_json5.c
+2
+grammar_jsonnet.c
+2
+grammar_julia.c
+2
+grammar_just.c
+2
+grammar_kconfig.c
+2
+grammar_kdl.c
+2
+grammar_kotlin.c
+2
+grammar_lean.c
+2
+grammar_linkerscript.c
+2
+grammar_liquid.c
+2
+grammar_llvm.c
+2
+grammar_lua.c
+2
+grammar_luau.c
+2
+grammar_magma.c
+2
+grammar_makefile.c
+2
+grammar_markdown.c
+2
+grammar_matlab.c
+2
+grammar_mermaid.c
+2
+grammar_meson.c
+2
+grammar_mojo.c
+2
+grammar_move.c
+2
+grammar_nasm.c
+2
+grammar_nickel.c
+2
+grammar_nix.c
+2
+grammar_objc.c
+2
+grammar_objectscript_routine.c
+2
+grammar_objectscript_udl.c
+2
+grammar_ocaml.c
+2
+grammar_odin.c
+2
+grammar_pascal.c
+2
+grammar_perl.c
+2
+grammar_php.c
+2
+grammar_pine.c
+2
+grammar_pkl.c
+2
+grammar_plsql.c
+2
+grammar_po.c
+2
+grammar_pony.c
+2
+grammar_powershell.c
+2
+grammar_prisma.c
+2
+grammar_properties.c
+2
+grammar_protobuf.c
+2
+grammar_puppet.c
+2
+grammar_purescript.c
+2
+grammar_python.c
+2
+grammar_qml.c
+2
+grammar_r.c
+2
+grammar_racket.c
+2
+grammar_regex.c
+2
+grammar_requirements.c
+2
+grammar_rescript.c
+2
+grammar_ron.c
+2
+grammar_rst.c
+2
+grammar_ruby.c
+2
+grammar_rust.c
+2
+grammar_scala.c
+2
+grammar_scheme.c
+2
+grammar_scss.c
+2
+grammar_slang.c
+2
+grammar_smali.c
+2
+grammar_smithy.c
+2
+grammar_solidity.c
+2
+grammar_soql.c
+2
+grammar_sosl.c
+2
+grammar_sql.c
+2
+grammar_squirrel.c
+2
+grammar_sshconfig.c
+2
+grammar_starlark.c
+2
+grammar_svelte.c
+2
+grammar_sway.c
+2
+grammar_swift.c
+2
+grammar_systemverilog.c
+2
+grammar_tablegen.c
+2
+grammar_tcl.c
+2
+grammar_teal.c
+2
+grammar_templ.c
+2
+grammar_thrift.c
+2
+grammar_tlaplus.c
+2
+grammar_toml.c
+2
+grammar_tsx.c
+2
+grammar_typescript.c
+2
+grammar_typst.c
+2
+grammar_verilog.c
+2
+grammar_vhdl.c
+2
+grammar_vim.c
+2
+grammar_vue.c
+2
+grammar_wgsl.c
+2
+grammar_wit.c
+2
+grammar_wolfram.c
+2
+grammar_xml.c
+2
+grammar_yaml.c
+2
+grammar_zig.c
+2
+grammar_zsh.c
+2
+helpers.c
+!
+69
+helpers.h
+3
+iris_export_xml.c
+25
+iris_export_xml.h
+1
+lang_specs.c
+4
+lang_specs.h
+2
+lsp_all.c
+2
+lz4_store.c
+5
+lz4_store.h
+2
+macro_table.c
+9
+macro_table.h
+7
+preprocessor.cpp
+10
+preprocessor.h
+!
+2
+service_patterns.c
+26
+service_patterns.h
+2
+sqlite_writer.c
+164
+sqlite_writer.h
+2
+ts_runtime.c
+2
+zstd_store.c
+6
+zstd_store.h
+2
+▸
+node_modules/
+●
+0
+▾
+pkg/
+●
+534
+▾
+chocolatey/
+●
+5
+▸
+tools/
+●
+4
+▾
+glama/
+12
+Dockerfile
+4
+verify.sh
+8
+▾
+go/
+187
+▸
+cmd/
+184
+go.mod
+2
+▾
+homebrew/
+6
+▸
+Formula/
+5
+▾
+npm/
+97
+▸
+test/
+28
+bin.js
+11
+install.js
+45
+README.md
+12
+▾
+pypi/
+157
+▸
+src/
+92
+▸
+tests/
+34
+pyproject.toml
+22
+README.md
+7
+▾
+scoop/
+15
+codebase-memory-mcp.json
+15
+▾
+winget/
+47
+▸
+manifests/
+46
+▸
+private/
+●
+0
+▾
+scripts/
+●
+1180
+▾
+ci/
+●
+257
+append-legacy-alias-checksums.sh
+4
+append-vt-notes.sh
+6
+check-binary-composition.sh
+!
+26
+check-glibc-compat.sh
+5
+check-virustotal.sh
+2
+clean-test-residue.ps1
+!
+4
+ensure-defender.ps1
+3
+exclude-rescanned-selected-objects.sh
+9
+extract-release-archives.sh
+2
+gen-mcpb-registry-entries.sh
+2
+generate-sbom.py
+5
+lint-mem.sh
+3
+msan-lane.sh
+8
+new-protected-temp-root.ps1
+3
+preflight-docker.sh
+9
+prepare-release-candidates.sh
+38
+publish-legacy-aliases.sh
+6
+publish-vt-evidence.sh
+7
+README.md
+3
+require-all-green.sh
+2
+select-release-candidates.py
+27
+smoke-artifact.sh
+20
+stage-release-candidates.py
+24
+test-package-wrappers.sh
+5
+test-ui.sh
+3
+verify-release-selection.py
+26
+verify-shard-union.sh
+5
+▾
+git-hooks/
+2
+commit-msg
+2
+▾
+hooks/
+2
+pre-commit
+2
+audit-grammar-security.sh
+13
+audit-license-provenance.py
+16
+benchmark-index.sh
+16
+benchmark-search-graph.sh
+6
+build.sh
+10
+check-dco.sh
+5
+check-lsp-originality.sh
+21
+check-no-test-skips.sh
+4
+check-nolint-whitelist.sh
+6
+clean.sh
+4
+clone-bench-repos.sh
+5
+embed-frontend.sh
+10
+env.sh
+9
+extract_nomic_vectors.py
+20
+gen-py-stdlib.py
+20
+gen-third-party-notices.sh
+5
+gen-ui-licenses.py
+6
+generate-lang-code.py
+11
+install-git-hooks.sh
+4
+license-gate-check-npm.py
+6
+license-gate-check.py
+3
+license-gate.sh
+6
+license-policy.json
+6
+lint-mem-gate.py
+12
+lint-tidy-diff.sh
+11
+lint.sh
+6
+memlab-drive.py
+4
+memlab-report.py
+8
+memlab.sh
+17
+msan.sh
+8
+new-languages.json
+12
+package-release.sh
+26
+path-safety.sh
+4
+README.md
+6
+repro.sh
+11
+run-test-wave.py
+24
+run-tests-parallel.sh
+32
+security-audit.sh
+17
+security-fuzz-random.sh
+12
+security-fuzz.sh
+11
+security-install.sh
+10
+security-network-source-audit.py
+25
+security-network.sh
+6
+security-strings.sh
+11
+security-ui.sh
+9
+security-vendored.sh
+24
+setup-windows.ps1
+!
+11
+setup.sh
+23
+smoke-fixture-server.py
+6
+smoke-invariants.sh
+!
+54
+smoke-local.sh
+21
+smoke-test.sh
+150
+soak-legs.sh
+8
+soak-test.sh
+67
+test_mcp_interactive.py
+15
+test_mcp_rapid_init.py
+5
+test-runtime.sh
+13
+test-windows.ps1
+!
+3
+test.sh
+11
+vendor-grammar.sh
+11
+▾
+src/
+●
+6871
+▾
+cli/
+●
+1222
+activation_transaction.c
+!
+104
+activation_transaction.h
+2
+agent_clients.c
+47
+agent_clients.h
+!
+2
+agent_profiles.c
+29
+agent_profiles.h
+!
+2
+cli.c
+!
+492
+cli.h
+11
+client_adapter.c
+8
+client_adapter.h
+4
+config_json_like.c
+!
+88
+config_json_like.h
+!
+2
+config_text_edit.c
+!
+65
+config_text_edit.h
+2
+config_toml_edit.c
+!
+106
+config_toml_edit.h
+!
+2
+config_yaml_edit.c
+!
+140
+config_yaml_edit.h
+!
+2
+hook_augment.c
+!
+80
+progress_sink.c
+32
+progress_sink.h
+2
+▾
+cypher/
+●
+218
+cypher.c
+!
+197
+cypher.h
+21
+▾
+daemon/
+●
+1206
+application_internal.h
+3
+application.c
+241
+application.h
+4
+bootstrap.c
+44
+bootstrap.h
+5
+daemon.c
+88
+daemon.h
+8
+frontend.c
+41
+frontend.h
+2
+host_internal.h
+4
+host.c
+88
+host.h
+2
+ipc_internal.h
+7
+ipc.c
+!
+319
+ipc.h
+3
+project_lock.c
+17
+project_lock.h
+2
+runtime.c
+!
+194
+runtime.h
+19
+service_internal.h
+3
+service.c
+46
+service.h
+5
+version_cohort.c
+59
+version_cohort.h
+2
+▾
+discover/
+●
+112
+discover.c
+!
+49
+discover.h
+4
+gitignore.c
+21
+language.c
+23
+userconfig.c
+13
+userconfig.h
+2
+▸
+foundation/
+●
+968
+▸
+git/
+●
+20
+▸
+graph_buffer/
+103
+▸
+mcp/
+●
+605
+▸
+pipeline/
+●
+1211
+▸
+semantic/
+129
+▸
+simhash/
+47
+▸
+store/
+●
+383
+▸
+traces/
+13
+▸
+ui/
+●
+444
+▸
+watcher/
+●
+79
+main.c
+96
+▾
+test-infrastructure/
+151
+▸
+vm/
+116
+docker-compose.yml
+4
+Dockerfile
+4
+ladder.sh
+12
+README.md
+6
+run.sh
+8
+▾
+tests/
+●
+11279
+▸
+fixtures/
+●
+30
+▸
+repro/
+●
+1345
+▸
+windows/
+109
+grammar_cases.h
+3
+scale_contract.sh
+13
+smoke_guard.sh
+9
+test_ac.c
+24
+test_activation_transaction.c
+41
+test_agent_clients.c
+49
+test_agent_profiles.c
+16
+test_arena.c
+34
+test_artifact.c
+46
+test_ast_profile.c
+14
+test_build_dir_safety.sh
+5
+test_c_lsp.c
+770
+test_call_reference_contract.c
+21
+test_cli.c
+!
+357
+test_complexity.c
+33
+test_config_json_like.c
+42
+test_config_text_edit.c
+36
+test_config_toml_edit.c
+68
+test_config_yaml_edit.c
+74
+test_configlink.c
+19
+test_convergence_probe.c
+60
+test_cpp_index_hang.sh
+14
+test_cross_repo.c
+21
+test_cs_lsp_bench.c
+6
+test_cs_lsp.c
+68
+test_cypher.c
+204
+test_daemon_application.c
+103
+test_daemon_bootstrap.c
+44
+test_daemon_frontend.c
+53
+test_daemon_ipc.c
+!
+108
+test_daemon_open_readiness.py
+22
+test_daemon_runtime_contract.h
+6
+test_daemon_runtime.c
+!
+124
+test_daemon_smoke.py
+51
+test_daemon_version.c
+28
+test_daemon.c
+20
+test_destructive_ordering_contract.sh
+4
+test_diagnostics.c
+29
+test_discover.c
+123
+test_dump_verify_io.c
+11
+test_dump_verify.c
+16
+test_dyn_array.c
+29
+test_edge_imports.c
+73
+test_edge_structural.c
+43
+test_edge_types_probe.c
+68
+test_extraction_imports.c
+30
+test_extraction_inheritance.c
+24
+test_extraction.c
+370
+test_fqn.c
+95
+test_framework.h
+31
+test_git_context.c
+8
+test_gitignore.c
+28
+test_go_lsp.c
+61
+test_grammar_imports.c
+4
+test_grammar_labels.c
+8
+test_grammar_probe_a.c
+57
+test_grammar_probe_b.c
+54
+test_grammar_probe_c.c
+55
+test_grammar_probe_d.c
+86
+test_grammar_probe_e.c
+67
+test_grammar_probe_f.c
+72
+test_grammar_probe_g.c
+55
+test_grammar_regression.c
+7
+test_graph_buffer.c
+57
+test_hash_table.c
+33
+test_helpers.h
+14
+test_hook_conflict_notice.sh
+10
+test_httpd.c
+126
+test_importance.c
+27
+test_incremental.c
+196
+test_index_format.c
+11
+test_index_resilience.c
+!
+15
+test_index_supervisor.c
+23
+test_infrascan.c
+7
+test_integration.c
+36
+test_java_lsp_coverage.c
+293
+test_java_lsp.c
+103
+test_kotlin_lsp.c
+96
+test_lang_contract.c
+68
+test_language_count_contract.sh
+10
+test_language.c
+234
+test_lock_registry.c
+35
+test_log.c
+25
+test_lsp_resolution_probe.c
+103
+test_lz4.c
+12
+test_main.c
+32
+test_makefile_ts_runtime_dependencies.sh
+7
+test_matrix_known_classes.c
+52
+test_matrix_new_constructs.c
+78
+test_mcp.c
+!
+437
+test_mcpb_bundle_contract.sh
+11
+test_mcpb_registry_entries_contract.sh
+5
+test_mem.c
+64
+test_node_creation_probe.c
+92
+test_nomic_blob_generator_contract.sh
+5
+test_parallel_harness_contract.sh
+7
+test_parallel.c
+125
+test_parent_watchdog.sh
+9
+test_parse_coverage.c
+35
+test_path_alias.c
+!
+18
+test_perl_lsp.c
+25
+test_php_lsp.c
+289
+test_pipeline.c
+372
+test_platform.c
+44
+test_private_file_lock.c
+22
+test_project_lock.c
+5
+test_py_lsp_bench.c
+6
+test_py_lsp_scale.c
+7
+test_py_lsp_stress.c
+49
+test_py_lsp.c
+89
+test_registry.c
+66
+test_release_archive_extractor_contract.sh
+4
+test_release_candidate_derivation_contract.sh
+14
+test_release_gate_chain_contract.sh
+7
+test_route_canon.c
+14
+test_runtime_isolation_contract.sh
+17
+test_rust_lsp.c
+535
+test_scope.c
+17
+test_script_exec_bit_contract.sh
+3
+test_security_fuzz_harness.sh
+15
+test_security_strings_allowlist.sh
+19
+test_security.c
+60
+test_semantic.c
+39
+test_shell_line_endings.sh
+5
+test_simhash.c
+37
+test_slab_alloc.c
+17
+test_smoke_fixture_contract.sh
+3
+test_soak_daemon_recovery_contract.sh
+4
+test_spawn_no_window_contract.sh
+3
+test_sqlite_writer.c
+20
+test_stack_overflow.c
+29
+test_store_arch.c
+74
+test_store_bulk.c
+9
+test_store_checkpoint.c
+15
+test_store_edges.c
+29
+test_store_nodes.c
+74
+test_store_pragmas.c
+15
+test_store_search.c
+82
+test_str_intern.c
+22
+test_str_util.c
+70
+test_subprocess.c
+49
+test_traces.c
+35
+test_ts_lsp.c
+316
+test_type_rep.c
+22
+test_ui_dev_proxy_security.sh
+4
+test_ui.c
+!
+49
+test_userconfig.c
+11
+test_vendored_integrity_contract.sh
+8
+test_venue_parity_contract.sh
+3
+test_version_cohort.c
+31
+test_version_metadata_contract.sh
+16
+test_vm_worktree_manifest.sh
+15
+test_vmem.c
+37
+test_vt_candidate_selection_contract.sh
+7
+test_vt_gate_policy_contract.sh
+21
+test_vt_release_notes_contract.sh
+7
+test_watcher_disabled.sh
+22
+test_watcher.c
+111
+test_windows_bundle_contract.sh
+3
+test_worker_error_response.sh
+10
+test_worker_pool.c
+!
+41
+test_worker_watchdog.sh
+13
+test_workspace.c
+26
+test_yaml.c
+76
+test_zstd.c
+8
+▾
+tools/
+●
+2221
+▸
+tree-sitter-arkts/
+●
+1197
+▸
+tree-sitter-chialisp/
+●
+203
+▸
+tree-sitter-form/
+●
+389
+▸
+tree-sitter-magma/
+●
+428
+▸
+vendored/
+●
+0
+.gitattributes
+2
+<python-builtins>
+12
+CODE_OF_CONDUCT.md
+14
+CONTRIBUTING.md
+19
+flake.nix
+8
+glama.json
+4
+install.ps1
+3
+install.sh
+2
+MAINTAINERS.md
+11
+README.md
+56
+SECURITY.md
+23
+server.json
+17
+THIRD_PARTY.md
+12
+Index details
+no file open
+Ask about selection
+
+pick a file in the explorer
+
+flow
+walk
+chat
+bug hunt
+change scope
+[esc] fold
+
+No project is open, and this view reads a project index. Open one and the reach of a change is drawn here.
+
+Selected code
+Pin
+
+Open a file to inspect its symbols and connections.
+
+galaxy
+hierarchy
+show legend
+collapse galaxy
+5000 nodes, 1268 edges from /api/layout; 40226 nodes indexed, 5000 fit the 5000 node budget
+10 edge kinds
+fit view
+
+Open a file or select a symbol to focus the graph.
+
+server ready
+Connection details
+Change impact
+
+Choose a change or selection, inspect its dependents, and review the evidence.
+
+Close change impact
+Current selection
+Working tree
+Since ref
+Refresh changes
+cbm-pr2068
+Uncommitted changes
+
+Compared explicitly with HEAD; staged, unstaged and untracked paths are included.
+
+260 of 260 changed paths loaded
+
+Change-set revision and limits
+Filter changed paths
+
+Areas are grouped by path and ordered by changed-file count, with the current selection first. These counts measure scope, not risk.
+
+src/daemon · 1 changed paths
+src/daemon/application.c
+src/daemon/application.c
+Analysis scope
+Entire indexed file
+cbm_daemon_application_fail_next_job_thread_start_for_test · line 218
+cbm_daemon_application_background_initializes_for_test · line 232
+cbm_daemon_application_busy_queue_waits_for_test · line 243
+cbm_daemon_application_hold_job_before_start_for_test · line 247
+application_job_thread_create · line 252
+application_request_cancelled_locked · line 260
+application_deadline_after · line 268
+application_cleanup_force_terminate · line 273
+application_project_lock_release_fully · line 288
+application_worker_diagnostic · line 304
+application_worker_start_default · line 318
+application_worker_poll_default · line 331
+application_worker_cancel_default · line 338
+application_worker_log_path_default · line 344
+application_worker_destroy_default · line 350
+application_get_u32 · line 356
+application_put_u32 · line 361
+application_text_copy · line 368
+application_regular_db_exists · line 380
+application_canonical_directory_exists · line 394
+application_find_watch_locked · line 399
+application_remove_watch_entry_locked · line 409
+application_remove_watch_locked · line 435
+application_release_session_watch_locked · line 440
+application_session_workspace_allowed · line 455
+application_refresh_watch_locked · line 472
+application_refresh_watch · line 555
+application_job_free · line 564
+application_jobs_reap_completed · line 578
+application_tmp_lock · line 618
+application_tmp_unlock · line 624
+application_cache_dir · line 628
+application_unique_recovery_file · line 653
+application_recovery_files_create · line 684
+application_recovery_files_remove · line 697
+application_truncate_file · line 707
+application_read_suspects · line 714
+application_free_suspects · line 806
+application_suspect_contains · line 816
+application_append_quarantine · line 825
+application_max_restarts · line 838
+application_attempt_init · line 850
+application_attempt_free · line 856
+application_job_cancel_requested · line 861
+application_project_keys_conflict · line 869
+application_mutation_conflicts_locked · line 874
+application_job_reserves_project_locked · line 885
+application_mutation_begin_internal · line 895
+cbm_daemon_application_project_mutation_try_begin · line 988
+cbm_daemon_application_project_mutation_end · line 993
+application_watcher_mutation_begin · line 1031
+application_watcher_mutation_end · line 1035
+application_watcher_project_pruned · line 1039
+application_session_mutation_begin · line 1054
+application_session_mutation_try_begin · line 1060
+application_session_mutation_end · line 1066
+application_job_wait_for_mutations · line 1073
+application_cancelled_result · line 1090
+application_job_run_attempt · line 1098
+application_job_failure_response · line 1176
+application_attempt_disposition · line 1197
+application_record_attempt · line 1210
+application_record_cancelled · line 1223
+application_result_is_attributable_failure · line 1231
+application_job_execution_init · line 1253
+application_job_execution_cancel · line 1258
+application_index_response_succeeded · line 1269
+application_consume_attempt · line 1279
+application_recovery_record_suspects · line 1310
+application_job_try_partial · line 1357
+application_job_recover · line 1384
+application_auto_index_retry_pending_locked · line 1439
+application_job_publish · line 1487
+application_job_thread · line 1520
+application_find_job_locked · line 1559
+application_find_active_job_locked · line 1572
+application_index_project_key · line 1582
+application_active_job_count_locked · line 1589
+application_index_args_normalize_defaults · line 1604
+application_index_args_equal · line 1623
+application_job_subscribe_locked · line 1645
+application_job_subscribe · line 1708
+application_job_unsubscribe_locked · line 1719
+application_auto_index_release_locked · line 1732
+application_auto_index_cancel_join · line 1748
+application_update_cancel_locked · line 1772
+application_update_owner_release_locked · line 1783
+application_update_version_valid · line 1799
+application_update_publish_terminal_locked · line 1812
+application_update_thread · line 1840
+application_update_subscribe_locked · line 1891
+application_update_reap · line 1931
+application_auto_index_args · line 1966
+application_background_initialize_impl · line 1981
+application_background_initialize · line 2064
+application_jsonrpc_success · line 2070
+application_update_notice_inject · line 2079
+application_watch_job_subscription_exists_locked · line 2092
+application_watch_job_subscribe_late_session_locked · line 2109
+application_watch_job_subscribe_sessions_locked · line 2137
+application_watch_job_unsubscribe_session_locked · line 2183
+application_watch_job_unsubscribe_job_locked · line 2202
+application_job_wait_for_session · line 2218
+application_index_execute · line 2242
+application_session_open · line 2305
+application_set_context · line 2347
+application_oversized_response_error · line 2422
+application_framable_response · line 2463
+cbm_daemon_application_framable_response_for_test · line 2472
+application_mcp_request · line 2477
+application_tool_request · line 2537
+application_set_ui_config · line 2573
+application_ui_readiness_proof · line 2611
+application_request_dispatch · line 2629
+application_request · line 2674
+application_cancel_jobs_locked · line 2762
+application_request_cancel · line 2770
+application_session_cancel · line 2800
+application_session_close · line 2858
+cbm_daemon_application_set_permanent · line 2900
+cbm_daemon_application_new · line 2909
+cbm_daemon_application_shutdown · line 2999
+cbm_daemon_application_free_with_timeout · line 3057
+cbm_daemon_application_free · line 3128
+cbm_daemon_application_runtime_callbacks · line 3132
+application_client_exchange_tagged · line 3148
+application_client_exchange · line 3192
+cbm_daemon_application_client_set_context · line 3200
+cbm_daemon_application_client_set_ui_config · line 3256
+cbm_daemon_application_client_ui_readiness_proof · line 3290
+application_client_text_request_tagged · line 3322
+application_client_text_request · line 3344
+cbm_daemon_application_client_mcp · line 3352
+cbm_daemon_application_client_mcp_tagged · line 3359
+cbm_daemon_application_client_tool · line 3368
+cbm_daemon_application_client_hook_augment · line 3392
+application_background_index · line 3400
+cbm_daemon_application_index · line 3508
+cbm_daemon_application_watcher_index · line 3513
+cbm_daemon_application_active_jobs · line 3518
+cbm_daemon_application_job_subscribers · line 3533
+cbm_daemon_application_physical_job_limit · line 3545
+cbm_daemon_application_worker_memory_budget_bytes · line 3555
+cbm_daemon_application_session_retains_store_for_test · line 3565
+Open source evidence
+This file is in the detected change set.
+This symbol was selected manually; edited lines are not automatically mapped to declarations.
+Inspect this file’s local diff
+Selection evidence
+Refresh analysis
+
+application_project_lock_release_fully
+src/daemon/application.c · selected symbol
+
+Review needed · elevated change risk
+Heuristic, no defect probability
+17 indexed dependents could be affected; inspect direct paths first.
+5 data limitations · inspect before relying on absence of findings
+Dependencies · 17
+Tests to review · 7
+Git history · 2
+Data quality · 5
+Structural impact · indexed dependencies
+
+2 direct · 17 total dependents within 4 hops. CALLS means a static call relation; IMPORTS means an import dependency. Neither proves runtime execution or data flow.
+
+Showing 8 of 17 returned evidence paths.
+
+application_mutation_begin_internaldirect dependency
+src/daemon/application.c:895
+Show indexed path (1 edge)
+cbm_daemon_application_project_mutation_enddirect dependency
+src/daemon/application.c:993
+Show indexed path (1 edge)
+cbm_daemon_application_project_mutation_try_begin2 hops
+src/daemon/application.c:988
+Show indexed path (2 edges)
+application_session_mutation_begin2 hops
+src/daemon/application.c:1054
+Show indexed path (2 edges)
+application_session_mutation_try_begin2 hops
+src/daemon/application.c:1060
+Show indexed path (2 edges)
+host_ui_mutation_end2 hops
+src/daemon/host.c:316
+Show indexed path (2 edges)
+daemon_application_reserved_mutation_delays_worker_start2 hops · test candidate (path heuristic)
+tests/test_daemon_application.c:4185
+Show indexed path (2 edges)
+daemon_application_mutation_does_not_block_other_project2 hops · test candidate (path heuristic)
+tests/test_daemon_application.c:4242
+Show indexed path (2 edges)
+Show more affected symbols (8 of 17)

@@ -4,14 +4,19 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h" /* cbm_setenv / cbm_unsetenv (Windows-portable) */
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_regex.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/compat_thread.h"
+#include "../src/foundation/mem_core.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
 #include "../src/foundation/system_info_internal.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/stat.h> /* chmod for the symlink-policy mode legs */
+#endif
 
 #ifdef __linux__
 /* Linux-only cgroup tests need stdio for FILE*, stdlib for mkdtemp,
@@ -43,8 +48,7 @@ TEST(platform_file_apis_survive_max_path_overflow) {
     ASSERT_NOT_NULL(cbm_mkdtemp(base));
 
     enum { LONG_SEGMENTS = 5 };
-    static const char segment[] =
-        "segment-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnop";
+    static const char segment[] = "segment-abcdefghijklmnopqrstuvwxyz0123456789-abcdefghijklmnop";
     char deep[CBM_SZ_1K];
     written = snprintf(deep, sizeof(deep), "%s", base);
     ASSERT_TRUE(written > 0 && written < (int)sizeof(deep));
@@ -77,6 +81,375 @@ TEST(platform_file_apis_survive_max_path_overflow) {
     PASS();
 }
 
+/* A directory reached through a symlink the invoking account owns is that
+ * account's own arrangement ONLY where the caller says so. The plain walk
+ * (cbm_mkdir_p) keeps refusing such a link: it is what repository-derived
+ * paths use, where a user-owned link can be a checked-in file. A caller that
+ * opts in with CBM_MKDIR_FOLLOW_OWNED -- paths rooted in HOME, XDG or the
+ * cache, the dotfile-manager shape ~/.config/opencode -> /mnt/... -- walks
+ * through it and creates the missing tail INSIDE the target. Even opted in, a
+ * dangling link or a link to a regular file fails closed with nothing created
+ * on either side. */
+TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-ownlink-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char target[CBM_SZ_1K];
+    char link[CBM_SZ_1K];
+    char through_link[CBM_SZ_1K];
+    char child[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+    (void)snprintf(target, sizeof(target), "%s/target", base);
+    (void)snprintf(link, sizeof(link), "%s/link", base);
+    (void)snprintf(through_link, sizeof(through_link), "%s/child/grandchild", link);
+    (void)snprintf(child, sizeof(child), "%s/child", target);
+    (void)snprintf(created, sizeof(created), "%s/child/grandchild", target);
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_EQ(symlink(target, link), 0);
+
+    /* "Own" means owned by the invoking account. Root owns everything it
+     * creates and root-owned links are trusted by BOTH walks, so under euid 0
+     * the link is given to a non-root account to keep the contrast real: then
+     * the plain walk refuses it, and so does the opted-in walk, because a
+     * privileged walk never follows a user's link. */
+    bool privileged = geteuid() == 0;
+    enum { LINK_OWNER_UID = 65533 };
+    if (privileged) {
+        ASSERT_EQ(lchown(link, LINK_OWNER_UID, LINK_OWNER_UID), 0);
+    }
+
+    /* The plain walk refuses the user-owned link and creates nothing. */
+    ASSERT_FALSE(cbm_mkdir_p(through_link, 0700));
+    ASSERT_FALSE(cbm_is_dir(child));
+
+    if (privileged) {
+        ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_FALSE(cbm_is_dir(child));
+        /* Root-owned again: infrastructure, followed by both walks as always. */
+        ASSERT_EQ(lchown(link, 0, 0), 0);
+        ASSERT_TRUE(cbm_mkdir_p(through_link, 0700));
+        ASSERT_TRUE(cbm_is_dir(created));
+    } else {
+        /* The opted-in walk follows it into the target. */
+        ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(created));
+    }
+
+    char dangling[CBM_SZ_1K];
+    char through_dangling[CBM_SZ_1K];
+    char dangling_target[CBM_SZ_1K];
+    (void)snprintf(dangling, sizeof(dangling), "%s/dangling", base);
+    (void)snprintf(through_dangling, sizeof(through_dangling), "%s/child", dangling);
+    (void)snprintf(dangling_target, sizeof(dangling_target), "%s/missing", base);
+    ASSERT_EQ(symlink("missing", dangling), 0);
+    ASSERT_FALSE(cbm_mkdir_p_ex(through_dangling, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_FALSE(cbm_is_dir(dangling_target));
+
+    /* An own link to a regular FILE is not a directory to walk into: refused,
+     * and the file it points at is left exactly as it was. */
+    char file_target[CBM_SZ_1K];
+    char file_link[CBM_SZ_1K];
+    char through_file_link[CBM_SZ_1K];
+    (void)snprintf(file_target, sizeof(file_target), "%s/file", base);
+    (void)snprintf(file_link, sizeof(file_link), "%s/file-link", base);
+    (void)snprintf(through_file_link, sizeof(through_file_link), "%s/child", file_link);
+    FILE *file = cbm_fopen(file_target, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_GTE(fputs("data\n", file), 0);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(symlink(file_target, file_link), 0);
+    ASSERT_FALSE(cbm_mkdir_p_ex(through_file_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_FALSE(cbm_is_dir(file_target));
+    ASSERT_EQ(cbm_file_size(file_target), 5);
+
+    ASSERT_EQ(cbm_unlink(file_link), 0);
+    ASSERT_EQ(cbm_unlink(file_target), 0);
+    ASSERT_EQ(cbm_unlink(dangling), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_rmdir(child), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
+/* A followed link is resolved from its own text, so the text has to be
+ * resolved the way the kernel resolves it: a relative text against the link's
+ * directory (never the process's working directory), an absolute text as is,
+ * and links inside the text followed in turn. The test changes into an
+ * unrelated directory first so a CWD-relative resolution would miss. */
+TEST(platform_mkdir_p_resolves_link_text_from_the_link_directory) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-linktext-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+    char elsewhere[CBM_SZ_1K];
+    char target[CBM_SZ_1K];
+    char nested[CBM_SZ_1K];
+    (void)snprintf(elsewhere, sizeof(elsewhere), "%s/elsewhere", base);
+    (void)snprintf(target, sizeof(target), "%s/dir/target", base);
+    (void)snprintf(nested, sizeof(nested), "%s/dir/nested", base);
+    ASSERT_TRUE(cbm_mkdir_p(elsewhere, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(nested, 0700));
+
+    char saved_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(getcwd(saved_cwd, sizeof(saved_cwd)));
+    ASSERT_EQ(chdir(elsewhere), 0);
+
+    /* relative text, sibling: dir/relative -> target */
+    char link[CBM_SZ_1K];
+    char through[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+    (void)snprintf(link, sizeof(link), "%s/dir/relative", base);
+    ASSERT_EQ(symlink("target", link), 0);
+    (void)snprintf(through, sizeof(through), "%s/child-relative", link);
+    (void)snprintf(created, sizeof(created), "%s/child-relative", target);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+
+    /* relative text through the parent: dir/nested/up -> ../target */
+    (void)snprintf(link, sizeof(link), "%s/up", nested);
+    ASSERT_EQ(symlink("../target", link), 0);
+    (void)snprintf(through, sizeof(through), "%s/child-up", link);
+    (void)snprintf(created, sizeof(created), "%s/child-up", target);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+
+    /* absolute text, and a chain whose text names another link */
+    (void)snprintf(link, sizeof(link), "%s/absolute", base);
+    ASSERT_EQ(symlink(target, link), 0);
+    char chain[CBM_SZ_1K];
+    (void)snprintf(chain, sizeof(chain), "%s/chain", base);
+    ASSERT_EQ(symlink("absolute", chain), 0);
+    (void)snprintf(through, sizeof(through), "%s/child-chain", chain);
+    (void)snprintf(created, sizeof(created), "%s/child-chain", target);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_unlink(chain), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+
+    ASSERT_EQ(chdir(saved_cwd), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(nested), 0);
+    char *slash = strrchr(target, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(target), 0); /* dir */
+    ASSERT_EQ(cbm_rmdir(elsewhere), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
+/* The trust an opted-in walk extends to a symlink is bounded on BOTH ends of
+ * the link. What the follow lands on must be a directory owned by root or the
+ * invoking user and not world-writable unless sticky; the mode legs bind on
+ * every run. Two more legs need root, because a non-root process cannot give
+ * a file away: a target owned by another account is refused even behind a
+ * root-owned link, and a link owned by a non-root account is refused when the
+ * walk itself runs as root, so a privileged install never follows a user's
+ * link. Each refusal is followed by restoring the state and walking again,
+ * which pins that state as the reason for the refusal. */
+TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-linkowner-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char target[CBM_SZ_1K];
+    char link[CBM_SZ_1K];
+    (void)snprintf(target, sizeof(target), "%s/target", base);
+    (void)snprintf(link, sizeof(link), "%s/link", base);
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_EQ(symlink(target, link), 0);
+
+    static const char *const children[] = {"control",   "world-writable", "sticky",
+                                           "private",   "foreign-target", "target-restored",
+                                           "user-link", "link-restored"};
+    enum {
+        CHILD_CONTROL,
+        CHILD_WORLD_WRITABLE,
+        CHILD_STICKY,
+        CHILD_PRIVATE,
+        CHILD_FOREIGN_TARGET,
+        CHILD_TARGET_RESTORED,
+        CHILD_USER_LINK,
+        CHILD_LINK_RESTORED
+    };
+    char through_link[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+#define LINKOWNER_PATHS(index)                                                              \
+    do {                                                                                    \
+        (void)snprintf(through_link, sizeof(through_link), "%s/%s", link, children[index]); \
+        (void)snprintf(created, sizeof(created), "%s/%s", target, children[index]);         \
+    } while (0)
+
+    LINKOWNER_PATHS(CHILD_CONTROL);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+
+    /* World-writable target without the sticky bit: anyone could pre-plant
+     * entries in it, so it is refused. Sticky (the /tmp shape) is fine, and
+     * so is an ordinary private directory. */
+    ASSERT_EQ(chmod(target, 0777), 0);
+    LINKOWNER_PATHS(CHILD_WORLD_WRITABLE);
+    ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_FALSE(cbm_is_dir(created));
+    ASSERT_EQ(chmod(target, 01777), 0);
+    LINKOWNER_PATHS(CHILD_STICKY);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(chmod(target, 0755), 0);
+    LINKOWNER_PATHS(CHILD_PRIVATE);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+
+    if (geteuid() == 0) {
+        enum { FOREIGN_UID = 65534, USER_UID = 65533 };
+
+        /* Root-owned link, target owned by another account: refused. */
+        ASSERT_EQ(chown(target, FOREIGN_UID, FOREIGN_UID), 0);
+        LINKOWNER_PATHS(CHILD_FOREIGN_TARGET);
+        ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_FALSE(cbm_is_dir(created));
+        ASSERT_EQ(chown(target, 0, 0), 0);
+        LINKOWNER_PATHS(CHILD_TARGET_RESTORED);
+        ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(created));
+
+        /* Link AND target owned by a non-root account -- the shape of a
+         * privileged install into that account's home -- walked as root:
+         * refused even when opted in, because root trusts only root-owned
+         * links. */
+        ASSERT_EQ(lchown(link, USER_UID, USER_UID), 0);
+        ASSERT_EQ(chown(target, USER_UID, USER_UID), 0);
+        LINKOWNER_PATHS(CHILD_USER_LINK);
+        ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_FALSE(cbm_is_dir(created));
+        ASSERT_EQ(lchown(link, 0, 0), 0);
+        ASSERT_EQ(chown(target, 0, 0), 0);
+        LINKOWNER_PATHS(CHILD_LINK_RESTORED);
+        ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(created));
+    }
+#undef LINKOWNER_PATHS
+
+    for (size_t index = 0; index < sizeof(children) / sizeof(children[0]); index++) {
+        (void)snprintf(created, sizeof(created), "%s/%s", target, children[index]);
+        if (cbm_is_dir(created)) {
+            ASSERT_EQ(cbm_rmdir(created), 0);
+        }
+    }
+    ASSERT_EQ(cbm_unlink(link), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
+/* The policy is per CALL SITE, not per path. The same user-owned link is
+ * followed by the opted-in walk a configuration root uses and refused by the
+ * plain walk a checkout uses: `~/.claude -> ~/dotfiles/claude` works for the
+ * installer, while a repository that ships `.codebase-memory -> <a directory
+ * the user owns>` cannot redirect the artifact writer. Under euid 0 the
+ * checked-in link is demoted to a non-root owner, since root-owned links are
+ * trusted by both walks and a privileged walk never follows a user's link. */
+TEST(platform_mkdir_p_follow_owned_is_per_call_site) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-linksite-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    /* The dotfile-manager shape under a home directory. */
+    char dotfiles[CBM_SZ_1K];
+    char claude_link[CBM_SZ_1K];
+    char agents_through_link[CBM_SZ_1K];
+    char agents_in_dotfiles[CBM_SZ_1K];
+    (void)snprintf(dotfiles, sizeof(dotfiles), "%s/home/dotfiles/claude", base);
+    (void)snprintf(claude_link, sizeof(claude_link), "%s/home/.claude", base);
+    (void)snprintf(agents_through_link, sizeof(agents_through_link), "%s/agents", claude_link);
+    (void)snprintf(agents_in_dotfiles, sizeof(agents_in_dotfiles), "%s/agents", dotfiles);
+    ASSERT_TRUE(cbm_mkdir_p(dotfiles, 0700));
+    ASSERT_EQ(symlink(dotfiles, claude_link), 0);
+    ASSERT_TRUE(cbm_mkdir_p_ex(agents_through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(agents_in_dotfiles));
+
+    /* A checked-in link inside a repository, pointing at a directory the
+     * same user owns: the plain walk refuses it and creates nothing behind
+     * it. The identical link IS followed once opted in, so the refusal comes
+     * from the call site's policy and nothing else. */
+    char outside[CBM_SZ_1K];
+    char artifact_link[CBM_SZ_1K];
+    char artifacts_through_link[CBM_SZ_1K];
+    char artifacts_outside[CBM_SZ_1K];
+    (void)snprintf(outside, sizeof(outside), "%s/outside", base);
+    (void)snprintf(artifact_link, sizeof(artifact_link), "%s/repo/.codebase-memory", base);
+    (void)snprintf(artifacts_through_link, sizeof(artifacts_through_link), "%s/artifacts",
+                   artifact_link);
+    (void)snprintf(artifacts_outside, sizeof(artifacts_outside), "%s/artifacts", outside);
+    char repo[CBM_SZ_1K];
+    (void)snprintf(repo, sizeof(repo), "%s/repo", base);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0700));
+    ASSERT_EQ(symlink(outside, artifact_link), 0);
+    /* Git creates the checked-in link owned by whoever cloned. A root run
+     * must model that account as non-root: root-owned links are trusted
+     * infrastructure for both walks, which is the pre-existing contract. */
+    bool privileged = geteuid() == 0;
+    enum { CLONING_UID = 65533 };
+    if (privileged) {
+        ASSERT_EQ(lchown(artifact_link, CLONING_UID, CLONING_UID), 0);
+    }
+    ASSERT_FALSE(cbm_mkdir_p(artifacts_through_link, 0700));
+    ASSERT_FALSE(cbm_is_dir(artifacts_outside));
+    if (!privileged) {
+        /* Same link, opted in: followed. Not under euid 0, where a privileged
+         * walk never follows a user's link whatever the call site says. */
+        ASSERT_TRUE(cbm_mkdir_p_ex(artifacts_through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(artifacts_outside));
+        ASSERT_EQ(cbm_rmdir(artifacts_outside), 0);
+    }
+
+    ASSERT_EQ(cbm_unlink(artifact_link), 0);
+    ASSERT_EQ(cbm_rmdir(repo), 0);
+    ASSERT_EQ(cbm_rmdir(outside), 0);
+    ASSERT_EQ(cbm_rmdir(agents_in_dotfiles), 0);
+    ASSERT_EQ(cbm_unlink(claude_link), 0);
+    ASSERT_EQ(cbm_rmdir(dotfiles), 0);
+    char *slash = strrchr(dotfiles, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(dotfiles), 0); /* home/dotfiles */
+    slash = strrchr(dotfiles, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(dotfiles), 0); /* home */
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
 TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
     char base[CBM_SZ_256];
     int written = snprintf(base, sizeof(base), "/tmp/cbm-utf8-Ã©Ã¨-XXXXXX");
@@ -102,6 +475,28 @@ TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
     ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
     PASS();
 }
+
+#ifdef _WIN32
+TEST(platform_mkstemp_retained_files_exceed_crt_namespace) {
+    char base[CBM_SZ_256] = "/tmp/cbm-many-temp-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+    char paths[64][CBM_SZ_512] = {{0}};
+    int created = 0;
+    for (; created < 64; created++) {
+        int written =
+            snprintf(paths[created], sizeof(paths[created]), "%s/.worker-log-XXXXXX", base);
+        ASSERT_TRUE(written > 0 && written < (int)sizeof(paths[created]));
+        int descriptor = cbm_mkstemp(paths[created]);
+        ASSERT_TRUE(descriptor >= 0);
+        ASSERT_EQ(_close(descriptor), 0);
+    }
+    for (int index = 0; index < created; index++) {
+        ASSERT_EQ(cbm_unlink(paths[index]), 0);
+    }
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+}
+#endif
 
 typedef struct {
     atomic_int *ready;
@@ -419,13 +814,141 @@ TEST(platform_cache_dir_rejects_truncated_override) {
     PASS();
 }
 
+/* cbm_env_long reads a whole number, or says it could not.
+ *
+ * atoi and atol answer 0 for text they cannot read, and 0 is a real setting at
+ * every place this project reads a number out of the environment. So the
+ * helper reports whether the read worked instead of folding a failure into a
+ * value that looks fine. */
+TEST(platform_env_long_reads_a_clean_number) {
+    const char *name = "CBM_TEST_ENV_LONG";
+    char *saved = getenv(name) ? strdup(getenv(name)) : NULL;
+    long out = 0;
+
+    ASSERT_EQ(cbm_setenv(name, "42", 1), 0);
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, 42);
+
+    /* Zero is a real answer, not a failure. This is the case that made
+     * CBM_INDEX_MAX_RESTARTS=0 mean 100 restarts. */
+    ASSERT_EQ(cbm_setenv(name, "0", 1), 0);
+    out = 999;
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, 0);
+
+    ASSERT_EQ(cbm_setenv(name, "-7", 1), 0);
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, -7);
+
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+    PASS();
+}
+
+TEST(platform_env_long_refuses_what_it_cannot_read) {
+    const char *name = "CBM_TEST_ENV_LONG";
+    char *saved = getenv(name) ? strdup(getenv(name)) : NULL;
+
+    /* Every one of these used to answer 0 through atol. */
+    const char *unreadable[] = {
+        "abc",
+        "30s",
+        " 30",
+        "30 ",
+        "",
+        "1e3",
+        "0x10",
+        "+ 30",
+        "--3",
+        "3.5",
+        "99999999999999999999999999",
+    };
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        ASSERT_EQ(cbm_setenv(name, unreadable[i], 1), 0);
+        long out = 1234; /* a value the helper must not touch */
+        if (cbm_env_long(name, &out)) {
+            printf("  \"%s\" was read as %ld\n", unreadable[i], out);
+        }
+        ASSERT_TRUE(!cbm_env_long(name, &out));
+        ASSERT_EQ(out, 1234);
+    }
+
+    /* A variable nobody set answers false too. */
+    ASSERT_EQ(cbm_unsetenv(name), 0);
+    long out = 555;
+    ASSERT_TRUE(!cbm_env_long(name, &out));
+    ASSERT_EQ(out, 555);
+
+    /* A NULL destination is refused rather than written through. */
+    ASSERT_EQ(cbm_setenv(name, "5", 1), 0);
+    ASSERT_TRUE(!cbm_env_long(name, NULL));
+
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+    PASS();
+}
+
+/* cbm_env_dup (#221) gives the same environment view as cbm_safe_getenv: an
+ * installed settings resolver answers first, a handled NULL masks the
+ * variable, and an unhandled name falls through to the process environment. */
+static bool platform_env_dup_test_resolver(const char *name, const char **value) {
+    if (strcmp(name, "CBM_TEST_ENV_DUP_RESOLVED") == 0) {
+        *value = "from-settings";
+        return true;
+    }
+    if (strcmp(name, "CBM_TEST_ENV_DUP_MASKED") == 0) {
+        *value = NULL;
+        return true;
+    }
+    return false;
+}
+
+TEST(platform_env_dup_honours_the_settings_resolver) {
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_RESOLVED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_MASKED", "from-environment", 1), 0);
+    ASSERT_EQ(cbm_setenv("CBM_TEST_ENV_DUP_NATIVE", "from-environment", 1), 0);
+
+    cbm_set_environment_resolver(platform_env_dup_test_resolver);
+    char *resolved = cbm_env_dup("CBM_TEST_ENV_DUP_RESOLVED");
+    char *masked = cbm_env_dup("CBM_TEST_ENV_DUP_MASKED");
+    char *native = cbm_env_dup("CBM_TEST_ENV_DUP_NATIVE");
+    char safe[64];
+    const char *safe_value = cbm_safe_getenv("CBM_TEST_ENV_DUP_RESOLVED", safe, sizeof(safe), NULL);
+    cbm_set_environment_resolver(NULL);
+
+    bool safe_ok = safe_value && strcmp(safe_value, "from-settings") == 0;
+    bool resolved_ok = resolved && strcmp(resolved, "from-settings") == 0;
+    bool masked_ok = masked == NULL;
+    bool native_ok = native && strcmp(native, "from-environment") == 0;
+    cbm_free(CBM_MEM_CLASS_OTHER, resolved);
+    cbm_free(CBM_MEM_CLASS_OTHER, masked);
+    cbm_free(CBM_MEM_CLASS_OTHER, native);
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_RESOLVED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_MASKED");
+    (void)cbm_unsetenv("CBM_TEST_ENV_DUP_NATIVE");
+
+    ASSERT_TRUE(safe_ok);
+    ASSERT_TRUE(resolved_ok);
+    ASSERT_TRUE(masked_ok);
+    ASSERT_TRUE(native_ok);
+    PASS();
+}
+
 #ifdef _WIN32
 /* cbm_safe_getenv reads Windows' wide environment as UTF-8. Its matching
  * setter must update that same wide environment; _putenv_s alone interprets
  * UTF-8 path bytes through the active ANSI code page. */
 TEST(platform_setenv_preserves_utf8_in_wide_environment) {
-    static const char utf8[] = "C:/cbm-cache-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac";
-    static const wchar_t wide[] = L"C:/cbm-cache-\u0394-\u65e5\u672c";
+    static const char utf8[] = "C:/cbm-cache-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac-\xe4\xb8\x81";
+    static const wchar_t wide[] = L"C:/cbm-cache-\u0394-\u65e5\u672c-\u4e01";
     ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", utf8, 1), 0);
     wchar_t observed_wide[128];
     ASSERT_EQ(GetEnvironmentVariableW(L"CBM_CACHE_DIR", observed_wide, 128), (DWORD)(wcslen(wide)));
@@ -433,6 +956,14 @@ TEST(platform_setenv_preserves_utf8_in_wide_environment) {
     char observed_utf8[128];
     ASSERT_NOT_NULL(cbm_safe_getenv("CBM_CACHE_DIR", observed_utf8, sizeof(observed_utf8), NULL));
     ASSERT_STR_EQ(observed_utf8, utf8);
+    /* Narrow getenv must agree with the CRT's active ANSI code page. */
+    char expected_narrow[128];
+    ASSERT_GT(WideCharToMultiByte(CP_ACP, 0, wide, -1, expected_narrow,
+                                  (int)sizeof(expected_narrow), NULL, NULL),
+              0);
+    const char *observed_narrow = getenv("CBM_CACHE_DIR");
+    ASSERT_NOT_NULL(observed_narrow);
+    ASSERT_STR_EQ(observed_narrow, expected_narrow);
     (void)cbm_unsetenv("CBM_CACHE_DIR");
     PASS();
 }
@@ -683,9 +1214,244 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+/* ── compat_regex: compile-size guard ──────────────────────────── */
+
+static uint64_t regex_units_ere(const char *pattern) {
+    return cbm_regcomp_estimate_units(pattern, CBM_REG_EXTENDED);
+}
+
+static uint64_t regex_units_bre(const char *pattern) {
+    return cbm_regcomp_estimate_units(pattern, 0);
+}
+
+/* Writes "(a|b|c|...)" with `branches` one-letter alternatives into buf, which
+ * must hold 2 * branches + 2 bytes. */
+static void regex_one_letter_alternation(char *buf, int branches) {
+    char *w = buf;
+    *w++ = '(';
+    for (int i = 0; i < branches; i++) {
+        if (i) {
+            *w++ = '|';
+        }
+        *w++ = (char)('a' + i % 26);
+    }
+    *w++ = ')';
+    *w = '\0';
+}
+
+/* Both regex backends expand `X{m,n}` into n copies of X at compile time, so
+ * nested intervals multiply and a 25-byte pattern can ask for millions of
+ * atoms. The wrapper sizes the pattern first and refuses one over the budget
+ * with CBM_REG_ETOOBIG before the platform compiler allocates anything, so
+ * there is nothing to free on refusal. The over-budget shapes here are small
+ * enough that an unguarded compile would still only cost tens of MB. */
+TEST(regex_compile_refuses_oversized_expansion) {
+    cbm_regex_t re;
+    /* 14^4 = 38,416 expanded atoms from 25 bytes: over the 32,768-unit budget. */
+    const char *nested = "((((a){14}){14}){14}){14}";
+    ASSERT_EQ(cbm_regcomp(&re, nested, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    /* Every flag set the call sites use is refused the same way. */
+    ASSERT_EQ(cbm_regcomp(&re, nested, CBM_REG_EXTENDED), CBM_REG_ETOOBIG);
+    ASSERT_EQ(cbm_regcomp(&re, nested, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE),
+              CBM_REG_ETOOBIG);
+    /* A repeated alternation multiplies too: (16 + 16*16/8) x 255 x 3 = 36,720. */
+    ASSERT_EQ(cbm_regcomp(&re, "((a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p){255}){3}",
+                          CBM_REG_EXTENDED | CBM_REG_NOSUB),
+              CBM_REG_ETOOBIG);
+    /* A plain alternation just over the budget: 509 one-letter branches cost
+     * 509 + 509*509/8 = 32,894 units; 508 cost 32,766 and stay accepted. */
+    char alts[2 * 509 + 2];
+    regex_one_letter_alternation(alts, 509);
+    ASSERT_EQ(regex_units_ere(alts), 32894);
+    ASSERT_EQ(cbm_regcomp(&re, alts, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    regex_one_letter_alternation(alts, 508);
+    ASSERT_EQ(regex_units_ere(alts), 32766);
+    ASSERT_LTE(regex_units_ere(alts), (uint64_t)CBM_REGEX_COMPILE_BUDGET_UNITS);
+    /* Bounds too large to represent saturate instead of wrapping around. */
+    ASSERT_EQ(cbm_regcomp(&re, "(a{99999999999999999999}){99999999999999999999}",
+                          CBM_REG_EXTENDED | CBM_REG_NOSUB),
+              CBM_REG_ETOOBIG);
+    /* Nesting deeper than the sizing pass tracks is refused, not recursed into. */
+    char deep[2 * 70 + 2];
+    memset(deep, '(', 70);
+    deep[70] = 'a';
+    memset(deep + 71, ')', 70);
+    deep[141] = '\0';
+    ASSERT_EQ(cbm_regcomp(&re, deep, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    PASS();
+}
+
+/* The same nested shape one step under the budget (13^4 = 28,561 units)
+ * compiles and matches, so the refusal starts only past the budget. */
+TEST(regex_compile_accepts_expansion_under_budget) {
+    cbm_regex_t re;
+    ASSERT_EQ(regex_units_ere("((((a){13}){13}){13}){13}"), 28561);
+    ASSERT_EQ(cbm_regcomp(&re, "((((a){13}){13}){13}){13}", CBM_REG_EXTENDED | CBM_REG_NOSUB),
+              CBM_REG_OK);
+    char *subject = malloc(28561 + 1);
+    ASSERT_NOT_NULL(subject);
+    memset(subject, 'a', 28561);
+    subject[28561] = '\0';
+    ASSERT_EQ(cbm_regexec(&re, subject, 0, NULL, 0), CBM_REG_OK);
+    subject[28560] = '\0'; /* 28,560 a's: one short of 13^4 */
+    ASSERT_EQ(cbm_regexec(&re, subject, 0, NULL, 0), CBM_REG_NOMATCH);
+    free(subject);
+    cbm_regfree(&re);
+    PASS();
+}
+
+/* A pattern longer than CBM_REGEX_PATTERN_MAX_BYTES is refused outright; one
+ * exactly at the cap still compiles (a literal at the cap is exactly the unit
+ * budget, which is accepted). */
+TEST(regex_compile_refuses_overlong_pattern) {
+    cbm_regex_t re;
+    char *pattern = malloc(CBM_REGEX_PATTERN_MAX_BYTES + 2);
+    ASSERT_NOT_NULL(pattern);
+    memset(pattern, 'a', CBM_REGEX_PATTERN_MAX_BYTES + 1);
+    pattern[CBM_REGEX_PATTERN_MAX_BYTES + 1] = '\0';
+    ASSERT_EQ(cbm_regcomp(&re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_ETOOBIG);
+    pattern[CBM_REGEX_PATTERN_MAX_BYTES] = '\0';
+    ASSERT_EQ(cbm_regcomp(&re, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+    cbm_regfree(&re);
+    free(pattern);
+    PASS();
+}
+
+/* Ordinary intervals, the pipeline's fixed patterns and patterns from the
+ * tool-level tests stay well inside the budget. */
+TEST(regex_compile_accepts_ordinary_intervals) {
+    static const char *const patterns[] = {
+        "[a-z]{1,64}",
+        ".{0,255}",
+        "(\\w{1,100}){1,20}",
+        "(foo|bar|baz){2,5}",
+        "^[A-Za-z_][A-Za-z0-9_]{0,255}$",
+        "[0-9]{4}-[0-9]{2}-[0-9]{2}",
+        /* pass_calls.c, and the retired env-URL scanner */
+        "Depends\\(([A-Za-z_][A-Za-z0-9_.]*)",
+        "^(ENV|ARG)[[:space:]]+([A-Za-z0-9_]+)[= ](.*)",
+        "(default|value)[[:space:]]*=[[:space:]]*\"(https?://[^\"]+)\"",
+        "(export[[:space:]]+)?([A-Za-z0-9_]+)=[\"']?(https?://[^ \t\"']+)",
+        /* test_mcp.c and test_cypher.c */
+        ".*Order.*",
+        "^src/",
+        "^no_such_dir/",
+        "/api/.*",
+        "^design/",
+    };
+    cbm_regex_t re;
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        int rc = cbm_regcomp(&re, patterns[i], CBM_REG_EXTENDED | CBM_REG_NOSUB);
+        if (rc != CBM_REG_OK) {
+            printf("  pattern %zu refused with rc=%d: %s\n", i, rc, patterns[i]);
+        }
+        ASSERT_EQ(rc, CBM_REG_OK);
+        cbm_regfree(&re);
+    }
+
+    /* A long alternation of identifiers, as a search for "any of these names"
+     * sends it: 400 names of up to nine characters is 3,761 bytes and about
+     * 23,400 units (20,000 of them the alternation share). It stays under both
+     * caps and compiles under the search_graph flag set. */
+    static const char *const prefixes[] = {"parse", "emit", "visit", "bind", "scan"};
+    char names[CBM_SZ_4K];
+    char *w = names;
+    *w++ = '(';
+    for (int i = 0; i < 400; i++) {
+        w += snprintf(w, (size_t)(names + sizeof(names) - w), "%s%s_%03d", i ? "|" : "",
+                      prefixes[i % 5], i);
+    }
+    *w++ = ')';
+    *w = '\0';
+    ASSERT_LTE(strlen(names), (size_t)CBM_REGEX_PATTERN_MAX_BYTES);
+    ASSERT_GTE(regex_units_ere(names), (uint64_t)20000);
+    ASSERT_LTE(regex_units_ere(names), (uint64_t)CBM_REGEX_COMPILE_BUDGET_UNITS);
+    ASSERT_EQ(cbm_regcomp(&re, names, CBM_REG_EXTENDED | CBM_REG_NOSUB | CBM_REG_ICASE),
+              CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "Bind_123", 0, NULL, 0), CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "bind_400", 0, NULL, 0), CBM_REG_NOMATCH);
+    cbm_regfree(&re);
+
+    /* The same at realistic identifier length: 400 names of 20 characters is
+     * 8,401 bytes and 28,000 units, inside the budget — the length cap never
+     * decides a name list of this size, the unit budget does. */
+    static const char *const long_prefixes[] = {"compute_checksum", "validate_request",
+                                                "serialize_record", "normalize_header",
+                                                "dispatch_message"};
+    const size_t long_cap = 400 * 21 + 3;
+    char *long_names = malloc(long_cap);
+    ASSERT_NOT_NULL(long_names);
+    w = long_names;
+    *w++ = '(';
+    for (int i = 0; i < 400; i++) {
+        w += snprintf(w, long_cap - (size_t)(w - long_names), "%s%s_%03d", i ? "|" : "",
+                      long_prefixes[i % 5], i);
+    }
+    *w++ = ')';
+    *w = '\0';
+    ASSERT_EQ(strlen(long_names), 8401);
+    ASSERT_EQ(regex_units_ere(long_names), 28000);
+    ASSERT_EQ(cbm_regcomp(&re, long_names, CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "normalize_header_123", 0, NULL, 0), CBM_REG_OK);
+    ASSERT_EQ(cbm_regexec(&re, "normalize_header_400", 0, NULL, 0), CBM_REG_NOMATCH);
+    cbm_regfree(&re);
+    free(long_names);
+
+    /* `.{0,500}` is 500 units, inside the budget. Whether it compiles is the
+     * platform's RE_DUP_MAX (255 on the TRE-derived libcs, 32767 on glibc),
+     * which the guard does not change. */
+    ASSERT_LTE(regex_units_ere(".{0,500}"), (uint64_t)CBM_REGEX_COMPILE_BUDGET_UNITS);
+#ifdef __linux__
+    ASSERT_EQ(cbm_regcomp(&re, ".{0,500}", CBM_REG_EXTENDED | CBM_REG_NOSUB), CBM_REG_OK);
+    cbm_regfree(&re);
+#endif
+    PASS();
+}
+
+/* Sizing must read the syntax the way the compilers do: nothing inside a
+ * bracket expression operates, a backslash escapes one character, braces that
+ * do not form an interval are literals, and only an interval multiplies. */
+TEST(regex_estimate_counts_brackets_and_escapes_literally) {
+    ASSERT_EQ(regex_units_ere("[{]{2}"), 2);
+    ASSERT_EQ(regex_units_ere("\\{"), 1);
+    ASSERT_EQ(regex_units_ere("a\\{2\\}"), 4);
+    ASSERT_EQ(regex_units_ere("[]a]{2}"), 2);
+    ASSERT_EQ(regex_units_ere("[^]a]{3}"), 3);
+    ASSERT_EQ(regex_units_ere("[[:alpha:]]{4}"), 4);
+    ASSERT_EQ(regex_units_ere("[a-z{3}]"), 1);
+    ASSERT_EQ(regex_units_ere("a{"), 2);
+    ASSERT_EQ(regex_units_ere("a{2"), 3);
+    ASSERT_EQ(regex_units_ere("a{x}"), 4);
+    ASSERT_EQ(regex_units_ere("a{2}"), 2);
+    ASSERT_EQ(regex_units_ere("a{2,}"), 2);
+    ASSERT_EQ(regex_units_ere("a{,3}"), 3);
+    ASSERT_EQ(regex_units_ere("a{2,5}"), 5);
+    ASSERT_EQ(regex_units_ere("a*b+c?"), 3);
+    ASSERT_EQ(regex_units_ere("a{3}{3}"), 9);
+    ASSERT_EQ(regex_units_ere("(ab){3}"), 6);
+    ASSERT_EQ(regex_units_ere("((ab){3}){4}"), 24);
+    /* A K-way alternation is charged K*K/8 on top of its branches. */
+    ASSERT_EQ(regex_units_ere("a|b|c|d"), 4 + 2);
+    ASSERT_EQ(regex_units_ere("(a|b|c|d){10}"), 60);
+    /* Basic syntax: bare braces and parens are literals; `\{ \}` and `\( \)`
+     * operate. No call site uses it today, but the guard is shared. */
+    ASSERT_EQ(regex_units_bre("a{2}"), 4);
+    ASSERT_EQ(regex_units_bre("a\\{2\\}"), 2);
+    ASSERT_EQ(regex_units_bre("\\(ab\\)\\{3\\}"), 6);
+    ASSERT_EQ(regex_units_bre("(ab){3}"), 7);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
+    RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
+    RUN_TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode);
+    RUN_TEST(platform_mkdir_p_follow_owned_is_per_call_site);
+    RUN_TEST(platform_mkdir_p_resolves_link_text_from_the_link_directory);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
+#ifdef _WIN32
+    RUN_TEST(platform_mkstemp_retained_files_exceed_crt_namespace);
+#endif
     RUN_TEST(platform_mkdtemp_is_thread_safe);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
@@ -707,7 +1473,15 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(platform_env_long_reads_a_clean_number);
+    RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
+    RUN_TEST(platform_env_dup_honours_the_settings_resolver);
     RUN_TEST(platform_system_info);
+    RUN_TEST(regex_compile_refuses_oversized_expansion);
+    RUN_TEST(regex_compile_accepts_expansion_under_budget);
+    RUN_TEST(regex_compile_refuses_overlong_pattern);
+    RUN_TEST(regex_compile_accepts_ordinary_intervals);
+    RUN_TEST(regex_estimate_counts_brackets_and_escapes_literally);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);

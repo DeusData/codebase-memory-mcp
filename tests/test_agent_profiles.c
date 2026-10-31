@@ -360,6 +360,24 @@ TEST(agent_profiles_omp_direct_has_prefixed_tools_and_handoff_excludes_mcp) {
     PASS();
 }
 
+TEST(agent_profiles_opencode_allows_tool_search_and_subagent_permissions) {
+    char *direct = cbm_render_graph_profile(CBM_GRAPH_DIALECT_OPENCODE, CBM_GRAPH_TIER_VERIFY,
+                                            CBM_GRAPH_ACCESS_DIRECT, NULL);
+    ASSERT_NOT_NULL(direct);
+    ASSERT_NOT_NULL(strstr(direct, "mode: subagent\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  \"*\": deny\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  read: allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  grep: allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  glob: allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  tool_search: allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  tool_search_regex: allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  \"codebase-memory-mcp_search_graph\": allow\n"));
+    ASSERT_NOT_NULL(strstr(direct, "  \"codebase-memory-mcp_check_index_coverage\": allow\n"));
+    ASSERT_NULL(strstr(direct, "delete_project"));
+    free(direct);
+    PASS();
+}
+
 SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_stable_tier_identity);
     RUN_TEST(agent_profiles_direct_dialects_are_coverage_aware_and_read_only);
@@ -371,6 +389,7 @@ SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path);
     RUN_TEST(agent_profiles_vibe_uses_matching_prompt_identifier_and_contract);
     RUN_TEST(agent_profiles_omp_direct_has_prefixed_tools_and_handoff_excludes_mcp);
+    RUN_TEST(agent_profiles_opencode_allows_tool_search_and_subagent_permissions);
     RUN_TEST(agent_profiles_grok_uses_dispatcher_ids_and_named_inheritance);
     RUN_TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs);
 }

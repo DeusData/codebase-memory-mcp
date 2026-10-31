@@ -1,0 +1,100 @@
+{
+  "files": 6,
+  "checksumsOk": true,
+  "llamaServerRuns": true,
+  "version": "0.3.0-dev (build 1, commit 90c26fc)",
+  "durationMs": 10686,
+  "generatedAt": "2026-08-28T22:36:00.816Z",
+  "extras": {
+    "models": [
+      {
+        "file": "gemma-4-E4B-it-Q4_K_M.gguf",
+        "expected": "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87",
+        "exists": true,
+        "size": 4977171584,
+        "actual": "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87",
+        "ok": true
+      },
+      {
+        "file": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf",
+        "expected": "b1b3de114215d9507409a662a501a631095a479a419584e8a2ded6304b19b4f5",
+        "exists": true,
+        "size": 730895168,
+        "actual": "b1b3de114215d9507409a662a501a631095a479a419584e8a2ded6304b19b4f5",
+        "ok": true
+      },
+      {
+        "file": "MiniCPM5-1B-Q4_K_M.gguf",
+        "expected": "81b64d05a23b17b34c475f42b3e72fbde62d4b92cc34541f7a8031d0752deafa",
+        "exists": true,
+        "size": 688065920,
+        "actual": "81b64d05a23b17b34c475f42b3e72fbde62d4b92cc34541f7a8031d0752deafa",
+        "ok": true
+      },
+      {
+        "file": "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "expected": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+        "exists": true,
+        "size": 1117320768,
+        "actual": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+        "ok": true
+      },
+      {
+        "file": "Qwen3.5-2B-Q4_K_M.gguf",
+        "expected": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+        "exists": true,
+        "size": 1280835840,
+        "actual": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+        "ok": true
+      },
+      {
+        "file": "Qwen3.5-4B-Q4_K_M.gguf",
+        "expected": "3874209241c9a397e2f62cd3f70f80fd2dfbf0dfccb6838416bdb48a714e8630",
+        "exists": true,
+        "size": 2834975040,
+        "actual": "3874209241c9a397e2f62cd3f70f80fd2dfbf0dfccb6838416bdb48a714e8630",
+        "ok": true
+      }
+    ],
+    "missing": [],
+    "unexpected": [],
+    "errors": [],
+    "versionExit": 0,
+    "versionOutput": [
+      "version: 0.3.0-dev (build 1, commit 90c26fc)",
+      "built with AppleClang 17.0.0.17000604 for Darwin arm64"
+    ],
+    "loadSmoke": {
+      "model": "MiniCPM5-1B-Q4_K_M.gguf",
+      "port": 4300,
+      "ready": true,
+      "durationMs": 1029,
+      "statuses": [
+        "503 {\"error\":{\"message\":\"Loading model\",\"type\":\"unavailable_erro",
+        "200 {\"status\":\"ok\"}"
+      ],
+      "props": {
+        "model_path": "models/MiniCPM5-1B-Q4_K_M.gguf",
+        "model_ftype": "Q4_K - Medium",
+        "n_ctx": 512,
+        "total_slots": 4
+      },
+      "error": "",
+      "tail": [
+        "0.00.045.844 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)",
+        "0.00.048.350 W srv  llama_server: -----------------",
+        "0.00.048.351 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set",
+        "0.00.048.351 W srv  llama_server: this can be a security risk (cross-origin attacks)",
+        "0.00.048.352 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655",
+        "0.00.048.352 W srv  llama_server: -----------------",
+        "0.00.049.761 I srv    load_model: loading model 'models/MiniCPM5-1B-Q4_K_M.gguf'",
+        "0.00.372.013 I cmn          init: llama threadpool init, n_threads = 8",
+        "0.00.515.790 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 512, kv_unified = 'true'",
+        "0.00.521.942 I srv  llama_server: model loaded",
+        "0.00.521.947 I srv  llama_server: listening on http://127.0.0.1:4300",
+        "0.01.031.167 I srv    operator(): operator(): cleaning up before exit..."
+      ]
+    },
+    "leftoverProcesses": 0
+  }
+}

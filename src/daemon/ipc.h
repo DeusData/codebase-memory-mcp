@@ -76,6 +76,19 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io);
 void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener);
 
+/* Heartbeat for the daemon's long-lived runtime artifacts: refresh the held
+ * lifetime reservation, the listener's participant guard (if it owns one),
+ * external_guard (optional, a guard the caller retains beside this listener)
+ * and the published identity marker so an age-based temp cleaner never
+ * deletes them (#2178). Returns 1 when all were refreshed, 0 once any no
+ * longer names the file this listener owns (a lost lifetime file lets a peer
+ * start a second generation; a lost identity marker makes listener close
+ * leave the socket pair behind), and -1 when a still-valid file could not be
+ * refreshed (transient). Only the thread that closes the listener may call it
+ * while the listener is open. */
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard);
+
 /* Create or validate one private current-user directory at an already
  * canonical local path. Ancestors are handle-validated without mutation:
  * POSIX permits only root/current-user owners and no group/other write (apart
@@ -91,9 +104,73 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
  * validation refusal (empty string when none). Diagnostic only — callers
  * append it to their error messages; policy decisions never read it. */
 const char *cbm_daemon_ipc_validation_detail(void);
+
+/* #1717: advice, never a refusal. When cache_root lives on a network
+ * filesystem (Linux statfs: NFS, CIFS, SMB2, Lustre, GPFS), log one
+ * `daemon.cache_root_network_fs` warning per process pointing at local
+ * storage. Returns true only when this call emitted that warning. */
+bool cbm_daemon_ipc_warn_if_network_cache_root(const char *cache_root);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Report `magic` as the cache root's statfs f_type on every platform (active),
+ * or restore real detection; either way re-arm the once-per-process warning. */
+void cbm_daemon_ipc_set_fs_magic_for_test(bool active, unsigned long magic);
+#endif
+
+/* This process's most recent listener-publication failure: the stage that
+ * refused, the errno the failing step reported (0 when the step reported
+ * none), and the artifact path it was operating on ("" when no path applies).
+ * Every `daemon.ipc.listen_failed` log line carries the same three fields.
+ * Reset at the start of each listen attempt. Returns false while no failure
+ * has been recorded. Diagnostic only: the daemon host copies it into its
+ * durable start-failure record so a waiting client can name the cause instead
+ * of burning its full startup deadline (#1828). */
+enum {
+    CBM_DAEMON_IPC_LISTEN_FAILURE_STAGE_CAP = 32,
+    CBM_DAEMON_IPC_LISTEN_FAILURE_PATH_CAP = 4096
+};
+typedef struct {
+    char stage[CBM_DAEMON_IPC_LISTEN_FAILURE_STAGE_CAP];
+    int errno_value;
+    char path[CBM_DAEMON_IPC_LISTEN_FAILURE_PATH_CAP];
+} cbm_daemon_ipc_listen_failure_t;
+bool cbm_daemon_ipc_listen_failure_detail(cbm_daemon_ipc_listen_failure_t *out);
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* #1537: seed the detail so a test can prove the CLI refusal surfaces it. */
 void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail);
+#ifdef _WIN32
+/* #1705: run the daemon's directory-owner/ACE trust predicate against an
+ * arbitrary SID, so a test can assert THIS machine's built-in Administrator
+ * (RID-500) is trusted while a foreign S-1-5-21-*-500 is not. Returns false on
+ * any setup failure. Windows only. */
+bool cbm_daemon_ipc_win_sid_trusted_for_testing(void *sid);
+#endif
+#ifndef _WIN32
+/* #1830 seams (POSIX). Override the single-uid user-namespace overflow uid that
+ * ancestors may be owned by (active=false restores the real /proc-derived
+ * value); and expose the pure uid_map-parse and ancestor accept/refuse decision
+ * so they can be tested without a chown-able overflow-owned directory. */
+void cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(bool active,
+                                                             unsigned long overflow_uid);
+/* #1717 seam (POSIX): report the directory at directory_path (matched by
+ * dev/ino) as owned by foreign_uid during the ancestor walk. False when the
+ * path is not a directory. Clear restores real ownership. */
+bool cbm_daemon_ipc_posix_set_foreign_owned_dir_for_test(const char *directory_path,
+                                                         unsigned long foreign_uid);
+void cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test(void);
+bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, unsigned long euid);
+bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
+                                                    unsigned long euid, bool overflow_active,
+                                                    unsigned long overflow_uid);
+/* #1687: treat every directory as on a WSL DrvFs mount so the remedy text in
+ * the private-directory refusal is testable off WSL. Diagnostic only. */
+void cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(bool force);
+#if defined(__linux__)
+/* Number of REAL overflow-uid derivations so far. The value is meaningless on
+ * its own; the point is that it must rise on every ancestor check, proving no
+ * cache has crept back in. */
+unsigned cbm_daemon_ipc_posix_overflow_compute_count_for_test(void);
+#endif
+#endif
 #endif
 
 /* Create/validate an owner-only directory and securely open one regular
@@ -131,9 +208,11 @@ int cbm_daemon_ipc_lifetime_reservation_probe(const cbm_daemon_ipc_endpoint_t *e
 /* Remove only a provably current-generation stale Unix socket identity. The
  * caller must first observe an absent lifetime reservation and retain the
  * matching startup lock for the complete call; the implementation rechecks
- * both conditions. Stable deletion requires a committed marker whose named
- * anchor and stable path are the same secure socket inode; pending alone may
- * only complete that commit when both paths independently corroborate it.
+ * both conditions. Stable deletion normally requires a committed marker whose
+ * named anchor and stable path are the same secure socket inode; pending alone
+ * may only complete that commit when both paths independently corroborate it.
+ * With both records absent, the exact owner-private two-name/two-link stable
+ * socket and anchor shape is also recoverable after immediate revalidation.
  * A differing stable replacement is preserved while owned anchor/records are
  * collected. Returns 1 when the stable endpoint is absent and all owned
  * artifacts are absent or were removed, 0 when cleanup is refused for a live,
@@ -193,8 +272,10 @@ int cbm_daemon_ipc_startup_lock_try_acquire(const cbm_daemon_ipc_endpoint_t *end
                                             cbm_daemon_ipc_startup_lock_t **lock_out);
 /* Activation-only no-spawn generation probe under the exact matching,
  * retained, unprepared startup lock. It ignores the caller's own startup-v2
- * and frozen-legacy startup claims, and reports only a live daemon lifetime,
- * stable current transport, or deterministic legacy/current sentinel.
+ * and frozen-legacy startup claims, serially cleans a provable stale POSIX
+ * generation under a temporary lifetime reservation, and reports only a live
+ * daemon lifetime, remaining stable transport, or deterministic
+ * legacy/current sentinel.
  * Returns 1 when active, 0 when authoritatively absent, and -1 when the lock,
  * endpoint, transport, or ownership cannot be validated. */
 int cbm_daemon_ipc_generation_probe_under_startup_lock(
@@ -222,6 +303,10 @@ bool cbm_daemon_ipc_startup_lock_release(cbm_daemon_ipc_startup_lock_t **lock_io
 int cbm_daemon_ipc_participant_guard_try_join(const cbm_daemon_ipc_endpoint_t *endpoint,
                                               cbm_daemon_ipc_participant_guard_t **guard_out);
 bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t **guard_io);
+/* Same heartbeat contract and 1/0/-1 result as cbm_daemon_ipc_listener_touch,
+ * for a guard the caller retains itself. */
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard);
 
 /* Standalone CLI work joins the legacy-compatible current participant group
  * without becoming a daemon client. Acquisition retains startup-v2 only for
@@ -252,7 +337,13 @@ bool cbm_daemon_ipc_local_transition_begin_work(cbm_daemon_ipc_local_transition_
  * Windows teardown reacquires startup-v2 and the legacy mutex, releases group
  * SH, closes this participant's sentinel last, then releases mutex and v2.
  * Success consumes and clears *transition_io; a retryable native cleanup
- * failure returns false and retains it. */
+ * failure or startup-gate contention returns false and retains it. */
 bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t **transition_io);
+/* Nonblocking release: 1 consumes and clears *transition_io (also when already
+ * empty), 0 retains it while another startup owns a required gate, and -1
+ * retains it on an unsafe/native I/O failure. A NULL transition_io is invalid.
+ * Callers can give healthy contention its own wait policy without extending
+ * the deadline for repeated native cleanup failures. */
+int cbm_daemon_ipc_local_transition_try_release(cbm_daemon_ipc_local_transition_t **transition_io);
 
 #endif /* CBM_DAEMON_IPC_H */

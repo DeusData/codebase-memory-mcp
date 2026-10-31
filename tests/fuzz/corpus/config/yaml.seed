@@ -1,0 +1,5 @@
+ymcp_servers:
+  other:
+    command: other
+  codebase-memory:
+    command: old

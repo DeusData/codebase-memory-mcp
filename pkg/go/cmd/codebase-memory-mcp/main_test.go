@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,18 +30,18 @@ func (transport archiveTestRoundTripper) RoundTrip(
 	return transport(request)
 }
 
-type archiveCountingBody struct {
-	reader io.Reader
-	read   int64
-}
+// formerMemberCapBytes is the size cap the 0.12.0 wrappers enforced, which
+// refused every release.
+const formerMemberCapBytes = int64(256 * 1024 * 1024)
 
-func (body *archiveCountingBody) Read(buffer []byte) (int, error) {
-	count, err := body.reader.Read(buffer)
-	body.read += int64(count)
-	return count, err
-}
+type zeroReader struct{}
 
-func (*archiveCountingBody) Close() error { return nil }
+func (zeroReader) Read(buffer []byte) (int, error) {
+	for index := range buffer {
+		buffer[index] = 0
+	}
+	return len(buffer), nil
+}
 
 func assertRuntimeTag(t *testing.T, directory, binaryName, tag string) {
 	t.Helper()
@@ -157,164 +158,167 @@ func writeTarGz(t *testing.T, archivePath string, names []string) {
 	}
 }
 
-func TestCompressedArchiveDownloadRejectsDeclaredAndActualOverflow(t *testing.T) {
-	const maxBytes = int64(8)
+func TestDownloadIgnoresADeclaredLengthAboveTheFormerCap(t *testing.T) {
 	priorClient := httpsOnlyClient
 	defer func() { httpsOnlyClient = priorClient }()
-
-	t.Run("declared", func(t *testing.T) {
-		httpsOnlyClient = &http.Client{Transport: archiveTestRoundTripper(
-			func(request *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode:    http.StatusOK,
-					Body:          io.NopCloser(strings.NewReader("")),
-					ContentLength: maxBytes + 1,
-					Header:        make(http.Header),
-					Request:       request,
-				}, nil
-			},
-		)}
-		destination := filepath.Join(t.TempDir(), "release.tar.gz")
-		err := httpGetWithLimit(
-			"https://example.invalid/release.tar.gz", destination, maxBytes,
-		)
-		if err == nil || !strings.Contains(err.Error(), "compressed safety limit") {
-			t.Fatalf("compressed declared overflow error = %v", err)
-		}
-		if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
-			t.Fatal("declared oversized archive created a download")
-		}
-	})
-
-	t.Run("actual", func(t *testing.T) {
-		body := &archiveCountingBody{reader: bytes.NewReader(
-			bytes.Repeat([]byte("x"), 1024),
-		)}
-		httpsOnlyClient = &http.Client{Transport: archiveTestRoundTripper(
-			func(request *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode:    http.StatusOK,
-					Body:          body,
-					ContentLength: -1,
-					Header:        make(http.Header),
-					Request:       request,
-				}, nil
-			},
-		)}
-		destination := filepath.Join(t.TempDir(), "release.tar.gz")
-		err := httpGetWithLimit(
-			"https://example.invalid/release.tar.gz", destination, maxBytes,
-		)
-		if err == nil || !strings.Contains(err.Error(), "compressed safety limit") {
-			t.Fatalf("compressed actual overflow error = %v", err)
-		}
-		if body.read != maxBytes+1 {
-			t.Fatalf("oversized response bytes consumed = %d, want %d", body.read, maxBytes+1)
-		}
-		if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
-			t.Fatal("rejected compressed archive left a partial download")
-		}
-	})
-}
-
-func testArchiveLimits(
-	members int, memberBytes, expandedBytes int64,
-) archiveResourceLimits {
-	return archiveResourceLimits{
-		compressedBytes: 1024 * 1024,
-		members:         members,
-		memberBytes:     memberBytes,
-		expandedBytes:   expandedBytes,
+	httpsOnlyClient = &http.Client{Transport: archiveTestRoundTripper(
+		func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Body:          io.NopCloser(strings.NewReader("contents")),
+				ContentLength: formerMemberCapBytes + 1,
+				Header:        make(http.Header),
+				Request:       request,
+			}, nil
+		},
+	)}
+	destination := filepath.Join(t.TempDir(), "release.tar.gz")
+	if err := httpGet(
+		"https://example.invalid/release.tar.gz", destination, false,
+	); err != nil {
+		t.Fatalf("download error = %v", err)
+	}
+	contents, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "contents" {
+		t.Fatalf("download stored %q", contents)
 	}
 }
 
-func TestTarArchiveRejectsMemberAndExpandedResourceOverflow(t *testing.T) {
+func TestTarArchiveRejectsMoreMembersThanTheLimit(t *testing.T) {
+	archivePath := filepath.Join(t.TempDir(), "members.tar.gz")
+	writeTarGz(t, archivePath, []string{"one", "two", "three"})
+	_, err := tarGzMemberNamesWithMemberLimit(archivePath, 2)
+	if err == nil || !strings.Contains(err.Error(), "2-member safety limit") {
+		t.Fatalf("tar member count error = %v", err)
+	}
+}
+
+func TestArchiveCopyAcceptsAMemberLargerThanTheFormerCap(t *testing.T) {
+	size := formerMemberCapBytes + 1024*1024
+	if err := copyArchiveMember(
+		io.Discard, io.LimitReader(zeroReader{}, size), "codebase-memory-mcp", size,
+	); err != nil {
+		t.Fatalf("copy of a %d-byte member error = %v", size, err)
+	}
+}
+
+func TestArchiveCopyRequiresTheDeclaredSize(t *testing.T) {
+	var output bytes.Buffer
+	err := copyArchiveMember(&output, strings.NewReader("123"), "member", 2)
+	if err == nil || !strings.Contains(err.Error(), "does not match declared size") {
+		t.Fatalf("declared size mismatch error = %v", err)
+	}
+}
+
+func TestDownloadBaseFollowsTheInstallShPolicy(t *testing.T) {
+	githubBase := "https://github.com/DeusData/codebase-memory-mcp/releases/download/v" + version
+	if base, loopback, err := downloadBase(""); err != nil || base != githubBase || loopback {
+		t.Fatalf("unset override = (%q, %v, %v), want the GitHub base", base, loopback, err)
+	}
+	for _, override := range []string{
+		"https://mirror.example/releases/v1",
+		"https://127.0.0.1:8443/fixture",
+	} {
+		base, loopback, err := downloadBase(override)
+		if err != nil || base != override || loopback {
+			t.Errorf("https override %q = (%q, %v, %v)", override, base, loopback, err)
+		}
+	}
+	for _, override := range []string{
+		"http://localhost",
+		"http://localhost:8080/fixture",
+		"http://127.0.0.1:41234/standard",
+		"http://[::1]:9/x?y#z",
+	} {
+		base, loopback, err := downloadBase(override)
+		if err != nil || base != override || !loopback {
+			t.Errorf("loopback override %q = (%q, %v, %v)", override, base, loopback, err)
+		}
+	}
+	for _, override := range []string{
+		"http://example.com/releases",
+		"http://127.0.0.1.example.com/",
+		"http://localhost.example.com:8080/",
+		"http://user@localhost/",
+		"http://127.0.0.2/",
+		"HTTP://localhost/",
+		"file:///tmp/releases",
+		"ftp://localhost/releases",
+		"github.com/DeusData/codebase-memory-mcp",
+	} {
+		_, _, err := downloadBase(override)
+		if err == nil || !strings.Contains(
+			err.Error(), "refusing non-HTTPS download URL (CBM_DOWNLOAD_URL)",
+		) {
+			t.Errorf("override %q error = %v, want a refusal", override, err)
+		}
+	}
+}
+
+func TestDownloadRefusesURLsOutsideTheirMode(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "release.tar.gz")
+	err := httpGet("http://127.0.0.1/release.tar.gz", destination, false)
+	if err == nil || !strings.Contains(err.Error(), "refusing non-https URL") {
+		t.Fatalf("plain HTTP without a loopback base error = %v", err)
+	}
+	err = httpGet("http://example.invalid/release.tar.gz", destination, true)
+	if err == nil || !strings.Contains(err.Error(), "refusing non-loopback HTTP URL") {
+		t.Fatalf("non-loopback URL with a loopback base error = %v", err)
+	}
+	if _, statErr := os.Stat(destination); !os.IsNotExist(statErr) {
+		t.Fatal("refused download created a file")
+	}
+}
+
+func TestLoopbackDownloadBypassesProxiesAndRefusesRedirects(t *testing.T) {
+	transport, ok := loopbackClient.Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatal("the loopback client must not use a proxy")
+	}
+	digest := strings.Repeat("a", 64)
+	server := httptest.NewServer(http.HandlerFunc(
+		func(response http.ResponseWriter, request *http.Request) {
+			switch request.URL.Path {
+			case "/fixture/archive":
+				_, _ = io.WriteString(response, "loopback contents")
+			case "/fixture/checksums.txt":
+				_, _ = io.WriteString(response, digest+"  archive\n")
+			default:
+				http.Redirect(
+					response, request, "https://example.invalid/elsewhere", http.StatusFound,
+				)
+			}
+		},
+	))
+	defer server.Close()
 	root := t.TempDir()
-	tests := []struct {
-		name      string
-		names     []string
-		limits    archiveResourceLimits
-		wantError string
-	}{
-		{
-			name:      "member count",
-			names:     []string{"one", "two", "three"},
-			limits:    testArchiveLimits(2, 1024, 4096),
-			wantError: "member safety limit",
-		},
-		{
-			name:      "declared member bytes",
-			names:     []string{"oversized"},
-			limits:    testArchiveLimits(4, 4, 4096),
-			wantError: "expanded safety limit",
-		},
-		{
-			name:      "declared aggregate bytes",
-			names:     []string{"one", "two"},
-			limits:    testArchiveLimits(4, 1024, 15),
-			wantError: "aggregate expanded safety limit",
-		},
-	}
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			archivePath := filepath.Join(root, strings.ReplaceAll(testCase.name, " ", "-")+".tar.gz")
-			writeTarGz(t, archivePath, testCase.names)
-			_, err := tarGzMemberNamesWithLimits(archivePath, testCase.limits)
-			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
-				t.Fatalf("tar resource overflow error = %v", err)
-			}
-		})
-	}
-}
 
-func TestArchiveCopyRejectsActualMemberAggregateAndMetadataMismatch(t *testing.T) {
-	tests := []struct {
-		name      string
-		contents  string
-		declared  int64
-		actual    int64
-		limits    archiveResourceLimits
-		wantError string
-	}{
-		{
-			name:      "actual member bytes",
-			contents:  "12345",
-			declared:  5,
-			limits:    testArchiveLimits(1, 4, 10),
-			wantError: "actual expanded safety limit",
-		},
-		{
-			name:      "actual aggregate bytes",
-			contents:  "12",
-			declared:  2,
-			actual:    4,
-			limits:    testArchiveLimits(1, 10, 5),
-			wantError: "aggregate actual expanded safety limit",
-		},
-		{
-			name:      "declared actual mismatch",
-			contents:  "123",
-			declared:  2,
-			limits:    testArchiveLimits(1, 10, 10),
-			wantError: "does not match declared size",
-		},
+	archivePath := filepath.Join(root, "archive")
+	if err := httpGet(server.URL+"/fixture/archive", archivePath, true); err != nil {
+		t.Fatalf("loopback download error = %v", err)
 	}
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			actual := testCase.actual
-			var output bytes.Buffer
-			err := copyArchiveMemberWithLimits(
-				&output,
-				strings.NewReader(testCase.contents),
-				"member",
-				testCase.declared,
-				&actual,
-				testCase.limits,
-			)
-			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
-				t.Fatalf("actual archive overflow error = %v", err)
-			}
-		})
+	contents, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "loopback contents" {
+		t.Fatalf("loopback download stored %q", contents)
+	}
+	checksums, err := fetchChecksums(server.URL+"/fixture/checksums.txt", true)
+	if err != nil || checksums["archive"] != digest {
+		t.Fatalf("loopback checksums = %v, %v", checksums, err)
+	}
+
+	redirected := filepath.Join(root, "redirected")
+	err = httpGet(server.URL+"/fixture/elsewhere", redirected, true)
+	if err == nil || !strings.Contains(err.Error(), "refusing redirect from loopback download") {
+		t.Fatalf("loopback redirect error = %v", err)
+	}
+	if _, statErr := os.Stat(redirected); !os.IsNotExist(statErr) {
+		t.Fatal("a refused loopback redirect created a file")
 	}
 }
 
@@ -342,52 +346,20 @@ func writeZip(t *testing.T, archivePath string, names []string) {
 	}
 }
 
-func TestZipArchiveRejectsMemberAndExpandedResourceOverflow(t *testing.T) {
+func TestZipArchiveRejectsMoreMembersThanTheLimit(t *testing.T) {
 	root := t.TempDir()
-	tests := []struct {
-		name      string
-		names     []string
-		limits    archiveResourceLimits
-		wantError string
-	}{
-		{
-			name:      "member count",
-			names:     []string{"one", "two", "three"},
-			limits:    testArchiveLimits(2, 1024, 4096),
-			wantError: "member safety limit",
-		},
-		{
-			name:      "declared member bytes",
-			names:     []string{"oversized"},
-			limits:    testArchiveLimits(4, 4, 4096),
-			wantError: "expanded safety limit",
-		},
-		{
-			name:      "declared aggregate bytes",
-			names:     []string{"one", "two"},
-			limits:    testArchiveLimits(4, 1024, 15),
-			wantError: "aggregate expanded safety limit",
-		},
+	names := []string{"one", "two", "three"}
+	archivePath := filepath.Join(root, "members.zip")
+	writeZip(t, archivePath, names)
+	destination := filepath.Join(root, "extract")
+	if err := os.Mkdir(destination, 0755); err != nil {
+		t.Fatal(err)
 	}
-	for _, testCase := range tests {
-		t.Run(testCase.name, func(t *testing.T) {
-			archivePath := filepath.Join(root, strings.ReplaceAll(testCase.name, " ", "-")+".zip")
-			writeZip(t, archivePath, testCase.names)
-			destination := filepath.Join(root, strings.ReplaceAll(testCase.name, " ", "-")+"-extract")
-			if err := os.Mkdir(destination, 0755); err != nil {
-				t.Fatal(err)
-			}
-			_, err := extractZipWithLimits(
-				archivePath,
-				destination,
-				testCase.names,
-				testCase.names[:1],
-				testCase.limits,
-			)
-			if err == nil || !strings.Contains(err.Error(), testCase.wantError) {
-				t.Fatalf("zip resource overflow error = %v", err)
-			}
-		})
+	_, err := extractZipWithMemberLimit(
+		archivePath, destination, names, names[:1], 2,
+	)
+	if err == nil || !strings.Contains(err.Error(), "2-member safety limit") {
+		t.Fatalf("zip member count error = %v", err)
 	}
 }
 
@@ -1398,5 +1370,21 @@ func TestRuntimeSetLockSerializesProcesses(t *testing.T) {
 	}
 	if _, err := os.Stat(acquiredPath); err != nil {
 		t.Fatalf("child never acquired the released runtime-set lock: %v", err)
+	}
+}
+
+func TestReleaseVersionFromModuleVersion(t *testing.T) {
+	cases := []struct{ module, want string }{
+		{"v0.12.1", "0.12.1"},
+		{"v0.9.1-rc.1", "0.9.1-rc.1"},
+		{"(devel)", "fallback"},
+		{"", "fallback"},
+		{"v0.0.0-20261015165448-ec6427c38176", "fallback"},
+		{"v0.12.2-0.20261016120000-0123456789ab", "fallback"},
+	}
+	for _, c := range cases {
+		if got := releaseVersionFrom(c.module, "fallback"); got != c.want {
+			t.Errorf("releaseVersionFrom(%q) = %q, want %q", c.module, got, c.want)
+		}
 	}
 }

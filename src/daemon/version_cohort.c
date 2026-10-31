@@ -7,6 +7,7 @@
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -362,6 +363,37 @@ cbm_private_file_lock_status_t cbm_version_cohort_lease_release(
     return result;
 }
 
+/* Folds one lock's touch into an accumulated result: a lost file (UNSAFE)
+ * outranks a transient refresh failure (IO), which outranks OK. A lease holds
+ * only lifetime after admission, so absent locks are skipped. */
+static cbm_version_cohort_status_t version_cohort_lock_touch(cbm_private_file_lock_t *lock,
+                                                             cbm_version_cohort_status_t result) {
+    if (!lock || result == CBM_VERSION_COHORT_UNSAFE) {
+        return result;
+    }
+    cbm_private_file_lock_status_t status = cbm_private_file_lock_touch(lock);
+    if (status == CBM_PRIVATE_FILE_LOCK_UNSAFE) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    return status == CBM_PRIVATE_FILE_LOCK_OK ? result : CBM_VERSION_COHORT_IO;
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_lease_touch(cbm_version_cohort_lease_t *lease) {
+    if (!lease || !lease->lifetime) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    cbm_version_cohort_status_t result =
+        version_cohort_lock_touch(lease->lifetime, CBM_VERSION_COHORT_OK);
+    result = version_cohort_lock_touch(lease->admission, result);
+    return version_cohort_lock_touch(lease->maintenance, result);
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_daemon_claim_touch(
+    cbm_version_cohort_daemon_claim_t *claim) {
+    return claim && claim->marker ? version_cohort_lock_touch(claim->marker, CBM_VERSION_COHORT_OK)
+                                  : CBM_VERSION_COHORT_UNSAFE;
+}
+
 static cbm_version_cohort_status_t version_cohort_failed(cbm_version_cohort_lease_t *lease,
                                                          cbm_version_cohort_status_t status,
                                                          cbm_version_cohort_lease_t **lease_out) {
@@ -414,11 +446,10 @@ static cbm_version_cohort_status_t version_cohort_claim_new(
                                   CBM_PRIVATE_FILE_LOCK_SH, deadline_ms, &lease->lifetime));
 }
 
-cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
-                                                       const cbm_daemon_build_identity_t *identity,
-                                                       uint64_t deadline_ms,
-                                                       cbm_version_cohort_lease_t **lease_out,
-                                                       cbm_daemon_conflict_t *conflict_out) {
+static cbm_version_cohort_status_t version_cohort_acquire_once(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out) {
     if (lease_out) {
         *lease_out = NULL;
     }
@@ -567,6 +598,77 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
     }
     *lease_out = lease;
     return CBM_VERSION_COHORT_OK;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #2046 test seam: counts conflict retries so a test can prove the waiting
+ * participant actually met the mismatched holder before that holder left —
+ * without it, "admitted after release" is indistinguishable from "arrived
+ * after release" and the test passes vacuously. */
+static atomic_uint_fast64_t version_cohort_conflict_retry_seam;
+uint64_t cbm_version_cohort_conflict_retries_for_testing(void) {
+    return atomic_load_explicit(&version_cohort_conflict_retry_seam, memory_order_acquire);
+}
+static void version_cohort_note_conflict_retry(void) {
+    (void)atomic_fetch_add_explicit(&version_cohort_conflict_retry_seam, 1, memory_order_release);
+}
+#else
+static void version_cohort_note_conflict_retry(void) {}
+#endif
+
+static const char *version_cohort_conflict_kind(const cbm_daemon_conflict_t *conflict) {
+    switch (conflict->status) {
+    case CBM_DAEMON_HELLO_VERSION_CONFLICT:
+        return "version";
+    case CBM_DAEMON_HELLO_BUILD_CONFLICT:
+        return "build";
+    case CBM_DAEMON_HELLO_PROTOCOL_ABI_CONFLICT:
+        return "protocol_abi";
+    case CBM_DAEMON_HELLO_STORE_ABI_CONFLICT:
+        return "store_abi";
+    case CBM_DAEMON_HELLO_FEATURE_ABI_CONFLICT:
+        return "feature_abi";
+    case CBM_DAEMON_HELLO_CACHE_CONFLICT:
+        return "cache_root";
+    default:
+        return "unknown";
+    }
+}
+
+/* A mismatched live holder is not necessarily a peer that will stay: an
+ * internal daemon keeps its lifetime SH lock for the few hundred milliseconds
+ * between its last client leaving and its teardown finishing, and a CLI under
+ * another CBM_CACHE_DIR arriving inside that window used to be refused with a
+ * cache-root conflict although nothing was running any more (#2046; the
+ * refusal was masked only by the local CLI's own slow startup). host.c already
+ * waits out the same handoff for the daemon claim marker. Admission therefore
+ * retries a conflict until the caller's deadline, holding NO guard between
+ * attempts so compatible peers and activations are never queued behind the
+ * wait. On deadline the last observed conflict is reported exactly as before;
+ * an indefinite deadline keeps failing fast because a mismatched holder may
+ * never leave. */
+cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
+                                                       const cbm_daemon_build_identity_t *identity,
+                                                       uint64_t deadline_ms,
+                                                       cbm_version_cohort_lease_t **lease_out,
+                                                       cbm_daemon_conflict_t *conflict_out) {
+    bool retry_logged = false;
+    for (;;) {
+        cbm_version_cohort_status_t status =
+            version_cohort_acquire_once(manager, identity, deadline_ms, lease_out, conflict_out);
+        if (status != CBM_VERSION_COHORT_CONFLICT || deadline_ms == UINT64_MAX ||
+            cbm_now_ms() >= deadline_ms) {
+            return status;
+        }
+        if (!retry_logged) {
+            retry_logged = true;
+            cbm_log_info("version_cohort.conflict_retry", "reason",
+                         version_cohort_conflict_kind(conflict_out), "active_build",
+                         conflict_out->active_build_fingerprint);
+        }
+        version_cohort_note_conflict_retry();
+        version_cohort_retry_sleep();
+    }
 }
 
 static cbm_version_cohort_status_t version_cohort_reserve_for_mutation_internal(

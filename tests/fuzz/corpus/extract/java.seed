@@ -1,0 +1,9 @@
+Main.java
+package app;
+
+import java.util.List;
+
+public class Main {
+  interface Repo { List<String> all(); }
+  public static void main(String[] args) { System.out.println(args.length); }
+}

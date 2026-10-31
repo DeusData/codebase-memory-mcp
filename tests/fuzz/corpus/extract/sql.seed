@@ -1,0 +1,3 @@
+schema.sql
+CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+SELECT name FROM nodes WHERE id = 1;

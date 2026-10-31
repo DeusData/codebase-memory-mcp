@@ -242,6 +242,38 @@ require(
     "install.ps1 version probes must relax EAP with restore and pre-seed LASTEXITCODE (#1255)",
 )
 
+# ── 3c. The TLS bitmask must not name a protocol schannel cannot negotiate ───
+# Windows 10's schannel has no TLS 1.3 (it arrives with Windows 11 / Server
+# 2022, build 20348). .NET Framework 4.8 still DEFINES SecurityProtocolType
+# .Tls13, so setting the bit succeeds silently and nothing warns -- then the
+# first HTTPS request dies with "Could not create SSL/TLS secure channel",
+# because an unsupported flag in this bitmask is a hard failure rather than a
+# downgrade. That blocked the installer on every Windows 10 machine before it
+# downloaded a single byte (#1856). Pin both halves of the guard: the build
+# gate, and the enum-name probe that keeps the script parsing on 4.7, where
+# Tls13 does not exist.
+require(
+    "[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13" not in installer,
+    "install.ps1 must not set the TLS 1.3 bit unconditionally -- it hard-fails "
+    "the handshake on Windows 10, whose schannel cannot negotiate it (#1856)",
+)
+require(
+    re.search(r"\[Environment\]::OSVersion\.Version\.Build\s+-ge\s+20348", installer) is not None,
+    "install.ps1 must gate TLS 1.3 on build 20348+ (Windows 11 / Server 2022) (#1856)",
+)
+require(
+    re.search(
+        r"\[enum\]::GetNames\(\[Net\.SecurityProtocolType\]\)\s+-contains\s+'Tls13'", installer
+    )
+    is not None,
+    "install.ps1 must probe the enum before naming Tls13, so it still parses on "
+    ".NET Framework 4.7 where the member is undefined (#1856)",
+)
+require(
+    "[Net.ServicePointManager]::SecurityProtocol = $CbmProtocols" in installer,
+    "install.ps1 must assign the computed protocol set, not a literal bitmask (#1856)",
+)
+
 # ── 4. Package-manager shims resolve the single Windows binary ───────────────
 single_binary_contracts = {
     "pkg/npm/install.js": (
@@ -302,6 +334,32 @@ for relative, needles in exact_archive_guards.items():
         f"{relative} must reject every Windows zip namespace except the official four-file "
         "allowlist",
     )
+
+# install.ps1 reports two different archive failures differently (#1218). A
+# checksum-verified archive whose root file set differs from the allowlist is a
+# release/installer version skew, not tampering, and must say so; a hostile
+# entry (unsafe path, duplicate or case conflict) stays "unsafe". Both exit 1.
+# The layout verdict may only be reached after EVERY entry cleared the hostile
+# checks, or an unexpected entry listed first would mask a later "../" entry.
+installer_archive = read("install.ps1")
+require(
+    "unsafe or incomplete release archive" not in installer_archive
+    and "error: unsafe release archive: " in installer_archive
+    and "error: release archive layout does not match this installer: " in installer_archive,
+    "install.ps1 must report a checksum-verified layout mismatch separately from an unsafe "
+    "archive (#1218)",
+)
+hostile_last = max(
+    installer_archive.find('throw "unsafe zip entry path:'),
+    installer_archive.find('throw "duplicate or case-conflicting zip entry:'),
+)
+layout_verdict = installer_archive.find("$LayoutMismatch = $true")
+require(
+    hostile_last != -1 and layout_verdict > hostile_last
+    and installer_archive.count("$LayoutMismatch = $true") == 1,
+    "install.ps1 must screen every zip entry for unsafe paths and duplicates before it "
+    "classifies an archive as a layout mismatch (#1218)",
+)
 
 # A portable mutation refusal must point to the owning package manager.
 guidance_contracts = {

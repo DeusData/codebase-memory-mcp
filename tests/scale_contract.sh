@@ -45,11 +45,10 @@ project_name() { printf '%s' "$1" | sed 's#^/##; s#[^A-Za-z0-9._-]#-#g'; }
 # Run query_graph and print the first integer in the JSON response (or -1).
 query_count() {
     local proj="$1" cypher="$2" resp
-    resp="$("$BIN" cli query_graph "{\"project\":\"$proj\",\"query\":\"$cypher\"}" 2>/dev/null)"
-    printf '%s' "$resp" | "$PY" -c 'import sys,re
-s=sys.stdin.read()
-m=re.findall(r"-?\d+", s)
-print(m[0] if m else -1)' 2>/dev/null || echo -1
+    resp="$("$BIN" cli query_graph "{\"project\":\"$proj\",\"query\":\"$cypher\",\"format\":\"json\"}" 2>/dev/null)"
+    printf '%s' "$resp" | "$PY" -c 'import json,sys
+d=json.load(sys.stdin); rows=d.get("rows", [])
+print(rows[0][0] if rows and rows[0] else -1)' 2>/dev/null || echo -1
 }
 
 assert_lang() {

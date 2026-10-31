@@ -7,6 +7,12 @@
 // Install:
 //
 //	go install github.com/DeusData/codebase-memory-mcp/pkg/go/cmd/codebase-memory-mcp@latest
+//
+// For testing, CBM_DOWNLOAD_URL overrides the download base URL (default
+// https://github.com/DeusData/codebase-memory-mcp/releases/download/v<version>):
+// the archive and checksums.txt are fetched from <CBM_DOWNLOAD_URL>/<file>. It
+// must be https://, or plain http:// to exactly localhost, 127.0.0.1, or [::1]
+// (optional port; no proxy, no redirects).
 package main
 
 import (
@@ -27,7 +33,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"syscall"
@@ -36,19 +44,15 @@ import (
 
 const (
 	repo              = "DeusData/codebase-memory-mcp"
-	version           = "0.10.8"
+	version           = "0.12.1"
 	windowsBinaryName = "codebase-memory-mcp.exe"
 
-	maxRedirects            = 5
-	requestTimeout          = 2 * time.Minute
-	connectTimeout          = 15 * time.Second
-	responseHeaderTimeout   = 30 * time.Second
-	candidateTimeout        = 15 * time.Second
-	maxChecksumManifestSize = 1024 * 1024
-	maxReleaseArchiveSize   = int64(256 * 1024 * 1024)
-	maxArchiveMembers       = 64
-	maxArchiveMemberSize    = int64(256 * 1024 * 1024)
-	maxArchiveExpandedSize  = int64(512 * 1024 * 1024)
+	maxRedirects          = 5
+	requestTimeout        = 2 * time.Minute
+	connectTimeout        = 15 * time.Second
+	responseHeaderTimeout = 30 * time.Second
+	candidateTimeout      = 15 * time.Second
+	maxArchiveMembers     = 64
 
 	runtimeSetLockName               = ".codebase-memory-mcp-runtime.lock"
 	runtimeSetLockWait               = 45 * time.Second
@@ -65,20 +69,6 @@ const (
 	runtimeBackupBeforeMarkerEvent   = "before-retirement-marker"
 	runtimeBackupCleanupRemovedEvent = "cleanup-member-removed"
 )
-
-type archiveResourceLimits struct {
-	compressedBytes int64
-	members         int
-	memberBytes     int64
-	expandedBytes   int64
-}
-
-var defaultArchiveResourceLimits = archiveResourceLimits{
-	compressedBytes: maxReleaseArchiveSize,
-	members:         maxArchiveMembers,
-	memberBytes:     maxArchiveMemberSize,
-	expandedBytes:   maxArchiveExpandedSize,
-}
 
 type runtimeSetLock struct {
 	path  string
@@ -169,7 +159,7 @@ func ensureBinary() (string, error) {
 
 func binPath() string {
 	return filepath.Join(
-		cacheDir(), version, binaryNameForOS(runtime.GOOS),
+		cacheDir(), installVersion, binaryNameForOS(runtime.GOOS),
 	)
 }
 
@@ -375,10 +365,14 @@ func download(dest string) error {
 		"codebase-memory-mcp-%s-%s%s.%s",
 		platform, arch, portable, ext,
 	)
-	url := fmt.Sprintf("https://github.com/%s/releases/download/v%s/%s", repo, version, archive)
-	checksumURL := fmt.Sprintf("https://github.com/%s/releases/download/v%s/checksums.txt", repo, version)
+	base, loopback, err := downloadBase(os.Getenv("CBM_DOWNLOAD_URL"))
+	if err != nil {
+		return err
+	}
+	url := base + "/" + archive
+	checksumURL := base + "/checksums.txt"
 
-	fmt.Fprintf(os.Stderr, "codebase-memory-mcp: downloading v%s for %s/%s...\n", version, platform, arch)
+	fmt.Fprintf(os.Stderr, "codebase-memory-mcp: downloading v%s for %s/%s...\n", installVersion, platform, arch)
 
 	tmp, err := os.MkdirTemp("", "cbm-install-*")
 	if err != nil {
@@ -387,13 +381,13 @@ func download(dest string) error {
 	defer os.RemoveAll(tmp)
 
 	archivePath := filepath.Join(tmp, "cbm."+ext)
-	if err := httpGet(url, archivePath); err != nil {
+	if err := httpGet(url, archivePath, loopback); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
 
 	// A release binary is executable input, so checksum verification is a
 	// mandatory precondition rather than a best-effort warning.
-	checksums, err := fetchChecksums(checksumURL)
+	checksums, err := fetchChecksums(checksumURL, loopback)
 	if err != nil {
 		return fmt.Errorf("checksum manifest unavailable: %w", err)
 	}
@@ -452,11 +446,80 @@ func download(dest string) error {
 	return nil
 }
 
+// loopbackHTTPURL is install.sh's pattern: plain HTTP only to an exact
+// loopback authority, for local smoke tests.
+// installVersion is the release this wrapper installs: its own module version
+// when Go installed it as a tagged release (`go install
+// .../pkg/go/cmd/codebase-memory-mcp@v0.12.1`, or @latest, which resolves to
+// the newest pkg/go/v* tag), else the version constant (a local build, or a
+// pseudo-version of an untagged commit).
+var installVersion = releaseVersionFrom(moduleVersion(), version)
+
+var releaseTag = regexp.MustCompile(`^v([0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?)$`)
+
+func moduleVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return ""
+}
+
+// releaseVersionFrom maps a module version to a release version: "v0.12.1" is
+// "0.12.1"; "(devel)", a pseudo-version or "" fall back.
+func releaseVersionFrom(module, fallback string) string {
+	if m := releaseTag.FindStringSubmatch(module); m != nil {
+		return m[1]
+	}
+	return fallback
+}
+
+var loopbackHTTPURL = regexp.MustCompile(
+	`^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?#].*)?$`,
+)
+
+var loopbackHostnames = map[string]bool{
+	"localhost": true,
+	"127.0.0.1": true,
+	"::1":       true,
+}
+
+// downloadBase returns the release download base and whether it is a
+// loopback HTTP base. CBM_DOWNLOAD_URL replaces the GitHub release base (for
+// testing) with install.sh's policy: HTTPS, or plain HTTP to an exact
+// loopback authority.
+func downloadBase(override string) (string, bool, error) {
+	if override == "" {
+		return fmt.Sprintf(
+			"https://github.com/%s/releases/download/v%s", repo, installVersion,
+		), false, nil
+	}
+	if strings.HasPrefix(override, "https://") {
+		return override, false, nil
+	}
+	if loopbackHTTPURL.MatchString(override) {
+		return override, true, nil
+	}
+	return "", false, fmt.Errorf(
+		"refusing non-HTTPS download URL (CBM_DOWNLOAD_URL): %s", override,
+	)
+}
+
 // validateURLScheme rejects non-https URLs before any fetch (defense-in-depth).
 func validateURLScheme(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
 		return fmt.Errorf("refusing non-https URL: %s", rawURL)
+	}
+	return nil
+}
+
+// validateLoopbackURL accepts only plain HTTP to an exact loopback authority.
+func validateLoopbackURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !loopbackHTTPURL.MatchString(rawURL) ||
+		parsed.Scheme != "http" || parsed.User != nil ||
+		!loopbackHostnames[parsed.Hostname()] {
+		return fmt.Errorf("refusing non-loopback HTTP URL: %s", rawURL)
 	}
 	return nil
 }
@@ -483,18 +546,40 @@ var httpsOnlyClient = &http.Client{
 	},
 }
 
-func httpGet(rawURL, dest string) error {
-	return httpGetWithLimit(rawURL, dest, maxReleaseArchiveSize)
+// loopbackClient serves a loopback CBM_DOWNLOAD_URL: it uses no proxy and
+// refuses every redirect, so no hop can leave the loopback authority.
+var loopbackClient = &http.Client{
+	Timeout: requestTimeout,
+	Transport: &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: connectTimeout}).DialContext,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+	},
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return fmt.Errorf("refusing redirect from loopback download: %s", req.URL)
+	},
 }
 
-func httpGetWithLimit(rawURL, dest string, maxBytes int64) error {
+// downloadClient validates rawURL for its mode and returns the client for it.
+func downloadClient(rawURL string, loopback bool) (*http.Client, error) {
+	if loopback {
+		if err := validateLoopbackURL(rawURL); err != nil {
+			return nil, err
+		}
+		return loopbackClient, nil
+	}
 	if err := validateURLScheme(rawURL); err != nil {
+		return nil, err
+	}
+	return httpsOnlyClient, nil
+}
+
+func httpGet(rawURL, dest string, loopback bool) error {
+	client, err := downloadClient(rawURL, loopback)
+	if err != nil {
 		return err
 	}
-	if maxBytes <= 0 {
-		return fmt.Errorf("invalid compressed archive safety limit")
-	}
-	resp, err := httpsOnlyClient.Get(rawURL) //nolint:gosec
+	resp, err := client.Get(rawURL) //nolint:gosec
 	if err != nil {
 		return err
 	}
@@ -502,24 +587,12 @@ func httpGetWithLimit(rawURL, dest string, maxBytes int64) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d for %s", resp.StatusCode, rawURL)
 	}
-	if resp.ContentLength > maxBytes {
-		return fmt.Errorf(
-			"release archive exceeds the %d-byte compressed safety limit",
-			maxBytes,
-		)
-	}
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
-	written, copyErr := io.Copy(f, io.LimitReader(resp.Body, maxBytes+1))
+	_, copyErr := io.Copy(f, resp.Body)
 	closeErr := f.Close()
-	if copyErr == nil && written > maxBytes {
-		copyErr = fmt.Errorf(
-			"release archive exceeds the %d-byte compressed safety limit",
-			maxBytes,
-		)
-	}
 	if copyErr != nil {
 		_ = os.Remove(dest)
 		return copyErr
@@ -530,11 +603,12 @@ func httpGetWithLimit(rawURL, dest string, maxBytes int64) error {
 	return closeErr
 }
 
-func fetchChecksums(url string) (map[string]string, error) {
-	if err := validateURLScheme(url); err != nil {
+func fetchChecksums(url string, loopback bool) (map[string]string, error) {
+	client, err := downloadClient(url, loopback)
+	if err != nil {
 		return nil, err
 	}
-	resp, err := httpsOnlyClient.Get(url) //nolint:gosec
+	resp, err := client.Get(url) //nolint:gosec
 	if err != nil {
 		return nil, err
 	}
@@ -542,12 +616,9 @@ func fetchChecksums(url string) (map[string]string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumManifestSize+1))
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
-	}
-	if len(body) > maxChecksumManifestSize {
-		return nil, fmt.Errorf("checksums.txt exceeds the 1 MiB safety limit")
 	}
 	result := make(map[string]string)
 	for _, line := range strings.Split(string(body), "\n") {
@@ -634,17 +705,7 @@ func validateArchiveMemberNames(
 	return nil
 }
 
-func validateArchiveResourceLimits(limits archiveResourceLimits) error {
-	if limits.compressedBytes <= 0 || limits.members <= 0 ||
-		limits.memberBytes <= 0 || limits.expandedBytes <= 0 {
-		return fmt.Errorf("invalid archive resource safety limits")
-	}
-	return nil
-}
-
-func requireCompressedArchiveWithinLimit(
-	archivePath string, limits archiveResourceLimits,
-) error {
+func requireRegularArchive(archivePath string) error {
 	status, err := os.Stat(archivePath)
 	if err != nil {
 		return err
@@ -652,67 +713,16 @@ func requireCompressedArchiveWithinLimit(
 	if !status.Mode().IsRegular() {
 		return fmt.Errorf("release archive is not a regular file")
 	}
-	if status.Size() > limits.compressedBytes {
-		return fmt.Errorf(
-			"release archive exceeds the %d-byte compressed safety limit",
-			limits.compressedBytes,
-		)
-	}
 	return nil
 }
 
-func accountDeclaredArchiveMember(
-	name string, size int64, expanded *int64, limits archiveResourceLimits,
+// copyArchiveMember copies one member and requires its declared size.
+func copyArchiveMember(
+	destination io.Writer, source io.Reader, name string, declaredSize int64,
 ) error {
-	if size < 0 {
-		return fmt.Errorf("archive member has a negative declared size: %q", name)
-	}
-	if size > limits.memberBytes {
-		return fmt.Errorf(
-			"archive member %q exceeds the %d-byte expanded safety limit",
-			name, limits.memberBytes,
-		)
-	}
-	if *expanded > limits.expandedBytes-size {
-		return fmt.Errorf(
-			"archive exceeds the %d-byte aggregate expanded safety limit",
-			limits.expandedBytes,
-		)
-	}
-	*expanded += size
-	return nil
-}
-
-func copyArchiveMemberWithLimits(
-	destination io.Writer,
-	source io.Reader,
-	name string,
-	declaredSize int64,
-	actualExpanded *int64,
-	limits archiveResourceLimits,
-) error {
-	remaining := limits.expandedBytes - *actualExpanded
-	copyLimit := limits.memberBytes
-	if remaining < copyLimit {
-		copyLimit = remaining
-	}
-	copied, err := io.Copy(
-		destination, io.LimitReader(source, copyLimit+1),
-	)
+	copied, err := io.Copy(destination, source)
 	if err != nil {
 		return err
-	}
-	if copied > limits.memberBytes {
-		return fmt.Errorf(
-			"archive member %q exceeds the %d-byte actual expanded safety limit",
-			name, limits.memberBytes,
-		)
-	}
-	if copied > remaining {
-		return fmt.Errorf(
-			"archive exceeds the %d-byte aggregate actual expanded safety limit",
-			limits.expandedBytes,
-		)
 	}
 	if copied != declaredSize {
 		return fmt.Errorf(
@@ -720,23 +730,19 @@ func copyArchiveMemberWithLimits(
 			name, copied, declaredSize,
 		)
 	}
-	*actualExpanded += copied
 	return nil
 }
 
 func tarGzMemberNames(archivePath string) ([]string, error) {
-	return tarGzMemberNamesWithLimits(
-		archivePath, defaultArchiveResourceLimits,
-	)
+	return tarGzMemberNamesWithMemberLimit(archivePath, maxArchiveMembers)
 }
 
-func tarGzMemberNamesWithLimits(
-	archivePath string, limits archiveResourceLimits,
+// tarGzMemberNamesWithMemberLimit lists the root members; the entry count
+// guard bounds the listing before the exact namespace check.
+func tarGzMemberNamesWithMemberLimit(
+	archivePath string, maxMembers int,
 ) ([]string, error) {
-	if err := validateArchiveResourceLimits(limits); err != nil {
-		return nil, err
-	}
-	if err := requireCompressedArchiveWithinLimit(archivePath, limits); err != nil {
+	if err := requireRegularArchive(archivePath); err != nil {
 		return nil, err
 	}
 	f, err := os.Open(archivePath)
@@ -751,7 +757,6 @@ func tarGzMemberNamesWithLimits(
 	defer gz.Close()
 	tr := tar.NewReader(gz)
 	var names []string
-	var declaredExpanded int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -765,15 +770,10 @@ func tarGzMemberNamesWithLimits(
 				"archive member is not a regular root file: %q", hdr.Name,
 			)
 		}
-		if len(names) >= limits.members {
+		if len(names) >= maxMembers {
 			return nil, fmt.Errorf(
-				"archive exceeds the %d-member safety limit", limits.members,
+				"archive exceeds the %d-member safety limit", maxMembers,
 			)
-		}
-		if err := accountDeclaredArchiveMember(
-			hdr.Name, hdr.Size, &declaredExpanded, limits,
-		); err != nil {
-			return nil, err
 		}
 		names = append(names, hdr.Name)
 	}
@@ -784,21 +784,21 @@ func extractTarGz(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
 ) ([]string, error) {
-	return extractTarGzWithLimits(
+	return extractTarGzWithMemberLimit(
 		archivePath,
 		destDir,
 		archiveNames,
 		extractNames,
-		defaultArchiveResourceLimits,
+		maxArchiveMembers,
 	)
 }
 
-func extractTarGzWithLimits(
+func extractTarGzWithMemberLimit(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-	limits archiveResourceLimits,
+	maxMembers int,
 ) ([]string, error) {
-	names, err := tarGzMemberNamesWithLimits(archivePath, limits)
+	names, err := tarGzMemberNamesWithMemberLimit(archivePath, maxMembers)
 	if err != nil {
 		return nil, err
 	}
@@ -824,8 +824,6 @@ func extractTarGzWithLimits(
 	tr := tar.NewReader(gz)
 	extracted := make(map[string]struct{}, len(runtimeNames))
 	memberCount := 0
-	var declaredExpanded int64
-	var actualExpanded int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -835,20 +833,15 @@ func extractTarGzWithLimits(
 			return nil, err
 		}
 		memberCount++
-		if memberCount > limits.members {
+		if memberCount > maxMembers {
 			return nil, fmt.Errorf(
-				"archive exceeds the %d-member safety limit", limits.members,
+				"archive exceeds the %d-member safety limit", maxMembers,
 			)
 		}
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			return nil, fmt.Errorf(
 				"archive member is not a regular root file: %q", hdr.Name,
 			)
-		}
-		if err := accountDeclaredArchiveMember(
-			hdr.Name, hdr.Size, &declaredExpanded, limits,
-		); err != nil {
-			return nil, err
 		}
 		if _, wanted := targets[hdr.Name]; wanted {
 			outputPath := filepath.Join(destDir, hdr.Name)
@@ -860,9 +853,7 @@ func extractTarGzWithLimits(
 			if err != nil {
 				return nil, err
 			}
-			copyErr := copyArchiveMemberWithLimits(
-				out, tr, hdr.Name, hdr.Size, &actualExpanded, limits,
-			)
+			copyErr := copyArchiveMember(out, tr, hdr.Name, hdr.Size)
 			closeErr := out.Close()
 			if copyErr != nil {
 				_ = os.Remove(outputPath)
@@ -873,8 +864,8 @@ func extractTarGzWithLimits(
 				return nil, closeErr
 			}
 			extracted[hdr.Name] = struct{}{}
-		} else if err := copyArchiveMemberWithLimits(
-			io.Discard, tr, hdr.Name, hdr.Size, &actualExpanded, limits,
+		} else if err := copyArchiveMember(
+			io.Discard, tr, hdr.Name, hdr.Size,
 		); err != nil {
 			return nil, err
 		}
@@ -889,24 +880,21 @@ func extractZip(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
 ) ([]string, error) {
-	return extractZipWithLimits(
+	return extractZipWithMemberLimit(
 		archivePath,
 		destDir,
 		archiveNames,
 		extractNames,
-		defaultArchiveResourceLimits,
+		maxArchiveMembers,
 	)
 }
 
-func extractZipWithLimits(
+func extractZipWithMemberLimit(
 	archivePath, destDir string,
 	archiveNames, extractNames []string,
-	limits archiveResourceLimits,
+	maxMembers int,
 ) ([]string, error) {
-	if err := validateArchiveResourceLimits(limits); err != nil {
-		return nil, err
-	}
-	if err := requireCompressedArchiveWithinLimit(archivePath, limits); err != nil {
+	if err := requireRegularArchive(archivePath); err != nil {
 		return nil, err
 	}
 	r, err := zip.OpenReader(archivePath)
@@ -914,14 +902,13 @@ func extractZipWithLimits(
 		return nil, err
 	}
 	defer r.Close()
-	if len(r.File) > limits.members {
+	if len(r.File) > maxMembers {
 		return nil, fmt.Errorf(
-			"archive exceeds the %d-member safety limit", limits.members,
+			"archive exceeds the %d-member safety limit", maxMembers,
 		)
 	}
 	names := make([]string, 0, len(r.File))
 	declaredSizes := make(map[string]int64, len(r.File))
-	var declaredExpanded int64
 	for _, f := range r.File {
 		name, err := validateWindowsZipMember(f.Name)
 		if err != nil {
@@ -932,17 +919,11 @@ func extractZipWithLimits(
 				"archive member is not a regular root file: %q", f.Name,
 			)
 		}
-		if f.UncompressedSize64 > uint64(limits.memberBytes) {
-			return nil, fmt.Errorf(
-				"archive member %q exceeds the %d-byte expanded safety limit",
-				name, limits.memberBytes,
-			)
-		}
 		declaredSize := int64(f.UncompressedSize64)
-		if err := accountDeclaredArchiveMember(
-			name, declaredSize, &declaredExpanded, limits,
-		); err != nil {
-			return nil, err
+		if declaredSize < 0 {
+			return nil, fmt.Errorf(
+				"archive member has an invalid declared size: %q", name,
+			)
 		}
 		names = append(names, name)
 		declaredSizes[name] = declaredSize
@@ -956,7 +937,6 @@ func extractZipWithLimits(
 		targetNames[name] = struct{}{}
 	}
 	extracted := make(map[string]struct{}, len(runtimeNames))
-	var actualExpanded int64
 
 	for index, target := range r.File {
 		name := names[index]
@@ -980,14 +960,7 @@ func extractZipWithLimits(
 			}
 			destination = out
 		}
-		copyErr := copyArchiveMemberWithLimits(
-			destination,
-			rc,
-			name,
-			declaredSizes[name],
-			&actualExpanded,
-			limits,
-		)
+		copyErr := copyArchiveMember(destination, rc, name, declaredSizes[name])
 		var closeOutErr error
 		if out != nil {
 			closeOutErr = out.Close()

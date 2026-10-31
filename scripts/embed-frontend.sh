@@ -30,7 +30,8 @@ content_type_for() {
     local f="$1"
     case "$f" in
         *.html) echo "text/html" ;;
-        *.js)   echo "application/javascript" ;;
+        *.js|*.mjs) echo "application/javascript" ;;
+        *.wasm) echo "application/wasm" ;;
         *.css)  echo "text/css" ;;
         *.json) echo "application/json" ;;
         *.svg)  echo "image/svg+xml" ;;
@@ -71,7 +72,7 @@ for file in "${FILES[@]}"; do
     if $IS_LINUX; then
         # Linux: ld -r -b binary (zero bloat, ELF only)
         abs_obj="$(cd "$(dirname "$0")/.." && pwd)/$obj"
-        (cd "$DIST_DIR" && ld -r -b binary -o "$abs_obj" "$rel")
+        (cd "$DIST_DIR" && "${LD:-ld}" -r -b binary -o "$abs_obj" "$rel")
     else
         # macOS/Windows/MSYS2: generate C byte array + cc (no xxd dependency)
         local_c="$OUTPUT_DIR/embed_${mangled}.c"

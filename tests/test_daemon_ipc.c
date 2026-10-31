@@ -13,6 +13,7 @@
 #include "daemon/ipc_internal.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/subprocess.h"
@@ -48,7 +49,11 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <pwd.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h> /* #1830 userns real smoke: unshare(CLONE_NEWUSER). */
+#endif
 #ifdef __APPLE__
 #include <membership.h>
 #include <sys/acl.h>
@@ -397,6 +402,7 @@ static int ipc_test_win_lock_child(const char *kind, const char *key, const char
 typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     int result;
+    atomic_bool finished; /* set once the startup call has fully returned */
 } ipc_test_win_startup_call_t;
 
 typedef struct {
@@ -417,16 +423,22 @@ static void ipc_test_startup_gate(void *context) {
     }
 }
 
-static bool ipc_test_startup_gate_wait_acquired(ipc_test_startup_gate_t *gate) {
-    /* `acquired` never clears, so this wait cannot miss the event; the bound
-     * only catches a thread that never started at all. */
-    for (size_t attempt = 0; attempt < 50000U; attempt++) {
-        if (atomic_load(&gate->acquired)) {
-            return true;
-        }
+/* Waits until the startup thread has either parked in the gate or returned
+ * without reaching it. Both flags only ever go false -> true, and one of them
+ * is always eventually set: before the gate the startup path only try-acquires
+ * (no blocking wait on anything this test holds), and a thread parked in the
+ * gate cannot return until the test releases it. So no attempt or time bound
+ * is needed, and none may decide the verdict: the previous 50000 x
+ * cbm_usleep(200) budget meant ~10 s on POSIX but, since cbm_usleep(200) is
+ * Sleep(0) on Windows, only 50000 bare yields there -- a loaded CI runner
+ * exhausted them before the thread reached the gate. A thread that never
+ * started is caught by the caller's thread_started check. */
+static bool ipc_test_startup_gate_wait_acquired(ipc_test_startup_gate_t *gate,
+                                                ipc_test_win_startup_call_t *call) {
+    while (!atomic_load(&gate->acquired) && !atomic_load(&call->finished)) {
         cbm_usleep(200);
     }
-    return false;
+    return atomic_load(&gate->acquired);
 }
 
 static void *ipc_test_win_startup_call(void *opaque) {
@@ -437,6 +449,7 @@ static void *ipc_test_win_startup_call(void *opaque) {
         call->result = 0;
     }
     cbm_daemon_ipc_startup_lock_release(&startup);
+    atomic_store(&call->finished, true);
     return NULL;
 }
 
@@ -878,6 +891,129 @@ TEST(daemon_ipc_windows_private_directory_ace_is_inheritable) {
     PASS();
 }
 
+typedef struct {
+    int calls;
+    bool plant_file; /* false: play a racer that creates the DIRECTORY first */
+    bool planted;
+} ipc_test_win_create_racer_t;
+
+/* Plays the concurrent process that wins the creation of a path component the
+ * walk has just observed absent. Runs inside the walk, at the exact point the
+ * race lives, so the interleaving is pinned by construction: no threads, no
+ * timing. */
+static void ipc_test_win_create_racer(const wchar_t *path, void *context) {
+    ipc_test_win_create_racer_t *racer = context;
+    racer->calls++;
+    if (racer->calls != 1) {
+        return;
+    }
+    if (racer->plant_file) {
+        HANDLE file =
+            CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        racer->planted = file != INVALID_HANDLE_VALUE;
+        if (racer->planted) {
+            (void)CloseHandle(file);
+        }
+    } else {
+        racer->planted = CreateDirectoryW(path, NULL) != 0;
+    }
+}
+
+/* Cold-start race (test-windows-guards section_cold_storm, 2026-09-21; the
+ * same thing a user gets when a host launches several MCP servers on its very
+ * first run): N processes first-start against a runtime directory that does
+ * not exist yet. All of them observe the final component absent, one
+ * CreateDirectoryW wins, and every other process gets ERROR_ALREADY_EXISTS.
+ * The walk treated that as a failure and recorded no detail, so the losers
+ * exited with a bare "secure CLI coordination could not be created
+ * (endpoint)". Losing the creation race is not a failure: the directory this
+ * process wanted now exists, and the owner / DACL / not-a-reparse-point checks
+ * that follow are exactly the ones a pre-existing directory gets. The POSIX
+ * walk has always tolerated EEXIST here. */
+TEST(daemon_ipc_windows_private_directory_survives_lost_creation_race) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool secured = false;
+    bool owner_only = false;
+    ipc_test_win_create_racer_t racer = {0};
+
+    if (ipc_test_parent_new(parent, "win-create-race")) {
+        int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = written > 0 && written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(ipc_test_win_create_racer, &racer);
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(NULL, NULL);
+    }
+    if (secured) {
+        /* The racer created the directory with an inherited DACL; the winner's
+         * directory must still end up owner-only, like any adopted one. */
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        ACL_SIZE_INFORMATION information;
+        memset(&information, 0, sizeof(information));
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                  &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            dacl &&
+            GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation)) {
+            owner_only = information.AceCount == 1;
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    /* The seam sat on the path and the racer really won: without these two the
+     * test could pass without ever exercising the race. */
+    ASSERT_EQ(racer.calls, 1);
+    ASSERT_TRUE(racer.planted);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(owner_only);
+    PASS();
+}
+
+/* The tolerance above must not admit anything: when what appeared at the path
+ * is NOT a directory, the walk still refuses -- and it says why. A bare
+ * "(endpoint)" is what four reporters in #1533/#1574 were left with; every
+ * refusal on this path names the component and the rule. */
+TEST(daemon_ipc_windows_private_directory_refuses_and_names_a_planted_file) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    char detail[512] = {0};
+    bool paths_ok = false;
+    bool refused = false;
+    ipc_test_win_create_racer_t racer = {.plant_file = true};
+
+    if (ipc_test_parent_new(parent, "win-create-race-file")) {
+        int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = written > 0 && written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(ipc_test_win_create_racer, &racer);
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(NULL, NULL);
+        const char *why = cbm_daemon_ipc_validation_detail();
+        (void)snprintf(detail, sizeof(detail), "%s", why ? why : "");
+    }
+
+    (void)DeleteFileA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_EQ(racer.calls, 1);
+    ASSERT_TRUE(racer.planted);
+    ASSERT_TRUE(refused);
+    ASSERT_NOT_NULL(strstr(detail, "cache"));
+    ASSERT_NOT_NULL(strstr(detail, "not a directory"));
+    PASS();
+}
+
 TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor) {
     char parent[TEST_PATH_CAP] = {0};
     char add_only[TEST_PATH_CAP] = {0};
@@ -917,6 +1053,120 @@ TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor)
     ASSERT_TRUE(acl_injected);
     ASSERT_TRUE(secured);
     ASSERT_TRUE(cache_created);
+    PASS();
+}
+
+/* Derive THIS machine's account-domain SID (S-1-5-21-a-b-c) from the current
+ * process token (S-1-5-21-a-b-c-<rid>), independently of production's LSA-based
+ * resolution. Caller frees with FreeSid. */
+static PSID ipc_test_local_account_domain_sid(void) {
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return NULL;
+    }
+    DWORD needed = 0;
+    (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    PSID domain = NULL;
+    if (needed > 0) {
+        void *buffer = calloc(1, needed);
+        if (buffer && GetTokenInformation(token, TokenUser, buffer, needed, &needed)) {
+            PSID user = ((TOKEN_USER *)buffer)->User.Sid;
+            if (user && IsValidSid(user)) {
+                UCHAR count = *GetSidSubAuthorityCount(user);
+                SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(user);
+                /* Machine/domain account SID: NT authority (Value[5]==5), first
+                 * sub-authority 21, at least the three domain sub-authorities plus
+                 * the account RID. Drop the RID to recover the domain SID. */
+                if (count >= 4 && authority->Value[5] == 5 && *GetSidSubAuthority(user, 0) == 21U) {
+                    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+                    (void)AllocateAndInitializeSid(
+                        &nt, 4, *GetSidSubAuthority(user, 0), *GetSidSubAuthority(user, 1),
+                        *GetSidSubAuthority(user, 2), *GetSidSubAuthority(user, 3), 0, 0, 0, 0,
+                        &domain);
+                }
+            }
+        }
+        free(buffer);
+    }
+    (void)CloseHandle(token);
+    return domain;
+}
+
+/* Synthesize the RID-500 built-in Administrator SID for a given account-domain
+ * SID, exactly as production does. Caller frees with free(). */
+static PSID ipc_test_admin_sid_for_domain(PSID domain_sid) {
+    if (!domain_sid) {
+        return NULL;
+    }
+    DWORD needed = 0;
+    (void)CreateWellKnownSid(WinAccountAdministratorSid, domain_sid, NULL, &needed);
+    if (needed == 0) {
+        return NULL;
+    }
+    PSID admin = malloc(needed);
+    if (admin && CreateWellKnownSid(WinAccountAdministratorSid, domain_sid, admin, &needed) &&
+        IsValidSid(admin)) {
+        return admin;
+    }
+    free(admin);
+    return NULL;
+}
+
+/* #1705: THIS machine's built-in Administrator ACCOUNT (RID-500 under the local
+ * account-domain SID) is a trusted directory owner/grantee, while a FOREIGN
+ * S-1-5-21-*-500 (a domain administrator, or another machine's built-in
+ * Administrator) must never be.
+ *
+ * RED without the fix: win_sid_trusted rejects the local RID-500 — on the VM this
+ * process runs as `test`, whose RID is not 500, so the -500 SID matches neither
+ * the current user nor SYSTEM, the Administrators GROUP, or TrustedInstaller — so
+ * local_ok is false. GREEN with the fix. foreign_ok is false either way, which is
+ * the exact cross-machine bypass this must never open. */
+TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500) {
+    PSID local_domain = ipc_test_local_account_domain_sid();
+    PSID local_admin = ipc_test_admin_sid_for_domain(local_domain);
+
+    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+    PSID foreign_domain = NULL;
+    (void)AllocateAndInitializeSid(&nt, 4, 21U, 111U, 222U, 333U, 0, 0, 0, 0, &foreign_domain);
+    PSID foreign_admin = ipc_test_admin_sid_for_domain(foreign_domain);
+
+    PSID builtin_admins = NULL;
+    DWORD builtin_needed = 0;
+    (void)CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, NULL, &builtin_needed);
+    if (builtin_needed > 0) {
+        builtin_admins = malloc(builtin_needed);
+        if (builtin_admins &&
+            !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins, &builtin_needed)) {
+            free(builtin_admins);
+            builtin_admins = NULL;
+        }
+    }
+
+    bool local_built = local_admin != NULL;
+    bool foreign_built = foreign_admin != NULL;
+    bool builtin_built = builtin_admins != NULL;
+
+    bool local_ok = local_built && cbm_daemon_ipc_win_sid_trusted_for_testing(local_admin);
+    bool foreign_ok = foreign_built && cbm_daemon_ipc_win_sid_trusted_for_testing(foreign_admin);
+    bool builtin_ok = builtin_built && cbm_daemon_ipc_win_sid_trusted_for_testing(builtin_admins);
+
+    free(local_admin);
+    free(foreign_admin);
+    free(builtin_admins);
+    if (local_domain) {
+        FreeSid(local_domain);
+    }
+    if (foreign_domain) {
+        FreeSid(foreign_domain);
+    }
+
+    ASSERT_TRUE(local_built);
+    ASSERT_TRUE(foreign_built);
+    ASSERT_TRUE(builtin_built);
+    ASSERT_TRUE(builtin_ok);  /* the seam works: an already-trusted SID passes */
+    ASSERT_TRUE(local_ok);    /* #1705 fix: THIS machine's RID-500 is trusted */
+    ASSERT_FALSE(foreign_ok); /* safety: a foreign -500 is NEVER trusted */
     PASS();
 }
 
@@ -1154,6 +1404,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     bool startup_observed = false;
     int join_status = -1;
     ipc_test_win_startup_call_t call = {.result = -1};
+    atomic_init(&call.finished, false);
     ipc_test_startup_gate_t gate;
     atomic_init(&gate.acquired, false);
     atomic_init(&gate.may_proceed, false);
@@ -1179,7 +1430,7 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
     if (thread_started) {
-        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate, &call);
     }
     ipc_test_win_lock_release(&record_reader);
     atomic_store(&gate.may_proceed, true);
@@ -1200,7 +1451,14 @@ TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader) {
     ASSERT_EQ(directory_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_EQ(record_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_TRUE(thread_started);
-    ASSERT_TRUE(startup_observed);
+    if (!startup_observed) {
+        /* The startup thread returned without reaching the gate; its
+         * try-acquire status is the true reason. */
+        char reason[96];
+        (void)snprintf(reason, sizeof(reason), "startup call returned %d without reaching the gate",
+                       call.result);
+        FAIL(reason);
+    }
     ASSERT_EQ(join_status, 0);
     ASSERT_EQ(call.result, 1);
     ASSERT_TRUE(address[0] != '\0');
@@ -1223,6 +1481,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     bool startup_observed = false;
     int join_status = -1;
     ipc_test_win_startup_call_t call = {.result = -1};
+    atomic_init(&call.finished, false);
 
     bool parent_ok = ipc_test_parent_new(parent, "win-lifetime-bridge");
     if (parent_ok) {
@@ -1260,7 +1519,7 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
         thread_started = cbm_thread_create(&thread, 0, ipc_test_win_startup_call, &call) == 0;
     }
     if (thread_started) {
-        startup_observed = ipc_test_startup_gate_wait_acquired(&gate);
+        startup_observed = ipc_test_startup_gate_wait_acquired(&gate, &call);
     }
     /* Claim the lifetime lock while startup is parked in the gate, so the
      * concurrent-owner bridge under test is exercised deterministically. */
@@ -1293,7 +1552,14 @@ TEST(daemon_ipc_windows_rendezvous_bridges_concurrent_lifetime_owner) {
     ASSERT_EQ(directory_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_EQ(record_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_TRUE(thread_started);
-    ASSERT_TRUE(startup_observed);
+    if (!startup_observed) {
+        /* The startup thread returned without reaching the gate; its
+         * try-acquire status is the true reason. */
+        char reason[96];
+        (void)snprintf(reason, sizeof(reason), "startup call returned %d without reaching the gate",
+                       call.result);
+        FAIL(reason);
+    }
     ASSERT_EQ(lifetime_status, CBM_PRIVATE_FILE_LOCK_OK);
     ASSERT_EQ(join_status, 0);
     ASSERT_EQ(call.result, 0);
@@ -1945,6 +2211,108 @@ TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen) {
     PASS();
 }
 
+/* #2178: an age-based temp cleaner unlinked the live daemon's lifetime lock
+ * and identity marker. The heartbeat must keep every listener-owned file
+ * young, and report loss (unlink, or replacement by a fresh file at the same
+ * name) so the daemon exits instead of serving under a lifetime file that
+ * coordinates nothing or leaving an unremovable socket pair behind at close. */
+TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
+#ifdef _WIN32
+    SKIP_PLATFORM("unlink-while-held of runtime files is POSIX behavior");
+#else
+    enum { TOUCH_CASES = 5 };
+    enum { LOSS_UNLINK, LOSS_REPLACE_FILE, LOSS_REPLACE_SYMLINK };
+    static const char key[] = "2178a2178a2178a0";
+    static const struct {
+        const char *suffix;
+        int loss;
+    } cases[TOUCH_CASES] = {
+        {"lifetime.lock", LOSS_UNLINK},       /* lifetime reservation */
+        {"lock", LOSS_UNLINK},                /* listener-owned participant guard */
+        {"sock.identity", LOSS_UNLINK},       /* identity marker, unlinked */
+        {"sock.identity", LOSS_REPLACE_FILE}, /* ... replaced by a fresh inode */
+        {"sock.identity", LOSS_REPLACE_SYMLINK} /* ... replaced by a symlink */,
+    };
+    const time_t stale = 1000000000;
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    bool started[TOUCH_CASES] = {false};
+    int touched_intact[TOUCH_CASES] = {0};
+    bool refreshed[TOUCH_CASES] = {false};
+    bool lost[TOUCH_CASES] = {false};
+    int touched_after_loss[TOUCH_CASES] = {1, 1, 1, 1, 1};
+    int unreadable_touch = 0;
+    int readable_again_touch = 0;
+
+    if (ipc_test_parent_new(parent, "listener-touch")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    }
+    /* A still-valid marker that merely cannot be reopened (EACCES) is a
+     * transient refresh failure, not loss: the daemon must keep serving. */
+    if (endpoint) {
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        char marker[TEST_PATH_CAP];
+        int written = snprintf(marker, sizeof(marker), "%s/cbm-%s.sock.identity", runtime_dir, key);
+        if (listener && written > 0 && written < (int)sizeof(marker) && chmod(marker, 0) == 0) {
+            unreadable_touch = cbm_daemon_ipc_listener_touch(listener, NULL);
+            readable_again_touch =
+                chmod(marker, 0600) == 0 ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        }
+        cbm_daemon_ipc_listener_close(listener);
+    }
+    for (size_t i = 0; endpoint && i < TOUCH_CASES; i++) {
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        started[i] = listener != NULL;
+        char path[TEST_PATH_CAP];
+        int written =
+            snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, cases[i].suffix);
+        bool path_ok = started[i] && written > 0 && written < (int)sizeof(path);
+        struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+        bool aged = path_ok && utimensat(AT_FDCWD, path, stale_times, AT_SYMLINK_NOFOLLOW) == 0;
+        touched_intact[i] = aged ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        struct stat after;
+        refreshed[i] = touched_intact[i] == 1 && stat(path, &after) == 0 &&
+                       after.st_atime > stale && after.st_mtime > stale;
+        lost[i] = refreshed[i] && unlink(path) == 0;
+        if (lost[i] && cases[i].loss == LOSS_REPLACE_FILE) {
+            int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            lost[i] = fd >= 0 && close(fd) == 0;
+        } else if (lost[i] && cases[i].loss == LOSS_REPLACE_SYMLINK) {
+            lost[i] = symlink("/dev/null", path) == 0;
+        }
+        touched_after_loss[i] = lost[i] ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        cbm_daemon_ipc_listener_close(listener);
+        /* A tampered marker makes close (correctly) keep the socket pair; clear
+         * this case's simulated leftovers so the next case can listen. */
+        static const char *const leftovers[] = {"sock.identity", "sock", "anc"};
+        for (size_t j = 0; j < sizeof(leftovers) / sizeof(leftovers[0]); j++) {
+            written = snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, leftovers[j]);
+            if (written > 0 && written < (int)sizeof(path)) {
+                (void)unlink(path);
+            }
+        }
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    /* Root bypasses mode 0, so the reopen succeeds there and the touch is 1. */
+    ASSERT_EQ(unreadable_touch, geteuid() == 0 ? 1 : -1);
+    ASSERT_EQ(readable_again_touch, 1);
+    for (size_t i = 0; i < TOUCH_CASES; i++) {
+        ASSERT_TRUE(started[i]);
+        ASSERT_EQ(touched_intact[i], 1);
+        ASSERT_TRUE(refreshed[i]);
+        ASSERT_TRUE(lost[i]);
+        ASSERT_EQ(touched_after_loss[i], 0);
+    }
+    PASS();
+#endif
+}
+
 TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window) {
     static const char key[] = "1029384756abcdef";
     char parent[TEST_PATH_CAP] = {0};
@@ -2201,6 +2569,7 @@ typedef struct {
     cbm_daemon_ipc_listener_t *listener;
     cbm_daemon_ipc_connection_t *connection;
     atomic_bool waiting;
+    atomic_bool finished; /* set once the server thread has returned */
     int receive_result;
 } ipc_forever_wait_server_t;
 
@@ -2223,6 +2592,7 @@ static void *ipc_forever_wait_server(void *opaque) {
             server->connection, CBM_DAEMON_IPC_WAIT_FOREVER, &frame, &payload);
     }
     free(payload);
+    atomic_store_explicit(&server->finished, true, memory_order_release);
     return NULL;
 }
 
@@ -2239,6 +2609,7 @@ TEST(daemon_ipc_wait_forever_is_interruptible) {
     int join_result = -1;
     ipc_forever_wait_server_t server = {0};
     atomic_init(&server.waiting, false);
+    atomic_init(&server.finished, false);
 
     if (ipc_test_parent_new(parent, "wait-forever")) {
         endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
@@ -2254,9 +2625,11 @@ TEST(daemon_ipc_wait_forever_is_interruptible) {
     if (thread_started) {
         client = cbm_daemon_ipc_connect(endpoint, 2000);
     }
-    uint64_t deadline = cbm_now_ms() + 2000;
-    while (client && cbm_now_ms() < deadline &&
-           !atomic_load_explicit(&server.waiting, memory_order_acquire)) {
+    /* Wait for the event itself, never a deadline: the server either enters
+     * its forever-wait or returns (its accept is bounded by the call's own
+     * timeout), and both flags only ever go false -> true. */
+    while (client && !atomic_load_explicit(&server.waiting, memory_order_acquire) &&
+           !atomic_load_explicit(&server.finished, memory_order_acquire)) {
         cbm_usleep(1000);
     }
     reached_wait = atomic_load_explicit(&server.waiting, memory_order_acquire);
@@ -2320,14 +2693,13 @@ TEST(daemon_ipc_connect_waits_for_delayed_listener) {
         thread_started = cbm_thread_create(&thread, 0, ipc_delayed_listener_start, &delayed) == 0;
     }
     if (thread_started) {
+        /* `delay_started` is the thread's first store, so it cannot return
+         * without setting it: wait for that event with no attempt bound. */
         struct timespec poll_delay = {.tv_sec = 0, .tv_nsec = 1000000};
-        for (size_t i = 0; i < 2000; i++) {
-            if (atomic_load_explicit(&delayed.delay_started, memory_order_acquire)) {
-                delay_observed = true;
-                break;
-            }
+        while (!atomic_load_explicit(&delayed.delay_started, memory_order_acquire)) {
             (void)cbm_nanosleep(&poll_delay, NULL);
         }
+        delay_observed = true;
     }
     if (delay_observed) {
         client = cbm_daemon_ipc_connect(endpoint, 1500);
@@ -2622,6 +2994,91 @@ TEST(daemon_ipc_local_participants_overlap_and_allow_modern_startup) {
     PASS();
 }
 
+TEST(daemon_ipc_windows_local_transition_release_reports_live_gate_contention) {
+#ifndef _WIN32
+    PASS();
+#else
+    static const char key[] = "6060717182829393";
+    char parent[TEST_PATH_CAP] = {0};
+    char canonical_parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char legacy_pipe[CBM_DAEMON_IPC_WINDOWS_NAME_CAP] = {0};
+    char legacy_startup[CBM_DAEMON_IPC_WINDOWS_NAME_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_local_transition_t *transition = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+
+    bool parent_ok = ipc_test_parent_new(parent, "local-release-busy") &&
+                     ipc_test_full_path(canonical_parent, parent);
+    bool names_ok = parent_ok && cbm_daemon_ipc_windows_legacy_names(canonical_parent, key,
+                                                                     legacy_pipe, legacy_startup);
+    if (names_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    }
+    int acquired =
+        endpoint ? cbm_daemon_ipc_local_transition_try_acquire(endpoint, &transition) : -1;
+    int sealed = acquired == 1 ? cbm_daemon_ipc_local_transition_seal_legacy(transition) : -1;
+    int lifetime =
+        sealed == 1 ? cbm_daemon_ipc_local_transition_lifetime_probe(endpoint, transition) : -1;
+    bool begun = lifetime == 0 && cbm_daemon_ipc_local_transition_begin_work(transition);
+    int startup_acquired = begun ? cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) : -1;
+    int blocked = cbm_daemon_ipc_local_transition_try_release(&transition);
+    bool retained_while_busy = transition != NULL;
+    bool boolean_blocked = cbm_daemon_ipc_local_transition_release(&transition);
+    /* Keep the already-validated named mutex alive after the startup owner
+     * exits. Holding just this mutex exercises the second contention path. */
+    wchar_t *legacy_name = names_ok ? cbm_utf8_to_wide(legacy_startup) : NULL;
+    HANDLE legacy_mutex = startup_acquired == 1 && legacy_name
+                              ? OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, legacy_name)
+                              : NULL;
+    free(legacy_name);
+    bool startup_released = cbm_daemon_ipc_startup_lock_release(&startup);
+    DWORD mutex_wait =
+        startup_released && legacy_mutex ? WaitForSingleObject(legacy_mutex, 0) : WAIT_FAILED;
+    bool mutex_owned = mutex_wait == WAIT_OBJECT_0 || mutex_wait == WAIT_ABANDONED;
+    int legacy_blocked =
+        mutex_owned ? cbm_daemon_ipc_local_transition_try_release(&transition) : -1;
+    bool retained_while_legacy_busy = transition != NULL;
+    bool mutex_released = mutex_owned && ReleaseMutex(legacy_mutex);
+    if (legacy_mutex) {
+        (void)CloseHandle(legacy_mutex);
+    }
+    int legacy_retained = endpoint ? cbm_daemon_ipc_legacy_generation_probe(endpoint) : -1;
+    int released = cbm_daemon_ipc_local_transition_try_release(&transition);
+    bool consumed = transition == NULL;
+    int legacy_after = endpoint ? cbm_daemon_ipc_legacy_generation_probe(endpoint) : -1;
+
+    (void)cbm_daemon_ipc_startup_lock_release(&startup);
+    (void)cbm_daemon_ipc_local_transition_release(&transition);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(names_ok);
+    ASSERT_EQ(acquired, 1);
+    ASSERT_EQ(sealed, 1);
+    ASSERT_EQ(lifetime, 0);
+    ASSERT_TRUE(begun);
+    ASSERT_EQ(startup_acquired, 1);
+    ASSERT_EQ(blocked, 0);
+    ASSERT_TRUE(retained_while_busy);
+    ASSERT_FALSE(boolean_blocked);
+    ASSERT_TRUE(startup_released);
+    ASSERT_EQ(mutex_wait, WAIT_OBJECT_0);
+    ASSERT_EQ(legacy_blocked, 0);
+    ASSERT_TRUE(retained_while_legacy_busy);
+    ASSERT_TRUE(mutex_released);
+    ASSERT_EQ(legacy_retained, 1);
+    ASSERT_EQ(released, 1);
+    ASSERT_TRUE(consumed);
+    ASSERT_EQ(legacy_after, 0);
+    PASS();
+#endif
+}
+
 TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex) {
 #ifndef _WIN32
     PASS();
@@ -2649,7 +3106,7 @@ TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex) {
     if (begun) {
         cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(1);
     }
-    bool first_release = cbm_daemon_ipc_local_transition_release(&transition);
+    int first_release = cbm_daemon_ipc_local_transition_try_release(&transition);
     bool retained_after_failure = transition != NULL;
     bool retry_release = cbm_daemon_ipc_local_transition_release(&transition);
     cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(0);
@@ -2665,7 +3122,7 @@ TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex) {
     ASSERT_EQ(sealed, 1);
     ASSERT_EQ(lifetime, 0);
     ASSERT_TRUE(begun);
-    ASSERT_FALSE(first_release);
+    ASSERT_EQ(first_release, -1);
     ASSERT_TRUE(retained_after_failure);
     ASSERT_TRUE(retry_release);
     ASSERT_NULL(transition);
@@ -3901,6 +4358,170 @@ TEST(daemon_ipc_posix_unknown_socket_without_identity_refuses_cleanup) {
     PASS();
 }
 
+TEST(daemon_ipc_posix_markerless_linked_socket_recovers_under_startup_lock) {
+    static const char key[] = "d1e2f30415263748";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char anchor_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+    int raw_listener = -1;
+    struct sockaddr_un address;
+    socklen_t address_length = 0;
+    struct stat socket_status = {0};
+    struct stat anchor_status = {0};
+    struct stat absent_status = {0};
+    bool paths_ok = false;
+    bool orphan_created = false;
+    int startup_result = -1;
+    int cleanup_result = -1;
+    int endpoint_after_cleanup = -1;
+    bool names_removed = false;
+
+    if (ipc_test_parent_new(parent, "markerless-linked-socket")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+        paths_ok = ipc_test_socket_anchor_path(anchor_path, runtime_dir, key) &&
+                   ipc_test_unix_address_set(&address, socket_path, &address_length);
+    }
+    if (paths_ok) {
+        raw_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    }
+    if (raw_listener >= 0) {
+        orphan_created =
+            bind(raw_listener, (const struct sockaddr *)&address, address_length) == 0 &&
+            chmod(socket_path, 0600) == 0 && listen(raw_listener, 1) == 0 &&
+            link(socket_path, anchor_path) == 0 && lstat(socket_path, &socket_status) == 0 &&
+            lstat(anchor_path, &anchor_status) == 0 && S_ISSOCK(socket_status.st_mode) &&
+            S_ISSOCK(anchor_status.st_mode) && socket_status.st_nlink == 2 &&
+            anchor_status.st_nlink == 2 && socket_status.st_dev == anchor_status.st_dev &&
+            socket_status.st_ino == anchor_status.st_ino;
+        (void)close(raw_listener);
+        raw_listener = -1;
+    }
+    if (orphan_created) {
+        startup_result = cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup);
+    }
+    if (startup) {
+        cleanup_result = cbm_daemon_ipc_stale_generation_cleanup(endpoint, startup);
+        endpoint_after_cleanup = cbm_daemon_ipc_endpoint_probe(endpoint, 0);
+        errno = 0;
+        bool socket_removed = lstat(socket_path, &absent_status) != 0 && errno == ENOENT;
+        errno = 0;
+        bool anchor_removed = lstat(anchor_path, &absent_status) != 0 && errno == ENOENT;
+        names_removed = socket_removed && anchor_removed;
+    }
+
+    cbm_daemon_ipc_startup_lock_release(&startup);
+    if (raw_listener >= 0) {
+        (void)close(raw_listener);
+    }
+    (void)unlink(anchor_path);
+    (void)unlink(socket_path);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(orphan_created);
+    ASSERT_EQ(startup_result, 1);
+    ASSERT_EQ(cleanup_result, 1);
+    ASSERT_EQ(endpoint_after_cleanup, 0);
+    ASSERT_TRUE(names_removed);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved) {
+    static const char key[] = "e1f2031425364758";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char anchor_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+    int stable_listener = -1;
+    int anchor_listener = -1;
+    struct sockaddr_un stable_address;
+    struct sockaddr_un anchor_address;
+    socklen_t stable_address_length = 0;
+    socklen_t anchor_address_length = 0;
+    struct stat stable_before = {0};
+    struct stat anchor_before = {0};
+    struct stat stable_after = {0};
+    struct stat anchor_after = {0};
+    bool paths_ok = false;
+    bool mismatch_created = false;
+    int startup_result = -1;
+    int cleanup_result = -1;
+    bool mismatch_preserved = false;
+
+    if (ipc_test_parent_new(parent, "markerless-mismatch")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+        paths_ok =
+            ipc_test_socket_anchor_path(anchor_path, runtime_dir, key) &&
+            ipc_test_unix_address_set(&stable_address, socket_path, &stable_address_length) &&
+            ipc_test_unix_address_set(&anchor_address, anchor_path, &anchor_address_length);
+    }
+    if (paths_ok) {
+        stable_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+        anchor_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    }
+    if (stable_listener >= 0 && anchor_listener >= 0) {
+        mismatch_created = bind(stable_listener, (const struct sockaddr *)&stable_address,
+                                stable_address_length) == 0 &&
+                           chmod(socket_path, 0600) == 0 && listen(stable_listener, 1) == 0 &&
+                           bind(anchor_listener, (const struct sockaddr *)&anchor_address,
+                                anchor_address_length) == 0 &&
+                           chmod(anchor_path, 0600) == 0 && listen(anchor_listener, 1) == 0 &&
+                           lstat(socket_path, &stable_before) == 0 &&
+                           lstat(anchor_path, &anchor_before) == 0 &&
+                           S_ISSOCK(stable_before.st_mode) && S_ISSOCK(anchor_before.st_mode) &&
+                           stable_before.st_ino != anchor_before.st_ino;
+        (void)close(stable_listener);
+        stable_listener = -1;
+        (void)close(anchor_listener);
+        anchor_listener = -1;
+    }
+    if (mismatch_created) {
+        startup_result = cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup);
+    }
+    if (startup) {
+        cleanup_result = cbm_daemon_ipc_stale_generation_cleanup(endpoint, startup);
+        mismatch_preserved = lstat(socket_path, &stable_after) == 0 &&
+                             lstat(anchor_path, &anchor_after) == 0 &&
+                             stable_after.st_dev == stable_before.st_dev &&
+                             stable_after.st_ino == stable_before.st_ino &&
+                             anchor_after.st_dev == anchor_before.st_dev &&
+                             anchor_after.st_ino == anchor_before.st_ino;
+    }
+
+    cbm_daemon_ipc_startup_lock_release(&startup);
+    if (stable_listener >= 0) {
+        (void)close(stable_listener);
+    }
+    if (anchor_listener >= 0) {
+        (void)close(anchor_listener);
+    }
+    (void)unlink(anchor_path);
+    (void)unlink(socket_path);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(mismatch_created);
+    ASSERT_EQ(startup_result, 1);
+    ASSERT_EQ(cleanup_result, 0);
+    ASSERT_TRUE(mismatch_preserved);
+    PASS();
+}
+
 TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure) {
     static const char key[] = "c1d2e3f405162738";
     enum { CLIENT_CAP = 64 };
@@ -4786,7 +5407,540 @@ TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
     ASSERT_TRUE(refused);
     PASS();
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1687: on a WSL DrvFs mount (/mnt/e, default 0777) the ancestor refusal is
+ * correct but used to leave the user guessing. The gate must still refuse, and
+ * the detail must now name the containing directory AND the WSL remedy. */
+TEST(daemon_ipc_posix_wsl_drvfs_refusal_names_remedy_issue1687) {
+    char parent[TEST_PATH_CAP];
+    char ancestor[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    char detail[512] = {0};
+    char plain_detail[512] = {0};
+    bool paths_ok = false;
+    bool ancestor_ready = false;
+    bool refused = false;
+    bool plain_refused = false;
+
+    if (ipc_test_parent_new(parent, "posix-wsl-drvfs")) {
+        int a = snprintf(ancestor, sizeof(ancestor), "%s/e", parent);
+        int c = snprintf(cache, sizeof(cache), "%s/codebase_memory_cache", ancestor);
+        paths_ok = a > 0 && a < (int)sizeof(ancestor) && c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_ready = mkdir(ancestor, 0777) == 0 && chmod(ancestor, 0777) == 0;
+    }
+    if (ancestor_ready) {
+        cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(true);
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(false);
+        (void)snprintf(detail, sizeof(detail), "%s", cbm_daemon_ipc_validation_detail());
+        plain_refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        (void)snprintf(plain_detail, sizeof(plain_detail), "%s",
+                       cbm_daemon_ipc_validation_detail());
+    }
+
+    (void)rmdir(cache);
+    (void)rmdir(ancestor);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(refused); /* policy unchanged: still refused */
+    ASSERT_NOT_NULL(strstr(detail, "CONTAINING 'codebase_memory_cache'"));
+    ASSERT_NOT_NULL(strstr(detail, "/etc/wsl.conf"));
+    ASSERT_NOT_NULL(strstr(detail, "metadata,umask=22,fmask=11"));
+    ASSERT_NOT_NULL(strstr(detail, "wsl --shutdown"));
+    ASSERT_NOT_NULL(strstr(detail, "~/.cache"));
+    /* The remedy must fit whole, not be clipped by the detail buffer. */
+    ASSERT_NOT_NULL(strstr(detail, "(e.g. ~/.cache)"));
+    /* Off DrvFs the generic message stays and carries no WSL advice. */
+    ASSERT_TRUE(plain_refused);
+    ASSERT_NOT_NULL(strstr(plain_detail, "CONTAINING 'codebase_memory_cache'"));
+    ASSERT_NULL(strstr(plain_detail, "wsl.conf"));
+    PASS();
+}
+
+/* #1717: an ancestor owned by ANOTHER non-root account (a shared filesystem
+ * whose parent directory belongs to a colleague) is refused -- that account can
+ * rename or replace everything below it, so the policy stays. What was wrong is
+ * the message: the refusal set no detail, and the caller printed
+ * "ancestry component validation failed (errno 17)", a stale EEXIST from
+ * mkdirat() that named neither the directory nor the reason. The reporter
+ * could not tell which directory, or why. The refusal must name the refusing
+ * directory, its owner uid, and the remedy. The seam reports one directory as
+ * foreign-owned because an unprivileged test cannot chown to another account. */
+enum { IPC_TEST_FOREIGN_MAX_DEPTH = 16 };
+
+typedef struct {
+    bool paths_ok;
+    bool seam_set;
+    bool refused;
+    bool cache_created;
+    bool secured_without_seam;
+    size_t foreign_path_length;
+    char detail[512];
+} ipc_test_foreign_result_t;
+
+/* Build <parent>/<depth x 24-char dirs>/shared-fs, mark shared-fs as owned by
+ * foreign_uid through the seam, and ask for <...>/shared-fs/cache. Deeper
+ * chains produce a path long enough that the detail must be shortened. */
+static void ipc_test_foreign_ancestor_run(const char *tag, int depth, unsigned long foreign_uid,
+                                          ipc_test_foreign_result_t *result) {
+    char parent[TEST_PATH_CAP];
+    char chain[IPC_TEST_FOREIGN_MAX_DEPTH + 1][TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    int made = 0;
+    memset(result, 0, sizeof(*result));
+    result->paths_ok = depth <= IPC_TEST_FOREIGN_MAX_DEPTH && ipc_test_parent_new(parent, tag);
+    const char *base = parent;
+    for (int level = 0; result->paths_ok && level <= depth; level++) {
+        const char *leaf = level == depth ? "shared-fs" : "level-component-24-chars";
+        int w = snprintf(chain[level], sizeof(chain[level]), "%s/%s", base, leaf);
+        result->paths_ok = w > 0 && w < (int)sizeof(chain[level]) && mkdir(chain[level], 0755) == 0;
+        made += result->paths_ok ? 1 : 0;
+        base = chain[level];
+    }
+    if (result->paths_ok) {
+        int c = snprintf(cache, sizeof(cache), "%s/cache", chain[depth]);
+        result->paths_ok = c > 0 && c < (int)sizeof(cache);
+        result->foreign_path_length = strlen(chain[depth]);
+    }
+    if (result->paths_ok) {
+        result->seam_set =
+            cbm_daemon_ipc_posix_set_foreign_owned_dir_for_test(chain[depth], foreign_uid);
+    }
+    if (result->seam_set) {
+        result->refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        const char *why = cbm_daemon_ipc_validation_detail();
+        (void)snprintf(result->detail, sizeof(result->detail), "%s", why ? why : "");
+        struct stat probe;
+        result->cache_created = lstat(cache, &probe) == 0;
+        cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test();
+        /* Control: with real ownership the same path is accepted, so the
+         * refusal above is the foreign owner and nothing else. */
+        result->secured_without_seam = cbm_daemon_ipc_private_directory_secure(cache);
+        (void)rmdir(cache);
+    }
+    cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test();
+    while (made > 0) {
+        (void)rmdir(chain[--made]);
+    }
+    if (depth <= IPC_TEST_FOREIGN_MAX_DEPTH) {
+        ipc_test_remove_flat_dir(parent);
+    }
+}
+
+TEST(daemon_ipc_posix_foreign_owned_ancestor_refusal_names_directory_issue1717) {
+    /* A uid no account resolves to: the detail names the uid alone. */
+    unsigned long foreign_uid = (unsigned long)geteuid() + 4242UL;
+    ASSERT_TRUE(getpwuid((uid_t)foreign_uid) == NULL); /* precondition */
+    ipc_test_foreign_result_t result;
+    ipc_test_foreign_ancestor_run("posix-foreign-ancestor", 0, foreign_uid, &result);
+    char owner_text[64];
+    (void)snprintf(owner_text, sizeof(owner_text), "owned by uid %lu,", foreign_uid);
+
+    ASSERT_TRUE(result.paths_ok);
+    ASSERT_TRUE(result.seam_set);
+    ASSERT_TRUE(result.refused);
+    ASSERT_TRUE(!result.cache_created); /* nothing is created below a foreign ancestor */
+    ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs'"));
+    ASSERT_NOT_NULL(strstr(result.detail, owner_text));
+    ASSERT_NOT_NULL(strstr(result.detail, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(strstr(result.detail, "errno") == NULL);
+    ASSERT_TRUE(result.secured_without_seam);
+    PASS();
+}
+
+/* #1717: the owner is named when the account resolves. uid 1 is a local system
+ * account in /etc/passwd on macOS and on the Linux images we test ("daemon" on
+ * both; Alpine calls it "bin"), so the expected name is taken from the same
+ * local database rather than hardcoded. */
+TEST(daemon_ipc_posix_foreign_owned_ancestor_names_owner_account_issue1717) {
+    const unsigned long named_uid = 1;
+    struct passwd *expected = getpwuid((uid_t)named_uid);
+    if (!expected || !expected->pw_name || !expected->pw_name[0]) {
+        SKIP_PLATFORM("uid 1 has no local account name on this system");
+    }
+    char owner_text[96];
+    (void)snprintf(owner_text, sizeof(owner_text), "owned by uid %lu (%s),", named_uid,
+                   expected->pw_name);
+    ipc_test_foreign_result_t result;
+    ipc_test_foreign_ancestor_run("posix-foreign-named", 0, named_uid, &result);
+
+    ASSERT_TRUE(result.paths_ok);
+    ASSERT_TRUE(result.seam_set);
+    ASSERT_TRUE(result.refused);
+    ASSERT_NOT_NULL(strstr(result.detail, owner_text));
+    ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs'"));
+    ASSERT_TRUE(result.secured_without_seam);
+    PASS();
+}
+
+/* #1717: the detail buffer is fixed (384 bytes). A long path must not push the
+ * remedy out: the path is shortened from the left, so the refusing component
+ * and the whole remedy survive. */
+TEST(daemon_ipc_posix_foreign_owned_ancestor_long_path_keeps_remedy_issue1717) {
+    const unsigned long named_uid = 1;
+    ipc_test_foreign_result_t result;
+    ipc_test_foreign_ancestor_run("posix-foreign-long", IPC_TEST_FOREIGN_MAX_DEPTH, named_uid,
+                                  &result);
+    static const char remedy[] =
+        "Use a location whose parent directories are yours or root's (e.g. set CBM_CACHE_DIR)";
+
+    ASSERT_TRUE(result.paths_ok);
+    ASSERT_TRUE(result.foreign_path_length > 384); /* the input really overflows */
+    ASSERT_TRUE(result.refused);
+    ASSERT_TRUE(strlen(result.detail) < 384);
+    ASSERT_TRUE(strncmp(result.detail, "'...", 4) == 0);
+    ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs' is owned by uid 1"));
+    size_t detail_length = strlen(result.detail);
+    ASSERT_TRUE(detail_length >= sizeof(remedy) - 1);
+    ASSERT_STR_EQ(result.detail + detail_length - (sizeof(remedy) - 1), remedy);
+    PASS();
+}
+#endif
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1830: /proc/self/uid_map single-uid detection. A single-uid map is exactly
+ * one line "<inside> <outside> 1" whose inside id is our euid; anything else —
+ * the init map, a count other than 1, a foreign inside id, extra lines, or junk
+ * — must read as "not single-uid" so the overflow tolerance never engages. */
+TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830) {
+    const unsigned long me = 1000;
+    ASSERT_TRUE(cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 1000 1\n", me));
+    ASSERT_TRUE(cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 0 1", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("0 0 4294967295\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 1000 2\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("42 1000 1\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 1000 1\n0 0 1\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("not a map", me));
+    PASS();
+}
+
+/* #1830: the ancestor accept/refuse decision. The overflow uid is tolerable for
+ * an ancestor ONLY when the single-uid tolerance is engaged, and even then only
+ * where a root owner would be: not world-writable unless sticky, and never
+ * group-writable (the unmapped owner's host group is unknown). With tolerance
+ * OFF (init/multi-uid/unreadable map) an overflow-owned ancestor is refused
+ * exactly as before #1830 — that OFF row is what a revert of the tolerance
+ * would collapse the ON rows to, so it pins the fix. euid/root/foreign owners
+ * behave identically with tolerance on or off. */
+TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830) {
+    const unsigned long euid = 1000;
+    const unsigned long ovf = 65534;
+    const unsigned long foreign = 4242;
+#define ANCESTOR_OK(owner, mode, on, ovfuid) \
+    cbm_daemon_ipc_posix_ancestor_stat_ok_for_test((owner), (mode), euid, (on), (ovfuid))
+
+    /* Overflow-owned ancestors, single-uid tolerance ENGAGED. */
+    ASSERT_TRUE(ANCESTOR_OK(ovf, 0755, true, ovf));
+    ASSERT_TRUE(ANCESTOR_OK(ovf, 0700, true, ovf));
+    ASSERT_TRUE(ANCESTOR_OK(ovf, 01777, true, ovf)); /* sticky /tmp shape */
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 0777, true, ovf)); /* world-writable, no sticky */
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 0775, true, ovf)); /* group-writable overflow owner */
+
+    /* Same ancestors, tolerance OFF — the pre-#1830 refusal (and the multi-uid /
+     * unreadable-map path). A revert of the fix makes the ON rows read like these. */
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 0755, false, 0));
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 01777, false, 0));
+
+    /* Controls unaffected by the tolerance. */
+    ASSERT_TRUE(ANCESTOR_OK(euid, 0755, true, ovf));
+    ASSERT_TRUE(ANCESTOR_OK(euid, 0700, false, 0));
+    ASSERT_TRUE(ANCESTOR_OK(0, 01777, true, ovf));       /* root-owned sticky /tmp */
+    ASSERT_TRUE(!ANCESTOR_OK(0, 0777, true, ovf));       /* root world-writable, no sticky */
+    ASSERT_TRUE(!ANCESTOR_OK(foreign, 0755, true, ovf)); /* a mapped-out foreign uid */
+#undef ANCESTOR_OK
+    PASS();
+}
+
+/* #1830 regression guard, and the test that would have caught the original bug
+ * with no namespace at all. The overflow uid used to be memoised per process
+ * via pthread_once. That made a SECURITY decision sticky: pthread_once state
+ * survives fork(), unshare(CLONE_NEWUSER) rewrites /proc/self/uid_map, so a
+ * process that forked and then entered a namespace kept the parent verdict.
+ * Nothing in the suite could see it, because every deterministic #1830 test
+ * drives the override seam rather than the real derivation -- they bind the
+ * decision TABLE, not the WIRING.
+ *
+ * So assert the wiring directly: two ancestor checks must perform two real
+ * derivations. Re-introduce any cache and the second call derives zero times
+ * and this fails by name, on every platform, with no namespace required. */
+TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830) {
+#if defined(__linux__)
+    char parent[TEST_PATH_CAP];
+    if (!ipc_test_parent_new(parent, "overflow-nocache")) {
+        FAIL("could not create the probe parent directory");
+    }
+    char probe[TEST_PATH_CAP];
+    (void)snprintf(probe, sizeof(probe), "%s/x", parent);
+
+    /* The override seam short-circuits derivation, so it must be OFF here or
+     * the test would measure nothing. */
+    cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(false, 0);
+
+    unsigned before = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+    (void)cbm_daemon_ipc_private_directory_secure(probe);
+    unsigned after_first = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+    (void)cbm_daemon_ipc_private_directory_secure(probe);
+    unsigned after_second = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+
+    (void)rmdir(probe);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(after_first > before);
+    /* The decisive half: the SECOND call must derive again. */
+    ASSERT_TRUE(after_second > after_first);
+    PASS();
+#else
+    SKIP_PLATFORM("the overflow-uid derivation is Linux-only");
+#endif
+}
+
+/* #1830 real end-to-end smoke: inside a single-uid user namespace the
+ * root-owned ancestors (/, /tmp) are overflow-owned, and the daemon must still
+ * create its private directory there. An overflow-owned ancestor cannot be
+ * fabricated unprivileged, so this runs the real path only when a user
+ * namespace is actually available. O10 whitelisted-skip everywhere it is not:
+ * macOS has no user namespaces (compile-gated out); Docker's default seccomp
+ * blocks unshare(CLONE_NEWUSER) on the Colima container leg; some kernels ship
+ * user namespaces disabled. NOT on that list any more: Ubuntu 23.10+ restricts
+ * unprivileged userns via AppArmor, which used to confine this test to the two
+ * ubuntu-22.04 legs -- broad-matrix only, so it ran in no PR and sat on
+ * GitHub's 2027-04-17 retirement clock. _test.yml now lifts that with
+ * kernel.apparmor_restrict_unprivileged_userns=0 on every ubuntu leg, so this
+ * runs on the CORE matrix. WHAT WAS TRIED when it skips: fork + unshare
+ * CLONE_NEWUSER + a 1:1 uid_map write, which the sandbox denied (EPERM). The
+ * deterministic decision coverage above is what binds the fix.
+ *
+ * TO REPRODUCE IT LOCALLY two things are needed, and the second is easy to
+ * miss: run the container with --security-opt seccomp=unconfined so unshare is
+ * permitted, AND run the suite as a NON-ROOT uid. As root the mapped range
+ * covers uid 0, so root-owned /tmp stays 1:1 inside the namespace, never turns
+ * overflow, and this test passes without ever reaching the branch it exists to
+ * cover -- it passes just as happily with the fix reverted. Under `su tester`
+ * (uid 1001, the shape CI's runner user has) the ancestors do go overflow and
+ * the assertion becomes real. */
+TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
+#if defined(__linux__)
+    uid_t host_uid = geteuid();
+    char probe[TEST_PATH_CAP];
+    (void)snprintf(probe, sizeof(probe), "/tmp/cbm-userns-smoke-%ld/x", (long)getpid());
+    char probe_dir[TEST_PATH_CAP];
+    (void)snprintf(probe_dir, sizeof(probe_dir), "/tmp/cbm-userns-smoke-%ld", (long)getpid());
+
+    pid_t child = fork();
+    if (child == 0) {
+        /* Child: enter a single-uid user namespace mapping host_uid 1:1. */
+        if (unshare(CLONE_NEWUSER) != 0) {
+            _exit(2); /* userns unavailable → signal skip to the parent. */
+        }
+        int sg = open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
+        if (sg >= 0) {
+            (void)!write(sg, "deny", 4);
+            (void)close(sg);
+        }
+        int mf = open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC);
+        char line[64];
+        int n = snprintf(line, sizeof(line), "%ld %ld 1", (long)host_uid, (long)host_uid);
+        bool mapped = mf >= 0 && n > 0 && write(mf, line, (size_t)n) == n;
+        if (mf >= 0) {
+            (void)close(mf);
+        }
+        if (!mapped) {
+            _exit(2);
+        }
+        /* Inside the ns / and /tmp now show the overflow uid. With #1830 the
+         * daemon can still build its private tree there; without it, refused.
+         *
+         * EXEC, do not just call. The overflow uid is derived once per process
+         * (pthread_once) from /proc/self/uid_map, and that state survives
+         * fork(): seven earlier call sites in this suite prime it with the HOST
+         * answer, so a forked child keeps "no overflow uid" and refuses no
+         * matter what its namespace says. That made this test fail on the only
+         * platform where it actually runs (ubuntu-22.04; macOS compile-gates it
+         * out, Colima's seccomp blocks unshare, and 23.10+ restricts
+         * unprivileged userns) -- while looking like a product regression.
+         * Re-exec so the decision is made by a process that STARTED here, which
+         * is also the only shape production ever takes. */
+        (void)execl("/proc/self/exe", "test-runner", "--userns-secure-probe", probe, (char *)NULL);
+        _exit(3); /* exec failed -- distinct from secure(0)/refused(1)/skip(2) */
+    }
+    if (child < 0) {
+        FAIL("fork failed for userns smoke");
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    (void)rmdir(probe);
+    (void)rmdir(probe_dir);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
+        SKIP_PLATFORM("user namespaces unavailable (no CLONE_NEWUSER / seccomp-blocked)");
+    }
+    /* A failed re-exec must never read as a product refusal: 3 is its own code
+     * so a broken probe is a loud harness failure, not a quiet "refused". */
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 3) {
+        FAIL("userns smoke could not re-exec /proc/self/exe for the probe");
+    }
+    /* {0,1,2,3} is the whole protocol. Any other code -- a sanitizer exit (LSan
+     * defaults to 23), an abort, a signal -- is a broken harness, not a refusal,
+     * and must say so with the code it actually saw. */
+    if (!WIFEXITED(status)) {
+        FAIL("userns probe did not exit normally (signalled) -- not a security verdict");
+    }
+    if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
+        char unexpected[128];
+        (void)snprintf(unexpected, sizeof(unexpected),
+                       "userns probe exited %d -- not a security verdict",
+                       WEXITSTATUS(status));
+        FAIL(unexpected);
+    }
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    PASS();
+#else
+    SKIP_PLATFORM("user namespaces are Linux-only");
+#endif
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
 #endif /* !_WIN32 */
+
+#ifndef _WIN32
+enum { IPC_TEST_LOG_CAPTURE_CAP = 16384 };
+static char ipc_test_log_capture[IPC_TEST_LOG_CAPTURE_CAP];
+static size_t ipc_test_log_capture_used;
+
+static void ipc_test_log_capture_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t length = strlen(line);
+    if (ipc_test_log_capture_used + length + 2 > sizeof(ipc_test_log_capture)) {
+        return;
+    }
+    memcpy(ipc_test_log_capture + ipc_test_log_capture_used, line, length);
+    ipc_test_log_capture_used += length;
+    ipc_test_log_capture[ipc_test_log_capture_used++] = '\n';
+    ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1717: a cache root on a network filesystem (shared HPC home, NFS/SMB mount)
+ * is ACCEPTED, but SQLite WAL is unreliable there, so startup logs ONE warning
+ * with the local-storage advice. The seam supplies the statfs f_type on every
+ * platform (real detection is Linux-only), so the mapping and the
+ * once-per-process rule are bound deterministically here. */
+static bool ipc_test_network_warning_emitted(unsigned long magic, const char *fs_name) {
+    ipc_test_log_capture_used = 0;
+    ipc_test_log_capture[0] = '\0';
+    cbm_daemon_ipc_set_fs_magic_for_test(true, magic);
+    cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+    bool warned = cbm_daemon_ipc_warn_if_network_cache_root("/shared/fs/me/.cache/cbm");
+    cbm_log_set_sink(NULL);
+    char expected[32];
+    (void)snprintf(expected, sizeof(expected), "fs=%s", fs_name);
+    const char *line = strstr(ipc_test_log_capture, "daemon.cache_root_network_fs");
+    return warned && line && strstr(line, expected) && strstr(line, "CBM_CACHE_DIR") &&
+           strstr(line, "path=/shared/fs/me/.cache/cbm");
+}
+
+TEST(daemon_ipc_network_cache_root_warns_once_issue1717) {
+    CBMLogLevel saved_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_WARN);
+    bool nfs = ipc_test_network_warning_emitted(0x6969UL, "NFS");
+    bool cifs = ipc_test_network_warning_emitted(0xFF534D42UL, "CIFS");
+    bool smb2 = ipc_test_network_warning_emitted(0xFE534D42UL, "SMB2");
+    bool lustre = ipc_test_network_warning_emitted(0x0BD00BD0UL, "Lustre");
+    bool gpfs = ipc_test_network_warning_emitted(0x47504653UL, "GPFS");
+
+    /* Once per process: a second startup check stays silent. */
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0x6969UL);
+    bool first = cbm_daemon_ipc_warn_if_network_cache_root("/nfs/cache");
+    bool second = cbm_daemon_ipc_warn_if_network_cache_root("/nfs/cache");
+
+    /* Local filesystems (ext4, xfs, tmpfs) never warn. */
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0xEF53UL);
+    bool ext4 = cbm_daemon_ipc_warn_if_network_cache_root("/home/me/.cache/cbm");
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0x58465342UL);
+    bool xfs = cbm_daemon_ipc_warn_if_network_cache_root("/home/me/.cache/cbm");
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0x01021994UL);
+    bool tmpfs = cbm_daemon_ipc_warn_if_network_cache_root("/home/me/.cache/cbm");
+
+    cbm_daemon_ipc_set_fs_magic_for_test(false, 0);
+    cbm_log_set_level(saved_level);
+
+    ASSERT_TRUE(nfs);
+    ASSERT_TRUE(cifs);
+    ASSERT_TRUE(smb2);
+    ASSERT_TRUE(lustre);
+    ASSERT_TRUE(gpfs);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(!second);
+    ASSERT_TRUE(!ext4);
+    ASSERT_TRUE(!xfs);
+    ASSERT_TRUE(!tmpfs);
+    PASS();
+}
+#endif
+
+/* #1828: a full /tmp made every daemon start die at pending publication, and
+ * the only durable trace was `daemon.ipc.listen_failed stage=pending_publication`
+ * -- no syscall, no errno, no path. The reporter needed hours (and a wrong
+ * `df` on the wrong mount) to find the cause. The failure line must name the
+ * errno and the exact artifact path that could not be written. */
+TEST(daemon_ipc_listen_failure_names_errno_and_path) {
+    static const char key[] = "1828000000000001";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char pending_path[TEST_PATH_CAP] = {0};
+    char expected_path[TEST_PATH_CAP + 16] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+
+    bool parent_ok = ipc_test_parent_new(parent, "enospc-diag");
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+    }
+    bool paths_ok = endpoint && ipc_test_socket_pending_path(pending_path, socket_path) &&
+                    snprintf(expected_path, sizeof(expected_path), "path=%s.tmp", pending_path) > 0;
+    if (paths_ok) {
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        listener = cbm_daemon_ipc_listen(endpoint);
+        cbm_log_set_sink(NULL);
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
+    }
+    const char *failed = strstr(ipc_test_log_capture, "msg=daemon.ipc.listen_failed");
+    bool stage_named = failed && strstr(failed, "stage=pending_publication") != NULL;
+    bool errno_named = failed && strstr(failed, "errno=ENOSPC") != NULL;
+    bool path_named = failed && strstr(failed, expected_path) != NULL;
+    struct stat leftover;
+    bool namespace_clean = paths_ok && lstat(socket_path, &leftover) != 0 && errno == ENOENT &&
+                           lstat(pending_path, &leftover) != 0 && errno == ENOENT;
+
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(listener == NULL);
+    ASSERT_TRUE(failed != NULL);
+    ASSERT_TRUE(stage_named);
+    ASSERT_TRUE(errno_named);
+    ASSERT_TRUE(path_named);
+    ASSERT_TRUE(namespace_clean);
+    PASS();
+}
+#endif
 
 SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_pending_timeout_race_returns_completed_io);
@@ -4799,7 +5953,10 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
+    RUN_TEST(daemon_ipc_windows_private_directory_survives_lost_creation_race);
+    RUN_TEST(daemon_ipc_windows_private_directory_refuses_and_names_a_planted_file);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
+    RUN_TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
     RUN_TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader);
@@ -4813,6 +5970,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_rejects_uppercase_instance_key);
     RUN_TEST(daemon_ipc_no_spawn_probe_distinguishes_absent_active_and_busy);
     RUN_TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen);
+    RUN_TEST(daemon_ipc_listener_touch_detects_lost_runtime_files);
     RUN_TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window);
     RUN_TEST(daemon_ipc_local_frame_roundtrip);
     RUN_TEST(daemon_ipc_bounded_receive_rejects_oversize_before_payload);
@@ -4822,12 +5980,23 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_activation_probe_ignores_matching_startup_claim_only);
     RUN_TEST(daemon_ipc_local_transition_coexists_with_active_daemon_lifetime);
     RUN_TEST(daemon_ipc_local_participants_overlap_and_allow_modern_startup);
+    RUN_TEST(daemon_ipc_windows_local_transition_release_reports_live_gate_contention);
     RUN_TEST(daemon_ipc_windows_local_transition_release_retries_retained_mutex);
     RUN_TEST(daemon_ipc_windows_startup_release_retains_retry_authority);
     RUN_TEST(daemon_ipc_frame_timeout_poisons_connection);
 #ifndef _WIN32
     RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
     RUN_TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_posix_wsl_drvfs_refusal_names_remedy_issue1687);
+    RUN_TEST(daemon_ipc_posix_foreign_owned_ancestor_refusal_names_directory_issue1717);
+    RUN_TEST(daemon_ipc_posix_foreign_owned_ancestor_names_owner_account_issue1717);
+    RUN_TEST(daemon_ipc_posix_foreign_owned_ancestor_long_path_keeps_remedy_issue1717);
+    RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
+    RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
+    RUN_TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830);
+    RUN_TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830);
+#endif
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
     RUN_TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance);
     RUN_TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge);
@@ -4838,6 +6007,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_pending_without_anchor_never_deletes_stable);
     RUN_TEST(daemon_ipc_posix_current_generation_crash_cleanup_requires_startup_lock);
     RUN_TEST(daemon_ipc_posix_unknown_socket_without_identity_refuses_cleanup);
+    RUN_TEST(daemon_ipc_posix_markerless_linked_socket_recovers_under_startup_lock);
+    RUN_TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved);
     RUN_TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure);
     RUN_TEST(daemon_ipc_posix_partial_frame_timeout_poisons_connection);
 #ifdef __APPLE__
@@ -4853,5 +6024,11 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
+#ifndef _WIN32
+    RUN_TEST(daemon_ipc_listen_failure_names_errno_and_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_network_cache_root_warns_once_issue1717);
+#endif
+#endif
 #endif
 }

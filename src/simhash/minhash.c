@@ -9,6 +9,7 @@
  */
 #include "simhash/minhash.h"
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "foundation/log.h"
 /* Inline all xxHash functions — avoids separate compilation unit. */
 #define XXH_INLINE_ALL
@@ -176,32 +177,45 @@ static int collect_ast_tokens(TSNode root, const char **tokens, int max_tokens) 
 /* Unique-trigram set: open addressing on 64-bit hashes. */
 enum { UNIQ_SET_SIZE = 4096, UNIQ_SET_MASK = 4095 };
 
+/* The set is sized per function: at least twice its trigram count (so it can
+ * never fill), at most UNIQ_SET_SIZE as before. Zeroing all 4,096 slots for
+ * every function was a 32 KB memset per fingerprint. */
 typedef struct {
     uint64_t slots[UNIQ_SET_SIZE];
+    uint32_t mask;
     int count;
 } uniq_trig_set_t;
 
-static void uniq_trig_init(uniq_trig_set_t *s) {
-    memset(s->slots, 0, sizeof(s->slots));
+enum { UNIQ_SET_MIN = 64 };
+
+static void uniq_trig_init(uniq_trig_set_t *s, int trigram_count) {
+    uint32_t size = UNIQ_SET_MIN;
+    while (size < UNIQ_SET_SIZE && (int64_t)size < (int64_t)trigram_count * PAIR_LEN) {
+        size <<= SKIP_ONE;
+    }
+    memset(s->slots, 0, (size_t)size * sizeof(s->slots[0]));
+    s->mask = size - SKIP_ONE;
     s->count = 0;
 }
 
-/* Insert a trigram hash.  Returns true if newly inserted. */
-static bool uniq_trig_insert(uniq_trig_set_t *s, uint64_t trig_hash) {
+enum { UNIQ_PRESENT = 0, UNIQ_NEW = 1, UNIQ_FULL = 2 };
+
+/* Insert a trigram hash: UNIQ_NEW, UNIQ_PRESENT, or UNIQ_FULL (not counted). */
+static int uniq_trig_insert(uniq_trig_set_t *s, uint64_t trig_hash) {
     uint64_t val = trig_hash | SKIP_ONE; /* ensure non-zero */
-    uint32_t slot = (uint32_t)(trig_hash & UNIQ_SET_MASK);
-    for (int probe = 0; probe < UNIQ_SET_SIZE; probe++) {
-        uint32_t idx = (slot + (uint32_t)probe) & UNIQ_SET_MASK;
+    uint32_t slot = (uint32_t)(trig_hash & s->mask);
+    for (uint32_t probe = 0; probe <= s->mask; probe++) {
+        uint32_t idx = (slot + probe) & s->mask;
         if (s->slots[idx] == 0) {
             s->slots[idx] = val;
             s->count++;
-            return true;
+            return UNIQ_NEW;
         }
         if (s->slots[idx] == val) {
-            return false;
+            return UNIQ_PRESENT;
         }
     }
-    return false;
+    return UNIQ_FULL;
 }
 
 /* Apply weighted MinHash for one trigram: hash w times per seed. */
@@ -224,7 +238,7 @@ static int hash_trigrams(const char **tokens, int token_count, cbm_minhash_t *ou
     }
 
     uniq_trig_set_t uniq;
-    uniq_trig_init(&uniq);
+    uniq_trig_init(&uniq, token_count > TRIGRAM_WINDOW ? token_count - TRIGRAM_WINDOW : 0);
     char trigram_buf[TRIGRAM_BUF_LEN];
 
     for (int i = 0; i + TRIGRAM_WINDOW < token_count; i++) {
@@ -240,8 +254,13 @@ static int hash_trigrams(const char **tokens, int token_count, cbm_minhash_t *ou
             continue;
         }
 
-        uniq_trig_insert(&uniq, XXH3_64bits(trigram_buf, (size_t)len));
-        weighted_minhash_update(out, trigram_buf, len, w);
+        /* A repeated trigram is the same string with the same weight: its
+         * update would lower the same minima to the same values. Only a first
+         * occurrence pays the 64 x w seeded hashes (identical fingerprints;
+         * the scaling lane had XXH3 at 15 % of all counted work). */
+        if (uniq_trig_insert(&uniq, XXH3_64bits(trigram_buf, (size_t)len)) != UNIQ_PRESENT) {
+            weighted_minhash_update(out, trigram_buf, len, w);
+        }
     }
     return uniq.count;
 }
@@ -355,7 +374,8 @@ static uint32_t band_hash(const cbm_minhash_t *fp, int band) {
 static void bucket_push(lsh_bucket_t *bucket, int entry_index) {
     if (bucket->count >= bucket->cap) {
         int new_cap = bucket->cap < BUCKET_INIT_CAP ? BUCKET_INIT_CAP : bucket->cap * GROW_FACTOR;
-        int *new_items = realloc(bucket->items, (size_t)new_cap * sizeof(int));
+        int *new_items =
+            cbm_realloc(CBM_MEM_CLASS_SEMANTIC, bucket->items, (size_t)new_cap * sizeof(int));
         if (!new_items) {
             return;
         }
@@ -366,7 +386,8 @@ static void bucket_push(lsh_bucket_t *bucket, int entry_index) {
 }
 
 cbm_lsh_index_t *cbm_lsh_new(void) {
-    cbm_lsh_index_t *idx = calloc(SKIP_ONE, sizeof(cbm_lsh_index_t));
+    cbm_lsh_index_t *idx =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)(SKIP_ONE) * (sizeof(cbm_lsh_index_t)));
     return idx;
 }
 
@@ -379,8 +400,8 @@ void cbm_lsh_insert(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *entry) {
     if (idx->entry_count >= idx->entry_cap) {
         int new_cap =
             idx->entry_cap < ENTRY_INIT_CAP ? ENTRY_INIT_CAP : idx->entry_cap * GROW_FACTOR;
-        cbm_lsh_entry_t *new_entries =
-            realloc(idx->entries, (size_t)new_cap * sizeof(cbm_lsh_entry_t));
+        cbm_lsh_entry_t *new_entries = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, idx->entries,
+                                                   (size_t)new_cap * sizeof(cbm_lsh_entry_t));
         if (!new_entries) {
             return;
         }
@@ -405,7 +426,7 @@ typedef struct {
 } seen_set_t;
 
 static void seen_set_init(seen_set_t *s) {
-    s->slots = calloc(SEEN_SET_SIZE, sizeof(int64_t));
+    s->slots = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)(SEEN_SET_SIZE) * (sizeof(int64_t)));
     s->cap = SEEN_SET_SIZE;
     /* 0 means empty — node_ids are always > 0 */
 }
@@ -429,7 +450,7 @@ static bool seen_set_insert(seen_set_t *s, int64_t node_id) {
 }
 
 static void seen_set_free(seen_set_t *s) {
-    free(s->slots);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, s->slots);
     s->slots = NULL;
 }
 
@@ -439,7 +460,8 @@ static bool result_push(cbm_lsh_index_t *idx, const cbm_lsh_entry_t *candidate) 
         int new_cap =
             idx->result_cap < RESULT_INIT_CAP ? RESULT_INIT_CAP : idx->result_cap * GROW_FACTOR;
         const cbm_lsh_entry_t **new_buf =
-            realloc(idx->result_buf, (size_t)new_cap * sizeof(const cbm_lsh_entry_t *));
+            cbm_realloc(CBM_MEM_CLASS_SEMANTIC, idx->result_buf,
+                        (size_t)new_cap * sizeof(const cbm_lsh_entry_t *));
         if (!new_buf) {
             return false;
         }
@@ -489,15 +511,52 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
     *count = mut_idx->result_count;
 }
 
-int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
-                       const cbm_lsh_entry_t **out_buf, int out_cap) {
-    if (!idx || !fp || !out_buf || out_cap <= 0) {
+/* The reusable set: a slot belongs to the running query only when its stamp is
+ * the current generation. Same size, hash and probe order as seen_set_t, so the
+ * candidates found (and their order) are exactly those of a fresh table. */
+struct cbm_lsh_seen {
+    int64_t ids[SEEN_SET_SIZE];
+    uint32_t stamp[SEEN_SET_SIZE];
+    uint32_t current;
+};
+
+cbm_lsh_seen_t *cbm_lsh_seen_new(void) {
+    return cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(cbm_lsh_seen_t));
+}
+
+void cbm_lsh_seen_free(cbm_lsh_seen_t *seen) {
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, seen);
+}
+
+static void lsh_seen_begin(cbm_lsh_seen_t *s) {
+    if (++s->current == 0) { /* generation wrapped: every old stamp must go */
+        memset(s->stamp, 0, sizeof(s->stamp));
+        s->current = 1;
+    }
+}
+
+static bool lsh_seen_insert(cbm_lsh_seen_t *s, int64_t node_id) {
+    uint32_t idx = (uint32_t)(node_id * KNUTH_MULT) & SEEN_SET_MASK;
+    for (int probe = 0; probe < SEEN_SET_SIZE; probe++) {
+        uint32_t slot = (idx + (uint32_t)probe) & SEEN_SET_MASK;
+        if (s->stamp[slot] != s->current) {
+            s->stamp[slot] = s->current;
+            s->ids[slot] = node_id;
+            return true; /* inserted (was not present) */
+        }
+        if (s->ids[slot] == node_id) {
+            return false; /* already present */
+        }
+    }
+    return false; /* table full */
+}
+
+int cbm_lsh_query_into_seen(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                            const cbm_lsh_entry_t **out_buf, int out_cap, cbm_lsh_seen_t *seen) {
+    if (!idx || !fp || !out_buf || out_cap <= 0 || !seen) {
         return 0;
     }
-
-    /* Thread-local dedup — no shared state touched. */
-    seen_set_t seen;
-    seen_set_init(&seen);
+    lsh_seen_begin(seen);
 
     int count = 0;
     for (int b = 0; b < CBM_LSH_BANDS; b++) {
@@ -508,7 +567,7 @@ int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
         }
         for (int i = 0; i < bucket->count && count < out_cap; i++) {
             const cbm_lsh_entry_t *candidate = &idx->entries[bucket->items[i]];
-            if (!seen_set_insert(&seen, candidate->node_id)) {
+            if (!lsh_seen_insert(seen, candidate->node_id)) {
                 continue;
             }
             out_buf[count++] = candidate;
@@ -517,8 +576,20 @@ int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
             break;
         }
     }
+    return count;
+}
 
-    seen_set_free(&seen);
+int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                       const cbm_lsh_entry_t **out_buf, int out_cap) {
+    if (!idx || !fp || !out_buf || out_cap <= 0) {
+        return 0;
+    }
+    cbm_lsh_seen_t *seen = cbm_lsh_seen_new();
+    if (!seen) {
+        return 0;
+    }
+    int count = cbm_lsh_query_into_seen(idx, fp, out_buf, out_cap, seen);
+    cbm_lsh_seen_free(seen);
     return count;
 }
 
@@ -529,10 +600,10 @@ void cbm_lsh_free(cbm_lsh_index_t *idx) {
     /* Free bucket arrays */
     for (int b = 0; b < CBM_LSH_BANDS; b++) {
         for (int h = 0; h < LSH_BUCKET_COUNT; h++) {
-            free(idx->bands[b][h].items);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, idx->bands[b][h].items);
         }
     }
-    free(idx->entries);
-    free(idx->result_buf);
-    free(idx);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, idx->entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, idx->result_buf);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, idx);
 }
