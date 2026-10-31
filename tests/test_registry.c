@@ -1260,6 +1260,45 @@ TEST(go_bare_ref_never_binds_field) {
     PASS();
 }
 
+TEST(go_bare_init_never_binds_init_namesake) {
+    /* Go cannot refer to a package init function, and a method or field
+     * named init needs a selector, so a bare `init` (a closure, a parameter,
+     * a `package init` clause) is always a local name. */
+    /* Every Go Function named init is a package init: refused for every
+     * registry strategy, same_module included (the pre-#1915 binding). */
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "same_module", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "import_map", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", NULL, "Function"));
+    /* A Method or Field namesake found by the name alone is refused. */
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Method"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "unique_name", "Method"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Field"));
+    /* ... but not one that an import- or module-aware strategy produced. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "same_module", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "import_map", "Method"));
+    /* lsp_* answers are kept: the sequential resolver emits them before its
+     * registry guards run, so refusing one here would split the resolvers. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "lsp_direct", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "lsp_direct", "Method"));
+    /* The member half of a selector (`w.init()`, `e.init`) is not bare. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, true, "init", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, true, "init", "suffix_match", "Field"));
+    /* Other names and other target kinds are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "initAll", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "Init", "suffix_match", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Module"));
+    /* Go only: elsewhere a bare `init()` is an ordinary call (a Java or C++
+     * method body calls its own init, a C or Python init is a function). */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(false, false, "init", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(false, false, "init", "same_module", "Function"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, NULL, "suffix_match", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", NULL));
+    PASS();
+}
+
 TEST(c_bare_ref_never_binds_field) {
     /* #2666: a C struct member is named only as the member half of `a.b`,
      * `a->b` or a designator `.b` (field_identifier → is_member_access). A
@@ -2656,6 +2695,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(go_bare_init_never_binds_init_namesake);
     RUN_TEST(c_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
