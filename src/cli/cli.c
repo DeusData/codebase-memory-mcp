@@ -9567,6 +9567,35 @@ static void install_devin_durable_context(const cbm_agent_registry_context_t *re
 static void install_generated_client_extension(const char *label, const char *path,
                                                const char *binary_path,
                                                char *(*generate)(const char *), bool dry_run) {
+    /* #2204: a module that already carries content but none of our markers is
+     * the user's. The generated header promises "remove the markers to take
+     * ownership", and appending our prelude to a foreign module produces a file
+     * the client cannot even parse — the prelude redeclares the user's own
+     * import and const names, and both sides declare a default export. Probe
+     * ownership before generating so the preview names the refusal instead of
+     * promising a write the run will not make. A probe failure (-1) falls
+     * through to the write, which reports it through the usual error path. */
+    bool foreign =
+        cbm_text_managed_block_status(path, CBM_ADAPTER_MARKER_START, CBM_ADAPTER_MARKER_END) == 1;
+    if (foreign) {
+        /* The --plan receipt (#388) lists only writes the run will make, and
+         * its stdout carries the receipt JSON, so plan mode records nothing
+         * and prints nothing here. The dry run names the skip instead. */
+        if (g_install_plan) {
+            return;
+        }
+        if (dry_run) {
+            printf("  extension: %s would be skipped — the file there is not ours (no "
+                   "codebase-memory-mcp markers), so it is left untouched; delete it or add the "
+                   "markers to let the installer manage it\n",
+                   path);
+        } else {
+            printf("  extension: %s left untouched — the file there is not ours (no "
+                   "codebase-memory-mcp markers)\n",
+                   path);
+        }
+        return;
+    }
     if (g_install_plan) {
         plan_record(label, "extension", path);
         return;
