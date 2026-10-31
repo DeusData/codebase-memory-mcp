@@ -6431,6 +6431,40 @@ TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
     PASS();
 }
 
+/* Issue #2537: a Go 1.22 ServeMux pattern may open with a method and/or a host
+ * ("POST /v1/payments", "GET api.example.com/v1/x"). The written pattern stays
+ * the first string argument, and its handler is captured exactly as for a
+ * plain "/v1/payments"; it was dropped because the pattern does not open with
+ * a slash. */
+TEST(extract_go_servemux_method_pattern_handler_issue2537) {
+    CBMFileResult *r = extract("package main\n"
+                               "import \"net/http\"\n"
+                               "func setup(mux *http.ServeMux) {\n"
+                               "    mux.HandleFunc(\"POST /v1/payments\", createPayment)\n"
+                               "    mux.Handle(\"GET api.example.com/v1/x\", hostHandler)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *method = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(method);
+    ASSERT_NOT_NULL(method->first_string_arg);
+    ASSERT_STR_EQ(method->first_string_arg, "POST /v1/payments");
+    ASSERT_NOT_NULL(method->second_arg_name);
+    ASSERT_STR_EQ(method->second_arg_name, "createPayment");
+
+    const CBMCall *host = find_call_by_callee(r, "mux.Handle");
+    ASSERT_NOT_NULL(host);
+    ASSERT_NOT_NULL(host->first_string_arg);
+    ASSERT_STR_EQ(host->first_string_arg, "GET api.example.com/v1/x");
+    ASSERT_NOT_NULL(host->second_arg_name);
+    ASSERT_STR_EQ(host->second_arg_name, "hostHandler");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #2291: the JS/TS twin of #1249. A BFF that builds its backend URL as
  * `${process.env.BACKEND_URL}/wallet/topup` from a configurable base must
  * index the literal path after the base, exactly as `BACKEND_URL + "/x"`
@@ -8139,6 +8173,68 @@ TEST(extract_templ_method_qn_matches_call_scope) {
     ASSERT_NOT_NULL(title_qn);
     ASSERT_NOT_NULL(scope);
     ASSERT_STR_EQ(scope, title_qn);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_go_multiple_init_disambiguated) {
+    /* Go allows several init() per package (even per file); each gets a
+     * file+ordinal-suffixed QN (#495 cfg-twin pattern) so none is lost to the
+     * same-QN upsert. The ordinal — unlike a line number — must not move when
+     * code is inserted above the function: the QN is node identity, and a
+     * line-based suffix would churn nodes on every unrelated edit. */
+    CBMFileResult *r = extract("package m\n"
+                               "func init() { a() }\n"
+                               "func init() { b() }\n"
+                               "func a() {}\n"
+                               "func b() {}\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *first = NULL;
+    const char *second = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || strcmp(d->name, "init") != 0) {
+            continue;
+        }
+        if (!first) {
+            first = d->qualified_name;
+        } else {
+            second = d->qualified_name;
+        }
+    }
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_EQ(first, "t.init#x.go:1");
+    ASSERT_STR_EQ(second, "t.init#x.go:2");
+
+    /* Stability: an insertion ABOVE both inits must not change either QN. */
+    CBMFileResult *r2 = extract("package m\n"
+                                "import \"fmt\"\n"
+                                "var shifted = fmt.Sprint(\"pad\")\n"
+                                "func init() { a() }\n"
+                                "func init() { b() }\n"
+                                "func a() {}\n"
+                                "func b() {}\n",
+                                CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    int seen = 0;
+    for (int i = 0; i < r2->defs.count; i++) {
+        const CBMDefinition *d = &r2->defs.items[i];
+        if (!d->name || strcmp(d->name, "init") != 0) {
+            continue;
+        }
+        seen++;
+        if (seen == 1) {
+            ASSERT_STR_EQ(d->qualified_name, "t.init#x.go:1");
+        } else {
+            ASSERT_STR_EQ(d->qualified_name, "t.init#x.go:2");
+        }
+    }
+    ASSERT_EQ(seen, 2);
+    cbm_free_result(r2);
     cbm_free_result(r);
     PASS();
 }
@@ -13536,6 +13632,7 @@ SUITE(extraction) {
     RUN_TEST(extract_go_selector_call_flags_is_method);
     RUN_TEST(extract_go_method_receiver_qualified_qn);
     RUN_TEST(extract_templ_method_qn_matches_call_scope);
+    RUN_TEST(extract_go_multiple_init_disambiguated);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
@@ -13907,6 +14004,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
+    RUN_TEST(extract_go_servemux_method_pattern_handler_issue2537);
     RUN_TEST(extract_ts_template_base_url_issue2291);
     RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
     RUN_TEST(extract_py_concat_const_url_issue706);

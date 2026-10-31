@@ -1183,6 +1183,65 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
     return NULL;
 }
 
+static bool mux_is_blank(char ch) {
+    return ch == ' ' || ch == '\t';
+}
+
+const char *cbm_service_pattern_mux_split(const char *pattern, char *method, size_t method_sz) {
+    if (method && method_sz > 0) {
+        method[0] = '\0';
+    }
+    if (!pattern || pattern[0] == '/') {
+        return NULL;
+    }
+    /* METHOD: Go cuts it at the first space or tab and trims the rest. */
+    const char *rest = pattern;
+    size_t method_len = 0;
+    while (pattern[method_len] >= 'A' && pattern[method_len] <= 'Z') {
+        method_len++;
+    }
+    if (method_len > 0 && mux_is_blank(pattern[method_len])) {
+        rest = pattern + method_len;
+        while (mux_is_blank(*rest)) {
+            rest++;
+        }
+    } else {
+        method_len = 0;
+    }
+    /* HOST: everything before the path's slash, with no blank or line break. */
+    const char *slash = rest;
+    while (*slash && *slash != '/' && !mux_is_blank(*slash) && *slash != '\n' && *slash != '\r') {
+        slash++;
+    }
+    if (*slash != '/' || (method_len == 0 && slash == rest)) {
+        return NULL;
+    }
+    if (method_len > 0 && method) {
+        if (method_len >= method_sz) {
+            method[0] = '\0';
+            return NULL;
+        }
+        memcpy(method, pattern, method_len);
+        method[method_len] = '\0';
+    }
+    return slash;
+}
+
+const char *cbm_service_pattern_mux_route_path(const char *callee_name, const char *pattern) {
+    static const char *const mux_callees[] = {".Handle", ".HandleFunc"};
+    if (!callee_name || !pattern || strstr(pattern, "://") != NULL) {
+        return NULL;
+    }
+    size_t clen = strlen(callee_name);
+    for (size_t i = 0; i < sizeof(mux_callees) / sizeof(mux_callees[0]); i++) {
+        size_t slen = strlen(mux_callees[i]);
+        if (clen >= slen && strcmp(callee_name + clen - slen, mux_callees[i]) == 0) {
+            return cbm_service_pattern_mux_split(pattern, NULL, 0);
+        }
+    }
+    return NULL;
+}
+
 const char *cbm_service_pattern_broker(const char *resolved_qn) {
     if (!resolved_qn) {
         return NULL;
