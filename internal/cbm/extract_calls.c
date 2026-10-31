@@ -4557,8 +4557,14 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 call.first_string_arg = route_path_with_group_prefix(ctx, node, call.callee_name,
                                                                      call.first_string_arg);
                 /* A slashless registration's string action would only be
-                 * guessed at (#1146): mint its Route without a handler. */
-                if (call.first_string_arg && call.first_string_arg[0] == '/' &&
+                 * guessed at (#1146): mint its Route without a handler. A Go
+                 * ServeMux pattern names its method or host before the slash
+                 * ("POST /v1/x", #2537) and keeps its handler. */
+                if (call.first_string_arg &&
+                    (call.first_string_arg[0] == '/' ||
+                     (ctx->language == CBM_LANG_GO &&
+                      cbm_service_pattern_mux_route_path(call.callee_name, call.first_string_arg) !=
+                          NULL)) &&
                     !(laravel_uri && php_route_action_is_string(node))) {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }

@@ -6431,6 +6431,40 @@ TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
     PASS();
 }
 
+/* Issue #2537: a Go 1.22 ServeMux pattern may open with a method and/or a host
+ * ("POST /v1/payments", "GET api.example.com/v1/x"). The written pattern stays
+ * the first string argument, and its handler is captured exactly as for a
+ * plain "/v1/payments"; it was dropped because the pattern does not open with
+ * a slash. */
+TEST(extract_go_servemux_method_pattern_handler_issue2537) {
+    CBMFileResult *r = extract("package main\n"
+                               "import \"net/http\"\n"
+                               "func setup(mux *http.ServeMux) {\n"
+                               "    mux.HandleFunc(\"POST /v1/payments\", createPayment)\n"
+                               "    mux.Handle(\"GET api.example.com/v1/x\", hostHandler)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *method = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(method);
+    ASSERT_NOT_NULL(method->first_string_arg);
+    ASSERT_STR_EQ(method->first_string_arg, "POST /v1/payments");
+    ASSERT_NOT_NULL(method->second_arg_name);
+    ASSERT_STR_EQ(method->second_arg_name, "createPayment");
+
+    const CBMCall *host = find_call_by_callee(r, "mux.Handle");
+    ASSERT_NOT_NULL(host);
+    ASSERT_NOT_NULL(host->first_string_arg);
+    ASSERT_STR_EQ(host->first_string_arg, "GET api.example.com/v1/x");
+    ASSERT_NOT_NULL(host->second_arg_name);
+    ASSERT_STR_EQ(host->second_arg_name, "hostHandler");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #2291: the JS/TS twin of #1249. A BFF that builds its backend URL as
  * `${process.env.BACKEND_URL}/wallet/topup` from a configurable base must
  * index the literal path after the base, exactly as `BACKEND_URL + "/x"`
@@ -13970,6 +14004,7 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
+    RUN_TEST(extract_go_servemux_method_pattern_handler_issue2537);
     RUN_TEST(extract_ts_template_base_url_issue2291);
     RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
     RUN_TEST(extract_py_concat_const_url_issue706);
