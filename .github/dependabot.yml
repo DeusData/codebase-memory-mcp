@@ -4,3 +4,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # init and analyze must run the same CodeQL Action version within a job, and
+      # upload-sarif is kept in step with them, so one PR bumps all three.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
