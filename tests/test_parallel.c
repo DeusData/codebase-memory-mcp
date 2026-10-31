@@ -5597,7 +5597,7 @@ TEST(parallel_php_external_row_replaces_only_its_exact_occurrence) {
         const char *keys[] = {"LocalRequest"};
         const char *vals[] = {project_type};
         cbm_pxc_run_one_with_php_bindings(CBM_LANG_PHP, r, source, (int)strlen(source), "p.main",
-                                          defs, 2, keys, vals, 1, &bindings);
+                                          NULL, defs, 2, keys, vals, 1, &bindings);
         int external_count = 0, project_count = 0;
         for (int i = 0; i < r->resolved_calls.count; i++) {
             const CBMResolvedCall *row = &r->resolved_calls.items[i];

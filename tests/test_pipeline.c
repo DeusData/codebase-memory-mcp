@@ -10834,6 +10834,243 @@ TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge) {
     PASS();
 }
 
+TEST(pipeline_go_multi_init_nodes_survive) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Two files, one package, one init() each — Go runs both at start-up.
+     * Pre-fix both collapsed onto one QN and the upsert kept one node
+     * (reproduce-first: RED asserts node count == 2). */
+    write_temp_file(tmp, "go.mod", "module example.com/reg\n\ngo 1.22\n");
+    write_temp_file(tmp, "reg/a.go",
+                    "package reg\n"
+                    "\n"
+                    "var handlers = map[string]func(){}\n"
+                    "\n"
+                    "func init() { handlers[\"a\"] = handleA }\n"
+                    "\n"
+                    "func handleA() {}\n");
+    write_temp_file(tmp, "reg/b.go",
+                    "package reg\n"
+                    "\n"
+                    "func init() { handlers[\"b\"] = handleB }\n"
+                    "\n"
+                    "func handleB() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Both init functions survive as distinct nodes. */
+    cbm_node_t *inits = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_name(s, project, "init", &inits, &ic);
+    ASSERT_EQ(ic, 2);
+    cbm_store_free_nodes(inits, ic);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Edges of `edge_type` whose source and target QNs end with the given
+ * suffixes (go_calls_between for any edge type, without the properties). */
+static int go_edges_between(cbm_store_t *s, const char *project, const char *edge_type,
+                            const char *caller_suffix, const char *callee_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count);
+    size_t cs = strlen(caller_suffix);
+    size_t ts = strlen(callee_suffix);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            src.qualified_name && tgt.qualified_name) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return hits;
+}
+
+/* Fixture for the #1910 Go init() LSP-join probes (sequential and parallel
+ * twins). Three init() in two files of one package -- two in b.go, so the
+ * per-file ordinal is pinned too -- each calling a method that only the Go
+ * LSP can bind: the receiver's type comes from a constructor in another
+ * file, and the method name also exists on a second package type and on
+ * other.Decoy, so no short-name fallback lands on the right target. a.go's
+ * init also passes a handler by value (add("a", handleA): a CALL_REFERENCE,
+ * which exists only as an LSP row). pad_files > 0 adds filler Go files past
+ * MIN_FILES_FOR_PARALLEL. */
+static void write_go_init_lsp_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxinit\n\ngo 1.22\n");
+    write_temp_file(tmp, "reg/codec.go",
+                    "package reg\n"
+                    "\n"
+                    "type Codec struct{ n int }\n"
+                    "\n"
+                    "func NewCodec() *Codec { return &Codec{} }\n"
+                    "\n"
+                    "func (c *Codec) register() { c.n++ }\n");
+    write_temp_file(tmp, "reg/store.go",
+                    "package reg\n"
+                    "\n"
+                    "type Store struct{ open bool }\n"
+                    "\n"
+                    "func NewStore() *Store { return &Store{} }\n"
+                    "\n"
+                    "func (s *Store) register() { s.open = true }\n"
+                    "\n"
+                    "func (s *Store) warm() {}\n");
+    write_temp_file(tmp, "reg/a.go",
+                    "package reg\n"
+                    "\n"
+                    "var handlers = map[string]func(){}\n"
+                    "\n"
+                    "func handleA() {}\n"
+                    "\n"
+                    "func add(name string, fn func()) { handlers[name] = fn }\n"
+                    "\n"
+                    "func init() {\n"
+                    "\tc := NewCodec()\n"
+                    "\tc.register()\n"
+                    "\tadd(\"a\", handleA)\n"
+                    "}\n");
+    write_temp_file(tmp, "reg/b.go",
+                    "package reg\n"
+                    "\n"
+                    "func init() {\n"
+                    "\ts := NewStore()\n"
+                    "\ts.register()\n"
+                    "}\n"
+                    "\n"
+                    "func init() {\n"
+                    "\ts := NewStore()\n"
+                    "\ts.warm()\n"
+                    "}\n");
+    write_temp_file(tmp, "other/other.go",
+                    "package other\n"
+                    "\n"
+                    "type Decoy struct{}\n"
+                    "\n"
+                    "func (d *Decoy) register() {}\n"
+                    "\n"
+                    "func (d *Decoy) warm() {}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* Each init's LSP-resolved edges start at that init's own node. */
+static int assert_go_init_lsp_edges(cbm_store_t *s, const char *project) {
+    const char *lsp = "\"strategy\":\"lsp_";
+    ASSERT_GTE(go_calls_between(s, project, ".reg.init#a.go:1", ".reg.Codec.register", lsp), 1);
+    ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:1", ".reg.Store.register", lsp), 1);
+    ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:2", ".reg.Store.warm", lsp), 1);
+    ASSERT_GTE(go_edges_between(s, project, "CALL_REFERENCE", ".reg.init#a.go:1", ".reg.handleA"),
+               1);
+    /* No cross-wiring between the inits, and nothing onto the decoy. */
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#a.go:1", ".reg.Store.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:1", ".reg.Codec.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:2", ".reg.Store.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#a.go:1", ".other.Decoy.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:1", ".other.Decoy.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:2", ".other.Decoy.warm", NULL), 0);
+    return 0;
+}
+
+/* #1910: the def extractor and compute_func_qn name each init
+ * pkg.init#<file>:<N>; the Go LSP must name its caller the same way
+ * (cbm_go_init_qn), or every LSP resolution inside an init body loses the
+ * exact caller-QN join and falls back to the registry resolver. */
+TEST(pipeline_go_init_lsp_edges_per_file) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_lsp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_init_lsp_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init_lsp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_init_lsp_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel twin: >= MIN_FILES_FOR_PARALLEL (50) files plus CBM_WORKERS=4
+ * take the parallel resolver (resolve_worker's Tier-2 dispatch). */
+TEST(pipeline_go_init_lsp_edges_per_file_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_lsp_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_init_lsp_fixture(tmp, 52);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init_lsp_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_init_lsp_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -16973,6 +17210,53 @@ TEST(pipeline_python_init_import_probe_failure_falls_back) {
     cbm_arena_destroy(&result.arena);
     cbm_pxc_free_module_def_index(index);
     ASSERT_TRUE(failed_precisely && resolved);
+    PASS();
+}
+
+/* #1910: with no shared Go registry (the incremental route can pass NULL
+ * cross_registries) the dispatch takes the per-file fallback, which must name
+ * each init() caller from the file path exactly as the def extractor does. */
+TEST(pipeline_go_init_dispatch_fallback_names_init_caller) {
+    const char *source = "package reg\n\n"
+                         "func init() {\n\tc := NewCodec()\n\tc.Register()\n}\n\n"
+                         "func init() {\n\tc := NewCodec()\n\tc.Register()\n}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.reg.NewCodec",
+         .short_name = "NewCodec",
+         .label = "Function",
+         .def_module_qn = "test.reg",
+         .return_types = "*Codec",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.reg.Codec",
+         .short_name = "Codec",
+         .label = "Class",
+         .def_module_qn = "test.reg",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.reg.Codec.Register",
+         .short_name = "Register",
+         .label = "Method",
+         .def_module_qn = "test.reg",
+         .receiver_type = "test.reg.Codec",
+         .lang = CBM_LANG_GO},
+    };
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_pxc_dispatch_file(CBM_LANG_GO, &result, source, (int)strlen(source), "reg/b.go", "test.reg",
+                          NULL, NULL, defs, 3, NULL, NULL, 0, NULL, NULL);
+    int first = 0;
+    int second = 0;
+    for (int i = 0; i < result.resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result.resolved_calls.items[i];
+        if (!rc->caller_qn || !rc->callee_qn || rc->confidence <= 0 ||
+            strcmp(rc->callee_qn, "test.reg.Codec.Register") != 0) {
+            continue;
+        }
+        first += strcmp(rc->caller_qn, "test.reg.init#b.go:1") == 0;
+        second += strcmp(rc->caller_qn, "test.reg.init#b.go:2") == 0;
+    }
+    cbm_arena_destroy(&result.arena);
+    ASSERT_EQ(first, 1);
+    ASSERT_EQ(second, 1);
     PASS();
 }
 
@@ -29207,6 +29491,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_init_register_scope_failure_parallel);
     RUN_TEST(pipeline_python_init_import_filter_precedence);
     RUN_TEST(pipeline_python_init_import_probe_failure_falls_back);
+    RUN_TEST(pipeline_go_init_dispatch_fallback_names_init_caller);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
     RUN_TEST(pipeline_issue1527_python_cross_memo_failure_sequential);
@@ -29333,6 +29618,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
+    RUN_TEST(pipeline_go_multi_init_nodes_survive);
+    RUN_TEST(pipeline_go_init_lsp_edges_per_file);
+    RUN_TEST(pipeline_go_init_lsp_edges_per_file_parallel);
     RUN_TEST(pipeline_go_crossfile_type_alias_method);
     RUN_TEST(pipeline_go_crossfile_type_alias_method_parallel);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
