@@ -989,7 +989,73 @@ TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships) {
     PASS();
 }
 
+/* Shape of redis src/defrag.c:1234. An #ifdef splitting a long else-if chain leaves
+ * the first syntax error more than 16 levels under the root. The audit used to call
+ * that a failure of the whole file, before the include table it reads later existed,
+ * so the next declared binding dereferenced a NULL table and took the indexing worker
+ * down. The boundary is the error's own position: earlier sites keep their proofs,
+ * later ones do not, and declarations past it are simply not proven. */
+TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error) {
+    const char *source = "#include \"lib.h\"\n"
+                         "struct Holder { int value; };\n"
+                         "void work(void);\n"
+                         "void before(void) { work(); }\n"
+                         "void chain(int n) {\n"
+                         "    if (n == 0) { n = 1;\n"
+                         "    } else if (n == 1) { n = 2;\n"
+                         "    } else if (n == 2) { n = 3;\n"
+                         "    } else if (n == 3) { n = 4;\n"
+                         "    } else if (n == 4) { n = 5;\n"
+                         "    } else if (n == 5) { n = 6;\n"
+                         "    } else if (n == 6) { n = 7;\n"
+                         "    } else if (n == 7) { n = 8;\n"
+                         "    } else if (n == 8) { n = 9;\n"
+                         "    } else if (n == 9) { n = 10;\n"
+                         "#ifdef EXTRA\n"
+                         "    } else if (n == 10) { n = 11;\n"
+                         "#endif\n"
+                         "    } else { n = 12;\n"
+                         "    }\n"
+                         "}\n"
+                         "struct Holder shared_holder;\n"
+                         "void after(void) { work(); }\n";
+    CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
+                         .declaration_identity = "fixture:test.main.work",
+                         .short_name = "work",
+                         .label = "Function"},
+                        {.qualified_name = "test.main.Holder",
+                         .graph_qualified_name = "test.main.Holder",
+                         .short_name = "Holder",
+                         .label = "Class",
+                         .def_module_qn = "test.main",
+                         .declaration_identity = "fixture:test.main.Holder",
+                         .field_defs = "value:int"}};
+    const char *paths[] = {"lib.h"}, *modules[] = {"test.lib"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    c_cross(&arena, source, false, defs, 2, paths, modules, 1, &out);
+    uint32_t error_region = (uint32_t)(strstr(source, "#ifdef EXTRA") - source);
+    uint32_t before_call = (uint32_t)(strstr(source, "work(); }") - source);
+    int before_proofs = 0, proofs_past_error = 0;
+    for (int i = 0; i < out.count; i++) {
+        const CBMResolvedCall *row = &out.items[i];
+        if (row->kind == CBM_RESOLVED_FIELD_REFERENCE || !c_row_admitted(row) ||
+            strcmp(row->callee_qn, "test.main.work"))
+            continue;
+        if (row->site_start_byte == before_call)
+            before_proofs++;
+        if (row->site_start_byte >= error_region)
+            proofs_past_error++;
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(before_proofs, 1);
+    ASSERT_EQ(proofs_past_error, 0);
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error);
     RUN_TEST(resolver_c_preprocessed_proofs_require_complete_explicit_configuration);
     RUN_TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships);
     RUN_TEST(resolver_c_external_prototype_requires_compatible_unique_definition);
