@@ -9888,14 +9888,22 @@ static bool elixir_is_branch_operator(TSNode node, const char *source) {
            elixir_node_text_is(op, source, "when");
 }
 
+/* The pending frames live on the same growable stack as cbm_compute_complexity:
+ * a small on-stack first chunk that spills to the heap through
+ * cbm_walk_stack_reserve, so a wide body is never truncated and no thread pays
+ * for a large fixed array. If the stack cannot grow, every metric reports
+ * CBM_WALK_METRIC_UNAVAILABLE instead of a silently low count. */
 static void elixir_compute_complexity(TSNode node, const char *source, cbm_complexity_t *out) {
-    enum { ELIXIR_CX_STACK_CAP = 4096 };
-    struct {
+    enum { ELIXIR_CX_STACK_INLINE = 512 };
+    struct elixir_cx_frame {
         TSNode node;
         int bdepth;
         int ldepth;
         int adepth;
-    } stack[ELIXIR_CX_STACK_CAP];
+    };
+    struct elixir_cx_frame inline_stack[ELIXIR_CX_STACK_INLINE];
+    struct elixir_cx_frame *stack = inline_stack;
+    int cap = ELIXIR_CX_STACK_INLINE;
     memset(out, 0, sizeof(*out));
     int top = 0;
     stack[top].node = node;
@@ -9943,7 +9951,17 @@ static void elixir_compute_complexity(TSNode node, const char *source, cbm_compl
             child_l = d;
         }
         uint32_t nc = ts_node_child_count(n);
-        for (int i = (int)nc - 1; i >= 0 && top < ELIXIR_CX_STACK_CAP; i--) {
+        if (!cbm_walk_stack_reserve((void **)&stack, &cap, top + (int)nc,
+                                    sizeof(struct elixir_cx_frame), inline_stack,
+                                    "elixir_compute_complexity")) {
+            out->cyclomatic = CBM_WALK_METRIC_UNAVAILABLE;
+            out->cognitive = CBM_WALK_METRIC_UNAVAILABLE;
+            out->loop_count = CBM_WALK_METRIC_UNAVAILABLE;
+            out->loop_depth = CBM_WALK_METRIC_UNAVAILABLE;
+            out->max_access_depth = CBM_WALK_METRIC_UNAVAILABLE;
+            break;
+        }
+        for (int i = (int)nc - 1; i >= 0; i--) {
             stack[top].node = ts_node_child(n, (uint32_t)i);
             stack[top].bdepth = child_b;
             stack[top].ldepth = child_l;
@@ -9951,6 +9969,7 @@ static void elixir_compute_complexity(TSNode node, const char *source, cbm_compl
             top++;
         }
     }
+    cbm_walk_stack_release(stack, inline_stack);
 }
 
 static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char *macro,

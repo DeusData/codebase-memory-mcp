@@ -2810,6 +2810,40 @@ TEST(elixir_complexity_and_fingerprint) {
     PASS();
 }
 
+/* The Elixir complexity walk keeps its pending nodes on the growable stack
+ * cbm_compute_complexity uses. A fixed 4096-frame stack dropped the FIRST
+ * children of any wider body (they are pushed last-to-first), so the largest
+ * functions silently under-reported. This body is wider than that old cap. */
+enum { ELIXIR_WIDE_STMTS = 5000 };
+
+TEST(elixir_complexity_wide_body_exceeds_old_stack_cap) {
+    static const char head[] = "defmodule Wide do\n  def wide(x) do\n";
+    static const char if_stmt[] = "    if x, do: :a\n";
+    static const char for_stmt[] = "    for y <- x, do: y\n";
+    static const char tail[] = "  end\nend\n";
+    size_t cap = sizeof(head) + (size_t)ELIXIR_WIDE_STMTS * sizeof(for_stmt) + sizeof(tail);
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "%s", head);
+    for (int i = 0; i < ELIXIR_WIDE_STMTS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "%s", (i % 2 == 0) ? if_stmt : for_stmt);
+    }
+    snprintf(src + pos, cap - pos, "%s", tail);
+    CBMFileResult *r = extract(src, CBM_LANG_ELIXIR, "t", "wide.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = elixir_first_def(r, "wide");
+    ASSERT_NOT_NULL(d);
+    /* every `if` and every `for` is one branching call at nesting depth 0 */
+    ASSERT_EQ(ELIXIR_WIDE_STMTS, d->complexity);
+    ASSERT_EQ(ELIXIR_WIDE_STMTS, d->cognitive);
+    ASSERT_EQ(ELIXIR_WIDE_STMTS / 2, d->loop_count);
+    ASSERT_EQ(1, d->loop_depth);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -14615,6 +14649,7 @@ SUITE(extraction) {
     RUN_TEST(extract_elixir_guarded_def_head_guard_usages);
     RUN_TEST(elixir_channels_pubsub_and_handle_in);
     RUN_TEST(elixir_complexity_and_fingerprint);
+    RUN_TEST(elixir_complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(haskell_function);
     RUN_TEST(haskell_infix_definition_name);
     RUN_TEST(ocaml_function);
