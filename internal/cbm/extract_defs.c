@@ -800,6 +800,15 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             return cbm_find_child_by_kind(node, "query_name");
         }
 
+        /* Swift init/deinit (#2379) have no name node at all. The declaration
+         * itself stands in for it, and cbm_func_name_node_text maps that
+         * node kind to "init" / "deinit". Gated on Swift: Slang's grammar
+         * also has an init_declaration node. */
+        if (lang == CBM_LANG_SWIFT &&
+            (strcmp(kind, "init_declaration") == 0 || strcmp(kind, "deinit_declaration") == 0)) {
+            return node;
+        }
+
         TSNode name = func_name_node(node);
 
         if (lang == CBM_LANG_R && strcmp(kind, "function_definition") == 0) {
@@ -9194,6 +9203,12 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
         (strcmp(ck, "function_declaration") == 0 ||
          strcmp(ck, "protocol_function_declaration") == 0)) {
         return cbm_find_child_by_kind(child, "simple_identifier");
+    }
+
+    // Swift init/deinit: named in one place, cbm_resolve_func_name (#2379).
+    if (lang == CBM_LANG_SWIFT &&
+        (strcmp(ck, "init_declaration") == 0 || strcmp(ck, "deinit_declaration") == 0)) {
+        return cbm_resolve_func_name(child, lang);
     }
 
     // Squirrel: function_declaration's name is a plain `identifier` child.

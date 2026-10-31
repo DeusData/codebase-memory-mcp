@@ -21227,6 +21227,253 @@ TEST(pipeline_swift_cross_package_import) {
     PASS();
 }
 
+/* #2379 at graph level, as a SwiftPM package. Sources/Kit/Inits.swift is the
+ * issue's reproduction. Sources/App/Sub.swift imports the Kit target -- which
+ * sends name resolution down the import-aware path -- and calls initializers
+ * the way real code does: `super.init` to a project superclass in another
+ * target, `super.init` to a superclass outside the project, an explicit
+ * `T.init(...)` on a project type and on a type outside the project, `self.init`
+ * from an extension of a type outside the project, and an implicit `.init(...)`.
+ * Each of those can attract a false CALLS edge now that initializers are nodes. */
+static const char *const SWIFT_INIT_PACKAGE_SRC =
+    "let package = Package(\n"
+    "    name: \"Kit\",\n"
+    "    products: [.library(name: \"Kit\", targets: [\"Kit\"])],\n"
+    "    targets: [\n"
+    "        .target(name: \"Kit\", dependencies: []),\n"
+    "        .target(name: \"App\", dependencies: [\"Kit\"])\n"
+    "    ]\n"
+    ")\n";
+
+static const char *const SWIFT_INIT_INITS_SRC = "func helper() -> Int { 1 }\n"
+                                                "func other() -> Int { 2 }\n"
+                                                "\n"
+                                                "struct Box {\n"
+                                                "    let value: Int\n"
+                                                "    init() {\n"
+                                                "        value = helper()\n"
+                                                "    }\n"
+                                                "    func read() -> Int {\n"
+                                                "        other()\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "final class Holder {\n"
+                                                "    let value: Int\n"
+                                                "    init(seed: Int) {\n"
+                                                "        value = helper() + seed\n"
+                                                "    }\n"
+                                                "    convenience init() {\n"
+                                                "        self.init(seed: other())\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "enum Mode {\n"
+                                                "    case on\n"
+                                                "    init?(flag: Bool) {\n"
+                                                "        if helper() > 0 { self = .on } else { "
+                                                "return nil }\n"
+                                                "    }\n"
+                                                "}\n"
+                                                "\n"
+                                                "extension Box {\n"
+                                                "    init(raw: Int) {\n"
+                                                "        value = other()\n"
+                                                "    }\n"
+                                                "}\n";
+
+static const char *const SWIFT_INIT_BASE_SRC = "open class Base {\n"
+                                               "    public init() {}\n"
+                                               "}\n";
+
+static const char *const SWIFT_INIT_SUB_SRC = "import Kit\n"
+                                              "import UIKit\n"
+                                              "\n"
+                                              "class Sub: Base {\n"
+                                              "    override init() {\n"
+                                              "        super.init()\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "class Screen: UIViewController {\n"
+                                              "    init() {\n"
+                                              "        super.init(nibName: nil, bundle: nil)\n"
+                                              "    }\n"
+                                              "    func alert() -> UIAlertAction {\n"
+                                              "        UIAlertAction.init(title: nil, style: "
+                                              ".default)\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "extension Notification {\n"
+                                              "    init(tag: String) {\n"
+                                              "        self.init(name: Notification.Name(tag))\n"
+                                              "    }\n"
+                                              "}\n"
+                                              "func make() -> Box {\n"
+                                              "    .init(raw: 1)\n"
+                                              "}\n"
+                                              "func explicit() -> Box {\n"
+                                              "    Box.init(raw: 2)\n"
+                                              "}\n";
+
+enum { SWIFT_INIT_EDGE_CAP = 32, SWIFT_INIT_EDGE_LEN = 192 };
+
+typedef struct {
+    int run_rc;
+    int calls;       /* CALLS edges seen; -1 if the store was not read */
+    int init_usages; /* USAGE edges into a node named init/deinit */
+    char edges[SWIFT_INIT_EDGE_CAP][SWIFT_INIT_EDGE_LEN]; /* "src -> tgt", sorted */
+} SwiftInitObservation;
+
+static int swift_init_edge_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* Qualified name relative to the project ("Inits.Box.init"). */
+static const char *swift_init_rel_qn(const char *qn, const char *project) {
+    size_t plen = strlen(project);
+    return strncmp(qn, project, plen) == 0 && qn[plen] == '.' ? qn + plen + 1 : qn;
+}
+
+static void swift_init_observe(cbm_store_t *s, const char *project, SwiftInitObservation *o) {
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    o->calls = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src = {0};
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                o->calls < SWIFT_INIT_EDGE_CAP) {
+                snprintf(o->edges[o->calls], SWIFT_INIT_EDGE_LEN, "%s -> %s",
+                         swift_init_rel_qn(src.qualified_name, project),
+                         swift_init_rel_qn(tgt.qualified_name, project));
+            }
+            o->calls++;
+            cbm_node_free_fields(&src);
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+    int kept = o->calls < SWIFT_INIT_EDGE_CAP ? o->calls : SWIFT_INIT_EDGE_CAP;
+    qsort(o->edges, (size_t)kept, sizeof(o->edges[0]), swift_init_edge_cmp);
+
+    edges = NULL;
+    count = 0;
+    o->init_usages = 0;
+    if (cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                tgt.name && (strcmp(tgt.name, "init") == 0 || strcmp(tgt.name, "deinit") == 0)) {
+                o->init_usages++;
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, count);
+        }
+    }
+}
+
+/* `pad` filler files push the run past MIN_FILES_FOR_PARALLEL so that, with
+ * `parallel`, it goes through pass_parallel.c rather than pass_calls.c. */
+static void swift_init_case(bool parallel, int pad, SwiftInitObservation *o) {
+    memset(o, 0, sizeof(*o));
+    o->run_rc = -1;
+    o->calls = -1;
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swift_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return;
+    }
+    char path[512];
+    bool written = true;
+    const char *names[] = {"Package.swift", "Sources/Kit/Inits.swift", "Sources/Kit/Base.swift",
+                           "Sources/App/Sub.swift"};
+    const char *sources[] = {SWIFT_INIT_PACKAGE_SRC, SWIFT_INIT_INITS_SRC, SWIFT_INIT_BASE_SRC,
+                             SWIFT_INIT_SUB_SRC};
+    for (int i = 0; i < 4 && written; i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmp, names[i]);
+        written = th_write_file(path, sources[i]) == 0;
+    }
+    for (int i = 0; i < pad && written; i++) {
+        char source[96];
+        snprintf(path, sizeof(path), "%s/Pad%02d.swift", tmp, i);
+        snprintf(source, sizeof(source), "func pad%02d() -> Int { %d }\n", i, i);
+        written = th_write_file(path, source) == 0;
+    }
+    if (written) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/swift_init.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o->run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            if (store && project) {
+                swift_init_observe(store, project, o);
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+}
+
+/* The exact CALLS set. Every initializer's own calls come from that
+ * initializer (the repro's file-level collapse is gone); Sub.init reaches
+ * Base.init in the other target and `Box.init(raw:)` reaches Box.init.
+ * UIViewController's and UIAlertAction's initializers, Notification's own and
+ * the implicit `.init(...)` are outside the project and form no edge -- in
+ * particular none to a project `init` that merely shares the name. Holder's
+ * convenience `self.init` is not a self-loop. */
+static int swift_init_assert_exact(const SwiftInitObservation *o) {
+    static const char *const expected[] = {
+        "Sources.App.Sub.Sub.init -> Sources.Kit.Base.Base.init",
+        "Sources.App.Sub.explicit -> Sources.Kit.Inits.Box.init",
+        "Sources.Kit.Inits.Box.init -> Sources.Kit.Inits.helper",
+        "Sources.Kit.Inits.Box.init -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Box.read -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Holder.init -> Sources.Kit.Inits.helper",
+        "Sources.Kit.Inits.Holder.init -> Sources.Kit.Inits.other",
+        "Sources.Kit.Inits.Mode.init -> Sources.Kit.Inits.helper",
+    };
+    enum { EXPECTED_CALLS = sizeof(expected) / sizeof(expected[0]) };
+    ASSERT_EQ(o->run_rc, 0);
+    ASSERT_EQ(o->init_usages, 0);
+    ASSERT_EQ(o->calls, (int)EXPECTED_CALLS);
+    for (int i = 0; i < (int)EXPECTED_CALLS; i++) {
+        ASSERT_STR_EQ(o->edges[i], expected[i]);
+    }
+    return 0;
+}
+
+TEST(pipeline_swift_init_exact_calls_sequential_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(false, 0, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
+/* Same input through pass_parallel.c: 55 fillers exceed MIN_FILES_FOR_PARALLEL. */
+TEST(pipeline_swift_init_exact_calls_parallel_issue2379) {
+    SwiftInitObservation o;
+    swift_init_case(true, 55, &o);
+    if (swift_init_assert_exact(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
 TEST(pipeline_python_cross_module_call) {
     /* Port of TestPythonCrossModuleCallViaImport */
     const char *files[] = {"utils.py", "main.py"};
@@ -29946,6 +30193,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_swift_cross_package_import);
+    RUN_TEST(pipeline_swift_init_exact_calls_sequential_issue2379);
+    RUN_TEST(pipeline_swift_init_exact_calls_parallel_issue2379);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
     RUN_TEST(pipeline_go_type_classification);
