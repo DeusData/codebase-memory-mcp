@@ -1745,8 +1745,7 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->http_veto = cbm_ht_create(128);
     resolver->http_domain_complete = true;
     resolver->project = cbm_arena_strdup(&resolver->arena, ctx->project_name);
-    cbm_resolve_proof_pool_init(&resolver->proofs, &resolver->arena, 4000000, 4000000,
-                                UINT64_C(64000000));
+    cbm_resolve_proof_pool_init_project(&resolver->proofs, &resolver->arena);
     resolver->solver = cbm_resolve_solver_new(&resolver->arena, &resolver->proofs,
                                               (cbm_resolve_solver_limits_t){0});
     resolver->go_types =
@@ -3099,7 +3098,8 @@ bool cbm_shared_resolver_adapter_init(cbm_shared_resolver_adapter_t *adapter,
     adapter->source_files = cbm_ht_create(0);
     if (!adapter->source_files)
         return adapter_fail(adapter);
-    cbm_resolve_proof_pool_init(&adapter->proofs, arena, 0, 0, 0);
+    /* One adapter serves every infrastructure input in the project. */
+    cbm_resolve_proof_pool_init_project(&adapter->proofs, arena);
     size_t count = 0;
     const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(ctx->gbuf, &count);
     for (size_t i = 0; i < count; i++) {

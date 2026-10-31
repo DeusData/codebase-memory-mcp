@@ -1075,8 +1075,7 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path) {
     gb->next_id = SKIP_ONE;
     gb->shared_ids = NULL;
     cbm_arena_init(&gb->proof_arena);
-    cbm_resolve_proof_pool_init(&gb->proof_pool, &gb->proof_arena, 16u * 1024u * 1024u,
-                                64u * 1024u * 1024u, UINT64_C(4294967296));
+    cbm_resolve_proof_pool_init_project(&gb->proof_pool, &gb->proof_arena);
 
     gb->node_by_qn = cbm_ht_create_in(CBM_MEM_CLASS_GBUF_INDEX, CBM_SZ_256);
     gb->by_id = NULL;

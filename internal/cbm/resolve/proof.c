@@ -56,6 +56,9 @@ void cbm_resolve_proof_pool_init(cbm_resolve_proof_pool_t *pool, CBMArena *arena
         .work_limit = work_limit ? work_limit : PROOF_DEFAULT_WORK,
         .failure = arena ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_FAILED};
 }
+void cbm_resolve_proof_pool_init_project(cbm_resolve_proof_pool_t *pool, CBMArena *arena) {
+    cbm_resolve_proof_pool_init(pool, arena, SIZE_MAX, SIZE_MAX, UINT64_MAX);
+}
 const cbm_resolve_proof_view_t *cbm_resolve_proof_view(const cbm_resolve_proof_t *proof) {
     return proof ? &proof->value : NULL;
 }

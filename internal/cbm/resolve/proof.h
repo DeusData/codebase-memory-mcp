@@ -90,6 +90,13 @@ typedef struct cbm_resolve_proof_pool {
  * shared registry's arena. */
 void cbm_resolve_proof_pool_init(cbm_resolve_proof_pool_t *pool, CBMArena *arena, size_t node_limit,
                                  size_t premise_limit, uint64_t work_limit);
+/* A pool whose population is the whole project: one node per distinct fact,
+ * each operation linear in its own text, so its total is a property of the
+ * input rather than a runaway. A cap here does not bound anything real; it
+ * refuses to publish a large enough repository, and because every hashed byte
+ * counts, how large depends on the length of the checkout path. Only the
+ * memory core can refuse this pool. */
+void cbm_resolve_proof_pool_init_project(cbm_resolve_proof_pool_t *pool, CBMArena *arena);
 const cbm_resolve_proof_view_t *cbm_resolve_proof_view(const cbm_resolve_proof_t *proof);
 /* Exact pointer membership in this pool's full-key interned entries. A hash
  * match alone never establishes ownership. The node must still be alive. */
