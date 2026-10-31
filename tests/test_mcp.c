@@ -4787,6 +4787,156 @@ TEST(tool_search_graph_bm25_zero_hint_names_the_label) {
     PASS();
 }
 
+/* file_pattern, kind and namespace filter after the BM25 candidate window
+ * (they cannot be put into the MATCH like the label). 2001 same-label nodes
+ * with a short path fill the window ahead of 3 that rank strictly lower (long
+ * path) and are the only ones passing each filter, so a windowed search
+ * answered 0 rows. A saturated window under such a filter is ranked over
+ * every candidate: all 3 rows, an exact total, consistent offset pages. */
+static void bm25_post_window_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-post-window");
+    for (int i = 0; i < 2004; i++) {
+        bool rare = i >= 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-post-window.%s_%04d", rare ? "rare" : "fn", i);
+        cbm_node_t node = {
+            .project = project,
+            .label = "Function",
+            .name = "postneedle",
+            .qualified_name = qn,
+            .file_path = rare ? "deeply/nested/package/layout/registry.c" : "many.c",
+            .start_line = i + 1,
+            .end_line = i + 1,
+            .properties_json =
+                rare ? "{\"kind\":\"Deployment\",\"obj_key\":\"apps/Deployment/prod/web\"}" : NULL};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_post_window_search(cbm_mcp_server_t *srv, const char *filter_json, int limit,
+                                     int offset) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2424,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-post-window\",\"query\":\"postneedle\"%s,"
+             "\"limit\":%d,\"offset\":%d,\"format\":\"json\"}}}",
+             filter_json, limit, offset);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-post-window");
+    bm25_post_window_fixture(store, "bm25-post-window");
+
+    static const char *const filters[] = {
+        ",\"file_pattern\":\"deeply/nested\"",
+        ",\"kind\":\"Deployment\"",
+        ",\"namespace\":\"prod\"",
+    };
+    for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
+        char *inner = bm25_post_window_search(srv, filters[i], 10, 0);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2001\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2003\""));
+        ASSERT_NULL(strstr(inner, "\"bm25-post-window.fn_"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":3,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+        free(inner);
+    }
+
+    /* Offset pages over the exhaustive ranking are disjoint and complete. */
+    char *page1 = bm25_post_window_search(srv, filters[0], 2, 0);
+    char *page2 = bm25_post_window_search(srv, filters[0], 2, 2);
+    ASSERT_NOT_NULL(page1);
+    ASSERT_NOT_NULL(page2);
+    ASSERT_NOT_NULL(strstr(page1, "\"returned\":2,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"returned\":1,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"total\":3,"));
+    for (int i = 2001; i < 2004; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "\"bm25-post-window.rare_%04d\"", i);
+        ASSERT_TRUE((strstr(page1, qn) != NULL) != (strstr(page2, qn) != NULL));
+    }
+    free(page1);
+    free(page2);
+
+    /* Without a post-window filter the window stays and says so. */
+    char *inner = bm25_post_window_search(srv, "", 10, 0);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled query whose whole candidate window is File/Folder/Variable/
+ * Project rows (excluded from unlabelled ranking) found no row at all, while
+ * a matching definition sat just beyond the window: 2001 short Folder rows
+ * outrank one Function with a long path. A window with no row passing the
+ * filters is ranked over every candidate instead. */
+TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-empty-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-empty-window"), CBM_STORE_OK);
+    for (int i = 0; i < 2002; i++) {
+        bool def = i == 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-empty-window.%s_%04d", def ? "def" : "dir", i);
+        cbm_node_t node = {.project = project,
+                           .label = def ? "Function" : "Folder",
+                           .name = "foldneedle",
+                           .qualified_name = qn,
+                           .file_path = def ? "deeply/nested/package/layout/registry.c" : "d",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2425,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-empty-window\",\"query\":\"foldneedle\",\"limit\":10,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-empty-window.def_2001\",\"Function\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* The definition whose NAME is the query ranks first: the `Table` class above
  * its own methods and above test methods that repeat "table" three times; the
  * `get_object_or_404` function above the test methods that contain it. */
@@ -10077,6 +10227,57 @@ TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
     PASS();
 }
 
+/* delete_project removes the ADR sidecar with the project, and a re-index of a
+ * same-named project afterwards starts with no ADR (round-2 review item 7c). */
+TEST(tool_delete_project_removes_adr_sidecar) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-adr-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "adr-delete-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, "/tmp/adr-delete-project"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(setup, project, "# Decision\nkeep it"), CBM_STORE_OK);
+    cbm_store_close(setup);
+
+    char adr_path[CBM_SZ_1K];
+    snprintf(adr_path, sizeof(adr_path), "%s.adr.db", db_path);
+    ASSERT_TRUE(cbm_file_exists(adr_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"adr-delete-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    free(resp);
+
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    ASSERT_FALSE(cbm_file_exists(adr_path)); /* sidecar removed with the project */
+
+    /* A fresh store of the same name starts with no ADR. */
+    cbm_store_t *fresh = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(fresh);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(fresh, project, &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(fresh);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
 TEST(tool_index_repository_mutation_guard_blocks_before_local_worker) {
     char root[CBM_SZ_1K];
     (void)snprintf(root, sizeof(root), "%s/cbm-index-guard-XXXXXX", cbm_tmpdir());
@@ -11668,6 +11869,88 @@ TEST(search_code_scoped_file_pattern_is_busybox_portable) {
     ASSERT_TRUE(portable_success);
     PASS();
 #endif
+}
+
+/* issue #2836: a file_pattern with '/' matched only the basename, so every
+ * directory-scoped glob silently returned 0 results. */
+TEST(search_code_file_pattern_matches_repo_relative_path_issue2836) {
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-fp-path-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char src_dir[CBM_SZ_1K];
+    char cli_dir[CBM_SZ_1K];
+    char main_path[CBM_SZ_1K];
+    char watcher_path[CBM_SZ_1K];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", tmp);
+    snprintf(cli_dir, sizeof(cli_dir), "%s/src/cli", tmp);
+    snprintf(main_path, sizeof(main_path), "%s/src/main.c", tmp);
+    snprintf(watcher_path, sizeof(watcher_path), "%s/src/cli/watcher.c", tmp);
+    ASSERT_EQ(cbm_mkdir(src_dir), 0);
+    ASSERT_EQ(cbm_mkdir(cli_dir), 0);
+    ASSERT_EQ(th_write_file(main_path, "int FP_PATH_NEEDLE = 1;\n"), 0);
+    ASSERT_EQ(th_write_file(watcher_path, "int FP_PATH_NEEDLE = 2;\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-fp-path";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+    cbm_node_t main_file = {.project = project,
+                            .label = "File",
+                            .name = "main.c",
+                            .qualified_name = "search-fp-path.src.main.c",
+                            .file_path = "src/main.c"};
+    cbm_node_t watcher_file = {.project = project,
+                               .label = "File",
+                               .name = "watcher.c",
+                               .qualified_name = "search-fp-path.src.cli.watcher.c",
+                               .file_path = "src/cli/watcher.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &main_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &watcher_file), 0);
+
+    static const struct {
+        const char *file_pattern;
+        const char *expect;
+        bool hint;
+    } cases[] = {
+        {"src/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/**/*.c", "\"total_grep_matches\":2", false}, /* ** spans zero dirs */
+        {"**/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/cli/", "\"total_grep_matches\":1", false},  /* no wildcard: substring */
+        {"watcher.c", "\"total_grep_matches\":1", false}, /* basename unchanged */
+        {"*.c", "\"total_grep_matches\":2", false},
+        {"lib/*.c", "\"total_grep_matches\":0", true},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args),
+                 "{\"pattern\":\"FP_PATH_NEEDLE\",\"project\":\"search-fp-path\","
+                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                 cases[i].file_pattern);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        char *inner = extract_text_content(response);
+        bool case_ok = inner && strstr(inner, cases[i].expect) &&
+                       (strstr(inner, "use path_filter") != NULL) == cases[i].hint;
+        if (!case_ok) {
+            fprintf(stderr, "file_pattern %s: %s\n", cases[i].file_pattern,
+                    inner ? inner : "(null)");
+            ok = false;
+        }
+        free(inner);
+        free(response);
+    }
+
+    cbm_mcp_server_free(srv);
+    cbm_unlink(watcher_path);
+    cbm_unlink(main_path);
+    cbm_rmdir(cli_dir);
+    cbm_rmdir(src_dir);
+    cbm_rmdir(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
 }
 
 TEST(search_code_recursive_fallback_propagates_discovery_failures) {
@@ -26219,6 +26502,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_bm25_label_scope_keeps_rank_order);
     RUN_TEST(tool_search_graph_bm25_serves_unranked_labels_when_named);
     RUN_TEST(tool_search_graph_bm25_zero_hint_names_the_label);
+    RUN_TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate);
+    RUN_TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
@@ -26322,6 +26607,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_fails_closed_when_complete_scan_is_impossible);
     RUN_TEST(search_code_scoped_scan_uses_canonical_file_nodes);
     RUN_TEST(search_code_scoped_file_pattern_is_busybox_portable);
+    RUN_TEST(search_code_file_pattern_matches_repo_relative_path_issue2836);
     RUN_TEST(search_code_recursive_fallback_propagates_discovery_failures);
     RUN_TEST(search_code_default_budget_limits_raw_rows_before_graph_results);
     RUN_TEST(search_code_raw_and_directory_remainders_are_independently_pageable);
@@ -26522,6 +26808,7 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
     RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+    RUN_TEST(tool_delete_project_removes_adr_sidecar);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
     RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);

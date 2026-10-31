@@ -459,6 +459,16 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
 bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
                                        double confidence);
 
+/* A bare Go `init` (a call or reference that is not the member half of a
+ * selector) is always a local name: Go forbids referring to a package init
+ * function, and a method or field needs a selector. True when such a name
+ * resolved onto a Function (every Go Function named init is a package init;
+ * any registry strategy) or onto a Method or Field found by a weak short-name
+ * strategy. lsp_* answers are kept. Go only. Pure; unit-tested in
+ * test_registry.c; wired in pass_calls.c, pass_usages.c and pass_parallel.c. */
+bool cbm_go_suppress_bare_init_bind(bool is_go, bool is_member, const char *name,
+                                    const char *strategy, const char *target_label);
+
 /* Import-binding counterpart (#2127). True when the callee's root identifier
  * is bound by an import of this file whose module chain contradicts the
  * resolved target (`from unittest.mock import patch; patch()` must not bind a

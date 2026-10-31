@@ -1015,6 +1015,46 @@ bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *s
     return confidence < CONF_UNIQUE_NAME;
 }
 
+bool cbm_go_suppress_bare_init_bind(bool is_go, bool is_member, const char *name,
+                                    const char *strategy, const char *target_label) {
+    /* The Go spec gives `init` no binding in the package block: the
+     * identifier declares init functions and nothing else, and "init
+     * functions cannot be referred to from anywhere in a program". A method
+     * or a field named init is reached only through a selector (`x.init()`,
+     * `e.init`), which arrives here as is_member and is left alone. So a
+     * BARE `init` is always a local name: a closure (`init :=
+     * func(ctx) {...}; init(ctx)`, 22 kubernetes e2e storage suites), a
+     * parameter (`func sum(init func() ref.Val)`), or the `package init`
+     * clause of a directory named init. None of them is a project node.
+     *
+     * Every Go Function named init is a package init (no other package-level
+     * `init` can be declared), so that target is refused for every registry
+     * strategy. Before #1915 the flat QN made same_module bind the bare name
+     * to its own package's init; after it, the per-file QN misses there and
+     * the name fallback binds unrelated init methods instead. A Method or
+     * Field namesake is refused when only the name found it (the shared weak
+     * drop-list), which is how every such edge was minted. lsp_* answers are
+     * untouched: the sequential resolver emits them before its registry
+     * guards run, so refusing one here would split the two resolvers.
+     *
+     * Go-gated: elsewhere `init` is an ordinary name. A bare `init()` in a
+     * Java, C#, C++, Kotlin or Ruby method calls the class's own method, and
+     * a C, Python or JS `init` function is called by its bare name. */
+    if (!is_go || is_member || !name || strcmp(name, "init") != 0 || !target_label) {
+        return false;
+    }
+    if (strategy && strncmp(strategy, "lsp_", strlen("lsp_")) == 0) {
+        return false;
+    }
+    if (strcmp(target_label, "Function") == 0) {
+        return true;
+    }
+    if (strcmp(target_label, "Method") == 0 || strcmp(target_label, "Field") == 0) {
+        return weak_short_name_strategy(strategy);
+    }
+    return false;
+}
+
 /* Import-binding counterpart of the parameter guard above (#2127). An import
  * binds the identifier for the whole module; when that import is external it
  * never materializes, and the chain falls through to project-wide short-name

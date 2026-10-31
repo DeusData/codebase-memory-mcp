@@ -1088,6 +1088,217 @@ TEST(pipeline_records_unresolved_injected_call_sites) {
     PASS();
 }
 
+/* An ADR written from a test hook BETWEEN the start of a reindex and its
+ * publication survives — the write lands in the "<db>.adr.db" sidecar, which the
+ * graph-DB rebuild never touches (round-2 review item 7a, full route). */
+typedef struct {
+    char db_path[512];
+    char project[256];
+    const char *adr;
+} adr_hook_ctx_t;
+
+static void write_adr_before_final_manifest(void *userdata) {
+    adr_hook_ctx_t *c = (adr_hook_ctx_t *)userdata;
+    cbm_store_t *s = cbm_store_open_path_existing(c->db_path);
+    if (!s) {
+        s = cbm_store_open_path(c->db_path);
+    }
+    if (s) {
+        (void)cbm_store_adr_store(s, c->project, c->adr);
+        cbm_store_close(s);
+    }
+}
+
+TEST(pipeline_adr_written_during_reindex_survives) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_hook_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    adr_hook_ctx_t ctx = {.adr = "# Decision\nWritten mid-reindex."};
+    snprintf(ctx.db_path, sizeof(ctx.db_path), "%s", db_path);
+    snprintf(ctx.project, sizeof(ctx.project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* Force a full reindex, writing the ADR from the publication hook. */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_before_final_manifest_once(write_adr_before_final_manifest, &ctx);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    /* Pin the route so this stays a full-rebuild test if routing changes. */
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    cbm_pipeline_free(p2);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, ctx.project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, ctx.adr);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+
+    rm_rf(tmp);
+    PASS();
+}
+
+/* Migrate-before-rebuild fails closed: if the sidecar cannot be opened (here a
+ * DIRECTORY sits at "<db>.adr.db"), the reindex must NOT delete the old
+ * generation — it returns CBM_PIPELINE_ABORT_PRESERVE_DB and the prior graph is
+ * left intact. Deterministic, no hook. */
+TEST(pipeline_adr_migrate_failure_preserves_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_migfail_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    cbm_store_t *before = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(before);
+    int nodes_before = cbm_store_count_nodes(before, project);
+    cbm_store_close(before);
+    ASSERT_TRUE(nodes_before > 0);
+
+    /* A directory at "<db>.adr.db" makes the sidecar open (and thus the
+     * migrate-before-delete step) fail deterministically. */
+    char adr_dir[600];
+    snprintf(adr_dir, sizeof(adr_dir), "%s.adr.db", db_path);
+    ASSERT_EQ(cbm_mkdir(adr_dir), 0);
+
+    /* Force a full reindex; migrate-before-delete must fail closed. */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    int rc = cbm_pipeline_run(p2);
+    cbm_pipeline_free(p2);
+    ASSERT_EQ(rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+
+    /* Old generation intact: the graph DB was not deleted or rebuilt. */
+    ASSERT_TRUE(cbm_file_exists(db_path));
+    cbm_store_t *after = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(cbm_store_count_nodes(after, project), nodes_before);
+    cbm_store_close(after);
+
+    rm_rf(tmp);
+    PASS();
+}
+
+/* Upgrade order: a legacy ADR row (pre-sidecar, in the graph DB) is migrated
+ * BEFORE a forced-full reindex deletes the old generation, with NO ADR read
+ * first — the pipeline's migrate-before-rebuild step must move it (item 7b). */
+TEST(pipeline_adr_legacy_migrates_before_forced_reindex) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_upgrade_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* Seed the ADR directly into the graph DB's project_summaries (the legacy
+     * layout), bypassing the sidecar entirely. */
+    static const char adr_text[] = "# Decision\nLegacy row, migrated before rebuild.";
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    sqlite3_exec(raw,
+                 "CREATE TABLE IF NOT EXISTS project_summaries (project TEXT PRIMARY KEY,"
+                 " summary TEXT NOT NULL, source_hash TEXT NOT NULL, created_at TEXT NOT NULL,"
+                 " updated_at TEXT NOT NULL);",
+                 NULL, NULL, NULL);
+    char *sql = sqlite3_mprintf(
+        "INSERT OR REPLACE INTO project_summaries VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z',"
+        " '2020-01-01T00:00:00Z');",
+        project, adr_text);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
+
+    /* No ADR read here. Force a full reindex (which deletes the old graph DB). */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
+
+    /* The legacy ADR was migrated to the sidecar before the delete, so it is
+     * still readable. */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -6183,6 +6394,60 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     PASS();
 }
 
+/* Companion to pipeline_adr_written_during_reindex_survives (the full route):
+ * an ADR written from the publication hook mid-reindex must also survive the
+ * closure-DELTA route (item 7a — "both the full and the delta route"). The
+ * delta route clones/patches/renames the graph DB but never touches the
+ * "<db>.adr.db" sidecar, so the hook-written ADR is preserved. A body-only edit
+ * forces the closure-repair (delta) route, which we assert explicitly so this
+ * can't silently pass on a full rebuild. */
+TEST(pipeline_adr_written_during_delta_reindex_survives) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_delta_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    closure_probe_repo(tmp);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/closure.db", tmp);
+
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    adr_hook_ctx_t ctx = {.adr = "# Decision\nWritten mid-delta-reindex."};
+    snprintf(ctx.db_path, sizeof(ctx.db_path), "%s", db);
+    snprintf(ctx.project, sizeof(ctx.project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    /* Body-only edit (same exported surface) → closure-repair delta route. */
+    write_temp_file(tmp, "lib.ts",
+                    "export function closureProbeHelper(x: number): string {\n"
+                    "  const doubled = x + x;\n"
+                    "  return String(doubled);\n"
+                    "}\n");
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_before_final_manifest_once(write_adr_before_final_manifest, &ctx);
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incr);
+    ASSERT_EQ(cbm_pipeline_run(incr), 0);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incr);
+    cbm_pipeline_incremental_test_reset_faults();
+    /* Must be the DELTA route, not a full rebuild — otherwise this proves nothing. */
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, ctx.project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, ctx.adr);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Removing a definition (no additions) keeps the closure route AND must drop
  * the dependent's stale CALL_REFERENCE. This is the assertion legacy partial
  * could never pass: its QN-keyed re-link resurrected yesterday's edge. */
@@ -7214,7 +7479,6 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
         .cancelled = NULL,
         .manifest = NULL,
         .manifest_count = 0,
-        .adr_content = NULL,
         .coverage = NULL,
         .coverage_count = 0,
     };
@@ -8855,79 +9119,215 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
     PASS();
 }
 
-/* A forced-full rebuild must never erase an ADR merely because the old
- * generation could not be read completely. The capture is part of the
- * publication transaction: failure preserves both graph and ADR. */
-TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
+/* An ADR written in the pre-sidecar layout (a row in the graph DB's
+ * project_summaries) is migrated into the "<db>.adr.db" sidecar the first time
+ * it is read, and then survives a full reindex — so upgrading needs no reindex
+ * and loses no decision record. */
+TEST(pipeline_adr_migrates_from_legacy_graph_row) {
     char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_adr_capture_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "generation.py", "def BeforeAdrCapture():\n    return 1\n");
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_migrate_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
     char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char main_py[512];
+    snprintf(main_py, sizeof(main_py), "%s/main.py", tmp);
+    FILE *f = fopen(main_py, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
 
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(baseline);
-    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
     char project[256];
-    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
-    cbm_pipeline_free(baseline);
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
 
-    static const char adr_text[] = "# Decision\nADR capture is fail-closed.";
-    cbm_store_t *adr_store = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(adr_store);
-    ASSERT_EQ(cbm_store_adr_store(adr_store, project, adr_text), CBM_STORE_OK);
-    cbm_store_close(adr_store);
+    /* Seed the ADR directly into the graph DB's project_summaries — the layout
+     * before the sidecar existed — bypassing cbm_store_adr_store (which now
+     * writes the sidecar). */
+    static const char adr_text[] = "# Decision\nLegacy row migrates to the sidecar.";
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO project_summaries (project, summary, source_hash, created_at, updated_at) "
+        "VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');",
+        project, adr_text);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
 
-    write_temp_file(tmp, "generation.py", "def AfterAdrCapture():\n    return 2\n");
-    cbm_pipeline_incremental_test_fail_adr_capture_once();
-    cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(faulted);
-    int faulted_rc = cbm_pipeline_run(faulted);
-    cbm_pipeline_free(faulted);
+    char adr_db[600];
+    snprintf(adr_db, sizeof(adr_db), "%s.adr.db", db_path);
+    ASSERT_TRUE(!cbm_file_exists(adr_db)); /* no sidecar yet */
 
-    int faulted_before = -1;
-    int faulted_after = -1;
-    observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture",
-                             &faulted_before, &faulted_after);
-    cbm_store_t *preserved = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(preserved);
-    cbm_adr_t preserved_adr = {0};
-    int preserved_adr_rc = cbm_store_adr_get(preserved, project, &preserved_adr);
-    bool preserved_adr_matches = preserved_adr_rc == CBM_STORE_OK && preserved_adr.content &&
-                                 strcmp(preserved_adr.content, adr_text) == 0;
-    cbm_store_adr_free(&preserved_adr);
-    cbm_store_close(preserved);
+    /* A READ returns the legacy row from the graph DB and must NOT create the
+     * sidecar (a query-only cache must stay unwritten). */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+    ASSERT_TRUE(!cbm_file_exists(adr_db)); /* read did not create the sidecar */
 
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(retry);
-    int retry_rc = cbm_pipeline_run(retry);
-    cbm_pipeline_free(retry);
-    int retry_before = -1;
-    int retry_after = -1;
-    observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture", &retry_before,
-                             &retry_after);
-    cbm_store_t *published = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(published);
-    cbm_adr_t published_adr = {0};
-    int published_adr_rc = cbm_store_adr_get(published, project, &published_adr);
-    bool published_adr_matches = published_adr_rc == CBM_STORE_OK && published_adr.content &&
-                                 strcmp(published_adr.content, adr_text) == 0;
-    cbm_store_adr_free(&published_adr);
-    cbm_store_close(published);
-    cbm_pipeline_incremental_test_reset_faults();
-    th_rmtree(tmp);
+    /* Force a full reindex; routing migrates the legacy row into the sidecar
+     * before the old generation is deleted, so the ADR survives. */
+    for (int i = 0; i < 4; i++) {
+        char extra[512];
+        snprintf(extra, sizeof(extra), "%s/extra%d.py", tmp, i);
+        f = fopen(extra, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
 
-    ASSERT_EQ(faulted_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
-    ASSERT_EQ(faulted_before, 1);
-    ASSERT_EQ(faulted_after, 0);
-    ASSERT_TRUE(preserved_adr_matches);
-    ASSERT_EQ(retry_rc, 0);
-    ASSERT_EQ(retry_before, 0);
-    ASSERT_EQ(retry_after, 1);
-    ASSERT_TRUE(published_adr_matches);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_adr_t adr2 = {0};
+    ASSERT_EQ(cbm_store_adr_get(s2, project, &adr2), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr2.content);
+    ASSERT_STR_EQ(adr2.content, adr_text);
+    cbm_store_adr_free(&adr2);
+    cbm_store_close(s2);
+
+    rm_rf(tmp);
+    PASS();
+}
+
+/* A sidecar that exists but was never marked `migrated` is half-created (a crash
+ * or a killed process between CREATE and the migration COMMIT). A read must fall
+ * back to the legacy graph row so a partial sidecar never hides an ADR. */
+TEST(pipeline_adr_half_created_sidecar_falls_back_to_legacy) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_halfcreated_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char main_py[512];
+    snprintf(main_py, sizeof(main_py), "%s/main.py", tmp);
+    FILE *f = fopen(main_py, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* Legacy ADR still only in the graph DB (pre-sidecar layout). */
+    static const char adr_text[] = "# Decision\nHalf-created sidecar must not hide me.";
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO project_summaries (project, summary, source_hash, created_at, updated_at) "
+        "VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');",
+        project, adr_text);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
+
+    /* Fabricate a HALF-CREATED sidecar: schema present, NO `migrated` marker. */
+    char adr_db[600];
+    snprintf(adr_db, sizeof(adr_db), "%s.adr.db", db_path);
+    sqlite3 *side = NULL;
+    ASSERT_EQ(sqlite3_open(adr_db, &side), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(side,
+                           "CREATE TABLE project_summaries (project TEXT PRIMARY KEY, summary TEXT "
+                           "NOT NULL, source_hash TEXT NOT NULL, created_at TEXT NOT NULL, "
+                           "updated_at TEXT NOT NULL);"
+                           "CREATE TABLE adr_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(side);
+    ASSERT_TRUE(cbm_file_exists(adr_db)); /* sidecar exists but is unmarked */
+
+    /* The read must fall back to the legacy graph row, not report NOT_FOUND. */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+
+    rm_rf(tmp);
+    PASS();
+}
+
+/* ADRs live in the "<db>.adr.db" sidecar, separate from the graph DB, and
+ * removing that sidecar (what delete_project does) removes the ADR store. */
+TEST(pipeline_adr_sidecar_is_separate_and_removable) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_sidecar_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char main_py[512];
+    snprintf(main_py, sizeof(main_py), "%s/main.py", tmp);
+    FILE *f = fopen(main_py, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    static const char adr_text[] = "# Decision\nADRs live in the sidecar.";
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_adr_store(s, project, adr_text), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    /* The ADR is in the sidecar, NOT in the graph DB's project_summaries. */
+    char adr_db[600];
+    snprintf(adr_db, sizeof(adr_db), "%s.adr.db", db_path);
+    ASSERT_TRUE(cbm_file_exists(adr_db));
+
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM project_summaries;", -1, &st, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int graph_rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    ASSERT_EQ(graph_rows, 0);
+
+    /* Removing the sidecar (as delete_project does) removes the ADR store. */
+    ASSERT_EQ(cbm_unlink(adr_db), 0);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_adr_t adr = {0};
+    int rc = cbm_store_adr_get(s2, project, &adr);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s2);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    rm_rf(tmp);
     PASS();
 }
 
@@ -10830,6 +11230,653 @@ TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge) {
     } else {
         cbm_unsetenv("CBM_WORKERS");
     }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_multi_init_nodes_survive) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Two files, one package, one init() each — Go runs both at start-up.
+     * Pre-fix both collapsed onto one QN and the upsert kept one node
+     * (reproduce-first: RED asserts node count == 2). */
+    write_temp_file(tmp, "go.mod", "module example.com/reg\n\ngo 1.22\n");
+    write_temp_file(tmp, "reg/a.go",
+                    "package reg\n"
+                    "\n"
+                    "var handlers = map[string]func(){}\n"
+                    "\n"
+                    "func init() { handlers[\"a\"] = handleA }\n"
+                    "\n"
+                    "func handleA() {}\n");
+    write_temp_file(tmp, "reg/b.go",
+                    "package reg\n"
+                    "\n"
+                    "func init() { handlers[\"b\"] = handleB }\n"
+                    "\n"
+                    "func handleB() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Both init functions survive as distinct nodes. */
+    cbm_node_t *inits = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_name(s, project, "init", &inits, &ic);
+    ASSERT_EQ(ic, 2);
+    cbm_store_free_nodes(inits, ic);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Edges of `edge_type` whose source and target QNs end with the given
+ * suffixes (go_calls_between for any edge type, without the properties). */
+static int go_edges_between(cbm_store_t *s, const char *project, const char *edge_type,
+                            const char *caller_suffix, const char *callee_suffix) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count);
+    size_t cs = strlen(caller_suffix);
+    size_t ts = strlen(callee_suffix);
+    int hits = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            src.qualified_name && tgt.qualified_name) {
+            size_t sl = strlen(src.qualified_name);
+            size_t tl = strlen(tgt.qualified_name);
+            if (sl >= cs && tl >= ts && strcmp(src.qualified_name + sl - cs, caller_suffix) == 0 &&
+                strcmp(tgt.qualified_name + tl - ts, callee_suffix) == 0) {
+                hits++;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return hits;
+}
+
+/* Fixture for the #1910 Go init() LSP-join probes (sequential and parallel
+ * twins). Three init() in two files of one package -- two in b.go, so the
+ * per-file ordinal is pinned too -- each calling a method that only the Go
+ * LSP can bind: the receiver's type comes from a constructor in another
+ * file, and the method name also exists on a second package type and on
+ * other.Decoy, so no short-name fallback lands on the right target. a.go's
+ * init also passes a handler by value (add("a", handleA): a CALL_REFERENCE,
+ * which exists only as an LSP row). pad_files > 0 adds filler Go files past
+ * MIN_FILES_FOR_PARALLEL. */
+static void write_go_init_lsp_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxinit\n\ngo 1.22\n");
+    write_temp_file(tmp, "reg/codec.go",
+                    "package reg\n"
+                    "\n"
+                    "type Codec struct{ n int }\n"
+                    "\n"
+                    "func NewCodec() *Codec { return &Codec{} }\n"
+                    "\n"
+                    "func (c *Codec) register() { c.n++ }\n");
+    write_temp_file(tmp, "reg/store.go",
+                    "package reg\n"
+                    "\n"
+                    "type Store struct{ open bool }\n"
+                    "\n"
+                    "func NewStore() *Store { return &Store{} }\n"
+                    "\n"
+                    "func (s *Store) register() { s.open = true }\n"
+                    "\n"
+                    "func (s *Store) warm() {}\n");
+    write_temp_file(tmp, "reg/a.go",
+                    "package reg\n"
+                    "\n"
+                    "var handlers = map[string]func(){}\n"
+                    "\n"
+                    "func handleA() {}\n"
+                    "\n"
+                    "func add(name string, fn func()) { handlers[name] = fn }\n"
+                    "\n"
+                    "func init() {\n"
+                    "\tc := NewCodec()\n"
+                    "\tc.register()\n"
+                    "\tadd(\"a\", handleA)\n"
+                    "}\n");
+    write_temp_file(tmp, "reg/b.go",
+                    "package reg\n"
+                    "\n"
+                    "func init() {\n"
+                    "\ts := NewStore()\n"
+                    "\ts.register()\n"
+                    "}\n"
+                    "\n"
+                    "func init() {\n"
+                    "\ts := NewStore()\n"
+                    "\ts.warm()\n"
+                    "}\n");
+    write_temp_file(tmp, "other/other.go",
+                    "package other\n"
+                    "\n"
+                    "type Decoy struct{}\n"
+                    "\n"
+                    "func (d *Decoy) register() {}\n"
+                    "\n"
+                    "func (d *Decoy) warm() {}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+/* Each init's LSP-resolved edges start at that init's own node. */
+static int assert_go_init_lsp_edges(cbm_store_t *s, const char *project) {
+    const char *lsp = "\"strategy\":\"lsp_";
+    ASSERT_GTE(go_calls_between(s, project, ".reg.init#a.go:1", ".reg.Codec.register", lsp), 1);
+    ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:1", ".reg.Store.register", lsp), 1);
+    ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:2", ".reg.Store.warm", lsp), 1);
+    ASSERT_GTE(go_edges_between(s, project, "CALL_REFERENCE", ".reg.init#a.go:1", ".reg.handleA"),
+               1);
+    /* No cross-wiring between the inits, and nothing onto the decoy. */
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#a.go:1", ".reg.Store.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:1", ".reg.Codec.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:2", ".reg.Store.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#a.go:1", ".other.Decoy.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:1", ".other.Decoy.register", NULL), 0);
+    ASSERT_EQ(go_calls_between(s, project, ".reg.init#b.go:2", ".other.Decoy.warm", NULL), 0);
+    return 0;
+}
+
+/* #1910: the def extractor and compute_func_qn name each init
+ * pkg.init#<file>:<N>; the Go LSP must name its caller the same way
+ * (cbm_go_init_qn), or every LSP resolution inside an init body loses the
+ * exact caller-QN join and falls back to the registry resolver. */
+TEST(pipeline_go_init_lsp_edges_per_file) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_lsp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_init_lsp_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init_lsp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_init_lsp_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel twin: >= MIN_FILES_FOR_PARALLEL (50) files plus CBM_WORKERS=4
+ * take the parallel resolver (resolve_worker's Tier-2 dispatch). */
+TEST(pipeline_go_init_lsp_edges_per_file_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_lsp_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_init_lsp_fixture(tmp, 52);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init_lsp_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_init_lsp_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Fixture for the bare-`init` probes (sequential and parallel twins), the
+ * shapes the kubernetes census found after #1915: a local closure `init :=
+ * func(ctx)` that is called, written and passed by value (the e2e storage
+ * suites), a parameter named init (`func sum(init func() ref.Val)`), and a
+ * `package init` directory. The decoys are a package init in the caller's
+ * own package (what same_module bound before #1915) and an unrelated
+ * Watcher.init method (what the name fallback binds after it). Watcher.Start
+ * and Boot call that method through a selector, the control that must keep
+ * resolving. pad_files > 0 adds filler Go files past MIN_FILES_FOR_PARALLEL. */
+static void write_go_bare_init_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxbareinit\n\ngo 1.22\n");
+    write_temp_file(tmp, "suites/suite.go",
+                    "package suites\n"
+                    "\n"
+                    "import \"context\"\n"
+                    "\n"
+                    "var registered []string\n"
+                    "\n"
+                    "func init() { registered = append(registered, \"volumes\") }\n"
+                    "\n"
+                    "func wrap(fn func(context.Context)) { _ = fn }\n"
+                    "\n"
+                    "func DefineTests(ctx context.Context) {\n"
+                    "\tinit := func(ctx context.Context) {\n"
+                    "\t\t_ = ctx\n"
+                    "\t}\n"
+                    "\tinit(ctx)\n"
+                    "\twrap(init)\n"
+                    "}\n"
+                    "\n"
+                    "func Sum(init func() int) int {\n"
+                    "\treturn init()\n"
+                    "}\n");
+    write_temp_file(tmp, "watcher/watcher.go",
+                    "package watcher\n"
+                    "\n"
+                    "type Watcher struct{ ready bool }\n"
+                    "\n"
+                    "func NewWatcher() *Watcher { return &Watcher{} }\n"
+                    "\n"
+                    "func (w *Watcher) init() { w.ready = true }\n"
+                    "\n"
+                    "func (w *Watcher) Start() {\n"
+                    "\tw.init()\n"
+                    "}\n"
+                    "\n"
+                    "func Boot() {\n"
+                    "\tw := NewWatcher()\n"
+                    "\tw.init()\n"
+                    "}\n");
+    write_temp_file(tmp, "boot/init/init.go",
+                    "// Package init installs defaults for its importers.\n"
+                    "package init\n"
+                    "\n"
+                    "func init() { setup() }\n"
+                    "\n"
+                    "func setup() {}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static bool bare_init_qn_ends_with(const char *qn, const char *suffix) {
+    size_t ql = strlen(qn);
+    size_t sl = strlen(suffix);
+    return ql >= sl && strcmp(qn + ql - sl, suffix) == 0;
+}
+
+/* Resolver edges into any node named `init` whose source is not one of the
+ * two selector controls. Every such edge in the fixture binds a bare `init`,
+ * which in Go is always a local name. */
+static int go_bare_init_false_edges(cbm_store_t *s, const char *project) {
+    static const char *const types[] = {"CALLS", "USAGE", "WRITES", "READS", "CALL_REFERENCE"};
+    int hits = 0;
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        cbm_store_find_edges_by_type(s, project, types[t], &edges, &edge_count);
+        for (int i = 0; i < edge_count; i++) {
+            cbm_node_t src = {0};
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+                src.qualified_name && tgt.name && strcmp(tgt.name, "init") == 0 &&
+                !bare_init_qn_ends_with(src.qualified_name, ".watcher.Watcher.Start") &&
+                !bare_init_qn_ends_with(src.qualified_name, ".watcher.Boot")) {
+                printf("  bare init bound: %s %s -> %s\n", types[t], src.qualified_name,
+                       tgt.qualified_name ? tgt.qualified_name : "?");
+                hits++;
+            }
+            cbm_node_free_fields(&src);
+            cbm_node_free_fields(&tgt);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    return hits;
+}
+
+static int assert_go_bare_init_edges(cbm_store_t *s, const char *project) {
+    /* The decoys exist, so a zero below is a refused binding and not an
+     * absent target: two package inits and the Watcher method. */
+    cbm_node_t *inits = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_name(s, project, "init", &inits, &ic);
+    int functions = 0;
+    int methods = 0;
+    for (int i = 0; i < ic; i++) {
+        functions += inits[i].label && strcmp(inits[i].label, "Function") == 0;
+        methods += inits[i].label && strcmp(inits[i].label, "Method") == 0;
+    }
+    cbm_store_free_nodes(inits, ic);
+    ASSERT_EQ(functions, 2);
+    ASSERT_EQ(methods, 1);
+    /* NEGATIVE: no bare `init` (closure call, closure write, closure passed
+     * by value, parameter call, `package init`) binds a package init or the
+     * unrelated method. */
+    ASSERT_EQ(go_bare_init_false_edges(s, project), 0);
+    /* CONTROL: a selector call `w.init()` is not bare and still resolves to
+     * the method, from a method body and from a free function. */
+    ASSERT_GTE(
+        go_calls_between(s, project, ".watcher.Watcher.Start", ".watcher.Watcher.init", NULL), 1);
+    ASSERT_GTE(go_calls_between(s, project, ".watcher.Boot", ".watcher.Watcher.init", NULL), 1);
+    return 0;
+}
+
+/* R45 (follow-up to #1915): a bare Go `init` never binds a package init or,
+ * by name alone, an init method (cbm_go_suppress_bare_init_bind). */
+TEST(pipeline_go_bare_init_binds_nothing) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_init_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare_init.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_bare_init_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel twin: >= MIN_FILES_FOR_PARALLEL (50) files plus CBM_WORKERS=4
+ * take the parallel resolver, which carries its own copy of each guard. */
+TEST(pipeline_go_bare_init_binds_nothing_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_init_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_init_fixture(tmp, 52);
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare_init_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(assert_go_bare_init_edges(s, project), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_parallel_field_hint_requires_owner_segment) {
+    /* #1927: try_field_type_hint (parallel resolver only) matched the hinted
+     * type name as a raw SUBSTRING of the candidate QN. A single-letter
+     * receiver — `f.Close()` on an *os.File — hints "F", and "F" is a
+     * substring of "…FileStore.Close", so a stdlib call was rebound to an
+     * arbitrary project method at PP_FIELD_HINT_CONF and presented as
+     * field_type_hint (the one weak strategy the Go selector guard trusts).
+     * The hint must fire only when the candidate's OWNING segment — the
+     * dot-segment immediately before the method — EQUALS the hinted type;
+     * otherwise the resolution stays a weak short-name match and the Go
+     * guard (#1906) drops it. >= 50 files forces pass_parallel.c, the only
+     * path that runs try_field_type_hint(). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_fth_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "go.mod", "module example.com/fxhint\n\ngo 1.22\n");
+    /* Two project methods named Close → the registry resolves f.Close() as an
+     * ambiguous short-name match (candidate_count 2), the shape the hint
+     * upgrades. FileStore's QN carries the capital F the buggy substring
+     * latches onto; Conn is the second candidate. */
+    write_temp_file(tmp, "filestore/filestore.go",
+                    "package filestore\n"
+                    "\n"
+                    "type FileStore struct{ open bool }\n"
+                    "\n"
+                    "func (fs *FileStore) Close() {\n"
+                    "\tfs.open = false\n"
+                    "}\n");
+    write_temp_file(tmp, "conn/conn.go",
+                    "package conn\n"
+                    "\n"
+                    "type Conn struct{ live bool }\n"
+                    "\n"
+                    "func (cn *Conn) Close() {\n"
+                    "\tcn.live = false\n"
+                    "}\n");
+    /* Two project methods named Find → same ambiguity, but here the receiver
+     * variable IS named after its type (`finder`), the case the hint exists
+     * for: the owning segment of Finder.Find equals the hinted "Finder". */
+    write_temp_file(tmp, "finder/finder.go",
+                    "package finder\n"
+                    "\n"
+                    "type Finder struct{ n int }\n"
+                    "\n"
+                    "func NewFinder() *Finder { return &Finder{n: 1} }\n"
+                    "\n"
+                    "func (fi *Finder) Find(id int) int {\n"
+                    "\treturn fi.n + id\n"
+                    "}\n");
+    write_temp_file(tmp, "locator/locator.go",
+                    "package locator\n"
+                    "\n"
+                    "type Locator struct{ n int }\n"
+                    "\n"
+                    "func (lo *Locator) Find(id int) int {\n"
+                    "\treturn lo.n - id\n"
+                    "}\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"os\"\n"
+                    "\n"
+                    "\txf \"example.com/fxhint/finder\"\n"
+                    ")\n"
+                    "\n"
+                    "func Lookup(path string) int64 {\n"
+                    "\tf, err := os.Open(path)\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\tdefer f.Close()\n"
+                    "\tst, err := f.Stat()\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\treturn st.Size()\n"
+                    "}\n"
+                    "\n"
+                    "func UseFinder(id int) int {\n"
+                    "\tfinder := xf.NewFinder()\n"
+                    "\treturn finder.Find(id)\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_fth.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Reproduce-first: RED before the fix. The substring hint rebinds the
+     * stdlib f.Close() to FileStore.Close ("F" ⊂ QN) at high confidence and
+     * the Go guard keeps it. With segment equality the upgrade is refused,
+     * the match stays suffix_match, and the Go guard drops it. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "Lookup", "Close"));
+    /* (2) The intended hint case survives: `finder` names its type, so the
+     * owning segment of Finder.Find equals the hint. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UseFinder", "Find"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment);
+
+TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
+    /* #1927, non-Go twin. Go no longer runs try_field_type_hint (e554a2ab),
+     * but every other language on the parallel path still does, and C# is the
+     * hint's intended consumer (it strips the _ / m_ field prefixes). C#
+     * method names are PascalCase, so a one-letter receiver hints a letter
+     * that every candidate QN already contains in the METHOD name: `w.Write()`
+     * hints "W", and a raw substring test accepts "...FileStore.Write" and
+     * "...Conn.Write" alike, whichever the registry lists first. The hint must
+     * bind only a candidate whose OWNING segment equals the hinted type.
+     * >= 50 files forces pass_parallel.c, the only path with the hint. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cs_fth_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Two project methods named Write: an untyped receiver resolves as an
+     * ambiguous short-name match (candidate_count 2), the shape the hint
+     * upgrades. */
+    write_temp_file(tmp, "Storage/FileStore.cs",
+                    "namespace Storage {\n"
+                    "    public class FileStore {\n"
+                    "        private int written;\n"
+                    "        public void Write(int v) { written += v; }\n"
+                    "        public void Put(int v) { written = v; }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "Net/Conn.cs",
+                    "namespace Net {\n"
+                    "    public class Conn {\n"
+                    "        private int sent;\n"
+                    "        public void Write(int v) { sent += v; }\n"
+                    "    }\n"
+                    "}\n");
+    /* Two project methods named Put, one owned by Store: the receiver `store`
+     * names its type, the case the hint exists for. FileStore's QN also
+     * contains "Store", so only segment equality picks Store.Put whatever
+     * the candidate order. */
+    write_temp_file(tmp, "Repo/Store.cs",
+                    "namespace Repo {\n"
+                    "    public class Store {\n"
+                    "        private int held;\n"
+                    "        public void Put(int v) { held = v; }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "App/Worker.cs",
+                    "namespace App {\n"
+                    "    public class Worker {\n"
+                    "        public void Log(System.IO.StreamWriter w) {\n"
+                    "            w.Write(1);\n"
+                    "        }\n"
+                    "        public void Keep() {\n"
+                    "            var store = Services.Resolve();\n"
+                    "            store.Put(2);\n"
+                    "        }\n"
+                    "    }\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[192];
+        snprintf(name, sizeof(name), "Pad/Filler%d.cs", i);
+        snprintf(body, sizeof(body),
+                 "namespace Pad {\n    public class Filler%d {\n"
+                 "        public int Get%d() { return %d; }\n    }\n}\n",
+                 i, i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cs_fth.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Reproduce-first: RED before the fix. "W" is a substring of every
+     * Write candidate, so the old hint upgraded the StreamWriter call to an
+     * arbitrary project Write at PP_FIELD_HINT_CONF. No owner segment is "W",
+     * so the fixed hint must not fire at all. */
+    ASSERT_FALSE(cross_file_call_has_strategy(s, project, "Log", "Write", "field_type_hint"));
+    /* (2) The intended hint case binds the owner it names, never FileStore. */
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", "field_type_hint"), 1);
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".FileStore.Put", NULL), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
     th_rmtree(tmp);
     PASS();
 }
@@ -14696,6 +15743,208 @@ TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
     PASS();
 }
 
+/* Route nodes whose qualified name contains `part`. */
+static int route_nodes_containing(cbm_store_t *s, const char *project, const char *part) {
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    if (cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name && strstr(routes[i].qualified_name, part)) {
+            matches++;
+        }
+    }
+    if (routes) {
+        cbm_store_free_nodes(routes, route_count);
+    }
+    return matches;
+}
+
+/* CALLS edges out of the function `source_name` into a Route node: the edge a
+ * route registration emits beside its Route (an HTTP client call's edge to a
+ * Route is HTTP_CALLS instead). */
+static int calls_into_route_count(cbm_store_t *s, const char *project, const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.label &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.label, "Route") == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Issue #2537: since Go 1.22 a ServeMux pattern may name a method and a host
+ * before the path ("POST /v1/payments", "GET api.example.com/v1/x"). Such a
+ * registration minted no Route and no HANDLES edge, because every registration
+ * gate wanted the first argument to open with a slash, while the same file
+ * written with "/v1/payments" had both. The method now comes from the pattern
+ * and a host is dropped from the path, in the sequential and the parallel pass
+ * alike. Only Go reads that grammar: a Python registration of "GET /py" is still
+ * no route. Only a ServeMux registration (Handle / HandleFunc) is read with it:
+ * another route-verb call names no pattern and mints no Route, neither
+ * `st.Get("users/123")` on a project method (which keeps its CALLS edge) nor
+ * `c.Get("https://api.example.com/v1/x")` on a client. */
+TEST(pipeline_go_servemux_method_patterns_issue2537) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_servemux_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/srv\n\ngo 1.22\n");
+    write_temp_file(tmp, "main.go",
+                    "package main\n"
+                    "\n"
+                    "import \"net/http\"\n"
+                    "\n"
+                    "func createPayment(w http.ResponseWriter, r *http.Request) {}\n"
+                    "func getPayment(w http.ResponseWriter, r *http.Request)    {}\n"
+                    "func hostOnly(w http.ResponseWriter, r *http.Request)      {}\n"
+                    "func legacyList(w http.ResponseWriter, r *http.Request)    {}\n"
+                    "\n"
+                    "type Store struct{ m map[string]string }\n"
+                    "\n"
+                    "func (s *Store) Get(k string) string { return s.m[k] }\n"
+                    "\n"
+                    "func lookup(st *Store) string { return st.Get(\"users/123\") }\n"
+                    "\n"
+                    "func fetchRemote(c *http.Client) {\n"
+                    "\t_, _ = c.Get(\"https://api.example.com/v1/x\")\n"
+                    "}\n"
+                    "\n"
+                    "func main() {\n"
+                    "\tmux := http.NewServeMux()\n"
+                    "\tmux.HandleFunc(\"POST /v1/payments\", createPayment)\n"
+                    "\tmux.HandleFunc(\"GET /v1/payments/{id}\", getPayment)\n"
+                    "\tmux.HandleFunc(\"api.example.com/v1/hosted\", hostOnly)\n"
+                    "\tmux.HandleFunc(\"/v1/legacy\", legacyList)\n"
+                    "\t_ = http.ListenAndServe(\":8080\", mux)\n"
+                    "}\n");
+    write_temp_file(tmp, "web/site.py",
+                    "from flask import Flask\n"
+                    "app = Flask(__name__)\n"
+                    "\n"
+                    "def py_view():\n"
+                    "    return \"ok\"\n"
+                    "\n"
+                    "app.add_url_rule(\"GET /py\", \"py_view\", py_view)\n");
+    /* past MIN_FILES_FOR_PARALLEL, so the threaded run takes the parallel pass */
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/padding%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc Padding%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    int run_rc[2] = {-1, -1};
+    bool opened[2] = {false, false};
+    int post[2] = {-1, -1};
+    int get_id[2] = {-1, -1};
+    int any_post[2] = {-1, -1};
+    int host[2] = {-1, -1};
+    int legacy[2] = {-1, -1};
+    int py_any[2] = {-1, -1};
+    int py_get[2] = {-1, -1};
+    int store_calls[2] = {-1, -1};
+    int store_route[2] = {-1, -1};
+    int lookup_reg[2] = {-1, -1};
+    int remote_route[2] = {-1, -1};
+    int remote_reg[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode == 0) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+            cbm_setenv("CBM_WORKERS", "4", 1);
+        }
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/servemux_%d.db", tmp, mode);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[mode] = p ? cbm_pipeline_run(p) : -1;
+        const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        opened[mode] = s != NULL;
+        if (s && project) {
+            post[mode] =
+                handles_to_route(s, project, "createPayment", "__route__POST__/v1/payments");
+            get_id[mode] =
+                handles_to_route(s, project, "getPayment", "__route__GET__/v1/payments/{}");
+            any_post[mode] =
+                handles_to_route(s, project, "createPayment", "__route__ANY__/v1/payments");
+            host[mode] = handles_to_route(s, project, "hostOnly", "__route__ANY__/v1/hosted");
+            legacy[mode] = handles_to_route(s, project, "legacyList", "__route__ANY__/v1/legacy");
+            py_any[mode] = handles_to_route(s, project, "py_view", "__route__ANY__/py");
+            py_get[mode] = handles_to_route(s, project, "py_view", "__route__GET__/py");
+            store_calls[mode] = named_edge_count(s, project, "CALLS", "lookup", "Get");
+            store_route[mode] = route_nodes_containing(s, project, "__route__GET__/123");
+            lookup_reg[mode] = calls_into_route_count(s, project, "lookup");
+            remote_route[mode] = route_nodes_containing(s, project, "//api.example.com");
+            remote_reg[mode] = calls_into_route_count(s, project, "fetchRemote");
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        /* the method is the pattern's, not ANY */
+        ASSERT_EQ(post[mode], 1);
+        ASSERT_EQ(get_id[mode], 1);
+        ASSERT_EQ(any_post[mode], 0);
+        /* a host names no method and is not part of the path */
+        ASSERT_EQ(host[mode], 1);
+        /* control: a plain path is unchanged */
+        ASSERT_EQ(legacy[mode], 1);
+        /* another language's "GET /py" is not read as a ServeMux pattern */
+        ASSERT_EQ(py_any[mode], 0);
+        ASSERT_EQ(py_get[mode], 0);
+        /* a project method named Get keeps its CALLS edge; "users/123" is no
+         * host + path */
+        ASSERT_EQ(store_calls[mode], 1);
+        ASSERT_EQ(store_route[mode], 0);
+        ASSERT_EQ(lookup_reg[mode], 0);
+        /* a client Get on a URL registers no route: "https:" is no host */
+        ASSERT_EQ(remote_route[mode], 0);
+        ASSERT_EQ(remote_reg[mode], 0);
+    }
+    PASS();
+}
+
 TEST(pipeline_swift_http_call_makes_route_issue1892) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_swifthttp_XXXXXX");
@@ -16973,6 +18222,53 @@ TEST(pipeline_python_init_import_probe_failure_falls_back) {
     cbm_arena_destroy(&result.arena);
     cbm_pxc_free_module_def_index(index);
     ASSERT_TRUE(failed_precisely && resolved);
+    PASS();
+}
+
+/* #1910: with no shared Go registry (the incremental route can pass NULL
+ * cross_registries) the dispatch takes the per-file fallback, which must name
+ * each init() caller from the file path exactly as the def extractor does. */
+TEST(pipeline_go_init_dispatch_fallback_names_init_caller) {
+    const char *source = "package reg\n\n"
+                         "func init() {\n\tc := NewCodec()\n\tc.Register()\n}\n\n"
+                         "func init() {\n\tc := NewCodec()\n\tc.Register()\n}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.reg.NewCodec",
+         .short_name = "NewCodec",
+         .label = "Function",
+         .def_module_qn = "test.reg",
+         .return_types = "*Codec",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.reg.Codec",
+         .short_name = "Codec",
+         .label = "Class",
+         .def_module_qn = "test.reg",
+         .lang = CBM_LANG_GO},
+        {.qualified_name = "test.reg.Codec.Register",
+         .short_name = "Register",
+         .label = "Method",
+         .def_module_qn = "test.reg",
+         .receiver_type = "test.reg.Codec",
+         .lang = CBM_LANG_GO},
+    };
+    CBMFileResult result = {0};
+    cbm_arena_init(&result.arena);
+    cbm_pxc_dispatch_file(CBM_LANG_GO, &result, source, (int)strlen(source), "reg/b.go", "test.reg",
+                          NULL, NULL, defs, 3, NULL, NULL, 0, NULL, NULL);
+    int first = 0;
+    int second = 0;
+    for (int i = 0; i < result.resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result.resolved_calls.items[i];
+        if (!rc->caller_qn || !rc->callee_qn || rc->confidence <= 0 ||
+            strcmp(rc->callee_qn, "test.reg.Codec.Register") != 0) {
+            continue;
+        }
+        first += strcmp(rc->caller_qn, "test.reg.init#b.go:1") == 0;
+        second += strcmp(rc->caller_qn, "test.reg.init#b.go:2") == 0;
+    }
+    cbm_arena_destroy(&result.arena);
+    ASSERT_EQ(first, 1);
+    ASSERT_EQ(second, 1);
     PASS();
 }
 
@@ -29207,6 +30503,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_init_register_scope_failure_parallel);
     RUN_TEST(pipeline_python_init_import_filter_precedence);
     RUN_TEST(pipeline_python_init_import_probe_failure_falls_back);
+    RUN_TEST(pipeline_go_init_dispatch_fallback_names_init_caller);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_sequential);
     RUN_TEST(pipeline_issue1527_python_raw_memo_failure_parallel);
     RUN_TEST(pipeline_issue1527_python_cross_memo_failure_sequential);
@@ -29333,6 +30630,13 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
+    RUN_TEST(pipeline_go_parallel_field_hint_requires_owner_segment);
+    RUN_TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment);
+    RUN_TEST(pipeline_go_multi_init_nodes_survive);
+    RUN_TEST(pipeline_go_init_lsp_edges_per_file);
+    RUN_TEST(pipeline_go_init_lsp_edges_per_file_parallel);
+    RUN_TEST(pipeline_go_bare_init_binds_nothing);
+    RUN_TEST(pipeline_go_bare_init_binds_nothing_parallel);
     RUN_TEST(pipeline_go_crossfile_type_alias_method);
     RUN_TEST(pipeline_go_crossfile_type_alias_method_parallel);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
@@ -29379,6 +30683,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
+    RUN_TEST(pipeline_go_servemux_method_patterns_issue2537);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
@@ -29786,7 +31091,13 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generation);
     RUN_TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retries);
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
-    RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
+    RUN_TEST(pipeline_adr_migrates_from_legacy_graph_row);
+    RUN_TEST(pipeline_adr_sidecar_is_separate_and_removable);
+    RUN_TEST(pipeline_adr_half_created_sidecar_falls_back_to_legacy);
+    RUN_TEST(pipeline_adr_written_during_reindex_survives);
+    RUN_TEST(pipeline_adr_written_during_delta_reindex_survives);
+    RUN_TEST(pipeline_adr_migrate_failure_preserves_generation);
+    RUN_TEST(pipeline_adr_legacy_migrates_before_forced_reindex);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
 #ifndef _WIN32
     RUN_TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory);

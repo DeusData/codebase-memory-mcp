@@ -2272,12 +2272,41 @@ static bool is_route_path_shaped(const char *val) {
     return val && val[0] == '/' && !cbm_service_pattern_is_comment_text(val);
 }
 
-static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
+const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang) {
+    const char *arg = call->first_string_arg;
+    if (lang != CBM_LANG_GO || !arg || cbm_service_pattern_is_comment_text(arg)) {
+        return NULL;
+    }
+    return cbm_service_pattern_mux_route_path(call->callee_name, arg);
+}
+
+const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang, char *buf,
+                                          size_t buf_sz) {
+    const char *method = cbm_service_pattern_route_method(call->callee_name);
+    if (method && strcmp(method, "ANY") != 0) {
+        return method;
+    }
+    if (cbm_pipeline_mux_route_path(call, lang) &&
+        cbm_service_pattern_mux_split(call->first_string_arg, buf, buf_sz) && buf[0] != '\0') {
+        return buf;
+    }
+    return method;
+}
+
+static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler,
+                                           CBMLanguage lang) {
     *out_handler = NULL;
     /* 1. First string arg starting with / */
     if (is_route_path_shaped(call->first_string_arg)) {
         *out_handler = call->second_arg_name;
         return call->first_string_arg;
+    }
+    /* 1b. Go ServeMux pattern with a method or host before the path (#2537),
+     * read for Handle / HandleFunc only. MUST match pass_calls.c route_reg_path. */
+    const char *mux_path = cbm_pipeline_mux_route_path(call, lang);
+    if (mux_path) {
+        *out_handler = call->second_arg_name;
+        return mux_path;
     }
     /* 2. Keyword args (prefix=, path=, route=, etc.) */
     const char *found = NULL;
@@ -2438,7 +2467,8 @@ static bool emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                     const char **ik, const char **iv, int ic,
                                     const char *route_mount, CBMLanguage lang) {
-    const char *method = cbm_service_pattern_route_method(call->callee_name);
+    char mux_method[CBM_SZ_16];
+    const char *method = cbm_pipeline_route_reg_method(call, lang, mux_method, sizeof(mux_method));
     char mounted[CBM_SZ_256];
     route_path = cbm_laravel_mount_route(route_mount, route_path, mounted, sizeof(mounted));
     char rqn[CBM_ROUTE_QN_SIZE];
@@ -2824,7 +2854,7 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
-        const char *route_path = find_route_path_in_args(call, &handler_ref);
+        const char *route_path = find_route_path_in_args(call, &handler_ref, lang);
         if (route_path) {
             return emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                            registry, main_gbuf, imp_keys, imp_vals, imp_count,
@@ -2888,7 +2918,7 @@ static bool emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
         return false;
     }
     const char *handler_ref = NULL;
-    const char *route_path = find_route_path_in_args(call, &handler_ref);
+    const char *route_path = find_route_path_in_args(call, &handler_ref, lang);
     if (route_path) {
         return emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                        registry, main_gbuf, imp_keys, imp_vals, imp_count,
@@ -2955,6 +2985,29 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
 /* Field type hint resolution for obj.Method() with multiple candidates.
  * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
  * checks if TypeName.Method or ITypeName.Method exists among candidates. */
+/* #1927: the hint may only bind a candidate whose OWNING dot-segment — the
+ * segment immediately before the method name — EQUALS the hinted type. The
+ * previous raw strstr() accepted the hinted name anywhere in the QN, so a
+ * single-letter receiver (`f.Close()` → hint "F") matched nearly every
+ * candidate ("F" ⊂ "…FileStore.Close", the method name included) and rebound
+ * a call whose resolution had already failed to an arbitrary project symbol
+ * at PP_FIELD_HINT_CONF. Segment equality keeps the intended
+ * variable-named-after-its-type case (`repo.Find()` → `Repo.Find`,
+ * lrp_go_s8_field_type_hint) and picks the candidate whose owner actually
+ * carries the name instead of whichever QN contains the letters. */
+static bool fth_owner_segment_is(const char *candidate_qn, const char *type_name) {
+    const char *last_dot = strrchr(candidate_qn, '.');
+    if (!last_dot || last_dot == candidate_qn) {
+        return false;
+    }
+    const char *seg_start = last_dot;
+    while (seg_start > candidate_qn && seg_start[-1] != '.') {
+        seg_start--;
+    }
+    size_t seg_len = (size_t)(last_dot - seg_start);
+    return seg_len > 0 && strncmp(seg_start, type_name, seg_len) == 0 && type_name[seg_len] == '\0';
+}
+
 static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
                                 int64_t source_id) {
     if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
@@ -2994,7 +3047,8 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
-        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+        if (fth_owner_segment_is(cands[ci], type_name) ||
+            fth_owner_segment_is(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
                 res->qualified_name = cands[ci];
@@ -3629,6 +3683,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * Variable or a Field. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, call->is_method, call->callee_name,
+                                           res.strategy, target_node->label)) {
+            /* Same guard as pass_calls.c — a bare Go `init` is a local name,
+             * never a package init or a method found by name alone. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
@@ -3805,6 +3866,12 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_bare_field_ref(lang, usage->is_member_access, tgt->label)) {
                 continue;
             }
+            /* A bare Go `init` names a local (cbm_go_suppress_bare_init_bind).
+             * Mirrors the sequential twin (pass_usages.c). */
+            if (tgt && cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      usage->ref_name, res.strategy, tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -3931,6 +3998,12 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         /* #1942/#1962/#2666: a bare Go or C reference can never denote a
          * struct field; a selector-LHS write (`t.err = x`) may bind it. */
         if (cbm_suppress_bare_field_ref(lang, rw->is_member_access, tgt->label)) {
+            continue;
+        }
+        /* A bare Go `init` names a local (cbm_go_suppress_bare_init_bind).
+         * Mirrors the sequential twin (pass_usages.c). */
+        if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, rw->is_member_access, rw->var_name,
+                                           res.strategy, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
