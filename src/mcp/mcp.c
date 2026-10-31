@@ -4036,6 +4036,8 @@ enum {
      * and then joining/filtering/re-ranking those, we bound all work to O(N) where
      * N = BM25_INNER_LIMIT rather than the full match set size. */
     BM25_INNER_LIMIT = 2000,
+    /* SQLite reads a negative LIMIT as "no limit": rank every candidate. */
+    BM25_INNER_ALL = -1,
     /* Longest label spliced into the MATCH pre-filter; real labels are short
      * identifiers, so anything longer simply skips the pre-filter. */
     BM25_LABEL_MAX = 64,
@@ -4391,6 +4393,96 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
     return json;
 }
 
+/* The MATCH expression and the filters the ranked and the count query share.
+ * One binder for both keeps them on identical parameters. */
+typedef struct {
+    const char *fts_query;
+    const char *project;
+    const char *file_like;
+    const char *label;
+    const char *kind;
+    const char *ns;
+    double label_weight;
+} bm25_filters_t;
+
+static void bm25_bind_opt_text(sqlite3_stmt *st, int idx, const char *value) {
+    if (value && value[0]) {
+        sqlite3_bind_text(st, idx, value, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(st, idx);
+    }
+}
+
+static void bm25_bind_filters(sqlite3_stmt *st, const bm25_filters_t *f) {
+    sqlite3_bind_text(st, BM25_BIND_QUERY, f->fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, BM25_BIND_PROJECT, f->project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    bm25_bind_opt_text(st, BM25_BIND_FILE, f->file_like);
+    bm25_bind_opt_text(st, BM25_BIND_LABEL, f->label);
+    bm25_bind_opt_text(st, BM25_BIND_KIND, f->kind);
+    bm25_bind_opt_text(st, BM25_BIND_NS, f->ns);
+    sqlite3_bind_double(st, BM25_BIND_LABEL_WEIGHT, f->label_weight);
+}
+
+/* The top-candidate window is a performance ceiling, not an exact-total
+ * boundary. Probe one candidate beyond it so a broad query never presents a
+ * window-local count as the complete match count. The probe shares the
+ * label-scoped MATCH but is otherwise global to the FTS table; saturation is
+ * therefore conservatively reported even when later project/path filters
+ * might discard the hidden candidates. */
+static bool bm25_window_saturated(sqlite3 *db, const char *fts_query) {
+    enum { PROBE_BIND_OFFSET = 2 };
+    const char *probe_sql = "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1 "
+                            "ORDER BY bm25(nodes_fts), rowid LIMIT 1 OFFSET ?2";
+    sqlite3_stmt *probe = NULL;
+    if (sqlite3_prepare_v2(db, probe_sql, BM25_SQL_AUTO_LEN, &probe, NULL) != SQLITE_OK) {
+        return true;
+    }
+    sqlite3_bind_text(probe, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_int(probe, PROBE_BIND_OFFSET, BM25_INNER_LIMIT);
+    bool saturated = sqlite3_step(probe) != SQLITE_DONE;
+    sqlite3_finalize(probe);
+    return saturated;
+}
+
+/* Count the candidates that pass the filters among the top `inner_limit`
+ * (BM25_INNER_ALL: among all of them), with the ranked query's subquery shape
+ * so FTS5 drives the scan here too. */
+static int bm25_count_candidates(sqlite3 *db, const bm25_filters_t *f, int inner_limit) {
+    const char *count_sql =
+        "SELECT COUNT(*) FROM ("
+        "    SELECT fts.rowid FROM ("
+        "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
+        "        ORDER BY " BM25_WEIGHTS " LIMIT ?3"
+        "    ) fts "
+        "    JOIN nodes n ON n.id = fts.rowid "
+        "    WHERE n.project = ?2 "
+        /* MIRRORS the ranked query's filter verbatim — same weights, same
+         * label exclusions. Changing one alone reports a total that does
+         * not describe the rows returned. */
+        "      AND " BM25_UNLABELLED_EXCLUSION " "
+        "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
+        "      AND (?7 IS NULL OR n.label = ?7)"
+        "      AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) "
+        "           THEN json_extract(n.properties,'$.kind') END) = ?9)"
+        "      AND (?10 IS NULL OR (CASE WHEN json_valid(n.properties) "
+        "           THEN json_extract(n.properties,'$.obj_key') END) "
+        "           LIKE ('%/%/' || replace(replace(replace(?10,'\\','\\\\'),'%','\\%'),"
+        "           '_','\\_') || '/%') ESCAPE '\\')"
+        ")";
+    int total = 0;
+    sqlite3_stmt *cs = NULL;
+    if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    bm25_bind_filters(cs, f);
+    sqlite3_bind_int(cs, BM25_BIND_LIMIT, inner_limit);
+    if (sqlite3_step(cs) == SQLITE_ROW) {
+        total = sqlite3_column_int(cs, 0);
+    }
+    sqlite3_finalize(cs);
+    return total;
+}
+
 /* Run the BM25 full-text search path and return the JSON result string.
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
@@ -4478,117 +4570,39 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         free(file_like);
         return NULL;
     }
-    sqlite3_bind_text(stmt, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    const bm25_filters_t filters = {.fts_query = fts_query,
+                                    .project = project,
+                                    .file_like = file_like,
+                                    .label = label,
+                                    .kind = kind,
+                                    .ns = ns,
+                                    .label_weight = label_weight};
+    bm25_bind_filters(stmt, &filters);
     sqlite3_bind_int(stmt, BM25_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
     sqlite3_bind_int(stmt, BM25_BIND_OFFSET, offset > 0 ? offset : 0);
-    sqlite3_bind_int(stmt, BM25_BIND_INNER, BM25_INNER_LIMIT);
-    if (file_like) {
-        sqlite3_bind_text(stmt, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, BM25_BIND_FILE);
-    }
-    if (label && label[0]) {
-        sqlite3_bind_text(stmt, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, BM25_BIND_LABEL);
-    }
     sqlite3_bind_text(stmt, BM25_BIND_EXACT, query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    if (kind && kind[0]) {
-        sqlite3_bind_text(stmt, BM25_BIND_KIND, kind, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, BM25_BIND_KIND);
-    }
-    if (ns && ns[0]) {
-        sqlite3_bind_text(stmt, BM25_BIND_NS, ns, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt, BM25_BIND_NS);
-    }
-    sqlite3_bind_double(stmt, BM25_BIND_LABEL_WEIGHT, label_weight);
 
-    /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
-     * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
-    int total = 0;
-    {
-        const char *count_sql =
-            "SELECT COUNT(*) FROM ("
-            "    SELECT fts.rowid FROM ("
-            "        SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1"
-            "        ORDER BY " BM25_WEIGHTS " LIMIT ?3"
-            "    ) fts "
-            "    JOIN nodes n ON n.id = fts.rowid "
-            "    WHERE n.project = ?2 "
-            /* MIRRORS the ranked query's filter verbatim — same weights, same
-             * label exclusions. Changing one alone reports a total that does
-             * not describe the rows returned. */
-            "      AND " BM25_UNLABELLED_EXCLUSION " "
-            "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
-            "      AND (?7 IS NULL OR n.label = ?7)"
-            "      AND (?9 IS NULL OR (CASE WHEN json_valid(n.properties) "
-            "           THEN json_extract(n.properties,'$.kind') END) = ?9)"
-            "      AND (?10 IS NULL OR (CASE WHEN json_valid(n.properties) "
-            "           THEN json_extract(n.properties,'$.obj_key') END) "
-            "           LIKE ('%/%/' || replace(replace(replace(?10,'\\','\\\\'),'%','\\%'),"
-            "           '_','\\_') || '/%') ESCAPE '\\')"
-            ")";
-        sqlite3_stmt *cs = NULL;
-        if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(cs, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_text(cs, BM25_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_int(cs, BM25_BIND_LIMIT, BM25_INNER_LIMIT);
-            sqlite3_bind_double(cs, BM25_BIND_LABEL_WEIGHT, label_weight);
-            if (file_like) {
-                sqlite3_bind_text(cs, BM25_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
-                                  MCP_SQLITE_TRANSIENT);
-            } else {
-                sqlite3_bind_null(cs, BM25_BIND_FILE);
-            }
-            if (label && label[0]) {
-                sqlite3_bind_text(cs, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN,
-                                  MCP_SQLITE_TRANSIENT);
-            } else {
-                sqlite3_bind_null(cs, BM25_BIND_LABEL);
-            }
-            if (kind && kind[0]) {
-                sqlite3_bind_text(cs, BM25_BIND_KIND, kind, BM25_SQL_AUTO_LEN,
-                                  MCP_SQLITE_TRANSIENT);
-            } else {
-                sqlite3_bind_null(cs, BM25_BIND_KIND);
-            }
-            if (ns && ns[0]) {
-                sqlite3_bind_text(cs, BM25_BIND_NS, ns, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
-            } else {
-                sqlite3_bind_null(cs, BM25_BIND_NS);
-            }
-            if (sqlite3_step(cs) == SQLITE_ROW) {
-                total = sqlite3_column_int(cs, 0);
-            }
-            sqlite3_finalize(cs);
-        }
+    /* file_pattern, kind and namespace cannot be put into the MATCH the way
+     * the label is, so they filter AFTER the candidate window. When more
+     * candidates exist beyond it, a narrow filter can find none of its rows in
+     * the top BM25_INNER_LIMIT and the search answered 0 rows although
+     * matching nodes exist. A saturated window under such a filter -- or one
+     * that held no row passing the filters at all -- is therefore ranked over
+     * every candidate instead: the FTS-first subquery plan stays, the extra
+     * work is linear in the token's match count (the saturation probe already
+     * orders every match), and the total becomes exact. The decision depends
+     * only on the query, never on the page, so offset pages stay consistent.
+     * Unfiltered and label-only queries that find rows keep the window. */
+    bool saturated = bm25_window_saturated(db, fts_query);
+    bool post_window_filter = file_like || (kind && kind[0]) || (ns && ns[0]);
+    int inner_limit = saturated && post_window_filter ? BM25_INNER_ALL : BM25_INNER_LIMIT;
+    int total = bm25_count_candidates(db, &filters, inner_limit);
+    if (saturated && total == 0 && inner_limit != BM25_INNER_ALL) {
+        inner_limit = BM25_INNER_ALL;
+        total = bm25_count_candidates(db, &filters, inner_limit);
     }
-
-    /* The top-candidate window is a performance ceiling, not an exact-total
-     * boundary. Probe one candidate beyond it so a broad query never presents
-     * a window-local count as the complete match count. The probe shares the
-     * label-scoped MATCH but is otherwise global to the FTS table; saturation
-     * is therefore conservatively reported even when later project/path
-     * filters might discard the hidden candidates. */
-    bool candidate_window_saturated = true;
-    {
-        const char *probe_sql = "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1 "
-                                "ORDER BY bm25(nodes_fts), rowid LIMIT 1 OFFSET ?2";
-        sqlite3_stmt *probe = NULL;
-        if (sqlite3_prepare_v2(db, probe_sql, BM25_SQL_AUTO_LEN, &probe, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(probe, BM25_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
-                              MCP_SQLITE_TRANSIENT);
-            sqlite3_bind_int(probe, BM25_BIND_PROJECT, BM25_INNER_LIMIT);
-            int probe_step = sqlite3_step(probe);
-            candidate_window_saturated = probe_step != SQLITE_DONE;
-            sqlite3_finalize(probe);
-        }
-    }
+    bool candidate_window_saturated = saturated && inner_limit != BM25_INNER_ALL;
+    sqlite3_bind_int(stmt, BM25_BIND_INNER, inner_limit);
 
     int row_cap = limit > 0 ? limit : BM25_DEFAULT_LIMIT;
     bm25_output_row_t *rows =

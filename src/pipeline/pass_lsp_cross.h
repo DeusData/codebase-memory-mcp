@@ -216,10 +216,14 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count);
 
+/* rel_path: the file's repo-relative path. Go needs it to name the file's
+ * init() functions as the def extractor does (#1910); cbm_pxc_run_one passes
+ * NULL (Go init() callers then stay flat). */
 void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
-                                       int source_len, const char *module_qn, CBMLSPDef *defs,
-                                       int def_count, const char **imp_names, const char **imp_qns,
-                                       int imp_count, const CBMPHPImportBindings *bindings);
+                                       int source_len, const char *module_qn, const char *rel_path,
+                                       CBMLSPDef *defs, int def_count, const char **imp_names,
+                                       const char **imp_qns, int imp_count,
+                                       const CBMPHPImportBindings *bindings);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
