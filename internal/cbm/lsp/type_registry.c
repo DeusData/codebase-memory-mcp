@@ -862,7 +862,9 @@ static const CBMRegisteredType *lookup_type_self(const CBMTypeRegistry *reg,
 
     for (int i = 0; i < reg->type_count; i++) {
         CBM_LSP_WORK(1);
-        if (strcmp(reg->types[i].qualified_name, qualified_name) == 0) {
+        /* stdlib-seeded entries can carry no qualified_name before finalize. */
+        if (reg->types[i].qualified_name &&
+            strcmp(reg->types[i].qualified_name, qualified_name) == 0) {
             return &reg->types[i];
         }
     }
@@ -1707,7 +1709,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
-        if (strcmp(f->qualified_name, buf) == 0) {
+        if (f->qualified_name && strcmp(f->qualified_name, buf) == 0) {
             if (!first_match)
                 first_match = f;
             int s = score_overload_match(f, arg_types, arg_count);
@@ -1801,7 +1803,7 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
 
     for (int i = 0; i < reg->func_count; i++) {
         const CBMRegisteredFunc *f = &reg->funcs[i];
-        if (strcmp(f->qualified_name, buf) == 0) {
+        if (f->qualified_name && strcmp(f->qualified_name, buf) == 0) {
             if (!first_match)
                 first_match = f;
             int pc = count_func_params(f);
