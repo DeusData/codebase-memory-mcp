@@ -13,7 +13,7 @@
  * file LSP picks them up.
  *
  * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
- * TSX, PHP, C#, and JVM (Java/Kotlin via the shared filter helper).
+ * TSX, PHP, C#, Ruby, and JVM (Java/Kotlin via the shared filter helper).
  * Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
@@ -37,6 +37,7 @@
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
+#include "lsp/ruby_lsp.h" /* cbm_run_ruby_lsp_cross (fallback cbm_pxc_run_one path) */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 
@@ -143,13 +144,14 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
  * per-file registry build entirely. NULL → fall back to the per-file
  * cbm_pxc_run_one path. */
 typedef struct {
-    CBMTypeRegistry *go;     /* CBM_LANG_GO */
-    CBMTypeRegistry *c;      /* CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA */
-    CBMTypeRegistry *python; /* CBM_LANG_PYTHON */
-    CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
-    CBMTypeRegistry *php;    /* CBM_LANG_PHP */
-    CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
-    CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    CBMTypeRegistry *go;        /* CBM_LANG_GO */
+    CBMTypeRegistry *c;         /* CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA */
+    CBMTypeRegistry *python;    /* CBM_LANG_PYTHON */
+    CBMTypeRegistry *ts;        /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
+    CBMTypeRegistry *php;       /* CBM_LANG_PHP */
+    CBMTypeRegistry *cs;        /* CBM_LANG_CSHARP */
+    CBMTypeRegistry *java;      /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    CBMRubyCrossRegistry *ruby; /* CBM_LANG_RUBY: method registry + hashed class table */
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
@@ -188,6 +190,8 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
         return r->cs;
     case CBM_LANG_JAVA:
         return r->java;
+    case CBM_LANG_RUBY:
+        return r->ruby ? &r->ruby->reg : NULL;
     default:
         return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }

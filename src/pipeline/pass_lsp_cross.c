@@ -28,6 +28,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/ruby_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
@@ -1655,6 +1656,7 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
     case CBM_LANG_RUST:   /* fallback cbm_pxc_run_one path (manifest-aware) */
+    case CBM_LANG_RUBY:   /* fallback cbm_pxc_run_one path */
         return true;
     default:
         return false;
@@ -2149,6 +2151,10 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
         cbm_run_kotlin_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count,
                                  imp_names, imp_qns, imp_count, tree, &out);
         break;
+    case CBM_LANG_RUBY:
+        cbm_run_ruby_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
+                               imp_qns, imp_count, tree, &out);
+        break;
     case CBM_LANG_RUST: {
         /* The Rust resolver wants CBMRustLSPDef (rust_lsp.h), not the
          * pipeline's CBMLSPDef — the structs share their first 9 fields
@@ -2336,6 +2342,15 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                                                imp_vals, imp_count, result->cached_tree, &out);
             used_prebuilt = true;
             break;
+        case CBM_LANG_RUBY:
+            /* The shared registry is sealed and read-only: methods and the
+             * hashed class table are looked up in it, nothing is built per
+             * file, so no per-file work scales with the project. */
+            cbm_run_ruby_lsp_cross_with_registry(&scratch, source, source_len, def_module,
+                                                 cross_registries->ruby, imp_keys, imp_vals,
+                                                 imp_count, result->cached_tree, &out);
+            used_prebuilt = true;
+            break;
         case CBM_LANG_JAVA:
             /* Java builds its own-module overlay on top of the one it is
              * handed; both live in scratch now. */
@@ -2393,11 +2408,15 @@ void cbm_pxc_dispatch_file_with_php_bindings(
      * crate — a module that is in neither own_module nor the import map, so
      * the filter starves cross-crate resolution (#56 repro red). Rust
      * therefore always resolves against the FULL def universe: the lazily
-     * built shared registry when available, else a full per-file build. */
+     * built shared registry when available, else a full per-file build.
+     * RUBY is exempt for the same reason with different mechanics: Ruby
+     * constants live in one global namespace and Rails/Zeitwerk autoloads
+     * them WITHOUT require statements, so an own+imports filter starves
+     * essentially all cross-file resolution in real Ruby apps. */
     CBMLSPDef *filtered = NULL;
     CBMLSPDef *file_defs = all_defs;
     int file_def_count = all_def_count;
-    if (module_def_index && lang != CBM_LANG_RUST) {
+    if (module_def_index && lang != CBM_LANG_RUST && lang != CBM_LANG_RUBY) {
         int filtered_count = 0;
         bool filter_succeeded = false;
         filtered = cbm_pxc_filter_defs_for_file(module_def_index, all_defs, lang,
@@ -2595,6 +2614,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.ruby = cbm_ruby_build_cross_registry(xa, all_defs, def_count);
     }
 
     int processed = 0;
