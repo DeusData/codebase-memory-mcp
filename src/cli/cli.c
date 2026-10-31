@@ -2720,7 +2720,26 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path) {
 
 static bool dir_exists(const char *path) {
     cbm_path_info_t info = {0};
-    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_directory;
+    if (cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK) {
+        return false;
+    }
+    if (info.is_directory) {
+        return true;
+    }
+#ifndef _WIN32
+    if (info.is_symlink) {
+        uid_t self = geteuid();
+        struct stat link_state;
+        if (lstat(path, &link_state) != 0 || !S_ISLNK(link_state.st_mode) ||
+            link_state.st_uid != self) {
+            return false;
+        }
+        struct stat target_state;
+        return stat(path, &target_state) == 0 && S_ISDIR(target_state.st_mode) &&
+               target_state.st_uid == self;
+    }
+#endif
+    return false;
 }
 
 /* Resolve the Claude Code config dir.
