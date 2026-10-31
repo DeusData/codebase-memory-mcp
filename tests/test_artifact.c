@@ -2,15 +2,22 @@
  * test_artifact.c — Tests for persistent artifact export/import.
  */
 #include "test_framework.h"
+#include "sqlite3.h" /* vendored/sqlite3 — seed a legacy project_summaries row in ADR tests */
 #include "store/store.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 
 #include <sys/stat.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <unistd.h> /* symlink for the checked-in artifact-dir link */
+#endif
+#include <stdarg.h>
+#include <string.h>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -56,6 +63,21 @@ static void cleanup_dir(const char *path) {
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
     (void)system(cmd);
+}
+
+/* Remove a destination graph DB (+ its -wal/-shm/-journal) while leaving the ADR
+ * sidecar "<db>.adr.db" in place. Import only runs when the graph DB is missing
+ * (try_artifact_bootstrap); this mirrors that shape so the import rename does not
+ * hit an existing file (which Windows refuses, unlike POSIX). */
+static void remove_graph_db_keep_sidecar(const char *db) {
+    char p[1200];
+    (void)cbm_unlink(db);
+    snprintf(p, sizeof(p), "%s-wal", db);
+    (void)cbm_unlink(p);
+    snprintf(p, sizeof(p), "%s-shm", db);
+    (void)cbm_unlink(p);
+    snprintf(p, sizeof(p), "%s-journal", db);
+    (void)cbm_unlink(p);
 }
 
 static void write_text_file(const char *path, const char *text) {
@@ -200,6 +222,175 @@ TEST(artifact_export_fast_roundtrip) {
     PASS();
 }
 
+/* The ADR travels with the exported artifact: it lives in the "<db>.adr.db"
+ * sidecar, and export must carry it into graph.db.zst so an import restores it
+ * into the destination's sidecar (round-2 review item 7d). */
+TEST(artifact_export_roundtrip_keeps_adr) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    const char *adr_text = "# Decision\nThe team chose the sidecar design.";
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", adr_text), CBM_STORE_OK);
+    cbm_store_close(src);
+
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* The imported project starts with the team's ADR (restored into the
+     * destination sidecar by import). */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* Regression: a stale legacy `project_summaries` row that lingers in the graph DB
+ * after its ADR was migrated then DELETED must NOT resurrect through an export.
+ * With the sidecar empty, the snapshot must ship an empty table, so an import
+ * finds no ADR. (Before the DELETE-first fix, VACUUM INTO copied the stale row
+ * and import restored a deleted decision record.) */
+TEST(artifact_export_without_adr_does_not_resurrect_legacy_row) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    /* Pre-sidecar layout: an ADR lingering only in the graph DB. */
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(g_db, &raw), SQLITE_OK);
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO project_summaries (project, summary, source_hash, created_at, updated_at) "
+        "VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');",
+        "test-proj", "# Decision\nstale, later deleted");
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
+
+    /* Migrate it into the sidecar (marker set), then DELETE it. The graph row
+     * still lingers; the sidecar is now migrated-but-empty. */
+    cbm_store_t *s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_adr_migrate_once(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_delete(s, "test-proj"), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* An import must not clobber an ADR already present locally: the restore uses
+ * INSERT OR IGNORE, so the teammate's own decision record survives importing a
+ * shared artifact. */
+TEST(artifact_import_does_not_clobber_local_adr) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    /* The shared artifact carries ADR "A". */
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", "# Decision\nshared A"), CBM_STORE_OK);
+    cbm_store_close(src);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    /* The importing machine already has its own local ADR "B" for this project. */
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    cbm_store_t *local = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(local);
+    ASSERT_EQ(cbm_store_adr_store(local, "test-proj", "# Decision\nlocal B"), CBM_STORE_OK);
+    cbm_store_close(local);
+
+    /* Import only runs when the graph DB is missing (try_artifact_bootstrap), and
+     * Windows cannot rename over an existing file. Remove the destination graph DB
+     * (keeping the sidecar + its marker) to match production. */
+    remove_graph_db_keep_sidecar(import_db);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* Local B is preserved — the import did not overwrite it with shared A. */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, "# Decision\nlocal B");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* The shared ADR must reach a teammate who has ALREADY indexed the project: their
+ * sidecar is marked migrated but has no ADR row, so the marker-gated migrate-once
+ * would skip it. Import restores-if-absent (ungated), so the artifact's ADR "A"
+ * arrives. (On main, import replaced the whole DB, so the ADR always came through;
+ * the sidecar must preserve that.) */
+TEST(artifact_import_restores_adr_when_local_absent) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    /* The shared artifact carries ADR "A". */
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", "# Decision\nshared A"), CBM_STORE_OK);
+    cbm_store_close(src);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    /* The destination is already indexed: a marked sidecar with NO ADR row. */
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    create_test_db(import_db);
+    cbm_store_t *pre = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(pre);
+    ASSERT_EQ(cbm_store_adr_migrate_once(pre), CBM_STORE_OK); /* marks the sidecar, no ADR */
+    cbm_adr_t none = {0};
+    ASSERT_EQ(cbm_store_adr_get(pre, "test-proj", &none), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&none);
+    cbm_store_close(pre);
+
+    /* Import only runs when the graph DB is missing; remove it (keep the marked
+     * sidecar) so the rename succeeds on Windows too. */
+    remove_graph_db_keep_sidecar(import_db);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* The shared ADR "A" is restored despite the pre-existing marker. */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, "# Decision\nshared A");
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_export_best_roundtrip) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -328,6 +519,82 @@ TEST(artifact_gitattributes_created) {
     PASS();
 }
 
+/* Read a small file through the UTF-8 path layer (wide on Windows), so a
+ * non-ASCII path is never misread by the test's own ANSI CRT call. Returns the
+ * byte count, or 0 when the file cannot be opened or is empty. */
+static size_t read_small_file_utf8(const char *path, char *buf, size_t cap) {
+    buf[0] = '\0';
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return 0;
+    }
+    size_t rd = fread(buf, 1, cap - 1, fp);
+    (void)fclose(fp);
+    buf[rd] = '\0';
+    return rd;
+}
+
+/* #1171: a repository (and a cache directory) under a non-ASCII path must
+ * export, report the artifact present, and import — also onto an existing
+ * cache db. On Windows the atomic writer used the ANSI CRT fopen + MoveFileExA
+ * and the existence check the ANSI stat, so CJK characters outside the active
+ * code page made every step fail. The same export also writes the
+ * .gitattributes merge=ours protection, which ensure_gitattributes created
+ * with the ANSI CRT open(): on Windows it was silently missing. The bytes are
+ * escaped UTF-8 for a CJK repo directory name and a CJK cache directory name
+ * (kept ASCII in source). */
+#define ART_CJK_REPO "\xe6\x8c\x81\xe4\xb9\x85\xe5\x8c\x96\xe5\xa4\x8d\xe7\x8e\xb0"
+#define ART_CJK_CACHE "\xe5\xaf\xbc\xe5\x85\xa5"
+TEST(artifact_roundtrip_non_ascii_paths) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char repo[1024];
+    snprintf(repo, sizeof(repo), "%s/cbm-" ART_CJK_REPO, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", repo);
+    ASSERT_TRUE(cbm_file_exists(zst));
+    ASSERT_TRUE(cbm_artifact_exists(repo));
+
+    char ga[1024];
+    snprintf(ga, sizeof(ga), "%s/.codebase-memory/.gitattributes", repo);
+    char ga_content[512];
+    ASSERT_TRUE(read_small_file_utf8(ga, ga_content, sizeof(ga_content)) > 0);
+    ASSERT_NOT_NULL(strstr(ga_content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
+
+    /* Create-only-if-absent: a re-export never rewrites an existing
+     * .gitattributes the user may have edited. */
+    static const char user_ga[] = "# user-owned\n";
+    FILE *uga = cbm_fopen(ga, "wb");
+    ASSERT_NOT_NULL(uga);
+    ASSERT_TRUE(fputs(user_ga, uga) >= 0);
+    ASSERT_EQ(fclose(uga), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    ASSERT_EQ(read_small_file_utf8(ga, ga_content, sizeof(ga_content)), strlen(user_ga));
+    ASSERT_STR_EQ(ga_content, user_ga);
+
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/" ART_CJK_CACHE, g_tmpdir);
+    ASSERT_TRUE(cbm_mkdir_p(cache_dir, 0755));
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", cache_dir);
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+    /* Re-import replaces the existing cache db (the second-session path). */
+    ASSERT_EQ(cbm_artifact_import(repo, import_db), 0);
+
+    cbm_store_t *s = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test-proj"), 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "test-proj"), 1);
+    cbm_store_close(s);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_export_rename_failure_logs_specific_error) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -390,6 +657,67 @@ TEST(pipeline_persistence_export_failure_returns_error) {
     PASS();
 }
 
+/* A checkout can ship `.codebase-memory` as a symlink. Git creates it owned by
+ * whoever cloned, so it is user-owned without being user-intended, and the
+ * export uses the plain walk that does not follow user-owned links: nothing
+ * may land behind the link, and the failure names the stage. With the link
+ * gone the same export succeeds, so the refusal was the link and nothing
+ * else. */
+TEST(artifact_export_refuses_symlinked_artifact_dir) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink contract");
+#else
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char outside[1024];
+    char artifact_link[1024];
+    snprintf(outside, sizeof(outside), "%s/outside", g_tmpdir);
+    snprintf(artifact_link, sizeof(artifact_link), "%s/%s", g_repo, CBM_ARTIFACT_DIR);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0755));
+    ASSERT_EQ(symlink(outside, artifact_link), 0);
+    /* Git creates the link owned by whoever cloned. A root run must model
+     * that account as non-root: root-owned links are trusted infrastructure
+     * for every walk, which is the pre-existing contract. */
+    if (geteuid() == 0) {
+        enum { CLONING_UID = 65533 };
+        ASSERT_EQ(lchown(artifact_link, CLONING_UID, CLONING_UID), 0);
+    }
+
+    int rc = cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST);
+    ASSERT_NEQ(rc, 0);
+    const char *err = cbm_artifact_export_last_error();
+    ASSERT_NOT_NULL(err);
+    ASSERT_NOT_NULL(strstr(err, "prepare_artifact_dir"));
+
+    /* Nothing landed behind the link: not the artifact, not its metadata,
+     * not the .gitattributes the export writes first, nothing at all. */
+    char leaked[1024];
+    snprintf(leaked, sizeof(leaked), "%s/%s", outside, CBM_ARTIFACT_FILENAME);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    snprintf(leaked, sizeof(leaked), "%s/%s", outside, CBM_ARTIFACT_META);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    snprintf(leaked, sizeof(leaked), "%s/.gitattributes", outside);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    cbm_dir_t *listing = cbm_opendir(outside);
+    ASSERT_NOT_NULL(listing);
+    int entries = 0;
+    for (cbm_dirent_t *entry = cbm_readdir(listing); entry; entry = cbm_readdir(listing)) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            entries++;
+        }
+    }
+    cbm_closedir(listing);
+    ASSERT_EQ(entries, 0);
+
+    ASSERT_EQ(cbm_unlink(artifact_link), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+#endif
+}
+
 TEST(artifact_null_safety) {
     ASSERT_NEQ(cbm_artifact_export(NULL, "/tmp", "p", 0), 0);
     ASSERT_NEQ(cbm_artifact_export("/tmp/x.db", NULL, "p", 0), 0);
@@ -397,6 +725,9 @@ TEST(artifact_null_safety) {
     ASSERT_NEQ(cbm_artifact_import("/tmp", NULL), 0);
     ASSERT_FALSE(cbm_artifact_exists(NULL));
     ASSERT_NULL(cbm_artifact_commit(NULL));
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(NULL, "/tmp/x.db", "p"), -1);
+    ASSERT_EQ(cbm_artifact_reconcile_hashes("/tmp", NULL, "p"), -1);
+    ASSERT_EQ(cbm_artifact_reconcile_hashes("/tmp", "/tmp/x.db", NULL), -1);
     PASS();
 }
 
@@ -543,6 +874,482 @@ TEST(store_deep_integrity_detects_page_corruption) {
     PASS();
 }
 
+
+/* ── Bootstrap reconciliation ─────────────────────────────────────────────────
+ *
+ * Ported from the contributor's stack (#868). Every git command below uses
+ * DOUBLE quotes, matching the production rule stated in artifact.c: cmd.exe
+ * does not honor single quotes, so `git -C '%s'` breaks on Windows. The same
+ * rule that fixes production applies to this harness. */
+
+/* printf-formatted system() wrapper; returns the exit status. */
+static int runf(const char *fmt, ...) {
+    char cmd[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    return system(cmd);
+}
+
+static void git_init(const char *repo) {
+    runf("git -C \"%s\" init -q", repo);
+    runf("git -C \"%s\" config user.email t@t.com", repo);
+    runf("git -C \"%s\" config user.name t", repo);
+    runf("git -C \"%s\" config commit.gpgsign false", repo);
+}
+
+/* Portable local mtime_ns for assertions (mirrors artifact.c's art_stat_mtime_ns
+ * and pipeline_incremental.c's stat_mtime_ns — all three must agree or a
+ * restamped row would never match the incremental classifier). */
+static int64_t t_mtime_ns(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+#ifdef __APPLE__
+    return (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + (int64_t)st.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st.st_mtime * 1000000000LL;
+#else
+    return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+#endif
+}
+
+/* True iff <repo>/.codebase-memory/artifact.json contains substr. */
+static bool meta_contains(const char *repo, const char *substr) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.codebase-memory/artifact.json", repo);
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return strstr(buf, substr) != NULL;
+}
+
+static int64_t row_mtime(cbm_file_hash_t *rows, int n, const char *rel) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(rows[i].rel_path, rel) == 0) {
+            return rows[i].mtime_ns;
+        }
+    }
+    return -1;
+}
+
+/* Overwrite one file_hashes row's mtime with a caller-chosen sentinel.
+ * Tests assert against this sentinel rather than against "a different
+ * wall-clock time": on Windows mtime_ns has ONE-SECOND resolution, so two
+ * writes in the same second are indistinguishable and an inequality
+ * assertion would be a coin flip (O9 — a verdict must not depend on
+ * filesystem timestamp granularity). */
+static bool stamp_row_mtime(const char *db, const char *proj, const char *rel, int64_t sentinel,
+                            const char *sha) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        return false;
+    }
+    int rc = cbm_store_upsert_file_hash(s, proj, rel, sha ? sha : "", sentinel, 1);
+    cbm_store_close(s);
+    return rc == CBM_STORE_OK;
+}
+
+/* Why the last build_trusted_artifact_repo() call returned NULL. Read by the
+ * BUILD_TRUSTED_REPO_OR_FAIL() call sites.
+ *
+ * A setup helper whose only failure signal is "NULL" is untestable on a
+ * platform nobody can attach to: six distinct exits (git commit, pipeline
+ * construction, pipeline run, marker absence, artifact commit, project-name
+ * derivation) all reported the same thing, and CI could not tell a failed
+ * `git commit` from a missing reconcile_basis marker. Every exit now names
+ * itself and carries the number that decided it. */
+static char g_build_repo_err[4096];
+
+static void build_repo_errf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_build_repo_err, sizeof(g_build_repo_err), fmt, ap);
+    va_end(ap);
+}
+
+/* Report which of export's four clean-basis preconditions denied the marker.
+ * Read straight from export's recorded blocker rather than recomputed: export's
+ * own ensure_gitattributes leaves an untracked .gitattributes behind, so any
+ * later evaluation answers tree_not_clean whatever the real cause was. Must run
+ * on the thread that ran the pipeline (cbm_pipeline_run exports inline). */
+static void describe_missing_marker(const char *repo) {
+    const char *blocker = cbm_artifact_reconcile_basis_last_blocker();
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repo);
+    struct stat st;
+    build_repo_errf(
+        "step=reconcile_basis: marker absent from %s (artifact.json %s); export blocked by: %s",
+        meta, stat(meta, &st) == 0 ? "present" : "MISSING",
+        blocker ? blocker
+                : "<nothing — export believed it wrote the marker, so the file read here is not "
+                  "the file export wrote>");
+}
+
+/* Build a git repo at g_repo with 5 .rs files, full-index + export (clean tree
+ * -> reconcile_basis marker set), and commit .codebase-memory so a clone receives
+ * the artifact. Returns the derived project name (caller frees) or NULL, with
+ * g_build_repo_err naming the failing step. */
+static char *build_trusted_artifact_repo(void) {
+    g_build_repo_err[0] = '\0';
+    git_init(g_repo);
+    const char *names[] = {"a.rs", "b.rs", "c.rs", "d.rs", "e.rs"};
+    for (int i = 0; i < 5; i++) {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", g_repo, names[i]);
+        char body[128];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(p, body);
+    }
+    int git_rc = runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm init", g_repo, g_repo);
+    if (git_rc != 0) {
+        build_repo_errf("step=commit_sources: `git add -A && git commit -qm init` in %s "
+                        "exited status=%d",
+                        g_repo, git_rc);
+        return NULL;
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    if (!p) {
+        build_repo_errf("step=pipeline_new: cbm_pipeline_new(repo=%s, db=%s) returned NULL", g_repo,
+                        g_db);
+        return NULL;
+    }
+    cbm_pipeline_set_persistence(p, true);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (rc != 0) {
+        build_repo_errf("step=pipeline_run: cbm_pipeline_run(repo=%s) rc=%d", g_repo, rc);
+        return NULL;
+    }
+    char *project = cbm_project_name_from_path(g_repo);
+    if (!project) {
+        build_repo_errf("step=project_name: cbm_project_name_from_path(%s) returned NULL", g_repo);
+        return NULL;
+    }
+    /* Clean source tree at export -> marker must be present. */
+    if (!meta_contains(g_repo, "\"reconcile_basis\"")) {
+        describe_missing_marker(g_repo);
+        free(project);
+        return NULL;
+    }
+    git_rc = runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm artifact", g_repo, g_repo);
+    if (git_rc != 0) {
+        build_repo_errf("step=commit_artifact: `git add -A && git commit -qm artifact` in %s "
+                        "exited status=%d",
+                        g_repo, git_rc);
+        free(project);
+        return NULL;
+    }
+    return project;
+}
+
+/* Call-site form: keeps file:line on the failing TEST while printing the step
+ * that actually failed inside the helper. */
+#define BUILD_TRUSTED_REPO_OR_FAIL(var)        \
+    do {                                       \
+        (var) = build_trusted_artifact_repo(); \
+        if (!(var)) {                          \
+            FAIL(g_build_repo_err);            \
+        }                                      \
+    } while (0)
+
+/* Clones g_repo (A) into <tmp>/work/repo (B) so both share the basename "repo"
+ * and thus the derived project name — required for artifact bootstrap. */
+static bool clone_to_b(char *repoB_out, size_t repoB_sz) {
+    char work[1024];
+    snprintf(work, sizeof(work), "%s/work", g_tmpdir);
+    cbm_mkdir_p(work, 0755);
+    snprintf(repoB_out, repoB_sz, "%s/repo", work);
+    if (runf("git clone -q \"%s\" \"%s\"", g_repo, repoB_out) != 0) {
+        return false;
+    }
+    /* A clone does NOT inherit the source repo's local user config, and CI
+     * runners have no global identity -- `git commit` then exits 128. Set it
+     * on the clone the same way git_init() does for the source repo. */
+    return runf("git -C \"%s\" config user.email t@t.com", repoB_out) == 0 &&
+           runf("git -C \"%s\" config user.name t", repoB_out) == 0;
+}
+
+TEST(artifact_export_marks_clean_basis) {
+    setup_artifact_test();
+    git_init(g_repo);
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn f0() {}\n");
+    ASSERT_EQ(runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm init", g_repo, g_repo), 0);
+
+    char *proj = cbm_project_name_from_path(g_repo);
+    ASSERT_NOT_NULL(proj);
+
+    /* Full index + export on a clean source tree -> clean-basis marker set.
+     * This assert is the one that failed on Windows CI for the original patch:
+     * the single-quoted `:(exclude)` pathspec made tree_clean_for_reconcile
+     * always report dirty under cmd.exe, so the marker was never written. It is
+     * a PRODUCTION assert, not a harness artifact. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    if (!meta_contains(g_repo, "\"reconcile_basis\"")) {
+        describe_missing_marker(g_repo);
+        free(proj);
+        FAIL(g_build_repo_err);
+    }
+
+    /* Dirty the source tree (uncommitted edit). Re-export must omit the marker:
+     * the tree is non-clean outside .codebase-memory (and the a.rs hash row no
+     * longer matches disk). */
+    write_text_file(src, "pub fn dirty() {}\n");
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, proj, CBM_ARTIFACT_FAST), 0);
+    ASSERT_FALSE(meta_contains(g_repo, "\"reconcile_basis\""));
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_restamps_unchanged) {
+    setup_artifact_test();
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
+
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    /* B: modify 2 files + add 1, commit. (Clone gave B fresh mtimes.) */
+    char m1[1152], m2[1152], add[1152];
+    snprintf(m1, sizeof(m1), "%s/a.rs", repoB);
+    snprintf(m2, sizeof(m2), "%s/b.rs", repoB);
+    snprintf(add, sizeof(add), "%s/added.rs", repoB);
+    write_text_file(m1, "pub fn f0() { /* changed */ }\n");
+    write_text_file(m2, "pub fn f1() { /* changed */ }\n");
+    write_text_file(add, "pub fn new_fn() {}\n");
+    ASSERT_EQ(runf("git -C \"%s\" add -A && git -C \"%s\" commit -qm edits", repoB, repoB), 0);
+
+    /* Import A's artifact into a fresh cache DB for B. */
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Pin a.rs's row to a sentinel so "changed rows stay foreign" is a
+     * deterministic assertion instead of an mtime-granularity race. */
+    const int64_t foreign_mtime = 12345;
+    ASSERT(stamp_row_mtime(dbB, proj, "a.rs", foreign_mtime, ""));
+
+    /* Reconcile: 5 rows; a.rs+b.rs changed (left foreign), 3 unchanged restamped. */
+    int restamped = cbm_artifact_reconcile_hashes(repoB, dbB, proj);
+    ASSERT_EQ(restamped, 3);
+
+    /* Unchanged row (c.rs) now carries B's local mtime; the changed row (a.rs)
+     * still carries its foreign stamp — untouched. */
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    char c_path[1152];
+    snprintf(c_path, sizeof(c_path), "%s/c.rs", repoB);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), t_mtime_ns(c_path));
+    ASSERT_EQ(row_mtime(rows, n, "a.rs"), foreign_mtime);
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_untracked_rows) {
+    setup_artifact_test();
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    /* B: a gitignored-yet-indexed file (the .cbmignore-negation shape, #500).
+     * git diff/ls-files are both blind to it, so without the tracked-at-commit
+     * gate it would be restamped as "unchanged" even though git cannot vouch
+     * for its content. */
+    char gen[1152], gi[1152];
+    snprintf(gen, sizeof(gen), "%s/gen.rs", repoB);
+    snprintf(gi, sizeof(gi), "%s/.gitignore", repoB);
+    write_text_file(gen, "pub fn generated_local() {}\n");
+    write_text_file(gi, "gen.rs\n");
+    ASSERT_EQ(runf("git -C \"%s\" add .gitignore && git -C \"%s\" commit -qm ignore", repoB, repoB),
+              0);
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Simulate the exporter having indexed gen.rs: insert a foreign-mtime row. */
+    const int64_t foreign_mtime = 12345;
+    ASSERT(stamp_row_mtime(dbB, proj, "gen.rs", foreign_mtime, ""));
+
+    /* Reconcile: the 5 tracked unchanged rows restamp; gen.rs must not. */
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), 5);
+
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    ASSERT_EQ(row_mtime(rows, n, "gen.rs"), foreign_mtime);
+    char c_path[1152];
+    snprintf(c_path, sizeof(c_path), "%s/c.rs", repoB);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), t_mtime_ns(c_path));
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_untrusted_metadata) {
+    setup_artifact_test();
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Snapshot one foreign mtime, then strip the trust marker. */
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    int64_t before = row_mtime(rows, n, "c.rs");
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    /* Rewrite artifact.json without reconcile_basis (schema_version preserved). */
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "{\"schema_version\":2,\"commit\":\"deadbeef\","
+                "\"original_size\":1000,\"indexed_at\":\"2026-01-01T00:00:00Z\"}");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    /* Rows untouched: still the foreign value captured before. */
+    s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), before);
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_unknown_commit) {
+    setup_artifact_test();
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Rewrite artifact.json: keep the marker but point commit at a hex-valid
+     * SHA that does not exist locally -> the object-existence gate fails. */
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp,
+            "{\"schema_version\":2,\"commit\":\"%s\","
+            "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}",
+            "1111111111111111111111111111111111111111");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_non_hex_commit) {
+    setup_artifact_test();
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* A commit field carrying shell metacharacters must never reach a command
+     * string: is_hex_oid is the hard gate in front of every interpolation. */
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "{\"schema_version\":2,\"commit\":\"a$(touch pwned)b\","
+                "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    char pwned[1152];
+    snprintf(pwned, sizeof(pwned), "%s/pwned", repoB);
+    struct stat st;
+    ASSERT_NEQ(stat(pwned, &st), 0);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_without_git) {
+    setup_artifact_test();
+    char *proj = NULL;
+    BUILD_TRUSTED_REPO_OR_FAIL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Disable the repo by renaming .git (portable; `rm -rf` is not a cmd.exe
+     * builtin). Marker + commit still present, but every git call now fails. */
+    char gitdir[1152], disabled[1152];
+    snprintf(gitdir, sizeof(gitdir), "%s/.git", repoB);
+    snprintf(disabled, sizeof(disabled), "%s/.git-disabled", repoB);
+    ASSERT_EQ(cbm_rename_replace(gitdir, disabled), 0);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 SUITE(artifact) {
     RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
     RUN_TEST(store_deep_integrity_detects_page_corruption);
@@ -550,14 +1357,27 @@ SUITE(artifact) {
     RUN_TEST(artifact_repo_path_shell_safe_rejects_injection);
     RUN_TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows);
     RUN_TEST(artifact_export_fast_roundtrip);
+    RUN_TEST(artifact_export_roundtrip_keeps_adr);
+    RUN_TEST(artifact_export_without_adr_does_not_resurrect_legacy_row);
+    RUN_TEST(artifact_import_does_not_clobber_local_adr);
+    RUN_TEST(artifact_import_restores_adr_when_local_absent);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
     RUN_TEST(artifact_commit_hash);
     RUN_TEST(artifact_schema_version_mismatch);
     RUN_TEST(artifact_import_missing);
     RUN_TEST(artifact_gitattributes_created);
+    RUN_TEST(artifact_roundtrip_non_ascii_paths);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_import_rejects_size_mismatch);
+    RUN_TEST(artifact_export_refuses_symlinked_artifact_dir);
     RUN_TEST(artifact_null_safety);
+    RUN_TEST(artifact_export_marks_clean_basis);
+    RUN_TEST(artifact_reconcile_restamps_unchanged);
+    RUN_TEST(artifact_reconcile_skips_untracked_rows);
+    RUN_TEST(artifact_reconcile_skips_untrusted_metadata);
+    RUN_TEST(artifact_reconcile_skips_unknown_commit);
+    RUN_TEST(artifact_reconcile_skips_non_hex_commit);
+    RUN_TEST(artifact_reconcile_skips_without_git);
 }

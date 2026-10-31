@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_fs_internal.h"
+#include "foundation/git_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,11 +24,13 @@
 #include <windows.h>
 
 #include <aclapi.h>
-#include <direct.h> /* _wmkdir */
-#include <errno.h>  /* errno for spawn-failure logging */
-#include <fcntl.h>  /* _O_RDONLY */
-#include <io.h>     /* _wunlink, _open_osfhandle, _close */
-#include <stdint.h> /* intptr_t */
+#include <direct.h>   /* _wmkdir */
+#include <errno.h>    /* errno for spawn-failure logging */
+#include <fcntl.h>    /* _O_RDONLY */
+#include <io.h>       /* _wunlink, _open_osfhandle, _close */
+#include <share.h>    /* _SH_DENYRW */
+#include <sys/stat.h> /* _S_IREAD */
+#include <stdint.h>   /* intptr_t */
 #include "foundation/log.h"
 #include "foundation/win_utf8.h"
 
@@ -123,17 +126,20 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     WIN32_FILE_ATTRIBUTE_DATA data;
     BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
+    DWORD path_error = ok ? ERROR_SUCCESS : GetLastError();
     free(wpath);
     if (!ok) {
-        return CBM_NOT_FOUND;
+        return path_error == ERROR_FILE_NOT_FOUND || path_error == ERROR_PATH_NOT_FOUND
+                   ? CBM_PATH_INFO_ABSENT
+                   : CBM_PATH_INFO_UNAVAILABLE;
     }
     memset(out, 0, sizeof(*out));
     out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -154,7 +160,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
         written >= windows_to_unix_ticks
             ? (int64_t)((written - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
             : 0;
-    return 0;
+    return CBM_PATH_INFO_OK;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -231,7 +237,9 @@ static wchar_t *cbm_resolve_comspec(void) {
 
 /* On failure returns NULL with *stage naming the failing step and *gle the
  * GetLastError value captured at that step (0 when errno is the signal). */
-static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle) {
+/* env: a CREATE_UNICODE_ENVIRONMENT block for the child, or NULL to inherit. */
+static FILE *cbm_popen_isolated(const char *cmd, const wchar_t *env, const char **stage,
+                                DWORD *gle) {
     *stage = "";
     *gle = 0;
     InitOnceExecuteOnce(&g_popen_once, cbm_popen_init, NULL, NULL);
@@ -310,8 +318,11 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
         *stage = "cmdline";
         *gle = ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE,
-                                 EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, NULL,
+        DWORD flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
+        if (env) {
+            flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
+        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
                                  &si.StartupInfo, &pi);
         if (!created) {
             *stage = "spawn";
@@ -367,27 +378,44 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
     return NULL;
 }
 
+static FILE *cbm_popen_read_isolated(const char *cmd, const wchar_t *env) {
+    const char *stage = "";
+    DWORD gle = 0;
+    FILE *fp = cbm_popen_isolated(cmd, env, &stage, &gle);
+    g_popen_last_isolated = (fp != NULL);
+    if (!fp) {
+        char glebuf[CBM_SZ_16];
+        char errnobuf[CBM_SZ_16];
+        snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
+        snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
+        cbm_log_warn("compat.popen_isolated_failed", "stage", stage, "gle", glebuf, "errno",
+                     errnobuf);
+    }
+    return fp;
+}
+
 FILE *cbm_popen(const char *cmd, const char *mode) {
     /* Our git shell-outs are all read-mode; they MUST use the isolated
      * spawn. On failure, log and fail the call — never fall back to
      * _popen, whose full handle inheritance re-arms the UI hang (#798). */
     if (mode && mode[0] == 'r' && mode[1] == '\0') {
-        const char *stage = "";
-        DWORD gle = 0;
-        FILE *fp = cbm_popen_isolated(cmd, &stage, &gle);
-        g_popen_last_isolated = (fp != NULL);
-        if (!fp) {
-            char glebuf[CBM_SZ_16];
-            char errnobuf[CBM_SZ_16];
-            snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
-            snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
-            cbm_log_warn("compat.popen_isolated_failed", "stage", stage, "gle", glebuf, "errno",
-                         errnobuf);
-        }
-        return fp;
+        return cbm_popen_read_isolated(cmd, NULL);
     }
     g_popen_last_isolated = 0;
     return _popen(cmd, mode);
+}
+
+FILE *cbm_popen_git(const char *cmd) {
+    /* Fail closed: without the scrubbed block the child would inherit a
+     * caller's GIT_DIR and read the wrong repository (#2003). */
+    wchar_t *env = cbm_git_child_env_block();
+    if (!env) {
+        cbm_log_warn("compat.popen_git_env_failed", "stage", "env_block");
+        return NULL;
+    }
+    FILE *fp = cbm_popen_read_isolated(cmd, env);
+    cbm_git_child_env_free(env); /* CreateProcessW copies the block into the child */
+    return fp;
 }
 
 int cbm_pclose(FILE *f) {
@@ -558,6 +586,13 @@ bool cbm_mkdir_p(const char *path, int mode) {
     return ok;
 }
 
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy) {
+    /* The Windows walk has its own reparse-point policy (see
+     * cbm_windows_mkdir_component); the POSIX symlink policy does not apply. */
+    (void)policy;
+    return cbm_mkdir_p(path, mode);
+}
+
 int cbm_unlink(const char *path) {
     wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
@@ -576,6 +611,26 @@ int cbm_rmdir(const char *path) {
     int ret = _wrmdir(wpath);
     free(wpath);
     return ret;
+}
+
+int cbm_lockfile_open(const char *path, bool create) {
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        errno = EINVAL;
+        return -1;
+    }
+    int flags = _O_RDWR | _O_BINARY | _O_NOINHERIT | (create ? _O_CREAT : 0);
+    /* _SH_DENYRW: every other open of this file, from any process, fails
+     * with EACCES until this descriptor closes -- including at death. */
+    int fd = _wsopen(wpath, flags, _SH_DENYRW, _S_IREAD | _S_IWRITE);
+    free(wpath);
+    return fd;
+}
+
+void cbm_lockfile_close(int fd) {
+    if (fd >= 0) {
+        (void)_close(fd);
+    }
 }
 
 /* Build a properly-quoted Windows command line from an argv array.
@@ -727,6 +782,9 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -795,11 +853,12 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     struct stat state;
     if (lstat(path, &state) != 0) {
-        return CBM_NOT_FOUND;
+        return errno == ENOENT || errno == ENOTDIR ? CBM_PATH_INFO_ABSENT
+                                                   : CBM_PATH_INFO_UNAVAILABLE;
     }
     memset(out, 0, sizeof(*out));
     out->is_regular = S_ISREG(state.st_mode);
@@ -813,7 +872,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     out->mtime_ns =
         ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
 #endif
-    return 0;
+    return CBM_PATH_INFO_OK;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -829,32 +888,250 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
     return popen(cmd, mode);
 }
 
+/* Streams opened by cbm_popen_git: popen() cannot take an environment, so
+ * those children are spawned here and reaped by cbm_pclose via this list. */
+typedef struct cbm_popen_git_entry {
+    FILE *fp;
+    pid_t pid;
+    struct cbm_popen_git_entry *next;
+} cbm_popen_git_entry_t;
+
+static cbm_popen_git_entry_t *g_popen_git_list = NULL;
+static pthread_mutex_t g_popen_git_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool cbm_fd_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+/* `/bin/sh -c cmd` with stdout on a pipe, stdin on /dev/null (never the MCP
+ * transport), stderr inherited like popen(), and `envp` as the environment. */
+static pid_t cbm_popen_spawn_sh(const char *cmd, char **envp, int *read_fd) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+    if (!cbm_fd_set_cloexec(fds[0]) || !cbm_fd_set_cloexec(fds[1])) {
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return -1;
+    }
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        (void)close(fds[0]);
+        (void)close(fds[1]);
+        return -1;
+    }
+    /* dup2 clears close-on-exec on the child's stdout; both pipe ends
+     * themselves stay close-on-exec, so no other child ever holds them. */
+    bool configured =
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0 &&
+        posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO) == 0;
+    char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
+    pid_t pid = -1;
+    int rc = configured ? posix_spawn(&pid, "/bin/sh", &actions, NULL, argv, envp) : -1;
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)close(fds[1]);
+    if (rc != 0 || pid <= 0) {
+        (void)close(fds[0]);
+        return -1;
+    }
+    *read_fd = fds[0];
+    return pid;
+}
+
+static int cbm_popen_git_wait(pid_t pid) {
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+    return status;
+}
+
+FILE *cbm_popen_git(const char *cmd) {
+    if (!cmd) {
+        return NULL;
+    }
+    /* Fail closed: without the scrubbed environment the child would inherit
+     * a caller's GIT_DIR and read the wrong repository (#2003). */
+    char **envp = cbm_git_child_envp();
+    if (!envp) {
+        return NULL;
+    }
+    int read_fd = -1;
+    pid_t pid = cbm_popen_spawn_sh(cmd, envp, &read_fd);
+    cbm_git_child_env_free(envp); /* posix_spawn copied it into the child */
+    if (pid < 0) {
+        return NULL;
+    }
+    cbm_popen_git_entry_t *entry = (cbm_popen_git_entry_t *)malloc(sizeof(*entry));
+    FILE *fp = entry ? fdopen(read_fd, "r") : NULL;
+    if (!fp) {
+        free(entry);
+        (void)close(read_fd);
+        (void)cbm_popen_git_wait(pid);
+        return NULL;
+    }
+    entry->fp = fp;
+    entry->pid = pid;
+    pthread_mutex_lock(&g_popen_git_lock);
+    entry->next = g_popen_git_list;
+    g_popen_git_list = entry;
+    pthread_mutex_unlock(&g_popen_git_lock);
+    return fp;
+}
+
 int cbm_pclose(FILE *f) {
-    return pclose(f);
+    cbm_popen_git_entry_t *found = NULL;
+    pthread_mutex_lock(&g_popen_git_lock);
+    for (cbm_popen_git_entry_t **link = &g_popen_git_list; *link; link = &(*link)->next) {
+        if ((*link)->fp == f) {
+            found = *link;
+            *link = found->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_popen_git_lock);
+    if (!found) {
+        return pclose(f); /* opened by popen() */
+    }
+    pid_t pid = found->pid;
+    free(found);
+    (void)fclose(f);
+    return cbm_popen_git_wait(pid); /* the raw wait status, as pclose() */
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
-static int cbm_open_directory_component(int parent, const char *component, int flags) {
+/* Symlink policy for the parent-chain walk. Every component is opened with
+ * O_NOFOLLOW; a symlink is followed only when its OWNER is trusted, never by
+ * default. Root-owned links are trusted everywhere (distro /home indirection,
+ * macOS /tmp: only root can create those, so they are outside the attacker
+ * model). A link owned by the invoking account is trusted only where the
+ * caller opted in with CBM_MKDIR_FOLLOW_OWNED: for a path rooted in the user's
+ * own configuration such a link is the user's own arrangement (a dotfile
+ * manager, ~/.config/opencode -> /mnt/...), and refusing it made every
+ * agent-config write under such a root fail with an opaque agent_config
+ * error. It is not trusted for a path derived from a repository, where git
+ * creates symlinks owned by whoever cloned, so "user-owned" says nothing about
+ * "user-intended". The rule is the one the Linux kernel's
+ * fs.protected_symlinks applies, and the ancestor policy the activation
+ * transaction already uses. A link owned by any OTHER account (planted in a
+ * group- or world-writable ancestor) stays refused, and a privileged walk
+ * (euid 0) still refuses user-owned links.
+ *
+ * Inspecting the link and following it are two steps, so what the follow
+ * lands on is checked as well: the opened target must be a directory owned by
+ * root or the invoking user, and not world-writable unless sticky. An account
+ * that can write the parent cannot steer the walk into a directory it
+ * controls or into one where anyone can pre-plant entries, and because the
+ * judgement and the follow are bound to one inode (cbm_read_trusted_link) it
+ * cannot substitute a link of its own between them either. */
+static bool cbm_walk_link_trusted(uid_t owner, bool follow_owned) {
+    return owner == 0U || (follow_owned && owner == geteuid());
+}
+
+static bool cbm_walk_target_trusted(const struct stat *target) {
+    bool trusted_owner = target->st_uid == 0U || target->st_uid == geteuid();
+    bool world_writable = (target->st_mode & S_IWOTH) != 0;
+    bool sticky = (target->st_mode & S_ISVTX) != 0;
+    return S_ISDIR(target->st_mode) && trusted_owner && (!world_writable || sticky);
+}
+
+/* Read the target text of the symlink at `component`, but only if the link's
+ * owner is trusted -- and read it from the SAME inode the judgement was made
+ * on. Judging by name and then opening by name is a check-then-use pair: an
+ * account that can write the parent could swap the entry in between, so the
+ * link that gets followed is never the one that was judged (demonstrated
+ * against an earlier head with an LD_PRELOAD shim). The link is therefore
+ * never opened by name after the judgement: on Linux an O_PATH|O_NOFOLLOW
+ * descriptor pins the inode, and both the fstat and the readlinkat operate on
+ * it; elsewhere the link is stat'ed by name before and after the readlinkat
+ * and both must be the same inode with the same owner. What is followed
+ * afterwards is the text this function returns, resolved from the parent. */
+static bool cbm_read_trusted_link(int parent, const char *component, bool follow_owned, char *text,
+                                  size_t text_size) {
+    ssize_t length = 0; /* nothing read yet: refused below unless a read succeeds */
+#if defined(__linux__) && defined(O_PATH)
+    int link = openat(parent, component, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (link < 0) {
+        return false;
+    }
+    struct stat state;
+    if (fstat(link, &state) == 0 && S_ISLNK(state.st_mode) &&
+        cbm_walk_link_trusted(state.st_uid, follow_owned)) {
+        /* An empty path names the link the descriptor itself refers to. */
+        length = readlinkat(link, "", text, text_size);
+    }
+    (void)close(link);
+#else
+    struct stat before;
+    struct stat after;
+    if (fstatat(parent, component, &before, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(before.st_mode) ||
+        !cbm_walk_link_trusted(before.st_uid, follow_owned)) {
+        return false;
+    }
+    length = readlinkat(parent, component, text, text_size);
+    if (fstatat(parent, component, &after, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(after.st_mode) ||
+        after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+        after.st_uid != before.st_uid) {
+        return false;
+    }
+#endif
+    /* Empty or truncated text is refused rather than guessed at. */
+    if (length <= 0 || (size_t)length >= text_size) {
+        return false;
+    }
+    text[length] = '\0';
+    return true;
+}
+
+static int cbm_open_directory_component(int parent, const char *component, int flags,
+                                        bool follow_owned) {
     int descriptor = openat(parent, component, flags);
 #if defined(O_NOFOLLOW) && defined(AT_SYMLINK_NOFOLLOW)
     if (descriptor < 0) {
-        struct stat state;
-        if (fstatat(parent, component, &state, AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISLNK(state.st_mode) && state.st_uid == 0U) {
-            descriptor = openat(parent, component, flags & ~O_NOFOLLOW);
+        /* The caller decides on errno from the FIRST open (ENOENT means
+         * "create it"); a refused link must not leak a later call's errno. */
+        int open_errno = errno;
+        char text[CBM_SZ_4K];
+        if (cbm_read_trusted_link(parent, component, follow_owned, text, sizeof(text))) {
+            /* The judged link's own text, resolved from the parent exactly as
+             * the kernel would resolve it (relative texts against the link's
+             * directory). Links inside the text are resolved by the kernel as
+             * before; the target check bounds where the walk lands. */
+            int followed = openat(parent, text, flags & ~O_NOFOLLOW);
+            struct stat target;
+            if (followed >= 0 && fstat(followed, &target) == 0 &&
+                cbm_walk_target_trusted(&target)) {
+                descriptor = followed;
+            } else if (followed >= 0) {
+                (void)close(followed);
+            }
+        }
+        if (descriptor < 0) {
+            errno = open_errno;
         }
     }
+#else
+    (void)follow_owned;
 #endif
     return descriptor;
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
+    return cbm_mkdir_p_ex(path, mode, 0U);
+}
+
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy) {
     if (!path || path[0] == '\0') {
         return false;
     }
+    bool follow_owned = (policy & CBM_MKDIR_FOLLOW_OWNED) != 0U;
     char *tmp = strdup(path);
     if (!tmp) {
         return false;
@@ -887,12 +1164,12 @@ bool cbm_mkdir_p(const char *path, int mode) {
             *separator = '\0';
         }
         if (cursor[0] != '\0' && strcmp(cursor, ".") != 0) {
-            int next = cbm_open_directory_component(directory, cursor, flags);
+            int next = cbm_open_directory_component(directory, cursor, flags, follow_owned);
             if (next < 0 && errno == ENOENT) {
                 if (mkdirat(directory, cursor, (mode_t)mode) != 0 && errno != EEXIST) {
                     ok = false;
                 } else {
-                    next = cbm_open_directory_component(directory, cursor, flags);
+                    next = cbm_open_directory_component(directory, cursor, flags, follow_owned);
                 }
             }
             if (ok && next < 0) {
@@ -923,6 +1200,34 @@ int cbm_unlink(const char *path) {
 
 int cbm_rmdir(const char *path) {
     return rmdir(path);
+}
+
+int cbm_lockfile_open(const char *path, bool create) {
+    int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | (create ? O_CREAT : 0);
+    int fd;
+    do {
+        fd = open(path, flags, S_IRUSR | S_IWUSR);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc;
+    do {
+        rc = flock(fd, LOCK_EX | LOCK_NB);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+        int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+void cbm_lockfile_close(int fd) {
+    if (fd >= 0) {
+        (void)close(fd);
+    }
 }
 
 int cbm_exec_no_shell(const char *const *argv) {

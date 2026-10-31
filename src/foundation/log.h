@@ -44,7 +44,14 @@ typedef enum {
  * unchanged. Call once at startup before any threads or log lines. */
 void cbm_log_init_from_env(void);
 
-/* Set minimum log level (default: INFO). */
+/* Apply a role-aware startup policy, then the environment override. Thin
+ * frontends pass quiet_by_default=true; detached daemons pass false. Physical
+ * workers also pass require_info_liveness=true because their private log is
+ * the supervisor's no-progress heartbeat, so WARN/NONE cannot suppress INFO
+ * lifecycle records and turn a healthy long index into a false hang. */
+void cbm_log_init_for_process(bool quiet_by_default, bool require_info_liveness);
+
+/* Set minimum log level (library default: INFO; process startup policy is role-aware). */
 void cbm_log_set_level(CBMLogLevel level);
 
 /* Get current log level. */
@@ -88,7 +95,8 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
 /* Operational event helpers. They deliberately avoid request bodies, headers,
  * arguments, and query strings. */
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,
-                         int64_t duration_us);
+                         int64_t duration_us, int64_t handler_duration_us,
+                         int64_t response_serialization_us, bool cancelled, bool timed_out);
 void cbm_log_http_request(const char *component, const char *method, const char *path, int status,
                           int64_t duration_ms, size_t request_bytes, size_t response_bytes);
 

@@ -1,0 +1,16 @@
+{
+  "grammars": [
+    {
+      "name": "arkts",
+      "camelcase": "Arkts",
+      "scope": "source.arkts",
+      "path": ".",
+      "file-types": ["ets"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "ArkTS (HarmonyOS .ets) grammar for tree-sitter — fork of tree-sitter-typescript v0.23.2"
+  }
+}

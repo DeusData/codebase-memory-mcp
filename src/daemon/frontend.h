@@ -29,6 +29,12 @@ bool cbm_daemon_frontend_is_cancellation_notification(const char *message);
 bool cbm_daemon_frontend_cancellation_matches_request(const char *message, int64_t active_id,
                                                       const char *active_id_str);
 
+/* The JSON-RPC error message answered for a cancelled request (#2144). A
+ * cancelled index_repository call is usually a client deadline on a long
+ * index, so its reply names the async alternative; every other request keeps
+ * the plain message. Returns a static string free of JSON metacharacters. */
+const char *cbm_daemon_frontend_cancelled_error_message(const char *request_message);
+
 /* Start a temporary observer for a one-shot local CLI command or physical
  * supervised worker. manager and cancel_context are borrowed until stop. On
  * maintenance intent the observer invokes cancel once, permits a fixed bounded
@@ -41,6 +47,18 @@ cbm_daemon_maintenance_monitor_t *cbm_daemon_maintenance_monitor_start(
     cbm_version_cohort_manager_t *manager, cbm_daemon_maintenance_cancel_fn cancel,
     void *cancel_context, int exit_code, const char *participant);
 bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **monitor_io);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Deterministic observer accounting for the idle-frontend regression test.
+ * The hold is inert until reset(true), and production builds contain neither
+ * these controls nor their counters. */
+void cbm_daemon_frontend_test_observer_reset(bool hold_monitor);
+void cbm_daemon_frontend_test_observer_release(void);
+bool cbm_daemon_frontend_test_monitor_waiting(void);
+uint64_t cbm_daemon_frontend_test_monitor_observations(void);
+uint64_t cbm_daemon_frontend_test_worker_observations(void);
+uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
+#endif
 
 /* Takes ownership of client and borrows cohort_manager for the complete call.
  * A dedicated reader keeps observing stdin while one joinable worker performs

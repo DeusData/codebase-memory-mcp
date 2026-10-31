@@ -7,8 +7,22 @@
 
 $ErrorActionPreference = "Stop"
 
-# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects).
+#
+# TLS 1.3 is added ONLY where schannel can actually negotiate it: Windows 11 and
+# Server 2022 (build 20348+). On Windows 10 the enum value still exists from
+# .NET Framework 4.8 onward, so the assignment succeeds and nothing warns -- but
+# the handshake then fails outright with "The request was aborted: Could not
+# create SSL/TLS secure channel". An unsupported protocol flag in this bitmask
+# is a hard failure, not a graceful downgrade, so every Windows 10 user was
+# blocked at the first download (#1856). The enum-name probe additionally keeps
+# the script parsing on .NET Framework 4.7, where Tls13 is not defined at all.
+$CbmProtocols = [Net.SecurityProtocolType]::Tls12
+if ([Environment]::OSVersion.Version.Build -ge 20348 -and
+    ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13')) {
+    $CbmProtocols = $CbmProtocols -bor [Net.SecurityProtocolType]::Tls13
+}
+[Net.ServicePointManager]::SecurityProtocol = $CbmProtocols
 Add-Type -AssemblyName System.Net.Http
 
 $Repo = "DeusData/codebase-memory-mcp"
@@ -120,13 +134,63 @@ Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
 
+# Reserve a temporary path that no other process can already own.
+#
+# The staging directory used to be "cbm-install-<Get-Random>" created with
+# -Force. Get-Random is seeded per process and its space is small, and -Force
+# ADOPTS a directory that already exists -- so a directory planted at a guessed
+# name became the installer's staging area, ahead of the owner-only DACL that
+# is applied below. GUID names plus -ErrorAction Stop mean a collision is a
+# retry, never an adoption. The same rule applies to the installer's own
+# sibling temp file: "<dest>.new" was a fixed path in the install directory,
+# reservable by anyone who could write there first. FileMode.CreateNew with
+# FileShare.None reserves an unguessable sibling atomically instead.
+function New-CbmExclusiveSiblingTemp {
+    param([Parameter(Mandatory=$true)][string]$Destination)
+
+    $directory = [System.IO.Path]::GetDirectoryName($Destination)
+    $leaf = [System.IO.Path]::GetFileName($Destination)
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $random = [System.IO.Path]::GetRandomFileName()
+        $candidate = Join-Path $directory ".$leaf.tmp-$random"
+        try {
+            $reservation = [System.IO.File]::Open(
+                $candidate,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+            $reservation.Dispose()
+            return $candidate
+        } catch [System.IO.IOException] {
+            # A collision belongs to another process; reserve a fresh sibling.
+        }
+    }
+    throw "could not reserve an exclusive temporary sibling for $Destination"
+}
+
+function New-CbmExclusiveTempDirectory {
+    param([Parameter(Mandatory=$true)][string]$ParentDirectory)
+
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        $candidate = Join-Path $ParentDirectory (
+            "cbm-install-" + [guid]::NewGuid().ToString("N")
+        )
+        try {
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+            return $candidate
+        } catch [System.IO.IOException] {
+            # Never adopt or remove a colliding path owned by another process.
+        }
+    }
+    throw "could not reserve an exclusive installer temporary directory"
+}
+
 # Build download URL
 $Archive = "codebase-memory-mcp-windows-$Arch.zip"
 $Url = "$BaseUrl/$Archive"
 
 # Download
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+$TmpDir = New-CbmExclusiveTempDirectory -ParentDirectory ([System.IO.Path]::GetTempPath())
 
 # Give the staging directory a protected owner-only DACL.
 #
@@ -213,8 +277,20 @@ try {
 
 # Validate the zip namespace before extraction. Windows paths are
 # case-insensitive, so two entries that differ only in case are ambiguous and
-# must never be allowed to overwrite each other. The official five entries are
+# must never be allowed to overwrite each other. The official four entries are
 # required at the archive root with their exact release names.
+#
+# Two failure classes are reported differently (both still exit 1; nothing is
+# relaxed). An unsafe entry path or a duplicate/case-conflicting entry is a
+# hostile archive shape. A well-formed archive whose root file SET differs from
+# $WindowsArchiveNames already passed checksum verification above, so it is
+# the published artifact for $BaseUrl -- the usual cause is this script being
+# newer or older than that release (e.g. install.ps1 run from main ahead of
+# the latest release, #1218). Calling that "unsafe" sends the user hunting for
+# tampering that is not there. Every entry is screened for the hostile class
+# BEFORE any layout verdict, so a bad path can never hide behind a layout
+# message just because an unexpected entry happened to come first.
+$LayoutMismatch = $false
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead("$TmpDir\$Archive")
@@ -222,6 +298,7 @@ try {
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
         $archiveCounts = @{}
         foreach ($archiveName in $WindowsArchiveNames) { $archiveCounts[$archiveName] = 0 }
+        $layoutProblem = $null
         foreach ($entry in $zip.Entries) {
             $entryName = $entry.FullName.Replace('\', '/')
             $isDirectory = $entryName.EndsWith('/')
@@ -240,10 +317,16 @@ try {
                 throw "duplicate or case-conflicting zip entry: $($entry.FullName)"
             }
             if (-not ($WindowsArchiveNames -ccontains $entryName) -or $isDirectory) {
-                throw "archive contains an unexpected root entry: $($entry.FullName)"
+                if ($null -eq $layoutProblem) {
+                    $layoutProblem = "archive contains an unexpected root entry: $($entry.FullName)"
+                }
+                continue
             }
             $archiveCounts[$entryName] = $archiveCounts[$entryName] + 1
         }
+        # Every entry passed the hostile-shape checks; only now judge the layout.
+        $LayoutMismatch = $true
+        if ($null -ne $layoutProblem) { throw $layoutProblem }
         foreach ($archiveName in $WindowsArchiveNames) {
             if ($archiveCounts[$archiveName] -ne 1) {
                 throw "archive must contain exactly one $archiveName"
@@ -252,11 +335,21 @@ try {
         if ($seen.Count -ne $WindowsArchiveNames.Count) {
             throw "archive does not match the exact Windows release allowlist"
         }
+        $LayoutMismatch = $false
     } finally {
         $zip.Dispose()
     }
 } catch {
-    Write-Host "error: unsafe or incomplete release archive: $_" -ForegroundColor Red
+    if ($LayoutMismatch) {
+        Write-Host "error: release archive layout does not match this installer: $_" -ForegroundColor Red
+        Write-Host "  The archive matched the checksum published with it at $BaseUrl, so it is"
+        Write-Host "  the genuine release artifact, built for a different installer version."
+        Write-Host "  This installer expects: $($WindowsArchiveNames -join ', ')"
+        Write-Host "  Fix: run the install.ps1 shipped inside that same release archive, or"
+        Write-Host "  re-run this script after the next release is published."
+    } else {
+        Write-Host "error: unsafe release archive: $_" -ForegroundColor Red
+    }
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     exit 1
 }
@@ -281,8 +374,21 @@ if ($binaryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
 }
 
 # Prove the downloaded binary runs before touching an existing installation.
+# PS 5.1 wraps redirected native stderr into ErrorRecords, so under the global
+# ErrorActionPreference=Stop a HEALTHY binary that prints one warning while
+# exiting 0 becomes a terminating error here. Relax to Continue for the probe
+# only; failure detection stays on $LASTEXITCODE, and the pre-seed guarantees
+# a binary that fails to START (stale $LASTEXITCODE from an earlier native
+# call) can never read as success.
 try {
-    $candidateVersion = & $DownloadedBinary --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $candidateVersion = & $DownloadedBinary --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "candidate exited with $LASTEXITCODE" }
     Write-Host "Verified candidate: $candidateVersion"
 } catch {
@@ -337,20 +443,35 @@ if ($LASTEXITCODE -ne 0) {
 $DownloadedInstaller = Join-Path $TmpDir "install.ps1"
 if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
     $InstallerDest = Join-Path $InstallDir "install.ps1"
-    $InstallerTmp = "$InstallerDest.new"
+    # Reserved inside the try: failing to reserve a sibling is a best-effort
+    # miss like any other step here, not a reason to abort a finished install.
+    $InstallerTmp = $null
     try {
+        $InstallerTmp = New-CbmExclusiveSiblingTemp -Destination $InstallerDest
         Copy-Item -LiteralPath $DownloadedInstaller -Destination $InstallerTmp -Force -ErrorAction Stop
         Move-Item -LiteralPath $InstallerTmp -Destination $InstallerDest -Force -ErrorAction Stop
         Write-Host "Installed updater -> $InstallerDest"
     } catch {
-        Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        if ($InstallerTmp) {
+            Remove-Item -LiteralPath $InstallerTmp -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "note: could not place install.ps1 in $InstallDir (update will explain where to find it)"
     }
 }
 
 # Verify
+# Same PS 5.1 stderr-wrapping guard as the candidate probe above; the pre-seed
+# matters MOST here, because prior successful native calls leave a stale
+# $LASTEXITCODE=0 that a start-failure would otherwise inherit.
 try {
-    $ver = & $Dest --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $ver = & $Dest --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {

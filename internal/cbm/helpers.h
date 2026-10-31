@@ -23,6 +23,17 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang);
 // stay in sync with kPyBuiltinNodes in internal/cbm/lsp/py_builtins.c.
 bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang);
 
+// The service an environment variable's value addresses -- never the value
+// itself: the host of a URL, of `host:port`, a `<svc>.<ns>.svc[.<domain>]`
+// name inside it, or the whole value when `key` names an address (*_ADDR,
+// *_ADDRESS, *_HOST, *_URL, *_ENDPOINT, *_URI) and it is a bare DNS name. A
+// templated value, localhost or an IP addresses nothing. Writes the host's
+// first label to `svc` and its second (`svc.ns`, `svc.ns.svc...`) to `ns`
+// ("" for one label), and returns the label count when the host is a
+// service DNS name (`svc`, `svc.ns`, `svc.ns.svc[...]`), else 0.
+int cbm_env_address(const char *key, const char *value, char *svc, size_t svc_sz, char *ns,
+                    size_t ns_sz);
+
 // Classify a string literal as URL, config, or neither.
 // Returns CBM_STRREF_URL (0), CBM_STRREF_CONFIG (1), or -1 for neither.
 int cbm_classify_string(const char *str, int len);
@@ -57,6 +68,49 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // found. Shared by the defs, calls, and unified extractors so all three agree on
 // enclosing-function attribution — drift between private copies caused #438.
 TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
+
+// tree-sitter error recovery around an unknown leading macro: `API RetT name(...)`
+// (`XXH_PUBLIC_API XXH64_hash_t XXH64(...)`, `JEMALLOC_ALWAYS_INLINE T *f(...)`)
+// carries one identifier more than the declaration grammar admits, so the parser
+// recovers in one of two shapes, and neither names the function:
+//   - C++ inserts a zero-width MISSING "::" and reads `RetT name` as the
+//     out-of-line name `RetT::name`; with a pointer return, the name side is a
+//     pointer_type_declarator that wraps the function_declarator;
+//   - C and C++ keep RetT as the declarator identifier and put the real name in
+//     an ERROR node directly before the parameter list.
+// cbm_c_qualifier_is_recovered: true when `qid` (a qualified_identifier or
+// scoped_identifier) is the first shape, i.e. its "::" token is MISSING.
+// cbm_c_recovered_func_name: the real name node of the second shape for a
+// function_declarator, or a null node when the declarator is not that shape.
+// Shared by every C-family declarator walk (defs, call scope, params, C LSP) so
+// the def QN and every caller QN agree on the recovered name.
+bool cbm_c_qualifier_is_recovered(TSNode qid);
+TSNode cbm_c_recovered_func_name(TSNode func_declarator);
+
+// True for a C keyword that error recovery can surface as a function "name"
+// (`else if (a) (b) {` split by #ifdef reads as a definition named `if`).
+// cbm_func_name_node_text returns NULL for these in the C-declarator grammars,
+// so neither a def nor a call scope is minted; the C LSP applies the same test.
+bool cbm_c_reserved_func_name(const char *name);
+
+// True for the languages whose `#define`s become Macro nodes: C, C++, CUDA,
+// GLSL, Objective-C and ISPC. The one predicate for what follows from the C
+// preprocessor: the `#macro` QN namespace (CBM_MACRO_QN_SUFFIX) and the
+// `variants` property (CBMDefinition.variants), because #if branches are what
+// lets one of these files define a name more than once.
+bool cbm_is_c_preprocessor_lang(CBMLanguage lang);
+
+// Macro-wrapped definition name (#946): `void FNAME(first)(void)` and
+// `void Cls::__API_HOOK(Spawn)()` parse as a function_declarator whose own
+// declarator is ANOTHER function_declarator — the macro call. Valid C/C++ never
+// nests them directly (a function cannot return a function; a function-pointer
+// return has a parenthesized_declarator in between), so the shape is always a
+// function-like macro spelling the name. When `decl` is such an outer
+// function_declarator and the macro takes exactly one bare name, returns that
+// name node ("first", "Spawn"); otherwise a null node, and callers keep their
+// ordinary declarator walk. Shared by the declarator resolver and the C LSP so
+// the def name and the LSP caller QN agree.
+TSNode cbm_c_macro_wrapped_name_node(TSNode decl);
 
 // Convert a resolved function/method name node to its name string, normalizing a
 // C++ conversion-operator's `operator_cast` node (which spans the full
@@ -103,6 +157,26 @@ const char *cbm_nix_binding_scope_qn(CBMExtractCtx *ctx, TSNode node, const char
 // attrpath and an enclosing attrset compose into one qualified name.
 const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, const char *name);
 
+// ── Elixir def-head guards ──
+// `def f(x) when g` parses its WHOLE head as a `when` binary_operator, so the
+// `f(x)` call naming the function is the operator's left operand, and more than
+// one guard (`when a when b`) nests those operators right-associatively, so the
+// head stays the outermost operator's left operand in either shape. Four
+// walks read that same first argument — the defs walk names the function from
+// it, the unified walk opens the function's call scope from it, the calls walk
+// tells a head apart from an invocation by it, and the usages walk excludes the
+// head's identifiers from the usage set by it — so a private copy in one of
+// them makes the rest disagree about what a guarded clause is.
+// cbm_elixir_is_when_guard answers "is this node a guarded head"; the unwrap
+// returns the head under every guard, or the node unchanged when it carries
+// none; cbm_elixir_def_head_is answers whether a node is that head or one of
+// the guard operators above it, which is the question the calls walk asks.
+// All three test the operator token, so an operator definition (`def a + b`) is
+// left alone rather than mis-read as a guard.
+bool cbm_elixir_is_when_guard(TSNode node);
+TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg);
+bool cbm_elixir_def_head_is(TSNode signature, TSNode node);
+
 // Resolve a function/method definition node's NAME node across all ~130 grammars
 // (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
 // per-language quirks: Fortran subroutine, SCSS mixin, SQL create_function, R,
@@ -119,8 +193,51 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 // def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
 char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
 
+/* Go: resolve a method_declaration's receiver parameter_list down to the bare
+ * receiver type_identifier (unwrapping pointer_type / generic_type). Shared by
+ * def extraction (extract_defs.c) and call-scope attribution
+ * (extract_unified.c) so the receiver-qualified method QN has ONE formula. */
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
+
+// Find every child node matching `kind` (unlike cbm_find_child_by_kind,
+// which stops at the first match). Writes up to `max` nodes into `out`;
+// returns how many were found. Repeated sibling nodes of the same kind are
+// common in some grammars (e.g. C#/PHP stack each `[Attr]` as its own
+// attribute_list child) — see #1692.
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max);
+
+/* --- Lisp-family shared gates ---------------------------------------------
+ * The defs, calls and unified extractors each walk the same generic `list`
+ * node and must agree on what it means. The predicates below therefore live
+ * here rather than being copied per translation unit: a private copy in each
+ * drifts, and the drift is silent — defs and call-scope simply stop describing
+ * the same tree.
+ */
+
+/* True when any ancestor list of `node` is headed by a quote symbol
+ * (`q` / `quote` / `qq`) — its contents are DATA, not code, so no def and no
+ * call may be minted from them. Bounded ancestor walk; the arena is used only
+ * for the head-text reads. */
+bool cbm_lisp_node_in_quote(CBMArena *a, TSNode node, const char *source);
+
+/* The `want`-th named child of `node`, skipping `comment` nodes. Comments are
+ * named in the s-expression grammars and so occupy named-child indices: a
+ * comment between a def head and its name shifts every later index by one.
+ * Definition extraction and call-scope attribution MUST use this same skipping
+ * rule or they desynchronise on exactly the files that carry doc comments. */
+TSNode cbm_lisp_named_child_skip_comments(TSNode node, uint32_t want);
+
+/* True for a Chialisp definition-form head. Deliberately separate from the
+ * Clojure/Scheme def-head set: Chialisp shares the generic `list` kind, and
+ * treating `mod`/`defconstant` as defs must not leak into the other lisps (in
+ * Scheme `(mod x y)` is a call). Excludes the expression-local binding forms
+ * (`let`, `assign`, `lambda`), which would fragment call attribution, and
+ * excludes `export`/`namespace`, which NAME an already-defined function rather
+ * than defining one. */
+bool cbm_chialisp_is_def_head(const char *t);
 
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
@@ -137,7 +254,29 @@ void cbm_kind_in_set_free_cache(void);
 // Check if node has an ancestor of the given kind, within max_depth levels.
 bool cbm_has_ancestor_kind(TSNode node, const char *kind, int max_depth);
 
+// Growable pending-node stack for the iterative AST walkers.
+//
+// No work cap may decide graph content, so walker stacks never truncate: a
+// walker starts on a small caller-owned on-stack chunk (`inline_buf`) and spills
+// to the heap (through the memory core, class EXTRACT) only for trees whose
+// pending set outgrows it. Traversal order is unaffected by where the frames
+// live. Ensures room for `need` frames in total; on success `*items`/`*cap`
+// describe the (possibly moved) stack and true is returned. On allocation
+// failure the stack is left intact, the failure is logged at error level under
+// "extract.walk_stack_alloc_failed" (walker=<walker>), and false is returned —
+// the caller then reports its documented failure sentinel instead of a
+// silently truncated result.
+bool cbm_walk_stack_reserve(void **items, int *cap, int need, size_t elem_size,
+                            const void *inline_buf, const char *walker);
+// Release a stack grown by cbm_walk_stack_reserve (no-op for the inline chunk).
+void cbm_walk_stack_release(void *items, const void *inline_buf);
+
+// Sentinel reported by the walkers below when their pending stack could not be
+// grown (allocation failure): the metric is unavailable, never an undercount.
+#define CBM_WALK_METRIC_UNAVAILABLE (-1)
+
 // Count nodes of given kinds in subtree (for complexity metric).
+// Returns CBM_WALK_METRIC_UNAVAILABLE on allocation failure.
 int cbm_count_branching(TSNode node, const char **branching_types);
 
 // Per-function structural complexity, computed in a single AST walk.
@@ -151,6 +290,7 @@ typedef struct {
 
 // Compute the metrics above in one traversal of `node`'s subtree.
 // `branching_types` is the language's branching node-type set.
+// On allocation failure every field is CBM_WALK_METRIC_UNAVAILABLE.
 void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out);
 
 // Is `kind` a loop construct node type? Language-agnostic curated set (for/while/
@@ -166,6 +306,13 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang);
 // parent's children (the common case). `parent` is the parent of the
 // node being classified.
 bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
+
+/* QN of a Go `init` function_declaration (#1910): base_qn + "#<file basename>:<N>",
+ * N = its 1-based ordinal among the file's top-level `init`s. The ONE formula
+ * for the def extractor, compute_func_qn and the Go LSP's enclosing-function
+ * QN. A NULL base_qn or rel_path returns base_qn unchanged. */
+const char *cbm_go_init_qn(CBMArena *a, const char *base_qn, const char *rel_path, TSNode fn_node,
+                           const char *source);
 
 // --- FQN computation ---
 
@@ -189,6 +336,22 @@ char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *r
 // language this is exactly cbm_fqn_compute (no behavior change).
 char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
                                   const char *name, CBMLanguage lang);
+
+// C-family platform variants: the same external-linkage function defined in
+// files that differ only by a platform token (foo_win.c / foo_posix.c,
+// src/unix/fs.c / src/win/fs.c) is one function with platform variants — two
+// external definitions of one name cannot link into one program, so they are
+// alternatives by construction. Each definition keeps its own path QN (it is
+// found by its file); this returns the KEY that relates the variants: the
+// platform-neutral QN (the path with its platform tokens removed), for a
+// non-static file-scope function of C/C++/CUDA/ObjC whose `qn` is the plain
+// file-stem form and whose path carries a platform token. NULL otherwise. A
+// pure function of the definition's own path, name and linkage: no other file
+// takes part, so a full index and an incremental repair write the same key.
+// It becomes the node's `variant_key` property (CBMDefinition.variant_key).
+const char *cbm_platform_neutral_qn(CBMArena *a, CBMLanguage lang, const char *project,
+                                    const char *rel_path, const char *name, const char *qn,
+                                    TSNode func_node);
 
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);

@@ -1,0 +1,303 @@
+/*
+ * test_index_format.c — Guard for the persisted index-format boundary (#769).
+ *
+ * #1108 changed File-node QNs to keep the file extension, so an index written
+ * before it holds collided File identities: badge.component.ts/.html/.scss all
+ * stripped to the same stem and only one File node survived per component.
+ * Refreshing such an index incrementally would mint new-format QNs only for the
+ * files that happened to change, leaving the old collided node behind — a mixed
+ * graph with duplicate nodes and stale edges.
+ *
+ * A stale-format index must therefore be routed through the existing
+ * full-reindex path exactly once (which preserves ADR/project metadata per
+ * #516), and the rebuilt index must not force a second rebuild on the next
+ * unchanged run.
+ */
+#include "test_framework.h"
+#include "repro_harness.h" /* RProj, rh_index_files, rh_count_label, rh_cleanup */
+#include "foundation/log.h"
+#include <sqlite3.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+/* ── Fixture: one component's siblings + an uncolliding control ─────── */
+
+static const char k_badge_ts[] = "export class BadgeComponent {\n"
+                                 "  isHighlighted() { return true; } /* repro-marker */\n"
+                                 "}\n";
+
+static const char k_badge_html[] = "<div class=\"badge\">repro-marker</div>\n";
+
+static const char k_badge_scss[] = ".badge { color: red; /* repro-marker */ }\n";
+
+/* help.html shares no stem with anything, so it is searchable both before and
+ * after the fix — a control that isolates the collision as the cause. */
+static const char k_help_html[] = "<p>repro-marker</p>\n";
+
+static const RFile k_files[] = {
+    {"badge/badge.component.ts", k_badge_ts},
+    {"badge/badge.component.html", k_badge_html},
+    {"badge/badge.component.scss", k_badge_scss},
+    {"standalone/help.html", k_help_html},
+};
+static const int k_nfiles = (int)(sizeof(k_files) / sizeof(k_files[0]));
+
+/* ── Log capture: the routing decision is only visible in the log ───── */
+
+enum { IF_LOG_BUF = 8192 };
+static char g_log_buf[IF_LOG_BUF];
+static size_t g_log_len;
+
+static void capture_sink(const char *line) {
+    size_t n = strlen(line);
+    if (g_log_len + n + 2 < sizeof(g_log_buf)) {
+        memcpy(g_log_buf + g_log_len, line, n);
+        g_log_len += n;
+        g_log_buf[g_log_len++] = '\n';
+        g_log_buf[g_log_len] = '\0';
+    }
+}
+
+static void capture_reset(void) {
+    g_log_len = 0;
+    g_log_buf[0] = '\0';
+}
+
+/* Run index_repository through the production MCP flow, capturing the log. */
+static char *index_capture(RProj *lp) {
+    char args[700];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
+    char *prior = getenv("CBM_CACHE_DIR");
+    char *saved = prior ? strdup(prior) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", lp->cachedir, 1);
+    capture_reset();
+    cbm_log_set_sink_ex(capture_sink, CBM_LOG_SINK_TEE);
+    char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
+    cbm_log_set_sink(NULL);
+    if (saved) {
+        cbm_setenv("CBM_CACHE_DIR", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    return resp;
+}
+/* ── Test 1: one File node per file, and every file reaches search ──── */
+
+TEST(index_format_siblings_distinct_and_searchable) {
+    RProj lp;
+    char args[700];
+    cbm_store_t *store = rh_index_files(&lp, k_files, k_nfiles);
+    ASSERT_NOT_NULL(store);
+
+    /* One File node per file on disk — not one per component stem. */
+    ASSERT_EQ(rh_count_label(store, lp.project, "File"), k_nfiles);
+
+    /* cbm_store_list_files is the set search_code scopes grep to: a file with
+     * no node carrying its exact path is never opened, and the miss is silent. */
+    char **listed = NULL;
+    int nlisted = 0;
+    ASSERT_EQ(cbm_store_list_files(store, lp.project, &listed, &nlisted), CBM_STORE_OK);
+    for (int i = 0; i < k_nfiles; i++) {
+        bool found = false;
+        for (int j = 0; j < nlisted; j++) {
+            if (listed[j] && strcmp(listed[j], k_files[i].name) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            FAIL("indexed file missing from cbm_store_list_files");
+        }
+    }
+    for (int j = 0; j < nlisted; j++) {
+        free(listed[j]);
+    }
+    free(listed);
+
+    /* Every sibling's marker is reachable. .scss/.html have no def nodes, so a
+     * hit lands in raw_matches rather than a containing node — mode="files"
+     * merges both, so assert against the file list. */
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"pattern\":\"repro-marker\",\"mode\":\"files\"}", lp.project);
+    char *saved_dup = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", lp.cachedir, 1);
+    char *resp = cbm_mcp_handle_tool(lp.srv, "search_code", args);
+    if (saved_dup) {
+        cbm_setenv("CBM_CACHE_DIR", saved_dup, 1);
+        free(saved_dup);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    ASSERT_NOT_NULL(resp);
+    for (int i = 0; i < k_nfiles; i++) {
+        if (!strstr(resp, k_files[i].name)) {
+            free(resp);
+            FAIL("search_code did not reach an indexed sibling");
+        }
+    }
+    free(resp);
+
+    rh_cleanup(&lp, store);
+    PASS();
+}
+
+/* ── Test 2: a legacy index rebuilds once, repairs, and settles ─────── */
+
+/* Rewrite the graph into the pre-#1108 shape: the three siblings collapsed onto
+ * a single File node keyed by the extension-stripped QN, which is what such an
+ * index actually holds on disk. */
+static int make_legacy_file_graph(cbm_store_t *store, const char *project, const char *legacy_qn) {
+    if (cbm_store_delete_nodes_by_label(store, project, "File") != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_node_t legacy = {
+        .project = project,
+        .label = "File",
+        .name = "badge.component.html",
+        .qualified_name = legacy_qn,
+        .file_path = "badge/badge.component.html",
+        .properties_json = "{\"extension\":\".html\"}",
+    };
+    return cbm_store_upsert_node(store, &legacy) > 0 ? 0 : -1;
+}
+
+TEST(index_format_legacy_index_rebuilds_and_repairs) {
+    char legacy_qn[512];
+    RProj lp;
+
+    /* Phase 1: index, then discard the query handle. */
+    cbm_store_t *q0 = rh_index_files(&lp, k_files, k_nfiles);
+    ASSERT_NOT_NULL(q0);
+    cbm_store_close(q0);
+
+    /* Phase 2: fabricate a legacy graph through a writable handle. */
+    cbm_store_t *w = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(w);
+    ASSERT_EQ(cbm_store_adr_store(w, lp.project, "index-format-adr"), CBM_STORE_OK);
+    snprintf(legacy_qn, sizeof(legacy_qn), "%s.badge.badge.component.__file__", lp.project);
+    ASSERT_EQ(make_legacy_file_graph(w, lp.project, legacy_qn), 0);
+    ASSERT_EQ(cbm_store_set_format_version(w, 0), CBM_STORE_OK);
+    cbm_store_close(w);
+
+    cbm_store_t *probe = cbm_store_open_path_query(lp.dbpath);
+    if (probe)
+        cbm_store_close(probe);
+
+    /* Run 1: stale format forces the full-reindex path. */
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    if (!strstr(g_log_buf, "format_change_reindex")) {
+        free(resp);
+        FAIL("a stale-format index was not routed through the full-reindex path");
+    }
+    if (!strstr(resp, "\"format_migration\":true")) {
+        free(resp);
+        FAIL("index_repository response did not surface format_migration");
+    }
+    free(resp);
+
+    /* Phase 3: verify the rebuild through a fresh read handle. */
+    cbm_store_t *r1 = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(r1);
+    cbm_node_t stale = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(r1, lp.project, legacy_qn, &stale), CBM_STORE_NOT_FOUND);
+    cbm_node_free_fields(&stale);
+    static const char *k_exts[] = {"ts", "html", "scss"};
+    for (int i = 0; i < 3; i++) {
+        char qn[512];
+        snprintf(qn, sizeof(qn), "%s.badge.badge.component.%s.__file__", lp.project, k_exts[i]);
+        cbm_node_t n = {0};
+        ASSERT_EQ(cbm_store_find_node_by_qn(r1, lp.project, qn, &n), CBM_STORE_OK);
+        cbm_node_free_fields(&n);
+    }
+    ASSERT_EQ(rh_count_label(r1, lp.project, "File"), k_nfiles);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(r1, lp.project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT(strstr(adr.content, "index-format-adr") != NULL);
+    cbm_store_adr_free(&adr);
+    int fmt = -1;
+    ASSERT_EQ(cbm_store_get_format_version(r1, &fmt), CBM_STORE_OK);
+    ASSERT_EQ(fmt, CBM_INDEX_FORMAT_VERSION);
+    cbm_store_close(r1);
+
+    /* Run 2: unchanged, current format — no second rebuild. */
+    resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    if (strstr(g_log_buf, "format_change_reindex")) {
+        free(resp);
+        FAIL("a current-format index was rebuilt again");
+    }
+    if (strstr(resp, "format_migration")) {
+        free(resp);
+        FAIL("format_migration surfaced on an unchanged run");
+    }
+    free(resp);
+
+    /* Phase 4: final check, then clean up (rh_cleanup closes r2). */
+    cbm_store_t *r2 = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(r2);
+    ASSERT_EQ(rh_count_label(r2, lp.project, "File"), k_nfiles);
+    rh_cleanup(&lp, r2);
+    PASS();
+}
+
+/* ── Test 3: an index from before format 3 drops its invented hosts ─── */
+
+/* Format 2 stored an image without a registry host under an invented
+ * docker.io identity. Refreshed in place, only touched files would get the
+ * new identity: both forms of one image in a single graph. */
+static const RFile k_image_files[] = {
+    {"a/Dockerfile", "FROM nginx:1.27\n"},
+    {"k8s.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n"
+                 "  template:\n    spec:\n      containers:\n        - name: web\n"
+                 "          image: nginx:1.27\n"},
+};
+
+TEST(index_format_v2_images_rebuild_without_invented_host) {
+    RProj lp;
+    cbm_store_t *q0 = rh_index_files(&lp, k_image_files, 2);
+    ASSERT_NOT_NULL(q0);
+    cbm_store_close(q0);
+
+    /* The format-2 shape: the same node, edges kept, under its old identity. */
+    cbm_store_t *w = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(w);
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(w),
+                           "UPDATE nodes SET name='docker.io/library/nginx', "
+                           "qualified_name='__image__docker.io/library/nginx', "
+                           "properties='{\"repository\":\"docker.io/library/nginx\"}' "
+                           "WHERE label='Image' AND name='nginx'",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_changes(cbm_store_get_db(w)), 1);
+    ASSERT_EQ(cbm_store_set_format_version(w, 2), CBM_STORE_OK);
+    cbm_store_close(w);
+
+    char *resp = index_capture(&lp);
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    if (!strstr(g_log_buf, "format_change_reindex")) {
+        FAIL("a format-2 index was not routed through the full-reindex path");
+    }
+    cbm_store_t *r = cbm_store_open_path(lp.dbpath);
+    ASSERT_NOT_NULL(r);
+    cbm_node_t n = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(r, lp.project, "__image__docker.io/library/nginx", &n),
+              CBM_STORE_NOT_FOUND);
+    cbm_node_free_fields(&n);
+    ASSERT_EQ(cbm_store_find_node_by_qn(r, lp.project, "__image__nginx", &n), CBM_STORE_OK);
+    ASSERT_NOT_NULL(n.properties_json);
+    ASSERT_NOT_NULL(strstr(n.properties_json, "\"registry\":\"unknown\""));
+    cbm_node_free_fields(&n);
+    rh_cleanup(&lp, r);
+    PASS();
+}
+
+SUITE(index_format) {
+    RUN_TEST(index_format_siblings_distinct_and_searchable);
+    RUN_TEST(index_format_legacy_index_rebuilds_and_repairs);
+    RUN_TEST(index_format_v2_images_rebuild_without_invented_host);
+}

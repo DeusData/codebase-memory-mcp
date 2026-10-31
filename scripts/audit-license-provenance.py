@@ -20,12 +20,30 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRAMMARS = os.path.join(ROOT, "internal/cbm/vendored/grammars")
 
-FIRST_PARTY = {"cobol", "form", "janet", "magma", "protobuf", "wolfram"}
+# Grammars authored in this repository. This is a REGISTRATION, not an
+# exemption: membership only routes the check -- the audit still requires the
+# vendored LICENSE to be byte-equal to the project root LICENSE, and reports
+# FIRST-PARTY-VAR (a failing verdict) when it is not.
+FIRST_PARTY = {"chialisp", "cobol", "form", "janet", "magma", "protobuf", "wolfram"}
 FORKS = {  # self-maintained forks: vendored LICENSE must match the original upstream
+    # arkts: our own ArkTS fork of tree-sitter-typescript. The vendored LICENSE is
+    # upstream's MIT verbatim, which is what MIT requires of a derivative; our own
+    # copyright and the fork's provenance live where our SOURCE is (grammar.js
+    # header, MANIFEST.md, THIRD_PARTY.md) rather than inside upstream's notice.
+    # This is a routing entry, NOT an exemption -- check_upstream still byte-verifies
+    # against the real upstream repository.
+    "arkts": "tree-sitter/tree-sitter-typescript",
     "cfml": "cfmleditor/tree-sitter-cfml",
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",
+    # javascript / tsx: our JSX lone-ampersand forks (#1736) of the pins we vendored
+    # before; same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "javascript": "tree-sitter/tree-sitter-javascript",
+    # pascal: our Unicode-identifier fork (#2211) of the pin we vendored before;
+    # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
+    "tsx": "tree-sitter/tree-sitter-typescript",
 }
 SPECIAL_NOTICE = {
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",

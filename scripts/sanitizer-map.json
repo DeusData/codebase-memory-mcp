@@ -1,0 +1,126 @@
+{
+  "about": "Defect class x platform coverage of the sanitizer lanes. Every cell is covered, partial (with why), or a named limit (with why). Validated by scripts/sanitizer-coverage-map.py map. Which functions each lane actually EXECUTES is the run/union/ratchet part of the same tool.",
+  "platforms": ["linux-x64", "linux-arm64", "macos-arm64", "windows-x64", "windows-arm64"],
+  "classes": [
+    {
+      "name": "heap/stack memory errors",
+      "cells": {
+        "linux-x64": {"status": "covered", "lane": "asan", "venue": "PR CI"},
+        "linux-arm64": {"status": "covered", "lane": "asan", "venue": "local container"},
+        "macos-arm64": {"status": "partial", "lane": "asan+diag", "why": "use-after-return and use-after-scope only on the Homebrew-LLVM diag lane, which is local-only"},
+        "windows-x64": {"status": "covered", "lane": "asan", "venue": "PR CI"},
+        "windows-arm64": {"status": "limit", "lane": "none", "why": "no ASan runtime for Windows ARM64; the class is covered for Windows by the x64 leg"}
+      }
+    },
+    {
+      "name": "allocator-path memory errors",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "asan", "why": "test builds use the C runtime allocator: mimalloc bindings, the --wrap shims and the slab never run sanitized; mimalloc itself is built without ASan"},
+        "linux-arm64": {"status": "partial", "lane": "asan", "why": "same as linux-x64"},
+        "macos-arm64": {"status": "partial", "lane": "asan", "why": "same as linux-x64; the zone-observer path runs only in the memwaste flavours"},
+        "windows-x64": {"status": "partial", "lane": "asan", "why": "same as linux-x64"},
+        "windows-arm64": {"status": "limit", "lane": "none", "why": "no ASan runtime for Windows ARM64"}
+      }
+    },
+    {
+      "name": "undefined behaviour",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "ubsan", "why": "tre (regex) is built with -fno-sanitize=alignment"},
+        "linux-arm64": {"status": "partial", "lane": "ubsan", "why": "tre (regex) is built with -fno-sanitize=alignment"},
+        "macos-arm64": {"status": "partial", "lane": "ubsan", "why": "tre (regex) is built with -fno-sanitize=alignment"},
+        "windows-x64": {"status": "partial", "lane": "ubsan", "why": "tre (regex) is built with -fno-sanitize=alignment"},
+        "windows-arm64": {"status": "partial", "lane": "ubsan-trap", "why": "trap mode: a violation stops the run without a message"}
+      }
+    },
+    {
+      "name": "leaks",
+      "cells": {
+        "linux-x64": {"status": "covered", "lane": "lsan", "venue": "PR CI (on by default under ASan)"},
+        "linux-arm64": {"status": "covered", "lane": "lsan", "venue": "local container"},
+        "macos-arm64": {"status": "covered", "lane": "test-lsan", "venue": "local (Homebrew LLVM; Apple clang refuses detect_leaks)"},
+        "windows-x64": {"status": "partial", "lane": "memwaste-event", "why": "no leak sanitizer on Windows; the waste lane's live-per-site report at the last phase and the soak slope stand in"},
+        "windows-arm64": {"status": "partial", "lane": "memwaste-event", "why": "no leak sanitizer on Windows; the waste lane's live-per-site report at the last phase and the soak slope stand in"}
+      }
+    },
+    {
+      "name": "uninitialised reads",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "msan", "why": "CI only; deep-recursion suites need larger thread stacks under MSan"},
+        "linux-arm64": {"status": "partial", "lane": "msan", "why": "locally red: three deep-recursion suites overflow their thread stacks"},
+        "macos-arm64": {"status": "partial", "lane": "memwaste-access", "why": "no MSan on macOS; the access lane's read-before-write verdict on a real corpus is the second net, per block, not per byte"},
+        "windows-x64": {"status": "partial", "lane": "memwaste-access", "why": "no MSan on Windows; the access lane (clang) is the second net"},
+        "windows-arm64": {"status": "partial", "lane": "memwaste-access", "why": "no MSan on Windows; the access lane (clang) is the second net"}
+      }
+    },
+    {
+      "name": "data races",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "tsan", "why": "a subset of suites runs under TSan"},
+        "linux-arm64": {"status": "partial", "lane": "tsan", "why": "a subset of suites runs under TSan"},
+        "macos-arm64": {"status": "partial", "lane": "tsan", "why": "a subset of suites runs under TSan"},
+        "windows-x64": {"status": "limit", "lane": "none", "why": "no TSan on Windows"},
+        "windows-arm64": {"status": "limit", "lane": "none", "why": "no TSan on Windows"}
+      }
+    },
+    {
+      "name": "static analysis",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "cppcheck+lint-mem+codeql", "why": "vendored trees are filtered out of cppcheck and the analyzer gate"},
+        "linux-arm64": {"status": "partial", "lane": "cppcheck+lint-mem", "why": "vendored trees are filtered out"},
+        "macos-arm64": {"status": "partial", "lane": "lint-mem", "why": "vendored trees are filtered out"},
+        "windows-x64": {"status": "limit", "lane": "none", "why": "static lanes are platform-independent source passes; Windows-only code is analysed by CodeQL only"},
+        "windows-arm64": {"status": "limit", "lane": "none", "why": "static lanes are platform-independent source passes"}
+      }
+    },
+    {
+      "name": "hostile input",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "security-fuzz+libfuzzer", "why": "fixed MCP payloads in CI; libFuzzer targets for extractors, Cypher and config editors run in dry-run/nightly"},
+        "linux-arm64": {"status": "partial", "lane": "libfuzzer", "why": "local only"},
+        "macos-arm64": {"status": "partial", "lane": "libfuzzer", "why": "local only (Homebrew LLVM ships libFuzzer; Apple clang does not)"},
+        "windows-x64": {"status": "limit", "lane": "none", "why": "libFuzzer is not built for the MinGW toolchain"},
+        "windows-arm64": {"status": "limit", "lane": "none", "why": "libFuzzer is not built for the MinGW toolchain"}
+      }
+    },
+    {
+      "name": "algorithmic blow-up",
+      "cells": {
+        "linux-x64": {"status": "covered", "lane": "complexity+memwaste-scaling"},
+        "linux-arm64": {"status": "covered", "lane": "complexity+memwaste-scaling"},
+        "macos-arm64": {"status": "covered", "lane": "complexity+memwaste-scaling"},
+        "windows-x64": {"status": "partial", "lane": "complexity", "why": "the per-function scaling lane needs clang's profile runtime; whole-pipeline counters only"},
+        "windows-arm64": {"status": "partial", "lane": "complexity", "why": "the per-function scaling lane needs clang's profile runtime; whole-pipeline counters only"}
+      }
+    },
+    {
+      "name": "memory waste",
+      "cells": {
+        "linux-x64": {"status": "covered", "lane": "memwaste-event+access"},
+        "linux-arm64": {"status": "covered", "lane": "memwaste-event+access"},
+        "macos-arm64": {"status": "covered", "lane": "memwaste-event+access"},
+        "windows-x64": {"status": "partial", "lane": "memwaste-event", "why": "libc wrappers cover mem*/str* and FILE I/O only; the access lane needs a clang build"},
+        "windows-arm64": {"status": "partial", "lane": "memwaste-event", "why": "libc wrappers cover mem*/str* and FILE I/O only"}
+      }
+    },
+    {
+      "name": "CPU waste",
+      "cells": {
+        "linux-x64": {"status": "covered", "lane": "memwaste-cpu+scaling"},
+        "linux-arm64": {"status": "covered", "lane": "memwaste-cpu+scaling"},
+        "macos-arm64": {"status": "covered", "lane": "memwaste-cpu+scaling"},
+        "windows-x64": {"status": "partial", "lane": "memwaste-cpu", "why": "no system-call or pthread lock wrappers on Windows: Win32 file and lock APIs are imports --wrap cannot redirect"},
+        "windows-arm64": {"status": "partial", "lane": "memwaste-cpu", "why": "no system-call or pthread lock wrappers on Windows: Win32 file and lock APIs are imports --wrap cannot redirect"}
+      }
+    },
+    {
+      "name": "executed-code coverage of the lanes",
+      "cells": {
+        "linux-x64": {"status": "partial", "lane": "sanitizer-coverage-map", "why": "needs a clang job; the gcc legs are not measured"},
+        "linux-arm64": {"status": "covered", "lane": "sanitizer-coverage-map"},
+        "macos-arm64": {"status": "covered", "lane": "sanitizer-coverage-map"},
+        "windows-x64": {"status": "limit", "lane": "none", "why": "no sanitizer lane on Windows executes under clang source coverage yet"},
+        "windows-arm64": {"status": "limit", "lane": "none", "why": "no sanitizer lane on Windows executes under clang source coverage yet"}
+      }
+    }
+  ]
+}

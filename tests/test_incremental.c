@@ -16,6 +16,7 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
 #include <foundation/platform.h>
@@ -107,7 +108,20 @@ static int reformat_files(const char *subdir, int max_files) {
 static char *index_repo(void) {
     char args[512];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", g_repodir);
-    return cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    char *resp = cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    /* Fail-closed at the source: every caller asserts resp != NULL, but an
+     * error response (e.g. a transient pre-publication abort that preserves
+     * the previous index) used to slip through and cascade into dozens of
+     * mysterious count/query failures downstream — a 99-test pile-up on the
+     * Windows leg traced back to exactly this. Surface the real cause once,
+     * here, and let the existing non-NULL asserts fail loudly. */
+    if (resp && strstr(resp, "\"isError\":true")) {
+        fprintf(stderr, "  index_repo: index_repository returned an error response:\n  %.400s\n",
+                resp);
+        free(resp);
+        return NULL;
+    }
+    return resp;
 }
 
 /* Timed index: returns response, sets *elapsed_ms and *peak_rss_mb */
@@ -533,6 +547,71 @@ TEST(incr_formatter_run) {
     PASS();
 }
 
+static char g_purge_log[8192];
+static int g_purge_progress_lines;
+
+static void purge_log_sink(const char *line) {
+    if (!line || !strstr(line, "msg=incremental.purge")) {
+        return;
+    }
+    if (strstr(line, "msg=incremental.purge.progress")) {
+        g_purge_progress_lines++;
+    }
+    size_t used = strlen(g_purge_log);
+    (void)snprintf(g_purge_log + used, sizeof(g_purge_log) - used, "%s\n", line);
+}
+
+/* #1300: the per-file purge after incremental.edge_snapshot logged nothing
+ * until it finished, so a stall there left no trace of where the run was. It
+ * now announces its counts and reports bounded progress — counts only, at
+ * most 20 progress lines however many files, ending at files_done ==
+ * files_total. */
+TEST(incr_purge_reports_bounded_progress_issue1300) {
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+    reformat_files("fastapi", 30);
+    /* The loop instrumented for #1300 sits on the legacy partial route (the
+     * production closure route purges in SQL and logs delta.snapshot_purge). */
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_purge_log[0] = '\0';
+    g_purge_progress_lines = 0;
+    cbm_log_set_sink_ex(purge_log_sink, CBM_LOG_SINK_TEE);
+    resp = index_repo();
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+
+    const char *start = strstr(g_purge_log, "msg=incremental.purge.start");
+    ASSERT(start != NULL);
+    int changed = -1;
+    int deleted = -1;
+    const char *changed_at = strstr(start, "changed=");
+    const char *deleted_at = strstr(start, "deleted=");
+    ASSERT(changed_at != NULL && deleted_at != NULL);
+    changed = atoi(changed_at + strlen("changed="));
+    deleted = atoi(deleted_at + strlen("deleted="));
+    int total = changed + deleted;
+    ASSERT_GT(total, 20); /* enough files that one line per file would exceed the bound */
+    ASSERT_GT(g_purge_progress_lines, 0);
+    ASSERT(g_purge_progress_lines <= 21);
+    ASSERT(g_purge_progress_lines < total); /* never one line per file */
+    char last[64];
+    (void)snprintf(last, sizeof(last), "files_done=%d files_total=%d", total, total);
+    ASSERT(strstr(g_purge_log, last) != NULL);
+    ASSERT(strstr(g_purge_log, "msg=incremental.purge elapsed_ms=") != NULL);
+    PASS();
+}
+
 TEST(incr_add_file) {
     int nodes_before = get_node_count();
 
@@ -916,6 +995,16 @@ TEST(incr_perf_single_file_fast) {
     }
 
     delete_file_at("fastapi/incr_perf_probe.py");
+    /* Publish the cleanup too. search_code now consumes the complete scoped
+     * file list and fails closed when the graph names a source file that grep
+     * cannot read; leaving this probe indexed would make every later matching
+     * search correctly report an incomplete snapshot instead of exercising
+     * the search parameter contract this fixture is meant to cover. The
+     * cleanup reindex is deliberately outside the measured interval above. */
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
     PASS();
 }
 
@@ -1568,26 +1657,29 @@ TEST(tool_qg_two_hop) {
 
 TEST(tool_qg_max_rows) {
     double ms;
-    /* Query without max_rows — gets many results */
+    /* Query without max_rows — its explicit Cypher LIMIT is the visible cap. */
     char *r1 = call_tool_timed("query_graph", &ms,
                                "{\"project\":\"%s\","
                                "\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 100\"}",
                                g_project);
     TOOL_OK(r1, ms);
-    int total_unlimited = count_in_response(r1, "total");
+    int returned_unlimited = count_in_response(r1, "returned");
     free(r1);
 
-    /* Same query without LIMIT but with max_rows=3 — must cap results */
+    /* max_rows caps presentation, not evaluation: returned is bounded while
+     * total remains the exact full materialized count. */
     char *r2 = call_tool_timed("query_graph", &ms,
                                "{\"project\":\"%s\","
                                "\"query\":\"MATCH (n:Function) RETURN n.name\","
                                "\"max_rows\":3}",
                                g_project);
     TOOL_OK(r2, ms);
+    int returned_limited = count_in_response(r2, "returned");
     int total_limited = count_in_response(r2, "total");
-    ASSERT_LTE(total_limited, 3);
-    /* Without max_rows should have more than with */
-    ASSERT_GT(total_unlimited, total_limited);
+    ASSERT_EQ(returned_limited, 3);
+    ASSERT_GT(total_limited, returned_limited);
+    ASSERT_GT(returned_unlimited, returned_limited);
+    ASSERT_NOT_NULL(strstr(r2, "page_limit"));
     free(r2);
     PASS();
 }
@@ -1908,12 +2000,22 @@ TEST(tool_arch_no_aspects) {
 
 TEST(tool_detect_changes_default) {
     double ms;
-    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
+    /* The fixture is intentionally detached, so pin only the base while
+     * exercising every other default (scope, direction, depth, and budget). */
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
     TOOL_OK(r, ms);
-    /* New tree contract: base + direction scalars, a changed_files section,
-     * and the seed/impact accounting. (The old changed_count/impacted_symbols/
-     * depth keys are gone — impact is now a real traversal, not bare names.) */
-    ASSERT(strstr(r, "changed_files:") != NULL);
+    NOT_ERROR(r);
+    /* Lean tree contract: preserve exact changed-file accounting, but do not
+     * spend tokens on a zero-row table. A non-empty page still carries the
+     * changed_files rows; an empty page is represented by its exact scalars. */
+    int changed_total = count_in_response(r, "changed_total");
+    int changed_returned = count_in_response(r, "changed_returned");
+    ASSERT_GTE(changed_total, 0);
+    ASSERT_GTE(changed_returned, 0);
+    ASSERT_LTE(changed_returned, changed_total);
+    ASSERT(changed_returned > 0 ? resp_has_key(r, "changed_files")
+                                : resp_lacks_key(r, "changed_files"));
     ASSERT(strstr(r, "direction:") != NULL);
     ASSERT(strstr(r, "seed_symbols:") != NULL);
     free(r);
@@ -1961,7 +2063,15 @@ TEST(tool_detect_changes_since) {
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"since\":\"HEAD\"}",
                               g_project);
     TOOL_OK(r, ms);
-    ASSERT(resp_has_key(r, "changed_files"));
+    NOT_ERROR(r);
+    ASSERT(strstr(r, "base: HEAD") != NULL);
+    int changed_total = count_in_response(r, "changed_total");
+    int changed_returned = count_in_response(r, "changed_returned");
+    ASSERT_GTE(changed_total, 0);
+    ASSERT_GTE(changed_returned, 0);
+    ASSERT_LTE(changed_returned, changed_total);
+    ASSERT(changed_returned > 0 ? resp_has_key(r, "changed_files")
+                                : resp_lacks_key(r, "changed_files"));
     free(r);
     PASS();
 }
@@ -2262,8 +2372,11 @@ TEST(tool_qg_max_rows_1) {
                               "\"max_rows\":1}",
                               g_project);
     TOOL_OK(r, ms);
+    int returned = count_in_response(r, "returned");
     int total = count_in_response(r, "total");
-    ASSERT_EQ(total, 1);
+    ASSERT_EQ(returned, 1);
+    ASSERT_GT(total, returned);
+    ASSERT_NOT_NULL(strstr(r, "page_limit"));
     free(r);
     PASS();
 }
@@ -3301,6 +3414,9 @@ SUITE(incremental) {
     RUN_TEST(tool_err_adr_bad_project);
     RUN_TEST(tool_err_ingest_bad_project);
     RUN_TEST(tool_err_ingest_no_traces);
+
+    /* #1300: legacy-partial purge progress (the full rebuild below resets the graph) */
+    RUN_TEST(incr_purge_reports_bounded_progress_issue1300);
 
     /* Phase 40: index_repository mode=full + arch empty aspects */
     RUN_TEST(tool_index_mode_full);
