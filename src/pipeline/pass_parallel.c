@@ -3629,6 +3629,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * Variable or a Field. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, call->is_method, call->callee_name,
+                                           res.strategy, target_node->label)) {
+            /* Same guard as pass_calls.c — a bare Go `init` is a local name,
+             * never a package init or a method found by name alone. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge
@@ -3805,6 +3812,12 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_bare_field_ref(lang, usage->is_member_access, tgt->label)) {
                 continue;
             }
+            /* A bare Go `init` names a local (cbm_go_suppress_bare_init_bind).
+             * Mirrors the sequential twin (pass_usages.c). */
+            if (tgt && cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      usage->ref_name, res.strategy, tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -3931,6 +3944,12 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         /* #1942/#1962/#2666: a bare Go or C reference can never denote a
          * struct field; a selector-LHS write (`t.err = x`) may bind it. */
         if (cbm_suppress_bare_field_ref(lang, rw->is_member_access, tgt->label)) {
+            continue;
+        }
+        /* A bare Go `init` names a local (cbm_go_suppress_bare_init_bind).
+         * Mirrors the sequential twin (pass_usages.c). */
+        if (cbm_go_suppress_bare_init_bind(lang == CBM_LANG_GO, rw->is_member_access, rw->var_name,
+                                           res.strategy, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";
