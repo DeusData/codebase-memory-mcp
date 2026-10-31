@@ -46,6 +46,13 @@ static const lib_pattern_t http_libraries[] = {
      * case-sensitive, so without this entry `Axios.get(url)` fell through to
      * the `.get` route-suffix fallback and became a route registration. */
     {"Axios", CBM_SVC_HTTP, NULL},
+    {"@angular/common/http", CBM_SVC_HTTP, NULL},
+    {"angular.common.http", CBM_SVC_HTTP, NULL},
+    {"HttpClient", CBM_SVC_HTTP, NULL},
+    {"httpClient", CBM_SVC_HTTP, NULL},
+    {"this.http", CBM_SVC_HTTP, NULL},
+    {"this.httpClient", CBM_SVC_HTTP, NULL},
+    {"$http", CBM_SVC_HTTP, NULL},
     {"superagent", CBM_SVC_HTTP, NULL},
     {"needle", CBM_SVC_HTTP, NULL},
     {"node-fetch", CBM_SVC_HTTP, NULL},

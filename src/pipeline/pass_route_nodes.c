@@ -113,6 +113,9 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
         json_extract(edge->properties_json, "method", method_buf, sizeof(method_buf));
     const char *broker =
         json_extract(edge->properties_json, "broker", broker_buf, sizeof(broker_buf));
+    if (!method && strcmp(edge->type, "HTTP_CALLS") == 0 && callee) {
+        method = cbm_service_pattern_http_method(callee);
+    }
 
     /* Build Route QN */
     char route_qn[CBM_ROUTE_QN_SIZE];

@@ -939,15 +939,20 @@ static int calls_emit_unresolved_service(cbm_pipeline_ctx_t *ctx, const CBMCall 
                                          const char **imp_keys, const char **imp_vals,
                                          int imp_count, const char *route_mount, CBMLanguage lang,
                                          CBMCallEvidence *evidence) {
-    if (calls_emit_route_call(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count,
-                              route_mount, lang, evidence)) {
-        return SKIP_ONE;
-    }
     cbm_svc_kind_t svc = cbm_service_pattern_match(call->callee_name);
     if (svc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
         svc = CBM_SVC_HTTP;
     }
-    return calls_emit_service_call(ctx, call, source_node, svc, NULL, evidence);
+    if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
+        if (calls_emit_service_call(ctx, call, source_node, svc, NULL, evidence)) {
+            return SKIP_ONE;
+        }
+    }
+    if (calls_emit_route_call(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count,
+                              route_mount, lang, evidence)) {
+        return SKIP_ONE;
+    }
+    return 0;
 }
 
 /* Apply the field-call policy after a registry target has been found. */
