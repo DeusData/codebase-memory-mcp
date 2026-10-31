@@ -29159,7 +29159,40 @@ TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
     PASS();
 }
 
+/* Discovery must choose the C++ grammar before the pipeline extracts .inc
+ * symbols; a direct extractor-only test would miss that routing failure. */
+TEST(pipeline_inc_c_family_fragments) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_inc_cpp_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "runtime.inc",
+                    "#define SAMPLE_CALLBACK(T) T\n"
+                    "extern \"C\" int sample_export() { return 0; }\n"
+                    "static SAMPLE_CALLBACK(int) sample_callback() { return sample_export(); }\n");
+    write_temp_file(tmp, "main.cpp", "#include \"runtime.inc\"\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    const cbm_index_mode_t modes[] = {CBM_MODE_FAST, CBM_MODE_FULL};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, modes[i]);
+        ASSERT_NOT_NULL(pipeline);
+        ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        const char *project = cbm_pipeline_project_name(pipeline);
+        ASSERT_EQ(fixture_node_count(store, project, "runtime.inc", "sample_export", "Function"),
+                  1);
+        ASSERT_EQ(fixture_node_count(store, project, "runtime.inc", "sample_callback", "Function"),
+                  1);
+        ASSERT_EQ(named_node_count(store, project, "extern"), 0);
+        cbm_store_close(store);
+        cbm_pipeline_free(pipeline);
+    }
+    th_rmtree(tmp);
+    PASS();
+}
 SUITE(pipeline) {
+    RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_python_class_body_calls_sequential);

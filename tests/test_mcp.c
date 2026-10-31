@@ -11670,6 +11670,88 @@ TEST(search_code_scoped_file_pattern_is_busybox_portable) {
 #endif
 }
 
+/* issue #2836: a file_pattern with '/' matched only the basename, so every
+ * directory-scoped glob silently returned 0 results. */
+TEST(search_code_file_pattern_matches_repo_relative_path_issue2836) {
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-fp-path-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char src_dir[CBM_SZ_1K];
+    char cli_dir[CBM_SZ_1K];
+    char main_path[CBM_SZ_1K];
+    char watcher_path[CBM_SZ_1K];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", tmp);
+    snprintf(cli_dir, sizeof(cli_dir), "%s/src/cli", tmp);
+    snprintf(main_path, sizeof(main_path), "%s/src/main.c", tmp);
+    snprintf(watcher_path, sizeof(watcher_path), "%s/src/cli/watcher.c", tmp);
+    ASSERT_EQ(cbm_mkdir(src_dir), 0);
+    ASSERT_EQ(cbm_mkdir(cli_dir), 0);
+    ASSERT_EQ(th_write_file(main_path, "int FP_PATH_NEEDLE = 1;\n"), 0);
+    ASSERT_EQ(th_write_file(watcher_path, "int FP_PATH_NEEDLE = 2;\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-fp-path";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+    cbm_node_t main_file = {.project = project,
+                            .label = "File",
+                            .name = "main.c",
+                            .qualified_name = "search-fp-path.src.main.c",
+                            .file_path = "src/main.c"};
+    cbm_node_t watcher_file = {.project = project,
+                               .label = "File",
+                               .name = "watcher.c",
+                               .qualified_name = "search-fp-path.src.cli.watcher.c",
+                               .file_path = "src/cli/watcher.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &main_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &watcher_file), 0);
+
+    static const struct {
+        const char *file_pattern;
+        const char *expect;
+        bool hint;
+    } cases[] = {
+        {"src/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/**/*.c", "\"total_grep_matches\":2", false}, /* ** spans zero dirs */
+        {"**/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/cli/", "\"total_grep_matches\":1", false},  /* no wildcard: substring */
+        {"watcher.c", "\"total_grep_matches\":1", false}, /* basename unchanged */
+        {"*.c", "\"total_grep_matches\":2", false},
+        {"lib/*.c", "\"total_grep_matches\":0", true},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args),
+                 "{\"pattern\":\"FP_PATH_NEEDLE\",\"project\":\"search-fp-path\","
+                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                 cases[i].file_pattern);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        char *inner = extract_text_content(response);
+        bool case_ok = inner && strstr(inner, cases[i].expect) &&
+                       (strstr(inner, "use path_filter") != NULL) == cases[i].hint;
+        if (!case_ok) {
+            fprintf(stderr, "file_pattern %s: %s\n", cases[i].file_pattern,
+                    inner ? inner : "(null)");
+            ok = false;
+        }
+        free(inner);
+        free(response);
+    }
+
+    cbm_mcp_server_free(srv);
+    cbm_unlink(watcher_path);
+    cbm_unlink(main_path);
+    cbm_rmdir(cli_dir);
+    cbm_rmdir(src_dir);
+    cbm_rmdir(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 TEST(search_code_recursive_fallback_propagates_discovery_failures) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX find/sort/xargs fallback contract");
@@ -26322,6 +26404,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_fails_closed_when_complete_scan_is_impossible);
     RUN_TEST(search_code_scoped_scan_uses_canonical_file_nodes);
     RUN_TEST(search_code_scoped_file_pattern_is_busybox_portable);
+    RUN_TEST(search_code_file_pattern_matches_repo_relative_path_issue2836);
     RUN_TEST(search_code_recursive_fallback_propagates_discovery_failures);
     RUN_TEST(search_code_default_budget_limits_raw_rows_before_graph_results);
     RUN_TEST(search_code_raw_and_directory_remainders_are_independently_pageable);

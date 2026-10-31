@@ -1707,6 +1707,12 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
         scope = "Compaction";
     }
     const char *tier = ha_active_tier(root, event);
+    /* SubagentStart carries no tool list, so agents defined without MCP tools
+     * (e.g. tools: Read, Grep, Glob, Bash) still get this; point them at the CLI. */
+    const char *cli_hint = strcmp(event, "SubagentStart") == 0
+                               ? " The same tools are also available from the shell: "
+                                 "`codebase-memory-mcp cli <tool> --help` lists each tool's flags."
+                               : "";
     if (project) {
         char safe_project[HA_METADATA_CAP];
         ha_sanitize_metadata(project, safe_project, sizeof(safe_project));
@@ -1723,8 +1729,8 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  "reported missed lines directly and qualify conclusions. For structural "
                  "code discovery use search_graph, then trace_path, then get_code_snippet; "
                  "use query_graph or get_architecture for broader structure. Use grep, glob, "
-                 "and file reads for literals, configs, non-code files, and verification.",
-                 scope, safe_project, tier);
+                 "and file reads for literals, configs, non-code files, and verification.%s",
+                 scope, safe_project, tier, cli_hint);
     } else {
         const char *index_guidance = ha_no_project_index_guidance(event);
         snprintf(context, sizeof(context),
@@ -1735,8 +1741,8 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  "call check_index_coverage for every file relied on; if incomplete, read the "
                  "reported missed lines directly and qualify conclusions. Use search_graph, "
                  "trace_path, and get_code_snippet first; use grep for "
-                 "literals, configs, non-code files, and verification.",
-                 scope, index_guidance, tier);
+                 "literals, configs, non-code files, and verification.%s",
+                 scope, index_guidance, tier, cli_hint);
     }
     free(project);
     if (dialect == HA_DIALECT_COPILOT) {
