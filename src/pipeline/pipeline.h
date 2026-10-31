@@ -278,6 +278,24 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
                                      const char *qualified_name, const char *label,
                                      CBMLanguage lang, size_t module_prefix_len);
 
+/* Register a symbol for exact (qualified-name) lookups only: it is never
+ * offered to the short-name strategies (unique_name, suffix_match,
+ * field_type_hint, fuzzy). For a generated member (cbm_def_props_generated),
+ * which the source never spells, so only a type-aware resolver that knows its
+ * owner may bind it. The three graph registration sites route such a symbol
+ * here instead of cbm_registry_add_lang_in_module. */
+void cbm_registry_add_qn_only(cbm_registry_t *r, const char *qualified_name, const char *label);
+
+/* True when a definition's extra_props (key, value, ..., NULL) carry the
+ * generated-member key (cbm.h CBM_PROP_GENERATED), e.g. a Java record's
+ * implicit accessor. Pure; unit-tested in test_registry.c. */
+bool cbm_def_props_generated(const char *const *extra_props);
+
+/* The stored-node twin of cbm_def_props_generated, for the incremental
+ * registry seed: true when a node's properties JSON carries that key as a
+ * string property. Pure; unit-tested in test_registry.c. */
+bool cbm_node_props_generated(const char *properties_json);
+
 /* True when code in `caller` can call a symbol defined in `target` by bare
  * name: same language, same interop family (JS/TS + script hosts, C/C++/CUDA/
  * ObjC, JVM, .NET, ...; the table lives in registry.c), or Swift with the C
@@ -511,6 +529,13 @@ bool cbm_c_member_rule_file(CBMLanguage lang, const char *rel_path);
  * registry carries that name (symbols of other labels are not candidates for
  * a member); NULL when none or several do. */
 const char *cbm_registry_unique_field_qn(const cbm_registry_t *r, const char *member_name);
+
+/* A Java call expression never names data: `p.x()` is a method invocation
+ * whatever `x` spells elsewhere in the project. Drops a CALLS bind whose
+ * target is a Variable or Field. Java only — Kotlin properties and C function
+ * pointers are callable names that are not methods. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

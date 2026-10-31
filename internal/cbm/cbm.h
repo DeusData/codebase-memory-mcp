@@ -298,9 +298,10 @@ typedef struct {
      * are bound to the owning result's source identity before cross-file use. */
     uint32_t test_name_start_byte, test_name_end_byte;
     uint32_t test_body_start_byte, test_body_end_byte;
-    /* Documents only: facts a document definition adds to its node's
-     * properties, as a NULL-terminated key, value, key, value, ... list (an
-     * ADR's id, status, date, deciders, title). Keys are fixed literals; the
+    /* Facts a definition adds to its node's properties, as a NULL-terminated
+     * key, value, key, value, ... list: a document's (an ADR's id, status,
+     * date, deciders, title), or CBM_PROP_GENERATED on a member the compiler
+     * writes and the source never spells. Keys are fixed literals; the
      * values are escaped where the properties are written. Tail field:
      * zero-init stays valid. */
     const char **extra_props;
@@ -320,6 +321,13 @@ typedef struct {
      * other language. Tail field: zero-init stays valid. */
     const char *alias_target;
 } CBMDefinition;
+
+/* extra_props key of a generated member, one the compiler writes and the
+ * source never spells: a Java record's implicit accessor carries
+ * `generated: record`. The node keeps the property, and the pipeline registers
+ * such a definition by qualified name only, so no short-name guess can land on
+ * it (pipeline.h cbm_def_props_generated). */
+#define CBM_PROP_GENERATED "generated"
 
 /* Argument captured from a call expression */
 typedef struct {
@@ -855,6 +863,8 @@ typedef struct {
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
 
+    uint64_t markdown_collection_steps; // collector cursor moves/node visits, not parser internals
+    uint64_t markdown_name_checks;      // heading-name lookup/group checks, excluding sorting
     CBMDefArray defs;
     CBMCallArray calls;
     CBMImportArray imports;
@@ -1066,6 +1076,9 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    /* Markdown: the settled names of the file's headings (extract_defs.c),
+     * NULL until the first heading; allocated in `scratch`. */
+    void *md_headings;
     const cbm_test_declarations_t *test_declarations; /* borrowed for this call only */
     bool test_declarations_raw_source;
     struct CBMTestDefinitionMatch *test_definition_matches; /* traversal scratch */

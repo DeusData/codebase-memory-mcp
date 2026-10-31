@@ -1663,8 +1663,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *  11: Python local defs and classes bind through their enclosing lexical
  *      scope, including app-factory route handlers. Published version 10
  *      predates this resolution, so unchanged files rebuild once on upgrade.
+ *  12: repeated ATX and Setext Markdown headings use parent-qualified Section
+ *      names only when distinct parent chains separate them. Unchanged bare names
+ *      are preserved and dotted-name collisions are disambiguated before section
+ *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
+ *      and diagram owners agree.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 11 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

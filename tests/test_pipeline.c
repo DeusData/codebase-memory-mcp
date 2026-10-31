@@ -18688,6 +18688,285 @@ TEST(pipeline_python_nested_def_local_after_incremental_issue1548) {
     PASS();
 }
 
+/* A Java record's implicit accessors are GENERATED members (#2295): Method
+ * nodes marked `generated: record`, registered by qualified name only, as a
+ * Python function's locals are. The type-aware resolver binds `p.y()` on a
+ * Point to Point.y; no short-name guess may land on a member the source never
+ * spells. `far` calls y() on a type outside the project, so the project-wide
+ * name registry is its only route to Point.y. `data` calls x(), whose other
+ * spelling is Spring's private field: neither the accessor (a name guess) nor
+ * the field (a Java call never names data) is its target. The record's
+ * hand-written z() and norm() are source members: no `generated` mark.
+ * `org.external.y.Vector` is not in the project, and its package segment `y`
+ * spells the accessor: the import's symbol-name fallback must not bind it
+ * there (no IMPORTS edge), or `new Vector()` in `make` would follow the import
+ * onto the accessor (elasticsearch: `import javax.crypto.spec.PBEKeySpec`
+ * bound a record's `spec()`). `stat` calls, and `refs` passes, the JDK's
+ * Objects.nonNull: no project callable is its target, and Seen's accessor --
+ * the only project callable called nonNull -- must not be taken for it on its
+ * leaf name alone (elasticsearch: `Objects.nonNull(x)` and
+ * `filter(Objects::nonNull)` bound a test record's nonNull()). */
+static const char jgen_point_java[] =
+    "package com.example;\n"
+    "public record Point(double x, double y, double z) {\n"
+    "    public double z() { return z; }\n"
+    "    public double norm() { return Math.sqrt(x * x + y * y + z * z); }\n"
+    "}\n";
+static const char jgen_seen_java[] = "package com.example;\n"
+                                     "record Seen(boolean nonNull) {}\n";
+static const char jgen_spring_java[] = "package com.example;\n"
+                                       "public final class Spring {\n"
+                                       "    private double x;\n"
+                                       "    public void put(double v) { this.x = v; }\n"
+                                       "}\n";
+static const char jgen_caller_java[] =
+    "package com.example;\n"
+    "import java.util.List;\n"
+    "import java.util.Objects;\n"
+    "import org.external.y.Vector;\n"
+    "public final class Caller {\n"
+    "    public double near(Point p) { return p.y(); }\n"
+    "    public double far(Vector v) { return v.y(); }\n"
+    "    public double data(Vector v) { return v.x(); }\n"
+    "    public Object make() { return new Vector(); }\n"
+    "    public boolean stat(Object o) { return Objects.nonNull(o); }\n"
+    "    public long refs(List<Object> xs) {\n"
+    "        return xs.stream().filter(Objects::nonNull).count();\n"
+    "    }\n"
+    "}\n";
+
+/* The id of the one `label` node called `name` in `file_path`; 0 when there is
+ * none or more than one. `generated` (optional) receives whether its
+ * properties carry the `generated: record` mark. */
+static int64_t jgen_node(cbm_store_t *s, const char *project, const char *name, const char *label,
+                         const char *file_path, bool *generated) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int64_t id = 0;
+    int hits = 0;
+    bool marked = false;
+    if (cbm_store_find_nodes_by_name(s, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0 && nodes[i].file_path &&
+            strcmp(nodes[i].file_path, file_path) == 0) {
+            hits++;
+            id = nodes[i].id;
+            marked = nodes[i].properties_json &&
+                     strstr(nodes[i].properties_json, "\"generated\":\"record\"") != NULL;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    if (generated) {
+        *generated = marked;
+    }
+    return hits == 1 ? id : 0;
+}
+
+/* CALLS edges out of `source_id` into `target_id`, or (target_id 0) into any
+ * node called `target_name`. */
+static int jgen_calls(cbm_store_t *s, int64_t source_id, int64_t target_id,
+                      const char *target_name) {
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    int n = 0;
+    if (cbm_store_find_edges_by_source_type(s, source_id, "CALLS", &edges, &ec) != CBM_STORE_OK) {
+        return -1;
+    }
+    for (int i = 0; i < ec; i++) {
+        if (target_id) {
+            n += edges[i].target_id == target_id;
+            continue;
+        }
+        cbm_node_t t = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].target_id, &t) == CBM_STORE_OK && t.name &&
+            strcmp(t.name, target_name) == 0) {
+            n++;
+        }
+        cbm_node_free_fields(&t);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, ec);
+    }
+    return n;
+}
+
+/* Edges of `type` into `target_id`. */
+static int jgen_edges_into(cbm_store_t *s, int64_t target_id, const char *type) {
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    if (cbm_store_find_edges_by_target_type(s, target_id, type, &edges, &ec) != CBM_STORE_OK) {
+        return -1;
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, ec);
+    }
+    return ec;
+}
+
+/* One fact of jgen_check: reported, counted, and the check goes on, so a run
+ * shows every fact that does not hold. */
+#define JGEN_EXPECT(cond)                                            \
+    do {                                                             \
+        if (!(cond)) {                                               \
+            printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            failed++;                                                \
+        }                                                            \
+    } while (0)
+
+/* Every fact the fixture pins, on one indexed store; the number that fail. */
+static int jgen_check(cbm_store_t *s, const char *project) {
+    int failed = 0;
+    bool gen_x = false;
+    bool gen_y = false;
+    bool gen_z = true;
+    bool gen_norm = true;
+    bool gen_nn = false;
+    int64_t acc_nn = jgen_node(s, project, "nonNull", "Method", "Seen.java", &gen_nn);
+    int64_t acc_x = jgen_node(s, project, "x", "Method", "Point.java", &gen_x);
+    int64_t acc_y = jgen_node(s, project, "y", "Method", "Point.java", &gen_y);
+    int64_t own_z = jgen_node(s, project, "z", "Method", "Point.java", &gen_z);
+    int64_t norm = jgen_node(s, project, "norm", "Method", "Point.java", &gen_norm);
+    int64_t near_m = jgen_node(s, project, "near", "Method", "Caller.java", NULL);
+    int64_t far_m = jgen_node(s, project, "far", "Method", "Caller.java", NULL);
+    int64_t data = jgen_node(s, project, "data", "Method", "Caller.java", NULL);
+    int64_t make = jgen_node(s, project, "make", "Method", "Caller.java", NULL);
+    int64_t stat = jgen_node(s, project, "stat", "Method", "Caller.java", NULL);
+    int64_t refs = jgen_node(s, project, "refs", "Method", "Caller.java", NULL);
+    JGEN_EXPECT(acc_x > 0 && acc_y > 0 && own_z > 0 && norm > 0 && acc_nn > 0);
+    JGEN_EXPECT(near_m > 0 && far_m > 0 && data > 0 && make > 0 && stat > 0 && refs > 0);
+    /* The compiler's members are marked; the hand-written ones are not. */
+    JGEN_EXPECT(gen_x);
+    JGEN_EXPECT(gen_y);
+    JGEN_EXPECT(gen_nn);
+    JGEN_EXPECT(!gen_z);
+    JGEN_EXPECT(!gen_norm);
+    /* Bound by qualified name through the receiver's type ... */
+    JGEN_EXPECT(jgen_calls(s, near_m, acc_y, NULL) == 1);
+    /* ... and never by a short-name guess. */
+    JGEN_EXPECT(jgen_calls(s, far_m, acc_y, NULL) == 0);
+    JGEN_EXPECT(jgen_calls(s, far_m, 0, "y") == 0);
+    /* Neither the accessor nor Spring's field `x`. */
+    JGEN_EXPECT(jgen_calls(s, data, 0, "x") == 0);
+    /* No import names a generated member, so nothing follows one onto it. */
+    JGEN_EXPECT(jgen_edges_into(s, acc_y, "IMPORTS") == 0);
+    JGEN_EXPECT(jgen_calls(s, make, 0, "y") == 0);
+    /* The JDK's Objects.nonNull is not Seen's accessor, called or referenced. */
+    JGEN_EXPECT(jgen_calls(s, stat, acc_nn, NULL) == 0);
+    JGEN_EXPECT(jgen_edges_into(s, acc_nn, "CALL_REFERENCE") == 0);
+    JGEN_EXPECT(jgen_edges_into(s, acc_nn, "USAGE") == 0);
+    return failed;
+}
+#undef JGEN_EXPECT
+
+static int jgen_write_fixture(const char *tmp) {
+    write_temp_file(tmp, "Point.java", jgen_point_java);
+    write_temp_file(tmp, "Seen.java", jgen_seen_java);
+    write_temp_file(tmp, "Spring.java", jgen_spring_java);
+    write_temp_file(tmp, "Caller.java", jgen_caller_java);
+    return 0;
+}
+
+TEST(pipeline_java_record_accessors_generated_qn_only) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_java_gen_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    jgen_write_fixture(tmp);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/java_gen.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = jgen_check(s, cbm_pipeline_project_name(p));
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+/* The same fixture through pass_parallel.c: >= 50 files and CBM_WORKERS=4. */
+TEST(pipeline_java_record_accessors_generated_qn_only_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_java_gen_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    jgen_write_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "Filler%d.java", i);
+        snprintf(body, sizeof(body),
+                 "package com.example;\nclass Filler%d { int f() { return %d; } }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/java_gen_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int run = p ? cbm_pipeline_run(p) : -1;
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(run, 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = jgen_check(s, cbm_pipeline_project_name(p));
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+/* An incremental re-index seeds its registry from the stored graph: the
+ * untouched Point.java's accessors come back from their nodes, and must stay
+ * out of the short-name index exactly as in the full index while the touched
+ * Caller.java is re-resolved. */
+TEST(pipeline_java_record_accessors_generated_qn_only_after_incremental) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_java_gen_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    jgen_write_fixture(tmp);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/java_gen_incr.db", tmp);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_pipeline_free(p1);
+
+    char caller_path[512];
+    snprintf(caller_path, sizeof(caller_path), "%s/Caller.java", tmp);
+    ASSERT_EQ(th_append_file(caller_path, "\n// touched: re-resolve Caller.java incrementally\n"),
+              0);
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int rc = jgen_check(s, cbm_pipeline_project_name(p2));
+    cbm_store_close(s);
+    cbm_pipeline_free(p2);
+    th_rmtree(tmp);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
 /* As pyn_edge, and the edge's properties also contain `fragment`. */
 static bool pyn_edge_with(cbm_store_t *s, const char *project, const char *src_rel,
                           const char *tgt_rel, const char *type, const char *fragment) {
@@ -28880,7 +29159,40 @@ TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
     PASS();
 }
 
+/* Discovery must choose the C++ grammar before the pipeline extracts .inc
+ * symbols; a direct extractor-only test would miss that routing failure. */
+TEST(pipeline_inc_c_family_fragments) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_inc_cpp_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "runtime.inc",
+                    "#define SAMPLE_CALLBACK(T) T\n"
+                    "extern \"C\" int sample_export() { return 0; }\n"
+                    "static SAMPLE_CALLBACK(int) sample_callback() { return sample_export(); }\n");
+    write_temp_file(tmp, "main.cpp", "#include \"runtime.inc\"\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    const cbm_index_mode_t modes[] = {CBM_MODE_FAST, CBM_MODE_FULL};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, modes[i]);
+        ASSERT_NOT_NULL(pipeline);
+        ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+        cbm_store_t *store = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(store);
+        const char *project = cbm_pipeline_project_name(pipeline);
+        ASSERT_EQ(fixture_node_count(store, project, "runtime.inc", "sample_export", "Function"),
+                  1);
+        ASSERT_EQ(fixture_node_count(store, project, "runtime.inc", "sample_callback", "Function"),
+                  1);
+        ASSERT_EQ(named_node_count(store, project, "extern"), 0);
+        cbm_store_close(store);
+        cbm_pipeline_free(pipeline);
+    }
+    th_rmtree(tmp);
+    PASS();
+}
 SUITE(pipeline) {
+    RUN_TEST(pipeline_inc_c_family_fragments);
     RUN_TEST(pipeline_python_module_callers_sequential);
     RUN_TEST(pipeline_python_module_callers_parallel);
     RUN_TEST(pipeline_python_class_body_calls_sequential);
@@ -29120,6 +29432,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_import_never_binds_a_local_def_issue1548);
     RUN_TEST(pipeline_python_nested_defs_parallel_issue1548);
     RUN_TEST(pipeline_python_nested_def_local_after_incremental_issue1548);
+    RUN_TEST(pipeline_java_record_accessors_generated_qn_only);
+    RUN_TEST(pipeline_java_record_accessors_generated_qn_only_parallel);
+    RUN_TEST(pipeline_java_record_accessors_generated_qn_only_after_incremental);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_issue1548);
     RUN_TEST(pipeline_python_local_def_shadows_module_def_parallel_issue1548);
     RUN_TEST(pipeline_python_super_follows_c3_mro);

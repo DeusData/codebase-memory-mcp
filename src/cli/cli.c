@@ -20,6 +20,7 @@
 #include "daemon/runtime.h"
 #include "daemon/version_cohort.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/json_writer.h"
@@ -2718,8 +2719,27 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path) {
 /* ── Agent detection ──────────────────────────────────────────── */
 
 static bool dir_exists(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    cbm_path_info_t info = {0};
+    if (cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK) {
+        return false;
+    }
+    if (info.is_directory) {
+        return true;
+    }
+#ifndef _WIN32
+    if (info.is_symlink) {
+        uid_t self = geteuid();
+        struct stat link_state;
+        if (lstat(path, &link_state) != 0 || !S_ISLNK(link_state.st_mode) ||
+            link_state.st_uid != self) {
+            return false;
+        }
+        struct stat target_state;
+        return stat(path, &target_state) == 0 && S_ISDIR(target_state.st_mode) &&
+               target_state.st_uid == self;
+    }
+#endif
+    return false;
 }
 
 /* Resolve the Claude Code config dir.
@@ -9297,7 +9317,11 @@ static const char *cbm_agent_registry_env_path(const char *env_name, const char 
 static bool cbm_agent_registry_path_exists(const char *path, const void *context) {
     (void)context;
     struct stat state;
+#ifndef _WIN32
+    return path && path[0] && lstat(path, &state) == 0 && !S_ISLNK(state.st_mode);
+#else
     return path && path[0] && stat(path, &state) == 0;
+#endif
 }
 
 static bool cbm_agent_registry_command_exists(const char *command, const void *context) {
