@@ -9853,9 +9853,6 @@ static bool fold_elixir_clause(CBMExtractCtx *ctx, const char *qn, TSNode scope,
     return true;
 }
 
-// Handle Elixir def/defp/defmacro — extract function definition. `scope` is the
-// module body the previous clause was extracted from, and is updated to this
-// def's own module body; see fold_elixir_clause for what it bounds.
 /* True when node `n` spans exactly the text `lit`. Avoids an arena allocation
  * per node in the complexity walk, which visits every node of every def. */
 static bool elixir_node_text_is(TSNode n, const char *source, const char *lit) {
@@ -10003,6 +10000,9 @@ static void elixir_compute_complexity(TSNode node, const char *source, cbm_compl
     cbm_walk_stack_release(stack, inline_stack);
 }
 
+// Handle Elixir def/defp/defmacro — extract function definition. `scope` is the
+// module body the previous clause was extracted from, and is updated to this
+// def's own module body; see fold_elixir_clause for what it bounds.
 static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char *macro,
                                     TSNode *scope) {
     CBMArena *a = ctx->arena;
