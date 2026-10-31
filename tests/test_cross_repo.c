@@ -944,10 +944,197 @@ TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
     PASS();
 }
 
+static bool cross_repo_seed_server_route(const cross_repo_fixture_t *fixture,
+                                         const char *target_project, const char *method,
+                                         const char *route_path, const char *handler_name) {
+    char target_path[512];
+    if (!cross_repo_project_path(fixture, target_project, target_path, sizeof(target_path))) {
+        return false;
+    }
+    cbm_store_t *target = cbm_store_open_path(target_path);
+    if (!target) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(target, target_project, fixture->cache) == CBM_STORE_OK;
+    char target_route_qn[256];
+    char handler_qn[256];
+    char route_name[128];
+    snprintf(target_route_qn, sizeof(target_route_qn), "__route__%s__%s", method, route_path);
+    snprintf(handler_qn, sizeof(handler_qn), "%s.%s", target_project, handler_name);
+    snprintf(route_name, sizeof(route_name), "%s %s", method, route_path);
+
+    cbm_node_t target_route = {.project = target_project,
+                               .label = "Route",
+                               .name = route_name,
+                               .qualified_name = target_route_qn,
+                               .file_path = "server.java"};
+    cbm_node_t handler = {.project = target_project,
+                          .label = "Function",
+                          .name = handler_name,
+                          .qualified_name = handler_qn,
+                          .file_path = "server.java"};
+    int64_t target_route_id = ok ? cbm_store_upsert_node(target, &target_route) : 0;
+    int64_t handler_id = ok ? cbm_store_upsert_node(target, &handler) : 0;
+    cbm_edge_t handles = {.project = target_project,
+                          .source_id = handler_id,
+                          .target_id = target_route_id,
+                          .type = "HANDLES"};
+    ok = ok && target_route_id > 0 && handler_id > 0 && cbm_store_insert_edge(target, &handles) > 0;
+    cbm_store_close(target);
+    return ok;
+}
+
+static bool cross_repo_seed_client_call(const cross_repo_fixture_t *fixture,
+                                        const char *source_project, const char *caller_name,
+                                        const char *callee_name, const char *url_path,
+                                        const char *method) {
+    char source_path[512];
+    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path))) {
+        return false;
+    }
+    cbm_store_t *source = cbm_store_open_path(source_path);
+    if (!source) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(source, source_project, fixture->cache) == CBM_STORE_OK;
+    char caller_qn[256];
+    char local_route_qn[256];
+    char edge_props[512];
+    snprintf(caller_qn, sizeof(caller_qn), "%s.%s", source_project, caller_name);
+    snprintf(local_route_qn, sizeof(local_route_qn), "__route__%s__%s", method ? method : "ANY",
+             url_path);
+    if (method) {
+        snprintf(edge_props, sizeof(edge_props),
+                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"method\":\"%s\"}", callee_name,
+                 url_path, method);
+    } else {
+        snprintf(edge_props, sizeof(edge_props),
+                 "{\"callee\":\"%s\",\"url_path\":\"%s\"}", callee_name, url_path);
+    }
+    cbm_node_t caller = {.project = source_project,
+                         .label = "Function",
+                         .name = caller_name,
+                         .qualified_name = caller_qn,
+                         .file_path = "item.service.ts"};
+    cbm_node_t local_route = {.project = source_project,
+                              .label = "Route",
+                              .name = url_path,
+                              .qualified_name = local_route_qn,
+                              .file_path = "item.service.ts"};
+    int64_t caller_id = ok ? cbm_store_upsert_node(source, &caller) : 0;
+    int64_t local_route_id = ok ? cbm_store_upsert_node(source, &local_route) : 0;
+    cbm_edge_t http_call = {.project = source_project,
+                            .source_id = caller_id,
+                            .target_id = local_route_id,
+                            .type = "HTTP_CALLS",
+                            .properties_json = edge_props};
+    ok = ok && caller_id > 0 && local_route_id > 0 && cbm_store_insert_edge(source, &http_call) > 0;
+    cbm_store_close(source);
+    return ok;
+}
+
+static int cross_repo_count_edges_like(const cross_repo_fixture_t *fixture, const char *project,
+                                       const char *edge_type, const char *pattern) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return -1;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    if (!store) {
+        return -1;
+    }
+    sqlite3_stmt *s = NULL;
+    int count = -1;
+    if (sqlite3_prepare_v2(
+            cbm_store_get_db(store),
+            "SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = ?2 AND properties LIKE ?3",
+            -1, &s, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(s, 1, project, -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 2, edge_type, -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 3, pattern, -1, SQLITE_STATIC);
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            count = sqlite3_column_int(s, 0);
+        }
+        sqlite3_finalize(s);
+    }
+    cbm_store_close(store);
+    return count;
+}
+
+/* #2768: Angular HttpClient calls must match cross-repo routes with exact HTTP verbs.
+ * When client makes GET requests to /items/list, /items/42, and /items/job/10,
+ * and the server defines overlapping routes:
+ *   DELETE /items/{id} (seeded first in DB)
+ *   GET    /items/{id} (seeded second in DB)
+ *   POST   /items/{parentId}/{id} (seeded first in DB)
+ *   GET    /items/job/{jobId} (seeded second in DB)
+ * the fuzzy route matcher must enforce method compatibility, linking the GET calls
+ * to their respective GET endpoints and never to DELETE or POST endpoints. */
+TEST(cross_repo_angular_http_client_exact_verb_matching_issue2768) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 /* Target server with overlapping endpoints */
+                 cross_repo_seed_server_route(&fixture, "api-2768", "GET", "/items/list",
+                                              "handle_list_items") &&
+                 cross_repo_seed_server_route(&fixture, "api-2768", "DELETE", "/items/{}",
+                                              "handle_delete_item") &&
+                 cross_repo_seed_server_route(&fixture, "api-2768", "GET", "/items/{}",
+                                              "handle_get_item") &&
+                 cross_repo_seed_server_route(&fixture, "api-2768", "POST", "/items/{}/{}",
+                                              "handle_post_nested_item") &&
+                 cross_repo_seed_server_route(&fixture, "api-2768", "GET", "/items/job/{}",
+                                              "handle_get_job") &&
+                 /* Angular client making GET requests */
+                 cross_repo_seed_client_call(&fixture, "angular-2768", "getItems",
+                                             "this.http.get", "/items/list", "GET") &&
+                 cross_repo_seed_client_call(&fixture, "angular-2768", "getItem",
+                                             "this.http.get", "/items/42", "GET") &&
+                 cross_repo_seed_client_call(&fixture, "angular-2768", "getJob",
+                                             "this.http.get", "/items/job/10", "GET");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed issue 2768 fixture");
+    }
+
+    const char *target = "api-2768";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("angular-2768", &target, 1);
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_EQ(fwd.http_edges, 3);
+
+    /* Assert that client CROSS_HTTP_CALLS edges are linked to GET handlers, not DELETE or POST */
+    ASSERT_EQ(cross_repo_count_edges_like(&fixture, "angular-2768", "CROSS_HTTP_CALLS",
+                                          "%handle_delete_item%"),
+              0);
+    ASSERT_EQ(cross_repo_count_edges_like(&fixture, "angular-2768", "CROSS_HTTP_CALLS",
+                                          "%handle_post_nested_item%"),
+              0);
+    ASSERT_EQ(cross_repo_count_edges_like(&fixture, "angular-2768", "CROSS_HTTP_CALLS",
+                                          "%handle_list_items%"),
+              1);
+    ASSERT_EQ(cross_repo_count_edges_like(&fixture, "angular-2768", "CROSS_HTTP_CALLS",
+                                          "%handle_get_item%"),
+              1);
+    ASSERT_EQ(cross_repo_count_edges_like(&fixture, "angular-2768", "CROSS_HTTP_CALLS",
+                                          "%handle_get_job%"),
+              1);
+
+    /* Reverse pass */
+    const char *consumer = "angular-2768";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api-2768", &consumer, 1);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(rev.http_edges, 3);
+
+    cross_repo_fixture_end(&fixture);
+    cbm_cross_repo_result_free(&fwd);
+    cbm_cross_repo_result_free(&rev);
+    PASS();
+}
+
 SUITE(cross_repo) {
     RUN_TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459);
     RUN_TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459);
     RUN_TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459);
+    RUN_TEST(cross_repo_angular_http_client_exact_verb_matching_issue2768);
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
