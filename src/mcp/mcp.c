@@ -5649,8 +5649,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
             "[\"send\",\"pubsub\",\"publish\"] — not a single string, and every element "
-            "must be a string. Split your query into individual keywords; each is scored "
-            "independently via per-keyword min-cosine.",
+            "must be a string. Elements may be keywords or short phrases; they are "
+            "combined into one hybrid BM25 + vector query.",
             true);
     }
 
