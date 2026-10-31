@@ -6180,6 +6180,149 @@ TEST(cli_zed_mcp_jsonc_comments) {
     PASS();
 }
 
+#ifndef _WIN32
+TEST(cli_install_agent_config_symlinks_issue2671) {
+    /* Refs #2671: dotfiles checkout pattern where agent config directory is a
+     * user-owned symlink into dotfiles under the user's home directory. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/Library/Application Support", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/Zed", parent_dir);
+#else
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/.config", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/zed", parent_dir);
+#endif
+
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
+
+    /* Dangling symlink and symlink to a regular file must remain undetected. */
+    char dangling_target[512];
+    snprintf(dangling_target, sizeof(dangling_target), "%s/dotfiles/missing-zed", tmpdir);
+    ASSERT_EQ(symlink(dangling_target, zed_link), 0);
+    bool dangling_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    ASSERT_EQ(symlink(dotfiles_settings, zed_link), 0);
+    bool file_link_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    /* Symlink resolving to a directory not owned by the invoking user must be refused. */
+    char foreign_dir[512];
+    const char *unowned_target = "/";
+    if (geteuid() == 0) {
+        snprintf(foreign_dir, sizeof(foreign_dir), "%s/dotfiles/foreign-zed", tmpdir);
+        test_mkdirp(foreign_dir);
+        ASSERT_EQ(chown(foreign_dir, 65534, 65534), 0);
+        unowned_target = foreign_dir;
+    }
+    ASSERT_EQ(symlink(unowned_target, zed_link), 0);
+    bool unowned_target_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    ASSERT_EQ(symlink(dotfiles_zed, zed_link), 0);
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT(!dangling_detected);
+    ASSERT(!file_link_detected);
+    ASSERT(!unowned_target_detected);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+
+TEST(cli_install_agent_config_file_symlink_issue2671) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-file-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/Library/Application Support/Zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#else
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/.config/zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#endif
+
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_settings_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  *  PATH management tests (port of TestCLI_InstallPATHAppend)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -19250,6 +19393,10 @@ SUITE(cli) {
     RUN_TEST(cli_zed_mcp_preserves_settings);
     RUN_TEST(cli_zed_mcp_uninstall);
     RUN_TEST(cli_zed_mcp_jsonc_comments);
+#ifndef _WIN32
+    RUN_TEST(cli_install_agent_config_symlinks_issue2671);
+    RUN_TEST(cli_install_agent_config_file_symlink_issue2671);
+#endif
 
     /* PATH management (3 tests) */
     RUN_TEST(cli_ensure_path_append);
