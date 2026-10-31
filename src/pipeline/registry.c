@@ -246,6 +246,113 @@ static int candidate_score(const char *candidate_qn, const char *module_qn, int 
     return score;
 }
 
+/* ── Receiver field-name hint (Rust value-receiver ties) ─────────────
+ *
+ * A lower-case receiver root names a VALUE (`entry.session.push_daily`), so
+ * receiver_chain_admits passes the call to every candidate unconditionally —
+ * its uppercase-root hard guard is deliberately value-blind. Among candidates
+ * that TIE on candidate_score the tie then ended in pure lexicographic QN
+ * order, which bound the field-receiver call to whichever same-named method
+ * sorted first: store_ffi.rs's `entry.session.push_daily` resolved to the
+ * trait stub Analytic.push_daily instead of Session.push_daily.
+ *
+ * The last chain segment before the method is the FIELD being read, and Rust
+ * field names match their declaring type case-insensitively ("session" ↔
+ * "Session") far more often than a lexicographic accident would. The hint is
+ * extracted once per resolve and applied only between two equal-scoring RUST
+ * candidates, ahead of the lexicographic fallback. A tiebreak, never a hard
+ * admit/refuse: when no candidate's type segment matches (chained method
+ * calls, foreign names) the pre-existing tie order stands. */
+static void receiver_field_hint(const char *callee_name, char *out, size_t cap) {
+    out[0] = '\0';
+    if (!callee_name || !callee_name[0] || cap == 0) {
+        return;
+    }
+    /* Normalize "::" → "." so the chain composes with dotted candidate QNs
+     * (same as receiver_chain_admits); strip the whitespace raw slices of
+     * line-wrapped call spans carry — none of it carries signal. */
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else if (*s == ' ' || *s == '\r' || *s == '\n' || *s == '\t') {
+            s++; /* embedded whitespace from a wrapped call span */
+        } else {
+            dotted[w++] = *s++;
+        }
+    }
+    dotted[w] = '\0';
+
+    const char *last_dot = strrchr(dotted, '.');
+    if (!last_dot || last_dot == dotted) {
+        return; /* bare name — no receiver chain */
+    }
+    if (dotted[0] >= 'A' && dotted[0] <= 'Z') {
+        return; /* uppercase root: type-rooted chains are already hard-guarded
+                 * by receiver_chain_admits; do not shift its verdicts */
+    }
+    /* The receiver's last segment before the method = the field. */
+    const char *prev = last_dot - 1;
+    while (prev > dotted && *prev != '.') {
+        prev--;
+    }
+    if (*prev == '.') {
+        prev++;
+    }
+    size_t flen = (size_t)(last_dot - prev);
+    if (flen >= 2 && prev[flen - 2] == '(' && prev[flen - 1] == ')') {
+        flen -= 2; /* `JSONEncoder().encode` reads as JSONEncoder */
+    }
+    if (flen == 0 || flen >= cap) {
+        return;
+    }
+    memcpy(out, prev, flen);
+    out[flen] = '\0';
+    if (out[0] >= '0' && out[0] <= '9') {
+        out[0] = '\0'; /* a tuple index names no type */
+    }
+}
+
+/* Does the Method candidate's owning-type segment case-insensitively equal
+ * the receiver-field hint (`<…>.Session.push_daily` matches "session")? */
+static bool rust_hint_matches_type(const char *qn, const char *hint) {
+    if (!qn || !hint || !hint[0]) {
+        return false;
+    }
+    const char *last = strrchr(qn, '.');
+    if (!last || last == qn) {
+        return false; /* bare candidate — no type segment */
+    }
+    const char *prev = last - 1;
+    while (prev > qn && *prev != '.') {
+        prev--;
+    }
+    if (*prev == '.') {
+        prev++;
+    }
+    size_t flen = (size_t)(last - prev);
+    size_t hlen = strlen(hint);
+    if (flen != hlen) {
+        return false;
+    }
+    for (size_t i = 0; i < hlen; i++) {
+        char a = prev[i];
+        char b = hint[i];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* How plainly a candidate is something a call can target, lower = better: a
  * function or method; then any other definition (a class for a constructor
  * call, a macro, a type); then a candidate whose label is unknown; last a
@@ -294,7 +401,8 @@ static bool csharp_reference_stub(const char *qn, uint8_t lang) {
  * django's `Model.objects.filter` to the template `Library.filter`, one
  * segment shallower than `QuerySet.filter` (2026-10-10 audit). */
 static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candidate,
-                                      uint8_t candidate_lang, const char *best, uint8_t best_lang) {
+                                      uint8_t candidate_lang, const char *best, uint8_t best_lang,
+                                      const char *hint) {
     int ck = callable_rank(r, candidate);
     int bk = callable_rank(r, best);
     if (ck != bk) {
@@ -305,7 +413,44 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
     if (cs != bs) {
         return !cs;
     }
+    if (hint && hint[0] && candidate_lang == (uint8_t)CBM_LANG_RUST &&
+        best_lang == (uint8_t)CBM_LANG_RUST) {
+        bool ch = rust_hint_matches_type(candidate, hint);
+        bool bh = rust_hint_matches_type(best, hint);
+        if (ch != bh) {
+            return ch;
+        }
+    }
     return strcmp(candidate, best) < 0;
+}
+
+/* The ONE callable Rust candidate whose owning type matches the receiver-field
+ * hint, or NULL when none does or more than one does (ambiguity keeps the
+ * pre-existing verdict). Used where import filtering has already collapsed the
+ * field to a single candidate: the receiver field is stronger evidence than
+ * "this file imports the trait's module", but only when it names exactly one
+ * target. */
+static const char *rust_unique_hint_candidate(const cbm_registry_t *r, const char **candidates,
+                                              const uint8_t *lang_flags, int count,
+                                              const char *hint) {
+    if (!hint || !hint[0]) {
+        return NULL;
+    }
+    const char *found = NULL;
+    for (int i = 0; i < count; i++) {
+        uint8_t lang = lang_flags ? lang_flags[i] : (uint8_t)CBM_LANG_COUNT;
+        if (lang != (uint8_t)CBM_LANG_RUST || callable_rank(r, candidates[i]) != 0) {
+            continue;
+        }
+        if (!rust_hint_matches_type(candidates[i], hint)) {
+            continue;
+        }
+        if (found) {
+            return NULL; /* two Rust methods of different types both match */
+        }
+        found = candidates[i];
+    }
+    return found;
 }
 
 /* Pick candidate with highest composite score (test-deprioritization + namespace
@@ -314,7 +459,10 @@ static bool candidate_outranks_on_tie(const cbm_registry_t *r, const char *candi
  * when the caller has none (a filtered subset carries its own copies). */
 static const char *best_by_import_distance(const cbm_registry_t *r, const char **candidates,
                                            const uint8_t *is_test_flags, const uint8_t *lang_flags,
-                                           int count, const char *module_qn) {
+                                           int count, const char *module_qn,
+                                           const char *callee_name) {
+    char hint[CBM_SZ_128];
+    receiver_field_hint(callee_name, hint, sizeof(hint));
     const char *best = NULL;
     uint8_t best_lang = (uint8_t)CBM_LANG_COUNT;
     int best_score = CBM_NOT_FOUND;
@@ -324,7 +472,7 @@ static const char *best_by_import_distance(const cbm_registry_t *r, const char *
         uint8_t lang = lang_flags ? lang_flags[i] : (uint8_t)CBM_LANG_COUNT;
         if (score > best_score ||
             (score == best_score && best &&
-             candidate_outranks_on_tie(r, candidates[i], lang, best, best_lang))) {
+             candidate_outranks_on_tie(r, candidates[i], lang, best, best_lang, hint))) {
             best_score = score;
             best = candidates[i];
             best_lang = lang;
@@ -1947,8 +2095,8 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
 
 /* Strategy 4: multiple candidates with import filtering. */
 static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, const qn_array_t *arr,
-                                                   const char *module_qn, const char **import_vals,
-                                                   int import_count) {
+                                                   const char *callee_name, const char *module_qn,
+                                                   const char **import_vals, int import_count) {
     const char *filtered[CBM_SZ_256];
     uint8_t filtered_test[CBM_SZ_256];
     uint8_t filtered_lang[CBM_SZ_256];
@@ -1968,20 +2116,36 @@ static cbm_resolution_t resolve_multi_with_imports(const cbm_registry_t *r, cons
         }
     }
     if (fcount == SKIP_ONE) {
+        /* Import filtering collapsed the field to one candidate, but "this file
+         * imports the trait's module" is weaker evidence than the receiver's
+         * declared field type: store_ffi.rs imports `Analytic` and calls
+         * `entry.session.push_daily()`, where the field is a `Session`. Lift the
+         * unique Rust method the field names — at the no-filter confidence,
+         * because the import verdict was overridden rather than confirmed. */
+        char hint[CBM_SZ_128];
+        receiver_field_hint(callee_name, hint, sizeof(hint));
+        const char *hinted = rust_unique_hint_candidate(r, (const char **)arr->items,
+                                                        qn_lang_flags(arr), arr->count, hint);
+        if (hinted && strcmp(hinted, filtered[0]) != 0) {
+            double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
+            return (cbm_resolution_t){hinted, "suffix_match", conf, arr->count};
+        }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best = best_by_import_distance(r, filtered, flags ? filtered_test : NULL,
-                                                   langs ? filtered_lang : NULL, fcount, module_qn);
+        const char *best =
+            best_by_import_distance(r, filtered, flags ? filtered_test : NULL,
+                                    langs ? filtered_lang : NULL, fcount, module_qn, callee_name);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
     /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best =
+        best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                qn_lang_flags(arr), arr->count, module_qn, callee_name);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
@@ -2197,10 +2361,12 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
+        return resolve_multi_with_imports(r, arr, callee_name, module_qn, import_vals,
+                                          import_count);
     }
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
+    const char *best =
+        best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                qn_lang_flags(arr), arr->count, module_qn, callee_name);
     if (best) {
         if (!receiver_chain_admits(callee_name, best)) {
             return empty_result();
@@ -2718,7 +2884,7 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
     if (fcount == 0) {
         /* No import-reachable — use originals with penalty */
         const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                                   qn_lang_flags(arr), arr->count, module_qn);
+                                                   qn_lang_flags(arr), arr->count, module_qn, NULL);
         if (!best) {
             return no_match;
         }
@@ -2733,8 +2899,9 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             true};
     }
     const bool all = fptr == (const char **)arr->items;
-    const char *best = best_by_import_distance(r, fptr, all ? qn_test_flags(arr) : NULL,
-                                               all ? qn_lang_flags(arr) : NULL, fcount, module_qn);
+    const char *best =
+        best_by_import_distance(r, fptr, all ? qn_test_flags(arr) : NULL,
+                                all ? qn_lang_flags(arr) : NULL, fcount, module_qn, NULL);
     if (!best) {
         return no_match;
     }
