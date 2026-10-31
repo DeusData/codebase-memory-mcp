@@ -9714,6 +9714,24 @@ static TSNode elixir_call_args(TSNode node) {
     return args;
 }
 
+/* Combine one folded clause's metric with the function's value so far. A clause
+ * whose walk could not finish reports CBM_WALK_METRIC_UNAVAILABLE, and so does
+ * the folded function: a sum that skipped that clause would read low on exactly
+ * the largest functions. */
+static int elixir_fold_metric_sum(int acc, int clause) {
+    if (acc < 0 || clause < 0) {
+        return CBM_WALK_METRIC_UNAVAILABLE;
+    }
+    return acc + clause;
+}
+
+static int elixir_fold_metric_max(int acc, int clause) {
+    if (acc < 0 || clause < 0) {
+        return CBM_WALK_METRIC_UNAVAILABLE;
+    }
+    return clause > acc ? clause : acc;
+}
+
 // Fold one more clause of an Elixir function into the def already pushed for
 // the previous clause. Every clause is its own `def` call, and an Elixir QN
 // carries neither module nor arity, so all of them compute one qualified name
@@ -9792,9 +9810,10 @@ static TSNode elixir_call_args(TSNode node) {
 // name, where the pre-patch last-clause-wins record reported a publicly
 // callable name as unexported. Verified against the source in every one: the
 // new value is the correct one.
+// `cx` is this clause's own complexity; a folded clause adds it to the function.
 // Returns true when the clause folded.
 static bool fold_elixir_clause(CBMExtractCtx *ctx, const char *qn, TSNode scope, TSNode node,
-                               uint32_t end_line, bool is_exported) {
+                               uint32_t end_line, bool is_exported, const cbm_complexity_t *cx) {
     if (!qn || ctx->result->defs.count <= 0 || ts_node_is_null(scope)) {
         return false;
     }
@@ -9819,6 +9838,18 @@ static bool fold_elixir_clause(CBMExtractCtx *ctx, const char *qn, TSNode scope,
         prev->end_line = end_line;
     }
     prev->is_exported = prev->is_exported || is_exported;
+    /* One node now stands for every clause, so its metrics cover every clause
+     * rather than the first: branch and loop counts add up, the nesting depths
+     * take the deepest clause, and each clause past the first is one more
+     * dispatch decision. A multi-clause function with no branch in any body is
+     * still a decision tree over its heads. `lines` follows the widened span. */
+    int cyclomatic = elixir_fold_metric_sum(prev->complexity, cx->cyclomatic);
+    prev->complexity = cyclomatic < 0 ? cyclomatic : cyclomatic + 1;
+    prev->cognitive = elixir_fold_metric_sum(prev->cognitive, cx->cognitive);
+    prev->loop_count = elixir_fold_metric_sum(prev->loop_count, cx->loop_count);
+    prev->loop_depth = elixir_fold_metric_max(prev->loop_depth, cx->loop_depth);
+    prev->max_access_depth = elixir_fold_metric_max(prev->max_access_depth, cx->max_access_depth);
+    prev->lines = (int)(prev->end_line - prev->start_line + TS_LINE_OFFSET);
     return true;
 }
 
@@ -10010,7 +10041,9 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
     uint32_t start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     uint32_t end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     bool is_exported = (strcmp(macro, "def") == 0 || strcmp(macro, "defmacro") == 0);
-    bool folded = fold_elixir_clause(ctx, qn, *scope, node, end_line, is_exported);
+    cbm_complexity_t cx;
+    elixir_compute_complexity(node, ctx->source, &cx);
+    bool folded = fold_elixir_clause(ctx, qn, *scope, node, end_line, is_exported, &cx);
     *scope = ts_node_parent(node);
     if (folded) {
         return;
@@ -10026,8 +10059,6 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
     def.end_line = end_line;
     def.is_exported = is_exported;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
-    cbm_complexity_t cx;
-    elixir_compute_complexity(node, ctx->source, &cx);
     def.complexity = cx.cyclomatic;
     def.cognitive = cx.cognitive;
     def.loop_count = cx.loop_count;

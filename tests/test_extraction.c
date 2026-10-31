@@ -2810,6 +2810,57 @@ TEST(elixir_complexity_and_fingerprint) {
     PASS();
 }
 
+/* The clauses of a multi-clause function fold into one Function node, so that
+ * node's metrics must cover every clause, not just the first: branch, cognitive
+ * and loop counts add up, loop_depth and max_access_depth take the deepest
+ * clause, every clause past the first is one more dispatch decision, and
+ * `lines` is the folded span. `single` repeats the second clause on its own as
+ * the per-clause reference: it is not folded, so it carries no dispatch charge. */
+TEST(elixir_folded_clause_metrics_cover_every_clause) {
+    CBMFileResult *r = extract("defmodule Route do\n"                             /* 1 */
+                               "  def pick(0), do: Map.new()\n"                   /* 2 */
+                               "  def pick(n) when n > 0 do\n"                    /* 3 */
+                               "    for x <- [n], do: Map.new([{x, x}])\n"        /* 4 */
+                               "  end\n"                                          /* 5 */
+                               "  def pick(rows) do\n"                            /* 6 */
+                               "    for row <- rows, do: (for x <- row, do: x)\n" /* 7 */
+                               "  end\n"                                          /* 8 */
+                               "  def single(n) when n > 0 do\n"                  /* 9 */
+                               "    for x <- [n], do: Map.new([{x, x}])\n"        /* 10 */
+                               "  end\n"                                          /* 11 */
+                               "end\n",                                           /* 12 */
+                               CBM_LANG_ELIXIR, "t", "route.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(1, count_defs_named(r, "Function", "pick"));
+    const CBMDefinition *one = elixir_first_def(r, "single");
+    ASSERT_NOT_NULL(one);
+    /* `when` + `for`, each at nesting 0; one comprehension; Map.new is one dot */
+    ASSERT_EQ(2, one->complexity);
+    ASSERT_EQ(2, one->cognitive);
+    ASSERT_EQ(1, one->loop_count);
+    ASSERT_EQ(1, one->loop_depth);
+    ASSERT_EQ(1, one->max_access_depth);
+    ASSERT_EQ(3, one->lines);
+
+    const CBMDefinition *pick = elixir_first_def(r, "pick");
+    ASSERT_NOT_NULL(pick);
+    ASSERT_EQ(2, (int)pick->start_line);
+    ASSERT_EQ(8, (int)pick->end_line);
+    /* clauses 0 + 2 + 2, plus 2 for the two clauses past the first */
+    ASSERT_EQ(6, pick->complexity);
+    /* 0 + 2 + (1 + 2): the inner comprehension sits one level deep */
+    ASSERT_EQ(5, pick->cognitive);
+    ASSERT_EQ(3, pick->loop_count);
+    /* the deepest clause, not the sum of the clauses (that would be 3) */
+    ASSERT_EQ(2, pick->loop_depth);
+    /* two clauses with one dot each: the deepest is 1, the sum would be 2 */
+    ASSERT_EQ(1, pick->max_access_depth);
+    ASSERT_EQ(7, pick->lines);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* The Elixir complexity walk keeps its pending nodes on the growable stack
  * cbm_compute_complexity uses. A fixed 4096-frame stack dropped the FIRST
  * children of any wider body (they are pushed last-to-first), so the largest
@@ -14649,6 +14700,7 @@ SUITE(extraction) {
     RUN_TEST(extract_elixir_guarded_def_head_guard_usages);
     RUN_TEST(elixir_channels_pubsub_and_handle_in);
     RUN_TEST(elixir_complexity_and_fingerprint);
+    RUN_TEST(elixir_folded_clause_metrics_cover_every_clause);
     RUN_TEST(elixir_complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(haskell_function);
     RUN_TEST(haskell_infix_definition_name);
