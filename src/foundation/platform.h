@@ -215,4 +215,17 @@ int64_t cbm_file_size(const char *path);
  * On POSIX, this is a no-op. Returns the input pointer. */
 char *cbm_normalize_path_sep(char *path);
 
+/* ── CPU scheduling priority ───────────────────────────────────── */
+
+enum { CBM_LOW_CPU_PRIORITY_NICE = 10 };
+
+/* Lower this process's CPU scheduling priority so background work yields the
+ * cores to interactive processes. POSIX: nice CBM_LOW_CPU_PRIORITY_NICE (never
+ * raises an already-nicer process). Plain nice only, deliberately not macOS
+ * background QoS: that pins work to efficiency cores and throttles I/O.
+ * Windows: BELOW_NORMAL_PRIORITY_CLASS. On Linux nice is per thread, so call
+ * this before creating threads; later threads inherit it.
+ * Returns false when the priority could not be changed. */
+bool cbm_lower_cpu_priority(void);
+
 #endif /* CBM_PLATFORM_H */
