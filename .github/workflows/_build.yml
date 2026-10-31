@@ -41,7 +41,9 @@ jobs:
             goarch: arm64
             cc: gcc
             cxx: g++
-          - os: macos-14
+          # The macOS minimum (14.0) is pinned in Makefile.cbm, not inherited
+          # from this runner's SDK, so both darwin binaries still start on macOS 14.
+          - os: macos-15
             goos: darwin
             goarch: arm64
             cc: cc

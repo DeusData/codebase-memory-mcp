@@ -40,7 +40,7 @@ jobs:
             group: linux
             cc: gcc
             cxx: g++
-          - os: macos-14
+          - os: macos-15
             group: macos
             cc: cc
             cxx: c++

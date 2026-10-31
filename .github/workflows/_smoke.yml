@@ -33,7 +33,7 @@ jobs:
           CORE_UNIX='[
             {"os":"ubuntu-latest","goos":"linux","goarch":"amd64"},
             {"os":"ubuntu-24.04-arm","goos":"linux","goarch":"arm64"},
-            {"os":"macos-14","goos":"darwin","goarch":"arm64"},
+            {"os":"macos-15","goos":"darwin","goarch":"arm64"},
             {"os":"macos-15-intel","goos":"darwin","goarch":"amd64"}
           ]'
           # Broad legs reuse existing goos/goarch artifacts on additional OS
@@ -47,9 +47,10 @@ jobs:
           # (ubuntu-22.04 / 22.04-arm). So the dynamic broad legs stay on
           # forward-compatible OSes only (macOS); running the dynamic binary on
           # ubuntu-22.04 would fail Phase 1 (glibc too old), not a real regression.
-          BROAD_UNIX='[
-            {"os":"macos-15","goos":"darwin","goarch":"arm64"}
-          ]'
+          # Empty since the move off macos-14 (retired 2026-11-02): the darwin-arm64
+          # artifact is now built AND smoked on macos-15, the core leg, which was
+          # this broad leg.
+          BROAD_UNIX='[]'
           CORE_WIN='[{"os":"windows-latest","arch":"amd64"}]'
           # windows-11-arm now runs the NATIVE arm64 binary (build-windows-arm64),
           # not the x86_64 binary under emulation — we smoke the artifact we ship.

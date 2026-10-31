@@ -355,7 +355,7 @@ static authority_callable_result_t authority_c_function_pointer(int mode) {
     out.setup = ok;
     if (ok) {
         cbm_pxc_run_one_with_imports(language, results[0], sources[0], (int)strlen(sources[0]),
-                                     modules[0], defs, def_count, names, values, count, NULL,
+                                     modules[0], NULL, defs, def_count, names, values, count, NULL,
                                      snapshot);
         const char *spelling = mode == 1 || mode == 15 ? "copy" : mode == 5 ? "foo" : "fp";
         const char *needle = mode == 1 || mode == 15 ? "copy();" : mode == 5 ? "foo();" : "fp();";

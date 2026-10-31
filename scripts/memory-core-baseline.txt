@@ -74,9 +74,9 @@ src/pipeline/pass_semantic.c	3
 src/pipeline/pass_tests.c	3
 src/pipeline/pass_usages.c	4
 src/pipeline/path_alias.c	40
-src/pipeline/pipeline.c	132
+src/pipeline/pipeline.c	129
 src/pipeline/pipeline_delta.c	19
-src/pipeline/pipeline_incremental.c	140
+src/pipeline/pipeline_incremental.c	130
 src/pipeline/registry.c	17
 src/pipeline/worker_pool.c	2
 src/store/store.c	354

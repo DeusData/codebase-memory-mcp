@@ -57,18 +57,21 @@ jobs:
         run: |
           # Every CORE leg is tagged with the lane (scripts/ci/select-lanes.sh)
           # it serves; the tag is what lane selection filters on below.
+          # The lane names unix-macos14 and tsan-mac are kept as lane keys
+          # (select-lanes.sh, ci-ok and the lane contracts key on them); both
+          # run on macos-15 because GitHub retires the macos-14 image on 2026-11-02.
           CORE_UNIX='[
             {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","lane":"unix-x86"},
             {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++","lane":"unix-arm64"},
-            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"unix-macos14"},
+            {"os":"macos-15","cc":"cc","cxx":"c++","lane":"unix-macos14"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++","lane":"unix-macos-intel"}
           ]'
           # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
           # escape hatches): the release dry run must be all-green, every platform.
+          # macos-15 is the CORE macOS arm64 leg now, so it is not repeated here.
           BROAD_UNIX='[
             {"os":"ubuntu-22.04","cc":"gcc","cxx":"g++"},
-            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-15","cc":"cc","cxx":"c++"}
+            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"}
           ]'
           # Each Windows leg pins the msys2 environment + package arch to the
           # RUNNER architecture so the build is native, never emulated:
@@ -92,7 +95,7 @@ jobs:
           TSAN='[
             {"os":"ubuntu-latest","cc":"clang","cxx":"clang++","lane":"tsan-x86"},
             {"os":"ubuntu-24.04-arm","cc":"clang","cxx":"clang++","lane":"tsan-arm"},
-            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"tsan-mac"}
+            {"os":"macos-15","cc":"cc","cxx":"c++","lane":"tsan-mac"}
           ]'
           # Lane selection. "all" (dry run, release) keeps every leg and drops
           # the tags, so those matrices -- and their job names -- stay exactly

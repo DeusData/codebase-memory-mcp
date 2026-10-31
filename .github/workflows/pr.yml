@@ -175,7 +175,7 @@ jobs:
           cat "$RUNNER_TEMP/selection.txt" >> "$GITHUB_OUTPUT"
           # pr-smoke's legs, each tagged with its lane (kept in the job name,
           # where ci-ok reads it back); the job gets the selected ones.
-          SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-14","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
+          SMOKE='[{"os":"ubuntu-latest","lane":"smoke-ubuntu"},{"os":"macos-15","lane":"smoke-mac"},{"os":"windows-latest","lane":"smoke-win"}]'
           LANES=$(sed -n 's/^lanes=//p' "$RUNNER_TEMP/selection.txt")
           echo "smoke={\"include\":$(jq -c --argjson sel "$LANES" 'map(select(.lane | IN($sel[])))' <<< "$SMOKE")}" >> "$GITHUB_OUTPUT"
           # The CodeQL legs, tagged the same way (codeql.yml's full matrix has
@@ -214,7 +214,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
 
       - name: Install ccache (macOS)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
         run: command -v ccache >/dev/null 2>&1 || brew install ccache
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
@@ -254,7 +254,7 @@ jobs:
           SMOKE_REQUIRE_WRAPPERS: "1"
 
       - name: Build prod + smoke (macOS)
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
         run: |
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp

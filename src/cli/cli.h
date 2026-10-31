@@ -250,6 +250,8 @@ void cbm_cli_set_client_selection_for_testing(const char *spec);
  * not recognisably foreign. Detection must be positive evidence — see the
  * implementation comment. */
 const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+/* #2722: override runtime binary self-path detection for testing. */
+void cbm_cli_set_self_path_override_for_test(const char *self_path);
 /* #1558: expose the config-key table so a test can prove a key is discoverable
  * (`config list`/`set` both walk it). */
 size_t cbm_cli_config_key_count_for_testing(void);

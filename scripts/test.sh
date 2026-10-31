@@ -496,6 +496,14 @@ make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
+# Step 5-alloc: the production allocator object Step 5 just built. The unit
+# suites link mimalloc's debug build without the global override, so they cannot
+# see free(NULL) before the allocator's constructor (mimalloc #1341, PR #2562)
+# or the vendored local patches; this links small fixtures against
+# prod_mimalloc.o itself.
+echo "=== Step 5-alloc: production allocator contract (mimalloc #1341 + local patches) ==="
+bash "$ROOT/tests/test_prod_allocator_contract.sh" "$ROOT/$BUILD_DIR"
+
 # Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which
 # makes it the first casualty when static TLS grows — glibc takes the TLS block
 # out of each thread's own stack allocation. Checked here, against the binary

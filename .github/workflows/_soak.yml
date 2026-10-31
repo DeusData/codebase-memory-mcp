@@ -44,7 +44,7 @@ jobs:
             goarch: arm64
             cc: gcc
             cxx: g++
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: arm64
             cc: cc
@@ -335,7 +335,7 @@ jobs:
             goarch: arm64
             cc: gcc
             cxx: g++
-          - os: macos-14
+          - os: macos-15
             goos: darwin
             goarch: arm64
             cc: cc

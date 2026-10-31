@@ -117,7 +117,7 @@ static bool go_exact_rows(const CBMResolvedCallArray *rows, const char *source,
 
 static void go_cross(CBMArena *arena, const char *source, CBMLSPDef *defs, int count,
                      const char **names, const char **qns, int imports, CBMResolvedCallArray *out) {
-    cbm_run_go_lsp_cross(arena, source, (int)strlen(source), "test.main", defs, count, names, qns,
+    cbm_run_go_lsp_cross(arena, source, (int)strlen(source), "test.main", NULL, defs, count, names, qns,
                          imports, NULL, out);
 }
 

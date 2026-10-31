@@ -255,7 +255,7 @@ codebase-memory-mcp config set auto_index true
 
 `auto_index` is off by default. When enabled, new projects are indexed automatically on first connection. The configurable file limit is `config set auto_index_limit 50000`. Previously indexed projects can be watched through `auto_watch` (on by default), subject to its global setting and session ownership.
 
-Each initialized, long-lived MCP session can register its root project when it connects and any target from a successful `index_repository` call, including custom project names and roots in another worktree. While `auto_watch` is enabled, these watches belong to the registering sessions and remain while at least one owning session is connected; closing the last owner removes the watch. An async index registers its target only after success and while its requesting session remains connected. CLI indexing and failed MCP indexes do not register watches. Global `auto_watch` controls registration and removes all watches on the next refresh or registration request when set to `false`. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
+Each initialized, long-lived MCP session can register its root project when it connects and any target from a successful `index_repository` call, including custom project names and roots in another worktree. While `auto_watch` is enabled, these watches belong to the registering sessions and remain while at least one owning session is connected; closing the last owner removes the watch. Under a daemon started with `daemon start` a watch outlives its last owning session: the project stays watched and is re-indexed in the background when it changes, until that daemon stops, the project is deleted, its directory disappears, or `auto_watch` is set to `false`. An async index registers its target only after success and while its requesting session remains connected. CLI indexing and failed MCP indexes do not register watches. Global `auto_watch` controls registration and removes all watches on the next refresh or registration request when set to `false`. `index_status` reports this in its `watch` object: `watched`, and either the poll cadence and last scan time or the `reason` it is not watched.
 
 Watcher registration is controlled globally by `auto_watch` (default `true`). On the next refresh or registration request, `true` allows MCP sessions to register their root on connect and their successful `index_repository` targets; `false` removes all watches. CLI indexing and failed MCP indexes do not add watches.
 
@@ -578,6 +578,30 @@ Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-
 You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ```
 
+### Install via Claude Code plugin
+
+This repository is also a Claude Code plugin marketplace, so you can find and
+add the server from inside Claude Code:
+
+```bash
+claude plugin marketplace add DeusData/codebase-memory-mcp
+claude plugin install codebase-memory@codebase-memory
+```
+
+The plugin registers the MCP server only. It starts the server with
+`npx -y codebase-memory-mcp@<version>`, pinned to the current release; the first
+start downloads that release's binary through the npm package, which verifies
+it against the release checksums. The skill, the three graph agents and the
+context hooks are not part of the plugin: they come from
+`codebase-memory-mcp install`.
+
+Use one or the other. `install` registers the same server for Claude Code, so
+with both you run it twice, under two tool namespaces
+(`mcp__codebase-memory-mcp__*` and
+`mcp__plugin_codebase-memory_codebase-memory-mcp__*`). Choose `install` for the
+full Claude Code setup; choose the plugin to add just the server without
+running an installer.
+
 ### Build from Source
 
 <details>
@@ -880,9 +904,9 @@ Tools requiring arguments accept JSON piped on stdin. Tools with only optional a
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. A successful call from an active MCP session registers the target for auto-sync while that session remains connected, subject to the global `auto_watch` setting; CLI calls do not register watches. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
+| `index_repository` | Index a repository into the graph. A successful call from an active MCP session registers the target for auto-sync while that session remains connected (under `daemon start`, also after it disconnects), subject to the global `auto_watch` setting; CLI calls do not register watches. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List indexed projects with paging; use `detail: "stats"` for node/edge counts and database sizes. |
-| `delete_project` | Remove a project and all its graph data. |
+| `delete_project` | Remove a project and all its graph data, including its ADR sidecar (`<db>.adr.db`). |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
 
@@ -1036,6 +1060,8 @@ Project config overrides global for conflicting extensions. An entry whose langu
 SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
 
 ## Troubleshooting
+
+Windows users: see [Windows troubleshooting](docs/WINDOWS_TROUBLESHOOTING.md) for versioned known issues and workarounds.
 
 | Problem | Fix |
 |---------|-----|

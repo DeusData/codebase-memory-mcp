@@ -1509,6 +1509,12 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
+    /* A generated member stays out of the short-name index here as in the
+     * full index (pass_definitions.c); its node carries the mark. */
+    if (cbm_node_props_generated(node->properties_json)) {
+        cbm_registry_add_qn_only(seed->registry, node->qualified_name, node->label);
+        return;
+    }
     CBMLanguage lang = cbm_registry_synthetic_path_language(node->file_path);
     if (lang == CBM_LANG_COUNT && seed->lang_by_path && node->file_path) {
         void *v = cbm_ht_get(seed->lang_by_path, node->file_path);
@@ -1738,7 +1744,12 @@ static int surface_added_names(const char *stored_json, const char *fresh_json, 
  *     change to it is GLOBAL (it sets the global usings of a whole project);
  *   - a REMOVED name can make another file's unresolved reference resolve (an
  *     overload group shrinks) or change its reason: the files whose rows
- *     mention it re-resolve with the closure. */
+ *     mention it re-resolve with the closure;
+ *   - an unresolved `path::member` row (missing, ambiguous) depends on the
+ *     member's file as a whole, its text included (a member the file writes
+ *     without a definition is no missing member, doc_links_md.c) and the size
+ *     of a same-named group: the files whose such rows name a changed or
+ *     deleted file, by its base name, re-resolve with the closure. */
 
 /* Add s[0..n) to a heap-keyed name set. false when it cannot be recorded (too
  * long for a key, or out of memory): callers fail closed. */
@@ -1884,6 +1895,58 @@ static void doc_row_name_dependents(const cbm_doc_link_row_t *rows, int n,
             }
         }
     }
+}
+
+/* Is an unresolved row's reason one a member lookup gives (doc_links_md.c)? */
+static bool doc_row_member_reason(const char *reason) {
+    return reason && (strcmp(reason, "missing") == 0 || strcmp(reason, "ambiguous") == 0);
+}
+
+/* Files whose unresolved `path::member` rows name a member of one of `paths`
+ * (the changed and deleted files), and no edge leads from such a row to the
+ * file: a body edit can write or drop a missing member's name without
+ * changing a definition, and a same-named group can shrink to one without
+ * removing its name. Matched by the base name before "::", since a
+ * reference may be written relative to the document or to the root. When
+ * memory runs out every such row's file is added: re-resolving a file that did
+ * not need it costs time, keeping a stale row costs correctness. Keys are
+ * borrowed from `rows`. */
+static void doc_row_member_dependents(const cbm_doc_link_row_t *rows, int n, char *const *paths,
+                                      int npaths, CBMHashTable *out_paths) {
+    if (npaths <= 0) {
+        return;
+    }
+    CBMHashTable *bases = cbm_ht_create(CBM_SZ_64); /* NULL: fail closed, every member row */
+    for (int i = 0; bases && i < npaths; i++) {
+        const char *slash = strrchr(paths[i], '/');
+        const char *base = slash ? slash + SKIP_ONE : paths[i];
+        cbm_ht_set(bases, base, (void *)base); /* borrowed from `paths` */
+    }
+    for (int i = 0; i < n; i++) {
+        const char *raw = rows[i].raw;
+        const char *rel = rows[i].rel_path;
+        const char *sep = raw ? strstr(raw, "::") : NULL;
+        if (!sep || !rel || !rel[0] || !doc_row_member_reason(rows[i].reason) ||
+            cbm_ht_get(out_paths, rel)) {
+            continue;
+        }
+        const char *base = sep;
+        while (base > raw && base[-1] != '/') {
+            base--;
+        }
+        char key[CBM_SZ_512];
+        size_t bl = (size_t)(sep - base);
+        bool hit = !bases || bl >= sizeof(key);
+        if (!hit && bl > 0) {
+            memcpy(key, base, bl);
+            key[bl] = '\0';
+            hit = cbm_ht_get(bases, key) != NULL;
+        }
+        if (hit) {
+            cbm_ht_set(out_paths, rel, (void *)rel);
+        }
+    }
+    cbm_ht_free(bases);
 }
 
 /* Doc-link carry-forward state of the legacy partial route: the previous
@@ -2331,8 +2394,7 @@ typedef struct {
 
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             atomic_int *cancelled, const cbm_file_hash_t *manifest,
-                            int manifest_count, const char *adr_content,
-                            const cbm_coverage_row_t *cov, int cov_count,
+                            int manifest_count, const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template,
                             const cbm_lsp_surface_row_t *surface_rows, int surface_row_count,
                             legacy_doc_rows_t doc, const cbm_doc_candidate_t *doc_candidates,
@@ -2346,7 +2408,6 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         .cancelled = cancelled,
         .manifest = manifest,
         .manifest_count = manifest_count,
-        .adr_content = adr_content,
         .coverage = cov,
         .coverage_count = cov_count,
         .coverage_meta = meta_template ? *meta_template : (cbm_coverage_meta_t){0},
@@ -3334,8 +3395,11 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
         }
     }
     /* Files whose unresolved doc-link references name something a changed or
-     * deleted file no longer declares re-resolve too. */
+     * deleted file no longer declares re-resolve too, and so do the files
+     * whose unresolved `path::member` rows name a changed or deleted file. */
     doc_row_name_dependents(plan->doc_rows, plan->doc_row_count, removed_names, row_deps);
+    doc_row_member_dependents(plan->doc_rows, plan->doc_row_count, changed_paths,
+                              n_changed + n_deleted, row_deps);
     {
         row_dep_walk_t walk = {.closure = closure_set, .files = files_by_path, .added = 0};
         cbm_ht_foreach(row_deps, row_dep_visitor, &walk);
@@ -3930,7 +3994,6 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             .cancelled = cbm_pipeline_cancelled_ptr(p),
             .manifest = manifest,
             .manifest_count = manifest_count,
-            .adr_content = NULL, /* the clone already carries the ADR rows */
             .coverage = cov,
             .coverage_count = cov_n,
             .coverage_meta =
@@ -4341,43 +4404,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
 
-    char *saved_adr = NULL;
-    cbm_adr_t existing_adr = {0};
-    int adr_rc = cbm_store_adr_get(store, project, &existing_adr);
-    if (adr_rc == CBM_STORE_OK) {
-        bool had_adr_content = existing_adr.content != NULL;
-        if (had_adr_content) {
-            saved_adr = strdup(existing_adr.content);
-        }
-        cbm_store_adr_free(&existing_adr);
-        if (had_adr_content && !saved_adr) {
-            cbm_gbuf_free(existing);
-            free(changed_files);
-            for (int i = 0; i < deleted_count; i++) {
-                free(deleted[i]);
-            }
-            free(deleted);
-            free_mode_skipped(mode_skipped, mode_skipped_count);
-            cbm_store_free_coverage(old_cov, old_cov_count);
-            cbm_store_close(store);
-            closure_plan_free(&closure_plan);
-            return CBM_PIPELINE_ABORT_PRESERVE_DB;
-        }
-    } else if (adr_rc != CBM_STORE_NOT_FOUND) {
-        cbm_store_adr_free(&existing_adr);
-        cbm_gbuf_free(existing);
-        free(changed_files);
-        for (int i = 0; i < deleted_count; i++) {
-            free(deleted[i]);
-        }
-        free(deleted);
-        free_mode_skipped(mode_skipped, mode_skipped_count);
-        cbm_store_free_coverage(old_cov, old_cov_count);
-        cbm_store_close(store);
-        closure_plan_free(&closure_plan);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-
+    /* ADRs live in the "<db>.adr.db" sidecar, which the delta clone/patch/rename
+     * never touches, so there is nothing to capture or re-apply here. */
     legacy_doc_t legacy_doc;
     legacy_doc_load(&legacy_doc, store, project, changed_files, ci, deleted, deleted_count);
     cbm_store_close(store);
@@ -4537,7 +4565,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         incr_free_edge_capture(&edge_cap);
         cbm_store_free_coverage(old_cov, old_cov_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        free(saved_adr);
         cbm_gbuf_free(existing);
         cbm_arena_destroy(&decl_arena);
         legacy_doc_free(&legacy_doc);
@@ -4659,7 +4686,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free(cov);
         cbm_store_free_coverage(old_cov, old_cov_count);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        free(saved_adr);
         cbm_gbuf_free(existing);
         cbm_arena_destroy(&decl_arena);
         cbm_doclinks_free_rows(doc_rows, doc_row_count);
@@ -4697,12 +4723,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * rehydrated project, so this run's rows are complete. */
     int doc_cand_n = 0;
     const cbm_doc_candidate_t *doc_cands = cbm_pipeline_doc_candidates(p, &doc_cand_n);
+    /* ADRs are not captured/re-applied here (sidecar store), so no adr argument. */
     int persist_rc = dump_and_persist(existing, db_path, project, cbm_pipeline_cancelled_ptr(p),
-                                      manifest, manifest_count, saved_adr, cov, cov_n,
-                                      &coverage_meta, NULL, 0, doc_out, doc_cands, doc_cand_n);
+                                      manifest, manifest_count, cov, cov_n, &coverage_meta, NULL, 0,
+                                      doc_out, doc_cands, doc_cand_n);
     cbm_doclinks_free_rows(doc_rows, doc_row_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
-    free(saved_adr);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);

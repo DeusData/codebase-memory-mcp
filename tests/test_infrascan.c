@@ -809,12 +809,61 @@ TEST(infrascan_data_flows_test_handlers_pair_only_within_their_file) {
     PASS();
 }
 
+/* Issue #2537: the Go 1.22 ServeMux grammar "[METHOD ][HOST]/[PATH]". The path
+ * is found inside the written pattern; a plain path, a lowercase word, a
+ * pattern without a path and a method too long for the buffer are no split.
+ * Only a Handle / HandleFunc registration is read with it. */
+TEST(infrascan_servemux_pattern_split_issue2537) {
+    char m[16];
+    const char *pat = "POST /v1/payments";
+    ASSERT_TRUE(cbm_service_pattern_mux_split(pat, m, sizeof(m)) == pat + 5);
+    ASSERT_STR_EQ(m, "POST");
+    pat = "GET \t /v1/payments/{id}";
+    ASSERT_TRUE(cbm_service_pattern_mux_split(pat, m, sizeof(m)) == pat + 6);
+    ASSERT_STR_EQ(m, "GET");
+    pat = "GET api.example.com/v1/x";
+    ASSERT_TRUE(cbm_service_pattern_mux_split(pat, m, sizeof(m)) == pat + 19);
+    ASSERT_STR_EQ(m, "GET");
+    pat = "api.example.com:8443/v1/x";
+    ASSERT_TRUE(cbm_service_pattern_mux_split(pat, m, sizeof(m)) == pat + 20);
+    ASSERT_STR_EQ(m, "");
+    pat = "DELETE /";
+    ASSERT_TRUE(cbm_service_pattern_mux_split(pat, NULL, 0) == pat + 7);
+
+    ASSERT_NULL(cbm_service_pattern_mux_split("/v1/x", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("get /v1/x", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("POST", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("POST ", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("GET host", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("GET a b/x", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("", m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split(NULL, m, sizeof(m)));
+    ASSERT_NULL(cbm_service_pattern_mux_split("ABCDEFGHIJKLMNOP /x", m, sizeof(m)));
+    ASSERT_STR_EQ(m, "");
+
+    /* only Handle / HandleFunc register a pattern, and never with a URL */
+    pat = "POST /v1/payments";
+    ASSERT_TRUE(cbm_service_pattern_mux_route_path("mux.HandleFunc", pat) == pat + 5);
+    pat = "api.example.com/v1/x";
+    ASSERT_TRUE(cbm_service_pattern_mux_route_path("s.mux.Handle", pat) == pat + 15);
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("st.Get", "users/123"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("c.Get", "https://api.example.com/v1/x"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("mux.Handle", "https://api.example.com/v1/x"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("PatchCollector.Delete", "storage.k8s.io/v1"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("r.Route", "GET /v1/x"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("mux.HandleFunc", "/v1/x"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path(NULL, "GET /v1/x"));
+    ASSERT_NULL(cbm_service_pattern_mux_route_path("mux.HandleFunc", NULL));
+    PASS();
+}
+
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_http_route_literal_guard_rejects_document_extensions);
     RUN_TEST(infrascan_client_navigation_is_js_family_only);
     RUN_TEST(infrascan_service_pattern_match_rejects_ids_inside_words);
     RUN_TEST(infrascan_service_pattern_match_keeps_real_library_qns);
+    RUN_TEST(infrascan_servemux_pattern_split_issue2537);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
     RUN_TEST(infrascan_decorator_route_metadata_keeps_its_escapes);
