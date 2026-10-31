@@ -161,6 +161,38 @@ TEST(gbuf_insert_edge) {
     PASS();
 }
 
+#if defined(CBM_MEM_TEST_API) && CBM_MEM_TEST_API
+TEST(gbuf_edge_append_oom_is_not_success) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    int64_t source = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t target = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    ASSERT_GT(source, 0);
+    ASSERT_GT(target, 0);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 0);
+
+    /* A fresh graph has no edge-array storage. Its first edge insertion must
+     * grow that primary array before registering any secondary edge indexes. */
+    cbm_mem_test_fail_next_realloc(CBM_MEM_CLASS_DYN_ARRAY);
+    int64_t failed = cbm_gbuf_insert_edge(gb, source, target, "CALLS", "{}");
+    bool injected = cbm_mem_test_reset_realloc_failure();
+    int after_failure = cbm_gbuf_edge_count(gb);
+
+    /* A failed append must not leave a dedup entry that makes retry appear to
+     * succeed while the array used by dump still contains no edge. */
+    int64_t retry = cbm_gbuf_insert_edge(gb, source, target, "CALLS", "{}");
+    int after_retry = cbm_gbuf_edge_count(gb);
+    cbm_gbuf_free(gb);
+
+    ASSERT(injected);
+    ASSERT_EQ(failed, 0);
+    ASSERT_EQ(after_failure, 0);
+    ASSERT_GT(retry, 0);
+    ASSERT_EQ(after_retry, 1);
+    PASS();
+}
+#endif
+
 TEST(gbuf_edge_dedup) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t n1 = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
@@ -1604,6 +1636,9 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_name);
     RUN_TEST(gbuf_delete_by_label);
     RUN_TEST(gbuf_insert_edge);
+#if defined(CBM_MEM_TEST_API) && CBM_MEM_TEST_API
+    RUN_TEST(gbuf_edge_append_oom_is_not_success);
+#endif
     RUN_TEST(gbuf_edge_dedup);
     RUN_TEST(gbuf_imports_multi_symbol_dedup);
     RUN_TEST(gbuf_imports_long_local_name_no_collision);
