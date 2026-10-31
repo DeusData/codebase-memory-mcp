@@ -810,7 +810,9 @@ static bool cli_activation_production_context_init(cli_activation_production_con
     context->cleanup_ok = true;
     context->deadline_ms = cli_activation_deadline_after(CLI_ACTIVATION_DRAIN_TIMEOUT_MS);
     context->control_deadline_ms = cli_activation_deadline_after(CLI_ACTIVATION_CONTROL_TIMEOUT_MS);
-    const char *original_cache_environment = getenv("CBM_CACHE_DIR");
+    char original_cache_buffer[CLI_BUF_4K];
+    const char *original_cache_environment = cbm_safe_getenv("CBM_CACHE_DIR", original_cache_buffer,
+                                                             sizeof(original_cache_buffer), NULL);
     context->original_cache_environment_present = original_cache_environment != NULL;
     if (context->original_cache_environment_present) {
         context->original_cache_environment = strdup(original_cache_environment);
@@ -4661,7 +4663,10 @@ static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config
 /* Search augmentation runs before Grep/Glob/Bash; exact coverage context runs after
  * Read. Both adapters are context-only and fail open. */
 #define CMM_HOOK_SEARCH_MATCHER "Grep|Glob|Bash"
-#define CMM_HOOK_READ_MATCHER "Read"
+/* The PostToolUse entry also matches the graph tools (mcp__<server>__<tool>,
+ * or mcp__plugin_<plugin>_<server>__<tool>), whose calls reset the drift
+ * reminder's search count (#509). */
+#define CMM_HOOK_READ_MATCHER "Read|mcp__.*codebase-memory-mcp__.*"
 /* Basename only; the full command path is resolved at install time via
  * cbm_resolve_hook_command so $CLAUDE_CONFIG_DIR is honored. */
 #ifdef _WIN32
@@ -4682,6 +4687,11 @@ static const char *const cmm_claude_exec_args[] = {"hook-augment"};
 /* Old matcher values from previous versions — recognized during upgrade so
  * upsert/remove can clean them up before inserting the current matcher.
  * Per-agent lists (no shared global): each caller passes its own. */
+/* Installs up to v0.12 matched only Read in PostToolUse. */
+static const char *const cmm_claude_old_read_matchers[] = {
+    "Read",
+    NULL,
+};
 static const char *const cmm_claude_old_matchers[] = {
     "Grep|Glob|Read|Search",
     "Grep|Glob|Read",
@@ -5459,7 +5469,7 @@ static int cbm_upsert_claude_hooks_with_binary(const char *settings_path, const 
     if (cbm_remove_previous_claude_exec_hook(settings_path, "PreToolUse", CMM_HOOK_SEARCH_MATCHER,
                                              cmm_claude_old_matchers, binary_path) != CLI_OK ||
         cbm_remove_previous_claude_exec_hook(settings_path, "PostToolUse", CMM_HOOK_READ_MATCHER,
-                                             NULL, binary_path) != CLI_OK) {
+                                             cmm_claude_old_read_matchers, binary_path) != CLI_OK) {
         return CLI_ERR;
     }
     int search_result = upsert_hooks_json((hooks_upsert_args_t){
@@ -5478,6 +5488,7 @@ static int cbm_upsert_claude_hooks_with_binary(const char *settings_path, const 
         .settings_path = settings_path,
         .hook_event = "PostToolUse",
         .matcher_str = CMM_HOOK_READ_MATCHER,
+        .old_matchers = cmm_claude_old_read_matchers,
         .command_str = command,
         .command_args = command_args,
         .command_arg_count = command_arg_count,
@@ -5532,6 +5543,7 @@ static int cbm_remove_claude_hooks_with_binary(const char *settings_path, const 
         .settings_path = settings_path,
         .hook_event = "PostToolUse",
         .matcher_str = CMM_HOOK_READ_MATCHER,
+        .old_matchers = cmm_claude_old_read_matchers,
         .old_commands = old_commands,
         .match_command_exact = command,
         .match_args = command_args,

@@ -122,6 +122,10 @@ typedef struct {
     uint32_t source_flags;
     const CBMType *source_return_type; /* Parsed, source-audited annotation only. */
     const CBMType *source_signature;   /* Audited syntax; type names may be unresolved. */
+    /* Go only (#2033): raw aliased type text of `type A = B` ("B"), qualified
+     * by the registrar against def_module_qn like return_types. NULL = not an
+     * identity alias. */
+    const char *alias_target;
 } CBMLSPDef;
 
 bool cbm_go_collect_source_facts(CBMArena *, const char *, int, const char *, CBMLSPDef *, int);

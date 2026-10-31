@@ -7,7 +7,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CBM_STORE_GRAPH_DIGEST_VERSION 2u
+/* Canonical stream version, hashed right after the domain string. A bump
+ * changes every digest, so a holder of an older digest (the test-impact
+ * receipt's graph_sha256) sees a mismatch instead of comparing two different
+ * stream definitions.
+ *   1  The nine tables projects .. store_meta.
+ *   2  #2265: also index_unresolved_candidates (streamed only when present) and
+ *      index_coverage_meta.unresolved_calls_complete (bound when present).
+ *   3  Also binds all eight resolver tables, including explicit absence. */
+#define CBM_STORE_GRAPH_DIGEST_VERSION 3u
 #define CBM_STORE_GRAPH_DIGEST_BYTES 32u
 
 typedef enum {
@@ -32,13 +40,14 @@ typedef struct {
     uint64_t framed_bytes;
 } cbm_store_graph_digest_t;
 
-/* Borrow a live, exclusive D5 scope. Hash the version-2 canonical stream of
- * all seventeen known tables, including resolver diagnostics, evidence, exact
- * CREATE SQL and explicit project identity. The eight resolver tables must be
- * all present or all absent; absence is explicitly bound for legacy stores. The database must use
- * UTF-8. No new handler or transaction is used. Independent scopes/connections may run
- * concurrently; no mutable state is shared. The callback/connection restrictions of D5 continue to
- * apply.
+/* Borrow a live, exclusive D5 scope. Hash the version-3 canonical stream of
+ * the nine legacy tables, the unresolved candidate index when present, and
+ * all eight resolver tables, including their exact CREATE SQL and explicit
+ * project identity. The resolver tables must be all present or all absent;
+ * absence is explicitly bound for legacy stores. The database must use UTF-8.
+ * No new handler or transaction is used. Independent scopes/connections may run
+ * concurrently; no mutable state is shared. The callback/connection restrictions
+ * of D5 continue to apply.
  *
  * All arguments are required. project is nonempty, length <= INT_MAX, and has
  * no embedded NUL; other database values are length-aware. Limits are positive,

@@ -7,6 +7,11 @@
 #include "store/store.h"
 #include "store/store_resolver.h"
 #include "sqlite3.h"
+#include "yyjson.h"
+#include "graph_buffer/graph_buffer.h"
+#include "pipeline/shared_resolver.h"
+#include "resolve/proof.h"
+#include "resolve/policy.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1036,7 +1041,173 @@ TEST(resolver_integration_arkts_escaped_module_paths_never_bind_raw_decoys) {
     return ecma_escaped_path_cases("ets");
 }
 
+/* Constructed publication facts isolate the capture/projection contract from
+ * language-engine recall. Spans and caller identities come from real extraction;
+ * the two calls intentionally share a leaf but are distinct occurrences. */
+static bool publication_capture_case(int variant, int *diagnostics, bool *complete,
+                                     bool *private_keys_removed) {
+    static const char source[] = "def caller():\n    receiver.run()\n    receiver.run()\n";
+    CBMFileResult *parsed = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON,
+                                             RESOLVER_PROJECT, "main.py", 0, NULL, NULL);
+    if (!parsed || parsed->calls.count != 2) {
+        cbm_free_result(parsed);
+        return false;
+    }
+    CBMFileResult view = *parsed;
+    CBMResolvedCall missing[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        const CBMCall *call = &parsed->calls.items[i];
+        missing[i] = (CBMResolvedCall){.kind = CBM_RESOLVED_INVOCATION,
+                                       .caller_qn = call->enclosing_func_qn,
+                                       .callee_qn = call->callee_name,
+                                       .strategy = "lsp_unresolved",
+                                       .reason = "unknown_receiver",
+                                       .site_start_byte = call->site_start_byte,
+                                       .site_end_byte = call->site_end_byte,
+                                       .source_origin = call->source_origin};
+    }
+    /* Hybrid diagnostics are a subset: withdrawn resolved claims remain in
+     * resolver occurrences, without fabricating an upstream missing carrier. */
+    if (variant == 12)
+        missing[0].strategy = "lsp_resolved";
+    view.resolved_calls.items = missing;
+    view.resolved_calls.count = variant == 11 ? 2 : 1;
+    CBMCall duplicate[2] = {parsed->calls.items[0], parsed->calls.items[0]};
+    if (variant == 9) {
+        view.calls.items = duplicate;
+        view.calls.count = 2;
+    }
+    CBMCall invalid_origin = parsed->calls.items[0];
+    if (variant == 13) {
+        invalid_origin.source_origin = (CBMSourceOrigin)-1;
+        view.calls.items = &invalid_origin;
+        view.calls.count = 1;
+        missing[0].source_origin = invalid_origin.source_origin;
+    }
+    const CBMCall *call = &parsed->calls.items[0];
+    cbm_resolve_result_t outcome = {
+        .binding = CBM_RESOLVE_BINDING_UNIQUE,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+        .rule = CBM_RESOLVE_RULE_SCOPE_BINDING,
+        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                 CBM_RESOLVE_FACT_SCOPE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+        .target = RESOLVER_PROJECT ".lib.target",
+        .candidate_count = 1,
+        .reason = "constructed_publication_fact"};
+    cbm_resolve_record_t record = {.file_path = "main.py",
+                                   .scope = call->enclosing_func_qn,
+                                   .spelling = call->callee_name,
+                                   .relation = "CALLS",
+                                   .start_byte = call->site_start_byte,
+                                   .end_byte = call->site_end_byte,
+                                   .source_origin = call->source_origin,
+                                   .content_identity =
+                                       parsed->source_content_id[call->source_origin],
+                                   .configuration_identity = parsed->source_configuration_id,
+                                   .result = outcome,
+                                   .emitted = variant != 1 && variant != 12};
+    if (variant == 3)
+        record.file_path = "other.py";
+    if (variant == 4)
+        record.scope = RESOLVER_PROJECT ".other.caller";
+    if (variant == 5)
+        record.source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    if (variant == 6)
+        record.spelling = "other.run";
+    if (variant == 7)
+        record.content_identity = "different-source";
+    if (variant == 8)
+        record.configuration_identity = "different-configuration";
+    if (variant == 10)
+        record.relation = "USAGE";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &arena, 0, 0, 0);
+    cbm_resolve_proof_source_t origin = {.project = RESOLVER_PROJECT,
+                                         .file = record.file_path,
+                                         .scope = record.scope,
+                                         .content_identity = record.content_identity,
+                                         .configuration_identity = record.configuration_identity,
+                                         .source_origin = record.source_origin};
+    /* A producer can propose an edge yet fail final source-site sealing. */
+    if (variant == 2)
+        origin.scope = RESOLVER_PROJECT ".wrong.caller";
+    cbm_resolve_proof_key_t key = {.lookup_domain = record.scope,
+                                   .lookup_key = record.spelling,
+                                   .binding_identity = outcome.target,
+                                   .detail = record.relation,
+                                   .start_byte = record.start_byte,
+                                   .end_byte = record.end_byte,
+                                   .origin = record.source_origin};
+    record.result.proof =
+        cbm_resolve_proof_leaf(&pool, CBM_PROOF_SOURCE_FACT, &origin, &key, &outcome);
+    cbm_gbuf_t *graph = cbm_gbuf_new(RESOLVER_PROJECT, "/tmp");
+    cbm_pipeline_t *pipeline = cbm_pipeline_new("/tmp", NULL, CBM_MODE_FULL);
+    bool ok = record.result.proof && graph && pipeline;
+    int64_t source_id = 0, target_id = 0;
+    if (ok) {
+        source_id = cbm_gbuf_upsert_node(graph, "Function", "caller", record.scope,
+                                         record.file_path, 1, 3, "{}");
+        target_id =
+            cbm_gbuf_upsert_node(graph, "Function", "target", outcome.target, "lib.py", 1, 1, "{}");
+        ok = source_id && target_id && cbm_gbuf_record_resolution(graph, &record);
+    }
+    if (ok && variant != 0)
+        ok = cbm_gbuf_insert_edge(graph, source_id, target_id, "CALLS", "{}") != 0;
+    if (ok) {
+        CBMCallEvidence legacy[2] = {
+            {.candidate_qn = outcome.target, .calls_emitted = variant != 0}, {0}};
+        cbm_pipeline_record_unresolved_calls_for_projection(pipeline, "main.py", &view,
+                                                            RESOLVER_PROJECT ".main", legacy);
+        ok = cbm_gbuf_resolutions_own_shared(graph) && cbm_shared_resolver_project(graph) &&
+             cbm_pipeline_reconcile_unresolved_calls(pipeline, graph);
+    }
+    if (ok && variant == 12) {
+        size_t occurrence_count = 0;
+        const cbm_resolve_record_t *occurrences = cbm_gbuf_resolutions(graph, &occurrence_count);
+        ok = occurrence_count == 1 && !occurrences[0].emitted;
+    }
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    cbm_pipeline_get_unresolved_calls(pipeline, &rows, &count, complete);
+    *diagnostics = 0;
+    *private_keys_removed = true;
+    for (int i = 0; ok && i < count; i++) {
+        yyjson_doc *doc = yyjson_read(rows[i].detail, strlen(rows[i].detail), 0);
+        yyjson_val *sites = doc ? yyjson_doc_get_root(doc) : NULL;
+        ok = yyjson_is_arr(sites);
+        *diagnostics += (int)yyjson_arr_size(sites);
+        *private_keys_removed &= strstr(rows[i].detail, "_resolver_") == NULL;
+        yyjson_doc_free(doc);
+    }
+    cbm_pipeline_free(pipeline);
+    cbm_gbuf_free(graph);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(parsed);
+    return ok;
+}
+
+TEST(resolver_integration_call_diagnostics_follow_final_publication) {
+    for (int variant = 0; variant < 14; variant++) {
+        int diagnostics = -1;
+        bool complete = false, private_keys_removed = false;
+        bool ok = publication_capture_case(variant, &diagnostics, &complete, &private_keys_removed);
+        int expected = variant == 0 || variant == 12 ? 0 : 1;
+        if (!ok || diagnostics != expected)
+            fprintf(stderr, "  publication variant=%d ok=%d diagnostics=%d\n", variant, ok,
+                    diagnostics);
+        ASSERT(ok);
+        ASSERT(complete);
+        ASSERT(private_keys_removed);
+        ASSERT_EQ(diagnostics, expected);
+    }
+    PASS();
+}
+
 SUITE(resolver_integration) {
+    RUN_TEST(resolver_integration_call_diagnostics_follow_final_publication);
     RUN_TEST(resolver_integration_missing_facts_rebuilds_unchanged_source);
     RUN_TEST(resolver_integration_missing_evidence_rebuilds_unchanged_source);
     RUN_TEST(resolver_integration_js_escaped_module_paths_never_bind_raw_decoys);

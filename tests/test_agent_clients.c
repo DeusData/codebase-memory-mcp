@@ -1177,6 +1177,10 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     /* TypeBox parameters schema is embedded with Type.Object syntax. */
     ASSERT_NOT_NULL(strstr(js, "Type.Object("));
     ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* #2787: String enums must use Type.String({ enum: [...] }) without anyOf/const */
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
     /* A numeric registry property must remain numeric in the generated schema. */
     ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
     /* TypeBox import should be present. */
@@ -1240,6 +1244,23 @@ TEST(client_adapter_pi_wraps_result_and_honors_abort) {
         strstr(js, "[{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }]"));
     ASSERT_NOT_NULL(strstr(js, "signal?.addEventListener('abort', onAbort, { once: true })"));
     ASSERT_NOT_NULL(strstr(js, "if (!child.killed) child.kill();"));
+    free(js);
+    PASS();
+}
+
+/* #2787: Pi extension must emit string enums as Type.String({ enum: [...] })
+ * rather than Type.Union([Type.Literal(...)]) which TypeBox serializes as
+ * anyOf/const, breaking Gemini / Antigravity function declaration validation. */
+TEST(client_adapter_pi_emits_string_enum_issue2787) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NULL(strstr(js, "Type.Union([Type.Literal"));
+    ASSERT_NULL(strstr(js, "Type.Literal("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String({ enum: ["));
+    ASSERT_NOT_NULL(strstr(js, "'full'"));
+    ASSERT_NOT_NULL(strstr(js, "'moderate'"));
+    ASSERT_NOT_NULL(strstr(js, "'fast'"));
+    ASSERT_NOT_NULL(strstr(js, "'cross-repo-intelligence'"));
     free(js);
     PASS();
 }
@@ -1405,6 +1426,7 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
     RUN_TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834);
     RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
+    RUN_TEST(client_adapter_pi_emits_string_enum_issue2787);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
