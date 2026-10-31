@@ -2610,11 +2610,14 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, 
         char esc_n[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
         cbm_json_escape(esc_n, sizeof(esc_n), norm);
-        char eprops[CBM_SZ_512];
+        /* Two escaped 255-byte strings plus the fixed keys and the verb: 1K
+         * never truncates the JSON (512 could, once the method was added). */
+        char eprops[CBM_SZ_1K];
         if (method) {
-            snprintf(eprops, sizeof(eprops),
-                     "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\",\"method\":\"%s\"}",
-                     esc_c, esc_n, method);
+            snprintf(
+                eprops, sizeof(eprops),
+                "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\",\"method\":\"%s\"}",
+                esc_c, esc_n, method);
         } else {
             snprintf(eprops, sizeof(eprops),
                      "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
