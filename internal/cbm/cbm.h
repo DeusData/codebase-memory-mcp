@@ -863,6 +863,8 @@ typedef struct {
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
 
+    uint64_t markdown_collection_steps; // collector cursor moves/node visits, not parser internals
+    uint64_t markdown_name_checks;      // heading-name lookup/group checks, excluding sorting
     CBMDefArray defs;
     CBMCallArray calls;
     CBMImportArray imports;
@@ -1074,6 +1076,9 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    /* Markdown: the settled names of the file's headings (extract_defs.c),
+     * NULL until the first heading; allocated in `scratch`. */
+    void *md_headings;
     const cbm_test_declarations_t *test_declarations; /* borrowed for this call only */
     bool test_declarations_raw_source;
     struct CBMTestDefinitionMatch *test_definition_matches; /* traversal scratch */

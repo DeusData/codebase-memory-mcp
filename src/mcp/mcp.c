@@ -729,7 +729,9 @@ static const tool_def_t TOOLS[] = {
     {"search_code",
      "Graph-ranked text search: compact symbols, full bounded source, or file paths.",
      "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"project\":{\"type\":"
-     "\"string\"},\"file_pattern\":{\"type\":\"string\"},\"path_filter\":{\"type\":\"string\"},"
+     "\"string\"},\"file_pattern\":{\"type\":\"string\",\"description\":\"Glob on file name; "
+     "with '/', on repo-relative path (** = any dirs).\"},"
+     "\"path_filter\":{\"type\":\"string\",\"description\":\"Regex on repo-relative path.\"},"
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"compact\",\"full\",\"files\"],\"default\":\"compact\"},"
      "\"context\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,\"maximum\":200},"
@@ -14714,6 +14716,7 @@ typedef struct {
     uint64_t enrich_ms;
     uint64_t elapsed_ms;
     bool include_phase_timings;
+    bool hint_path_filter; /* a search with a '/' file_pattern returned no matches */
 } search_metrics_t;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -14806,6 +14809,47 @@ static int search_result_cmp(const void *a, const void *b) {
         return ra->end_line < rb->end_line ? -1 : 1;
     }
     return 0;
+}
+
+#define SEARCH_CODE_PATH_HINT                                                            \
+    "no results; a file_pattern with '/' must match the whole repo-relative path (e.g. " \
+    "src/**/*.c); to scope by folder you can also use path_filter (regex on the "        \
+    "repo-relative path, e.g. ^src/cli/)"
+
+/* A file_pattern containing '/' is matched against the whole repo-relative path, like
+ * search_graph's file_pattern: '*' and '**' match any run of characters including '/', a
+ * '**' followed by '/' also matches zero directories, '?' matches one character, and a
+ * pattern without wildcards is a substring match. Portable (no fnmatch on Windows) and
+ * linear: every '*' is equivalent, so one backtrack point suffices. */
+static bool search_code_path_glob_match(const char *pat, const char *path) {
+    if (!strpbrk(pat, "*?")) {
+        return strstr(path, pat) != NULL;
+    }
+    const char *star_pat = NULL;
+    const char *star_path = NULL;
+    for (;;) {
+        if (*pat == '*') {
+            const char *run = pat;
+            while (*pat == '*') {
+                pat++;
+            }
+            if (pat - run > SKIP_ONE && *pat == '/') {
+                pat++;
+            }
+            star_pat = pat;
+            star_path = path;
+        } else if (*path && (*pat == '?' || *pat == *path)) {
+            pat++;
+            path++;
+        } else if (!*pat && !*path) {
+            return true;
+        } else if (star_pat && *star_path) {
+            pat = star_pat;
+            path = ++star_path;
+        } else {
+            return false;
+        }
+    }
 }
 
 /* Moving an arbitrary file_pattern ahead of Select-String is not generally results-preserving:
@@ -15430,6 +15474,9 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
                             "(not as alternation). Pass regex=true for 'foo|bar' to mean "
                             "'foo OR bar'.");
     }
+    if (metrics->hint_path_filter) {
+        cbm_tree_scalar_str(&sb, "hint", SEARCH_CODE_PATH_HINT);
+    }
     if (metrics->elapsed_ms >= SEARCH_SLOW_MS) {
         cbm_tree_scalar_str(&sb, "warning_slow",
                             "search was slow; narrow file_pattern/path_filter or use a more "
@@ -15668,6 +15715,9 @@ static char *assemble_search_output(
     }
     if (yyjson_mut_arr_size(warnings) > 0) {
         yyjson_mut_obj_add_val(doc, root_obj, "warnings", warnings);
+    }
+    if (metrics->hint_path_filter) {
+        yyjson_mut_obj_add_str(doc, root_obj, "hint", SEARCH_CODE_PATH_HINT);
     }
 
     char *json = yy_doc_to_str(doc);
@@ -16446,6 +16496,17 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
                     continue;
                 }
             }
+            /* A file_pattern with '/' is matched here on every platform; the basename
+             * filters below (and the Windows prefilter, which rejects '/') skip it. */
+            bool path_glob = file_pattern && strchr(file_pattern, '/');
+            if (path_glob) {
+#ifdef _WIN32
+                cbm_normalize_path_sep(indexed_files[fi]);
+#endif
+                if (!search_code_path_glob_match(file_pattern, indexed_files[fi])) {
+                    continue;
+                }
+            }
 #ifndef _WIN32
             /* GNU grep's --include is unavailable in BusyBox grep. Filter the
              * canonical list before xargs instead, preserving grep's basename
@@ -16453,7 +16514,7 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
              * on GNU userland. Windows keeps its PowerShell -like filter. */
             const char *basename = strrchr(indexed_files[fi], '/');
             basename = basename ? basename + SKIP_ONE : indexed_files[fi];
-            if (file_pattern && fnmatch(file_pattern, basename, 0) != 0) {
+            if (file_pattern && !path_glob && fnmatch(file_pattern, basename, 0) != 0) {
                 continue;
             }
 #endif
@@ -17471,8 +17532,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         bool scan_in_process = scoped && !srv->search_scan_command_override;
 #ifdef _WIN32
         scan_in_process =
-            scan_in_process &&
-            (!file_pattern || cbm_search_code_file_pattern_can_prefilter(file_pattern));
+            scan_in_process && (!file_pattern || strchr(file_pattern, '/') ||
+                                cbm_search_code_file_pattern_can_prefilter(file_pattern));
 #endif
         mcp_scan_cause_t scan_cause;
         if (scan_in_process) {
@@ -17644,6 +17705,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         directory_output = directory_limit;
     }
     bool warn_literal_pipe = pat_has_pipe && !use_regex;
+    metrics.hint_path_filter = file_pattern && strchr(file_pattern, '/') && gm_count == 0;
     /* Every render below re-checks each result's file against the root; one
      * containment for the request keeps that to one resolution per file. */
     root_containment_t request_containment;
