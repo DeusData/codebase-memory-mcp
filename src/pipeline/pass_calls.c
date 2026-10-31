@@ -577,6 +577,22 @@ cbm_svc_kind_t cbm_pipeline_external_import_service(cbm_external_import_index_t 
     return CBM_SVC_NONE;
 }
 
+/* The path a route registration's first argument names: the argument itself
+ * when it opens with a slash, or in Go the path of a ServeMux pattern that
+ * names a method or host first ("POST /v1/x", #2537; Handle / HandleFunc
+ * only). NULL when it names no path. MUST match pass_parallel.c
+ * find_route_path_in_args. */
+static const char *route_reg_path(const CBMCall *call, CBMLanguage lang) {
+    const char *arg = call->first_string_arg;
+    if (!arg) {
+        return NULL;
+    }
+    if (arg[0] == '/') {
+        return arg;
+    }
+    return cbm_pipeline_mux_route_path(call, lang);
+}
+
 /* Handle a route registration call: create Route node + HANDLES edge.
  * route_mount is the framework mount of the registering file ("/api" for a
  * Laravel 11+ `withRouting(api: ...)` file, #1146) or "". */
@@ -584,10 +600,11 @@ static bool handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count,
                                       const char *route_mount, CBMLanguage lang) {
-    const char *method = cbm_service_pattern_route_method(call->callee_name);
+    char mux_method[CBM_SZ_16];
+    const char *method = cbm_pipeline_route_reg_method(call, lang, mux_method, sizeof(mux_method));
     char mounted[CBM_SZ_256];
     const char *path =
-        cbm_laravel_mount_route(route_mount, call->first_string_arg, mounted, sizeof(mounted));
+        cbm_laravel_mount_route(route_mount, route_reg_path(call, lang), mounted, sizeof(mounted));
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
@@ -824,7 +841,7 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  bool suppress_plain_calls, const char *route_mount,
                                  CBMLanguage lang) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
-    if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
+    if (svc == CBM_SVC_ROUTE_REG && route_reg_path(call, lang) != NULL) {
         return handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
                                          imp_count, route_mount, lang);
     }
@@ -924,8 +941,8 @@ static bool calls_emit_route_call(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                   const char **imp_keys, const char **imp_vals, int imp_count,
                                   const char *route_mount, CBMLanguage lang,
                                   CBMCallEvidence *evidence) {
-    if (cbm_service_pattern_route_method(call->callee_name) == NULL || !call->first_string_arg ||
-        call->first_string_arg[0] != '/') {
+    if (cbm_service_pattern_route_method(call->callee_name) == NULL ||
+        route_reg_path(call, lang) == NULL) {
         return false;
     }
     evidence->calls_emitted |= handle_route_registration(
