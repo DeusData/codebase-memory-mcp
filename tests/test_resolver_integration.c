@@ -7,7 +7,7 @@
 #include "store/store.h"
 #include "store/store_resolver.h"
 #include "sqlite3.h"
-#include "yyjson.h"
+#include "yyjson/yyjson.h"
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/shared_resolver.h"
 #include "resolve/proof.h"

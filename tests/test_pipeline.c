@@ -1645,6 +1645,46 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
 }
 
+/* True iff the exact named CALLS edge exists and its serialized strategy
+ * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
+ * this on a separate ordinary-call control: it proves the cross-file LSP ran
+ * successfully for the language/target, rather than letting a registry-only
+ * edge make a broken fixture look healthy. */
+static bool cross_file_call_has_strategy(cbm_store_t *s, const char *project, const char *src_name,
+                                         const char *tgt_name, const char *strategy_fragment) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && edges[j].properties_json &&
+                    strstr(edges[j].properties_json, strategy_fragment)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
 /* Nix attrpath qualification, end to end. A call inside a scoped binding must
  * source to the QUALIFIED definition.
  *
