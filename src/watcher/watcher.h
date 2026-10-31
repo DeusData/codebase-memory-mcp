@@ -195,6 +195,15 @@ int cbm_watcher_poll_interval_ms(int file_count);
  * Negative inputs are treated as zero. */
 int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures);
 
+/* Return the delay (ms) before the next poll after a SUCCESSFUL re-index that
+ * took `index_elapsed_ms`: max(interval_ms, INDEX_COOLDOWN_FACTOR (3) x
+ * index_elapsed_ms), with the cooldown term capped at INDEX_COOLDOWN_CEILING_MS
+ * (30 min). The caller counts it from when the index finished, so the watcher
+ * spends at most ~1/4 of wall time indexing a project; sub-second indexes keep
+ * `interval_ms`.
+ * Never below `interval_ms`; overflow-safe; negative inputs act as zero. */
+int cbm_watcher_success_delay_ms(int interval_ms, int64_t index_elapsed_ms);
+
 /* Classify a stat() errno observed on a watched project root: returns true
  * only for values that mean the root itself is gone (ENOENT, ENOTDIR) and
  * may count toward stale-root pruning (#286). Any other failure (EACCES,
