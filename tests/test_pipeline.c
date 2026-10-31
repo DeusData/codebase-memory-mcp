@@ -14933,6 +14933,208 @@ TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing) {
     PASS();
 }
 
+/* Route nodes whose qualified name contains `part`. */
+static int route_nodes_containing(cbm_store_t *s, const char *project, const char *part) {
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    if (cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name && strstr(routes[i].qualified_name, part)) {
+            matches++;
+        }
+    }
+    if (routes) {
+        cbm_store_free_nodes(routes, route_count);
+    }
+    return matches;
+}
+
+/* CALLS edges out of the function `source_name` into a Route node: the edge a
+ * route registration emits beside its Route (an HTTP client call's edge to a
+ * Route is HTTP_CALLS instead). */
+static int calls_into_route_count(cbm_store_t *s, const char *project, const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.label &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.label, "Route") == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Issue #2537: since Go 1.22 a ServeMux pattern may name a method and a host
+ * before the path ("POST /v1/payments", "GET api.example.com/v1/x"). Such a
+ * registration minted no Route and no HANDLES edge, because every registration
+ * gate wanted the first argument to open with a slash, while the same file
+ * written with "/v1/payments" had both. The method now comes from the pattern
+ * and a host is dropped from the path, in the sequential and the parallel pass
+ * alike. Only Go reads that grammar: a Python registration of "GET /py" is still
+ * no route. Only a ServeMux registration (Handle / HandleFunc) is read with it:
+ * another route-verb call names no pattern and mints no Route, neither
+ * `st.Get("users/123")` on a project method (which keeps its CALLS edge) nor
+ * `c.Get("https://api.example.com/v1/x")` on a client. */
+TEST(pipeline_go_servemux_method_patterns_issue2537) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_servemux_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/srv\n\ngo 1.22\n");
+    write_temp_file(tmp, "main.go",
+                    "package main\n"
+                    "\n"
+                    "import \"net/http\"\n"
+                    "\n"
+                    "func createPayment(w http.ResponseWriter, r *http.Request) {}\n"
+                    "func getPayment(w http.ResponseWriter, r *http.Request)    {}\n"
+                    "func hostOnly(w http.ResponseWriter, r *http.Request)      {}\n"
+                    "func legacyList(w http.ResponseWriter, r *http.Request)    {}\n"
+                    "\n"
+                    "type Store struct{ m map[string]string }\n"
+                    "\n"
+                    "func (s *Store) Get(k string) string { return s.m[k] }\n"
+                    "\n"
+                    "func lookup(st *Store) string { return st.Get(\"users/123\") }\n"
+                    "\n"
+                    "func fetchRemote(c *http.Client) {\n"
+                    "\t_, _ = c.Get(\"https://api.example.com/v1/x\")\n"
+                    "}\n"
+                    "\n"
+                    "func main() {\n"
+                    "\tmux := http.NewServeMux()\n"
+                    "\tmux.HandleFunc(\"POST /v1/payments\", createPayment)\n"
+                    "\tmux.HandleFunc(\"GET /v1/payments/{id}\", getPayment)\n"
+                    "\tmux.HandleFunc(\"api.example.com/v1/hosted\", hostOnly)\n"
+                    "\tmux.HandleFunc(\"/v1/legacy\", legacyList)\n"
+                    "\t_ = http.ListenAndServe(\":8080\", mux)\n"
+                    "}\n");
+    write_temp_file(tmp, "web/site.py",
+                    "from flask import Flask\n"
+                    "app = Flask(__name__)\n"
+                    "\n"
+                    "def py_view():\n"
+                    "    return \"ok\"\n"
+                    "\n"
+                    "app.add_url_rule(\"GET /py\", \"py_view\", py_view)\n");
+    /* past MIN_FILES_FOR_PARALLEL, so the threaded run takes the parallel pass */
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/padding%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc Padding%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    int run_rc[2] = {-1, -1};
+    bool opened[2] = {false, false};
+    int post[2] = {-1, -1};
+    int get_id[2] = {-1, -1};
+    int any_post[2] = {-1, -1};
+    int host[2] = {-1, -1};
+    int legacy[2] = {-1, -1};
+    int py_any[2] = {-1, -1};
+    int py_get[2] = {-1, -1};
+    int store_calls[2] = {-1, -1};
+    int store_route[2] = {-1, -1};
+    int lookup_reg[2] = {-1, -1};
+    int remote_route[2] = {-1, -1};
+    int remote_reg[2] = {-1, -1};
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode == 0) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+            cbm_setenv("CBM_WORKERS", "4", 1);
+        }
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/servemux_%d.db", tmp, mode);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        run_rc[mode] = p ? cbm_pipeline_run(p) : -1;
+        const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        opened[mode] = s != NULL;
+        if (s && project) {
+            post[mode] =
+                handles_to_route(s, project, "createPayment", "__route__POST__/v1/payments");
+            get_id[mode] =
+                handles_to_route(s, project, "getPayment", "__route__GET__/v1/payments/{}");
+            any_post[mode] =
+                handles_to_route(s, project, "createPayment", "__route__ANY__/v1/payments");
+            host[mode] = handles_to_route(s, project, "hostOnly", "__route__ANY__/v1/hosted");
+            legacy[mode] = handles_to_route(s, project, "legacyList", "__route__ANY__/v1/legacy");
+            py_any[mode] = handles_to_route(s, project, "py_view", "__route__ANY__/py");
+            py_get[mode] = handles_to_route(s, project, "py_view", "__route__GET__/py");
+            store_calls[mode] = named_edge_count(s, project, "CALLS", "lookup", "Get");
+            store_route[mode] = route_nodes_containing(s, project, "__route__GET__/123");
+            lookup_reg[mode] = calls_into_route_count(s, project, "lookup");
+            remote_route[mode] = route_nodes_containing(s, project, "//api.example.com");
+            remote_reg[mode] = calls_into_route_count(s, project, "fetchRemote");
+        }
+        if (s) {
+            cbm_store_close(s);
+        }
+        cbm_pipeline_free(p);
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    for (int mode = 0; mode < 2; mode++) {
+        ASSERT_EQ(run_rc[mode], 0);
+        ASSERT_TRUE(opened[mode]);
+        /* the method is the pattern's, not ANY */
+        ASSERT_EQ(post[mode], 1);
+        ASSERT_EQ(get_id[mode], 1);
+        ASSERT_EQ(any_post[mode], 0);
+        /* a host names no method and is not part of the path */
+        ASSERT_EQ(host[mode], 1);
+        /* control: a plain path is unchanged */
+        ASSERT_EQ(legacy[mode], 1);
+        /* another language's "GET /py" is not read as a ServeMux pattern */
+        ASSERT_EQ(py_any[mode], 0);
+        ASSERT_EQ(py_get[mode], 0);
+        /* a project method named Get keeps its CALLS edge; "users/123" is no
+         * host + path */
+        ASSERT_EQ(store_calls[mode], 1);
+        ASSERT_EQ(store_route[mode], 0);
+        ASSERT_EQ(lookup_reg[mode], 0);
+        /* a client Get on a URL registers no route: "https:" is no host */
+        ASSERT_EQ(remote_route[mode], 0);
+        ASSERT_EQ(remote_reg[mode], 0);
+    }
+    PASS();
+}
+
 TEST(pipeline_swift_http_call_makes_route_issue1892) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_swifthttp_XXXXXX");
@@ -29667,6 +29869,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_route_prefix_bridge_is_order_free_and_root_bridges_nothing);
+    RUN_TEST(pipeline_go_servemux_method_patterns_issue2537);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
