@@ -789,6 +789,20 @@ static void cbm_attr_check_declaration(TSNode node, const char *source, CBMAttrW
         if (!ts_node_is_error(child)) {
             continue;
         }
+        /* `class ATTR Name : public Base { };`: with an empty body the grammar reads a
+         * variable named Base, and no declaration has a base clause but a class. */
+        if (!definition && !ts_node_is_null(type) &&
+            cbm_attr_is_tag_specifier(ts_node_type(type)) &&
+            ts_node_is_null(ts_node_child_by_field_name(type, "body", 4)) &&
+            ts_node_start_byte(child) < declarator_start &&
+            memchr(source + ts_node_start_byte(child), ':',
+                   ts_node_end_byte(child) - ts_node_start_byte(child))) {
+            TSNode name = ts_node_child_by_field_name(type, "name", 4);
+            if (!ts_node_is_null(name)) {
+                cbm_attr_word_add(words, name);
+            }
+            return;
+        }
         /* `void f(int a) ATTR {`: the function is in the error and the macro is what the
          * grammar kept as the declarator. */
         if (definition && bare_declarator && ts_node_named_child_count(child) == 1 &&
