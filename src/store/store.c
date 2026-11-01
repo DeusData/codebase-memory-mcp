@@ -12010,13 +12010,6 @@ static bool adr_migrated(sqlite3 *adb) {
     return done;
 }
 
-/* Copy any legacy ADR rows from the graph DB's project_summaries into the
- * sidecar (INSERT OR IGNORE, so a local row is never clobbered), then set the
- * one-time marker. The marker check, copy and marker insert run in ONE
- * BEGIN IMMEDIATE transaction on the sidecar, so two processes migrating at
- * once cannot re-copy a row the other just deleted. Returns CBM_STORE_ERR on
- * any failure (transaction rolled back) so callers can fail closed and preserve
- * the old generation. No-op once the marker is set. */
 /* Copy every ADR row from the graph DB's project_summaries into the sidecar with
  * INSERT OR IGNORE (so a row already present locally is never overwritten). Must
  * run inside a transaction on the sidecar connection. Returns OK/ERR; does not
@@ -12070,6 +12063,13 @@ static int adr_copy_rows(cbm_store_t *s, sqlite3 *adb) {
     return (rc == SQLITE_DONE) ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
+/* Copy any legacy ADR rows from the graph DB's project_summaries into the
+ * sidecar (INSERT OR IGNORE, so a local row is never clobbered), then set the
+ * one-time marker. The marker check, copy and marker insert run in ONE
+ * BEGIN IMMEDIATE transaction on the sidecar, so two processes migrating at
+ * once cannot re-copy a row the other just deleted. Returns CBM_STORE_ERR on
+ * any failure (transaction rolled back) so callers can fail closed and preserve
+ * the old generation. No-op once the marker is set. */
 static int adr_copy_legacy_once(cbm_store_t *s, sqlite3 *adb) {
     if (adr_migrated(adb)) {
         return CBM_STORE_OK; /* fast path: already migrated, no lock needed */
@@ -12106,19 +12106,22 @@ fail:
  * DB's project_summaries, and a teammate who already indexed the project (so the
  * sidecar is marked, but has no ADR) must still receive it. INSERT OR IGNORE
  * guarantees a local ADR is never clobbered; running ungated by the marker is
- * what distinguishes this from the one-time legacy migration. */
+ * what distinguishes this from the one-time legacy migration. It never writes
+ * the marker: `adb` comes from adr_conn_write, which hands out a sidecar handle
+ * only after adr_copy_legacy_once committed it, and nothing deletes it. On
+ * failure the store error names the step (the import logs it). */
 static int adr_restore_if_absent(cbm_store_t *s, sqlite3 *adb) {
     if (sqlite3_exec(adb, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr restore begin");
         return CBM_STORE_ERR;
     }
     if (adr_copy_rows(s, adb) != CBM_STORE_OK) {
+        store_set_error(s, "adr restore copy failed");
         (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return CBM_STORE_ERR;
     }
-    /* Mark migrated too, so a later reindex's before-delete migration is a no-op. */
-    (void)sqlite3_exec(adb, "INSERT OR IGNORE INTO adr_meta (key, value) VALUES ('migrated','1');",
-                       NULL, NULL, NULL);
     if (sqlite3_exec(adb, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr restore commit");
         (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return CBM_STORE_ERR;
     }
