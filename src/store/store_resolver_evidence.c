@@ -145,6 +145,7 @@ static char *schema_sql(void) {
 enum {
     DIGEST_BYTES = 32,
     DICT_CACHE_SLOTS = 1 << 16,
+    VERIFIED_SOURCE_SLOTS = 1 << 12,
     /* One line per this many stored rows keeps a long write visibly alive: the
      * worker's log is the supervisor's no-progress heartbeat. */
     PROGRESS_ROWS = 1 << 20
@@ -167,6 +168,10 @@ typedef struct {
     sqlite3_int64 file;
     unsigned char digest[DIGEST_BYTES];
 } type_digest_t;
+typedef struct {
+    const char *content, *file, *project, *configuration;
+    uint32_t origin;
+} verified_source_t;
 typedef struct fact_text {
     char *bytes;
     size_t length, capacity;
@@ -184,6 +189,7 @@ typedef struct {
     dict_slot_t *dict;
     size_t dict_capacity, dict_count;
     dict_cache_t *cache;
+    verified_source_t verified[VERIFIED_SOURCE_SLOTS];
     CBMArena owned;
     type_digest_t *types;
     size_t type_count, type_capacity;
@@ -377,11 +383,8 @@ static const cbm_resolve_file_t *find_file(const evidence_write_t *w, const char
     return lo < w->file_count && !strcmp(text(w->files[lo]->file_path), text(path)) ? w->files[lo]
                                                                                     : NULL;
 }
-static bool source_matches(const evidence_write_t *w, const cbm_resolve_proof_source_t *s) {
-    /* Missing context remains explicitly unknown. Whenever a captured source
-     * identity is claimed, it must identify this generation's exact snapshot. */
-    if (!s->content_identity || !*s->content_identity)
-        return true;
+static bool source_matches_snapshot(const evidence_write_t *w,
+                                    const cbm_resolve_proof_source_t *s) {
     const cbm_resolve_file_t *file = find_file(w, s->file);
     if (!file || s->source_origin > 1 ||
         (s->project && *s->project && strcmp(s->project, w->project)))
@@ -390,6 +393,28 @@ static bool source_matches(const evidence_write_t *w, const cbm_resolve_proof_so
         s->source_origin ? file->preprocessed_content_identity : file->raw_content_identity;
     return !strcmp(text(content), s->content_identity) &&
            !strcmp(text(file->configuration_identity), text(s->configuration_identity));
+}
+/* Missing context remains explicitly unknown. Whenever a captured source identity
+ * is claimed, it must identify this generation's exact snapshot. A pool stores each
+ * string once, so facts of one file repeat the same pointers, and a source already
+ * verified needs no binary search and no comparison of 64-character identities. */
+static bool source_matches(evidence_write_t *w, const cbm_resolve_proof_source_t *s) {
+    if (!s->content_identity || !*s->content_identity)
+        return true;
+    verified_source_t *seen =
+        &w->verified[dict_cache_at(s->content_identity) & (VERIFIED_SOURCE_SLOTS - 1)];
+    if (seen->content == s->content_identity && seen->file == s->file &&
+        seen->project == s->project && seen->configuration == s->configuration_identity &&
+        seen->origin == s->source_origin)
+        return true;
+    if (!source_matches_snapshot(w, s))
+        return false;
+    *seen = (verified_source_t){.content = s->content_identity,
+                                .file = s->file,
+                                .project = s->project,
+                                .configuration = s->configuration_identity,
+                                .origin = s->source_origin};
+    return true;
 }
 static char *fact_json(const cbm_resolve_proof_view_t *v) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -948,29 +973,39 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
         qsort(ordered_files, file_count, sizeof(*ordered_files), compare_files);
     if (ok && summary_count > 1)
         qsort(ordered_summaries, summary_count, sizeof(*ordered_summaries), compare_summaries);
-    evidence_write_t w = {.db = db,
-                          .project = project,
-                          .files = ordered_files,
-                          .file_count = file_count,
-                          .cache = cache};
-    cbm_arena_init(&w.owned);
-    ok = ok && reset_tables(db, project, &w.pid) && prepare_writer(&w) &&
-         write_facts(&w, roots, root_count);
+    evidence_write_t *writer = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*writer));
+    if (!writer) {
+        cbm_free(CBM_MEM_CLASS_STORE, roots);
+        cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
+        cbm_free(CBM_MEM_CLASS_STORE, ordered_summaries);
+        cbm_free(CBM_MEM_CLASS_STORE, cache);
+        return false;
+    }
+    evidence_write_t *w = writer;
+    w->db = db;
+    w->project = project;
+    w->files = ordered_files;
+    w->file_count = file_count;
+    w->cache = cache;
+    cbm_arena_init(&w->owned);
+    ok = ok && reset_tables(db, project, &w->pid) && prepare_writer(w) &&
+         write_facts(w, roots, root_count);
     cbm_free(CBM_MEM_CLASS_STORE, roots);
-    ok = ok && write_occurrences(&w, rows, count) &&
-         write_summaries(&w, ordered_summaries, summary_count) &&
-         write_files(&w, ordered_summaries, summary_count);
-    sqlite3_finalize(w.text);
-    sqlite3_finalize(w.fact);
-    sqlite3_finalize(w.support);
-    sqlite3_finalize(w.occurrence);
-    cbm_free(CBM_MEM_CLASS_STORE, w.ids);
-    cbm_free(CBM_MEM_CLASS_STORE, w.digests);
-    cbm_free(CBM_MEM_CLASS_STORE, w.dict);
-    cbm_free(CBM_MEM_CLASS_STORE, w.types);
-    cbm_free(CBM_MEM_CLASS_STORE, w.fact_text.bytes);
+    ok = ok && write_occurrences(w, rows, count) &&
+         write_summaries(w, ordered_summaries, summary_count) &&
+         write_files(w, ordered_summaries, summary_count);
+    sqlite3_finalize(w->text);
+    sqlite3_finalize(w->fact);
+    sqlite3_finalize(w->support);
+    sqlite3_finalize(w->occurrence);
+    cbm_free(CBM_MEM_CLASS_STORE, w->ids);
+    cbm_free(CBM_MEM_CLASS_STORE, w->digests);
+    cbm_free(CBM_MEM_CLASS_STORE, w->dict);
+    cbm_free(CBM_MEM_CLASS_STORE, w->types);
+    cbm_free(CBM_MEM_CLASS_STORE, w->fact_text.bytes);
     cbm_free(CBM_MEM_CLASS_STORE, cache);
-    cbm_arena_destroy(&w.owned);
+    cbm_arena_destroy(&w->owned);
+    cbm_free(CBM_MEM_CLASS_STORE, writer);
     cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
     cbm_free(CBM_MEM_CLASS_STORE, ordered_summaries);
     return ok;
