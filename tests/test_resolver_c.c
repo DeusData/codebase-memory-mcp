@@ -2376,19 +2376,31 @@ TEST(resolver_cpp_class_names_hide_the_enclosing_scope) {
     "};\n"                                                                                      \
     "EXTERN win_T *curwin INIT( = NULL);\n"                                                     \
     "EXTERN int Rows INIT( = 0);\n"                                                             \
+    "LUA_API int (lua_gettop) (int *L);\n"                                                      \
     "#endif\n"
 #define C_TU_GLOBALS_USE                                                                        \
     "#include \"globals.h\"\n"                                                                  \
     "int read_rows(void) { return Rows; }\n"                                                    \
     "void set_cursor(int v) { curwin->w_cursor = v; }\n"                                        \
     "int shadowed(int Rows) { return Rows; }\n"                                                 \
-    "int same(int a, int b) { return (a == b); }\n"
-static const RQ_Source C_TU_GLOBALS[] = {{.path = "globals.h", .text = C_TU_GLOBALS_HEADER},
-                                         {.path = "use_globals.c", .text = C_TU_GLOBALS_USE}};
+    "int same(int a, int b) { return (a == b); }\n"                                             \
+    "int top(int *L) { return lua_gettop(L); }\n"
+static const RQ_Source C_TU_GLOBALS[] = {
+    {.path = "globals.h", .text = C_TU_GLOBALS_HEADER},
+    {.path = "lapi.c", .text = "#include \"globals.h\"\nLUA_API int lua_gettop (int *L) { return *L; }\n"},
+    {.path = "use_globals.c", .text = C_TU_GLOBALS_USE}};
 
 TEST(resolver_c_initializer_macro_declares_the_global) {
     const char *use = C_TU_GLOBALS_USE;
     const RQ_Expected expected[] = {
+        {.case_id = "prototype-with-a-parenthesized-name",
+         .site = {.file = "use_globals.c", .caller = "use_globals.top", .needle = "lua_gettop(L)"},
+         .relation = "CALLS",
+         .target = {.file = "lapi.c",
+                    .suffix = "lapi.lua_gettop",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "LUA_API int lua_gettop (int *L) { return *L; }"}},
         {.case_id = "global-with-initializer-macro",
          .site = C_TU_WORD("use_globals.c", use, "use_globals.read_rows", "return Rows", "Rows"),
          .relation = "USAGE",

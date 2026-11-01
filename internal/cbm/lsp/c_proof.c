@@ -428,6 +428,9 @@ static void csp_note_macro(csp_context_t *ctx, TSNode node) {
 
 static void csp_free_function(csp_context_t *ctx, TSNode node, const char *owner) {
     TSNode decl = csp_function_declarator(node), name_node = csp_field(decl, "declarator");
+    /* Lua declares its whole API as `LUA_API int (lua_gettop) (lua_State *L);`. */
+    while (csp_is(name_node, "parenthesized_declarator"))
+        name_node = ts_node_named_child(name_node, 0);
     if (!csp_is(name_node, "identifier")) {
         if (csp_is(node, "declaration"))
             csp_note_values(ctx, node, owner);
