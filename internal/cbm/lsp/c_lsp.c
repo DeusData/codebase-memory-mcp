@@ -7288,8 +7288,26 @@ static cbm_resolve_result_t c_proof_value(CLSPContext *ctx, const char *name, TS
     return via ? c_proof_import_join(ctx, result, via->via, CBM_PROOF_IMPORT_BINDING) : result;
 }
 
+/* An argument of a function-like macro is tokens, not an expression: neovim's
+ * `HAS_KEY(opts, win_text_height, start_row)` pastes both names into another identifier. So a
+ * bare name there says nothing about a declaration that happens to have that name. */
+static bool c_bare_argument_of_macro(CLSPContext *ctx, TSNode node) {
+    TSNode list = ts_node_parent(node);
+    if (ts_node_is_null(list) || strcmp(ts_node_type(list), "argument_list"))
+        return false;
+    TSNode call = ts_node_parent(list);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression"))
+        return false;
+    TSNode function = ts_node_child_by_field_name(call, "function", 8);
+    if (ts_node_is_null(function) || strcmp(ts_node_type(function), "identifier"))
+        return false;
+    const char *name = c_node_text(ctx, function);
+    return name && c_proof_macro_visible(ctx, name, ts_node_start_byte(call));
+}
+
 static void c_emit_value_reference(CLSPContext *ctx, TSNode node) {
-    if (!ctx->c_decls || !ctx->enclosing_func_qn || ctx->in_template)
+    if (!ctx->c_decls || !ctx->enclosing_func_qn || ctx->in_template ||
+        c_bare_argument_of_macro(ctx, node))
         return;
     TSNode parent = ts_node_parent(node);
     const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
@@ -7431,8 +7449,9 @@ static void c_resolve_callable_argument_references(CLSPContext *ctx, TSNode call
     for (uint32_t i = 0; i < count; i++) {
         TSNode argument = ts_node_named_child(arguments, i);
         const char *kind = ts_node_type(argument);
-        if (!strcmp(kind, "identifier") || !strcmp(kind, "qualified_identifier") ||
-            !strcmp(kind, "scoped_identifier")) {
+        if ((!strcmp(kind, "identifier") || !strcmp(kind, "qualified_identifier") ||
+             !strcmp(kind, "scoped_identifier")) &&
+            !c_bare_argument_of_macro(ctx, argument)) {
             cbm_resolve_result_t proof = c_callable_proof(ctx, argument);
             c_emit_proven(ctx, &proof, c_node_text(ctx, argument), CBM_RESOLVED_CALL_REFERENCE,
                           argument);
