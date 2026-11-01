@@ -342,8 +342,8 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         break;
     case CBM_LANG_PERL:
         out->adapter = "perl_source";
-        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
-                             CBM_RESOLVE_CAP_MEMBER;
+        out->proof_subsets =
+            CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT | CBM_RESOLVE_CAP_MEMBER;
         out->limitation =
             "Package subs, qualified subs, Exporter imports and Class->m or $self->m through @ISA; "
             "builtins, computed names and a graph node shared by two packages abstain. A glob "

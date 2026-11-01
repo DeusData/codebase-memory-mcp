@@ -631,6 +631,12 @@ static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
         if (name_len == word_len && !strncmp(*define, words->source + word_start, word_len)) {
             return;
         }
+        /* The expanded buffer holds the body in the name's place: `-DAPI=Junk` turns
+         * `class API Foo` into `class Junk Foo`, and the body means what was configured. */
+        const char *body = (*define)[name_len] ? *define + name_len + 1 : NULL;
+        if (body && strlen(body) == word_len && !strncmp(body, words->source + word_start, word_len)) {
+            return;
+        }
     }
     cbm_attr_range_add(words, (TSRange){ts_node_start_point(word), ts_node_end_point(word),
                                         ts_node_start_byte(word), ts_node_end_byte(word)});
@@ -4361,10 +4367,10 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     bool c_family = language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
-    TSTree *tree = c_family ? cbm_parse_c_source_defined(parser, source, (uint32_t)source_len, opts,
-                                                         extra_defines)
-                            : cbm_parse_source_repairing(parser, language, source,
-                                                         (uint32_t)source_len, opts);
+    TSTree *tree =
+        c_family
+            ? cbm_parse_c_source_defined(parser, source, (uint32_t)source_len, opts, extra_defines)
+            : cbm_parse_source_repairing(parser, language, source, (uint32_t)source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
@@ -4596,8 +4602,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
             if (pp_parser) {
                 ts_parser_reset(pp_parser);
                 TSParseOptions pp_opts = {0};
-                TSTree *pp_tree =
-                    cbm_parse_c_source(pp_parser, expanded, (uint32_t)expanded_len, pp_opts);
+                TSTree *pp_tree = cbm_parse_c_source_defined(
+                    pp_parser, expanded, (uint32_t)expanded_len, pp_opts, extra_defines);
                 if (pp_tree) {
                     TSNode pp_root = ts_tree_root_node(pp_tree);
                     cbm_sha256_hex(expanded, (size_t)expanded_len,

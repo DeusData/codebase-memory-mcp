@@ -4598,7 +4598,8 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
             if (!lib || !cbm_repo_rel_join(lib, slash + 1, path, sizeof(path)))
                 return NULL;
             *reason = "dart_package_uri_through_pubspec";
-            const cbm_gbuf_node_t *target = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+            const cbm_gbuf_node_t *target =
+                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
             return target && import_language_matches(CBM_LANG_DART, target) ? target : NULL;
         }
         if (imp->kind != CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH)

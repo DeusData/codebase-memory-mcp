@@ -209,9 +209,9 @@ static void zig_collect_container(zig_ctx_t *ctx, const char *owner, TSNode body
                 if (zig_container_value(value)) {
                     const char *nested = zig_nested(ctx, owner, name);
                     (void)cbm_source_declare(walk, nested, "", NULL, CBM_SOURCE_DECL_F_TYPE, line);
-                    cbm_source_decl_t *decl = cbm_source_declare(
-                        walk, owner, name, cbm_source_def_qn(walk, name, line),
-                        CBM_SOURCE_DECL_F_TYPE | visibility, line);
+                    cbm_source_decl_t *decl =
+                        cbm_source_declare(walk, owner, name, cbm_source_def_qn(walk, name, line),
+                                           CBM_SOURCE_DECL_F_TYPE | visibility, line);
                     if (decl)
                         decl->type = cbm_source_table_intern(
                             walk, cbm_arena_sprintf(walk->arena, "O|%s", nested));
@@ -221,9 +221,9 @@ static void zig_collect_container(zig_ctx_t *ctx, const char *owner, TSNode body
                 cbm_source_decl_t *decl = NULL;
                 if (!ts_node_is_null(type)) {
                     /* A typed global is a value of that type, not an alias. */
-                    decl = cbm_source_declare(walk, owner, name,
-                                              cbm_source_def_qn(walk, name, line),
-                                              CBM_SOURCE_DECL_F_VALUE | visibility, line);
+                    decl =
+                        cbm_source_declare(walk, owner, name, cbm_source_def_qn(walk, name, line),
+                                           CBM_SOURCE_DECL_F_VALUE | visibility, line);
                     const char *encoded = zig_encode(ctx, type, 0);
                     if (decl && encoded)
                         decl->type = cbm_source_table_intern(walk, encoded);
@@ -549,8 +549,8 @@ static void zig_visit_children(zig_ctx_t *ctx, TSNode node, unsigned depth) {
     if (cbm_source_is(node, "block_label") || cbm_source_is(node, "break_label") ||
         cbm_source_is(node, "payload"))
         return;
-    TSNode declared = cbm_source_is(node, "variable_declaration") ? zig_declared_name(node)
-                                                                   : (TSNode){0};
+    TSNode declared =
+        cbm_source_is(node, "variable_declaration") ? zig_declared_name(node) : (TSNode){0};
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
@@ -685,8 +685,7 @@ static void zig_resolve(cbm_source_walk_t *walk) {
     zig_visit_children(&ctx, walk->root, 0);
 }
 
-const cbm_source_adapter_t cbm_source_adapter_zig = {
-    .language = CBM_LANG_ZIG,
-    .collect = zig_collect,
-    .resolve = zig_resolve,
-    .decides_references = true};
+const cbm_source_adapter_t cbm_source_adapter_zig = {.language = CBM_LANG_ZIG,
+                                                     .collect = zig_collect,
+                                                     .resolve = zig_resolve,
+                                                     .decides_references = true};

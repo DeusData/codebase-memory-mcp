@@ -50,12 +50,12 @@ void cbm_resolve_proof_pool_init(cbm_resolve_proof_pool_t *pool, CBMArena *arena
                                  size_t premise_limit, uint64_t work_limit) {
     if (!pool)
         return;
-    *pool = (cbm_resolve_proof_pool_t){
-        .arena = arena,
-        .node_limit = node_limit ? node_limit : SIZE_MAX,
-        .premise_limit = premise_limit ? premise_limit : SIZE_MAX,
-        .work_limit = work_limit ? work_limit : UINT64_MAX,
-        .failure = arena ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_FAILED};
+    *pool = (cbm_resolve_proof_pool_t){.arena = arena,
+                                       .node_limit = node_limit ? node_limit : SIZE_MAX,
+                                       .premise_limit = premise_limit ? premise_limit : SIZE_MAX,
+                                       .work_limit = work_limit ? work_limit : UINT64_MAX,
+                                       .failure = arena ? CBM_RESOLVE_ANALYSIS_COMPLETE
+                                                        : CBM_RESOLVE_ANALYSIS_FAILED};
 }
 void cbm_resolve_proof_pool_init_project(cbm_resolve_proof_pool_t *pool, CBMArena *arena) {
     cbm_resolve_proof_pool_init(pool, arena, 0, 0, 0);

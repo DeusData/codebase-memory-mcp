@@ -403,8 +403,8 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
             return true;
         bool same_file = !strcmp(prior->file, file);
         bool same_owner = same_file && !strcmp(prior->label, definition->label);
-        bool same_span = prior->start_line == definition->start_line &&
-                         prior->end_line == definition->end_line;
+        bool same_span =
+            prior->start_line == definition->start_line && prior->end_line == definition->end_line;
         prior->cross_file |= !same_file;
         if (same_owner &&
             (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA)) {
@@ -582,9 +582,13 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
      * (graph_buffer.c, "Definition variants"). Rust `impl From<A> for E` beside
      * `impl From<B> for E`, overloads and build-tag twins all land here, and any member
      * reaches the same node, so selecting that node is exact whichever member a site
-     * means. The node must still be one the census recorded. */
+     * means. The node must still be one the census recorded.
+     * TypeScript merges its overloads and value + type pairs into one proof, so an
+     * ambiguous proof there is two distinct functions that extraction named flat. A
+     * source adapter states its own rule for what a shared name means. */
     if (proof->ambiguous)
-        return !cbm_source_adapter_supported(resolver->file->language) && !proof->mixed_kinds &&
+        return !cbm_source_adapter_supported(resolver->file->language) &&
+               !ecma_language(resolver->file->language) && !proof->mixed_kinds &&
                !proof->rebound && !strcmp(proof->label, node->label) &&
                target_declared_in(proof, node->file_path);
     if (strcmp(proof->file, node->file_path) || node->start_line < 0 || node->end_line < 0)
@@ -2724,8 +2728,7 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         !resolver->python_star_provided || !resolver->python_nested || !resolver->python_members ||
         !resolver->http_defaults || !resolver->http_sites || !resolver->http_unsafe ||
         !resolver->http_candidates || !resolver->http_veto || !resolver->project ||
-        !resolver->solver || !resolver->go_types || !resolver->ecma ||
-        !resolver->source_table) {
+        !resolver->solver || !resolver->go_types || !resolver->ecma || !resolver->source_table) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -4083,8 +4086,7 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
         !((((resolver->file->language == CBM_LANG_PYTHON ||
              cbm_oo_language(resolver->file->language)) &&
             target->label && cbm_label_is_type_like(target->label)) ||
-           ((ecma_language(resolver->file->language) ||
-             resolver->file->language == CBM_LANG_VUE ||
+           ((ecma_language(resolver->file->language) || resolver->file->language == CBM_LANG_VUE ||
              resolver->file->language == CBM_LANG_SVELTE) &&
             target->label && !strcmp(target->label, "Class")) ||
            ((resolver->file->language == CBM_LANG_DART ||
@@ -4213,9 +4215,8 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
         cbm_source_unit_extra_calls(resolver->source_unit, &extra_count);
     for (size_t e = 0; e < extra_count; e++) {
         const cbm_source_extra_call_t *extra = &extras[e];
-        cbm_resolve_result_t outcome =
-            source_adapter_result(resolver, extra->name, extra->start, extra->end,
-                                  CBM_SOURCE_ORIGIN_RAW, true);
+        cbm_resolve_result_t outcome = source_adapter_result(
+            resolver, extra->name, extra->start, extra->end, CBM_SOURCE_ORIGIN_RAW, true);
         if (!record_result(resolver, extra->scope, extra->name, "CALLS", extra->start, extra->end,
                            CBM_SOURCE_ORIGIN_RAW, outcome, NULL))
             return false;
@@ -4444,8 +4445,8 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     cbm_source_table_t *standalone = NULL;
     if (cbm_source_adapter_supported(file->language)) {
         const cbm_source_table_t *table = shared ? shared->source_table : NULL;
-        bool matches =
-            source && cbm_result_source_matches(file->result, source, length, CBM_SOURCE_ORIGIN_RAW);
+        bool matches = source && cbm_result_source_matches(file->result, source, length,
+                                                           CBM_SOURCE_ORIGIN_RAW);
         if (!table) {
             standalone = cbm_source_table_new();
             if (standalone)

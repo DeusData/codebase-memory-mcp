@@ -4876,8 +4876,8 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
     }
     /* These languages state their rules per occurrence in adapter_<lang>.c.
      * This index only attests the exact site through cbm_resolve_binding_source_site. */
-    if (adapter_sites_only ||
-        (cbm_source_adapter_supported(language) && !cbm_source_adapter_has_binding_rules(language))) {
+    if (adapter_sites_only || (cbm_source_adapter_supported(language) &&
+                               !cbm_source_adapter_has_binding_rules(language))) {
         index->analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
         index->reason = "source_adapter_binding";
         return index;
@@ -6027,9 +6027,10 @@ const cbm_resolve_python_nested_import_t *cbm_resolve_binding_python_nested_site
         bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
     const char *dot = strchr(name, '.');
     size_t root = dot ? (size_t)(dot - name) : strlen(name);
-    const binding_name_t *binding = site && !site->attribute_terminal
-                                        ? find_lexical_name(index, name, root, site->scope, NULL, JS_SPACE_ANY)
-                                        : NULL;
+    const binding_name_t *binding =
+        site && !site->attribute_terminal
+            ? find_lexical_name(index, name, root, site->scope, NULL, JS_SPACE_ANY)
+            : NULL;
     return binding && binding->flags == BINDING_IMPORT && binding->nested_import
                ? &index->python_nested[binding->nested_import - 1]
                : NULL;

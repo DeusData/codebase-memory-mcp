@@ -4405,8 +4405,8 @@ void cbm_run_go_lsp_cross_with_registry(CBMArena *arena, const char *source, int
 
 void cbm_run_go_lsp_cross_with_registry_with_source(
     CBMArena *arena, const char *source, int source_len, const char *module_qn,
-    const char *rel_path, CBMTypeRegistry *reg, const char **import_names,
-    const char **import_qns, int import_count, TSTree *cached_tree, CBMResolvedCallArray *out,
+    const char *rel_path, CBMTypeRegistry *reg, const char **import_names, const char **import_qns,
+    int import_count, TSTree *cached_tree, CBMResolvedCallArray *out,
     const cbm_resolve_proof_source_t *source_context) {
     if (!source || source_len <= 0 || !reg)
         return;

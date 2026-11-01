@@ -2522,8 +2522,8 @@ static void pxc_run_oo(CBMLanguage lang, CBMFileResult *result, const char *sour
     pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
     CBMResolvedCallArray out = {0};
     char *file_qn = cbm_pipeline_fqn_compute(result->source_project, rel, "__file__");
-    cbm_oo_resolve_file(index, &scratch, lang, rel, file_qn, source, source_len, result->cached_tree,
-                        result, &out);
+    cbm_oo_resolve_file(index, &scratch, lang, rel, file_qn, source, source_len,
+                        result->cached_tree, result, &out);
     pxc_append_results(&result->arena, &result->resolved_calls, &out);
     free(file_qn);
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
@@ -2655,7 +2655,7 @@ void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result,
                 &scratch, source, source_len, def_module, js, jsx, dts, &overlay, ts_defs,
                 ts_def_count, imp_keys, imp_vals, imp_count, result->cached_tree, &out,
                 &proof_source);
-            free(ts_filtered);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, ts_filtered);
             used_prebuilt = true;
             break;
         }
@@ -2737,7 +2737,7 @@ void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result,
                                      file_def_count, imp_keys, imp_vals, imp_count, bindings,
                                      imports);
     }
-    free(filtered);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, filtered);
 }
 
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
@@ -3244,7 +3244,7 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
             i);
     }
 
-    CBMModuleDefIndex *idx = (CBMModuleDefIndex *)calloc(1, sizeof(*idx));
+    CBMModuleDefIndex *idx = (CBMModuleDefIndex *)cbm_calloc(CBM_MEM_CLASS_EXTRACT, sizeof(*idx));
     if (!idx) {
         cbm_ht_foreach(ht, pxc_module_entry_free_cb, NULL);
         cbm_ht_free(ht);
@@ -3270,7 +3270,7 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx) {
         cbm_ht_foreach(idx->namespace_ht, pxc_module_entry_free_cb, NULL);
         cbm_ht_free(idx->namespace_ht);
     }
-    free(idx);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, idx);
 }
 
 /* A Python namespace record that points at another module (a re-export or a
@@ -3439,7 +3439,8 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
         return NULL;
     }
 
-    CBMLSPDef *out = (CBMLSPDef *)malloc((size_t)total * sizeof(CBMLSPDef));
+    CBMLSPDef *out =
+        (CBMLSPDef *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)total * sizeof(CBMLSPDef));
     if (!out) {
         goto failed;
     }

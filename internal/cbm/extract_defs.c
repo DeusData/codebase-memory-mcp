@@ -9644,8 +9644,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
         // Ruby `class << self` holds the class's singleton methods. The walk
         // otherwise stops at the class body, leaving each of them without a node
         // even though the calls inside it are attributed to that name.
-        if (ctx->language == CBM_LANG_RUBY &&
-            strcmp(ts_node_type(child), "singleton_class") == 0) {
+        if (ctx->language == CBM_LANG_RUBY && strcmp(ts_node_type(child), "singleton_class") == 0) {
             TSNode singleton_body = ts_node_child_by_field_name(child, TS_FIELD("body"));
             uint32_t members =
                 ts_node_is_null(singleton_body) ? 0 : ts_node_named_child_count(singleton_body);

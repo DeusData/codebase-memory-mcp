@@ -586,9 +586,9 @@ static void ruby_audit_locals(ruby_visit_t *visit, TSNode node, unsigned depth) 
         const char *text = cbm_source_text(visit->base.walk, cbm_source_field(node, "left"));
         for (const char *p = text ? strstr(text, "(?<") : NULL; p; p = strstr(p + 3, "(?<")) {
             const char *close = strchr(p + 3, '>');
-            char *name = close ? cbm_arena_strndup(visit->base.walk->arena, p + 3,
-                                                   (size_t)(close - p - 3))
-                               : NULL;
+            char *name =
+                close ? cbm_arena_strndup(visit->base.walk->arena, p + 3, (size_t)(close - p - 3))
+                      : NULL;
             ruby_local_t *local = name && name[0] ? ruby_local(visit, name) : NULL;
             if (local)
                 local->blocked = true;

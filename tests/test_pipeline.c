@@ -10,6 +10,7 @@
 #include "resolver_quality.h"
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
+#include "foundation/mem_core.h"
 #include "pipeline/pipeline.h"
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
@@ -22417,7 +22418,7 @@ static bool python_init_filter_is(CBMLSPDef *defs, int def_count, const char *co
             hits += got[j].qualified_name && strcmp(got[j].qualified_name, expected[i]) == 0;
         correct = hits == 1;
     }
-    free(got);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, got);
     cbm_pxc_free_module_def_index(index);
     return correct;
 }
@@ -22507,7 +22508,7 @@ TEST(pipeline_python_init_import_probe_failure_falls_back) {
         index, defs, CBM_LANG_PYTHON, NULL, "test.consumer", values, 1, &count, &succeeded);
     cbm_pxc_test_import_probe_fail_after(-1);
     bool failed_precisely = index && !filtered && count == 0 && !succeeded;
-    free(filtered);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, filtered);
     CBMFileResult result = {0};
     cbm_arena_init(&result.arena);
     cbm_pxc_test_import_probe_fail_after(0);
