@@ -272,7 +272,37 @@ TEST(resolver_solver_limits_abstain_globally_independent_of_registration_order) 
     PASS();
 }
 
+/* One solver holds every fact of a project, and exhausting it voids every occurrence in
+ * the generation. kubernetes' staging tree alone registers 1315391 facts and settles them
+ * in 4.4M steps, so the former 1M node cap turned all 6.4M occurrences of the repository
+ * into source_declaration_identity_conflict and published no CALLS at all. */
+TEST(resolver_solver_zero_limits_do_not_cap_a_project_sized_population) {
+    enum { FACTS = 1000001 };
+    solver_fixture_t fixture;
+    ASSERT(solver_fixture_init(&fixture, (cbm_resolve_solver_limits_t){0}));
+    const cbm_resolve_proof_t *audit = solver_audit(&fixture, "project_audit");
+    ASSERT_NOT_NULL(audit);
+    for (int i = 0; i < FACTS; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "fact_%07d", i);
+        ASSERT(cbm_resolve_solver_leaf(fixture.solver, key, CBM_SOLVER_KNOWN,
+                                       (cbm_resolve_solver_value_t){.target = "project.target",
+                                                                    .kind = 1},
+                                       audit));
+    }
+    ASSERT(cbm_resolve_solver_solve(fixture.solver));
+    ASSERT(cbm_resolve_solver_complete(fixture.solver));
+    ASSERT_EQ(cbm_resolve_solver_count(fixture.solver), FACTS);
+    cbm_resolve_solver_result_t last;
+    cbm_resolve_solver_get(fixture.solver, "fact_1000000", &last);
+    ASSERT_EQ(last.status, CBM_SOLVER_KNOWN);
+    ASSERT_STR_EQ(last.value.target, "project.target");
+    cbm_arena_destroy(&fixture.arena);
+    PASS();
+}
+
 SUITE(resolver_solver) {
+    RUN_TEST(resolver_solver_zero_limits_do_not_cap_a_project_sized_population);
     RUN_TEST(resolver_solver_pending_is_not_unknown_and_copy_settles);
     RUN_TEST(resolver_solver_join_preserves_unknown_and_unsupported_competitors);
     RUN_TEST(resolver_solver_join_compares_target_kind_and_module_identity);

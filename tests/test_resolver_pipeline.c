@@ -713,7 +713,79 @@ TEST(resolver_pipeline_infra_adapter_pool_has_no_proof_work_budget) {
     PASS();
 }
 
+static int python_file_emitted_calls(size_t name_bytes, int functions) {
+    enum { LINE_BYTES = 64 };
+    char *project = malloc(name_bytes + 1);
+    char *source = malloc((size_t)functions * LINE_BYTES + 64);
+    int emitted = -1;
+    if (!project || !source) {
+        free(project);
+        free(source);
+        return emitted;
+    }
+    memset(project, 'p', name_bytes);
+    project[name_bytes] = '\0';
+    size_t used = (size_t)snprintf(source, 64, "def base():\n    return 1\n");
+    for (int i = 0; i < functions; i++)
+        used += (size_t)snprintf(source + used, LINE_BYTES, "def f%d():\n    return base()\n", i);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)used, CBM_LANG_PYTHON, project, "module.py", 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    if (result && graph && registry) {
+        result->source = source;
+        result->source_len = (int)used;
+        const char *target = NULL;
+        for (int d = 0; d < result->defs.count; d++) {
+            const CBMDefinition *def = &result->defs.items[d];
+            if (!def->qualified_name || !def->name || !def->label)
+                continue;
+            cbm_gbuf_upsert_node(graph, def->label, def->name, def->qualified_name, "module.py",
+                                 def->start_line, def->end_line, "{}");
+            cbm_registry_add(registry, def->name, def->qualified_name, def->label);
+            if (!strcmp(def->name, "base"))
+                target = def->qualified_name;
+        }
+        cbm_file_info_t file = {
+            .path = "/tmp/module.py", .rel_path = "module.py", .language = CBM_LANG_PYTHON};
+        cbm_pipeline_ctx_t ctx = {
+            .project_name = project, .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+        cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+        cbm_resolver_file_t input = {.ctx = &ctx,
+                                     .registry = registry,
+                                     .graph = graph,
+                                     .output = graph,
+                                     .result = result,
+                                     .rel_path = "module.py",
+                                     .module_qn = result->module_qn,
+                                     .language = CBM_LANG_PYTHON};
+        if (shared && target && cbm_shared_resolver_file(shared, &input))
+            emitted = emitted_target(graph, "CALLS", target);
+        cbm_shared_resolver_free(shared);
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    free(project);
+    return emitted;
+}
+
+/* A file's own lookup proofs have the same shape as a project's: one per occurrence, each
+ * linear in its text. A fixed budget stopped resolving partway through any large enough
+ * file, leaving every later occurrence as registry_lookup_proof_unavailable, and how soon
+ * depended on the length of the checkout path because every proof hashes the project name.
+ * The short name is the control: only the hashed text differs between these two files. */
+TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget) {
+    enum { FUNCTIONS = 400 };
+    ASSERT_EQ(python_file_emitted_calls(4, FUNCTIONS), FUNCTIONS);
+    ASSERT_EQ(python_file_emitted_calls(4000, FUNCTIONS), FUNCTIONS);
+    PASS();
+}
+
 SUITE(resolver_pipeline) {
+    RUN_TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget);
     RUN_TEST(resolver_pipeline_shared_build_has_no_proof_work_budget);
     RUN_TEST(resolver_pipeline_graph_pool_has_no_proof_work_budget);
     RUN_TEST(resolver_pipeline_infra_adapter_pool_has_no_proof_work_budget);

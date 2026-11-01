@@ -3,6 +3,7 @@
 #include "resolve/policy.h"
 #include "resolve/symbols.h"
 #include "lsp/proof_bridge.h"
+#include <stdio.h>
 #include <string.h>
 
 static cbm_resolve_result_t proof_outcome(const char *target) {
@@ -161,6 +162,26 @@ TEST(resolver_proof_incomplete_predecessors_revoke_authority) {
     ASSERT_NOT_NULL(pending);
     ASSERT_EQ(pending->value.outcome.analysis, CBM_RESOLVE_ANALYSIS_PENDING);
     ASSERT(!pending->value.predecessors_closed);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Per-file pools once defaulted to 65536 nodes and 4M hashed bytes. Reaching either left
+ * the rest of that file's occurrences LIMITED, so a graph edge depended on where it sat in
+ * the file and on how long the checkout path was. Explicit limits still apply. */
+TEST(resolver_proof_zero_limits_do_not_cap_a_file_sized_population) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &arena, 0, 0, 0);
+    for (int i = 0; i < 65537; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "project.fact_%d", i);
+        ASSERT_NOT_NULL(proof_leaf(&pool, name, CBM_RESOLVE_ANALYSIS_COMPLETE));
+    }
+    pool.work = UINT64_C(4194304);
+    ASSERT_NOT_NULL(proof_leaf(&pool, "project.after_former_budget", CBM_RESOLVE_ANALYSIS_COMPLETE));
+    ASSERT_EQ(pool.failure, CBM_RESOLVE_ANALYSIS_COMPLETE);
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -470,6 +491,7 @@ SUITE(resolver_proof) {
     RUN_TEST(resolver_proof_closed_join_keeps_all_distinct_supports);
     RUN_TEST(resolver_proof_clone_owns_dag_and_canonical_traversal);
     RUN_TEST(resolver_proof_incomplete_predecessors_revoke_authority);
+    RUN_TEST(resolver_proof_zero_limits_do_not_cap_a_file_sized_population);
     RUN_TEST(resolver_proof_limits_and_unknown_source_are_explicit);
     RUN_TEST(resolver_proof_same_pool_chain_does_not_revisit_ancestors);
     RUN_TEST(resolver_proof_named_copy_keeps_rule_and_dependency_without_admission_flags);
