@@ -2031,8 +2031,8 @@ TEST(resolver_c_known_gaps_stay_honest) {
     "#include \"ascii.h\"\n"                                                                    \
     "int use_one(int c) { return ascii_iswhite(c); }\n"                                         \
     "int use_two(int c) { return ascii_isdigit(c); }\n"
-/* `struct timeval tv { 0 };` has the words of the macro form and is a variable, and
- * `Foo Bar f();` does not say which word is the macro, so nothing is left out. */
+/* `struct timeval tv { 0 };` has the words of the macro form and is a variable, so nothing
+ * is left out of it. */
 #define C_TU_ATTR_DECOY                                                                         \
     "struct timeval { int s; };\n"                                                              \
     "struct timeval tv { 0 };\n"                                                                \
@@ -2456,7 +2456,118 @@ TEST(resolver_c_large_file_keeps_its_last_call) {
     PASS();
 }
 
+/* What the C++ rules leave unbound on LLVM. Each is a genuine call the resolver abstains on. */
+#define C_TU_CXX_GAPS_HEADER                                                                    \
+    "#ifndef CXX_GAPS_H\n"                                                                      \
+    "#define CXX_GAPS_H\n"                                                                      \
+    "namespace llvm {\n"                                                                        \
+    "template <typename T> class ArrayRef {\n"                                                  \
+    "public:\n"                                                                                 \
+    "  int size() const { return 1; }\n"                                                        \
+    "};\n"                                                                                      \
+    "class Value {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  int *parts();\n"                                                                         \
+    "  const int *parts() const;\n"                                                             \
+    "  int length() const { return 1; }\n"                                                      \
+    "};\n"                                                                                      \
+    "template <typename T> bool usesLayout(int x) { return x > 0; }\n"                          \
+    "Value makeValue();\n"                                                                      \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_CXX_GAPS_IMPL                                                                      \
+    "#include \"cxx_gaps.h\"\n"                                                                 \
+    "namespace llvm {\n"                                                                        \
+    "int *Value::parts() { return 0; }\n"                                                       \
+    "const int *Value::parts() const { return 0; }\n"                                           \
+    "}\n"
+#define C_TU_CXX_GAPS_USE                                                                       \
+    "#include \"cxx_gaps.h\"\n"                                                                 \
+    "namespace llvm {\n"                                                                        \
+    "int useTemplate(ArrayRef<int> A) { return A.size(); }\n"                                   \
+    "int useAuto() { auto V = makeValue(); return V.length(); }\n"                              \
+    "int useConstOverload(Value V) { return *V.parts(); }\n"                                    \
+    "bool useFunctionTemplate() { return usesLayout<int>(1); }\n"                               \
+    "}\n"
+static const RQ_Source C_TU_CXX_GAPS[] = {
+    {.path = "cxx_gaps.h", .text = C_TU_CXX_GAPS_HEADER},
+    {.path = "cxx_gaps.cpp", .text = C_TU_CXX_GAPS_IMPL},
+    {.path = "cxx_gaps_use.cpp", .text = C_TU_CXX_GAPS_USE}};
+
+TEST(resolver_cpp_known_gaps_stay_honest) {
+    const RQ_Expected expected[] = {
+        {.case_id = "member-of-a-class-template",
+         .site = {.file = "cxx_gaps_use.cpp", .caller = "llvm.useTemplate", .needle = "A.size()"},
+         .relation = "CALLS",
+         .target = {.file = "cxx_gaps.h",
+                    .suffix = "llvm.ArrayRef.size",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text = "  int size() const { return 1; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "cpp-class-template-member",
+         .why = "A specialization can replace the member, and the graph has one node per template "
+                "name, so a class template is not taken as a receiver's class.",
+         .tried = "Read SmallVector, ArrayRef and Optional in LLVM. SmallVectorTemplateBase has two "
+                  "specializations; a rule for templates needs specialization facts first."},
+        {.case_id = "receiver-declared-auto",
+         .site = {.file = "cxx_gaps_use.cpp", .caller = "llvm.useAuto", .needle = "V.length()"},
+         .relation = "CALLS",
+         .target = {.file = "cxx_gaps.h",
+                    .suffix = "llvm.Value.length",
+                    .label = "Method",
+                    .declaration_line = 12,
+                    .declaration_text = "  int length() const { return 1; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "cpp-auto-receiver",
+         .why = "An `auto` variable's type is inferred from its initializer. Only written "
+                "declarations give a receiver its type here.",
+         .tried = "Written declaration types are followed through typedefs, fields and declared "
+                  "return types. Initializer flow is left out on purpose: it can go stale."},
+        {.case_id = "overloads-of-one-parameter-count",
+         .site = {.file = "cxx_gaps_use.cpp", .caller = "llvm.useConstOverload", .needle = "V.parts()"},
+         .relation = "CALLS",
+         .target = {.file = "cxx_gaps.cpp",
+                    .suffix = "cxx_gaps.Value.parts",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text = "int *Value::parts() { return 0; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "cpp-same-count-overloads",
+         .why = "Overloads are told apart by parameter count only. Const-ness and conversion "
+                "ranking are not modelled, and the two definitions share one graph QN.",
+         .tried = "Seen on IEEEFloat::significandParts. Arity selection binds the rest; these abstain."},
+        {.case_id = "explicit-template-arguments",
+         .site = {.file = "cxx_gaps_use.cpp",
+                  .caller = "llvm.useFunctionTemplate",
+                  .needle = "usesLayout<int>(1)"},
+         .relation = "CALLS",
+         .target = {.file = "cxx_gaps.h",
+                    .suffix = "llvm.usesLayout",
+                    .label = "Function",
+                    .declaration_line = 14,
+                    .declaration_text =
+                        "template <typename T> bool usesLayout(int x) { return x > 0; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "cpp-function-template",
+         .why = "Function templates take part in overload resolution by deduction, which is not "
+                "modelled.",
+         .tried = "Plain functions and members bind. A template function is skipped as a candidate "
+                  "so it never wins by being the only name visible."},
+    };
+    const CTUCase fixture = {.suite = "c-tu-cxx-gaps",
+                             .sources = C_TU_CXX_GAPS,
+                             .source_count = sizeof(C_TU_CXX_GAPS) / sizeof(C_TU_CXX_GAPS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .known_gaps = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_cpp_known_gaps_stay_honest);
     RUN_TEST(resolver_c_large_file_keeps_its_last_call);
     RUN_TEST(resolver_c_initializer_macro_declares_the_global);
     RUN_TEST(resolver_cpp_class_names_hide_the_enclosing_scope);
