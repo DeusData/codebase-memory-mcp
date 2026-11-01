@@ -449,12 +449,8 @@ static const CP_Golden cp_goldens[] = {
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
     {"cp_operator_kotlin_plus", "Vec.minus", "CALLS", 154, 183, "Vec", "Class",
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
-    /* Kotlin records no USES_TYPE occurrence for these annotations; USAGE names the class. */
-    {"cp_operator_kotlin_plus", "Vec.plus", "USAGE", 70, 73, "Vec", "Class",
-     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    /* Kotlin records no USES_TYPE occurrence for a result type; USAGE names the class. */
     {"cp_operator_kotlin_plus", "Vec.plus", "USAGE", 76, 79, "Vec", "Class",
-     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
-    {"cp_operator_kotlin_plus", "Vec.minus", "USAGE", 142, 145, "Vec", "Class",
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
     {"cp_operator_kotlin_plus", "Vec.minus", "USAGE", 148, 151, "Vec", "Class",
      "data class Vec(val x: Int, val y: Int) {", 1, false, true},
