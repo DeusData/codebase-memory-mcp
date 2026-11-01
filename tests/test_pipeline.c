@@ -21140,8 +21140,9 @@ static int pyn_run_init_collision(int fillers) {
             const char *project = cbm_pipeline_project_name(p);
             imports[run] = pyn_edge(s, project, "tests.test_app.py.__file__",
                                     "src.rowpkg.layout.Layout", "IMPORTS");
+            /* Layout defines __init__, so Layout("demo") targets it (#1642). */
             calls[run] = pyn_edge(s, project, "tests.test_app.test_build",
-                                  "src.rowpkg.layout.Layout", "CALLS");
+                                  "src.rowpkg.layout.Layout.__init__", "CALLS");
             method[run] = pyn_edge(s, project, "tests.test_app.test_build",
                                    "src.rowpkg.layout.Layout.create", "CALLS");
             cbm_store_close(s);
@@ -21160,7 +21161,7 @@ static int pyn_run_init_collision(int fillers) {
     for (int run = 0; run < 2; run++) {
         ASSERT_EQ(rc[run], 0);
         ASSERT_TRUE(imports[run]); /* the class stays importable */
-        ASSERT_TRUE(calls[run]);   /* Layout("demo") */
+        ASSERT_TRUE(calls[run]);   /* Layout("demo") -> Layout.__init__ */
         ASSERT_TRUE(method[run]);  /* .create() through the constructed type */
     }
     PASS();
