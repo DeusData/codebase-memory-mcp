@@ -657,9 +657,8 @@ static rs_env_t rs_env_here(rs_walk_t *w) {
 
 static bool rs_inst_binds_trait(rs_walk_t *w, rs_inst_t *inst, const rs_item_t *trait) {
     const rs_mod_t *syn = inst->syn;
-    for (int i = 0; i < syn->nitems; i++)
-        if (syn->items[i] == trait)
-            return true;
+    if (trait->owner == syn)
+        return true;
     for (const rs_use_t *use = syn->uses; use; use = use->next) {
         if (!use->nseg || strcmp(use->segs[use->nseg - 1], trait->name) != 0)
             continue;
@@ -2766,8 +2765,7 @@ static const rs_type_t *rs_element_of(rs_walk_t *w, const rs_type_t *iterable) {
     } else if (type->kind == RT_ITEM) {
         /* A project iterator names its element in `type Item = X`. */
         for (const rs_impl_t *impl = type->item->impls; impl; impl = impl->next_self) {
-            if (!impl->trait_syn || impl->trait_syn->kind != RS_TS_PATH || !impl->trait_syn->nseg ||
-                strcmp(impl->trait_syn->segs[impl->trait_syn->nseg - 1], "Iterator") != 0)
+            if (!rs_iterator_trait_name(rs_tsyn_leaf(impl->trait_syn)))
                 continue;
             for (int i = 0; i < impl->nassoc; i++) {
                 if (strcmp(impl->assoc_names[i], "Item") != 0)

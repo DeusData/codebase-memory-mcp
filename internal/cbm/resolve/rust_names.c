@@ -1561,10 +1561,15 @@ static void rs_package_crates(cbm_rust_project_t *project, rs_package_t *package
         rs_join(arena, package->dir, package->build_path ? package->build_path : "build.rs");
     if (build_rel)
         (void)rs_crate_add(project, package, "build_script_build", build_rel, RS_CRATE_AUX);
+}
+
+/* src/bin, tests, benches and examples of whichever package owns each file. */
+static void rs_auto_crates(cbm_rust_project_t *project) {
+    CBMArena *arena = &project->arena;
     for (int i = 0; i < project->nfiles; i++) {
         const char *rel = project->files[i]->rel, *rest = NULL;
-        if (rs_owning_package(project, rel) != package || !rs_under(rel, package->dir, &rest) ||
-            rs_target_listed(package, rel, arena))
+        rs_package_t *package = (rs_package_t *)rs_owning_package(project, rel);
+        if (!package || !package->name || !rs_under(rel, package->dir, &rest))
             continue;
         const char *name = NULL;
         rs_crate_kind_t kind = RS_CRATE_AUX;
@@ -1574,7 +1579,8 @@ static void rs_package_crates(cbm_rust_project_t *project, rs_package_t *package
                  !(package->auto_benches && (name = rs_auto_target(arena, rest, "benches/"))) &&
                  !(package->auto_examples && (name = rs_auto_target(arena, rest, "examples/"))))
             continue;
-        (void)rs_crate_add(project, package, rs_folded(arena, name), rel, kind);
+        if (!rs_target_listed(package, rel, arena))
+            (void)rs_crate_add(project, package, rs_folded(arena, name), rel, kind);
     }
 }
 
@@ -1686,6 +1692,7 @@ bool cbm_rust_project_seal(cbm_rust_project_t *project) {
         if (package->has_package && package->name)
             rs_package_crates(project, package);
     }
+    rs_auto_crates(project);
     if (!any_manifest) {
         /* Without a manifest an entry file is an explicit rustc root. */
         for (int i = 0; i < project->nfiles; i++) {
