@@ -565,7 +565,11 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
                     .declaration_line = 2,
                     .declaration_text = "export function wrong_target() { return 9; }"}}};
     char ids[8][128], negative_ids[8][128];
-    size_t n = 1, nf = 1;
+    size_t n = 1, nf = 1, required = 1;
+    /* The Rust adapter admits these; losing one of them is a failure, not debt. */
+    bool admitted = !strcmp(test, "cp_async_rust_await") ||
+                    !strcmp(test, "cp_interface_dispatch_rust_dyn") ||
+                    !strcmp(test, "cp_enum_variant_rust_impl");
     for (size_t i = 0; i < sizeof(cp_goldens) / sizeof(cp_goldens[0]); i++) {
         const CP_Golden *golden = cp_goldens + i;
         if (strcmp(test, golden->test))
@@ -578,7 +582,7 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
             .site = cp_quality_site(golden, files[0].name),
             .relation = golden->relation,
             .target = cp_quality_target(golden, files[0].name),
-            .mode = RQ_KNOWN_GAP,
+            .mode = admitted ? RQ_REQUIRED : RQ_KNOWN_GAP,
             .gap_id =
                 golden->target ? quality->gap : "implicit-constructor-identity-not-materialized",
             .why = golden->target
@@ -591,6 +595,7 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
                 "fixture bytes and extraction assertions; authored exact source occurrences "
                 "and declaration targets. The shared quality oracle and a separate required "
                 "exact-call control now run through both sequential and padded parallel indexing."};
+        required += admitted;
         n++;
     }
     for (size_t i = 0; i < sizeof(cp_forbidden) / sizeof(cp_forbidden[0]); i++) {
@@ -620,7 +625,8 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
         bool checked =
             store && rq_check_project_declarations(store, project.project, suite, sources, 2,
                                                    expected, n, forbidden, nf, &result, stderr);
-        ok = checked && result.genuine == n && result.found == 1 && result.missing == n - 1 && ok;
+        ok = checked && result.genuine == n && result.found == required &&
+             result.missing == n - required && ok;
         cp_cleanup(&project, store);
     }
     return ok;

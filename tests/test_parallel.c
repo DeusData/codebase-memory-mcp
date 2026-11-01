@@ -4219,7 +4219,7 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "pub fn helper() {}"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "rust-cross-crate-call-proof",
          .why = "Manifest routing alone does not supply a cross-crate declaration proof.",
          .tried = "Retained the declared path dependency, unlisted crate decoy and optional local "
