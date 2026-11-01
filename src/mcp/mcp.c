@@ -17314,6 +17314,28 @@ static mcp_scan_cause_t mcp_run_shell_command_cancellable_bounded(
     uint64_t deadline_ms, bool deadline_enabled, bool deadline_latched, bool exit_one_is_no_match,
     bool git_child, cbm_proc_result_t *result_out);
 
+#ifndef _WIN32
+/* POSIX-only: supervised run of one argv stage (no shell). Same latch and
+ * containment contract as the shell runner; the measured file's size plus
+ * output_base counts toward output_limit so chained stages share one budget.
+ * tolerate_exit_one maps a plain exit-1 (grep's no-match) to SUCCESS. */
+static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
+    cbm_mcp_server_t *srv, const char *bin, const char *const *argv,
+    const char *const *env_overrides, const char *stdout_capture, uint64_t output_base,
+    size_t output_limit, uint64_t deadline_ms, bool deadline_enabled, bool tolerate_exit_one,
+    bool *cancellation_latched, bool *deadline_latched, bool *output_limit_latched,
+    cbm_proc_result_t *result_out);
+
+/* POSIX-only: the unscoped search_code scan as find/sort argv stages feeding the
+ * in-process scanner. */
+static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
+                                                 const char *file_pattern, const char *pattern,
+                                                 const char *filelist, const char *root_path,
+                                                 char output_path[CBM_SZ_2K], size_t output_limit,
+                                                 uint64_t deadline_ms, bool deadline_latched,
+                                                 cbm_proc_result_t *result_out);
+#endif
+
 static char *search_code_timeout_result(void) {
     static const char message[] = "search_code scan exceeded its execution deadline";
     static const char fallback[] =
@@ -17713,10 +17735,22 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                 scan_cause = MCP_SCAN_COMMAND_FAILURE;
             }
         } else {
-            scan_cause = mcp_run_shell_command_cancellable_bounded(
-                srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
-                scan_deadline_latched, /*exit_one_is_no_match=*/false, /*git_child=*/false,
-                &scan_result);
+#ifndef _WIN32
+            if (!srv->search_scan_command_override) {
+                /* POSIX unscoped scans run as find/sort/grep argv stages: no
+                 * shell parses search scopes or file patterns anymore (#2634).
+                 * The command override keeps the shell runner for tests. */
+                scan_cause = mcp_run_search_scan_argv(
+                    srv, use_regex, file_pattern, pattern, filelist, root_path, output_path,
+                    scan_output_limit, scan_deadline_ms, scan_deadline_latched, &scan_result);
+            } else
+#endif
+            {
+                scan_cause = mcp_run_shell_command_cancellable_bounded(
+                    srv, scan_command, output_path, scan_output_limit, scan_deadline_ms, true,
+                    scan_deadline_latched, /*exit_one_is_no_match=*/false, /*git_child=*/false,
+                    &scan_result);
+            }
         }
         /* Both POSIX commands wrap grep and map its no-match status to 0, so any
          * non-zero exit (a failed find/sort, an unreadable operand, a broken
@@ -18235,6 +18269,165 @@ static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *
      * success; only spawn/rejection or failed supervision is a wrapper error. */
     return cause == MCP_SCAN_COMMAND_FAILURE || cause == MCP_SCAN_SUPERVISION_FAILURE ? -1 : 0;
 }
+
+#ifndef _WIN32
+/* Latch poll shared by argv stages: request-cancellation, wall-clock deadline,
+ * and the cumulative measured-file output budget. Mirrors the latch updates of
+ * the shell runner so both paths fail the same way. */
+static void mcp_argv_stage_poll_latches(cbm_mcp_server_t *srv, const char *measured_path,
+                                        uint64_t output_base, size_t output_limit,
+                                        uint64_t deadline_ms, bool deadline_enabled,
+                                        bool *cancellation_latched, bool *deadline_latched,
+                                        bool *output_limit_latched) {
+    *cancellation_latched = *cancellation_latched || mcp_request_cancelled(srv);
+    *deadline_latched = *deadline_latched || (deadline_enabled && cbm_now_ms() >= deadline_ms);
+    if (!*output_limit_latched && output_limit > 0 && measured_path && measured_path[0]) {
+        int64_t measured_size = cbm_file_size(measured_path);
+        *output_limit_latched =
+            measured_size > 0 && output_base + (uint64_t)measured_size > output_limit;
+    }
+}
+
+static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
+    cbm_mcp_server_t *srv, const char *bin, const char *const *argv,
+    const char *const *env_overrides, const char *stdout_capture, uint64_t output_base,
+    size_t output_limit, uint64_t deadline_ms, bool deadline_enabled, bool tolerate_exit_one,
+    bool *cancellation_latched, bool *deadline_latched, bool *output_limit_latched,
+    cbm_proc_result_t *result_out) {
+    memset(result_out, 0, sizeof(*result_out));
+    mcp_argv_stage_poll_latches(srv, stdout_capture, output_base, output_limit, deadline_ms,
+                                deadline_enabled, cancellation_latched, deadline_latched,
+                                output_limit_latched);
+    if (*cancellation_latched || *deadline_latched || *output_limit_latched) {
+        result_out->tree_quiesced = true; /* no child was spawned */
+        if (*cancellation_latched) {
+            return MCP_SCAN_CANCELLED;
+        }
+        return *deadline_latched ? MCP_SCAN_DEADLINE : MCP_SCAN_OUTPUT_LIMIT;
+    }
+    cbm_proc_opts_t options = {
+        .bin = bin,
+        .argv = argv,
+        .env_overrides = env_overrides,
+        .log_file = NULL,
+        .quiet_timeout_ms = 0,
+        .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
+        .delete_log_on_exit = false,
+        .strip_git_repo_env = false,
+        .stdout_file = stdout_capture,
+    };
+    cbm_subprocess_t *process = NULL;
+    if (cbm_subprocess_spawn(&options, &process) != 0) {
+        result_out->tree_quiesced = true;
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    cbm_proc_poll_t state;
+    for (;;) {
+        mcp_argv_stage_poll_latches(srv, stdout_capture, output_base, output_limit, deadline_ms,
+                                    deadline_enabled, cancellation_latched, deadline_latched,
+                                    output_limit_latched);
+        if (*cancellation_latched || *deadline_latched || *output_limit_latched) {
+            (void)cbm_subprocess_request_cancel(process);
+        }
+        state = cbm_subprocess_poll(process, result_out);
+        if (state != CBM_PROC_POLL_RUNNING) {
+            break;
+        }
+        cbm_usleep(10000);
+    }
+    bool contained = state == CBM_PROC_POLL_TERMINAL && result_out->tree_quiesced &&
+                     !result_out->supervision_failed;
+    cbm_subprocess_destroy(process);
+    mcp_argv_stage_poll_latches(srv, stdout_capture, output_base, output_limit, deadline_ms,
+                                deadline_enabled, cancellation_latched, deadline_latched,
+                                output_limit_latched);
+    if (!contained) {
+        return MCP_SCAN_SUPERVISION_FAILURE;
+    }
+    if (*cancellation_latched) {
+        return MCP_SCAN_CANCELLED;
+    }
+    if (*deadline_latched) {
+        return MCP_SCAN_DEADLINE;
+    }
+    if (*output_limit_latched) {
+        return MCP_SCAN_OUTPUT_LIMIT;
+    }
+    if (tolerate_exit_one && result_out->outcome == CBM_PROC_EXIT_NONZERO &&
+        result_out->exit_code == 1) {
+        return MCP_SCAN_SUCCESS; /* ordinary grep no-match */
+    }
+    return result_out->outcome == CBM_PROC_CLEAN ? MCP_SCAN_SUCCESS
+                                                 : MCP_SCAN_CONTAINED_COMMAND_FAILURE;
+}
+
+/* The unscoped (unindexed or not-fully-indexed root) search_code scan with no
+ * shell anywhere: find writes the NUL-delimited candidate list and LC_ALL=C
+ * sort orders it in place, both as argv stages, then the list feeds the
+ * in-process scanner (search_scan_in_process). Search scopes and file patterns
+ * reach find as plain arguments instead of shell-string interpolations (#2634).
+ * find/sort failures fail closed, and an empty list is a successful empty
+ * scan. */
+static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
+                                                 const char *file_pattern, const char *pattern,
+                                                 const char *filelist, const char *root_path,
+                                                 char output_path[CBM_SZ_2K], size_t output_limit,
+                                                 uint64_t deadline_ms, bool deadline_latched,
+                                                 cbm_proc_result_t *result_out) {
+    bool cancellation_latched = false;
+    bool output_limit_latched = false;
+
+    const char *find_argv[9];
+    int fa = 0;
+    find_argv[fa++] = "find";
+    find_argv[fa++] = root_path;
+    find_argv[fa++] = "-type";
+    find_argv[fa++] = "f";
+    if (file_pattern) {
+        find_argv[fa++] = "-name";
+        find_argv[fa++] = file_pattern;
+    }
+    find_argv[fa++] = "-print0";
+    find_argv[fa] = NULL;
+    mcp_scan_cause_t cause = mcp_run_argv_stage_cancellable_bounded(
+        srv, "find", find_argv, NULL, filelist, 0, 0, deadline_ms, true, false,
+        &cancellation_latched, &deadline_latched, &output_limit_latched, result_out);
+    if (cause != MCP_SCAN_SUCCESS) {
+        return cause;
+    }
+
+    const char *sort_argv[] = {"sort", "-z", "-o", filelist, filelist, NULL};
+    const char *sort_env[] = {"LC_ALL=C", NULL};
+    cause = mcp_run_argv_stage_cancellable_bounded(
+        srv, "sort", sort_argv, sort_env, NULL, 0, 0, deadline_ms, true, false,
+        &cancellation_latched, &deadline_latched, &output_limit_latched, result_out);
+    if (cause != MCP_SCAN_SUCCESS) {
+        return cause;
+    }
+
+    if (!mcp_command_output_path(output_path)) {
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    FILE *out = cbm_fopen(output_path, "wb");
+    if (!out) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+        return MCP_SCAN_COMMAND_FAILURE;
+    }
+    /* The sorted, NUL-separated file list feeds the same in-process scanner an
+     * indexed project uses, so matching has one implementation. */
+    mcp_scan_cause_t scan_cause =
+        search_scan_in_process(srv, filelist, pattern, use_regex, out, output_limit, deadline_ms);
+    if (fclose(out) != 0 && scan_cause == MCP_SCAN_SUCCESS) {
+        scan_cause = MCP_SCAN_COMMAND_FAILURE;
+    }
+    if (scan_cause != MCP_SCAN_SUCCESS) {
+        (void)cbm_unlink(output_path);
+        output_path[0] = '\0';
+    }
+    return scan_cause;
+}
+#endif
 
 /* Does `node`'s line range overlap any recorded hunk for `file`? Used to scope
  * seed detection to the actually-changed lines rather than the whole file.
