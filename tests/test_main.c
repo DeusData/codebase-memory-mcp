@@ -1794,6 +1794,7 @@ extern void suite_resolver_binding_js(void);
 extern void suite_resolver_ts(void);
 extern void suite_resolver_c(void);
 extern void suite_resolver_php(void);
+extern void suite_resolver_source_langs(void);
 extern void suite_resolver_kotlin(void);
 extern void suite_resolver_cs(void);
 extern void suite_resolver_quality(void);
@@ -2433,6 +2434,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(resolver_ts);
     RUN_SELECTED_SUITE(resolver_c);
     RUN_SELECTED_SUITE(resolver_php);
+    RUN_SELECTED_SUITE(resolver_source_langs);
     RUN_SELECTED_SUITE(resolver_kotlin);
     RUN_SELECTED_SUITE(resolver_cs);
     RUN_SELECTED_SUITE(resolver_quality);

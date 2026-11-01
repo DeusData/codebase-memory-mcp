@@ -860,12 +860,8 @@ static const char *php_var_class(php_ctx_t *ctx, php_scope_t *scope, const char 
                                  unsigned depth) {
     if (!scope)
         return NULL;
-    if (!strcmp(name, "$this")) {
-        for (php_scope_t *owner = scope; owner; owner = owner->parent)
-            if (owner->has_this)
-                return ctx->cls ? ctx->cls->canonical : NULL;
-        return NULL;
-    }
+    if (!strcmp(name, "$this"))
+        return scope->has_this && ctx->cls ? ctx->cls->canonical : NULL;
     if (scope->dynamic)
         return NULL;
     php_var_t *var = NULL;
@@ -1253,9 +1249,7 @@ static void php_emit_member_call(php_ctx_t *ctx, TSNode node, const php_member_r
     if (decl && static_form && !(decl->flags & CBM_SOURCE_DECL_F_STATIC)) {
         /* parent::m() and Base::m() from an instance method forward $this;
          * from anywhere else this is an error. */
-        bool has_this = false;
-        for (php_scope_t *owner = ctx->scope; owner; owner = owner->parent)
-            has_this |= owner->has_this;
+        bool has_this = ctx->scope && ctx->scope->has_this;
         const char *caller = ctx->cls ? ctx->cls->canonical : NULL;
         bool forwards = has_this && caller && found->receiver &&
                         (relative || php_class_inherits(ctx, caller, found->receiver));
@@ -1482,9 +1476,7 @@ static void php_visit(php_ctx_t *ctx, TSNode node, unsigned depth) {
     }
     if (!strcmp(kind, "anonymous_function") || !strcmp(kind, "arrow_function")) {
         /* A closure binds $this lexically unless it is declared static. */
-        bool bound = false;
-        for (php_scope_t *owner = ctx->scope; owner; owner = owner->parent)
-            bound |= owner->has_this;
+        bool bound = ctx->scope && ctx->scope->has_this;
         php_visit_function(ctx, node, bound && !php_static_modifier(node), true, depth);
         return;
     }

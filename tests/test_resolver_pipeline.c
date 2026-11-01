@@ -266,10 +266,12 @@ TEST(resolver_pipeline_shadow_ambiguity_and_unsupported_are_recorded) {
         "def target():\n    return 1\ndef caller(target):\n    return target()\n",
         ("def target():\n    return 1\ndef target():\n    return 2\ndef caller():\n    return "
          "target()\n"),
-        "def target\n 1\nend\ndef caller\n target()\nend\n"};
+        /* Julia has no adapter. This example held Ruby until Ruby got one: see
+         * resolver_pipeline_ruby_parenthesized_call_binds_its_top_level_def. */
+        "function target()\n 1\nend\nfunction caller()\n target()\nend\n"};
     for (int example = 0; example < 3; example++) {
-        CBMLanguage language = example == 2 ? CBM_LANG_RUBY : CBM_LANG_PYTHON;
-        const char *rel = example == 2 ? "main.rb" : "main.py";
+        CBMLanguage language = example == 2 ? CBM_LANG_JULIA : CBM_LANG_PYTHON;
+        const char *rel = example == 2 ? "main.jl" : "main.py";
         CBMFileResult *result = cbm_extract_file(sources[example], (int)strlen(sources[example]),
                                                  language, "proj", rel, 0, NULL, NULL);
         ASSERT_NOT_NULL(result);
@@ -307,6 +309,80 @@ TEST(resolver_pipeline_shadow_ambiguity_and_unsupported_are_recorded) {
         cbm_gbuf_free(graph);
         cbm_free_result(result);
     }
+    PASS();
+}
+
+/* This test used to pin Ruby's `target()` at no edge because methods are dynamic
+ * and a bare identifier may be a local. Neither reason applies to this form.
+ * Ruby's parser reads an identifier as a local only when it has no arguments and
+ * no parentheses and an assignment precedes it, so `target()` is a method call by
+ * the grammar. A top-level `def` defines a private method of Object, which every
+ * object inherits, so with an implicit receiver the static rule selects it. A
+ * class overriding it at runtime is dispatch, which CALLS does not model. What
+ * does stop the rule is another definition of that name, computed or literal. */
+static int ruby_target_edges(const char *source, const char *rel) {
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUBY, "proj", rel, 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    int edges = -1;
+    if (result && graph && registry && add_result(graph, registry, result, rel, source)) {
+        cbm_pipeline_ctx_t ctx = {
+            .project_name = "proj", .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+        cbm_resolver_file_t input = {.ctx = &ctx,
+                                     .registry = registry,
+                                     .graph = graph,
+                                     .output = graph,
+                                     .result = result,
+                                     .rel_path = rel,
+                                     .module_qn = result->module_qn,
+                                     .language = CBM_LANG_RUBY};
+        if (cbm_shared_resolver_file(NULL, &input)) {
+            size_t count = 0;
+            const cbm_resolve_record_t *records = cbm_gbuf_resolutions(graph, &count);
+            edges = 0;
+            for (size_t r = 0; r < count; r++)
+                edges += records[r].emitted && !strcmp(records[r].relation, "CALLS");
+        }
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    cbm_free_result(result);
+    return edges;
+}
+
+TEST(resolver_pipeline_ruby_parenthesized_call_binds_its_top_level_def) {
+    ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target()\nend\n", "main.rb"), 1);
+    ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target 1\nend\n", "main.rb"), 1);
+    /* A local of that name cannot capture a call with parentheses. */
+    ASSERT_EQ(
+        ruby_target_edges("def target\n 1\nend\ndef caller\n target = 2\n target()\nend\n", "main.rb"),
+        1);
+    PASS();
+}
+
+TEST(resolver_pipeline_ruby_redefinition_and_metaprogramming_abstain) {
+    const char *const sources[] = {
+        /* Two definitions of one name. */
+        "def target\n 1\nend\ndef target\n 2\nend\ndef caller\n target()\nend\n",
+        /* `define_method` replaces the literal name in the class. */
+        "class A\n def target\n 1\n end\n define_method(:target) { 2 }\n def caller\n target()\n "
+        "end\nend\n",
+        /* An attribute macro declares it too. */
+        "class A\n attr_reader :target\n def target\n 1\n end\n def caller\n target()\n "
+        "end\nend\n",
+        /* A prepended module outside the project comes before the class. */
+        "class A\n prepend Outside\n def target\n 1\n end\n def caller\n target()\n end\nend\n",
+        /* instance_eval runs the block with another self. */
+        "class A\n def target\n 1\n end\n def caller(o)\n o.instance_eval { target() }\n "
+        "end\nend\n",
+        /* A DSL block in a class body runs against whatever the DSL chooses. */
+        "class A\n def self.target\n 1\n end\n before do\n target()\n end\nend\n",
+        /* An unknown superclass may declare a name the class does not. */
+        "class A < Outside\n def caller\n target()\n end\nend\ndef target\n 1\nend\n",
+    };
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        ASSERT_EQ(ruby_target_edges(sources[i], "main.rb"), 0);
     PASS();
 }
 
@@ -727,5 +803,7 @@ SUITE(resolver_pipeline) {
     RUN_TEST(resolver_pipeline_missing_import_records_quality_gap_without_local_substitute);
     RUN_TEST(resolver_pipeline_lua_local_function_uses_shared_binding);
     RUN_TEST(resolver_pipeline_shadow_ambiguity_and_unsupported_are_recorded);
+    RUN_TEST(resolver_pipeline_ruby_parenthesized_call_binds_its_top_level_def);
+    RUN_TEST(resolver_pipeline_ruby_redefinition_and_metaprogramming_abstain);
     RUN_TEST(resolver_pipeline_projection_refuses_fabricated_emitted_claim);
 }
