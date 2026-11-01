@@ -6,6 +6,8 @@ endpoint*, not merely for the daemon process, before it reports or opens the URL
 
 This guard uses a real UI build and isolated daemon generations:
 
+* a saved disabled UI survives cold and repeated bare starts, while explicit
+  UI requests and saved enabled settings still start the listener;
 * a temporarily occupied port proves the command waits and then succeeds once
   the verified UI listener becomes available;
 * a foreign service returning the exact formerly accepted HTML markers proves
@@ -327,6 +329,97 @@ def assert_active_daemon_open(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
+def saved_ui_setting(binary, env, work):
+    """Return the persisted (ui_enabled, ui_port) pair as ``config get`` reports it.
+
+    ``config set`` keeps the UI keys in the shared settings database
+    (``_config.db``), not in ``config.json``.  Reading them back through the
+    product's own command checks the value every start path loads, whatever the
+    storage format.  Returns None when a read fails.
+    """
+    values = []
+    for key in ("ui_enabled", "ui_port"):
+        result = subprocess.run([binary, "config", "get", key], capture_output=True,
+                                timeout=10, env=env, cwd=work)
+        if result.returncode != 0:
+            print("diagnostic: config get %s failed:\n%s" % (key, output_text(result)[:700]))
+            return None
+        values.append(result.stdout.decode("utf-8", "replace").strip())
+    return tuple(values)
+
+
+def assert_persisted_ui_setting(binary, work, enabled=False, flags=()):
+    name = "enabled" if enabled else "disabled"
+    name += "-" + ("-".join(flag.lstrip("-") for flag in flags) or "bare")
+    cache = os.path.join(work, "cache-" + name)
+    marker = os.path.join(work, "browser-" + name + ".txt")
+    probe, port = occupied_loopback_port()
+    probe.close()
+    os.makedirs(cache, exist_ok=True)
+    env = fixture_environment(work, cache, marker, 10000)
+    daemon_pid = 0
+    try:
+        for key, value in (("ui_enabled", str(enabled).lower()), ("ui_port", str(port))):
+            configured = subprocess.run([binary, "config", "set", key, value],
+                                        capture_output=True, timeout=10, env=env, cwd=work)
+            if configured.returncode != 0:
+                print("SETUP FAIL: could not persist UI setting:\n%s" % output_text(configured))
+                return False
+        original_setting = saved_ui_setting(binary, env, work)
+        if original_setting != (str(enabled).lower(), str(port)):
+            print("SETUP FAIL: config get does not report the saved UI setting (%s): %r" %
+                  (name, original_setting))
+            return False
+        arguments = ["--port=%d" % port if flag == "--port" else flag for flag in flags]
+        first = subprocess.run([binary, "daemon", "start", *arguments], capture_output=True,
+                               timeout=30, env=env, cwd=work)
+        first_text = output_text(first)
+        daemon_pid = pid_from(first_text)
+        if first.returncode != 0 or "daemon: started" not in first_text:
+            print("RED: daemon start failed with saved UI setting (%s):\n%s" %
+                  (name, first_text[:700]))
+            return False
+        current_setting = saved_ui_setting(binary, env, work)
+        expected_enabled = enabled or bool(flags)
+        if (current_setting is None or current_setting[0] != str(expected_enabled).lower() or
+                (not expected_enabled and current_setting != original_setting)):
+            print("RED: daemon start rewrote the saved UI setting (%s): %r" %
+                  (name, current_setting))
+            return False
+        if expected_enabled:
+            opened = subprocess.run([binary, "daemon", "start", "--open"], capture_output=True,
+                                    timeout=20, env=env, cwd=work)
+            if opened.returncode != 0 or not os.path.exists(marker):
+                print("RED: requested UI did not become ready (%s):\n%s" %
+                      (name, output_text(opened)[:700]))
+                return False
+        else:
+            for arguments in (("start",), ("status",), ("start", "--open")):
+                result = subprocess.run([binary, "daemon", *arguments], capture_output=True,
+                                        timeout=10, env=env, cwd=work)
+                text = output_text(result)
+                expected_result = 1 if "--open" in arguments else 0
+                if (result.returncode != expected_result or "disabled" not in text or
+                        "warming" in text or os.path.exists(marker)):
+                    print("RED: disabled UI was not preserved by %r:\n%s" %
+                          (arguments, text[:700]))
+                    return False
+            repeated_setting = saved_ui_setting(binary, env, work)
+            if repeated_setting != original_setting:
+                print("RED: repeated daemon start rewrote disabled UI config: %r" %
+                      (repeated_setting,))
+                return False
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.5)
+                if connection.connect_ex(("127.0.0.1", port)) == 0:
+                    print("RED: disabled UI opened a listener")
+                    return False
+        print("PASS: daemon start respects saved settings and explicit UI requests (%s)" % name)
+        return True
+    finally:
+        stop_daemon(binary, env, daemon_pid)
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: python3 test_daemon_open_readiness.py <ui-binary>")
@@ -346,6 +439,10 @@ def main():
     # Darwin temporary root so the product endpoint itself remains valid.
     short_temp_root = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
     with tempfile.TemporaryDirectory(prefix="cbm_uiopen_", dir=short_temp_root) as work:
+        for enabled, flags in ((False, ()), (True, ()),
+                               (False, ("--port",)), (False, ("--open",))):
+            if not assert_persisted_ui_setting(binary, work, enabled, flags):
+                return 1
         if not assert_delayed_success(binary, work):
             return 1
         if not assert_bounded_foreign_port_failure(binary, work):
