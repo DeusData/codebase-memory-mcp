@@ -1696,6 +1696,25 @@ TEST(resolver_rust_underscore_holds_its_position) {
     PASS();
 }
 
+/* matches! takes a pattern: Kind::One names the enum, and a bare `helper` is a new binding
+ * even when a function of that name is in scope. */
+TEST(resolver_rust_matches_macro_reads_a_pattern) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub enum Kind { One, Two(i32) }\n"
+         "pub fn helper() {}\n"
+         "pub fn make() -> Kind { Kind::One }\n"
+         "fn check() -> bool { let k = make(); matches!(k, Kind::One | Kind::Two(_)) }\n"
+         "fn binder(k: &Option<i32>) -> bool { matches!(k, Some(helper) if *helper > 0) }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.check", "src.main.Kind"), 1);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.binder", "src.main.helper"), 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
     RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
@@ -1728,6 +1747,7 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_glob_of_a_std_enum_binds_only_its_variants);
     RUN_TEST(resolver_rust_std_signatures_carry_the_element);
     RUN_TEST(resolver_rust_underscore_holds_its_position);
+    RUN_TEST(resolver_rust_matches_macro_reads_a_pattern);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
