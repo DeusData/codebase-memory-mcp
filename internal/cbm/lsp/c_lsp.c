@@ -4917,6 +4917,19 @@ static const CBMRegisteredType *c_lookup_field_owner(CLSPContext *ctx, const cha
 static const CBMRegisteredType *c_proof_direct_class(CLSPContext *ctx, const char *qn, uint32_t at);
 static const CBMRegisteredType *c_proof_field_class(CLSPContext *ctx, const char *qn, uint32_t at);
 
+/* Declared inside a class, as `typedef detail::IEEEFloat IEEEFloat;` is in APFloat, a type's
+ * plain name means nothing outside that class. Code in a class with bases may inherit it.
+ * C has no such scope: a struct tag declared inside another struct is at file scope. */
+static bool c_nested_type_in_scope(const CLSPContext *ctx, const char *scope) {
+    if (!ctx->cpp_mode || ctx->plain_header)
+        return true;
+    const CBMRegisteredType *klass = ctx->proof_method_class;
+    if (!klass)
+        return ctx->enclosing_class_qn != NULL;
+    return !strcmp(klass->qualified_name, scope) ||
+           (klass->embedded_types && klass->embedded_types[0]);
+}
+
 /* Every declaration of this type name the translation unit sees. A name may be
  * declared repeatedly: `typedef struct X X;` beside `struct X {...}`, or the same
  * typedef in several headers. Those denote one type. Anything else is a conflict. */
@@ -4936,6 +4949,10 @@ static const CBMRegisteredType *c_proof_included_annotation(CLSPContext *ctx, co
             strcmp(qn + qn_len - name_len, name))
             continue;
         size_t module_len = qn_len - name_len - 1;
+        const char *scope = cbm_arena_strndup(ctx->arena, qn, module_len);
+        if (scope && cbm_registry_lookup_type(ctx->proof_registry, scope) &&
+            !c_nested_type_in_scope(ctx, scope))
+            continue;
         bool own = c_is_own_declaration(ctx, candidate->source_file_qn, qn, module_len);
         const CTUModule *entry =
             own ? NULL : c_tu_for_declaration(ctx, candidate->source_file_qn, qn, module_len);
@@ -7118,10 +7135,13 @@ static void c_member_hit_add(CMemberHit *hit, const char *target) {
  * one whose own file includes the class. Overloads are told apart by parameter count,
  * which a default argument makes a maximum, or not at all. */
 static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klass, const char *name,
-                                 int argc, uint32_t at, int depth, CMemberHit *hit) {
+                                 int argc, uint32_t at, int depth, bool from_own_class,
+                                 CMemberHit *hit) {
     if (!klass || depth > 8)
         return;
     bool same_class = ctx->proof_method_class && ctx->proof_method_class == klass;
+    /* A member function reaches its bases' protected members, and no further. */
+    bool from_derived = !same_class && from_own_class;
     /* What the class body says about this name, which a definition elsewhere does not:
      * that it is declared at all, and with what access. */
     bool declared = false;
@@ -7133,7 +7153,8 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
             !klass->source_file_qn || strcmp(decl->file, klass->source_file_qn))
             continue;
         declared = true;
-        if (!same_class && (decl->flags & CBM_C_DECL_NOT_PUBLIC)) {
+        if (!same_class && (decl->flags & CBM_C_DECL_NOT_PUBLIC) &&
+            !(from_derived && (decl->flags & CBM_C_DECL_PROTECTED))) {
             hit->open = true;
             return;
         }
@@ -7145,8 +7166,9 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
         const CBMRegisteredFunc *candidate = &iterator.reg->funcs[index];
         if (!(candidate->flags & CBM_FUNC_FLAG_PROJECT_SOURCE) || candidate->type_param_names ||
             !(candidate->source_flags & CBM_SOURCE_DECL_KNOWN) ||
-            (!same_class &&
-             (candidate->source_flags & (CBM_SOURCE_DECL_PRIVATE | CBM_SOURCE_DECL_PROTECTED))) ||
+            (!same_class && (candidate->source_flags & CBM_SOURCE_DECL_PRIVATE)) ||
+            (!same_class && !from_derived &&
+             (candidate->source_flags & CBM_SOURCE_DECL_PROTECTED)) ||
             (argc >= 0 && candidate->source_arity && candidate->source_arity != argc + 1))
             continue;
         const char *target =
@@ -7183,7 +7205,8 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
             c_proof_named_class(ctx, c_base_class_name(ctx, klass->embedded_types[i]), at);
         if (!base)
             hit->open = true;
-        c_proof_class_method(ctx, base, name, argc, at, depth + 1, hit);
+        c_proof_class_method(ctx, base, name, argc, at, depth + 1,
+                             from_own_class || ctx->proof_method_class == klass, hit);
     }
     /* A class whose body is not fully understood may hold more. */
     if (!(klass->source_flags & CBM_SOURCE_CLASS_BODY_COMPLETE))
@@ -7215,7 +7238,7 @@ static cbm_resolve_result_t c_proof_scoped_member(CLSPContext *ctx, TSNode funct
     if (!klass || !written)
         return c_proof_missing("c_scope_class_not_visible");
     CMemberHit hit = {0};
-    c_proof_class_method(ctx, klass, written, c_call_argument_count(call), at, 0, &hit);
+    c_proof_class_method(ctx, klass, written, c_call_argument_count(call), at, 0, false, &hit);
     if (!hit.target || hit.conflict)
         return c_proof_missing("c_scoped_member_not_selected");
     cbm_resolve_result_t typed = cbm_lsp_proof_type_lookup(
@@ -7352,7 +7375,7 @@ static void c_emit_value_reference(CLSPContext *ctx, TSNode node) {
             return;
         }
         CMemberHit hit = {0};
-        c_proof_class_method(ctx, ctx->proof_method_class, name, -1, at, 0, &hit);
+        c_proof_class_method(ctx, ctx->proof_method_class, name, -1, at, 0, false, &hit);
         if (hit.target || hit.open)
             return;
     }
@@ -7612,7 +7635,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     !c_proof_macro_visible(ctx, written, at)) {
                     CMemberHit hit = {0};
                     c_proof_class_method(ctx, ctx->proof_method_class, written,
-                                         c_call_argument_count(node), at, 0, &hit);
+                                         c_call_argument_count(node), at, 0, false, &hit);
                     if (hit.target && !hit.conflict) {
                         cbm_resolve_result_t typed = c_proof_method_class_lookup(ctx, node);
                         cbm_resolve_result_t member =
@@ -7673,7 +7696,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         !c_proof_field_declarer(ctx, receiver, written, at, 0, NULL)) {
                         CMemberHit hit = {0};
                         c_proof_class_method(ctx, receiver, written, c_call_argument_count(node),
-                                             at, 0, &hit);
+                                             at, 0, false, &hit);
                         if (hit.target && !hit.conflict) {
                             const char *spelling = c_node_text(ctx, func_node);
                             cbm_resolve_result_t member = c_proof_member_lookup(

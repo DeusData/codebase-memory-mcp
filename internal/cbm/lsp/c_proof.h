@@ -26,6 +26,7 @@ enum {
     CBM_C_DECL_C_LINKAGE = 1u << 1,   /* written under extern "C" */
     CBM_C_DECL_CONDITIONAL = 1u << 2, /* inside a preprocessor branch */
     CBM_C_DECL_NOT_PUBLIC = 1u << 3,  /* a class member under private: or protected: */
+    CBM_C_DECL_PROTECTED = 1u << 4,   /* with NOT_PUBLIC: reachable from a derived class */
 };
 
 typedef struct CBMCDecl {
