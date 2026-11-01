@@ -3036,7 +3036,11 @@ void cbm_doclink_cs_test_spoil_scope(const char *rel_path) {
 #endif
 
 const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx) {
-    if (ts_node_is_null(ctx->root)) {
+    /* The parse view reads one branch of each #if, which is enough for the graph's nodes. A scope
+     * read from it would call a namespace or a type complete when another branch of the file
+     * names a different one, and a reference valid there would be reported as doc rot. */
+    TSNode root = ts_node_is_null(ctx->unrepaired_root) ? ctx->root : ctx->unrepaired_root;
+    if (ts_node_is_null(root)) {
         return NULL;
     }
     cs_scan_t s = {.ctx = ctx,
@@ -3046,13 +3050,13 @@ const char *cbm_doclink_cs_scan_scope(CBMExtractCtx *ctx) {
                    .untrusted = UINT32_MAX,
                    .next_region = SKIP_ONE};
     s.root_end_byte = ctx->source_len > 0 ? (uint32_t)ctx->source_len : 0;
-    s.root_end_line = cs_end_line(ctx->root);
-    s.lexical = ts_node_has_error(ctx->root);
+    s.root_end_line = cs_end_line(root);
+    s.lexical = ts_node_has_error(root);
     if (s.lexical) {
         cs_scan_tokens(&s);
     }
     /* the root itself is an error node when nothing of the file parsed */
-    cs_collect(&s, ctx->root, cs_kind_is(ctx->root, "ERROR") ? CS_OWNER_LEXICAL : CS_OWNER_NONE);
+    cs_collect(&s, root, cs_kind_is(root, "ERROR") ? CS_OWNER_LEXICAL : CS_OWNER_NONE);
     cs_add_text_items(&s);
     sb_puts(&s.sb, CBM_DOCLINK_CS_SCOPE_TAG "\n");
     cs_emit_items(&s);
