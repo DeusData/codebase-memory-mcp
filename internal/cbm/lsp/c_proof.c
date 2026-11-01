@@ -69,7 +69,13 @@ static TSNode csp_function_declarator(TSNode node) {
     for (unsigned depth = 0; depth < 32 && !ts_node_is_null(decl); depth++) {
         if (csp_is(decl, "function_declarator"))
             return decl;
-        if (!csp_is(decl, "pointer_declarator") && !csp_is(decl, "reference_declarator"))
+        if (csp_is(decl, "reference_declarator")) {
+            /* `T &f()`: the grammar gives this declarator's inner part no field name. */
+            uint32_t count = ts_node_named_child_count(decl);
+            decl = count ? ts_node_named_child(decl, count - 1) : (TSNode){0};
+            continue;
+        }
+        if (!csp_is(decl, "pointer_declarator"))
             break;
         decl = csp_field(decl, "declarator");
     }
@@ -679,7 +685,7 @@ bool cbm_c_collect_file_facts(CBMArena *arena, const char *source, int length, c
     /* C source can name a variable `new` or `class`, and the C++ grammar then
      * loses the declaration it sits in. */
     ts_parser_set_language(parser, language == CBM_LANG_C ? tree_sitter_c() : tree_sitter_cpp());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_c_source(parser, source, (uint32_t)length, (TSParseOptions){0});
     ts_parser_delete(parser);
     if (!tree)
         return false;

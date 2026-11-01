@@ -578,6 +578,283 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
     return tree;
 }
 
+/* ── Attribute macros a C-family grammar cannot read past ────────────────────
+ *
+ * `class LLVM_ABI StringRef {` is how real C++ exports a class. Without the macro's
+ * definition the grammar reads a function named StringRef whose body holds the members
+ * as statements, so the class, its methods and its fields are all lost. The same goes
+ * for `bool f(int a) ATTR_A ATTR_B {` and for the return type of
+ * `LLVM_NODISCARD StringRef f()`.
+ *
+ * Each form below cannot be valid source unless one word expands to an attribute or to
+ * nothing. That word is left out of a second parse through included ranges, so every
+ * offset and position stays that of the real file, and a file with none of these forms
+ * keeps its first tree. Where nothing says which of two words is the macro, none is
+ * left out. */
+#define CBM_ATTR_MAX_ROUNDS 6 /* a macro hides at most one nesting level per round */
+#define CBM_ATTR_MAX_DEPTH 256
+#define CBM_ATTR_MIN_CAPS 3
+
+typedef struct {
+    TSRange *items;
+    uint32_t count;
+    uint32_t cap;
+    bool failed;
+} CBMAttrWords;
+
+static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
+    if (words->failed) {
+        return;
+    }
+    if (words->count == words->cap) {
+        uint32_t cap = words->cap ? words->cap * 2 : 32;
+        TSRange *grown =
+            (TSRange *)cbm_realloc(CBM_MEM_CLASS_EXTRACT, words->items, cap * sizeof(TSRange));
+        if (!grown) {
+            words->failed = true;
+            return;
+        }
+        words->items = grown;
+        words->cap = cap;
+    }
+    words->items[words->count++] = (TSRange){ts_node_start_point(word), ts_node_end_point(word),
+                                             ts_node_start_byte(word), ts_node_end_byte(word)};
+}
+
+/* A macro's spelling: capitals, digits and underscores, too long to be a template
+ * parameter. */
+static bool cbm_attr_all_caps(const char *source, TSNode word) {
+    uint32_t start = ts_node_start_byte(word);
+    uint32_t end = ts_node_end_byte(word);
+    bool letter = false;
+    for (uint32_t i = start; i < end; i++) {
+        char c = source[i];
+        if (c >= 'A' && c <= 'Z') {
+            letter = true;
+        } else if (c != '_' && !(c >= '0' && c <= '9')) {
+            return false;
+        }
+    }
+    return letter && end - start >= CBM_ATTR_MIN_CAPS;
+}
+
+static bool cbm_attr_spells_builtin(const char *source, TSNode word) {
+    static const char *const builtins[] = {"void",  "bool",      "char",   "short",  "int",
+                                           "long",  "float",     "double", "signed", "unsigned",
+                                           "const", "constexpr", "auto",   NULL};
+    uint32_t start = ts_node_start_byte(word);
+    size_t length = ts_node_end_byte(word) - start;
+    for (int i = 0; builtins[i]; i++) {
+        if (strlen(builtins[i]) == length && !strncmp(source + start, builtins[i], length)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The one word an ERROR node holds, or a null node. */
+static TSNode cbm_attr_error_word(TSNode error) {
+    TSNode none = {0};
+    if (ts_node_named_child_count(error) != 1) {
+        return none;
+    }
+    TSNode word = ts_node_named_child(error, 0);
+    return strcmp(ts_node_type(word), "identifier") ? none : word;
+}
+
+static bool cbm_attr_is_tag_specifier(const char *kind) {
+    return !strcmp(kind, "class_specifier") || !strcmp(kind, "struct_specifier") ||
+           !strcmp(kind, "union_specifier");
+}
+
+/* `bool f(int a) ATTR_A ATTR_B {`: a prototype missing its semicolon, then a "definition"
+ * made of two bare words. */
+static bool cbm_attr_follows_open_prototype(TSNode definition) {
+    TSNode previous = ts_node_prev_named_sibling(definition);
+    if (ts_node_is_null(previous) || strcmp(ts_node_type(previous), "declaration")) {
+        return false;
+    }
+    TSNode declarator = ts_node_child_by_field_name(previous, "declarator", 10);
+    uint32_t count = ts_node_child_count(previous);
+    return !ts_node_is_null(declarator) &&
+           !strcmp(ts_node_type(declarator), "function_declarator") && count > 0 &&
+           ts_node_is_missing(ts_node_child(previous, count - 1));
+}
+
+/* A word between the type and the declarator: `TYPE word f()`. */
+static void cbm_attr_leading_word(CBMAttrWords *words, const char *source, TSNode type,
+                                  TSNode word) {
+    if (strcmp(ts_node_type(type), "type_identifier")) {
+        /* `int WINAPI f()`: a builtin type cannot be the macro. */
+        cbm_attr_word_add(words, word);
+    } else if (cbm_attr_spells_builtin(source, word)) {
+        /* `Q_INVOKABLE void f()`: the grammar took the macro for the type. */
+        cbm_attr_word_add(words, type);
+    } else if (cbm_attr_all_caps(source, type) != cbm_attr_all_caps(source, word)) {
+        cbm_attr_word_add(words, cbm_attr_all_caps(source, type) ? type : word);
+    }
+}
+
+static void cbm_attr_check_declaration(TSNode node, const char *source, CBMAttrWords *words) {
+    TSNode type = ts_node_child_by_field_name(node, "type", 4);
+    TSNode declarator = ts_node_child_by_field_name(node, "declarator", 10);
+    if (ts_node_is_null(declarator)) {
+        return;
+    }
+    const char *declarator_kind = ts_node_type(declarator);
+    bool definition = !strcmp(ts_node_type(node), "function_definition");
+    bool bare_declarator = !strcmp(declarator_kind, "identifier");
+    if (definition && bare_declarator && !ts_node_is_null(type)) {
+        /* A function definition needs a function declarator, so `class ATTR Name {` is the
+         * only reading: the specifier's name is the macro. */
+        if (cbm_attr_is_tag_specifier(ts_node_type(type))) {
+            TSNode name = ts_node_child_by_field_name(type, "name", 4);
+            if (!ts_node_is_null(name) &&
+                ts_node_is_null(ts_node_child_by_field_name(type, "body", 4))) {
+                cbm_attr_word_add(words, name);
+            }
+            return;
+        }
+        if (!strcmp(ts_node_type(type), "type_identifier") &&
+            cbm_attr_follows_open_prototype(node)) {
+            cbm_attr_word_add(words, type);
+            cbm_attr_word_add(words, declarator);
+            return;
+        }
+    }
+    uint32_t declarator_start = ts_node_start_byte(declarator);
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (!ts_node_is_error(child)) {
+            continue;
+        }
+        /* `void f(int a) ATTR {`: the function is in the error and the macro is what the
+         * grammar kept as the declarator. */
+        if (definition && bare_declarator && ts_node_named_child_count(child) == 1 &&
+            !strcmp(ts_node_type(ts_node_named_child(child, 0)), "function_declarator")) {
+            cbm_attr_word_add(words, declarator);
+            continue;
+        }
+        TSNode word = cbm_attr_error_word(child);
+        if (ts_node_is_null(word)) {
+            continue;
+        }
+        if (ts_node_start_byte(child) >= declarator_start) {
+            /* `int f() const ATTR {` and `void f() override ATTR;` */
+            if (!strcmp(declarator_kind, "function_declarator")) {
+                cbm_attr_word_add(words, word);
+            }
+        } else if (!ts_node_is_null(type)) {
+            cbm_attr_leading_word(words, source, type, word);
+        }
+    }
+}
+
+static bool cbm_attr_is_container(const char *kind) {
+    static const char *const containers[] = {"translation_unit",
+                                             "namespace_definition",
+                                             "declaration_list",
+                                             "field_declaration_list",
+                                             "linkage_specification",
+                                             "template_declaration",
+                                             "class_specifier",
+                                             "struct_specifier",
+                                             "union_specifier",
+                                             "preproc_if",
+                                             "preproc_ifdef",
+                                             "preproc_elif",
+                                             "preproc_elifdef",
+                                             "preproc_else",
+                                             NULL};
+    for (int i = 0; containers[i]; i++) {
+        if (!strcmp(kind, containers[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A subtree without an error can only hold the clean `class ATTR Name {` form, and that
+ * form never sits inside a clean function body of real source. */
+static void cbm_attr_collect(TSNode node, const char *source, CBMAttrWords *words, int depth) {
+    if (depth > CBM_ATTR_MAX_DEPTH || words->failed) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *kind = ts_node_type(child);
+        bool declaration = !strcmp(kind, "function_definition") || !strcmp(kind, "declaration") ||
+                           !strcmp(kind, "field_declaration");
+        if (declaration) {
+            cbm_attr_check_declaration(child, source, words);
+        }
+        if (ts_node_has_error(child) || cbm_attr_is_container(kind)) {
+            cbm_attr_collect(child, source, words, depth + 1);
+        }
+    }
+}
+
+static int cbm_attr_range_cmp(const void *a, const void *b) {
+    uint32_t left = ((const TSRange *)a)->start_byte;
+    uint32_t right = ((const TSRange *)b)->start_byte;
+    return (left > right) - (left < right);
+}
+
+/* Sets the parser to read everything except the words. The last range is open, so the
+ * virtual final newline of cbm_parse_source stays inside it. */
+static bool cbm_attr_exclude_words(TSParser *parser, CBMAttrWords *words) {
+    qsort(words->items, words->count, sizeof(TSRange), cbm_attr_range_cmp);
+    uint32_t unique = 0;
+    for (uint32_t i = 0; i < words->count; i++) {
+        if (!unique || words->items[i].start_byte != words->items[unique - 1].start_byte) {
+            words->items[unique++] = words->items[i];
+        }
+    }
+    words->count = unique;
+    TSRange *kept =
+        (TSRange *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, ((size_t)unique + 1) * sizeof(TSRange));
+    if (!kept) {
+        return false;
+    }
+    uint32_t from = 0;
+    TSPoint from_point = {0, 0};
+    for (uint32_t i = 0; i < unique; i++) {
+        kept[i] =
+            (TSRange){from_point, words->items[i].start_point, from, words->items[i].start_byte};
+        from = words->items[i].end_byte;
+        from_point = words->items[i].end_point;
+    }
+    kept[unique] = (TSRange){from_point, {UINT32_MAX, UINT32_MAX}, from, UINT32_MAX};
+    bool set = ts_parser_set_included_ranges(parser, kept, unique + 1);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, kept);
+    return set;
+}
+
+TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
+                           TSParseOptions opts) {
+    TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
+    CBMAttrWords words = {0};
+    for (int round = 0; tree && round < CBM_ATTR_MAX_ROUNDS; round++) {
+        uint32_t before = words.count;
+        cbm_attr_collect(ts_tree_root_node(tree), source, &words, 0);
+        if (words.failed || words.count == before || !cbm_attr_exclude_words(parser, &words)) {
+            break;
+        }
+        TSTree *next = cbm_parse_source(parser, source, source_len, opts);
+        (void)ts_parser_set_included_ranges(parser, NULL, 0);
+        if (!next) {
+            ts_parser_reset(parser);
+            break;
+        }
+        ts_tree_delete(tree);
+        tree = next;
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, words.items);
+    return tree;
+}
+
 // --- Parse timeout callback ---
 
 /* Budget for the tree-sitter progress callback. The PRIMARY gate is per-thread
@@ -3254,7 +3531,7 @@ static void cbm_rescue_defs_from_projection(CBMExtractCtx *raw_ctx, const TSLang
         TSParseOptions opts = {0};
         /* The projection keeps the raw source's length and line structure,
          * so it is parsed under the same terminated-last-line rule (#2078). */
-        tree = cbm_parse_source(parser, projected, (uint32_t)raw_ctx->source_len, opts);
+        tree = cbm_parse_c_source(parser, projected, (uint32_t)raw_ctx->source_len, opts);
     }
     CBMHashTable *held = tree ? cbm_ht_create(CBM_SZ_256) : NULL;
     if (held) {
@@ -3418,7 +3695,7 @@ static void extract_cpp_branch_views(const CBMExtractCtx *raw, const TSLanguage 
         }
         /* A view keeps the raw source's length and line structure, so it is
          * parsed under the same terminated-last-line rule (#2078). */
-        TSTree *tree = cbm_parse_source(parser, view, (uint32_t)raw->source_len, opts);
+        TSTree *tree = cbm_parse_c_source(parser, view, (uint32_t)raw->source_len, opts);
         if (!tree) {
             return;
         }
@@ -3866,7 +4143,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     bool sql_ranged = language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) &&
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
-    TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
+    bool c_family = language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
+    TSTree *tree = c_family ? cbm_parse_c_source(parser, source, (uint32_t)source_len, opts)
+                            : cbm_parse_source(parser, source, (uint32_t)source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
@@ -4097,16 +4376,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
             TSParser *pp_parser = get_thread_parser(ts_lang, language);
             if (pp_parser) {
                 ts_parser_reset(pp_parser);
-                CBMStringInput pp_input = {expanded, (uint32_t)expanded_len, false};
-                TSInput pp_ts_input = {
-                    &pp_input,
-                    cbm_string_read,
-                    TSInputEncodingUTF8,
-                    NULL,
-                };
                 TSParseOptions pp_opts = {0};
                 TSTree *pp_tree =
-                    ts_parser_parse_with_options(pp_parser, NULL, pp_ts_input, pp_opts);
+                    cbm_parse_c_source(pp_parser, expanded, (uint32_t)expanded_len, pp_opts);
                 if (pp_tree) {
                     TSNode pp_root = ts_tree_root_node(pp_tree);
                     cbm_sha256_hex(expanded, (size_t)expanded_len,

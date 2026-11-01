@@ -6802,7 +6802,7 @@ static void c_emit_field_reference(CLSPContext *ctx, TSNode node) {
     const CBMType *object_type = c_eval_expr_type(ctx, argument);
     const char *type_qn = NULL;
     const cbm_resolve_proof_t *receiver_proof = NULL;
-    if (cbm_type_is_unknown(object_type) ||
+    if (cbm_type_is_unknown(object_type) || !c_cxx_access_is_builtin(ctx, node, object_type) ||
         !c_field_receiver_proven(ctx, argument, object_type, 0, &type_qn, &receiver_proof))
         return;
     bool is_arrow = false;
@@ -7166,6 +7166,35 @@ static int c_call_argument_count(TSNode call) {
     for (uint32_t i = 0; i < count; i++)
         total += strcmp(ts_node_type(ts_node_named_child(arguments, i)), "comment") != 0;
     return total;
+}
+
+/* `Type::member(...)`: the scope names a class the translation unit sees, and the member
+ * is selected in it by the same rules as through a receiver. */
+static cbm_resolve_result_t c_proof_scoped_member(CLSPContext *ctx, TSNode function, TSNode call) {
+    TSNode scope = ts_node_child_by_field_name(function, "scope", 5);
+    TSNode name = ts_node_child_by_field_name(function, "name", 4);
+    if (ts_node_is_null(scope) || ts_node_is_null(name) ||
+        strcmp(ts_node_type(scope), "namespace_identifier") ||
+        strcmp(ts_node_type(name), "identifier"))
+        return c_proof_missing("c_scope_is_not_a_plain_name");
+    const char *owner = c_node_text(ctx, scope);
+    const char *written = c_node_text(ctx, name);
+    uint32_t at = ts_node_start_byte(call);
+    const CBMRegisteredType *klass = c_proof_named_class(ctx, owner, at);
+    if (!klass || !written)
+        return c_proof_missing("c_scope_class_not_visible");
+    CMemberHit hit = {0};
+    c_proof_class_method(ctx, klass, written, c_call_argument_count(call), at, 0, &hit);
+    if (!hit.target || hit.conflict)
+        return c_proof_missing("c_scoped_member_not_selected");
+    cbm_resolve_result_t typed = cbm_lsp_proof_type_lookup(
+        &ctx->field_types, owner, scope, "c-written-class-scope", klass->qualified_name,
+        klass->declaration_identity, klass->graph_qualified_name, klass->source_flags,
+        "class-named-by-the-call's-scope");
+    typed = c_proof_type_import(ctx, klass->qualified_name, at, typed);
+    return cbm_resolve_admit(&typed) ? c_proof_member_lookup(ctx, c_node_text(ctx, function),
+                                                             function, hit.target, typed.proof)
+                                     : typed;
 }
 
 /* A file-scope object or enumerator in the translation unit. An extern declaration
@@ -7559,6 +7588,15 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                 c_emit_proven(ctx, &proof, c_node_text(ctx, func_node), CBM_RESOLVED_INVOCATION,
                               node);
                 goto recurse;
+            }
+
+            if (c_cxx_rules(ctx) && !ctx->in_template && !strcmp(fk, "qualified_identifier")) {
+                cbm_resolve_result_t scoped = c_proof_scoped_member(ctx, func_node, node);
+                if (cbm_resolve_admit(&scoped)) {
+                    c_emit_proven(ctx, &scoped, c_node_text(ctx, func_node),
+                                  CBM_RESOLVED_INVOCATION, node);
+                    goto recurse;
+                }
             }
 
             // field_expression: obj.method() or ptr->method()
@@ -8555,8 +8593,12 @@ static const CBMRegisteredType *c_proof_function_class(CLSPContext *ctx, TSNode 
     if (!c_cxx_rules(ctx) || ctx->in_template)
         return NULL;
     uint32_t at = ts_node_start_byte(func_node);
-    if (ctx->enclosing_class_qn)
-        return c_proof_field_class(ctx, ctx->enclosing_class_qn, at);
+    /* For `Name::f` this QN is a guess at this module's own class. A class declared in
+     * a header under a namespace is found by the name written in the declarator. */
+    const CBMRegisteredType *enclosing =
+        ctx->enclosing_class_qn ? c_proof_field_class(ctx, ctx->enclosing_class_qn, at) : NULL;
+    if (enclosing)
+        return enclosing;
     TSNode declarator = ts_node_child_by_field_name(func_node, "declarator", 10);
     for (int hop = 0; hop < 16 && !ts_node_is_null(declarator); hop++) {
         const char *kind = ts_node_type(declarator);
@@ -8741,10 +8783,10 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         } else if (strchr(func_qn, '.')) {
             /* `Name::f` whose class is declared in another file, or `ns::f`: the class
              * lookup above found nothing in this module, and the def walk writes this
-             * definition under the file's own scope all the same. */
-            const char *scope = ctx->current_namespace ? ctx->current_namespace : ctx->module_qn;
-            if (scope)
-                func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", scope, func_qn);
+             * definition directly under the file's module, whatever namespace block it
+             * sits in. */
+            if (ctx->module_qn)
+                func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, func_qn);
         } else if (!strchr(func_qn, '.')) {
             /* A free function in a namespace is qualified by the namespace scope
              * (current_namespace is module_qn.ns), matching the def QN the extractor
@@ -9833,7 +9875,7 @@ bool cbm_run_c_lsp_with_test_owners(CBMArena *arena, CBMFileResult *result, cons
             ts_parser_delete(parser);
             return false;
         }
-        owner_tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        owner_tree = cbm_parse_c_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!owner_tree)
             return false;
@@ -10268,7 +10310,7 @@ static bool c_lsp_cross_with_registry_run(
             return false;
         const TSLanguage *ts_lang = cpp_mode ? tree_sitter_cpp() : tree_sitter_c();
         ts_parser_set_language(parser, ts_lang);
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        tree = cbm_parse_c_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         owns_tree = true;
         if (!tree)
@@ -10395,7 +10437,7 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
             return false;
         const TSLanguage *ts_lang = cpp_mode ? tree_sitter_cpp() : tree_sitter_c();
         ts_parser_set_language(parser, ts_lang);
-        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
+        tree = cbm_parse_c_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         owns_tree = true;
         if (!tree)
