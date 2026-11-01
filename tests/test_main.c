@@ -1791,6 +1791,7 @@ extern void suite_index_format(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
+extern void suite_svn_state(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
 extern void suite_zstd(void);
@@ -2416,6 +2417,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(path_alias);
 
     /* Watcher (M10) */
+    RUN_SELECTED_SUITE(svn_state);
     RUN_SELECTED_SUITE(watcher);
 
     /* LZ4 + zstd + SQLite writer */
