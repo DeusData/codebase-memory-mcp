@@ -981,6 +981,41 @@ TEST(resolver_stabilization_go_block_frames_shadow_exactly) {
     PASS();
 }
 
+/* `func New() *pkg.T` selects a member of pkg. It declares no local T for the body, while a
+ * parameter or a named result really does. */
+TEST(resolver_stabilization_go_bare_result_types_declare_no_local) {
+    const char *source = GO_TWO_TYPES
+        "func T() A { return A{} }\n"
+        "func F() *other.T {\n"
+        "  T().M(/*pointer*/)\n"
+        "  return nil\n"
+        "}\n"
+        "func G() []other.T {\n"
+        "  T().M(/*slice*/)\n"
+        "  return nil\n"
+        "}\n"
+        "func H() {\n"
+        "  _ = func() *other.T {\n"
+        "    T().M(/*literal*/)\n"
+        "    return nil\n"
+        "  }\n"
+        "}\n"
+        "func P(T B) *other.T {\n"
+        "  T.M(/*parameter*/)\n"
+        "  return nil\n"
+        "}\n"
+        "func R() (T B) {\n"
+        "  T.M(/*named-result*/)\n"
+        "  return\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "T().M(/*pointer*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.G", "T().M(/*slice*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.H", "T().M(/*literal*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.P", "T.M(/*parameter*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.R", "T.M(/*named-result*/", "test.api.B.M"));
+    PASS();
+}
+
 TEST(resolver_stabilization_go_tuple_results_bind_by_position) {
     const char *source = GO_TWO_TYPES
         "func Pair() (*A, *B) { return nil, nil }\n"
@@ -1097,6 +1132,36 @@ TEST(resolver_stabilization_go_open_embedded_type_blocks_promotion) {
                          "}\n";
     ASSERT(go_selects(source, "test.api.F", "o.Val(/*blocked*/", NULL));
     ASSERT(go_selects(source, "test.api.F", "o.Own(/*direct*/", "test.api.Open.Own"));
+    PASS();
+}
+
+/* component-base/metrics: CounterVec embeds *prometheus.CounterVec beside lazyMetric, and calls
+ * cv.lazyInit. Another package's type cannot hold this package's non-exported name, but it may
+ * hold any exported one. A bare undeclared name may be this package's, so it hides both. */
+TEST(resolver_stabilization_go_foreign_embed_hides_only_exported_names) {
+    const char *source = "package api\n"
+                         "type lazy struct{}\nfunc (lazy) start() {}\nfunc (lazy) Create() {}\n"
+                         "type deep struct{ lazy }\n"
+                         "type Vec struct {\n  *ext.Vec\n  lazy\n}\n"
+                         "type Generic struct {\n  ext.Box[int]\n  lazy\n}\n"
+                         "type Deep struct {\n  ext.Vec\n  deep\n}\n"
+                         "type Bare struct {\n  Undeclared\n  lazy\n}\n"
+                         "func F(v Vec, g Generic, d Deep, b Bare) {\n"
+                         "  v.start(/*private*/)\n"
+                         "  v.Create(/*exported*/)\n"
+                         "  g.start(/*generic*/)\n"
+                         "  g.Create(/*generic-exported*/)\n"
+                         "  d.start(/*deep*/)\n"
+                         "  d.Create(/*deep-exported*/)\n"
+                         "  b.start(/*bare*/)\n"
+                         "}\n";
+    ASSERT(go_selects(source, "test.api.F", "v.start(/*private*/", "test.api.lazy.start"));
+    ASSERT(go_selects(source, "test.api.F", "v.Create(/*exported*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "g.start(/*generic*/", "test.api.lazy.start"));
+    ASSERT(go_selects(source, "test.api.F", "g.Create(/*generic-exported*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "d.start(/*deep*/", "test.api.lazy.start"));
+    ASSERT(go_selects(source, "test.api.F", "d.Create(/*deep-exported*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "b.start(/*bare*/", NULL));
     PASS();
 }
 
@@ -1228,6 +1293,64 @@ TEST(resolver_stabilization_go_defined_non_struct_types_have_method_sets) {
     ASSERT(go_selects(source, "test.api.F", "b.Set(1)", "test.api.bits.Set"));
     ASSERT(go_selects(source, "test.api.F", "f.Call(1)", "test.api.Fn.Call"));
     ASSERT(go_selects(source, "test.api.F", "a.Set(2)", "test.api.bits.Set"));
+    PASS();
+}
+
+/* client-go: `type PodIndexInformer cache.TypedSharedIndexInformer[*v1.Pod]`. component-base:
+ * `type GaugeOpts KubeOpts`. A new type keeps an interface's methods and a struct's fields and
+ * embeds, never the methods bound to a concrete type. */
+TEST(resolver_stabilization_go_defined_type_keeps_what_the_spec_says) {
+    const char *source = "package api\n"
+                         "type In struct{}\nfunc (In) Val() {}\n"
+                         "type Getter interface {\n  Get() In\n}\n"
+                         "type Generic[T any] interface {\n  Make() In\n}\n"
+                         "type Named Getter\n"
+                         "type Twice Named\n"
+                         "type Inst Generic[int]\n"
+                         "type Opts struct {\n  Inner In\n  In\n}\nfunc (Opts) Own() {}\n"
+                         "type Copy Opts\nfunc (Copy) Mine() {}\n"
+                         "type Over struct{ Copy }\n"
+                         "type Remote other.Thing\n"
+                         "type Bare Undeclared\n"
+                         "type Holder struct{ Remote }\n"
+                         "type Level int\nfunc (Level) Type() Level { return 0 }\n"
+                         "type Node struct{ Level }\n"
+                         "type Failure error\n"
+                         "type Both struct {\n  Failure\n  In\n}\n"
+                         "func F(n Named, t Twice, i Inst, c Copy, o Over, r Remote, b Bare, h Holder, k Node, e Both) {\n"
+                         "  n.Get(/*interface*/)\n"
+                         "  t.Get(/*chain*/)\n"
+                         "  i.Make(/*generic*/)\n"
+                         "  v := n.Get()\n"
+                         "  v.Val(/*result*/)\n"
+                         "  c.Inner.Val(/*field*/)\n"
+                         "  c.Val(/*promoted*/)\n"
+                         "  c.Mine(/*own*/)\n"
+                         "  c.Own(/*not-inherited*/)\n"
+                         "  o.Inner.Val(/*embedded*/)\n"
+                         "  o.Own(/*embedded-not-inherited*/)\n"
+                         "  r.Get(/*remote*/)\n"
+                         "  b.Get(/*bare*/)\n"
+                         "  h.Get(/*holder*/)\n"
+                         "  k.Type(/*universe*/)\n"
+                         "  e.Val(/*error*/)\n"
+                         "}\n";
+    ASSERT(go_selects(source, "test.api.F", "n.Get(/*interface*/", "test.api.Getter.Get"));
+    ASSERT(go_selects(source, "test.api.F", "t.Get(/*chain*/", "test.api.Getter.Get"));
+    ASSERT(go_selects(source, "test.api.F", "i.Make(/*generic*/", "test.api.Generic.Make"));
+    ASSERT(go_selects(source, "test.api.F", "v.Val(/*result*/", "test.api.In.Val"));
+    ASSERT(go_selects(source, "test.api.F", "c.Inner.Val(/*field*/", "test.api.In.Val"));
+    ASSERT(go_selects(source, "test.api.F", "c.Val(/*promoted*/", "test.api.In.Val"));
+    ASSERT(go_selects(source, "test.api.F", "c.Mine(/*own*/", "test.api.Copy.Mine"));
+    ASSERT(go_selects(source, "test.api.F", "c.Own(/*not-inherited*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "o.Inner.Val(/*embedded*/", "test.api.In.Val"));
+    ASSERT(go_selects(source, "test.api.F", "o.Own(/*embedded-not-inherited*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "r.Get(/*remote*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "b.Get(/*bare*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "h.Get(/*holder*/", NULL));
+    /* `type Level int` has nothing to inherit, so promotion through it holds. error has a method. */
+    ASSERT(go_selects(source, "test.api.F", "k.Type(/*universe*/", "test.api.Level.Type"));
+    ASSERT(go_selects(source, "test.api.F", "e.Val(/*error*/", NULL));
     PASS();
 }
 
@@ -1568,6 +1691,15 @@ static int go_references_case(bool parallel) {
                             "func MapLiteral() map[string]int {\n"
                             "\treturn map[string]int{Name: 1}\n"
                             "}\n\n"
+                            "var Getter = 1\n\n"
+                            "func Result() *lib.Getter {\n"
+                            "\t_ = Getter\n"
+                            "\treturn nil\n"
+                            "}\n\n"
+                            "func ResultParam(Getter int) *lib.Getter {\n"
+                            "\t_ = Getter\n"
+                            "\treturn nil\n"
+                            "}\n\n"
                             "func Declared() {\n"
                             "\tmount.New().Run()\n"
                             "}\n"),
@@ -1601,6 +1733,11 @@ static int go_references_case(bool parallel) {
     ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Literal", "test.lib.Impl.Name"), 1);
     ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Literal", "test.app.Name"), 0);
     ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.MapLiteral", "test.app.Name"), 1);
+    /* A result `*lib.Getter` selects lib's member and declares no local Getter, so the body's
+     * name is still the package variable. A real parameter does hide it. */
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Result", "test.lib.Getter"), 1);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Result", "test.app.Getter"), 1);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.ResultParam", "test.app.Getter"), 0);
     /* The import binds mount, the package's declared name, though the path says mount-utils. */
     ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Declared", "test.mount-utils.New"), 1);
     ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Declared", "test.mount-utils.Mounter.Run"),
@@ -1697,16 +1834,19 @@ SUITE(resolver_stabilization) {
     RUN_TEST(resolver_stabilization_go_static_type_survives_flow_and_unknown_stays_unknown);
     RUN_TEST(resolver_stabilization_go_calls_in_every_statement_form_are_visited);
     RUN_TEST(resolver_stabilization_go_block_frames_shadow_exactly);
+    RUN_TEST(resolver_stabilization_go_bare_result_types_declare_no_local);
     RUN_TEST(resolver_stabilization_go_tuple_results_bind_by_position);
     RUN_TEST(resolver_stabilization_go_field_chains_follow_declared_field_types);
     RUN_TEST(resolver_stabilization_go_interface_methods_are_their_own_declarations);
     RUN_TEST(resolver_stabilization_go_embedding_follows_the_selector_rule);
     RUN_TEST(resolver_stabilization_go_open_embedded_type_blocks_promotion);
+    RUN_TEST(resolver_stabilization_go_foreign_embed_hides_only_exported_names);
     RUN_TEST(resolver_stabilization_go_range_index_and_channel_yield_their_element);
     RUN_TEST(resolver_stabilization_go_assertions_and_type_switch_clauses_use_the_written_type);
     RUN_TEST(resolver_stabilization_go_literals_new_make_and_conversions_are_typed);
     RUN_TEST(resolver_stabilization_go_package_variables_have_their_declared_type);
     RUN_TEST(resolver_stabilization_go_defined_non_struct_types_have_method_sets);
+    RUN_TEST(resolver_stabilization_go_defined_type_keeps_what_the_spec_says);
     RUN_TEST(resolver_stabilization_go_generic_declarations_keep_their_method_sets);
     RUN_TEST(resolver_stabilization_go_build_tag_twins_are_one_target_but_results_must_agree);
     RUN_TEST(resolver_stabilization_go_imported_members_keep_their_package_identity);
