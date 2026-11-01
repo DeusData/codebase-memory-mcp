@@ -2586,9 +2586,6 @@ static cbm_resolve_result_t rust_result(file_resolver_t *resolver, cbm_rust_site
         result.reason = "rust_target_label_conflict";
         return result;
     }
-    /* A tuple struct's name is its constructor. */
-    if (kind == CBM_RUST_SITE_CALL && site->label && !strcmp(site->label, "Struct"))
-        result.facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
     cbm_resolve_lookup_context_t *shared = cbm_resolve_binding_lookup_context(resolver->bindings);
     if (!shared)
         return unresolved("rust_proof_context_missing");
