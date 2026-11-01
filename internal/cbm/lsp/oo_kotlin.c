@@ -1744,7 +1744,7 @@ static kw_implicit_t kw_implicit_member(kw_t *k, TSNode name_site, const char *n
         /* Kotlin spec 11.3: extensions on this receiver come before the next
          * receiver's members. */
         oo_select_t extension =
-            oo_closed_member(name)
+            oo_closed_member(w, name)
                 ? (oo_select_t){.status = OO_SEL_NONE}
                 : kw_extension_on_implicit(w, &r->value, name, argc, args, out.unknown_receiver);
         if (extension.status == OO_SEL_UNIQUE || extension.status == OO_SEL_AMBIGUOUS) {
@@ -1915,7 +1915,7 @@ static oo_value_t kw_bare_call_with(kw_t *k, TSNode node, TSNode callee, TSNode 
                          implicit.extension ? "kotlin-implicit-receiver-extension"
                                             : "kotlin-implicit-receiver-member");
         result = oo_callable_return(w, target, subst);
-    } else if (!implicit.stop && !oo_closed_member(name)) {
+    } else if (!implicit.stop && !oo_closed_member(w, name)) {
         /* An unlistable implicit receiver could hide a free function. An explicit
          * import spells out this very name, and would be useless if it did. */
         oo_select_t selected = kw_free_call(k, name, argc, values, &constructor, &type_value,
@@ -2725,14 +2725,15 @@ static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
     if (parts == 1) {
         /* `::name`: every declaration of the name competes. */
         kw_implicit_t implicit = kw_implicit_member(k, member, name, -1, NULL);
-        if (implicit.selected.status == OO_SEL_UNIQUE)
+        if (implicit.selected.status == OO_SEL_UNIQUE && !implicit.selected.overload_set)
             target = implicit.selected.callable;
         else if (!implicit.stop && !implicit.unknown_receiver && !oo_lookup_local(w, name)) {
             bool constructor = false;
             oo_value_t type_value = oo_value_unknown();
             oo_select_t selected =
                 kw_free_call(k, name, -1, NULL, &constructor, &type_value, false);
-            if (selected.status == OO_SEL_UNIQUE && !constructor)
+            /* Overloads share a node, but this spelling picks none of them. */
+            if (selected.status == OO_SEL_UNIQUE && !constructor && !selected.overload_set)
                 target = selected.callable;
         }
     } else if (!ts_node_is_null(receiver_node)) {
@@ -2759,13 +2760,21 @@ static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
     return oo_value_unknown();
 }
 
-static oo_value_t kw_literal(const char *kind) {
+static oo_value_t kw_literal(kw_t *k, TSNode node, const char *kind) {
     if (!strcmp(kind, "string_literal") || !strcmp(kind, "line_string_literal") ||
         !strcmp(kind, "multi_line_string_literal"))
         return oo_value_external("String");
     if (!strcmp(kind, "integer_literal") || !strcmp(kind, "hex_literal") ||
-        !strcmp(kind, "bin_literal"))
-        return oo_value_external("Int");
+        !strcmp(kind, "bin_literal")) {
+        /* A decimal literal past Int's range has type Long (Kotlin spec 2.3.1). */
+        const char *digits = kt_compact(&k->text, node);
+        bool beyond = digits && !strcmp(kind, "integer_literal") &&
+                      (strlen(digits) > 10 ||
+                       (strlen(digits) == 10 && strcmp(digits, "2147483647") > 0));
+        oo_value_t value = oo_value_external(beyond ? "Long" : "Int");
+        value.small_literal = !beyond;
+        return value;
+    }
     if (!strcmp(kind, "long_literal"))
         return oo_value_external("Long");
     if (!strcmp(kind, "real_literal"))
@@ -3009,7 +3018,7 @@ static oo_value_t kw_expr_kind(kw_t *k, TSNode node, const char *kind) {
         !strcmp(kind, "line_comment") || !strcmp(kind, "multiline_comment") ||
         !strcmp(kind, "label") || !strcmp(kind, "string_content"))
         return oo_value_unknown();
-    oo_value_t literal = kw_literal(kind);
+    oo_value_t literal = kw_literal(k, node, kind);
     if (oo_value_known(&literal))
         return literal;
     kw_children(k, node);

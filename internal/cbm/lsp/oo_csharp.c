@@ -241,6 +241,23 @@ static uint32_t cs_line(TSNode node) {
     return ts_node_start_point(node).row + 1;
 }
 
+/* `ref` and `out`. `in` also takes a plain argument, so it does not distinguish. */
+static bool cs_has_ref_modifier(const cs_text_t *t, TSNode node) {
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode part = ts_node_child(node, i);
+        const char *kind = ts_node_type(part);
+        if (!strcmp(kind, "ref") || !strcmp(kind, "out"))
+            return true;
+        if (!strcmp(kind, "modifier")) {
+            const char *text = cs_text(t, part);
+            if (text && (!strcmp(text, "ref") || !strcmp(text, "out")))
+                return true;
+        }
+    }
+    return false;
+}
+
 static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, bool *extension) {
     uint32_t count = ts_node_is_null(list) ? 0 : ts_node_child_count(list);
     const oo_typeref_t **refs =
@@ -256,8 +273,17 @@ static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, b
             variadic = true;
         } else if (!strcmp(kind, "parameter")) {
             TSNode type = cs_field(child, "type");
-            if (refs)
+            if (refs) {
                 refs[total] = cs_typeref(&h->text, type);
+                if (refs[total] && cs_has_ref_modifier(&h->text, child)) {
+                    oo_typeref_t *by_ref = cbm_arena_alloc(h->text.arena, sizeof(*by_ref));
+                    if (by_ref) {
+                        *by_ref = *refs[total];
+                        by_ref->by_ref = true;
+                        refs[total] = by_ref;
+                    }
+                }
+            }
             /* A named child after the name is its default value. */
             TSNode name = cs_field(child, "name");
             uint32_t parts = ts_node_named_child_count(child);
@@ -570,6 +596,7 @@ typedef struct {
     oo_walk_t *w;
     cs_text_t text;
     int depth;
+    bool static_method;
 } cw_t;
 
 static oo_value_t cw_expr(cw_t *c, TSNode node);
@@ -702,6 +729,7 @@ static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count) {
         if (!cs_is(argument, "argument"))
             continue;
         oo_value_t value = cw_expr(c, cw_argument_value(argument));
+        value.by_ref = cs_has_ref_modifier(&c->text, argument);
         if (values)
             values[at] = value;
         at++;
@@ -809,6 +837,10 @@ static oo_value_t cw_member_call(cw_t *c, TSNode site, const oo_value_t *receive
     oo_walk_t *w = c->w;
     if (receiver->type) {
         oo_select_t member = oo_select_method(w, receiver, name, argc, args, receiver->classref);
+        /* C# 12.8.7: a static member is not reached through an instance. */
+        if (member.status == OO_SEL_UNIQUE && !receiver->classref &&
+            (member.callable->flags & OO_F_STATIC))
+            return oo_value_unknown();
         if (member.status == OO_SEL_UNIQUE)
             return cw_emit_selected(c, site, &member,
                                     receiver->classref ? "csharp-static-member"
@@ -841,6 +873,10 @@ static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
             continue;
         if (oo_has_method_named(w, &r->value, name)) {
             oo_select_t selected = oo_select_method(w, &r->value, name, argc, args, false);
+            /* C# 12.8.4: a static method reaches no instance member by simple name. */
+            if (c->static_method && selected.status == OO_SEL_UNIQUE &&
+                !(selected.callable->flags & OO_F_STATIC))
+                return oo_value_unknown();
             return cw_emit_selected(c, site, &selected, "csharp-enclosing-type-member");
         }
         /* A delegate-typed member of this name is the member lookup's answer. */
@@ -851,7 +887,7 @@ static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
         if (!oo_hierarchy_complete(w->ix, r->value.type))
             complete = false;
     }
-    if (!complete || oo_closed_member(name))
+    if (!complete || oo_closed_member(w, name))
         return oo_value_unknown();
     /* `using static`: every imported type's members compete. */
     const oo_type_t *found = NULL;
@@ -884,9 +920,9 @@ static const char *cw_generic_or_name(cw_t *c, TSNode node) {
     return cs_name(&c->text, node);
 }
 
-static oo_value_t cw_this(const oo_walk_t *w) {
-    const oo_receiver_t *r = w->receiver;
-    if (!r || r->unknown)
+static oo_value_t cw_this(const cw_t *c) {
+    const oo_receiver_t *r = c->w->receiver;
+    if (!r || r->unknown || c->static_method)
         return oo_value_unknown();
     oo_value_t value = r->value;
     value.classref = false;
@@ -897,7 +933,7 @@ static oo_value_t cw_this(const oo_walk_t *w) {
 static oo_value_t cw_base_call(cw_t *c, TSNode site, const char *name, int argc,
                                const oo_value_t *args) {
     oo_walk_t *w = c->w;
-    oo_value_t self = cw_this(w);
+    oo_value_t self = cw_this(c);
     if (!self.type)
         return oo_value_unknown();
     const oo_type_t *only = NULL;
@@ -1044,11 +1080,11 @@ static oo_value_t cw_member_access(cw_t *c, TSNode node) {
             }
         }
     }
-    oo_value_t receiver = cs_is(object, "this")   ? cw_this(w)
+    oo_value_t receiver = cs_is(object, "this")   ? cw_this(c)
                           : cs_is(object, "base") ? oo_value_unknown()
                                                   : cw_expr(c, object);
     if (cs_is(object, "base")) {
-        oo_value_t self = cw_this(w);
+        oo_value_t self = cw_this(c);
         if (self.type && self.type->super_count && self.type->supers[0].resolved)
             receiver = oo_value_of_type(self.type->supers[0].resolved);
     }
@@ -1242,7 +1278,7 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
         !strcmp(kind, "unsafe_statement"))
         return cw_block_like(c, node);
     if (!strcmp(kind, "this"))
-        return cw_this(w);
+        return cw_this(c);
     if (!strcmp(kind, "foreach_statement"))
         return cw_foreach(c, node);
     if (!strcmp(kind, "declaration_pattern"))
@@ -1424,8 +1460,13 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
             cw_children(c, node);
         return oo_value_external("string");
     }
-    if (!strcmp(kind, "integer_literal"))
-        return oo_value_external("int");
+    if (!strcmp(kind, "integer_literal")) {
+        /* The suffix decides: 1L is a long, and does not reach an int parameter. */
+        const char *digits = ts_node_start_byte(node) < ts_node_end_byte(node)
+                                 ? c->w->source + ts_node_end_byte(node) - 1
+                                 : "";
+        return oo_value_external(*digits == 'l' || *digits == 'L' ? "long" : "int");
+    }
     if (!strcmp(kind, "boolean_literal"))
         return oo_value_external("bool");
     if (!strcmp(kind, "real_literal"))
@@ -1466,6 +1507,15 @@ static oo_value_t cw_expr(cw_t *c, TSNode node) {
 static void cw_method(cw_t *c, TSNode node) {
     oo_walk_t *w = c->w;
     oo_scope_t saved = w->scope;
+    bool saved_static = c->static_method;
+    c->static_method = false;
+    uint32_t parts = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < parts; i++) {
+        TSNode part = ts_node_named_child(node, i);
+        const char *text = cs_is(part, "modifier") ? cs_text(&c->text, part) : NULL;
+        if (text && !strcmp(text, "static"))
+            c->static_method = true;
+    }
     w->scope.tparams = cs_tparams(&c->text, node, &w->scope.tparam_count);
     oo_frame_t frame;
     oo_frame_push(w, &frame);
@@ -1478,6 +1528,7 @@ static void cw_method(cw_t *c, TSNode node) {
     (void)cw_expr(c, cs_field(node, "body"));
     oo_frame_pop(w);
     w->scope = saved;
+    c->static_method = saved_static;
 }
 
 static void cw_members(cw_t *c, TSNode body, const oo_type_t *type) {

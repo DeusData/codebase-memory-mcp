@@ -35,6 +35,7 @@ typedef struct oo_typeref {
     bool function;                  /* Kotlin function type: args are its parameters. */
     const struct oo_typeref *fn_receiver;
     const struct oo_typeref *fn_return;
+    bool by_ref; /* C# `ref` or `out` parameter. */
 } oo_typeref_t;
 
 typedef struct {
@@ -162,6 +163,8 @@ typedef struct oo_value {
     int dims;
     bool classref;         /* Denotes the type itself rather than an instance. */
     bool function_literal; /* An argument spelled as a lambda: its own type is not read. */
+    bool small_literal;    /* An integer literal: it fits a narrower or wider parameter. */
+    bool by_ref;           /* C#: passed with `ref` or `out`. */
     const oo_hidden_t *hidden;
     /* Kotlin function value. */
     const struct oo_value *fn_receiver;
@@ -214,6 +217,7 @@ typedef struct {
     oo_select_status_t status;
     const oo_callable_t *callable;
     oo_subst_t *subst;
+    bool overload_set; /* Several declarations remain, all on one graph node. */
 } oo_select_t;
 
 typedef struct oo_local {
@@ -319,7 +323,7 @@ bool oo_is_subtype(const cbm_oo_index_t *ix, const oo_type_t *type, const oo_typ
 bool oo_type_shaped(const char *name);
 /* A member of a well-known external supertype whose member list is closed. A
  * free function of this name cannot be told apart from the inherited member. */
-bool oo_closed_member(const char *name);
+bool oo_closed_member(const oo_walk_t *w, const char *name);
 /* The element a collection-like value yields, or unknown. */
 oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value);
 /* The declared result of a standard collection accessor, or unknown. */

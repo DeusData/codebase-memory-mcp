@@ -251,7 +251,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         bool same_span = prior->start_line == definition->start_line &&
                          prior->end_line == definition->end_line;
         if (same_owner && !same_span && cbm_oo_language(language) &&
-            strcmp(definition->label, "Class") != 0)
+            (strcmp(definition->label, "Class") != 0 || language == CBM_LANG_CSHARP))
             prior->overload_set = true;
         else
             prior->ambiguous |= !same_owner || !same_span || language == CBM_LANG_PYTHON;

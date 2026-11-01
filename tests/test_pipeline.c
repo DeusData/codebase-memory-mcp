@@ -14032,6 +14032,10 @@ TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
                     "            var store = Services.Resolve();\n"
                     "            store.Put(2);\n"
                     "        }\n"
+                    "        private Repo.Store _store = null;\n"
+                    "        public void KeepField() {\n"
+                    "            _store.Put(3);\n"
+                    "        }\n"
                     "    }\n"
                     "}\n");
     for (int i = 0; i < 52; i++) {
@@ -14060,9 +14064,13 @@ TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
      * arbitrary project Write at PP_FIELD_HINT_CONF. No owner segment is "W",
      * so the fixed hint must not fire at all. */
     ASSERT_FALSE(cross_file_call_has_strategy(s, project, "Log", "Write", "field_type_hint"));
-    /* (2) The intended hint case binds the owner it names, never FileStore. */
-    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", "field_type_hint"), 1);
+    /* (2) A variable's name proves nothing: Services is undeclared, so `store` has
+     * no known type and the hint's old answer was a guess that binds nothing now. */
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", NULL), 0);
     ASSERT_EQ(count_calls_with(s, project, ".Keep", ".FileStore.Put", NULL), 0);
+    /* (3) A declared field's type is a fact: the owner it declares, never FileStore. */
+    ASSERT_EQ(count_calls_with(s, project, ".KeepField", ".Store.Put", NULL), 1);
+    ASSERT_EQ(count_calls_with(s, project, ".KeepField", ".FileStore.Put", NULL), 0);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);

@@ -799,7 +799,7 @@ static oo_value_t jw_bare_call(jw_t *j, TSNode site, const char *name, int argc,
     /* A single-static import spells out this very name: a shadowing inherited
      * member would make that import useless, so it is taken even when a
      * supertype is unindexed. */
-    return jw_static_import_call(j, site, name, argc, args, complete && !oo_closed_member(name));
+    return jw_static_import_call(j, site, name, argc, args, complete && !oo_closed_member(w, name));
 }
 
 /* The innermost `this`, or `Outer.this`. */
@@ -1174,12 +1174,15 @@ static oo_value_t jw_catch(jw_t *j, TSNode node) {
     return oo_value_unknown();
 }
 
-static oo_value_t jw_literal(const char *kind) {
+static oo_value_t jw_literal(const oo_walk_t *w, TSNode node, const char *kind) {
     if (!strcmp(kind, "string_literal"))
         return oo_value_external("String");
     if (!strcmp(kind, "decimal_integer_literal") || !strcmp(kind, "hex_integer_literal") ||
-        !strcmp(kind, "octal_integer_literal") || !strcmp(kind, "binary_integer_literal"))
-        return oo_value_external("int");
+        !strcmp(kind, "octal_integer_literal") || !strcmp(kind, "binary_integer_literal")) {
+        /* The suffix decides: 1L is a long, and does not reach an int parameter. */
+        char last = w->source[ts_node_end_byte(node) - 1];
+        return oo_value_external(last == 'l' || last == 'L' ? "long" : "int");
+    }
     if (!strcmp(kind, "decimal_floating_point_literal") ||
         !strcmp(kind, "hex_floating_point_literal"))
         return oo_value_external("double");
@@ -1338,7 +1341,7 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
         if (!strcmp(kind, "type_pattern"))
             return jw_type_pattern(j, node);
         if (!strcmp(kind, "true"))
-            return jw_literal(kind);
+            return jw_literal(w, node, kind);
         break;
     case 'p':
         if (!strcmp(kind, "parenthesized_expression") && ts_node_named_child_count(node) == 1)
@@ -1360,7 +1363,7 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
         if (!strcmp(kind, "constructor_body"))
             return jw_block_like(j, node);
         if (!strcmp(kind, "character_literal"))
-            return jw_literal(kind);
+            return jw_literal(w, node, kind);
         break;
     case 'a':
         if (!strcmp(kind, "assignment_expression")) {
@@ -1408,7 +1411,7 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
             return jw_conditional_statement(j, node);
         if (!strcmp(kind, "decimal_integer_literal") ||
             !strcmp(kind, "decimal_floating_point_literal"))
-            return jw_literal(kind);
+            return jw_literal(w, node, kind);
         break;
     case 'e':
         if (!strcmp(kind, "enhanced_for_statement"))
@@ -1444,7 +1447,7 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
         break;
     case 's':
         if (!strcmp(kind, "string_literal"))
-            return jw_literal(kind);
+            return jw_literal(w, node, kind);
         if (!strcmp(kind, "switch_block") || !strcmp(kind, "switch_rule") ||
             !strcmp(kind, "switch_block_statement_group") ||
             !strcmp(kind, "synchronized_statement"))
@@ -1458,14 +1461,14 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
         break;
     case 'h':
         if (!strcmp(kind, "hex_integer_literal") || !strcmp(kind, "hex_floating_point_literal"))
-            return jw_literal(kind);
+            return jw_literal(w, node, kind);
         break;
     default:
         break;
     }
     if (!strcmp(kind, "false") || !strcmp(kind, "octal_integer_literal") ||
         !strcmp(kind, "binary_integer_literal"))
-        return jw_literal(kind);
+        return jw_literal(w, node, kind);
     if (!strcmp(kind, "null_literal") || !strcmp(kind, "block_comment"))
         return oo_value_unknown();
     if (!strcmp(kind, "explicit_constructor_invocation")) {

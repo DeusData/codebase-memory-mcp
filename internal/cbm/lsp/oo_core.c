@@ -774,12 +774,46 @@ static bool oo_closed_super(const char *name) {
     return false;
 }
 
-bool oo_closed_member(const char *name) {
+/* Does an enclosing type have this member from outside the project? Every class
+ * has the root type's members; a listed supertype brings its own. Such a member
+ * has no declaration to bind, and beats a free function of the name. */
+bool oo_closed_member(const oo_walk_t *w, const char *name) {
+    static const char *const ROOT_MEMBERS =
+        "toString equals hashCode getClass notify notifyAll wait finalize clone "
+        "ToString Equals GetHashCode GetType MemberwiseClone ReferenceEquals Finalize";
     if (!name)
         return false;
-    for (size_t i = 0; i < sizeof(OO_CLOSED_SUPERS) / sizeof(OO_CLOSED_SUPERS[0]); i++)
-        if (oo_word_in(OO_CLOSED_SUPERS[i].members, name))
+    for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
+        if (!r->value.type)
+            continue;
+        if (oo_word_in(ROOT_MEMBERS, name))
             return true;
+        const oo_type_t *queue[OO_MAX_HIERARCHY];
+        int head = 0, tail = 0;
+        queue[tail++] = r->value.type;
+        while (head < tail) {
+            const oo_type_t *current = queue[head++];
+            for (int i = 0; i < current->super_count; i++) {
+                const oo_super_t *super = &current->supers[i];
+                const oo_type_t *next = super->resolved;
+                if (!next) {
+                    const char *spelled = super->ref ? super->ref->name : NULL;
+                    const char *dot = spelled ? strrchr(spelled, '.') : NULL;
+                    const char *leaf = dot ? dot + 1 : spelled;
+                    for (size_t t = 0; leaf && t < sizeof(OO_CLOSED_SUPERS) / sizeof(OO_CLOSED_SUPERS[0]); t++)
+                        if (!strcmp(OO_CLOSED_SUPERS[t].type, leaf) &&
+                            oo_word_in(OO_CLOSED_SUPERS[t].members, name))
+                            return true;
+                    continue;
+                }
+                bool seen = false;
+                for (int j = 0; j < tail && !seen; j++)
+                    seen = queue[j] == next;
+                if (!seen && tail < OO_MAX_HIERARCHY)
+                    queue[tail++] = next;
+            }
+        }
+    }
     return false;
 }
 
@@ -1064,6 +1098,61 @@ static bool oo_overrides(const oo_callable_t *earlier, const oo_callable_t *late
     return true;
 }
 
+typedef enum { OO_SCALAR_NONE, OO_SCALAR_INTEGER, OO_SCALAR_REAL, OO_SCALAR_BOOL, OO_SCALAR_CHAR, OO_SCALAR_STRING } oo_scalar_t;
+
+static oo_scalar_t oo_scalar_of(const char *leaf) {
+    static const char *const integers[] = {
+        "int",    "long",   "short",   "byte",   "sbyte",  "uint",   "ulong",  "ushort", "nint",
+        "nuint",  "Int",    "Long",    "Short",  "Byte",   "UInt",   "ULong",  "UShort", "UByte",
+        "Integer", "Int16", "Int32",   "Int64",  "UInt16", "UInt32", "UInt64", "SByte",  NULL};
+    static const char *const reals[] = {"float", "double", "decimal", "Float",
+                                        "Double", "Decimal", "Single", NULL};
+    static const char *const bools[] = {"boolean", "bool", "Boolean", NULL};
+    static const char *const chars[] = {"char", "Char", "Character", NULL};
+    static const char *const strings[] = {"String", "string", NULL};
+    if (oo_name_in(leaf, integers))
+        return OO_SCALAR_INTEGER;
+    if (oo_name_in(leaf, reals))
+        return OO_SCALAR_REAL;
+    if (oo_name_in(leaf, bools))
+        return OO_SCALAR_BOOL;
+    if (oo_name_in(leaf, chars))
+        return OO_SCALAR_CHAR;
+    return oo_name_in(leaf, strings) ? OO_SCALAR_STRING : OO_SCALAR_NONE;
+}
+
+/* A scalar value cannot reach a scalar parameter of another family. Java and C#
+ * widen integers and chars into numbers; Kotlin widens nothing. Inside the integers
+ * only a long into something narrower is certain, because a small literal fits all. */
+static bool oo_scalar_mismatch(CBMLanguage language, const char *parameter,
+                               const oo_value_t *value) {
+    const char *argument = value->external;
+    const char *parameter_leaf = oo_leaf(parameter), *argument_leaf = oo_leaf(argument);
+    oo_scalar_t to = oo_scalar_of(parameter_leaf), from = oo_scalar_of(argument_leaf);
+    /* The root type does not convert to a scalar without a cast, in any of the three. */
+    static const char *const roots[] = {"object", "Object", "Any", NULL};
+    if (to != OO_SCALAR_NONE && oo_name_in(argument_leaf, roots))
+        return true;
+    if (to == OO_SCALAR_NONE || from == OO_SCALAR_NONE)
+        return false;
+    if (to == from) {
+        /* Kotlin widens nothing: an Int variable is not a Long. A literal adapts. */
+        if (language == CBM_LANG_KOTLIN && to == OO_SCALAR_INTEGER && !value->small_literal &&
+            strcmp(parameter_leaf, argument_leaf))
+            return true;
+        static const char *const narrow[] = {"int",   "short", "byte",  "Int",     "Short",
+                                             "Byte",  "sbyte", "Int32", "Integer", "Int16",
+                                             "SByte", NULL};
+        static const char *const wide[] = {"long", "Long", "Int64", NULL};
+        return to == OO_SCALAR_INTEGER && oo_name_in(argument_leaf, wide) &&
+               oo_name_in(parameter_leaf, narrow);
+    }
+    if (language != CBM_LANG_KOTLIN && (from == OO_SCALAR_INTEGER || from == OO_SCALAR_CHAR) &&
+        (to == OO_SCALAR_INTEGER || to == OO_SCALAR_REAL))
+        return false;
+    return true;
+}
+
 /* NO only when both sides are known to differ; an unknown keeps the candidate
  * so that it continues to compete. */
 static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
@@ -1076,6 +1165,8 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
             index = callable->param_count - 1;
         if (index < 0 || !callable->params || !callable->params[index])
             continue;
+        if (args[i].by_ref != callable->params[index]->by_ref)
+            return true;
         if (callable->max_args < 0 && index == callable->param_count - 1)
             continue; /* Variadic element versus array conversion is not modelled. */
         if (oo_ref_is_tparam(callable, callable->params[index]))
@@ -1111,13 +1202,12 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
         } else if (parameter.type && argument->external && !argument->fn_ref) {
             /* A literal or JDK value versus a project parameter: only a primitive
              * or String literal is certainly not that class. */
-            const char *leaf = oo_leaf(argument->external);
-            if (oo_builtin_name(leaf) || !strcmp(leaf, "String"))
+            if (oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE)
                 return true;
-        } else if (parameter.external && argument->external && !parameter.dims && !argument->dims &&
-                   oo_builtin_name(parameter.external) &&
-                   !strcmp(oo_leaf(argument->external), "String")) {
-            return true;
+        } else if (parameter.external && argument->external && !parameter.dims && !argument->dims) {
+            if (oo_scalar_mismatch(callable->file ? callable->file->language : CBM_LANG_JAVA,
+                                   parameter.external, argument))
+                return true;
         } else if (parameter.external && argument->type && oo_builtin_name(parameter.external)) {
             return true;
         }
@@ -1140,7 +1230,9 @@ static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, in
             break;
         }
     }
-    if (out.status == OO_SEL_AMBIGUOUS && args && argc >= 0) {
+    /* Even a single candidate must fit: a project namesake of the wrong signature
+     * is not the target of a call whose real target lies outside the project. */
+    if (args && argc >= 0) {
         int kept = 0;
         for (int i = 0; i < count; i++)
             if (!oo_argument_excludes(w, candidates[i].callable, candidates[i].subst, args, argc))
@@ -1160,6 +1252,7 @@ static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, in
     if (out.status == OO_SEL_UNIQUE) {
         out.callable = candidates[0].callable;
         out.subst = candidates[0].subst;
+        out.overload_set = count > 1;
     }
     return out;
 }

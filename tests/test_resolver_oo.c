@@ -267,9 +267,10 @@ static int oo_java_check(bool parallel) {
     OO_EXPECT("CALLS", "Main.patternShadows", "core.Store.get", 0);
     OO_EXPECT("CALLS", "Main.loopShadows", "other.Decoy.get", 1);
     OO_EXPECT("CALLS", "Main.loopShadows", "core.Store.get", 0);
-    /* The anonymous body's own member hides the supertype's. */
-    OO_EXPECT("CALLS", "Main.g", "other.Decoy.local", 0);
-    OO_EXPECT("CALLS", "Main.g", "other.Decoy.inherited", 1);
+    /* The anonymous body's own member hides the supertype's. Its methods have no
+     * node, so their calls belong to the enclosing method, like a lambda's. */
+    OO_EXPECT("CALLS", "Main.anonymous", "other.Decoy.local", 0);
+    OO_EXPECT("CALLS", "Main.anonymous", "other.Decoy.inherited", 1);
     OO_EXPECT("CALL_REFERENCE", "Main.reference", "app.Main.callsNew", 1);
     OO_EXPECT("CALLS", "Api.twice", "core.Api.run", 1);
     /* A class-level initializer is sourced from its File node (#787). */
@@ -314,7 +315,6 @@ static const OOFile KOTLIN_FILES[] = {
      "class Child : Store()\n"
      "object Single {\n    fun one(): Int = 1\n}\n"
      "fun Store.ext(): Int = 2\n"
-     "fun Store.memberOverExtension(): Int = 3\n"
      "fun <T : Store> T.bounded(): T = this\n"
      "fun packageFunction(): Int = 4\n"
      "private fun fileOnly(): Int = 5\n"
@@ -328,6 +328,7 @@ static const OOFile KOTLIN_FILES[] = {
      "fun inTx(block: Tx.() -> Unit) {}\n"
      "fun withIt(block: (Store) -> Unit) {}\n"
      "fun Tx.txExt(): Int = 1\n"
+     "fun Store.memberOverExtension(): Int = 3\n"
      "fun Tx.pick(): Int = 2\n"
      "class Outer {\n"
      "    fun pick(): Int = 1\n"
@@ -457,7 +458,7 @@ static int oo_kotlin_check(bool parallel) {
     OO_EXPECT("CALLS", "Main.bound", "Store.bounded", 1);
     /* A member beats an extension of the same name. */
     OO_EXPECT("CALLS", "Main.memberWins", "Store.Store.memberOverExtension", 1);
-    OO_EXPECT("CALLS", "Main.memberWins", "Store.memberOverExtension", 0);
+    OO_EXPECT("CALLS", "Main.memberWins", "Tx.memberOverExtension", 0);
     OO_EXPECT("CALLS", "Main.companion", "Store.Store.Companion.make", 1);
     OO_EXPECT("CALLS", "Main.singleton", "Store.Single.one", 1);
     OO_EXPECT("CALLS", "Main.constructs", "Store.Store", 1);
@@ -502,7 +503,7 @@ static int oo_kotlin_check(bool parallel) {
     OO_EXPECT("CALLS", "Main.objectValue", "Store.Store.get", 1);
     OO_EXPECT("CALLS", "Main.objectValue", "Store.ext", 1);
     OO_EXPECT("CALLS", "Main.objectOwnMember", "Store.Store.memberOverExtension", 0);
-    OO_EXPECT("CALLS", "Main.objectOwnMember", "Store.memberOverExtension", 0);
+    OO_EXPECT("CALLS", "Main.objectOwnMember", "Tx.memberOverExtension", 0);
     /* A member extension needs its dispatch receiver in scope, and it beats a
      * top-level extension of the same name. */
     OO_EXPECT("CALLS", "Users.keyed", "Dsl.Table.asKey", 1);

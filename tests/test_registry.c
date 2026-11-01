@@ -1484,8 +1484,7 @@ TEST(java_call_never_binds_data_member) {
 
 TEST(generated_member_registers_by_qn_only) {
     /* A generated member (a Java record's implicit accessor) is found by its
-     * qualified name, never by a short-name guess. The same member registered
-     * the ordinary way is exactly what the guess binds. */
+     * qualified name, never by a short-name guess. */
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add_qn_only(r, "proj.geo.Point.Point.y", "Method");
     ASSERT_TRUE(cbm_registry_exists(r, "proj.geo.Point.Point.y"));
@@ -1496,9 +1495,12 @@ TEST(generated_member_registers_by_qn_only) {
     ASSERT_EQ(n, 0);
     cbm_resolution_t res = cbm_registry_resolve(r, "v.y", "proj.app.Caller", NULL, NULL, 0);
     ASSERT_NULL(res.qualified_name);
+    /* The ordinary way adds the short name the generated way must not. Strict
+     * resolution retired the guess itself, so the distinction is now this index. */
     cbm_registry_add(r, "x", "proj.geo.Point.Point.x", "Method");
-    res = cbm_registry_resolve(r, "v.x", "proj.app.Caller", NULL, NULL, 0);
-    ASSERT_STR_EQ(res.qualified_name, "proj.geo.Point.Point.x");
+    ASSERT_EQ(cbm_registry_find_by_name(r, "x", &qns, &n), 0);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(qns[0], "proj.geo.Point.Point.x");
     /* Degenerate input registers nothing. */
     cbm_registry_add_qn_only(r, NULL, "Method");
     cbm_registry_add_qn_only(r, "proj.geo.Point.Point.z", NULL);
