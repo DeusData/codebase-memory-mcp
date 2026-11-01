@@ -53,8 +53,13 @@ static const edge_row_t edge_rows[] = {
      "Exact declared packages and aliases; incomplete or competing namespace candidates abstain."},
     {CBM_LANG_CSHARP, TYPED_EDGES,
      "Exact declared namespace members; unproved aliases and competing candidates abstain."},
-    {CBM_LANG_PHP, TYPED_EDGES,
+    {CBM_LANG_PHP, TYPED_EDGES | EDGE(USAGE),
      "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
+    {CBM_LANG_ELIXIR, EDGE(CALLS), NULL},
+    {CBM_LANG_ERLANG, EDGE(CALLS), NULL},
+    {CBM_LANG_ZIG, EDGE(CALLS), NULL},
+    {CBM_LANG_PERL, EDGE(CALLS), NULL},
+    {CBM_LANG_RUBY, EDGE(CALLS), NULL},
     {CBM_LANG_RUST, TYPED_EDGES,
      "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
@@ -164,6 +169,10 @@ static void edge_capabilities(cbm_resolve_capabilities_t *out) {
             "require exact source spans and a captured environment input; unsupported images "
             "abstain.";
     }
+    if (out->language == CBM_LANG_PHP)
+        out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
+            "Class-like names through use aliases and the current namespace, at the exact name "
+            "token; imported and absent names outside the project abstain.";
     if (out->language == CBM_LANG_K8S)
         out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
             "Kubernetes raw literal image repositories and core Secret, ConfigMap, ServiceAccount "
@@ -260,14 +269,62 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
             "Explicit imports and bounded reexports; ordinary declared receivers and "
             "aliases; dynamic/inherited lookup and decorated callable identity abstain.";
         break;
+    case CBM_LANG_PHP:
+        out->adapter = "php_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
+                             CBM_RESOLVE_CAP_TYPE_FLOW;
+        out->limitation =
+            "Namespace, use and global-fallback name resolution; class chains through declared "
+            "parameter, property and return types and consistent local assignment. A chain "
+            "leaving the project, magic members, PHPDoc types and reference effects abstain.";
+        break;
+    case CBM_LANG_ELIXIR:
+        out->adapter = "elixir_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation =
+            "Module functions by name and arity through defmodule, alias and import; quote, "
+            "protocols, computed modules and a graph node shared by two modules abstain.";
+        break;
+    case CBM_LANG_ERLANG:
+        out->adapter = "erlang_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "Functions by name and arity, -import and exported m:f and ?MODULE:f; a "
+                          "variable module or function and macros abstain.";
+        break;
+    case CBM_LANG_ZIG:
+        out->adapter = "zig_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
+                             CBM_RESOLVE_CAP_TYPE_FLOW;
+        out->limitation =
+            "Container declarations, relative @import and members through declared types and "
+            "return types; build-mapped imports, comptime types, captures and a graph node shared "
+            "by two structs of a file abstain.";
+        break;
+    case CBM_LANG_PERL:
+        out->adapter = "perl_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_MEMBER;
+        out->limitation =
+            "Package subs, qualified subs, Exporter imports and Class->m or $self->m through @ISA; "
+            "builtins, computed names and a graph node shared by two packages abstain. A glob "
+            "assigned through a computed name is unbounded and is not modelled.";
+        break;
+    case CBM_LANG_RUBY:
+        out->adapter = "ruby_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation =
+            "Implicit self, self and Const receivers on the lexical class's ancestor chain; blocks "
+            "that can rebind self, metaprogrammed names, unknown ancestors and reopened duplicates "
+            "abstain. Constants inherited from an ancestor are not modelled.";
+        break;
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
     case CBM_LANG_CSHARP:
-    case CBM_LANG_PHP:
         out->adapter = language == CBM_LANG_JAVA     ? "java"
                        : language == CBM_LANG_KOTLIN ? "kotlin"
-                       : language == CBM_LANG_CSHARP ? "csharp"
-                                                     : "php";
+                                                     : "csharp";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW;
@@ -303,10 +360,6 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         break;
     case CBM_LANG_SWIFT:
         out->limitation = "Swift build-module membership and binding proofs unimplemented.";
-        break;
-    case CBM_LANG_PERL:
-        out->limitation =
-            "Single-file legacy engine has no admitted cross-file semantic proof bridge.";
         break;
     default:
         break;

@@ -9532,6 +9532,25 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
+        // Ruby `class << self` holds the class's singleton methods. The walk
+        // otherwise stops at the class body, leaving each of them without a node
+        // even though the calls inside it are attributed to that name.
+        if (ctx->language == CBM_LANG_RUBY &&
+            strcmp(ts_node_type(child), "singleton_class") == 0) {
+            TSNode singleton_body = ts_node_child_by_field_name(child, TS_FIELD("body"));
+            uint32_t members =
+                ts_node_is_null(singleton_body) ? 0 : ts_node_named_child_count(singleton_body);
+            for (uint32_t m = 0; m < members; m++) {
+                TSNode member = ts_node_named_child(singleton_body, m);
+                if (!cbm_kind_in_set(member, spec->function_node_types))
+                    continue;
+                TSNode member_name = resolve_method_name(member, ctx->language);
+                if (!ts_node_is_null(member_name))
+                    push_method_def(ctx, member, class_node, class_qn, spec, member_name);
+            }
+            continue;
+        }
+
         // Squirrel wraps each class member in a member_declaration node; the
         // method is the inner function_declaration. Peek through the wrapper.
         if (ctx->language == CBM_LANG_SQUIRREL &&

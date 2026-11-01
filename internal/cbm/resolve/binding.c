@@ -1,4 +1,5 @@
 #include "binding.h"
+#include "source_adapter.h"
 #include "../helpers.h"
 #include "../lang_specs.h"
 #include <stdlib.h>
@@ -2353,7 +2354,12 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
     index->observation = cbm_arena_calloc(arena, sizeof(*index->observation));
     if (!index->observation)
         return NULL;
-    cbm_resolve_proof_pool_init(&index->observation->pool, arena, 0, 0, 0);
+    /* An adapter's proofs grow with its file's occurrences, one bounded root per
+     * site. A size budget would decide graph content by how long the file is. */
+    if (cbm_source_adapter_supported(language))
+        cbm_resolve_proof_pool_init_project(&index->observation->pool, arena);
+    else
+        cbm_resolve_proof_pool_init(&index->observation->pool, arena, 0, 0, 0);
     cbm_resolve_proof_source_t captured = {
         .module = result ? result->module_qn : NULL,
         .scope = result ? result->module_qn : NULL,
@@ -2366,6 +2372,13 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
     if (result && result->source_content_id[CBM_SOURCE_ORIGIN_RAW][0] &&
         !cbm_result_source_matches(result, source, source_len, CBM_SOURCE_ORIGIN_RAW)) {
         index->reason = "binding_source_snapshot_mismatch";
+        return index;
+    }
+    /* These languages state their rules per occurrence in adapter_<lang>.c.
+     * This index only attests the exact site through cbm_resolve_binding_source_site. */
+    if (cbm_source_adapter_supported(language)) {
+        index->analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
+        index->reason = "source_adapter_binding";
         return index;
     }
     bool component = language == CBM_LANG_VUE || language == CBM_LANG_SVELTE;
@@ -2863,6 +2876,50 @@ cbm_resolve_result_t cbm_resolve_binding_local(const cbm_resolve_binding_index_t
     result.target = binding->target;
     result.candidate_count = 1;
     return cbm_resolve_binding_validate(index, name, start, end, origin, result);
+}
+
+static uint32_t source_rule_fact(cbm_resolve_rule_t rule) {
+    switch (rule) {
+    case CBM_RESOLVE_RULE_SCOPE_BINDING:
+        return CBM_RESOLVE_FACT_SCOPE_BOUND;
+    case CBM_RESOLVE_RULE_IMPORT_BINDING:
+        return CBM_RESOLVE_FACT_IMPORT_BOUND;
+    case CBM_RESOLVE_RULE_TYPE_MEMBER:
+        return CBM_RESOLVE_FACT_RECEIVER_TYPED;
+    case CBM_RESOLVE_RULE_LANGUAGE_BINDING:
+        return CBM_RESOLVE_FACT_LANGUAGE_BOUND;
+    default:
+        return 0;
+    }
+}
+
+cbm_resolve_result_t cbm_resolve_binding_source_site(const cbm_resolve_binding_index_t *index,
+                                                     const char *name, uint32_t start, uint32_t end,
+                                                     CBMSourceOrigin origin, const char *domain,
+                                                     const char *target, cbm_resolve_rule_t rule,
+                                                     const char *decision) {
+    cbm_resolve_lookup_t query;
+    binding_query_begin(index, &query, name, start, end, origin);
+    uint32_t fact = source_rule_fact(rule);
+    cbm_resolve_result_t result = {.reason = decision};
+    if (!index || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name || !*name ||
+        origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !target || !*target || !fact)
+        return binding_query_finish(index, &query, result);
+    (void)cbm_resolve_lookup_observe(&query, "source_occurrences", name, name,
+                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0,
+                                     true, "exact_occurrence_observed");
+    (void)cbm_resolve_lookup_observe(&query, domain ? domain : "source_adapter", name, target,
+                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0,
+                                     true, decision);
+    result.binding = CBM_RESOLVE_BINDING_UNIQUE;
+    result.domain = CBM_RESOLVE_DOMAIN_PROJECT;
+    result.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
+    result.rule = rule;
+    result.facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                   CBM_RESOLVE_FACT_OCCURRENCE_EXACT | fact;
+    result.target = target;
+    result.candidate_count = 1;
+    return binding_query_finish(index, &query, result);
 }
 
 const char *cbm_resolve_binding_status(const cbm_resolve_binding_index_t *index) {
