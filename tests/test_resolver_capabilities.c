@@ -65,6 +65,8 @@ TEST(resolver_capabilities_report_supported_subsets_and_quality_gaps) {
     ASSERT_EQ(edge.availability, CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
     ASSERT(cbm_resolve_edge_capability(CBM_LANG_GO, "WRITES", &edge));
     ASSERT_EQ(edge.availability, CBM_RESOLVE_EDGE_UNSUPPORTED);
+    ASSERT(cbm_resolve_edge_capability(CBM_LANG_PYTHON, "WRITES", &edge));
+    ASSERT_EQ(edge.availability, CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
     ASSERT(cbm_resolve_edge_capability(CBM_LANG_DART, "IMPORTS", &edge));
     ASSERT_EQ(edge.availability, CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
     ASSERT(cbm_resolve_edge_capability(CBM_LANG_DART, "CALLS", &edge));
