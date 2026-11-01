@@ -1559,6 +1559,70 @@ TEST(resolver_rust_every_named_type_in_a_signature_is_a_use) {
     PASS();
 }
 
+/* `Self::Named { inner } => inner.go()` from meilisearch's Details: Self is the impl's type,
+ * so the variant's fields give the pattern its types. `Self::Output` is a member with no node. */
+TEST(resolver_rust_self_variant_path_binds_its_fields) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub struct Inner;\nimpl Inner { pub fn go(&self) {} }\n"
+         "pub struct Decoy;\nimpl Decoy { pub fn go(&self) {} }\n"
+         "pub enum Kind { Named { inner: Inner }, Other { inner: Decoy } }\n"
+         "impl Kind {\n"
+         "    pub fn act(&self) {\n"
+         "        match self { Self::Named { inner } => inner.go(), Self::Other { .. } => {} }\n"
+         "    }\n"
+         "    pub fn make(i: Inner) -> Self { Self::Named { inner: i } }\n"
+         "}\n"
+         "impl std::ops::Add for Kind {\n"
+         "    type Output = Kind;\n"
+         "    fn add(self, _o: Kind) -> Self::Output { self }\n"
+         "}\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.Kind.act", "src.main.Inner.go"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.Kind.act", "src.main.Decoy.go"), 0);
+        ASSERT(!rust_occurrence_reason(store, "USAGE", "Named", "rust_struct_path_unsupported"));
+        ASSERT(!rust_occurrence_reason(store, "USAGE", "Named", "rust_pattern_path_unsupported"));
+        ASSERT(rust_occurrence_reason(store, "USES_TYPE", "Self::Output", "rust_associated_type"));
+    }
+    PASS();
+}
+
+/* meilisearch's `use std::ops::Bound::*;` in a function body hid every outer name from the walk,
+ * because an external glob might bind anything. A standard enum's variants are a closed list. */
+TEST(resolver_rust_glob_of_a_std_enum_binds_only_its_variants) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub struct Local;\nimpl Local { pub fn make() {} }\n"
+         "fn helper() {}\n"
+         "fn Included(_v: i32) {}\n"
+         "fn closed() {\n"
+         "    use std::ops::Bound::*;\n"
+         "    let _low = Included(1);\n"
+         "    Local::make();\n"
+         "    helper();\n"
+         "}\n"
+         "fn outer() { Included(2); }\n"
+         "fn open_glob() {\n"
+         "    use other_crate::stuff::*;\n"
+         "    helper();\n"
+         "}\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.closed", "src.main.Local.make"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.closed", "src.main.helper"), 1);
+        /* The variant the glob does bind hides the module's function in that block. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.closed", "src.main.Included"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.outer", "src.main.Included"), 1);
+        /* Another crate's glob stays open: it may bind helper. */
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.open_glob"), 0);
+        ASSERT(rust_occurrence_reason(store, "CALLS", "helper", "rust_glob_domain_open"));
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
     RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
@@ -1587,6 +1651,8 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_deferred_let_takes_its_type_from_the_assignment);
     RUN_TEST(resolver_rust_anyhow_context_keeps_the_success_type);
     RUN_TEST(resolver_rust_every_named_type_in_a_signature_is_a_use);
+    RUN_TEST(resolver_rust_self_variant_path_binds_its_fields);
+    RUN_TEST(resolver_rust_glob_of_a_std_enum_binds_only_its_variants);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
