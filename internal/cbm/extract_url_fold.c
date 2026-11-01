@@ -401,10 +401,22 @@ static bool is_interpolated_string(TSNode node) {
     return false;
 }
 
+/* A Python string whose opening token is more than one quote -- a prefix
+ * (r"", b"", u"", an f"" with no field) or a triple quote -- cannot go down
+ * the literal path: that strips exactly one quote from each end, so the
+ * prefix and the extra quotes stayed in the URL and it never matched a route
+ * (#523). Folding reads the content pieces instead. JS/TS strings have no
+ * string_start, so this is Python only. */
+static bool is_wrapped_string(TSNode node) {
+    TSNode start = ts_node_child(node, 0);
+    return !ts_node_is_null(start) && strcmp(ts_node_type(start), "string_start") == 0 &&
+           ts_node_end_byte(start) - ts_node_start_byte(start) > SKIP_ONE;
+}
+
 static bool is_foldable_arg(TSNode arg) {
     const char *k = ts_node_type(arg);
     if (strcmp(k, "string") == 0) {
-        return is_interpolated_string(arg);
+        return is_interpolated_string(arg) || is_wrapped_string(arg);
     }
     return strcmp(k, "template_string") == 0 || strcmp(k, "binary_expression") == 0 ||
            strcmp(k, "binary_operator") == 0 || strcmp(k, "identifier") == 0 ||

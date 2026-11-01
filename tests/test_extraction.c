@@ -7,6 +7,7 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "foundation/platform.h"
 #include "foundation/constants.h"     /* CBM_SZ_* */
 #include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
@@ -93,6 +94,47 @@ static int count_defs_named(CBMFileResult *r, const char *label, const char *nam
     for (int i = 0; i < r->defs.count; i++) {
         if (strcmp(r->defs.items[i].label, label) == 0 &&
             strcmp(r->defs.items[i].name, name) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Count calls to `callee` whose enclosing scope is exactly `scope_qn`. A call the
+ * scope walk failed to place carries the FILE or module QN here, so a bare count
+ * of the callee passes just as happily with every call homed on the file. */
+static int count_calls_from(CBMFileResult *r, const char *callee, const char *scope_qn) {
+    int count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && r->calls.items[i].enclosing_func_qn &&
+            strcmp(r->calls.items[i].callee_name, callee) == 0 &&
+            strcmp(r->calls.items[i].enclosing_func_qn, scope_qn) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Count usages of `ref` attributed to exactly `scope_qn`, and to any scope. A
+ * def head is a BINDING, not a usage, so the pair separates two different
+ * mistakes: too few rows means a read was swallowed by the binding, too many
+ * means a binding site was counted as a read. */
+static int count_usages_from(CBMFileResult *r, const char *ref, const char *scope_qn) {
+    int count = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && r->usages.items[i].enclosing_func_qn &&
+            strcmp(r->usages.items[i].ref_name, ref) == 0 &&
+            strcmp(r->usages.items[i].enclosing_func_qn, scope_qn) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static int count_usages_named(CBMFileResult *r, const char *ref) {
+    int count = 0;
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, ref) == 0) {
             count++;
         }
     }
@@ -246,6 +288,29 @@ TEST(extract_c_macros_issue375) {
     ASSERT(has_def(r, "Macro", "FN_MACRO"));
     ASSERT(has_def(r, "Macro", "EMPTY_MACRO"));
     ASSERT(has_def(r, "Function", "main")); /* macros don't displace function defs */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_inc_linkage_and_callback) {
+    CBMFileResult *r =
+        extract("#define SAMPLE_CALLBACK(type) type\n"
+                "extern \"C\" __declspec(dllexport) int sample_export() { return 0; }\n"
+                "static SAMPLE_CALLBACK(int) sample_callback() { return sample_export(); }\n",
+                CBM_LANG_CPP, "sample", "runtime/sample.inc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_def(r, "Function", "sample_export"));
+    ASSERT_TRUE(has_def(r, "Function", "sample_callback"));
+    ASSERT_FALSE(has_def_any(r, "extern"));
+    cbm_free_result(r);
+
+    /* A statement include has no enclosing function in the file. Keep any
+     * syntax coverage diagnostic rather than inventing a callable owner. */
+    r = extract("#ifdef ENABLE_SAMPLE\nif (sample_check()) return 1;\n#endif\n", CBM_LANG_CPP,
+                "sample", "runtime/guard.inc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(has_def_any(r, "extern"));
+    ASSERT_FALSE(has_def(r, "Function", "if"));
     cbm_free_result(r);
     PASS();
 }
@@ -852,6 +917,57 @@ TEST(ruby_module) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def_any(r, "Greetable"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A Ruby `Const.new` call is rewritten to name the CONSTANT, not the method:
+ * the constructor body lives in `initialize`, so the call should link the class
+ * like every other language's `new T()`. The rewrite fired only for bare
+ * `constant` receivers, so a scope-resolved receiver kept the whole call text
+ * as its callee ("Admin::User.new"), which resolves to nothing and cannot join
+ * the Ruby LSP's constructor rows, whose callee is the class QN.
+ *
+ * Both spellings must land on the bare constant path; a retained ".new" suffix
+ * is the bug's signature. */
+TEST(ruby_constructor_callee_is_constant_path) {
+    CBMFileResult *r = extract("module Admin\n  class User\n  end\nend\n"
+                               "class Widget\nend\n"
+                               "class Maker\n"
+                               "  def build\n"
+                               "    Admin::User.new\n"
+                               "    Widget.new\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_RUBY, "t", "maker.rb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int scoped = 0, bare = 0, kept_new = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *callee = r->calls.items[i].callee_name;
+        if (strcmp(callee, "Admin::User") == 0)
+            scoped = 1;
+        if (strcmp(callee, "Widget") == 0)
+            bare = 1;
+        /* Either failure mode: the method name survived on its own, or the
+         * whole `Recv.new` expression did. */
+        size_t n = strlen(callee);
+        if (strcmp(callee, "new") == 0 || (n >= 4 && strcmp(callee + n - 4, ".new") == 0))
+            kept_new = 1;
+    }
+    if (!scoped || !bare || kept_new) {
+        printf("  ruby callees (%d):\n", r->calls.count);
+        for (int i = 0; i < r->calls.count; i++)
+            printf("    '%s'\n", r->calls.items[i].callee_name);
+    }
+    /* Scope-resolved receiver reduces to the constant path; its bare leaf is
+     * what resolution joins on. */
+    ASSERT(scoped);
+    /* Bare receiver: pre-existing behaviour, guarded against regression. */
+    ASSERT(bare);
+    ASSERT_FALSE(kept_new);
+
     cbm_free_result(r);
     PASS();
 }
@@ -1821,6 +1937,730 @@ TEST(elixir_function) {
     PASS();
 }
 
+/* ── Elixir def-head guard helpers (internal/cbm/helpers.c) ─────────
+ *
+ * `def name(args) when guard` parses its WHOLE head as one `when`
+ * binary_operator whose left operand is the `name(args)` call, and Elixir
+ * admits more than one guard on a clause, which tree-sitter-elixir nests
+ * right-associatively. Four walks read that same first argument and each asks a
+ * different question of it: the defs and call-scope walks want the head UNDER
+ * every guard, the usages walk wants it so that a parameter READ by the guard
+ * stays outside the binding, and the calls walk wants to know whether the node
+ * it is visiting IS that head or one of the guard operators above it.
+ *
+ * That last question is why cbm_elixir_def_head_is exists beside the unwrap,
+ * and it is exercised here on the AST rather than through cbm_extract_file
+ * because the two routes it has to answer for are indistinguishable from
+ * outside: `def f(x) when g` reaches the calls walk as the inner `f(x)` call,
+ * which the unwrap reaches, while `def f when g` has no inner call at all and
+ * reaches it as the `when` operator itself, which the unwrap does not. A test
+ * that only drives one walk sees whichever of the two that walk happens to hit.
+ *
+ * This file's helpers change no extraction behaviour on their own; the walks
+ * that consume them are separate changes. */
+
+enum { ELIXIR_HEAD_PROBE_MAX = 16, ELIXIR_HEAD_STACK_MAX = 256 };
+
+static bool head_probe_text_is(const char *source, TSNode node, const char *want) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = strlen(want);
+    return end >= start && (size_t)(end - start) == len && memcmp(source + start, want, len) == 0;
+}
+
+/* The first argument of every `def`/`defp` call under `root`, in source order.
+ * That argument is what all four walks read, so it is what the helpers take. */
+typedef struct {
+    TSNode signature[ELIXIR_HEAD_PROBE_MAX];
+    int count;
+} elixir_head_probe_t;
+
+static void collect_elixir_def_signatures(TSNode root, const char *source,
+                                          elixir_head_probe_t *out) {
+    TSNode stack[ELIXIR_HEAD_STACK_MAX];
+    int top = 0;
+    stack[top++] = root;
+    while (top > 0) {
+        TSNode cur = stack[--top];
+        uint32_t cc = ts_node_child_count(cur);
+        if (cc > 1 && strcmp(ts_node_type(cur), "call") == 0 &&
+            (head_probe_text_is(source, ts_node_child(cur, 0), "def") ||
+             head_probe_text_is(source, ts_node_child(cur, 0), "defp")) &&
+            out->count < ELIXIR_HEAD_PROBE_MAX) {
+            TSNode args = ts_node_child(cur, 1);
+            if (!ts_node_is_null(args) && ts_node_child_count(args) > 0) {
+                out->signature[out->count++] = ts_node_child(args, 0);
+            }
+        }
+        for (int i = (int)cc - 1; i >= 0 && top < ELIXIR_HEAD_STACK_MAX; i--) {
+            stack[top++] = ts_node_child(cur, (uint32_t)i);
+        }
+    }
+}
+
+TEST(elixir_def_head_is_covers_the_head_and_every_guard_above_it) {
+    const char *source = "defmodule Heads do\n"
+                         "  def plain(x), do: x\n"
+                         "  def guarded(x) when is_binary(x), do: x\n"
+                         "  def bare when true, do: :ok\n"
+                         "  def twice(x) when is_atom(x) when is_binary(x), do: x\n"
+                         "  def a + b, do: {a, b}\n"
+                         "end\n";
+    const TSLanguage *language = cbm_ts_language(CBM_LANG_ELIXIR);
+    ASSERT_NOT_NULL(language);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, language));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)strlen(source));
+    ASSERT_NOT_NULL(tree);
+
+    elixir_head_probe_t probe;
+    probe.count = 0;
+    collect_elixir_def_signatures(ts_tree_root_node(tree), source, &probe);
+    ASSERT_EQ(5, probe.count);
+
+    /* Unguarded: nothing to peel, and the head is the whole first argument.
+     * The name node inside it is NOT the head -- the calls walk compares the
+     * node it is visiting, and the `plain` identifier is one of those. */
+    TSNode plain = probe.signature[0];
+    ASSERT_FALSE(cbm_elixir_is_when_guard(plain));
+    ASSERT_TRUE(ts_node_eq(cbm_elixir_def_head_unwrap_guard(plain), plain));
+    ASSERT_TRUE(cbm_elixir_def_head_is(plain, plain));
+    ASSERT_FALSE(cbm_elixir_def_head_is(plain, ts_node_child(plain, 0)));
+
+    /* One guard: the first argument is the operator, the head is its left
+     * operand, and BOTH answer true -- the operator is the node the paren-less
+     * route hands the calls walk, the inner call is the node the peel route
+     * hands it. The guard expression answers false, or the walk would suppress
+     * a real call written inside a guard. */
+    TSNode guarded = probe.signature[1];
+    ASSERT_TRUE(cbm_elixir_is_when_guard(guarded));
+    TSNode guarded_head = cbm_elixir_def_head_unwrap_guard(guarded);
+    ASSERT_FALSE(ts_node_eq(guarded_head, guarded));
+    ASSERT_STR_EQ("call", ts_node_type(guarded_head));
+    ASSERT_TRUE(head_probe_text_is(source, guarded_head, "guarded(x)"));
+    ASSERT_TRUE(cbm_elixir_def_head_is(guarded, guarded));
+    ASSERT_TRUE(cbm_elixir_def_head_is(guarded, guarded_head));
+    TSNode guard_expr = ts_node_child_by_field_name(guarded, TS_FIELD("right"));
+    ASSERT_FALSE(ts_node_is_null(guard_expr));
+    ASSERT_TRUE(head_probe_text_is(source, guard_expr, "is_binary(x)"));
+    ASSERT_FALSE(cbm_elixir_def_head_is(guarded, guard_expr));
+
+    /* Paren-less: the head under the guard is a bare identifier, so there is no
+     * inner call for the peel route to produce. This is the shape that makes
+     * cbm_elixir_def_head_is necessary: the only node the calls walk ever sees
+     * for this clause is the operator. */
+    TSNode bare = probe.signature[2];
+    ASSERT_TRUE(cbm_elixir_is_when_guard(bare));
+    TSNode bare_head = cbm_elixir_def_head_unwrap_guard(bare);
+    ASSERT_STR_EQ("identifier", ts_node_type(bare_head));
+    ASSERT_TRUE(head_probe_text_is(source, bare_head, "bare"));
+    ASSERT_TRUE(cbm_elixir_def_head_is(bare, bare));
+    ASSERT_TRUE(cbm_elixir_def_head_is(bare, bare_head));
+
+    /* Two guards on one clause. tree-sitter-elixir nests them
+     * RIGHT-associatively -- `when(twice(x), when(is_atom(x), is_binary(x)))`,
+     * which is what this asserts -- so the head is still the outer operator's
+     * left operand and the peel reaches it in one step. The repeated peel is
+     * therefore a fixed point rather than a chain walk on this grammar; the
+     * nodes that must answer true are the operator and the head. */
+    TSNode twice = probe.signature[3];
+    ASSERT_TRUE(cbm_elixir_is_when_guard(twice));
+    TSNode second_guard = ts_node_child_by_field_name(twice, TS_FIELD("right"));
+    ASSERT_TRUE(cbm_elixir_is_when_guard(second_guard));
+    TSNode twice_head = cbm_elixir_def_head_unwrap_guard(twice);
+    ASSERT_TRUE(head_probe_text_is(source, twice_head, "twice(x)"));
+    ASSERT_TRUE(cbm_elixir_def_head_is(twice, twice));
+    ASSERT_TRUE(cbm_elixir_def_head_is(twice, twice_head));
+    /* The second guard is a `when` operator too, and it is NOT on the head
+     * chain: a walk that treated any `when` above the head as a declaration
+     * would suppress the calls written inside it. */
+    ASSERT_FALSE(cbm_elixir_def_head_is(twice, second_guard));
+
+    /* An operator definition's head is a binary_operator too, and unwrapping it
+     * would name the function after its own left parameter. Only the `when`
+     * token admits the peel, so `def a + b` is returned unchanged and its left
+     * operand is not a head. */
+    TSNode op_def = probe.signature[4];
+    ASSERT_STR_EQ("binary_operator", ts_node_type(op_def));
+    ASSERT_FALSE(cbm_elixir_is_when_guard(op_def));
+    ASSERT_TRUE(ts_node_eq(cbm_elixir_def_head_unwrap_guard(op_def), op_def));
+    ASSERT_TRUE(cbm_elixir_def_head_is(op_def, op_def));
+    TSNode op_lhs = ts_node_child_by_field_name(op_def, TS_FIELD("left"));
+    ASSERT_TRUE(head_probe_text_is(source, op_lhs, "a"));
+    ASSERT_FALSE(cbm_elixir_def_head_is(op_def, op_lhs));
+
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+/* `def name(args) when guard` parses its whole head as a `when`
+ * binary_operator, so the name sits on the operator's left operand rather than
+ * directly under the call. The def extractor accepted only `call` and
+ * `identifier` there, so every guarded clause was dropped -- and a function
+ * whose clauses ALL carry guards never reached the graph at all, silently.
+ * Guards are ordinary Elixir: on one real 2.9k-function codebase this hid 216
+ * of 270 all-guarded functions, and every call edge touching them. */
+TEST(extract_elixir_guarded_def_head) {
+    CBMFileResult *r = extract("defmodule Guarded do\n"
+                               "  def plain(x), do: x\n"
+                               "  def guarded(x) when is_binary(x), do: x\n"
+                               "  def guarded(x) when is_list(x), do: x\n"
+                               "  def multi(x, y) when is_binary(x) and is_integer(y), do: {x, y}\n"
+                               "  defp priv_guarded(x) when is_atom(x), do: x\n"
+                               "  def bare when true, do: :ok\n"
+                               "  def a + b, do: {a, b}\n"
+                               "  def c - d when is_integer(c), do: {c, d}\n"
+                               "  def multi_guard(x) when is_atom(x) when is_binary(x), do: x\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "guarded.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "plain"));
+    ASSERT(has_def(r, "Function", "guarded"));
+    ASSERT(has_def(r, "Function", "multi"));
+    ASSERT(has_def(r, "Function", "priv_guarded"));
+    ASSERT(has_def(r, "Function", "bare"));
+
+    /* Elixir admits more than one guard on a clause. tree-sitter-elixir nests
+     * those `when` operators right-associatively, so the declared head stays
+     * the outermost operator's left operand -- one node either way, and the
+     * peel must not stop short of it or return the guard. */
+    ASSERT(has_def(r, "Function", "multi_guard"));
+    ASSERT_EQ(count_defs_named(r, "Function", "multi_guard"), 1);
+
+    /* An operator definition is a binary_operator head too, but it is not a
+     * guard: unwrapping it names the function after its own LEFT PARAMETER.
+     * `def a + b` must not mint a function called `a`, nor `def c - d when ...`
+     * one called `c` -- the guard's left operand is itself the `c - d`
+     * operator, which names no function either. Neither operator form is
+     * extracted at all, which is what this grammar did before guards were
+     * handled; only the `when` token admits the unwrap. */
+    ASSERT_EQ(count_defs_named(r, "Function", "a"), 0);
+    ASSERT_EQ(count_defs_named(r, "Function", "c"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A guard hides the head from the scope walk and from the calls walk.
+ * compute_elixir_func_qn accepts only a `call` or an `identifier` as a def's
+ * first argument, so a guarded clause resolved no QN and opened NO function
+ * scope: every call in its body was attributed to the FILE node, the function
+ * reported no outgoing edges, and its callees gained an in-edge from the file
+ * instead of from their caller. A paren-less guarded clause (`def f when g`) is
+ * worse still: it has no inner call node at all, so the guard operator itself
+ * falls through to extract_callee_name's first-identifier last resort and mints
+ * a phantom CALLS edge naming the function being defined. */
+TEST(extract_elixir_guarded_def_head_scope) {
+    CBMFileResult *r = extract("defmodule Guards do\n"
+                               "  def target(x), do: x\n"
+                               "  def other(x), do: x\n"
+                               "  def unguarded_caller(a), do: target(a)\n"
+                               "  def guarded_caller(a) when is_binary(a) do\n"
+                               "    target(a)\n"
+                               "    other(a)\n"
+                               "  end\n"
+                               "  def bare_guarded when true, do: target(:ok)\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "guard_scope.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* A paren-less guarded head is a definition, never a call to itself. */
+    ASSERT_EQ(count_calls_named(r, "bare_guarded"), 0);
+
+    /* Both calls in the guarded body source to the guarded function, and the
+     * paren-less clause's body call to that clause. */
+    ASSERT_EQ(count_calls_from(r, "target", "t.guard_scope.guarded_caller"), 1);
+    ASSERT_EQ(count_calls_from(r, "other", "t.guard_scope.guarded_caller"), 1);
+    ASSERT_EQ(count_calls_from(r, "target", "t.guard_scope.bare_guarded"), 1);
+
+    /* Control on the path the fix does not touch: an unguarded clause still
+     * sources its body call to itself. This is NOT a leak detector -- the walk
+     * expires scopes by tree depth (pop_expired_scopes), so a sibling clause
+     * always unwinds the previous one before pushing its own and "pushed but
+     * never popped" is not a state this walk can reach. */
+    ASSERT_EQ(count_calls_from(r, "target", "t.guard_scope.unguarded_caller"), 1);
+
+    /* Nothing falls back to the file node. */
+    ASSERT_EQ(count_calls_from(r, "target", "t.guard_scope"), 0);
+    ASSERT_EQ(count_calls_from(r, "other", "t.guard_scope"), 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The half the calls and scope assertions above cannot see: the usages walk
+ * asks whether an identifier sits inside the def's SIGNATURE, and treats
+ * everything that does as part of the binding rather than as a reference. A
+ * guard makes that signature the whole `when` operator, which spans the guard
+ * expression too -- so `a` read by `is_binary(a)` was classified as its own
+ * binding and emitted no USAGE row at all. A guard is an expression, not a
+ * pattern: the parameters are bound by `guarded(a, b)` and every mention of one
+ * to its right is a read, exactly as the same mention in the body already is.
+ * Unwrapping the signature to the head restores those rows without admitting
+ * the binding sites themselves, which is why each name is asserted both within
+ * its scope and in total. */
+TEST(extract_elixir_guarded_def_head_guard_usages) {
+    CBMFileResult *r = extract("defmodule GuardUsage do\n"
+                               "  def plain(x), do: x\n"
+                               "  def guarded(a, b) when is_binary(a) and byte_size(a) > 3 do\n"
+                               "    b\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "guard_usage.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Both guard reads of the parameter are usages of the guarded clause. */
+    ASSERT_EQ(count_usages_from(r, "a", "t.guard_usage.guarded"), 2);
+    /* ...and nothing else claims `a`: the `a` in `guarded(a, b)` binds it. */
+    ASSERT_EQ(count_usages_named(r, "a"), 2);
+
+    /* The body read is unchanged, and the head's `b` is still a binding --
+     * an unwrap that took the guard instead of the head would add both head
+     * parameters here. */
+    ASSERT_EQ(count_usages_from(r, "b", "t.guard_usage.guarded"), 1);
+    ASSERT_EQ(count_usages_named(r, "b"), 1);
+
+    /* Control: an unguarded clause was never affected either way. */
+    ASSERT_EQ(count_usages_from(r, "x", "t.guard_usage.plain"), 1);
+    ASSERT_EQ(count_usages_named(r, "x"), 1);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Every clause of an Elixir function is its own `def` call, and an Elixir QN
+ * carries neither module nor arity, so all clauses compute one qualified name
+ * and collide on a single graph node. cbm_gbuf_upsert_node ranks a same-QN
+ * collision by LARGEST start_line, so the survivor was the last clause in the
+ * file and get_code_snippet returned that clause as the whole function: a
+ * two-clause `admin?` read back as `def admin?(%__MODULE__{}), do: false` --
+ * the graph asserting a predicate that always returns false. The node has to
+ * span its own clauses, and ONLY its own: the fold is bounded to the
+ * immediately preceding definition and to the enclosing module body, so a def
+ * of another name ends the group and two same-named functions in two modules
+ * stay two nodes. */
+TEST(extract_elixir_clauses_fold_only_when_adjacent_in_one_module) {
+    CBMFileResult *r = extract("defmodule Roles do\n"                       /* 1 */
+                               "  def admin?(%{role: :admin}), do: true\n"  /* 2 */
+                               "  def admin?(%{}), do: false\n"             /* 3 */
+                               "\n"                                         /* 4 */
+                               "  def promote(user), do: user\n"            /* 5 */
+                               "\n"                                         /* 6 */
+                               "  def admin?(_other), do: false\n"          /* 7 */
+                               "end\n"                                      /* 8 */
+                               "\n"                                         /* 9 */
+                               "defmodule Guests do\n"                      /* 10 */
+                               "  def admin?(:root), do: true\n"            /* 11 */
+                               "  def admin?(_any), do: false\n"            /* 12 */
+                               "end\n",                                     /* 13 */
+                               CBM_LANG_ELIXIR, "t", "roles.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* The two adjacent Roles clauses fold; the clause past `promote` is its own
+     * group; the Guests pair is a DIFFERENT function and stays its own node. */
+    ASSERT_EQ(3, count_defs_named(r, "Function", "admin?"));
+    ASSERT_EQ(1, count_defs_named(r, "Function", "promote"));
+
+    const CBMDefinition *admin[3] = {NULL, NULL, NULL};
+    const CBMDefinition *promote = NULL;
+    int seen = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Function") != 0) {
+            continue;
+        }
+        if (strcmp(r->defs.items[i].name, "admin?") == 0 && seen < 3) {
+            admin[seen++] = &r->defs.items[i];
+        } else if (strcmp(r->defs.items[i].name, "promote") == 0) {
+            promote = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(admin[0]);
+    ASSERT_NOT_NULL(admin[1]);
+    ASSERT_NOT_NULL(admin[2]);
+    ASSERT_NOT_NULL(promote);
+
+    ASSERT_EQ(2, (int)admin[0]->start_line);
+    ASSERT_EQ(3, (int)admin[0]->end_line);
+    /* separated from lines 2-3 by `promote`, so it keeps its own span */
+    ASSERT_EQ(7, (int)admin[1]->start_line);
+    ASSERT_EQ(7, (int)admin[1]->end_line);
+    /* Guests.admin? never reaches back over the module boundary */
+    ASSERT_EQ(11, (int)admin[2]->start_line);
+    ASSERT_EQ(12, (int)admin[2]->end_line);
+    ASSERT_EQ(5, (int)promote->start_line);
+    ASSERT_EQ(5, (int)promote->end_line);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A nested module is the one place where the "def of another name ends the
+ * group" rule is not enough: an Elixir QN carries no module, so `Outer.run` and
+ * `Outer.Inner.run` compute the SAME qualified name, and when Inner sits
+ * directly above Outer's own clause the two are adjacent in the extracted defs.
+ * The fold is bounded to the module body as well, so they stay two nodes. */
+TEST(extract_elixir_nested_module_clauses_do_not_fold) {
+    CBMFileResult *r = extract("defmodule Outer do\n"          /* 1 */
+                               "  defmodule Inner do\n"        /* 2 */
+                               "    def run(a), do: a\n"       /* 3 */
+                               "  end\n"                       /* 4 */
+                               "\n"                            /* 5 */
+                               "  def run(b), do: b + 1\n"     /* 6 */
+                               "end\n",                        /* 7 */
+                               CBM_LANG_ELIXIR, "t", "nested.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(2, count_defs_named(r, "Function", "run"));
+
+    const CBMDefinition *runs[2] = {NULL, NULL};
+    int seen = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Function") == 0 &&
+            strcmp(r->defs.items[i].name, "run") == 0 && seen < 2) {
+            runs[seen++] = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(runs[0]);
+    ASSERT_NOT_NULL(runs[1]);
+    ASSERT_EQ(3, (int)runs[0]->start_line);
+    ASSERT_EQ(3, (int)runs[0]->end_line);
+    ASSERT_EQ(6, (int)runs[1]->start_line);
+    ASSERT_EQ(6, (int)runs[1]->end_line);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Folding clauses has to decide is_exported for the merged node. A `def` clause
+ * and a `defp` clause of the same name AND arity are clauses of one function --
+ * a private guard clause or a nil short-circuit written above the public head
+ * is ordinary Elixir -- so is_exported is the OR over the folded clauses: the
+ * name is callable from outside if any clause exports it, and a wholly private
+ * function stays unexported. */
+TEST(extract_elixir_folded_clause_is_exported_is_the_or) {
+    CBMFileResult *r = extract("defmodule Acc do\n"                                /* 1 */
+                               "  def build(l), do: build(l)\n"                    /* 2 */
+                               "  defp build([]), do: []\n"                        /* 3 */
+                               "\n"                                                /* 4 */
+                               "  defp trim(nil), do: nil\n"                       /* 5 */
+                               "  defp trim(s), do: s\n"                           /* 6 */
+                               "end\n",                                            /* 7 */
+                               CBM_LANG_ELIXIR, "t", "acc.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(1, count_defs_named(r, "Function", "build"));
+    ASSERT_EQ(1, count_defs_named(r, "Function", "trim"));
+
+    const CBMDefinition *build = NULL;
+    const CBMDefinition *trim = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Function") != 0) {
+            continue;
+        }
+        if (strcmp(r->defs.items[i].name, "build") == 0) {
+            build = &r->defs.items[i];
+        } else if (strcmp(r->defs.items[i].name, "trim") == 0) {
+            trim = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(build);
+    ASSERT_NOT_NULL(trim);
+    ASSERT_EQ(2, (int)build->start_line);
+    ASSERT_EQ(3, (int)build->end_line);
+    ASSERT_TRUE(build->is_exported);
+    ASSERT_EQ(5, (int)trim->start_line);
+    ASSERT_EQ(6, (int)trim->end_line);
+    ASSERT_FALSE(trim->is_exported);
+    cbm_free_result(r);
+
+    /* The other direction, and the only one the `prev->is_exported ||` disjunct
+     * decides. Above, the exporting clause is the FIRST one, so a plain
+     * `prev->is_exported = is_exported` assignment would also have to lose it
+     * on the later defp -- but a last-clause-wins assignment happens to be
+     * right whenever the def comes last. Here the defp comes first and the def
+     * second, so the surviving flag can only be true if the fold ORs rather
+     * than assigns. */
+    CBMFileResult *o = extract("defmodule Ord do\n"           /* 1 */
+                               "  defp z(1), do: 1\n"         /* 2 */
+                               "  def z(2), do: 2\n"          /* 3 */
+                               "end\n",                       /* 4 */
+                               CBM_LANG_ELIXIR, "t", "ord.ex");
+    ASSERT_NOT_NULL(o);
+    ASSERT_FALSE(o->has_error);
+    ASSERT_EQ(1, count_defs_named(o, "Function", "z"));
+    const CBMDefinition *z = NULL;
+    for (int i = 0; i < o->defs.count; i++) {
+        if (strcmp(o->defs.items[i].label, "Function") == 0 &&
+            strcmp(o->defs.items[i].name, "z") == 0) {
+            z = &o->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(z);
+    ASSERT_EQ(2, (int)z->start_line);
+    ASSERT_EQ(3, (int)z->end_line);
+    ASSERT_TRUE(z->is_exported);
+    cbm_free_result(o);
+    PASS();
+}
+
+/* First definition with this name, for the Elixir clause-fold tests below.
+ * find_def() is declared much further down this file. */
+static const CBMDefinition *elixir_first_def(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* A guarded clause head is a DECLARATION of the name, never a call to it, and
+ * the call extractor has to agree with the def extractor about which node the
+ * head is. It did not: it suppressed a head only when the head node IS the
+ * def's first named argument, but `def f(x) when g` parses its whole head as a
+ * `when` binary_operator, so the inner `f(x)` was not that argument and was
+ * recorded as a call to `f`. Under the folded span that phantom lands inside
+ * the function's own node, and self-recursion is decided by line containment,
+ * so an ordinary two-clause guarded function reported itself recursive.
+ * Recursion is a load-bearing signal: `recursive` is a queryable node property
+ * and seeds the cycle detection in pass_complexity. */
+TEST(extract_elixir_guarded_clause_head_is_not_a_self_call) {
+    CBMFileResult *r = extract("defmodule Guarded do\n"                     /* 1 */
+                               "  def f(x) when is_integer(x), do: x\n"     /* 2 */
+                               "  def f(_x), do: 0\n"                       /* 3 */
+                               "\n"                                         /* 4 */
+                               "  def solo(x) when is_binary(x), do: x\n"   /* 5 */
+                               "end\n",                                     /* 6 */
+                               CBM_LANG_ELIXIR, "t", "guard_call.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* No call to either name exists anywhere in this file. */
+    ASSERT_EQ(0, count_calls_named(r, "f"));
+    ASSERT_EQ(0, count_calls_named(r, "solo"));
+    /* The guard predicate IS a real call and stays one. */
+    ASSERT_EQ(1, count_calls_named(r, "is_integer"));
+    ASSERT_EQ(1, count_calls_named(r, "is_binary"));
+
+    ASSERT_EQ(1, count_defs_named(r, "Function", "f"));
+    const CBMDefinition *f = elixir_first_def(r, "f");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(2, (int)f->start_line);
+    ASSERT_EQ(3, (int)f->end_line);
+    ASSERT_FALSE(f->is_recursive);
+
+    /* A single guarded clause was wrong even before the span widened: the
+     * phantom landed on its own one-line node. */
+    const CBMDefinition *solo = elixir_first_def(r, "solo");
+    ASSERT_NOT_NULL(solo);
+    ASSERT_FALSE(solo->is_recursive);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Every reference of any kind this file records for `name`, across all four
+ * extractors the unified walk runs over one subtree: a call site, a value
+ * usage, a read/write occurrence, a type reference. Suppressing a node in ONE
+ * of them does not remove a phantom reference, it moves it -- handle_calls
+ * declining a node leaves state->callee_expr unset, and handle_usages then
+ * reaches the bare identifier and mints a USAGE instead. USAGE and CALLS are
+ * separate rows in the edge table, so the relabelled phantom also escapes the
+ * UNIQUE(source,target,type) dedup that had been collapsing it onto a real
+ * call, and pass_importance counts an inbound reference that did not exist
+ * before. An assertion naming only r->calls cannot see any of that. */
+static int elixir_any_ref_count(CBMFileResult *r, const char *name) {
+    int count = count_calls_named(r, name);
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strcmp(r->usages.items[i].ref_name, name) == 0) {
+            count++;
+        }
+    }
+    for (int i = 0; i < r->rw.count; i++) {
+        if (r->rw.items[i].var_name && strcmp(r->rw.items[i].var_name, name) == 0) {
+            count++;
+        }
+    }
+    for (int i = 0; i < r->type_refs.count; i++) {
+        if (r->type_refs.items[i].type_name && strcmp(r->type_refs.items[i].type_name, name) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* The head suppression has to REMOVE the phantom, not relabel it. What makes
+ * that hold for a def head is not the calls walk alone: is_elixir_def_binding in
+ * extract_usages.c already treats everything inside a def's first argument as
+ * a binding occurrence rather than a reference, so the identifier handle_calls
+ * declines is declined by handle_usages too. That agreement is the invariant
+ * under test, and it is why the counts below are over every extractor rather
+ * than over r->calls.
+ *
+ * `spec_subject` pins the boundary between the two mechanisms. A typespec
+ * subject is the same shape as a def head, and suppressing it in the calls walk
+ * would only relabel its phantom as a USAGE, because nothing treats it as a
+ * binding. It is removed instead by skipping the whole `@spec` subtree before
+ * any extractor sees it (is_elixir_typespec_attribute, extract_unified.c), so
+ * the assertion is both that no reference of any kind survives AND that what
+ * does survive is never a relabelling: the equality holds at 0 == 0 here, and
+ * would hold at 1 == 1 on a build with the subtree skip removed but the calls
+ * suppression left in place. */
+TEST(extract_elixir_declaration_head_mints_no_reference_of_any_kind) {
+    CBMFileResult *r = extract("defmodule Heads do\n"                              /* 1 */
+                               "  def guarded(x) when is_integer(x), do: x\n"      /* 2 */
+                               "  def guarded(_x), do: 0\n"                        /* 3 */
+                               "\n"                                                /* 4 */
+                               "  defp bare(x), do: x\n"                           /* 5 */
+                               "\n"                                                /* 6 */
+                               "  @spec spec_subject(integer) :: integer\n"        /* 7 */
+                               "  def spec_subject(n), do: n\n"                    /* 8 */
+                               "end\n",                                            /* 9 */
+                               CBM_LANG_ELIXIR, "t", "heads.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Nothing in this file references `guarded` or `bare`. Not as a call, not
+     * as a value, not as a read/write, not as a type. */
+    ASSERT_EQ(0, elixir_any_ref_count(r, "guarded"));
+    ASSERT_EQ(0, elixir_any_ref_count(r, "bare"));
+    /* The guard predicate is a real call and survives as one. */
+    ASSERT_EQ(1, count_calls_named(r, "is_integer"));
+    ASSERT_EQ(1, elixir_any_ref_count(r, "is_integer"));
+    /* Neither the @spec line nor the def head it precedes leaves a reference,
+     * and nothing has been relabelled into a usage, a read/write or a type
+     * reference. */
+    ASSERT_EQ(0, count_calls_named(r, "spec_subject"));
+    ASSERT_EQ(count_calls_named(r, "spec_subject"),
+              elixir_any_ref_count(r, "spec_subject"));
+
+    ASSERT_EQ(1, count_defs_named(r, "Function", "guarded"));
+    const CBMDefinition *guarded = elixir_first_def(r, "guarded");
+    ASSERT_NOT_NULL(guarded);
+    ASSERT_EQ(2, (int)guarded->start_line);
+    ASSERT_EQ(3, (int)guarded->end_line);
+    ASSERT_FALSE(guarded->is_recursive);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The other direction: suppressing declaration heads must not blind the
+ * detector to real recursion, and folding must not lose a self-call written in
+ * a clause that is no longer the surviving one. `walk` recurses from its
+ * guarded second clause; exactly one call to `walk` is recorded (the body one,
+ * not the two heads) and the folded node is recursive. */
+TEST(extract_elixir_real_recursion_survives_head_suppression) {
+    CBMFileResult *r = extract("defmodule Rec do\n"                                        /* 1 */
+                               "  def walk([]), do: []\n"                                  /* 2 */
+                               "  def walk([h | t]) when is_integer(h), do: [h | walk(t)]\n" /* 3 */
+                               "end\n",                                                    /* 4 */
+                               CBM_LANG_ELIXIR, "t", "rec.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(1, count_calls_named(r, "walk"));
+    ASSERT_EQ(1, count_defs_named(r, "Function", "walk"));
+    const CBMDefinition *walk = elixir_first_def(r, "walk");
+    ASSERT_NOT_NULL(walk);
+    ASSERT_EQ(2, (int)walk->start_line);
+    ASSERT_EQ(3, (int)walk->end_line);
+    ASSERT_TRUE(walk->is_recursive);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* An Elixir module attribute parses as `unary_operator(@, call(<attr>, args))`,
+ * so a typespec line reaches the unified walk as ordinary code and every symbol
+ * it names collects a phantom inbound edge from the enclosing Module -- a CALLS
+ * onto the specified function, and for `@type` a USAGE plus a WRITES asserting
+ * a mutation that does not exist. On a codebase whose convention is @spec on
+ * every public function, fan_in then never reaches 0 and "which exported
+ * functions nothing calls" is unanswerable.
+ *
+ * All six heads in the skip list are exercised, so deleting any one entry from
+ * typespec_heads[] breaks this test.
+ *
+ * Two of the groups below pin a decision rather than a repair, and both are
+ * argued in is_elixir_typespec_attribute's comment:
+ *
+ *   type_refs[] -- a typespec's type references are not indexed at all. A type
+ *   declaration mints no node, so such a reference resolves onto nothing or
+ *   onto a same-named FUNCTION, which is the pollution rather than a record of
+ *   it. Restoring any of them must break this test.
+ *
+ *   behaviour_contract_names[] -- accepted cost. A @callback / @macrocallback
+ *   name is a function name, so before this change it resolved cross-file onto
+ *   the functions implementing the behaviour. Nothing replaces that edge.
+ *
+ * The attribute NAME phantom outside the typespec family is deliberately still
+ * there: `@timeout` keeps its one reference, and its VALUE is ordinary
+ * compile-time code that still runs. `guarded` is pinned at 0 rather than 1
+ * because the guarded def head no longer mints a phantom either -- the calls
+ * walk now recognises a `when`-wrapped head as a declaration. */
+TEST(extract_elixir_typespec_attribute_is_not_code) {
+    /* Names a typespec declares, plus the six attribute heads themselves.
+     * Every one carries a reference on the pristine build. */
+    static const char *const declared[] = {"with_spec", "entry",  "secret",  "handle",
+                                           "spec",      "type",   "typep",   "opaque",
+                                           "callback",  "macrocallback", NULL};
+    /* Accepted cost: these used to resolve onto the behaviour's implementors. */
+    static const char *const behaviour_contract_names[] = {"handle_it", "expand_it", NULL};
+    /* Pinned decision: type references are not indexed -- remote, bare-local
+     * and builtin alike. */
+    static const char *const type_refs[] = {"MyApp.User.t", "String.t", "MyApp.Vault.key",
+                                            "Macro.t",      "t",        "key",
+                                            "term",         "integer",  "reference",
+                                            "atom",         NULL};
+    CBMFileResult *r = extract("defmodule Specced do\n"
+                               "  @timeout Application.compile_env(:app, :timeout)\n"
+                               "  @type entry :: String.t()\n"
+                               "  @typep secret :: MyApp.Vault.key()\n"
+                               "  @opaque handle :: reference()\n"
+                               "  @callback handle_it(term) :: :ok\n"
+                               "  @macrocallback expand_it(term) :: Macro.t()\n"
+                               "  @spec with_spec(MyApp.User.t()) :: integer\n"
+                               "  def with_spec(n), do: n\n"
+                               "  def without_spec(n), do: n\n"
+                               "  @spec guarded(atom) :: :ok\n"
+                               "  def guarded(x) when is_atom(x), do: :ok\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "specced.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The definitions themselves are a separate pass and are unaffected. */
+    ASSERT(has_def(r, "Function", "with_spec"));
+    ASSERT(has_def(r, "Function", "without_spec"));
+    ASSERT(has_def(r, "Function", "guarded"));
+    /* Control on the instrument, not a pin: `without_spec` carries no typespec
+     * and is never called, so it reads 0 on the pristine build too. It is here
+     * to show elixir_any_ref_count does not score a definition as a reference,
+     * which is what would make every 0 below vacuous. It cannot fail first and
+     * cannot catch a regression. */
+    ASSERT_EQ(0, elixir_any_ref_count(r, "without_spec"));
+    for (const char *const *name = declared; *name; name++) {
+        ASSERT_EQ(0, elixir_any_ref_count(r, *name));
+    }
+    for (const char *const *name = behaviour_contract_names; *name; name++) {
+        ASSERT_EQ(0, elixir_any_ref_count(r, *name));
+    }
+    for (const char *const *name = type_refs; *name; name++) {
+        ASSERT_EQ(0, elixir_any_ref_count(r, *name));
+    }
+    /* A non-typespec attribute is untouched: its value really is compile-time
+     * code, and its name still mints the one phantom this fix does not close. */
+    ASSERT_EQ(1, count_calls_named(r, "Application.compile_env"));
+    ASSERT_EQ(1, elixir_any_ref_count(r, "timeout"));
+    /* Both phantoms onto `guarded` are gone: the @spec one to the subtree skip,
+     * the def-head one to the calls walk recognising a guarded head. */
+    ASSERT_EQ(0, elixir_any_ref_count(r, "guarded"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* tree-sitter-elixir gives a call's arguments node no field name, so the
  * generic `arguments` field lookup returns null and first_string_arg was never
  * populated for any Elixir call — Phoenix route paths, service URLs and config
@@ -1845,6 +2685,213 @@ TEST(elixir_call_string_argument) {
     }
     ASSERT_EQ(1, seen);
     cbm_free_result(r);
+    PASS();
+}
+
+/* True when a channel with this name/transport/direction was extracted. */
+static int has_channel(CBMFileResult *r, const char *name, const char *transport,
+                       CBMChannelDirection dir) {
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *c = &r->channels.items[i];
+        if (c->channel_name && strcmp(c->channel_name, name) == 0 && c->transport &&
+            strcmp(c->transport, transport) == 0 && c->direction == dir)
+            return 1;
+    }
+    return 0;
+}
+
+/* Phoenix pub/sub and channel listeners. Both branches were unreachable: the
+ * emit side looked up an "arguments" FIELD that tree-sitter-elixir does not
+ * define, and the listener side dispatched on a "def" NODE TYPE that does not
+ * exist (Elixir defs are `call` nodes), so a Phoenix app produced no channels
+ * at all. */
+TEST(elixir_channels_pubsub_and_handle_in) {
+    CBMFileResult *r =
+        extract("defmodule Acme.Notifier do\n"
+                "  def announce(p) do\n"
+                "    Phoenix.PubSub.broadcast(Acme.PubSub, \"user:created\", p)\n"
+                "  end\n"
+                "  def watch, do: Phoenix.PubSub.subscribe(Acme.PubSub, \"user:updated\")\n"
+                "end\n"
+                "defmodule AcmeWeb.RoomChannel do\n"
+                "  def handle_in(\"new_msg\", payload, socket) do\n"
+                "    push(socket, \"pong\", %{})\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "  def handle_in(\"ping\", _p, socket) when is_map(socket) do\n"
+                "    {:noreply, socket}\n"
+                "  end\n"
+                "end\n",
+                CBM_LANG_ELIXIR, "t", "chan.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "user:created", "phoenix_pubsub", CBM_CHANNEL_EMIT));
+    ASSERT(has_channel(r, "user:updated", "phoenix_pubsub", CBM_CHANNEL_LISTEN));
+    /* handle_in clauses are listeners — including the guarded one. */
+    ASSERT(has_channel(r, "new_msg", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    ASSERT(has_channel(r, "ping", "phoenix_channel", CBM_CHANNEL_LISTEN));
+    /* A bare push/broadcast inside the channel module is an emit. */
+    ASSERT(has_channel(r, "pong", "phoenix_channel", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Elixir control flow is `call` nodes and `stab_clause` arms, not branch node
+ * TYPES, so the generic complexity walk scored every Elixir function 0 and the
+ * fingerprint was never computed at all — no similarity or duplicate detection. */
+TEST(elixir_complexity_and_fingerprint) {
+    CBMFileResult *r = extract("defmodule Cx do\n"
+                               "  def classify(x) do\n"
+                               "    case x do\n"
+                               "      0 -> :zero\n"
+                               "      n when n > 0 -> :pos\n"
+                               "      _ -> :neg\n"
+                               "    end\n"
+                               "  end\n"
+                               "  def plain(a), do: a\n"
+                               "  def summarize(orders, currency) do\n"
+                               "    totals = Enum.map(orders, fn order -> order.amount * order.rate end)\n"
+                               "    count = length(totals)\n"
+                               "    sum = Enum.reduce(totals, 0, fn value, acc -> acc + value end)\n"
+                               "    average = if count > 0, do: sum / count, else: 0\n"
+                               "    label = String.upcase(currency) <> \" total\"\n"
+                               "    %{label: label, sum: sum, count: count, average: average}\n"
+                               "  end\n"
+                               "  def tally(items, unit) do\n"
+                               "    values = Enum.map(items, fn item -> item.price * item.qty end)\n"
+                               "    n = length(values)\n"
+                               "    total = Enum.reduce(values, 0, fn v, a -> a + v end)\n"
+                               "    mean = if n > 0, do: total / n, else: 0\n"
+                               "    tag = String.upcase(unit) <> \" total\"\n"
+                               "    %{tag: tag, total: total, n: n, mean: mean}\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "cx.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    CBMDefinition *cls = NULL;
+    CBMDefinition *plain = NULL;
+    CBMDefinition *summarize = NULL;
+    CBMDefinition *tally = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "classify") == 0)
+            cls = &r->defs.items[i];
+        if (strcmp(r->defs.items[i].name, "plain") == 0)
+            plain = &r->defs.items[i];
+        if (strcmp(r->defs.items[i].name, "summarize") == 0)
+            summarize = &r->defs.items[i];
+        if (strcmp(r->defs.items[i].name, "tally") == 0)
+            tally = &r->defs.items[i];
+    }
+    /* A body past the MinHash size gate gets a fingerprint (Elixir used to emit
+     * none at all); a one-expression body stays below the gate and gets none. */
+    ASSERT_NOT_NULL(summarize);
+    ASSERT(summarize->fingerprint_k > 0);
+    ASSERT_NOT_NULL(summarize->fingerprint);
+    /* Duplicate detection is what the fingerprint exists for: the same body
+     * shape under other function and variable names gets the same fingerprint. */
+    ASSERT_NOT_NULL(tally);
+    ASSERT_EQ(summarize->fingerprint_k, tally->fingerprint_k);
+    ASSERT_NOT_NULL(tally->fingerprint);
+    ASSERT(memcmp(summarize->fingerprint, tally->fingerprint,
+                  (size_t)summarize->fingerprint_k * sizeof(summarize->fingerprint[0])) == 0);
+    ASSERT_NOT_NULL(cls);
+    /* The `case` itself + its 3 arms + the second arm's own `when` guard. */
+    ASSERT_EQ(5, cls->complexity);
+    ASSERT(cls->cognitive > 0);
+    ASSERT(cls->lines > 0);
+    /* A straight-line body has no decisions but still gets a line count — a
+     * language must not become nonzero everywhere just by being measured. */
+    ASSERT_NOT_NULL(plain);
+    ASSERT_EQ(0, plain->complexity);
+    ASSERT(plain->lines > 0);
+    ASSERT_EQ(0, plain->fingerprint_k);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The clauses of a multi-clause function fold into one Function node, so that
+ * node's metrics must cover every clause, not just the first: branch, cognitive
+ * and loop counts add up, loop_depth and max_access_depth take the deepest
+ * clause, every clause past the first is one more dispatch decision, and
+ * `lines` is the folded span. `single` repeats the second clause on its own as
+ * the per-clause reference: it is not folded, so it carries no dispatch charge. */
+TEST(elixir_folded_clause_metrics_cover_every_clause) {
+    CBMFileResult *r = extract("defmodule Route do\n"                             /* 1 */
+                               "  def pick(0), do: Map.new()\n"                   /* 2 */
+                               "  def pick(n) when n > 0 do\n"                    /* 3 */
+                               "    for x <- [n], do: Map.new([{x, x}])\n"        /* 4 */
+                               "  end\n"                                          /* 5 */
+                               "  def pick(rows) do\n"                            /* 6 */
+                               "    for row <- rows, do: (for x <- row, do: x)\n" /* 7 */
+                               "  end\n"                                          /* 8 */
+                               "  def single(n) when n > 0 do\n"                  /* 9 */
+                               "    for x <- [n], do: Map.new([{x, x}])\n"        /* 10 */
+                               "  end\n"                                          /* 11 */
+                               "end\n",                                           /* 12 */
+                               CBM_LANG_ELIXIR, "t", "route.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(1, count_defs_named(r, "Function", "pick"));
+    const CBMDefinition *one = elixir_first_def(r, "single");
+    ASSERT_NOT_NULL(one);
+    /* `when` + `for`, each at nesting 0; one comprehension; Map.new is one dot */
+    ASSERT_EQ(2, one->complexity);
+    ASSERT_EQ(2, one->cognitive);
+    ASSERT_EQ(1, one->loop_count);
+    ASSERT_EQ(1, one->loop_depth);
+    ASSERT_EQ(1, one->max_access_depth);
+    ASSERT_EQ(3, one->lines);
+
+    const CBMDefinition *pick = elixir_first_def(r, "pick");
+    ASSERT_NOT_NULL(pick);
+    ASSERT_EQ(2, (int)pick->start_line);
+    ASSERT_EQ(8, (int)pick->end_line);
+    /* clauses 0 + 2 + 2, plus 2 for the two clauses past the first */
+    ASSERT_EQ(6, pick->complexity);
+    /* 0 + 2 + (1 + 2): the inner comprehension sits one level deep */
+    ASSERT_EQ(5, pick->cognitive);
+    ASSERT_EQ(3, pick->loop_count);
+    /* the deepest clause, not the sum of the clauses (that would be 3) */
+    ASSERT_EQ(2, pick->loop_depth);
+    /* two clauses with one dot each: the deepest is 1, the sum would be 2 */
+    ASSERT_EQ(1, pick->max_access_depth);
+    ASSERT_EQ(7, pick->lines);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The Elixir complexity walk keeps its pending nodes on the growable stack
+ * cbm_compute_complexity uses. A fixed 4096-frame stack dropped the FIRST
+ * children of any wider body (they are pushed last-to-first), so the largest
+ * functions silently under-reported. This body is wider than that old cap. */
+enum { ELIXIR_WIDE_STMTS = 5000 };
+
+TEST(elixir_complexity_wide_body_exceeds_old_stack_cap) {
+    static const char head[] = "defmodule Wide do\n  def wide(x) do\n";
+    static const char if_stmt[] = "    if x, do: :a\n";
+    static const char for_stmt[] = "    for y <- x, do: y\n";
+    static const char tail[] = "  end\nend\n";
+    size_t cap = sizeof(head) + (size_t)ELIXIR_WIDE_STMTS * sizeof(for_stmt) + sizeof(tail);
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "%s", head);
+    for (int i = 0; i < ELIXIR_WIDE_STMTS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "%s", (i % 2 == 0) ? if_stmt : for_stmt);
+    }
+    snprintf(src + pos, cap - pos, "%s", tail);
+    CBMFileResult *r = extract(src, CBM_LANG_ELIXIR, "t", "wide.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = elixir_first_def(r, "wide");
+    ASSERT_NOT_NULL(d);
+    /* every `if` and every `for` is one branching call at nesting depth 0 */
+    ASSERT_EQ(ELIXIR_WIDE_STMTS, d->complexity);
+    ASSERT_EQ(ELIXIR_WIDE_STMTS, d->cognitive);
+    ASSERT_EQ(ELIXIR_WIDE_STMTS / 2, d->loop_count);
+    ASSERT_EQ(1, d->loop_depth);
+    cbm_free_result(r);
+    free(src);
     PASS();
 }
 
@@ -5380,6 +6427,24 @@ TEST(extract_python_bare_decorator_route_rules) {
     PASS();
 }
 
+/* Issue #2090: Solidity modifier_invocation tracked as decorator. */
+TEST(solidity_modifier_decorator) {
+    CBMFileResult *r = extract("pragma solidity ^0.8.0;\n"
+                               "contract Vault {\n"
+                               "    modifier onlyOwner() { _; }\n"
+                               "    function withdraw() public onlyOwner {\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_SOLIDITY, "t", "Vault.sol");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "withdraw");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "onlyOwner"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
@@ -6290,6 +7355,40 @@ TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249) {
     PASS();
 }
 
+/* Issue #2537: a Go 1.22 ServeMux pattern may open with a method and/or a host
+ * ("POST /v1/payments", "GET api.example.com/v1/x"). The written pattern stays
+ * the first string argument, and its handler is captured exactly as for a
+ * plain "/v1/payments"; it was dropped because the pattern does not open with
+ * a slash. */
+TEST(extract_go_servemux_method_pattern_handler_issue2537) {
+    CBMFileResult *r = extract("package main\n"
+                               "import \"net/http\"\n"
+                               "func setup(mux *http.ServeMux) {\n"
+                               "    mux.HandleFunc(\"POST /v1/payments\", createPayment)\n"
+                               "    mux.Handle(\"GET api.example.com/v1/x\", hostHandler)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "routes.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMCall *method = find_call_by_callee(r, "mux.HandleFunc");
+    ASSERT_NOT_NULL(method);
+    ASSERT_NOT_NULL(method->first_string_arg);
+    ASSERT_STR_EQ(method->first_string_arg, "POST /v1/payments");
+    ASSERT_NOT_NULL(method->second_arg_name);
+    ASSERT_STR_EQ(method->second_arg_name, "createPayment");
+
+    const CBMCall *host = find_call_by_callee(r, "mux.Handle");
+    ASSERT_NOT_NULL(host);
+    ASSERT_NOT_NULL(host->first_string_arg);
+    ASSERT_STR_EQ(host->first_string_arg, "GET api.example.com/v1/x");
+    ASSERT_NOT_NULL(host->second_arg_name);
+    ASSERT_STR_EQ(host->second_arg_name, "hostHandler");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #2291: the JS/TS twin of #1249. A BFF that builds its backend URL as
  * `${process.env.BACKEND_URL}/wallet/topup` from a configurable base must
  * index the literal path after the base, exactly as `BACKEND_URL + "/x"`
@@ -6499,6 +7598,81 @@ TEST(extract_py_url_fold_no_fabrication_issue706) {
     ASSERT_TRUE(url_not_claimed(r, "requests.get", "slash"));
     ASSERT_TRUE(url_not_claimed(r, "requests.get", "empty"));
     ASSERT_TRUE(url_not_claimed(r, "requests.get", "two"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #523 follow-up: a Python string whose opening token is more than one
+ * quote -- a prefix (r"", u"", b"", Rb"", an f"" with no field) or a triple
+ * quote -- kept the prefix and the extra quotes in the URL (`f"http://..."`,
+ * `""http://...""`), so the HTTP_CALLS edge never matched a route. Each must
+ * yield the bare URL, positional or as `url=`. */
+TEST(extract_py_prefixed_string_url_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def f_plain():\n"
+                               "    return requests.get(f\"http://svc/v2/health\")\n"
+                               "def raw():\n"
+                               "    return requests.get(r\"http://svc/v2/health\")\n"
+                               "def uni():\n"
+                               "    return requests.get(u\"http://svc/v2/health\")\n"
+                               "def byt():\n"
+                               "    return requests.get(b\"http://svc/v2/health\")\n"
+                               "def raw_bytes():\n"
+                               "    return requests.get(Rb\"http://svc/v2/health\")\n"
+                               "def triple():\n"
+                               "    return requests.get(\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def triple_single():\n"
+                               "    return requests.get('''http://svc/v2/health''')\n"
+                               "def f_triple():\n"
+                               "    return requests.get(f\"\"\"http://svc/v2/health\"\"\")\n"
+                               "def kw():\n"
+                               "    return requests.get(url=r\"http://svc/v2/health\")\n",
+                               CBM_LANG_PYTHON, "t", "client.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "uni"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "byt"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_bytes"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "triple_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "f_triple"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "kw"), "http://svc/v2/health");
+
+    /* A wrapped literal is still a fully known value, so it is exact. */
+    const CBMCall *raw = find_call_in_func(r, "requests.get", "raw");
+    ASSERT_NOT_NULL(raw);
+    ASSERT_GTE(raw->arg_count, 1);
+    ASSERT_NOT_NULL(raw->args[0].value);
+    ASSERT_STR_EQ(raw->args[0].value, "http://svc/v2/health");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same issue, the controls: a plain one-quote literal keeps the literal path
+ * unchanged, and an interpolating f-string still folds its field to "{}". */
+TEST(extract_py_prefixed_string_url_controls_issue523) {
+    CBMFileResult *r = extract("import requests\n"
+                               "def plain():\n"
+                               "    return requests.get(\"http://svc/v2/health\")\n"
+                               "def plain_single():\n"
+                               "    return requests.get('http://svc/v2/health')\n"
+                               "def field(order_id):\n"
+                               "    return requests.get(f\"http://svc/v2/orders/{order_id}\")\n"
+                               "def raw_field(order_id):\n"
+                               "    return requests.get(rf\"http://svc/v2/orders/{order_id}\")\n",
+                               CBM_LANG_PYTHON, "t", "ctl.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "plain_single"), "http://svc/v2/health");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "field"), "http://svc/v2/orders/{}");
+    ASSERT_STR_EQ(url_in(r, "requests.get", "raw_field"), "http://svc/v2/orders/{}");
 
     cbm_free_result(r);
     PASS();
@@ -7312,6 +8486,85 @@ TEST(body_tokens_wide_body_samples_from_the_start) {
     PASS();
 }
 
+/* The YAML walkers kept their pending mappings in fixed-size stacks (256 for
+ * the dotted key-path walk, 512 for the infrastructure-binding scan) and
+ * silently stopped pushing once full (#2388). A root mapping with more nested
+ * sibling mappings than the old cap lost the full dotted key_path of every
+ * leaf past it: `k299.url` was only ever recorded as the bare `url` that the
+ * per-mapping walk of the nested block emits. */
+enum { WIDE_YAML_KEYS = 300, WIDE_YAML_ITEMS = 600 };
+
+static int has_string_ref_path(CBMFileResult *r, const char *key_path, const char *value) {
+    for (int i = 0; i < r->string_refs.count; i++) {
+        const CBMStringRef *s = &r->string_refs.items[i];
+        if (s->key_path && s->value && strcmp(s->key_path, key_path) == 0 &&
+            strcmp(s->value, value) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(yaml_key_paths_wide_mapping_exceed_old_stack_cap) {
+    size_t cap = (size_t)WIDE_YAML_KEYS * 48 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_YAML_KEYS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos,
+                                "k%d:\n  url: \"https://h%d.example.com/x\"\n", i, i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_YAML, "t", "wide.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_YAML_KEYS; i++) {
+        char path[32];
+        char value[48];
+        snprintf(path, sizeof(path), "k%d.url", i);
+        snprintf(value, sizeof(value), "https://h%d.example.com/x", i);
+        ASSERT(has_string_ref_path(r, path, value));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+static int has_infra_source(CBMFileResult *r, const char *source, const char *url) {
+    for (int i = 0; i < r->infra_bindings.count; i++) {
+        const CBMInfraBinding *b = &r->infra_bindings.items[i];
+        if (b->source_name && b->target_url && strcmp(b->source_name, source) == 0 &&
+            strcmp(b->target_url, url) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(yaml_infra_bindings_wide_sequence_exceed_old_stack_cap) {
+    size_t cap = (size_t)WIDE_YAML_ITEMS * 64 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = 0;
+    for (int i = 0; i < WIDE_YAML_ITEMS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos,
+                                "- topic: t%d\n  push_endpoint: \"https://h%d.example.com/p\"\n", i,
+                                i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_YAML, "t", "pubsub.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_YAML_ITEMS; i++) {
+        char source[16];
+        char url[48];
+        snprintf(source, sizeof(source), "t%d", i);
+        snprintf(url, sizeof(url), "https://h%d.example.com/p", i);
+        ASSERT(has_infra_source(r, source, url));
+    }
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Perl call-graph noise (#459 follow-up)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -7844,6 +9097,68 @@ TEST(extract_templ_method_qn_matches_call_scope) {
     ASSERT_NOT_NULL(title_qn);
     ASSERT_NOT_NULL(scope);
     ASSERT_STR_EQ(scope, title_qn);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_go_multiple_init_disambiguated) {
+    /* Go allows several init() per package (even per file); each gets a
+     * file+ordinal-suffixed QN (#495 cfg-twin pattern) so none is lost to the
+     * same-QN upsert. The ordinal — unlike a line number — must not move when
+     * code is inserted above the function: the QN is node identity, and a
+     * line-based suffix would churn nodes on every unrelated edit. */
+    CBMFileResult *r = extract("package m\n"
+                               "func init() { a() }\n"
+                               "func init() { b() }\n"
+                               "func a() {}\n"
+                               "func b() {}\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *first = NULL;
+    const char *second = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || strcmp(d->name, "init") != 0) {
+            continue;
+        }
+        if (!first) {
+            first = d->qualified_name;
+        } else {
+            second = d->qualified_name;
+        }
+    }
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_EQ(first, "t.init#x.go:1");
+    ASSERT_STR_EQ(second, "t.init#x.go:2");
+
+    /* Stability: an insertion ABOVE both inits must not change either QN. */
+    CBMFileResult *r2 = extract("package m\n"
+                                "import \"fmt\"\n"
+                                "var shifted = fmt.Sprint(\"pad\")\n"
+                                "func init() { a() }\n"
+                                "func init() { b() }\n"
+                                "func a() {}\n"
+                                "func b() {}\n",
+                                CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    int seen = 0;
+    for (int i = 0; i < r2->defs.count; i++) {
+        const CBMDefinition *d = &r2->defs.items[i];
+        if (!d->name || strcmp(d->name, "init") != 0) {
+            continue;
+        }
+        seen++;
+        if (seen == 1) {
+            ASSERT_STR_EQ(d->qualified_name, "t.init#x.go:1");
+        } else {
+            ASSERT_STR_EQ(d->qualified_name, "t.init#x.go:2");
+        }
+    }
+    ASSERT_EQ(seen, 2);
+    cbm_free_result(r2);
     cbm_free_result(r);
     PASS();
 }
@@ -10661,6 +11976,49 @@ TEST(extract_rescript_let_bindings_use_the_walk_cursor) {
     ASSERT_EQ(big_fallbacks, 0);
     PASS();
 }
+
+/* Every Python usage asks whether it is a global/nonlocal name and whether it
+ * sits in a parameter default. Both climbed with ts_node_parent, which
+ * descends from the ROOT: O(d^2) for a usage d deep, so one deep expression
+ * went cubic (2.2 s / 17 s / >90 s at 500/1000/2000 terms). Count every such
+ * root-descending step at N and 2N terms. */
+TEST(extract_python_deep_default_parent_climbs_are_linear) {
+    enum { SMALL = 200 };
+    uint64_t slow_parents[2];
+    for (int round = 0; round < 2; round++) {
+        /* def f(x=x + x + ... + x): return x -- a binary_operator chain. */
+        int terms = SMALL << round;
+        size_t capacity = 32U + (size_t)terms * 4U;
+        char *source = malloc(capacity);
+        ASSERT_NOT_NULL(source);
+        int length = snprintf(source, capacity, "def f(x=x");
+        for (int i = 1; i < terms; i++) {
+            length += snprintf(source + length, capacity - (size_t)length, " + x");
+        }
+        length += snprintf(source + length, capacity - (size_t)length, "):\n    return x\n");
+        cbm_usage_field_lookup_test_reset();
+        CBMFileResult *result =
+            cbm_extract_file(source, length, CBM_LANG_PYTHON, "proj", "deep.py", 0, NULL, NULL);
+        free(source);
+        ASSERT_NOT_NULL(result);
+        slow_parents[round] = cbm_usage_slow_parent_fallback_test_count();
+        /* Anti-vacuous: every default x climbed its chain to the parameter and
+         * reads the enclosing namespace; only `return x` is shadowed by it. */
+        int defaults = 0;
+        for (int i = 0; i < result->usages.count; i++) {
+            const CBMUsage *usage = &result->usages.items[i];
+            defaults += usage->ref_name && strcmp(usage->ref_name, "x") == 0 &&
+                        !usage->semantic_reference_local_shadow;
+        }
+        cbm_free_result(result);
+        ASSERT_EQ(defaults, terms);
+    }
+    fprintf(stderr, "  [python-deep-default] slow_parents(%d)=%llu slow_parents(%d)=%llu\n", SMALL,
+            (unsigned long long)slow_parents[0], 2 * SMALL, (unsigned long long)slow_parents[1]);
+    /* Twice the terms may cost about twice the steps; the cubic climb took 4x. */
+    ASSERT_LTE(slow_parents[1], slow_parents[0] * 3U + 64U);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -13119,7 +14477,42 @@ TEST(python_namespace_facts_multiple_bindings_and_unsupported_effects) {
     PASS();
 }
 
+#ifdef _WIN32
+/* The supervisor sets this path through cbm_setenv. Exercise the actual
+ * journal writer, which must read it as UTF-8 before calling cbm_fopen. */
+TEST(extraction_marker_round_trips_non_ascii_environment_path) {
+    char dir[512] = "/tmp/cbm-marker-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char marker[640];
+    snprintf(marker, sizeof(marker), "%s/marker-\xce\x94-\xe4\xb8\x81.log", dir);
+    char saved[4096];
+    const char *previous = cbm_safe_getenv("CBM_INDEX_MARKER_FILE", saved, sizeof(saved), NULL);
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_MARKER_FILE", marker, 1), 0);
+    cbm_index_mark_start("synthetic.cpp");
+    cbm_index_mark_done("synthetic.cpp");
+    if (previous) {
+        (void)cbm_setenv("CBM_INDEX_MARKER_FILE", saved, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_INDEX_MARKER_FILE");
+    }
+    FILE *file = cbm_fopen(marker, "rb");
+    char contents[128] = {0};
+    if (file) {
+        (void)fread(contents, 1, sizeof(contents) - 1, file);
+        (void)fclose(file);
+    }
+    (void)cbm_unlink(marker);
+    (void)cbm_rmdir(dir);
+    ASSERT_NOT_NULL(file);
+    ASSERT_STR_EQ(contents, "S synthetic.cpp\nD synthetic.cpp\n");
+    PASS();
+}
+#endif
+
 SUITE(extraction) {
+#ifdef _WIN32
+    RUN_TEST(extraction_marker_round_trips_non_ascii_environment_path);
+#endif
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
@@ -13148,6 +14541,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
     RUN_TEST(extract_rescript_let_bindings_use_the_walk_cursor);
+    RUN_TEST(extract_python_deep_default_parent_climbs_are_linear);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
@@ -13162,6 +14556,7 @@ SUITE(extraction) {
     RUN_TEST(extract_go_selector_call_flags_is_method);
     RUN_TEST(extract_go_method_receiver_qualified_qn);
     RUN_TEST(extract_templ_method_qn_matches_call_scope);
+    RUN_TEST(extract_go_multiple_init_disambiguated);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
@@ -13208,6 +14603,7 @@ SUITE(extraction) {
     RUN_TEST(traversal_stack_not_in_result_arena_issue2010);
     RUN_TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010);
     RUN_TEST(extract_c_macros_issue375);
+    RUN_TEST(extract_cpp_inc_linkage_and_callback);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
     RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
@@ -13237,6 +14633,7 @@ SUITE(extraction) {
     RUN_TEST(php_function);
     RUN_TEST(ruby_class);
     RUN_TEST(ruby_module);
+    RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
@@ -13289,7 +14686,22 @@ SUITE(extraction) {
 
     /* Functional */
     RUN_TEST(elixir_function);
+    RUN_TEST(elixir_def_head_is_covers_the_head_and_every_guard_above_it);
+    RUN_TEST(extract_elixir_guarded_def_head);
+    RUN_TEST(extract_elixir_clauses_fold_only_when_adjacent_in_one_module);
+    RUN_TEST(extract_elixir_nested_module_clauses_do_not_fold);
+    RUN_TEST(extract_elixir_folded_clause_is_exported_is_the_or);
+    RUN_TEST(extract_elixir_guarded_clause_head_is_not_a_self_call);
+    RUN_TEST(extract_elixir_declaration_head_mints_no_reference_of_any_kind);
+    RUN_TEST(extract_elixir_real_recursion_survives_head_suppression);
+    RUN_TEST(extract_elixir_typespec_attribute_is_not_code);
     RUN_TEST(elixir_call_string_argument);
+    RUN_TEST(extract_elixir_guarded_def_head_scope);
+    RUN_TEST(extract_elixir_guarded_def_head_guard_usages);
+    RUN_TEST(elixir_channels_pubsub_and_handle_in);
+    RUN_TEST(elixir_complexity_and_fingerprint);
+    RUN_TEST(elixir_folded_clause_metrics_cover_every_clause);
+    RUN_TEST(elixir_complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(haskell_function);
     RUN_TEST(haskell_infix_definition_name);
     RUN_TEST(ocaml_function);
@@ -13509,6 +14921,7 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_python_bare_decorator_route_rules);
+    RUN_TEST(solidity_modifier_decorator);
     RUN_TEST(arkts_component_struct);
     RUN_TEST(arkts_exported_struct_decorators);
     RUN_TEST(arkts_member_decorators);
@@ -13529,10 +14942,13 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
+    RUN_TEST(extract_go_servemux_method_pattern_handler_issue2537);
     RUN_TEST(extract_ts_template_base_url_issue2291);
     RUN_TEST(extract_ts_template_base_url_no_literal_path_issue2291);
     RUN_TEST(extract_py_concat_const_url_issue706);
     RUN_TEST(extract_py_url_fold_no_fabrication_issue706);
+    RUN_TEST(extract_py_prefixed_string_url_issue523);
+    RUN_TEST(extract_py_prefixed_string_url_controls_issue523);
     RUN_TEST(extract_ts_const_template_url_issue1147);
     RUN_TEST(extract_ts_url_fold_no_fabrication_issue1147);
     RUN_TEST(extract_ts_folded_topics_keep_raw_identity);
@@ -13570,6 +14986,8 @@ SUITE(extraction) {
     RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
     RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
     RUN_TEST(body_tokens_wide_body_samples_from_the_start);
+    RUN_TEST(yaml_key_paths_wide_mapping_exceed_old_stack_cap);
+    RUN_TEST(yaml_infra_bindings_wide_sequence_exceed_old_stack_cap);
     RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
     RUN_TEST(extract_cpp_preproc_signature_gap_issue946);
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);

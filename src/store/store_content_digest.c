@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <string.h>
 
+enum { SC_SQL_TEXT_LENGTH = -1 };
+
 typedef struct {
     const char *name;
     const char *sql; /* ?1 = project; every column is hashed, rows in this order */
@@ -44,11 +46,15 @@ static const sc_query_t sc_queries[] = {
                     "main.lsp_surface WHERE project=?1 ORDER BY 1,2,3,4,5;"},
     {"index_coverage", "SELECT rel_path,kind,detail FROM main.index_coverage WHERE project=?1 "
                        "ORDER BY 1,2,3;"},
-    {"index_coverage_meta", "SELECT index_mode,recording_status,ignored_files_stored,"
-                            "ignored_files_total,coverage_version,hash_records_complete FROM "
-                            "main.index_coverage_meta WHERE project=?1;"},
+    {"index_coverage_meta",
+     "SELECT index_mode,recording_status,ignored_files_stored,"
+     "ignored_files_total,coverage_version,hash_records_complete,unresolved_calls_complete FROM "
+     "main.index_coverage_meta WHERE project=?1;"},
     {"project_summaries", "SELECT summary,source_hash FROM main.project_summaries WHERE "
                           "project=?1;"},
+    {"index_unresolved_candidates", "SELECT candidate,rel_path,kind FROM "
+                                    "main.index_unresolved_candidates WHERE project=?1 "
+                                    "ORDER BY 1,2,3;"},
 };
 
 /* What test selection reads: node identity and every edge by its endpoints
@@ -84,7 +90,31 @@ static void sc_frame(cbm_sha256_ctx *ctx, unsigned char tag, const void *bytes, 
 static bool sc_table(sqlite3 *db, const sc_query_t *q, const char *project, cbm_sha256_ctx *ctx) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, q->sql, -1, &st, NULL) != SQLITE_OK) {
-        return false;
+        sqlite3_finalize(st);
+        st = NULL;
+        if (strcmp(q->name, "index_unresolved_candidates") == 0) {
+            /* Omit the optional frame only for proven legacy absence. Errors
+             * reading a present candidate index must invalidate the digest. */
+            sqlite3_stmt *schema = NULL;
+            bool absent =
+                sqlite3_prepare_v2(
+                    db,
+                    "SELECT 1 FROM main.sqlite_schema WHERE name='index_unresolved_candidates' "
+                    "COLLATE NOCASE LIMIT 1;",
+                    SC_SQL_TEXT_LENGTH, &schema, NULL) == SQLITE_OK &&
+                sqlite3_step(schema) == SQLITE_DONE;
+            return sqlite3_finalize(schema) == SQLITE_OK && absent;
+        }
+        /* Read-only legacy databases retain their existing content digest. */
+        if (strcmp(q->name, "index_coverage_meta") != 0 ||
+            sqlite3_prepare_v2(db,
+                               "SELECT index_mode,recording_status,ignored_files_stored,"
+                               "ignored_files_total,coverage_version,hash_records_complete FROM "
+                               "main.index_coverage_meta WHERE project=?1;",
+                               SC_SQL_TEXT_LENGTH, &st, NULL) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            return false;
+        }
     }
     bool ok = sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK;
     sc_frame(ctx, 'T', q->name, strlen(q->name));

@@ -10,6 +10,7 @@
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
 #include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
+#include "../src/foundation/sha256.h"
 #include "../src/foundation/str_util.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
@@ -2045,7 +2046,7 @@ static int issue403_initialize_count_calls(const char *session_root, bool approv
     char err[1024];
     bool approved =
         !approve_sensitive || cbm_workspace_grant_add(cache, cbm_workspace_home_dir(), session_root,
-                                                      true, err, sizeof(err));
+                                                      true, false, err, sizeof(err));
     cbm_config_t *cfg = approved ? cbm_config_open(cache) : NULL;
     cbm_mcp_server_t *srv = cfg ? cbm_mcp_server_new(NULL) : NULL;
     int calls = -2;
@@ -2444,6 +2445,10 @@ TEST(server_handle_logs_request_without_params) {
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));
     PASS();
@@ -4503,6 +4508,431 @@ TEST(tool_search_graph_bm25_applies_label_filter) {
     ASSERT_NOT_NULL(strstr(inner, "\"total\":1"));
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #2386: the label filter must choose the BM25 candidate window, not trim it
+ * afterwards. 2001 Functions fill the window ahead of 3 Classes that rank
+ * strictly lower (longer file_path), so a post-window filter returns 0 Classes
+ * while reporting a saturated window. */
+static char *bm25_label_window_search(cbm_mcp_server_t *srv, const char *label_json) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2386,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-label-window\",\"query\":\"windowneedle\","
+             "\"label\":%s,\"limit\":10,\"format\":\"json\"}}}",
+             label_json);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_label_filter_selects_candidate_window) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-label-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-label-window"), CBM_STORE_OK);
+
+    for (int i = 0; i < 2001; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.fn_%04d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "many.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-label-window.cls_%d", i);
+        cbm_node_t node = {.project = project,
+                           .label = "Class",
+                           .name = "windowneedle",
+                           .qualified_name = qn,
+                           .file_path = "deeply/nested/package/layout/registry.c",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    /* The rare label comes back in full, and the window is not saturated. */
+    char *inner = bm25_label_window_search(srv, "\"Class\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_0\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-label-window.cls_2\""));
+    ASSERT_NULL(strstr(inner, "\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+    free(inner);
+
+    /* The common label still overflows its own window and says so. */
+    inner = bm25_label_window_search(srv, "\"Function\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    /* A label carrying FTS5 syntax is never spliced into MATCH: the query
+     * stays in BM25 mode and the exact label check matches nothing. */
+    inner = bm25_label_window_search(srv, "\"Class\\\" OR windowneedle\"");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Scoping the MATCH to a label must not reorder that label's rows: a
+ * label-filtered query lists its rows in the same order as the unfiltered
+ * query does. The fixture's four `table` Methods differ in row length, which
+ * is exactly what a scored label phrase would re-weight. */
+TEST(tool_search_graph_bm25_label_scope_keeps_rank_order) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-find");
+    bm25_findability_fixture(store, "bm25-find");
+
+    char *all_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2387,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"limit\":20,\"format\":\"json\"}}}");
+    char *methods_resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2388,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"table\",\"label\":\"Method\","
+             "\"limit\":20,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(all_resp);
+    ASSERT_NOT_NULL(methods_resp);
+    char *all = extract_text_content(all_resp);
+    char *methods = extract_text_content(methods_resp);
+    free(all_resp);
+    free(methods_resp);
+    ASSERT_NOT_NULL(all);
+    ASSERT_NOT_NULL(methods);
+    ASSERT_NOT_NULL(strstr(methods, "\"total\":4"));
+
+    static const char *const qns[] = {
+        "\"bm25-find.core.Table.Table.unquoted\"",
+        "\"bm25-find.core.Table.Table.describe\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name\"",
+        "\"bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql\"",
+    };
+    enum { QN_COUNT = sizeof(qns) / sizeof(qns[0]) };
+    for (int i = 0; i < QN_COUNT; i++) {
+        for (int j = 0; j < QN_COUNT; j++) {
+            if (i == j) {
+                continue;
+            }
+            const char *ai = strstr(all, qns[i]);
+            const char *aj = strstr(all, qns[j]);
+            const char *mi = strstr(methods, qns[i]);
+            const char *mj = strstr(methods, qns[j]);
+            ASSERT_NOT_NULL(ai);
+            ASSERT_NOT_NULL(aj);
+            ASSERT_NOT_NULL(mi);
+            ASSERT_NOT_NULL(mj);
+            ASSERT_EQ(ai < aj, mi < mj);
+        }
+    }
+    free(all);
+    free(methods);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled BM25 query never ranks File, Folder, Variable or Project nodes
+ * (they match almost any token through their path), but an explicit label
+ * naming one of them must be served: those nodes are in nodes_fts, and
+ * excluding them there too answered `query=config label=Folder` with 0 rows
+ * and an exact "eq" total. One node per label shares the query tokens with a
+ * Function. */
+static void bm25_unranked_labels_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-noise");
+    struct {
+        const char *label, *name, *qn, *file;
+    } rows[] = {
+        {"Function", "loadconfig", "bm25-noise.app.loadconfig", "app/config.py"},
+        {"File", "__file__", "bm25-noise.app.config.py", "app/config.py"},
+        {"Folder", "config", "bm25-noise.app.config", "app/config"},
+        {"Variable", "CONFIG_PATH", "bm25-noise.app.config.CONFIG_PATH", "app/config.py"},
+        {"Project", "bm25-noise", "bm25-noise", ""},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        cbm_node_t node = {.project = project,
+                           .label = rows[i].label,
+                           .name = rows[i].name,
+                           .qualified_name = rows[i].qn,
+                           .file_path = rows[i].file,
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 1};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_noise_search(cbm_mcp_server_t *srv, const char *query, const char *label) {
+    char req[512];
+    char label_arg[128] = "";
+    if (label) {
+        snprintf(label_arg, sizeof(label_arg), ",\"label\":\"%s\"", label);
+    }
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2423,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-noise\",\"query\":\"%s\"%s,\"limit\":10,\"format\":\"json\"}}}",
+             query, label_arg);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_serves_unranked_labels_when_named) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-noise");
+    bm25_unranked_labels_fixture(store, "bm25-noise");
+
+    static const struct {
+        const char *label, *qn;
+    } named[] = {
+        {"File", "\"bm25-noise.app.config.py\",\"File\""},
+        {"Folder", "\"bm25-noise.app.config\",\"Folder\""},
+        {"Variable", "\"bm25-noise.app.config.CONFIG_PATH\",\"Variable\""},
+        {"Project", "\"bm25-noise\",\"Project\""},
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
+        char *inner = bm25_noise_search(srv, "noise config", named[i].label);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, named[i].qn));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "\"hint\""));
+        free(inner);
+    }
+
+    /* Without a label the four stay out of the ranking: only the Function. */
+    char *inner = bm25_noise_search(srv, "noise config", NULL);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-noise.app.loadconfig\",\"Function\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NULL(strstr(inner, "\"File\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NULL(strstr(inner, "\"Variable\""));
+    ASSERT_NULL(strstr(inner, "\"Project\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Labels are case-sensitive. A BM25 query whose label no node carries as
+ * spelled answers 0 rows like the structural path does, but never silently:
+ * the hint names the stored spelling, or get_graph_schema when the label is
+ * unknown. An existing label with no matching row is a true zero: no hint. */
+TEST(tool_search_graph_bm25_zero_hint_names_the_label) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-noise");
+    bm25_unranked_labels_fixture(store, "bm25-noise");
+
+    char *inner = bm25_noise_search(srv, "config", "folder");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"hint\":"));
+    ASSERT_NOT_NULL(strstr(inner, "retry with label=\\\"Folder\\\""));
+    free(inner);
+
+    inner = bm25_noise_search(srv, "config", "Widget");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NOT_NULL(strstr(inner, "get_graph_schema"));
+    free(inner);
+
+    inner = bm25_noise_search(srv, "zzznomatch", "Function");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":0,"));
+    ASSERT_NULL(strstr(inner, "\"hint\""));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* file_pattern, kind and namespace filter after the BM25 candidate window
+ * (they cannot be put into the MATCH like the label). 2001 same-label nodes
+ * with a short path fill the window ahead of 3 that rank strictly lower (long
+ * path) and are the only ones passing each filter, so a windowed search
+ * answered 0 rows. A saturated window under such a filter is ranked over
+ * every candidate: all 3 rows, an exact total, consistent offset pages. */
+static void bm25_post_window_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-post-window");
+    for (int i = 0; i < 2004; i++) {
+        bool rare = i >= 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-post-window.%s_%04d", rare ? "rare" : "fn", i);
+        cbm_node_t node = {
+            .project = project,
+            .label = "Function",
+            .name = "postneedle",
+            .qualified_name = qn,
+            .file_path = rare ? "deeply/nested/package/layout/registry.c" : "many.c",
+            .start_line = i + 1,
+            .end_line = i + 1,
+            .properties_json =
+                rare ? "{\"kind\":\"Deployment\",\"obj_key\":\"apps/Deployment/prod/web\"}" : NULL};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+static char *bm25_post_window_search(cbm_mcp_server_t *srv, const char *filter_json, int limit,
+                                     int offset) {
+    char req[512];
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":2424,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-post-window\",\"query\":\"postneedle\"%s,"
+             "\"limit\":%d,\"offset\":%d,\"format\":\"json\"}}}",
+             filter_json, limit, offset);
+    char *resp = cbm_mcp_server_handle(srv, req);
+    char *inner = resp ? extract_text_content(resp) : NULL;
+    free(resp);
+    return inner;
+}
+
+TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, "bm25-post-window");
+    bm25_post_window_fixture(store, "bm25-post-window");
+
+    static const char *const filters[] = {
+        ",\"file_pattern\":\"deeply/nested\"",
+        ",\"kind\":\"Deployment\"",
+        ",\"namespace\":\"prod\"",
+    };
+    for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
+        char *inner = bm25_post_window_search(srv, filters[i], 10, 0);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2001\""));
+        ASSERT_NOT_NULL(strstr(inner, "\"bm25-post-window.rare_2003\""));
+        ASSERT_NULL(strstr(inner, "\"bm25-post-window.fn_"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total\":3,"));
+        ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+        ASSERT_NULL(strstr(inner, "candidate_window_saturated"));
+        free(inner);
+    }
+
+    /* Offset pages over the exhaustive ranking are disjoint and complete. */
+    char *page1 = bm25_post_window_search(srv, filters[0], 2, 0);
+    char *page2 = bm25_post_window_search(srv, filters[0], 2, 2);
+    ASSERT_NOT_NULL(page1);
+    ASSERT_NOT_NULL(page2);
+    ASSERT_NOT_NULL(strstr(page1, "\"returned\":2,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"returned\":1,"));
+    ASSERT_NOT_NULL(strstr(page2, "\"total\":3,"));
+    for (int i = 2001; i < 2004; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "\"bm25-post-window.rare_%04d\"", i);
+        ASSERT_TRUE((strstr(page1, qn) != NULL) != (strstr(page2, qn) != NULL));
+    }
+    free(page1);
+    free(page2);
+
+    /* Without a post-window filter the window stays and says so. */
+    char *inner = bm25_post_window_search(srv, "", 10, 0);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":2000,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"candidate_window_saturated\":true"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* An unlabelled query whose whole candidate window is File/Folder/Variable/
+ * Project rows (excluded from unlabelled ranking) found no row at all, while
+ * a matching definition sat just beyond the window: 2001 short Folder rows
+ * outrank one Function with a long path. A window with no row passing the
+ * filters is ranked over every candidate instead. */
+TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-empty-window";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bm25-empty-window"), CBM_STORE_OK);
+    for (int i = 0; i < 2002; i++) {
+        bool def = i == 2001;
+        char qn[64];
+        snprintf(qn, sizeof(qn), "bm25-empty-window.%s_%04d", def ? "def" : "dir", i);
+        cbm_node_t node = {.project = project,
+                           .label = def ? "Function" : "Folder",
+                           .name = "foldneedle",
+                           .qualified_name = qn,
+                           .file_path = def ? "deeply/nested/package/layout/registry.c" : "d",
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                                    "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                                    "label, file_path FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2425,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-empty-window\",\"query\":\"foldneedle\",\"limit\":10,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-empty-window.def_2001\",\"Function\""));
+    ASSERT_NULL(strstr(inner, "\"Folder\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1,"));
+    ASSERT_NOT_NULL(strstr(inner, "\"total_relation\":\"eq\""));
+    free(inner);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -6904,7 +7334,16 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
      * metadata_match contract below would fail. */
     cbm_path_info_t path_info;
     ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+    /* The real content hash, as the indexer records it: a path counts as
+     * current only when its bytes are verified (#2585). */
+    char content[4096];
+    FILE *source = fopen(source_path, "rb");
+    ASSERT_NOT_NULL(source);
+    size_t content_len = fread(content, 1, sizeof(content), source);
+    fclose(source);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(content, content_len, sha);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", sha, path_info.mtime_ns,
                                          path_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
@@ -7060,6 +7499,286 @@ TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed) {
     PASS();
 }
 
+/* #2585 fixtures: record main.go's hash row with its real size and either its
+ * real or a shifted mtime, and either its real content hash or another
+ * file's. This reaches each freshness state without touching file times, which
+ * some platforms cannot set precisely. */
+static int record_main_go_hash(cbm_store_t *store, const char *tmp, bool real_content,
+                               bool real_mtime) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    if (cbm_path_info_utf8(path, &info) != 0) {
+        return CBM_STORE_ERR;
+    }
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return CBM_STORE_ERR;
+    }
+    char bytes[4096];
+    size_t len = fread(bytes, 1, sizeof(bytes), fp);
+    fclose(fp);
+    char sha[CBM_SHA256_HEX_LEN + 1];
+    if (real_content) {
+        cbm_sha256_hex(bytes, len, sha);
+    } else {
+        cbm_sha256_hex("other bytes", strlen("other bytes"), sha);
+    }
+    int64_t mtime_ns = real_mtime ? info.mtime_ns : info.mtime_ns - (int64_t)CBM_NSEC_PER_SEC;
+    return cbm_store_upsert_file_hash(store, "test-project", "main.go", sha, mtime_ns, info.size);
+}
+
+static yyjson_val *coverage_first_path(cbm_mcp_server_t *srv, yyjson_doc **doc, char **inner) {
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                         "\"format\":\"json\"}");
+    *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = *inner ? yyjson_read(*inner, strlen(*inner), 0) : NULL;
+    return *doc ? yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(*doc), "paths"), 0) : NULL;
+}
+
+/* #2585: freshness judged by mtime and size passed a same-size edit whose
+ * timestamp was preserved, and stayed stale after identical bytes were
+ * rewritten. With a recorded content hash it now reports the bytes. */
+TEST(tool_check_index_coverage_freshness_verifies_content_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    ASSERT_EQ(write_coverage_meta(store, project.indexed_at, "complete"), CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+
+    static const struct {
+        bool real_content;
+        bool real_mtime;
+        const char *freshness;
+        const char *action;
+    } cases[] = {
+        /* Same metadata, different bytes: previously metadata_match. */
+        {false, true, "content_changed", "read_source_and_reindex"},
+        {true, true, "metadata_match", "use_graph_with_best_effort_caveat"},
+        /* Stale metadata, identical bytes: previously metadata_changed. */
+        {true, false, "content_match", "use_graph_with_best_effort_caveat"},
+        {false, false, "metadata_changed", "read_source_and_reindex"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(record_main_go_hash(store, tmp, cases[i].real_content, cases[i].real_mtime),
+                  CBM_STORE_OK);
+        yyjson_doc *doc = NULL;
+        char *inner = NULL;
+        yyjson_val *path = coverage_first_path(srv, &doc, &inner);
+        ASSERT_NOT_NULL(path);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), cases[i].freshness);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")), cases[i].action);
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* A row without a usable content hash keeps the metadata verdict and says
+     * the content was not verified. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", 0, 0),
+              CBM_STORE_OK);
+    yyjson_doc *doc = NULL;
+    char *inner = NULL;
+    yyjson_val *path = coverage_first_path(srv, &doc, &inner);
+    ASSERT_NOT_NULL(path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_changed");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* Matching metadata alone is not evidence the bytes are current: without
+     * a usable hash, the path must not be recommended as if it were. */
+    char main_go[512];
+    snprintf(main_go, sizeof(main_go), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(main_go, &info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", info.mtime_ns,
+                                         info.size),
+              CBM_STORE_OK);
+    path = coverage_first_path(srv, &doc, &inner);
+    ASSERT_NOT_NULL(path);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "freshness")), "metadata_match");
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(path, "content_verified")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "recommended_action")),
+                  "read_source_and_reindex");
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+static char *snippet_process_order(cbm_mcp_server_t *srv, yyjson_doc **doc) {
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\","
+        "\"qualified_name\":\"test-project.cmd.server.main.ProcessOrder\",\"format\":\"json\"}");
+    char *inner = response ? extract_text_content(response) : NULL;
+    free(response);
+    *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    return inner;
+}
+
+/* #2585 (and #1750): the snippet's line range is the indexed range. When the
+ * file's bytes are not the indexed bytes, the same range can hold another
+ * symbol's code, so the source is withheld rather than misattributed. */
+TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    /* Same metadata, different bytes: mtime/size cannot see this, and the
+     * indexed range would be sliced from bytes that were never indexed. */
+    ASSERT_EQ(record_main_go_hash(store, tmp, false, true), CBM_STORE_OK);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "freshness")), "content_changed");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "recommended_action")), "reindex_then_retry");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* The indexed bytes, with current or stale metadata, are served. */
+    for (int real_mtime = 1; real_mtime >= 0; real_mtime--) {
+        ASSERT_EQ(record_main_go_hash(store, tmp, true, real_mtime == 1), CBM_STORE_OK);
+        inner = snippet_process_order(srv, &doc);
+        ASSERT_NOT_NULL(doc);
+        root = yyjson_doc_get_root(doc);
+        ASSERT_NOT_NULL(
+            strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func ProcessOrder"));
+        ASSERT_NULL(yyjson_obj_get(root, "source_drift"));
+        ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+        yyjson_doc_free(doc);
+        free(inner);
+    }
+
+    /* Without a usable hash the previous behavior holds, marked unverified. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", 0, 0), CBM_STORE_OK);
+    inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(strstr(yyjson_get_str(yyjson_obj_get(root, "source")), "func ProcessOrder"));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Rewrites main.go so that the indexed ProcessOrder range holds other code. */
+static void snippet_capture_rewrite(void *context, const char *rel_path) {
+    (void)rel_path;
+    FILE *fp = fopen((const char *)context, "w");
+    if (fp) {
+        fputs("package main\n\n// a\n// b\n// c\n// d\nfunc Intruder() {\n}\n", fp);
+        fclose(fp);
+    }
+}
+
+/* #2585: the bytes get_code_snippet serves must be the bytes it verified. A
+ * write landing after the hash check and before the slice must not produce a
+ * content_verified snippet holding code that was never indexed. */
+TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+    char main_go[512];
+    snprintf(main_go, sizeof(main_go), "%s/project/main.go", tmp);
+
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, snippet_capture_rewrite, main_go);
+    yyjson_doc *doc = NULL;
+    char *inner = snippet_process_order(srv, &doc);
+    cbm_mcp_server_set_snippet_capture_test_hook(srv, NULL, NULL);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    const char *source = yyjson_get_str(yyjson_obj_get(root, "source"));
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "content_verified")));
+    ASSERT_NULL(strstr(source, "Intruder"));
+    ASSERT_NOT_NULL(strstr(source, "func ProcessOrder"));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    /* The write did land: the next call sees it and withholds the source. */
+    inner = snippet_process_order(srv, &doc);
+    ASSERT_NOT_NULL(doc);
+    root = yyjson_doc_get_root(doc);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(root, "source_drift")));
+    yyjson_doc_free(doc);
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+#endif
+
+/* #2585: metadata.generation names the coverage-recording run and does not
+ * change on incremental re-index, so it cannot tell two publications apart.
+ * store_generation does, and every response that carries it agrees. */
+TEST(tool_responses_carry_store_generation_issue2585) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(write_coverage_meta(store, "coverage-run-1", "complete"), CBM_STORE_OK);
+    ASSERT_EQ(record_main_go_hash(store, tmp, true, true), CBM_STORE_OK);
+
+    char before[96];
+    ASSERT_EQ(cbm_store_generation(store, before, sizeof(before)), CBM_STORE_OK);
+    yyjson_doc *cdoc = NULL;
+    char *cinner = NULL;
+    ASSERT_NOT_NULL(coverage_first_path(srv, &cdoc, &cinner));
+    yyjson_val *meta = yyjson_obj_get(yyjson_doc_get_root(cdoc), "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "store_generation")), before);
+    yyjson_doc *sdoc = NULL;
+    char *sinner = snippet_process_order(srv, &sdoc);
+    ASSERT_NOT_NULL(sdoc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(sdoc), "store_generation")),
+                  before);
+    yyjson_doc_free(cdoc);
+    free(cinner);
+    yyjson_doc_free(sdoc);
+    free(sinner);
+
+    /* An index run advances the store generation, not the coverage one. */
+    char project_dir[512];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", tmp);
+    ASSERT_EQ(cbm_store_upsert_project(store, "test-project", project_dir), CBM_STORE_OK);
+    char after[96];
+    ASSERT_EQ(cbm_store_generation(store, after, sizeof(after)), CBM_STORE_OK);
+    ASSERT_STR_NEQ(after, before);
+    ASSERT_NOT_NULL(coverage_first_path(srv, &cdoc, &cinner));
+    meta = yyjson_obj_get(yyjson_doc_get_root(cdoc), "metadata");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "store_generation")), after);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(meta, "generation")), "coverage-run-1");
+    yyjson_doc_free(cdoc);
+    free(cinner);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(tool_check_index_coverage_surfaces_lookup_errors) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -7123,6 +7842,200 @@ TEST(tool_index_status_includes_git_metadata) {
 /* ══════════════════════════════════════════════════════════════════
  *  TOOL HANDLERS WITH DATA
  * ══════════════════════════════════════════════════════════════════ */
+
+/* #2816: stored recursion must remain visible even when the CALLS graph has
+ * no self-edges. Removing metadata emission must fail these assertions. */
+TEST(tool_trace_path_recursion_metadata_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion"), CBM_STORE_OK);
+    const struct {
+        const char *name;
+        const char *props;
+        const char *self;
+        const char *recursive;
+    } cases[] = {
+        {"countdown", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"visit", "{\"self_recursive\":true,\"recursive\":true}", "true", "true"},
+        {"mutual", "{\"self_recursive\":false,\"recursive\":true}", "false", "true"},
+        {"leaf", "{\"self_recursive\":false,\"recursive\":false}", "false", "false"},
+        {"legacy", "{}", "null", "null"},
+        {"partial", "{\"self_recursive\":true}", "true", "null"},
+        {"invalid", "{\"self_recursive\":\"true\",\"recursive\":1}", "null", "null"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char qn[128];
+        snprintf(qn, sizeof(qn), "%s.%s", proj, cases[i].name);
+        cbm_node_t n = {.project = proj,
+                        .label = i == 1 ? "Method" : "Function",
+                        .name = cases[i].name,
+                        .qualified_name = qn,
+                        .file_path = "recursion.ts",
+                        .start_line = 1,
+                        .end_line = 5,
+                        .properties_json = cases[i].props};
+        ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+        for (int json = 0; json < 2; json++) {
+            for (int inbound = 0; inbound < 2; inbound++) {
+                char args[512];
+                snprintf(args, sizeof(args),
+                         "{\"project\":\"%s\",\"function_name\":\"%s\","
+                         "\"direction\":\"%s\",\"format\":\"%s\"}",
+                         proj, cases[i].name, inbound ? "inbound" : "outbound",
+                         json ? "json" : "tree");
+                char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                char *inner = extract_text_content(response);
+                ASSERT_NOT_NULL(inner);
+                char expected[128];
+                snprintf(expected, sizeof(expected),
+                         json ? "\"self_recursive\":%s" : "self_recursive: %s\n", cases[i].self);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                         cases[i].recursive);
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                                   : "self_call_policy: omitted\n"));
+                snprintf(expected, sizeof(expected), json ? "\"%s_total\":0" : "%s_total: 0\n",
+                         inbound ? "callers" : "callees");
+                ASSERT_NOT_NULL(strstr(inner, expected));
+                free(inner);
+                free(response);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_union_and_edges_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-union";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-union"), CBM_STORE_OK);
+    cbm_node_t def = {.project = proj,
+                      .label = "Function",
+                      .name = "countdown",
+                      .qualified_name = "recursion-union.impl.countdown",
+                      .file_path = "impl.ts",
+                      .start_line = 1,
+                      .end_line = 10,
+                      .properties_json = "{\"self_recursive\":false,\"recursive\":false}"};
+    int64_t def_id = cbm_store_upsert_node(st, &def);
+    ASSERT_GT(def_id, 0);
+    cbm_node_t stub = def;
+    stub.qualified_name = "recursion-union.stub.countdown";
+    stub.file_path = "stub.d.ts";
+    stub.end_line = 1;
+    stub.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+    cbm_node_t leaf = def;
+    leaf.name = "leaf";
+    leaf.qualified_name = "recursion-union.impl.leaf";
+    leaf.properties_json = "{\"self_recursive\":true,\"recursive\":true}";
+    int64_t leaf_id = cbm_store_upsert_node(st, &leaf);
+    ASSERT_GT(leaf_id, 0);
+    cbm_edge_t edge = {.project = proj, .source_id = def_id, .target_id = leaf_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    const char *expected_flags[] = {"true", "null", "false", "true"};
+    for (int state = 0; state < 4; state++) {
+        def.properties_json = state == 3 ? "{\"self_recursive\":true,\"recursive\":true}"
+                                         : "{\"self_recursive\":false,\"recursive\":false}";
+        stub.properties_json = state == 0   ? "{\"self_recursive\":true,\"recursive\":true}"
+                               : state == 2 ? "{\"self_recursive\":false,\"recursive\":false}"
+                                            : "{}";
+        ASSERT_GT(cbm_store_upsert_node(st, &def), 0);
+        ASSERT_GT(cbm_store_upsert_node(st, &stub), 0);
+        for (int json = 0; json < 2; json++) {
+            char args[512];
+            snprintf(args, sizeof(args),
+                     "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                     "\"direction\":\"outbound\",\"format\":\"%s\"}",
+                     proj, json ? "json" : "tree");
+            char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+            char *inner = extract_text_content(response);
+            ASSERT_NOT_NULL(inner);
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"callees_total\":1" : "callees_total: 1\n"));
+            ASSERT_NOT_NULL(strstr(inner, json ? "\"leaf\"" : ".leaf"));
+            char expected[128];
+            snprintf(expected, sizeof(expected),
+                     json ? "\"self_recursive\":%s" : "self_recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            snprintf(expected, sizeof(expected), json ? "\"recursive\":%s" : "recursive: %s\n",
+                     expected_flags[state]);
+            ASSERT_NOT_NULL(strstr(inner, expected));
+            free(inner);
+            free(response);
+        }
+    }
+    /* Recursion is root metadata, but the omission policy concerns CALLS only. */
+    char *response =
+        cbm_mcp_handle_tool(srv, "trace_path",
+                            "{\"project\":\"recursion-union\",\"function_name\":\"countdown\","
+                            "\"edge_types\":[\"IMPORTS\"],\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NULL(strstr(inner, "self_call_policy"));
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_recursion_survives_budget_floor_issue2816) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "recursion-budget";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/recursion-budget"), CBM_STORE_OK);
+    char huge[4096];
+    memset(huge, 'x', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = '\0';
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "countdown",
+                    .qualified_name = "recursion-budget.countdown",
+                    .file_path = "recursion.ts",
+                    .start_line = 1,
+                    .end_line = 10,
+                    .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
+    int64_t root_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(root_id, 0);
+    n.name = huge;
+    n.qualified_name = huge;
+    int64_t callee_id = cbm_store_upsert_node(st, &n);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {
+        .project = proj, .source_id = root_id, .target_id = callee_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    for (int json = 0; json < 2; json++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"countdown\","
+                 "\"direction\":\"outbound\",\"format\":\"%s\",\"max_output_tokens\":128}",
+                 proj, json ? "json" : "tree");
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "output_budget"));
+        ASSERT_NULL(strstr(inner, huge));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_recursive\":true" : "self_recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"recursive\":true" : "recursive: true\n"));
+        ASSERT_NOT_NULL(strstr(inner, json ? "\"self_call_policy\":\"omitted\""
+                                           : "self_call_policy: omitted\n"));
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
 
 TEST(tool_trace_call_path_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -7678,6 +8591,14 @@ TEST(tool_trace_budget_never_slices_identifiers) {
     const char *project = "trace-byte-budget";
     cbm_mcp_server_set_project(srv, project);
     ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/trace-byte-budget"), CBM_STORE_OK);
+    cbm_coverage_meta_t coverage_meta = {.generation = "fixture",
+                                         .index_mode = "full",
+                                         .recorded_at = "2026-09-24T00:00:00Z",
+                                         .recording_status = "complete",
+                                         .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                         .unresolved_calls_complete = true,
+                                         .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &coverage_meta), CBM_STORE_OK);
 
     cbm_node_t hub = {.project = project,
                       .label = "Function",
@@ -7813,7 +8734,8 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                       .qualified_name = "trace-budget-cursor.hub",
                       .file_path = "src/hub.c",
                       .start_line = 1,
-                      .end_line = 2};
+                      .end_line = 2,
+                      .properties_json = "{\"self_recursive\":true,\"recursive\":true}"};
     cbm_node_t short_node = {.project = project,
                              .label = "Function",
                              .name = "short_row",
@@ -7853,6 +8775,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
                             "\"format\":\"json\"}");
     char *inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NOT_NULL(strstr(inner, "short_row"));
     yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
     ASSERT_NOT_NULL(doc);
@@ -7873,6 +8798,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, long_qn));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -7892,6 +8820,9 @@ TEST(tool_trace_cursor_survives_output_budget_increase) {
     response = cbm_mcp_handle_tool(srv, "trace_path", args);
     inner = extract_text_content(response);
     ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"self_recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"self_call_policy\":\"omitted\""));
     ASSERT_NULL(strstr(inner, "cursor_params_mismatch"));
     ASSERT_NULL(strstr(inner, "short_row"));
     doc = yyjson_read(inner, strlen(inner), 0);
@@ -8023,6 +8954,14 @@ TEST(tool_trace_reports_engine_saturation_as_lower_bound) {
     const char *project = "trace-engine-cap";
     cbm_mcp_server_set_project(srv, project);
     ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/trace-engine-cap"), CBM_STORE_OK);
+    cbm_coverage_meta_t coverage_meta = {.generation = "fixture",
+                                         .index_mode = "full",
+                                         .recorded_at = "2026-09-24T00:00:00Z",
+                                         .recording_status = "complete",
+                                         .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                         .unresolved_calls_complete = true,
+                                         .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, NULL, 0, &coverage_meta), CBM_STORE_OK);
     cbm_node_t hub = {.project = project,
                       .label = "Function",
                       .name = "hub",
@@ -8511,6 +9450,344 @@ TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped) {
     free(ev_json_txt);
     free(ev_json);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Unrelated file evidence must not poison a clean caller's exact outbound
+ * count. Inbound checks use their materialized candidate index, so corrupting
+ * an unrelated JSON payload after publication must not trigger a full scan. */
+TEST(tool_trace_path_reads_only_relevant_unresolved_evidence) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "bounded-trace";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/bounded-trace"), CBM_STORE_OK);
+    cbm_node_t root = {.project = project,
+                       .label = "Function",
+                       .name = "run",
+                       .qualified_name = "bounded-trace.run",
+                       .file_path = "clean.js",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(store, &root), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "unrelated.js", "fixture", 0, 0),
+              CBM_STORE_OK);
+    cbm_coverage_row_t row = {.rel_path = "unrelated.js",
+                              .kind = "unresolved_calls",
+                              .detail = "[{\"caller\":\"bounded-trace.other\",\"leaf\":\"other\","
+                                        "\"candidate\":\"bounded-trace.other\"}]"};
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, &row, 1, &meta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "UPDATE index_coverage SET detail='broken json' "
+                                    "WHERE project='bounded-trace';"),
+              CBM_STORE_OK);
+    const char *directions[] = {"outbound", "inbound"};
+    const char *fields[] = {"callees_total_relation", "callers_total_relation"};
+    for (int i = 0; i < 2; i++) {
+        char args[256], expected[80];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"run\","
+                 "\"direction\":\"%s\",\"format\":\"json\"}",
+                 project, directions[i]);
+        char *out = cbm_mcp_handle_tool(srv, "trace_path", args);
+        ASSERT_NOT_NULL(out);
+        snprintf(expected, sizeof(expected), "\"%s\":\"eq\"", fields[i]);
+        ASSERT(response_contains_json_fragment(out, expected));
+        free(out);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_truncated_evidence_is_conservative) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "truncated-trace";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/truncated-trace"), CBM_STORE_OK);
+    cbm_node_t root = {.project = project, .label = "Function", .name = "run",
+                      .qualified_name = "truncated-trace.run", .file_path = "clean.js",
+                      .start_line = 1, .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(store, &root), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "unrelated.js", "fixture", 0, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "clean.js", "fixture", 0, 0), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "fixture", .index_mode = "full",
+        .recording_status = "complete", .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+        .unresolved_calls_complete = true, .hash_records_complete = true};
+    const char *details[] = {"[{\"truncated\":true}]", "[null]", "broken json"};
+    const char *directions[] = {"outbound", "inbound"};
+    const char *fields[] = {"callees_total_relation", "callers_total_relation"};
+    for (size_t detail = 0; detail < sizeof(details) / sizeof(details[0]); detail++) {
+        for (int relevant = 0; relevant < 2; relevant++) {
+            cbm_coverage_row_t row = {.rel_path = relevant ? "clean.js" : "unrelated.js",
+                                     .kind = "unresolved_calls", .detail = details[detail]};
+            ASSERT_EQ(cbm_store_coverage_replace_ex(store, project, &row, 1, &meta), CBM_STORE_OK);
+            for (int direction = 0; direction < 2; direction++) {
+                char args[256], expected[80];
+                snprintf(args, sizeof(args), "{\"project\":\"%s\",\"function_name\":\"run\","
+                                             "\"direction\":\"%s\",\"format\":\"json\"}", project, directions[direction]);
+                char *out = cbm_mcp_handle_tool(srv, "trace_path", args);
+                ASSERT_NOT_NULL(out);
+                snprintf(expected, sizeof(expected), "\"%s\":\"%s\"", fields[direction],
+                         relevant || direction == 1 ? "unknown" : "eq");
+                ASSERT(response_contains_json_fragment(out, expected));
+                free(out);
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_marks_unresolved_call_totals_unknown) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "unresolved-trace";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/unresolved-trace");
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "unresolved-trace.service.run",
+                         .file_path = "service.js",
+                         .start_line = 1,
+                         .end_line = 4};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "buscar",
+                         .qualified_name = "unresolved-trace.client.buscar",
+                         .file_path = "client.js",
+                         .start_line = 1,
+                         .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &caller), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &callee), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, proj, "service.js", "fixture", 0, 0), CBM_STORE_OK);
+    char *out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"run\",\"direction\":\"outbound\","
+             "\"format\":\"json\"}}}");
+    char *txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callees_total_relation\":\"unknown\""));
+    free(txt);
+    free(out);
+    cbm_coverage_row_t row = {
+        .rel_path = "service.js",
+        .kind = "unresolved_calls",
+        .detail = "[{\"caller\":\"unresolved-trace.service.run\",\"leaf\":\"buscar\","
+                  "\"start_byte\":42,\"end_byte\":59,\"line\":3,"
+                  "\"candidate\":\"unresolved-trace.client.buscar\","
+                  "\"reason\":\"method_not_in_registry\"}]"};
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recorded_at = "2026-09-24T00:00:00Z",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, &row, 1, &meta), CBM_STORE_OK);
+
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"run\",\"direction\":\"outbound\","
+             "\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callees_total_relation\":\"unknown\""));
+    free(txt);
+    free(out);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"buscar\",\"direction\":\"inbound\","
+             "\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callers_total_relation\":\"unknown\""));
+    free(txt);
+    free(out);
+    /* The same leaf in an unrelated module was never a resolver candidate. */
+    cbm_node_t unrelated = callee;
+    unrelated.qualified_name = "unresolved-trace.other.buscar";
+    unrelated.file_path = "other.js";
+    ASSERT_GT(cbm_store_upsert_node(st, &unrelated), 0);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"unresolved-trace.other.buscar\","
+             "\"direction\":\"inbound\",\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callers_total_relation\":\"eq\""));
+    free(txt);
+    free(out);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"check_index_coverage\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"paths\":[\"service.js\"],\"diagnostics\":\"full\","
+             "\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"status\":\"unresolved_calls\""));
+    ASSERT_NOT_NULL(strstr(txt, "method_not_in_registry"));
+    free(txt);
+    free(out);
+    out = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+             "\"unresolved-trace\",\"function_name\":\"run\",\"direction\":\"outbound\","
+             "\"edge_types\":[\"IMPORTS\"],\"format\":\"json\"}}}");
+    txt = extract_text_content(out);
+    ASSERT_NOT_NULL(strstr(txt, "\"callees_total_relation\":\"eq\""));
+    free(txt);
+    free(out);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_trace_path_outbound_requires_project_symbol) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "project-symbol-trace";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/project-symbol-trace"), CBM_STORE_OK);
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "run",
+                         .qualified_name = "project-symbol-trace.service.run",
+                         .file_path = "service.js",
+                         .start_line = 1,
+                         .end_line = 4};
+    cbm_node_t local = {.project = proj,
+                        .label = "Function",
+                        .name = "buscar",
+                        .qualified_name = "project-symbol-trace.client.buscar",
+                        .file_path = "client.js"};
+    cbm_node_t constructor = {.project = proj,
+                              .label = "Class",
+                              .name = "Cliente",
+                              .qualified_name = "project-symbol-trace.client.Cliente",
+                              .file_path = "client.js"};
+    cbm_node_t foreign = {.project = "other-project",
+                          .label = "Function",
+                          .name = "foreignOnly",
+                          .qualified_name = "other-project.client.foreignOnly",
+                          .file_path = "client.js"};
+    ASSERT_GT(cbm_store_upsert_node(st, &caller), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &local), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &constructor), 0);
+    ASSERT_EQ(cbm_store_upsert_project(st, foreign.project, "/tmp/other-project"), CBM_STORE_OK);
+    ASSERT_GT(cbm_store_upsert_node(st, &foreign), 0);
+    const char *containers[] = {"File", "Folder", "Project", "Module", "Package", "Section"};
+    for (size_t i = 0; i < sizeof(containers) / sizeof(containers[0]); i++) {
+        char name[64], qn[128];
+        snprintf(name, sizeof(name), "external%s", containers[i]);
+        snprintf(qn, sizeof(qn), "%s.%s", proj, name);
+        cbm_node_t container = {
+            .project = proj, .label = containers[i], .name = name, .qualified_name = qn};
+        ASSERT_GT(cbm_store_upsert_node(st, &container), 0);
+    }
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, proj, "service.js", "fixture", 0, 0), CBM_STORE_OK);
+    cbm_coverage_meta_t meta = {.generation = "fixture",
+                                .index_mode = "full",
+                                .recorded_at = "2026-09-29T00:00:00Z",
+                                .recording_status = "complete",
+                                .coverage_version = CBM_UNRESOLVED_CALL_COVERAGE_VERSION,
+                                .unresolved_calls_complete = true,
+                                .hash_records_complete = true};
+    const struct {
+        const char *leaf;
+        const char *relation;
+    } cases[] = {{"printf", "eq"},         {"foreignOnly", "eq"},     {"Buscar", "eq"},
+                 {"externalFile", "eq"},   {"externalFolder", "eq"},  {"externalProject", "eq"},
+                 {"externalModule", "eq"}, {"externalPackage", "eq"}, {"externalSection", "eq"},
+                 {"buscar", "unknown"},    {"Cliente", "unknown"}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char detail[512];
+        snprintf(detail, sizeof(detail),
+                 "[{\"caller\":\"project-symbol-trace.service.run\",\"leaf\":\"%s\","
+                 "\"start_byte\":42,\"end_byte\":59,\"line\":3,"
+                 "\"reason\":\"method_not_in_registry\"}]",
+                 cases[i].leaf);
+        cbm_coverage_row_t row = {
+            .rel_path = "service.js", .kind = "unresolved_calls", .detail = detail};
+        ASSERT_EQ(cbm_store_coverage_replace_ex(st, proj, &row, 1, &meta), CBM_STORE_OK);
+        char *out = cbm_mcp_server_handle(
+            srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"project\":"
+                 "\"project-symbol-trace\",\"function_name\":\"run\","
+                 "\"direction\":\"outbound\",\"format\":\"json\"}}}");
+        char *txt = extract_text_content(out);
+        char expected[80];
+        snprintf(expected, sizeof(expected), "\"callees_total_relation\":\"%s\"",
+                 cases[i].relation);
+        ASSERT_NOT_NULL(strstr(txt, expected));
+        ASSERT_NOT_NULL(strstr(txt, "\"callees_total\":0"));
+        free(txt);
+        free(out);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_index_unresolved_nested_functions_are_indexed) {
+    char tmp[256] = "/tmp/cbm-mcp-unresolved-XXXXXX";
+    char cache[256] = "/tmp/cbm-mcp-unresolved-cache-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/service.js", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export class Client { buscar(id) { return id; } }\n"
+          "export function factory({ client }) {\n"
+          "  function inner(id) {\n"
+          "    return client.buscar(id);\n"
+          "  }\n  return { inner };\n}\n",
+          f);
+    fclose(f);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", tmp);
+    char *out = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"status\":\"indexed\""));
+    ASSERT(response_contains_json_fragment(out, "\"skipped_count\":0"));
+    free(out);
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"inner\","
+             "\"direction\":\"outbound\",\"format\":\"json\"}",
+             project);
+    out = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"callees_total_relation\":\"unknown\""));
+    free(out);
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"function_name\":\"factory\","
+             "\"direction\":\"outbound\",\"format\":\"json\"}",
+             project);
+    out = cbm_mcp_handle_tool(srv, "trace_path", args);
+    ASSERT_NOT_NULL(out);
+    ASSERT(response_contains_json_fragment(out, "\"callees_total_relation\":\"eq\""));
+    free(out);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    free(project);
+    remove(path);
+    cbm_rmdir(tmp);
+    cbm_rmdir(cache);
     PASS();
 }
 
@@ -9145,6 +10422,57 @@ TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
     ASSERT_STR_EQ(probe.end_projects[0], project);
     ASSERT_FALSE(cbm_file_exists(db_path));
     free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
+/* delete_project removes the ADR sidecar with the project, and a re-index of a
+ * same-named project afterwards starts with no ADR (round-2 review item 7c). */
+TEST(tool_delete_project_removes_adr_sidecar) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-adr-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "adr-delete-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, "/tmp/adr-delete-project"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(setup, project, "# Decision\nkeep it"), CBM_STORE_OK);
+    cbm_store_close(setup);
+
+    char adr_path[CBM_SZ_1K];
+    snprintf(adr_path, sizeof(adr_path), "%s.adr.db", db_path);
+    ASSERT_TRUE(cbm_file_exists(adr_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"adr-delete-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    free(resp);
+
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    ASSERT_FALSE(cbm_file_exists(adr_path)); /* sidecar removed with the project */
+
+    /* A fresh store of the same name starts with no ADR. */
+    cbm_store_t *fresh = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(fresh);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(fresh, project, &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(fresh);
 
     cbm_mcp_server_free(srv);
     cleanup_project_db(cache, project);
@@ -10745,6 +12073,88 @@ TEST(search_code_scoped_file_pattern_is_busybox_portable) {
     ASSERT_TRUE(portable_success);
     PASS();
 #endif
+}
+
+/* issue #2836: a file_pattern with '/' matched only the basename, so every
+ * directory-scoped glob silently returned 0 results. */
+TEST(search_code_file_pattern_matches_repo_relative_path_issue2836) {
+    char tmp[CBM_SZ_512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm-search-fp-path-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char src_dir[CBM_SZ_1K];
+    char cli_dir[CBM_SZ_1K];
+    char main_path[CBM_SZ_1K];
+    char watcher_path[CBM_SZ_1K];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", tmp);
+    snprintf(cli_dir, sizeof(cli_dir), "%s/src/cli", tmp);
+    snprintf(main_path, sizeof(main_path), "%s/src/main.c", tmp);
+    snprintf(watcher_path, sizeof(watcher_path), "%s/src/cli/watcher.c", tmp);
+    ASSERT_EQ(cbm_mkdir(src_dir), 0);
+    ASSERT_EQ(cbm_mkdir(cli_dir), 0);
+    ASSERT_EQ(th_write_file(main_path, "int FP_PATH_NEEDLE = 1;\n"), 0);
+    ASSERT_EQ(th_write_file(watcher_path, "int FP_PATH_NEEDLE = 2;\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "search-fp-path";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+    cbm_node_t main_file = {.project = project,
+                            .label = "File",
+                            .name = "main.c",
+                            .qualified_name = "search-fp-path.src.main.c",
+                            .file_path = "src/main.c"};
+    cbm_node_t watcher_file = {.project = project,
+                               .label = "File",
+                               .name = "watcher.c",
+                               .qualified_name = "search-fp-path.src.cli.watcher.c",
+                               .file_path = "src/cli/watcher.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &main_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &watcher_file), 0);
+
+    static const struct {
+        const char *file_pattern;
+        const char *expect;
+        bool hint;
+    } cases[] = {
+        {"src/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/**/*.c", "\"total_grep_matches\":2", false}, /* ** spans zero dirs */
+        {"**/cli/*.c", "\"total_grep_matches\":1", false},
+        {"src/cli/", "\"total_grep_matches\":1", false},  /* no wildcard: substring */
+        {"watcher.c", "\"total_grep_matches\":1", false}, /* basename unchanged */
+        {"*.c", "\"total_grep_matches\":2", false},
+        {"lib/*.c", "\"total_grep_matches\":0", true},
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args),
+                 "{\"pattern\":\"FP_PATH_NEEDLE\",\"project\":\"search-fp-path\","
+                 "\"file_pattern\":\"%s\",\"format\":\"json\"}",
+                 cases[i].file_pattern);
+        char *response = cbm_mcp_handle_tool(srv, "search_code", args);
+        char *inner = extract_text_content(response);
+        bool case_ok = inner && strstr(inner, cases[i].expect) &&
+                       (strstr(inner, "use path_filter") != NULL) == cases[i].hint;
+        if (!case_ok) {
+            fprintf(stderr, "file_pattern %s: %s\n", cases[i].file_pattern,
+                    inner ? inner : "(null)");
+            ok = false;
+        }
+        free(inner);
+        free(response);
+    }
+
+    cbm_mcp_server_free(srv);
+    cbm_unlink(watcher_path);
+    cbm_unlink(main_path);
+    cbm_rmdir(cli_dir);
+    cbm_rmdir(src_dir);
+    cbm_rmdir(tmp);
+    ASSERT_TRUE(ok);
+    PASS();
 }
 
 TEST(search_code_recursive_fallback_propagates_discovery_failures) {
@@ -12462,14 +13872,27 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     };
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_code",
-                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
-                            "\"file_pattern\":\"*.go\"}");
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\",\"file_pattern\":"
+             "\"*.go\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(probe.cancel_accepted);
     ASSERT_NOT_NULL(strstr(response, "cancelled"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "tool=search_code"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
 
     char logs[640];
     snprintf(logs, sizeof(logs), "%s/logs", cache.path);
@@ -12479,6 +13902,39 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(server_handle_logs_timeout_without_query) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=timeout"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -23184,6 +24640,161 @@ TEST(autoindex_limit_guards_git_root_issue713) {
     PASS();
 }
 
+/* A servable project row is a committed index. user_version stays 0, so a
+ * later run cannot take the incremental no-op and skip recording workers. */
+static bool mcp_publish_committed_index(const char *root) {
+    char *project = root ? cbm_project_name_from_path(root) : NULL;
+    cbm_store_t *store = project ? cbm_store_open(project) : NULL;
+    bool published = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    free(project);
+    return published;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    const char *root;
+    bool published;
+} mcp_committed_seed_t;
+
+/* maybe_auto_index returns before the thread when <project>.db already
+ * exists. Publish the committed index from the count hook, which runs after
+ * that check and before autoindex_thread chooses a width. */
+static void mcp_autoindex_publish_committed(void *context) {
+    mcp_committed_seed_t *seed = context;
+    if (seed) {
+        seed->published = mcp_publish_committed_index(seed->root);
+    }
+}
+#endif
+
+/* First index, including one started automatically, uses every core. Headroom
+ * applies only once a servable project database already exists.
+ * automatic: in-process auto-index (initialize → autoindex_thread).
+ * Otherwise index_repository with _cbm_background, the daemon/watcher path. */
+static int mcp_assert_inprocess_worker_policy(bool committed, bool automatic) {
+    char cache[256];
+    char repo[512];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-worker-policy-%d%d-XXXXXX", cbm_tmpdir(),
+                   committed ? 1 : 0, automatic ? 1 : 0);
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    (void)snprintf(repo, sizeof(repo), "%s/repo", cache);
+    char source[640];
+    (void)snprintf(source, sizeof(source), "%s/main.py", repo);
+    bool repo_ready = cache_ready && th_mkdir_p(repo) == 0 &&
+                      th_write_file(source, "def background_index():\n    return True\n") == 0;
+
+    mcp_test_env_backup_t environment[] = {
+        {.name = "CBM_CACHE_DIR"},
+        {.name = "CBM_WORKERS"},
+        {.name = "CBM_INDEX_SINGLE_THREAD"},
+    };
+    bool environment_saved = true;
+    for (size_t i = 0; i < sizeof(environment) / sizeof(environment[0]); i++) {
+        const char *value = getenv(environment[i].name);
+        environment[i].present = value != NULL;
+        environment[i].value = value ? strdup(value) : NULL;
+        environment_saved = environment_saved && (!value || environment[i].value);
+    }
+    bool environment_ready = environment_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                             cbm_unsetenv("CBM_WORKERS") == 0 &&
+                             cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") == 0;
+
+    bool seeded = !committed;
+    char old_cwd[CBM_SZ_4K] = {0};
+    bool cwd_ready = true;
+    cbm_config_t *config = NULL;
+    bool config_ready = true;
+    cbm_mcp_server_t *server = NULL;
+    char *response = NULL;
+    if (automatic) {
+        cwd_ready = repo_ready && environment_ready && cbm_getcwd(old_cwd, sizeof(old_cwd)) &&
+                    cbm_chdir(repo) == 0;
+        config = cwd_ready ? cbm_config_open(cache) : NULL;
+        config_ready = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                       cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+        cbm_pipeline_worker_count_test_reset();
+        server = config_ready ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            cbm_mcp_server_set_config(server, config);
+#ifdef CBM_ENABLE_TEST_SEAMS
+            mcp_committed_seed_t seed = {.root = repo, .published = !committed};
+            if (committed) {
+                cbm_mcp_server_set_auto_index_count_test_hook(
+                    server, mcp_autoindex_publish_committed, &seed);
+            }
+#endif
+            response = cbm_mcp_server_handle(
+                server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+#ifdef CBM_ENABLE_TEST_SEAMS
+            seeded = seed.published;
+#endif
+            cbm_mcp_server_free(server); /* joins the automatic index thread */
+        }
+    } else {
+        if (committed && repo_ready && environment_ready) {
+            seeded = mcp_publish_committed_index(repo);
+        }
+        cbm_pipeline_worker_count_test_reset();
+        server = repo_ready && environment_ready && seeded ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            char repo_json[512];
+            char args[CBM_SZ_1K];
+            (void)snprintf(repo_json, sizeof(repo_json), "%s", repo);
+            cbm_normalize_path_sep(repo_json);
+            (void)snprintf(args, sizeof(args), "{\"_cbm_background\":true,\"repo_path\":\"%s\"}",
+                           repo_json);
+            response = cbm_mcp_handle_tool(server, "index_repository", args);
+            cbm_mcp_server_free(server);
+        }
+    }
+    int selected_workers = cbm_pipeline_worker_count_test_last();
+    bool server_ready = server != NULL;
+    bool response_ready = response != NULL;
+
+    free(response);
+    cbm_config_close(config);
+    if (automatic && cwd_ready) {
+        (void)cbm_chdir(old_cwd);
+    }
+    /* Capture while CBM_WORKERS is still unset. Restoring first makes the
+     * expected count follow the lane override instead of this policy. */
+    int expected = committed ? cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                                    cbm_default_worker_count(false))
+                             : cbm_default_worker_count(true);
+    mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
+    bool cleaned = !cache_ready || th_rmtree(cache) == 0;
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(repo_ready);
+    ASSERT_TRUE(environment_saved);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(cwd_ready);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(seeded);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(response_ready);
+    ASSERT_EQ(selected_workers, expected);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+TEST(mcp_auto_index_in_process_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, true);
+}
+
+TEST(mcp_auto_index_in_process_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, true);
+}
+
+TEST(mcp_background_flag_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, false);
+}
+
+TEST(mcp_background_flag_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, false);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
@@ -24501,6 +26112,42 @@ TEST(search_code_rejects_quote_in_file_pattern) {
     PASS();
 }
 
+TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "coverage-priority";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/coverage-priority"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, project, "mixed.js", "fixture", 0, 0),
+              CBM_STORE_OK);
+    const char *kinds[] = {"parse_partial", "parse_unusable", "oversized", "not_indexed_file"};
+    const char *statuses[] = {"partial", "unusable", "skipped", "excluded"};
+    for (size_t i = 0; i < sizeof(kinds) / sizeof(kinds[0]); i++) {
+        cbm_coverage_row_t rows[] = {
+            {.rel_path = "mixed.js", .kind = "unresolved_calls", .detail = "[]"},
+            {.rel_path = "mixed.js", .kind = kinds[i], .detail = "1-2"},
+        };
+        ASSERT_EQ(cbm_store_coverage_replace(store, project, rows, 2), CBM_STORE_OK);
+        char *response = cbm_mcp_handle_tool(
+            srv, "check_index_coverage",
+            "{\"project\":\"coverage-priority\",\"paths\":[\"mixed.js\"],\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *path = yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "paths"), 0);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(path, "status")), statuses[i]);
+        ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(path, "coverage")), 2);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── search_code: every match resolves inside the project root ─────────
  * search_code returns the lines its scan opened. The scoped file list is
  * built from the index, and an indexed path that now passes through a
@@ -25058,6 +26705,7 @@ TEST(search_code_scan_in_process_limits_and_failures) {
 #undef SCAN_RS
 
 SUITE(mcp) {
+    RUN_TEST(tool_check_index_coverage_parse_gap_precedes_unresolved_calls);
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
     RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
@@ -25209,6 +26857,12 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
     RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_label_filter_selects_candidate_window);
+    RUN_TEST(tool_search_graph_bm25_label_scope_keeps_rank_order);
+    RUN_TEST(tool_search_graph_bm25_serves_unranked_labels_when_named);
+    RUN_TEST(tool_search_graph_bm25_zero_hint_names_the_label);
+    RUN_TEST(tool_search_graph_bm25_post_window_filters_rank_every_candidate);
+    RUN_TEST(tool_search_graph_bm25_empty_window_ranks_every_candidate);
     RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
@@ -25237,10 +26891,19 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
+    RUN_TEST(tool_check_index_coverage_freshness_verifies_content_issue2585);
+    RUN_TEST(tool_get_code_snippet_withholds_source_whose_content_drifted_issue2585);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(tool_get_code_snippet_serves_the_bytes_it_verified_issue2585);
+#endif
+    RUN_TEST(tool_responses_carry_store_generation_issue2585);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
+    RUN_TEST(tool_trace_path_recursion_metadata_issue2816);
+    RUN_TEST(tool_trace_path_recursion_union_and_edges_issue2816);
+    RUN_TEST(tool_trace_path_recursion_survives_budget_floor_issue2816);
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_call_invalid_project_name_leaves_no_corrupt_litter_issue1425);
     RUN_TEST(tool_trace_missing_function_name);
@@ -25258,6 +26921,11 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_qn_fallback_frees_name_miss);
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
+    RUN_TEST(tool_trace_path_reads_only_relevant_unresolved_evidence);
+    RUN_TEST(tool_trace_path_truncated_evidence_is_conservative);
+    RUN_TEST(tool_trace_path_marks_unresolved_call_totals_unknown);
+    RUN_TEST(tool_trace_path_outbound_requires_project_symbol);
+    RUN_TEST(tool_index_unresolved_nested_functions_are_indexed);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
     RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
     RUN_TEST(tool_trace_path_edge_details_use_canonical_predecessor);
@@ -25301,6 +26969,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_fails_closed_when_complete_scan_is_impossible);
     RUN_TEST(search_code_scoped_scan_uses_canonical_file_nodes);
     RUN_TEST(search_code_scoped_file_pattern_is_busybox_portable);
+    RUN_TEST(search_code_file_pattern_matches_repo_relative_path_issue2836);
     RUN_TEST(search_code_recursive_fallback_propagates_discovery_failures);
     RUN_TEST(search_code_default_budget_limits_raw_rows_before_graph_results);
     RUN_TEST(search_code_raw_and_directory_remainders_are_independently_pageable);
@@ -25323,6 +26992,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);
@@ -25479,6 +27149,10 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
+    RUN_TEST(mcp_auto_index_in_process_fresh_project_uses_full_width);
+    RUN_TEST(mcp_auto_index_in_process_existing_index_keeps_headroom);
+    RUN_TEST(mcp_background_flag_fresh_project_uses_full_width);
+    RUN_TEST(mcp_background_flag_existing_index_keeps_headroom);
     RUN_TEST(search_code_context_window_is_bounded);
     RUN_TEST(search_code_context_extreme_values_answer_normally);
     RUN_TEST(tool_query_graph_max_rows_above_ceiling_is_capped);
@@ -25500,6 +27174,7 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_ingest_traces_mutation_guard_missing_store_releases);
     RUN_TEST(tool_ingest_traces_mutation_guard_query_failure_releases);
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+    RUN_TEST(tool_delete_project_removes_adr_sidecar);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
     RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);

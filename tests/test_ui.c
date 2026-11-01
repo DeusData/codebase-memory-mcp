@@ -556,7 +556,41 @@ TEST(layout_to_json) {
     ASSERT(strstr(json, "\"hello\"") != NULL);
     ASSERT(strstr(json, "\"Function\"") != NULL);
 
-    free(json);
+    cbm_layout_free_json(json);
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* cbm_layout_to_json hands out one memory-core block of the OTHER class, and
+ * cbm_layout_free_json takes exactly that block back. A raw allocation on either
+ * side of the pair fails the count. */
+TEST(layout_json_memory_core_ownership) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "hello",
+                    .qualified_name = "test::hello",
+                    .file_path = "a.c",
+                    .start_line = 1,
+                    .end_line = 5};
+    cbm_store_upsert_node(store, &n);
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+
+    size_t bytes = cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER);
+    size_t blocks = cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER);
+    char *json = cbm_layout_to_json(r);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"hello\"") != NULL);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks + 1);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER) >= bytes + strlen(json) + 1);
+
+    cbm_layout_free_json(json);
+    ASSERT_EQ(cbm_mem_class_live_bytes(CBM_MEM_CLASS_OTHER), bytes);
+    ASSERT_EQ(cbm_mem_class_live_blocks(CBM_MEM_CLASS_OTHER), blocks);
     cbm_layout_free(r);
     cbm_store_close(store);
     PASS();
@@ -635,6 +669,30 @@ TEST(layout_dead_code_classification) {
                       .qualified_name = "dc::exportedfn",
                       .file_path = "src/d.c",
                       .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t framework = {.project = "dc",
+                            .label = "Function",
+                            .name = "frameworkfn",
+                            .qualified_name = "dc::frameworkfn",
+                            .file_path = "src/routes.c",
+                            .properties_json = "{}"};
+    cbm_node_t route = {.project = "dc",
+                        .label = "Route",
+                        .name = "GET /framework",
+                        .qualified_name = "dc::route",
+                        .file_path = "src/routes.c",
+                        .properties_json = "{}"};
+    cbm_node_t unrelated = {.project = "dc",
+                            .label = "Class",
+                            .name = "UnrelatedTarget",
+                            .qualified_name = "dc::unrelated",
+                            .file_path = "src/routes.c",
+                            .properties_json = "{}"};
+    cbm_node_t nonroute = {.project = "dc",
+                           .label = "Function",
+                           .name = "nonroutefn",
+                           .qualified_name = "dc::nonroutefn",
+                           .file_path = "src/routes.c",
+                           .properties_json = "{}"};
     cbm_node_t single = {.project = "dc",
                          .label = "Function",
                          .name = "calledonce",
@@ -666,6 +724,14 @@ TEST(layout_dead_code_classification) {
     cbm_store_upsert_node(store, &tst);
     cbm_store_upsert_node(store, &tstpath);
     cbm_store_upsert_node(store, &exp);
+    int64_t id_framework = cbm_store_upsert_node(store, &framework);
+    int64_t id_route = cbm_store_upsert_node(store, &route);
+    int64_t id_unrelated = cbm_store_upsert_node(store, &unrelated);
+    int64_t id_nonroute = cbm_store_upsert_node(store, &nonroute);
+    ASSERT_GT(id_framework, 0);
+    ASSERT_GT(id_route, 0);
+    ASSERT_GT(id_unrelated, 0);
+    ASSERT_GT(id_nonroute, 0);
     int64_t id_single = cbm_store_upsert_node(store, &single);
     int64_t id_norm = cbm_store_upsert_node(store, &norm);
     int64_t id_caller = cbm_store_upsert_node(store, &caller);
@@ -678,9 +744,15 @@ TEST(layout_dead_code_classification) {
     cbm_edge_t e2 = {
         .project = "dc", .source_id = id_caller, .target_id = id_norm, .type = "CALLS"};
     cbm_edge_t e3 = {.project = "dc", .source_id = id_dead, .target_id = id_norm, .type = "CALLS"};
+    cbm_edge_t framework_route = {
+        .project = "dc", .source_id = id_framework, .target_id = id_route, .type = "HANDLES"};
+    cbm_edge_t framework_unrelated = {
+        .project = "dc", .source_id = id_nonroute, .target_id = id_unrelated, .type = "HANDLES"};
     cbm_store_insert_edge(store, &e1);
     cbm_store_insert_edge(store, &e2);
     cbm_store_insert_edge(store, &e3);
+    ASSERT_GT(cbm_store_insert_edge(store, &framework_route), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &framework_unrelated), 0);
 
     cbm_layout_result_t *r = cbm_layout_compute(store, "dc", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
     ASSERT_NOT_NULL(r);
@@ -708,6 +780,18 @@ TEST(layout_dead_code_classification) {
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "exported");
 
+    ln = find_layout_node(r, "frameworkfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "entry");
+
+    ln = find_layout_node(r, "nonroutefn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "dead");
+
+    ln = find_layout_node(r, "GET /framework");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "structural");
+
     ln = find_layout_node(r, "calledonce");
     ASSERT_NOT_NULL(ln);
     ASSERT_STR_EQ(ln->status, "single");
@@ -727,7 +811,7 @@ TEST(layout_dead_code_classification) {
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "\"status\":\"dead\"") != NULL);
     ASSERT(strstr(json, "\"in_calls\":2") != NULL);
-    free(json);
+    cbm_layout_free_json(json);
 
     cbm_layout_free(r);
     cbm_store_close(store);
@@ -2698,6 +2782,7 @@ SUITE(ui) {
     RUN_TEST(layout_honors_budget_above_default);
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
+    RUN_TEST(layout_json_memory_core_ownership);
     RUN_TEST(layout_null_inputs);
     RUN_TEST(layout_dead_code_classification);
     RUN_TEST(layout_coincident_nodes_bounded);
