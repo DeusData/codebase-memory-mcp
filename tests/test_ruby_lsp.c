@@ -1430,6 +1430,74 @@ TEST(rubylsp_mixin_walk_visits_each_module_once) {
     PASS();
 }
 
+/* `class Probe; def run; S0::S1::...::S<n-1>.new; end; end` */
+static char *rubylsp_deep_const_src(int n) {
+    size_t cap = (size_t)n * 12 + 128;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t off = (size_t)snprintf(src, cap, "class Probe\n  def run\n    ");
+    for (int i = 0; i < n; i++)
+        off += (size_t)snprintf(src + off, cap - off, i ? "::S%d" : "S%d", i);
+    (void)snprintf(src + off, cap - off, ".new\n  end\nend\n");
+    return src;
+}
+
+static size_t rubylsp_deep_const_bytes(int n) {
+    char *src = rubylsp_deep_const_src(n);
+    if (!src)
+        return 0;
+    size_t bytes = 0;
+    (void)rubylsp_counted_work(src, &bytes);
+    free(src);
+    return bytes;
+}
+
+/* Review ask (b): a constant path is built in one pass. Recursing once per
+ * `::` and re-formatting the growing prefix at every level costs one stack
+ * frame per segment and quadratic bytes; the loop has no recursion and
+ * writes the path once. The positive control pins the exact class QN for a
+ * deep path and for a leading `::`. */
+TEST(rubylsp_const_path_is_linear) {
+    size_t b_n = rubylsp_deep_const_bytes(800);
+    size_t b_2n = rubylsp_deep_const_bytes(1600);
+    printf("  const path arena bytes: n=800 %zu, n=1600 %zu\n", b_n, b_2n);
+    ASSERT(b_n > 0);
+    ASSERT(b_2n <= 3 * b_n);
+
+    const char *src = "module L0\n"
+                      "  module L1\n"
+                      "    module L2\n"
+                      "      module L3\n"
+                      "        module L4\n"
+                      "          class Leaf\n"
+                      "          end\n"
+                      "        end\n"
+                      "      end\n"
+                      "    end\n"
+                      "  end\n"
+                      "end\n"
+                      "class Top\n"
+                      "  class Inner\n"
+                      "  end\n"
+                      "end\n"
+                      "class Caller\n"
+                      "  def deep\n"
+                      "    L0::L1::L2::L3::L4::Leaf.new\n"
+                      "  end\n"
+                      "  def rooted\n"
+                      "    ::Top::Inner.new\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(require_resolved_exact(r, "test.main.Caller.deep", "test.main.L0.L1.L2.L3.L4.Leaf") >=
+           0);
+    ASSERT(require_resolved_exact(r, "test.main.Caller.rooted", "test.main.Top.Inner") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── suite ──────────────────────────────────────────────────────── */
 
 void suite_ruby_lsp(void) {
@@ -1467,4 +1535,5 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
     RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
     RUN_TEST(rubylsp_mixin_walk_visits_each_module_once);
+    RUN_TEST(rubylsp_const_path_is_linear);
 }

@@ -114,10 +114,52 @@ static char *ruby_node_text(RubyLSPContext *ctx, TSNode node) {
     return cbm_node_text(ctx->arena, node, ctx->source);
 }
 
+/* Byte length of a node's source text (0 for an empty node). */
+static size_t ruby_node_len(TSNode node) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    return end > start ? (size_t)(end - start) : 0;
+}
+
+/* One step left along a constant path. `*cur` is a scope_resolution whose
+ * own segment has been taken; on success `*seg` is the next segment to its
+ * left and `*cur` the node to continue from. The path ends at a missing
+ * scope (`::Foo`), at a scope that is not a constant path (`expr::Foo`),
+ * and at an empty segment. A plain `constant` has no scope field, so it is
+ * always the last segment. */
+static bool ruby_const_step(TSNode *cur, TSNode *seg) {
+    TSNode scope = ts_node_child_by_field_name(*cur, "scope", 5);
+    if (ts_node_is_null(scope))
+        return false;
+    const char *k = ts_node_type(scope);
+    if (strcmp(k, "constant") == 0) {
+        if (ruby_node_len(scope) == 0)
+            return false;
+        *seg = scope;
+        *cur = scope;
+        return true;
+    }
+    if (strcmp(k, "scope_resolution") != 0)
+        return false;
+    TSNode name = ts_node_child_by_field_name(scope, "name", 4);
+    if (ts_node_is_null(name) || ruby_node_len(name) == 0)
+        return false;
+    *seg = name;
+    *cur = scope;
+    return true;
+}
+
 /* Convert a constant expression node (constant | scope_resolution) into a
  * dotted path ("Foo", "A.B.C"). Returns NULL for anything else. A leading
  * "::Foo" (scope_resolution without a scope) yields "Foo" — the resolver's
- * table probe covers the top-level meaning. */
+ * table probe covers the top-level meaning. A scope that is not itself a
+ * constant path (`expr::Foo`) contributes nothing.
+ *
+ * `A::B::C` nests to the LEFT (scope_resolution(scope_resolution(A, B), C)),
+ * so the path is read from the outermost node along the `scope` fields: one
+ * pass measures the segments, a second copies them right to left into one
+ * buffer. No recursion and no re-formatting of a growing prefix, so neither
+ * stack depth nor bytes grow faster than the path itself. */
 static const char *ruby_const_path(RubyLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return NULL;
@@ -126,19 +168,32 @@ static const char *ruby_const_path(RubyLSPContext *ctx, TSNode node) {
         return ruby_node_text(ctx, node);
     if (strcmp(k, "scope_resolution") != 0)
         return NULL;
-    TSNode scope = ts_node_child_by_field_name(node, "scope", 5);
     TSNode name = ts_node_child_by_field_name(node, "name", 4);
-    if (ts_node_is_null(name))
+    if (ts_node_is_null(name) || ruby_node_len(name) == 0)
         return NULL;
-    char *nm = ruby_node_text(ctx, name);
-    if (!nm || !nm[0])
+
+    size_t total = 0;
+    TSNode cur = node;
+    TSNode seg = name;
+    do {
+        total += ruby_node_len(seg) + 1; /* segment + its '.' (or the NUL) */
+    } while (ruby_const_step(&cur, &seg));
+
+    char *out = (char *)cbm_arena_alloc(ctx->arena, total);
+    if (!out)
         return NULL;
-    if (ts_node_is_null(scope))
-        return nm; /* ::Foo */
-    const char *sp = ruby_const_path(ctx, scope);
-    if (!sp || !sp[0])
-        return nm;
-    return cbm_arena_sprintf(ctx->arena, "%s.%s", sp, nm);
+    size_t pos = total - 1;
+    out[pos] = '\0';
+    cur = node;
+    seg = name;
+    do {
+        size_t len = ruby_node_len(seg);
+        pos -= len;
+        memcpy(out + pos, ctx->source + ts_node_start_byte(seg), len);
+        if (pos > 0)
+            out[--pos] = '.';
+    } while (ruby_const_step(&cur, &seg));
+    return out;
 }
 
 /* Join two dotted path fragments; either side may be empty/NULL. */
