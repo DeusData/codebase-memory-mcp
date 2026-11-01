@@ -386,19 +386,30 @@ TEST(resolver_stabilization_go_three_package_alias_chain_and_registration_order)
     PASS();
 }
 
-TEST(resolver_stabilization_go_unknown_flow_and_shadowing_do_not_borrow_old_bindings) {
-    const char *bodies[] = {
-        "func Run() { f:=bridge.Make(); p:=f.New(); q:=p; if flag { q=nil }; q.Send() }\n",
-        "func Run() { f:=bridge.Make(); p:=f.New(); q:=p; { q:=unknown(); _=q }; q.Send() }\n",
-        "func Run() { f:=bridge.Make(); p:=f.New(); q:=p; q=nil; q.Send() }\n"};
-    for (size_t variant = 0; variant < sizeof(bodies) / sizeof(bodies[0]); variant++) {
+/* q's static type is fixed by q := p. `q = nil` compiles only because that type admits nil,
+ * and no branch can change it, so these select Client.Send. This test used to pin abstention
+ * for the first and third bodies, treating a Go local as flow-sensitive. Only a value the
+ * declaration itself cannot type stays unknown. */
+TEST(resolver_stabilization_go_static_type_survives_flow_and_unknown_stays_unknown) {
+    const struct {
+        const char *body;
+        bool admitted;
+    } cases[] = {
+        {"func Run() { f:=bridge.Make(); p:=f.New(); q:=p; if flag { q=nil }; q.Send() }\n", true},
+        {"func Run() { f:=bridge.Make(); p:=f.New(); q:=p; { q:=unknown(); _=q }; q.Send() }\n",
+         true},
+        {"func Run() { f:=bridge.Make(); p:=f.New(); q:=p; q=nil; q.Send() }\n", true},
+        {"func Run() { q:=unknown(); q.Send() }\n", false},
+        {"func Run() { f:=bridge.Make(); q:=f.New(); { q:=unknown(); q.Send() } }\n", false},
+    };
+    for (size_t variant = 0; variant < sizeof(cases) / sizeof(cases[0]); variant++) {
         stabilization_t f;
         initialize(&f, (cbm_resolve_solver_limits_t){0});
         cbm_go_stabilization_t *state = cbm_go_stabilization_new(&f.arena, &f.proofs, f.solver);
         ASSERT_NOT_NULL(state);
         char source[512];
         snprintf(source, sizeof(source), "package app\nimport \"example/bridge\"\n%s",
-                 bodies[variant]);
+                 cases[variant].body);
         ASSERT(collect_fixture(state, "api/types.go", "test.api", API, NULL, NULL));
         ASSERT(collect_fixture(state, "bridge/make.go", "test.bridge", BRIDGE, "api", "test.api"));
         ASSERT(collect_fixture(state, "app/main.go", "test.app", source, "bridge", "test.bridge"));
@@ -408,8 +419,10 @@ TEST(resolver_stabilization_go_unknown_flow_and_shadowing_do_not_borrow_old_bind
         cbm_resolve_result_t result;
         ASSERT(
             fixture_resolution(state, "app/main.go", source, "test.app.Run", "q.Send()", &result));
-        ASSERT_EQ(cbm_resolve_admit(&result), variant == 1);
-        if (variant != 1)
+        ASSERT_EQ(cbm_resolve_admit(&result), cases[variant].admitted);
+        if (cases[variant].admitted)
+            ASSERT_STR_EQ(result.target, "test.api.Client.Send");
+        else
             ASSERT_NULL(result.target);
         cbm_go_stabilization_dispose(state);
         cbm_arena_destroy(&f.arena);
@@ -896,6 +909,719 @@ static int index_fixture(const char *repo, const char *database, bool parallel) 
     free(old_single);
     return rc;
 }
+/* What one call site selects in a one-package fixture; expected NULL means abstention. */
+static bool go_selects(const char *source, const char *scope, const char *anchor,
+                       const char *expected) {
+    stabilization_t f;
+    initialize(&f, (cbm_resolve_solver_limits_t){0});
+    cbm_go_stabilization_t *state = cbm_go_stabilization_new(&f.arena, &f.proofs, f.solver);
+    bool ok = state && collect_fixture(state, "api/types.go", "test.api", source, NULL, NULL) &&
+              cbm_go_stabilization_register(state) && cbm_resolve_solver_solve(f.solver) &&
+              cbm_go_stabilization_seal(state);
+    cbm_resolve_result_t result = {0};
+    bool controlled =
+        ok && fixture_resolution(state, "api/types.go", source, scope, anchor, &result);
+    bool admitted = controlled && cbm_resolve_admit(&result);
+    bool right = controlled && (expected ? admitted && result.target &&
+                                               !strcmp(result.target, expected)
+                                         : !admitted && !result.target);
+    if (!right)
+        fprintf(stderr, "go_selects: %s at %s: setup=%d controlled=%d target=%s expected=%s\n",
+                anchor, scope, ok, controlled, result.target ? result.target : "<none>",
+                expected ? expected : "<abstain>");
+    cbm_go_stabilization_dispose(state);
+    cbm_arena_destroy(&f.arena);
+    return right;
+}
+
+#define GO_TWO_TYPES                     \
+    "package api\n"                      \
+    "type A struct{}\nfunc (A) M() {}\n" \
+    "type B struct{}\nfunc (B) M() {}\nfunc (B) N() {}\n"
+
+/* client-go: `if err != nil { return }` and friends surround nearly every call. */
+TEST(resolver_stabilization_go_calls_in_every_statement_form_are_visited) {
+    const char *source = GO_TWO_TYPES
+        "func New() *A { return nil }\n"
+        "func F(flag bool, xs []int, ch chan int) {\n"
+        "  x := New()\n"
+        "  if flag { x = nil; x.M(/*if*/) }\n"
+        "  for range xs { x.M(/*for*/) }\n"
+        "  switch { case flag: x.M(/*switch*/); default: x.M(/*default*/) }\n"
+        "  select { case <-ch: x.M(/*select*/) }\n"
+        "  go func() { x.M(/*closure*/) }()\n"
+        "  defer x.M(/*defer*/)\n"
+        "L:\n  for { x.M(/*label*/); break L }\n"
+        "  x.M(/*after*/)\n"
+        "}\n";
+    const char *anchors[] = {"x.M(/*if*/",      "x.M(/*for*/",     "x.M(/*switch*/",
+                             "x.M(/*default*/", "x.M(/*select*/",  "x.M(/*closure*/",
+                             "x.M(/*defer*/",   "x.M(/*label*/",   "x.M(/*after*/"};
+    for (size_t i = 0; i < sizeof(anchors) / sizeof(anchors[0]); i++)
+        ASSERT(go_selects(source, "test.api.F", anchors[i], "test.api.A.M"));
+    PASS();
+}
+
+/* Frames still decide which variable a name means. */
+TEST(resolver_stabilization_go_block_frames_shadow_exactly) {
+    const char *source = GO_TWO_TYPES
+        "func New() *A { return nil }\n"
+        "func F(flag bool) {\n"
+        "  x := New()\n"
+        "  if x := (B{}); flag { x.M(/*init*/) }\n"
+        "  { x := B{}; x.M(/*block*/) }\n"
+        "  x.M(/*outer*/)\n"
+        "  for x := range []B{} { _ = x }\n"
+        "  x.M(/*after*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "x.M(/*init*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "x.M(/*block*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "x.M(/*outer*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "x.M(/*after*/", "test.api.A.M"));
+    PASS();
+}
+
+TEST(resolver_stabilization_go_tuple_results_bind_by_position) {
+    const char *source = GO_TWO_TYPES
+        "func Pair() (*A, *B) { return nil, nil }\n"
+        "func Named() (x, y A, z B) { return }\n"
+        "func Run() {\n"
+        "  a, b := Pair()\n"
+        "  a.M(/*first*/)\n"
+        "  b.M(/*second*/)\n"
+        "  _, q, r := Named()\n"
+        "  q.M(/*grouped*/)\n"
+        "  r.M(/*third*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.Run", "a.M(/*first*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.Run", "b.M(/*second*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.Run", "q.M(/*grouped*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.Run", "r.M(/*third*/", "test.api.B.M"));
+    PASS();
+}
+
+/* client-go informers: f.factory.InformerFor(...), c.client.Put().Name(...). */
+TEST(resolver_stabilization_go_field_chains_follow_declared_field_types) {
+    const char *source = GO_TWO_TYPES
+        "type H struct {\n"
+        "  impl *A\n"
+        "  left, right B\n"
+        "  next *H\n"
+        "  call func() int\n"
+        "}\n"
+        "func (h *H) Self() *H { return h }\n"
+        "func F(h *H) {\n"
+        "  h.impl.M(/*field*/)\n"
+        "  h.right.N(/*grouped*/)\n"
+        "  h.next.next.impl.M(/*deep*/)\n"
+        "  h.Self().impl.M(/*through-call*/)\n"
+        "  h.call(/*func-field*/)\n"
+        "  h.absent.M(/*absent*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "h.impl.M(/*field*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "h.right.N(/*grouped*/", "test.api.B.N"));
+    ASSERT(go_selects(source, "test.api.F", "h.next.next.impl.M(/*deep*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "h.Self().impl.M(/*through-call*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "h.call(/*func-field*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "h.absent.M(/*absent*/", NULL));
+    PASS();
+}
+
+/* CALLS names the interface method a static type selects, whatever implements it. */
+TEST(resolver_stabilization_go_interface_methods_are_their_own_declarations) {
+    const char *source = GO_TWO_TYPES
+        "type I interface {\n  M()\n  Sub() J\n}\n"
+        "type J interface {\n  N()\n}\n"
+        "type Both interface {\n  I\n  J\n  Own()\n}\n"
+        "func Make() I { return nil }\n"
+        "func F(i I, b Both) {\n"
+        "  i.M(/*direct*/)\n"
+        "  i.Sub().N(/*chain*/)\n"
+        "  Make().M(/*result*/)\n"
+        "  b.M(/*embedded*/)\n"
+        "  b.N(/*embedded-j*/)\n"
+        "  b.Own(/*own*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "i.M(/*direct*/", "test.api.I.M"));
+    ASSERT(go_selects(source, "test.api.F", "i.Sub().N(/*chain*/", "test.api.J.N"));
+    ASSERT(go_selects(source, "test.api.F", "Make().M(/*result*/", "test.api.I.M"));
+    ASSERT(go_selects(source, "test.api.F", "b.M(/*embedded*/", "test.api.I.M"));
+    ASSERT(go_selects(source, "test.api.F", "b.N(/*embedded-j*/", "test.api.J.N"));
+    ASSERT(go_selects(source, "test.api.F", "b.Own(/*own*/", "test.api.Both.Own"));
+    PASS();
+}
+
+/* The shallowest depth holding a name decides; two holders at that depth is illegal Go. */
+TEST(resolver_stabilization_go_embedding_follows_the_selector_rule) {
+    const char *source =
+        "package api\n"
+        "type In struct{}\nfunc (*In) Ptr() {}\nfunc (In) Val() {}\nfunc (In) Deep() {}\n"
+        "type Mid struct{ In }\nfunc (Mid) Deep() {}\n"
+        "type Out struct {\n  *Mid\n  Other\n}\n"
+        "type Other struct{}\nfunc (Other) Twin() {}\nfunc (Other) Own() {}\n"
+        "type Second struct{}\nfunc (Second) Twin() {}\n"
+        "type Both struct {\n  Other\n  Second\n}\n"
+        "type Shadow struct {\n  In\n  Val func()\n}\n"
+        "func F(o Out, b Both, s Shadow, m *Mid) {\n"
+        "  o.Ptr(/*depth2*/)\n"
+        "  o.Val(/*depth2-val*/)\n"
+        "  o.Deep(/*shallow-wins*/)\n"
+        "  o.Own(/*depth1*/)\n"
+        "  b.Twin(/*two-holders*/)\n"
+        "  s.Val(/*field-shadows*/)\n"
+        "  s.Deep(/*beside-field*/)\n"
+        "  m.Ptr(/*through-pointer*/)\n"
+        "  o.Mid.Deep(/*named-embed*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "o.Ptr(/*depth2*/", "test.api.In.Ptr"));
+    ASSERT(go_selects(source, "test.api.F", "o.Val(/*depth2-val*/", "test.api.In.Val"));
+    ASSERT(go_selects(source, "test.api.F", "o.Deep(/*shallow-wins*/", "test.api.Mid.Deep"));
+    ASSERT(go_selects(source, "test.api.F", "o.Own(/*depth1*/", "test.api.Other.Own"));
+    ASSERT(go_selects(source, "test.api.F", "b.Twin(/*two-holders*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "s.Val(/*field-shadows*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "s.Deep(/*beside-field*/", "test.api.In.Deep"));
+    ASSERT(go_selects(source, "test.api.F", "m.Ptr(/*through-pointer*/", "test.api.In.Ptr"));
+    ASSERT(go_selects(source, "test.api.F", "o.Mid.Deep(/*named-embed*/", "test.api.Mid.Deep"));
+    PASS();
+}
+
+/* An embedded type we cannot enumerate might hold the name at its own depth, so only what is
+ * declared directly stays proved. Mirrors `struct { sync.Mutex; Inner }`. */
+TEST(resolver_stabilization_go_open_embedded_type_blocks_promotion) {
+    const char *source = "package api\n"
+                         "type In struct{}\nfunc (In) Val() {}\n"
+                         "type Open struct {\n  Undeclared\n  In\n}\nfunc (Open) Own() {}\n"
+                         "func F(o Open) {\n"
+                         "  o.Val(/*blocked*/)\n"
+                         "  o.Own(/*direct*/)\n"
+                         "}\n";
+    ASSERT(go_selects(source, "test.api.F", "o.Val(/*blocked*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "o.Own(/*direct*/", "test.api.Open.Own"));
+    PASS();
+}
+
+TEST(resolver_stabilization_go_range_index_and_channel_yield_their_element) {
+    const char *source = GO_TWO_TYPES
+        "type List []A\n"
+        "type Table map[string]B\n"
+        "type Struct struct{}\n"
+        "func F(xs []*A, m map[string]B, ch chan A, p **A, l List, t Table, s Struct) {\n"
+        "  for _, v := range xs { v.M(/*slice*/) }\n"
+        "  for k, v := range m { k.M(/*map-key*/); v.M(/*map-value*/) }\n"
+        "  for i := range xs { i.M(/*index*/) }\n"
+        "  xs[0].M(/*indexed*/)\n"
+        "  m[\"a\"].M(/*keyed*/)\n"
+        "  (*p).M(/*deref*/)\n"
+        "  e := <-ch\n"
+        "  e.M(/*received*/)\n"
+        "  for _, v := range l { v.M(/*named-slice*/) }\n"
+        "  e2 := t[\"a\"]\n"
+        "  e2.M(/*named-index*/)\n"
+        "  s[0].M(/*struct-index*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "v.M(/*slice*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "k.M(/*map-key*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "v.M(/*map-value*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "i.M(/*index*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "xs[0].M(/*indexed*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "m[\"a\"].M(/*keyed*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "(*p).M(/*deref*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "e.M(/*received*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "v.M(/*named-slice*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "e2.M(/*named-index*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "s[0].M(/*struct-index*/", NULL));
+    PASS();
+}
+
+/* The written type decides. One spelled alias binds once per clause, so each clause must get
+ * its own type: an earlier version of this rule gave every clause the first one. */
+TEST(resolver_stabilization_go_assertions_and_type_switch_clauses_use_the_written_type) {
+    const char *source = GO_TWO_TYPES
+        "func F(v interface{}) {\n"
+        "  i := v.(*A)\n"
+        "  i.M(/*assert*/)\n"
+        "  if j, ok := v.(B); ok { j.M(/*comma-ok*/); ok.M(/*ok*/) }\n"
+        "  v.(*A).M(/*inline*/)\n"
+        "  switch t := v.(type) {\n"
+        "  case *A:\n    t.M(/*case-a*/)\n"
+        "  case B:\n    t.M(/*case-b*/)\n"
+        "  case int, string:\n    t.M(/*case-two*/)\n"
+        "  default:\n    t.M(/*case-default*/)\n"
+        "  }\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "i.M(/*assert*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "j.M(/*comma-ok*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "ok.M(/*ok*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "v.(*A).M(/*inline*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "t.M(/*case-a*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "t.M(/*case-b*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "t.M(/*case-two*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "t.M(/*case-default*/", NULL));
+    PASS();
+}
+
+TEST(resolver_stabilization_go_literals_new_make_and_conversions_are_typed) {
+    const char *source = GO_TWO_TYPES
+        "type S string\nfunc (S) Up() {}\n"
+        "func F(raw string) {\n"
+        "  a := &A{}\n"
+        "  a.M(/*address*/)\n"
+        "  b := new(B)\n"
+        "  b.M(/*new*/)\n"
+        "  c := make([]A, 1)\n"
+        "  c[0].M(/*make*/)\n"
+        "  S(raw).Up(/*convert*/)\n"
+        "  (*A)(nil).M(/*convert-pointer*/)\n"
+        "}\n"
+        "func G() {\n"
+        "  new := func(n int) *B { return nil }\n"
+        "  z := new(1)\n"
+        "  z.M(/*shadowed-new*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "a.M(/*address*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "b.M(/*new*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "c[0].M(/*make*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "S(raw).Up(/*convert*/", "test.api.S.Up"));
+    ASSERT(go_selects(source, "test.api.F", "(*A)(nil).M(/*convert-pointer*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.G", "z.M(/*shadowed-new*/", NULL));
+    PASS();
+}
+
+TEST(resolver_stabilization_go_package_variables_have_their_declared_type) {
+    const char *source = GO_TWO_TYPES
+        "func New() *A { return nil }\n"
+        "var Default = New()\n"
+        "var Typed *B\n"
+        "var first, second = New(), B{}\n"
+        "func F() {\n"
+        "  Default.M(/*inferred*/)\n"
+        "  Typed.M(/*annotated*/)\n"
+        "  second.M(/*position*/)\n"
+        "  Missing.M(/*undeclared*/)\n"
+        "}\n"
+        "func G() {\n"
+        "  Default := B{}\n"
+        "  Default.M(/*shadowed*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "Default.M(/*inferred*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "Typed.M(/*annotated*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "second.M(/*position*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "Missing.M(/*undeclared*/", NULL));
+    ASSERT(go_selects(source, "test.api.G", "Default.M(/*shadowed*/", "test.api.B.M"));
+    PASS();
+}
+
+/* A defined type's method set is its own whatever the underlying type. */
+TEST(resolver_stabilization_go_defined_non_struct_types_have_method_sets) {
+    const char *source = "package api\n"
+                         "type bits []uint64\nfunc (b bits) Set(i int) {}\n"
+                         "type Fn func(int) int\nfunc (f Fn) Call(i int) int { return f(i) }\n"
+                         "type other struct{}\nfunc (o other) Set(i int) {}\n"
+                         "type Set = bits\n"
+                         "func Make() Set { return nil }\n"
+                         "func F(b bits, f Fn) {\n"
+                         "  b.Set(1)\n"
+                         "  f.Call(1)\n"
+                         "  a := Make()\n"
+                         "  a.Set(2)\n"
+                         "}\n";
+    ASSERT(go_selects(source, "test.api.F", "b.Set(1)", "test.api.bits.Set"));
+    ASSERT(go_selects(source, "test.api.F", "f.Call(1)", "test.api.Fn.Call"));
+    ASSERT(go_selects(source, "test.api.F", "a.Set(2)", "test.api.bits.Set"));
+    PASS();
+}
+
+TEST(resolver_stabilization_go_generic_declarations_keep_their_method_sets) {
+    const char *source = "package api\n"
+                         "type T struct{}\nfunc (T) M() {}\n"
+                         "type Box[E any] struct{ V E }\n"
+                         "func (b *Box[E]) Get() E { return b.V }\n"
+                         "func NewBox[E any]() *Box[E] { return nil }\n"
+                         "func F() {\n"
+                         "  var c Box[int]\n"
+                         "  c.Get(/*annotated*/)\n"
+                         "  d := NewBox[int]()\n"
+                         "  d.Get(/*returned*/)\n"
+                         "  c.V.M(/*parameter-field*/)\n"
+                         "}\n";
+    ASSERT(go_selects(source, "test.api.F", "c.Get(/*annotated*/", "test.api.Box.Get"));
+    ASSERT(go_selects(source, "test.api.F", "d.Get(/*returned*/", "test.api.Box.Get"));
+    ASSERT(go_selects(source, "test.api.F", "c.V.M(/*parameter-field*/", NULL));
+    PASS();
+}
+
+/* Build-tag twins are one graph node, so one selection whichever file a build compiles. Their
+ * results are a separate question: only agreeing twins type a value. */
+TEST(resolver_stabilization_go_build_tag_twins_are_one_target_but_results_must_agree) {
+    const char *linux_file = "package api\n"
+                             "type A struct{}\nfunc (A) M() {}\n"
+                             "type B struct{}\nfunc (B) M() {}\n"
+                             "func work() A { return A{} }\n"
+                             "func same() A { return A{} }\n";
+    const char *windows_file = "package api\n"
+                               "func work() B { return B{} }\n"
+                               "func same() A { return A{} }\n";
+    const char *use = "package api\n"
+                      "func F() {\n"
+                      "  work(/*twin*/)\n"
+                      "  work(/*differ*/).M()\n"
+                      "  same(/*agree*/).M()\n"
+                      "}\n";
+    stabilization_t f;
+    initialize(&f, (cbm_resolve_solver_limits_t){0});
+    cbm_go_stabilization_t *state = cbm_go_stabilization_new(&f.arena, &f.proofs, f.solver);
+    ASSERT_NOT_NULL(state);
+    ASSERT(collect_fixture(state, "api/a_linux.go", "test.api", linux_file, NULL, NULL));
+    ASSERT(collect_fixture(state, "api/a_windows.go", "test.api", windows_file, NULL, NULL));
+    ASSERT(collect_fixture(state, "api/use.go", "test.api", use, NULL, NULL));
+    ASSERT(cbm_go_stabilization_register(state));
+    ASSERT(cbm_resolve_solver_solve(f.solver));
+    ASSERT(cbm_go_stabilization_seal(state));
+    cbm_resolve_result_t result;
+    ASSERT(fixture_resolution(state, "api/use.go", use, "test.api.F", "work(/*twin*/", &result));
+    ASSERT(cbm_resolve_admit(&result));
+    ASSERT_STR_EQ(result.target, "test.api.work");
+    ASSERT(fixture_resolution(state, "api/use.go", use, "test.api.F", "work(/*differ*/).M",
+                              &result));
+    ASSERT(!cbm_resolve_admit(&result));
+    ASSERT(fixture_resolution(state, "api/use.go", use, "test.api.F", "same(/*agree*/).M", &result));
+    ASSERT(cbm_resolve_admit(&result));
+    ASSERT_STR_EQ(result.target, "test.api.A.M");
+    cbm_go_stabilization_dispose(state);
+    cbm_arena_destroy(&f.arena);
+    PASS();
+}
+
+/* Imported package variables and the qualified forms of the rules above. */
+TEST(resolver_stabilization_go_imported_members_keep_their_package_identity) {
+    const char *library = "package lib\n"
+                          "type Impl struct{ Inner }\nfunc (i *Impl) Close() {}\n"
+                          "type Inner struct{ hidden *Impl }\nfunc (i Inner) Touch() {}\n"
+                          "var Default = &Impl{}\n"
+                          "var private = &Impl{}\n";
+    const char *use = "package app\nimport \"example/lib\"\n"
+                      "type holder struct{ lib.Inner }\n"
+                      "func F(h holder) {\n"
+                      "  lib.Default.Close(/*var*/)\n"
+                      "  lib.Default.Touch(/*promoted*/)\n"
+                      "  h.Touch(/*embedded-import*/)\n"
+                      "  lib.private.Close(/*private-var*/)\n"
+                      "  h.hidden.Close(/*private-field*/)\n"
+                      "}\n";
+    stabilization_t f;
+    initialize(&f, (cbm_resolve_solver_limits_t){0});
+    cbm_go_stabilization_t *state = cbm_go_stabilization_new(&f.arena, &f.proofs, f.solver);
+    ASSERT_NOT_NULL(state);
+    ASSERT(collect_fixture(state, "lib/lib.go", "test.lib", library, NULL, NULL));
+    ASSERT(collect_fixture(state, "app/use.go", "test.app", use, "lib", "test.lib"));
+    ASSERT(cbm_go_stabilization_register(state));
+    ASSERT(cbm_resolve_solver_solve(f.solver));
+    ASSERT(cbm_go_stabilization_seal(state));
+    cbm_resolve_result_t result;
+    ASSERT(fixture_resolution(state, "app/use.go", use, "test.app.F", "lib.Default.Close(/*var*/",
+                              &result));
+    ASSERT(cbm_resolve_admit(&result));
+    ASSERT_STR_EQ(result.target, "test.lib.Impl.Close");
+    ASSERT(fixture_resolution(state, "app/use.go", use, "test.app.F",
+                              "lib.Default.Touch(/*promoted*/", &result));
+    ASSERT(cbm_resolve_admit(&result));
+    ASSERT_STR_EQ(result.target, "test.lib.Inner.Touch");
+    ASSERT(fixture_resolution(state, "app/use.go", use, "test.app.F", "h.Touch(/*embedded-import*/",
+                              &result));
+    ASSERT(cbm_resolve_admit(&result));
+    ASSERT_STR_EQ(result.target, "test.lib.Inner.Touch");
+    /* Lower-case names do not cross a package boundary, so neither may bind. */
+    ASSERT(fixture_resolution(state, "app/use.go", use, "test.app.F",
+                              "h.hidden.Close(/*private-field*/", &result));
+    ASSERT(!cbm_resolve_admit(&result));
+    cbm_go_stabilization_dispose(state);
+    cbm_arena_destroy(&f.arena);
+    PASS();
+}
+
+/* Go 1.26's new(40) is a parse error to this grammar: one literal in one test table used to
+ * take every function in its file out of the fixed point. */
+TEST(resolver_stabilization_go_syntax_error_costs_only_its_own_declaration) {
+    const char *source = "package api\n"
+                         "type T struct{}\nfunc (T) M() {}\n"
+                         "func Broken() {\n  x := (\n  x.M()\n}\n"
+                         "func Good(t T) { t.M() }\n";
+    ASSERT(go_selects(source, "test.api.Good", "t.M()", "test.api.T.M"));
+    PASS();
+}
+
+static int go_import_admitted(const char *root, const char *source, const char *rel,
+                              const char *folder_qn, const char *folder_path, const char *import,
+                              const char *target) {
+    CBMFileResult *parsed =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_GO, "test", rel, 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new("test", root);
+    if (!parsed || !graph)
+        return -1;
+    char *file_qn = cbm_pipeline_fqn_compute("test", rel, "__file__");
+    cbm_gbuf_upsert_node(graph, "File", rel, file_qn, rel, 1, 3, "{}");
+    cbm_gbuf_upsert_node(graph, "Folder", folder_path, folder_qn, folder_path, 0, 0, "{}");
+    CBMHashTable *map = cbm_ht_create(16);
+    cbm_ht_set(map, import, (void *)target);
+    CBMHashTable *saved = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(map);
+    cbm_pipeline_ctx_t pipeline = {.project_name = "test", .repo_path = root, .gbuf = graph};
+    bool captured = cbm_pipeline_capture_go_imports(&pipeline, rel, parsed);
+    cbm_pipeline_set_pkgmap(saved);
+    const cbm_resolve_import_snapshot_t *imports = captured ? cbm_gbuf_imports(graph, rel) : NULL;
+    int admitted = -1;
+    if (imports && imports->count == 1) {
+        admitted = cbm_resolve_admit(&imports->items[0].dependency) ? 1 : 0;
+        if (admitted && strcmp(imports->items[0].dependency.target, folder_qn))
+            admitted = -2;
+    }
+    cbm_ht_free(map);
+    cbm_gbuf_free(graph);
+    cbm_free_result(parsed);
+    free(file_qn);
+    return admitted;
+}
+
+/* kubernetes keeps its modules in one tree and binds them with replace directives. A module's
+ * own go.mod names exactly one directory for that path, so the import is proved. Another
+ * directory that merely declares the same module path, or an import with no directive, comes
+ * from the module cache and stays unproven. */
+TEST(resolver_stabilization_go_replace_directive_proves_a_sibling_module) {
+    const char *root = th_mktempdir("cbm_go_replace");
+    ASSERT_NOT_NULL(root);
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "staging/client/rest"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "staging/api/core"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "staging/other"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "decoy/api/core"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(root, "staging/client/go.mod"),
+                            "module k8s.io/client\n\ngo 1.22\n\n"
+                            "require k8s.io/api v0.0.0\n\n"
+                            "replace (\n"
+                            "\tk8s.io/api => ../api\n"
+                            "\tk8s.io/versioned v1.2.3 => ../versioned // pinned\n"
+                            "\tk8s.io/remote => github.com/fork/remote v1.0.0\n"
+                            ")\n"
+                            "replace k8s.io/single => ../other\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "staging/api/go.mod"), "module k8s.io/api\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "staging/other/go.mod"), "module k8s.io/single\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "decoy/api/go.mod"), "module k8s.io/api\n"), 0);
+    const char *source = "package rest\nimport \"k8s.io/api/core\"\nfunc Run(){core.Make()}\n";
+    const char *rel = "staging/client/rest/main.go";
+    ASSERT_EQ(th_write_file(TH_PATH(root, rel), source), 0);
+    ASSERT_EQ(go_import_admitted(root, source, rel, "test.staging.api.core", "staging/api/core",
+                                 "k8s.io/api/core", "test.staging.api.core"),
+              1);
+    /* The directive names staging/api; a decoy module of the same name is not that directory. */
+    ASSERT_EQ(go_import_admitted(root, source, rel, "test.decoy.api.core", "decoy/api/core",
+                                 "k8s.io/api/core", "test.decoy.api.core"),
+              0);
+    const char *single = "package rest\nimport \"k8s.io/single\"\nfunc Run(){single.Make()}\n";
+    ASSERT_EQ(go_import_admitted(root, single, rel, "test.staging.other", "staging/other",
+                                 "k8s.io/single", "test.staging.other"),
+              1);
+    /* A replacement that names another module's source is that module, not a local path. */
+    const char *remote = "package rest\nimport \"k8s.io/remote\"\nfunc Run(){remote.Make()}\n";
+    ASSERT_EQ(go_import_admitted(root, remote, rel, "test.staging.other", "staging/other",
+                                 "k8s.io/remote", "test.staging.other"),
+              0);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(resolver_stabilization_go_workspace_use_proves_a_listed_module) {
+    const char *root = th_mktempdir("cbm_go_workspace");
+    ASSERT_NOT_NULL(root);
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "app/cmd"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "lib/util"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(root, "unlisted/util"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(root, "go.work"),
+                            "go 1.22\n\nuse (\n\t./app\n\t./lib // shared\n)\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "app/go.mod"), "module example/app\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "lib/go.mod"), "module example/lib\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "unlisted/go.mod"), "module example/unlisted\n"), 0);
+    const char *rel = "app/cmd/main.go";
+    const char *listed = "package cmd\nimport \"example/lib/util\"\nfunc Run(){util.Make()}\n";
+    ASSERT_EQ(th_write_file(TH_PATH(root, rel), listed), 0);
+    ASSERT_EQ(go_import_admitted(root, listed, rel, "test.lib.util", "lib/util", "example/lib/util",
+                                 "test.lib.util"),
+              1);
+    const char *unlisted =
+        "package cmd\nimport \"example/unlisted/util\"\nfunc Run(){util.Make()}\n";
+    ASSERT_EQ(go_import_admitted(root, unlisted, rel, "test.unlisted.util", "unlisted/util",
+                                 "example/unlisted/util", "test.unlisted.util"),
+              0);
+    th_rmtree(root);
+    PASS();
+}
+
+static int count_edge_between(sqlite3 *db, const char *relation, const char *source,
+                              const char *target) {
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+             "JOIN nodes t ON t.id=e.target_id WHERE e.type='%s' AND s.qualified_name='%s' "
+             "AND t.qualified_name='%s'",
+             relation, source, target);
+    return scalar(db, sql);
+}
+
+/* Build-tag twins through the real pipeline, both routes: an occurrence in either twin belongs
+ * to the one node (graph_buffer.c: "edges are the union of every variant's body"), and a
+ * package-level initializer belongs to its file, since the package's QN is a shared Folder. */
+static int go_twins_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_go_twins");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "pkg"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "other"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example\ngo 1.22\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/a_linux.go"),
+                            "package pkg\n\nfunc forLinux() int { return 1 }\n\n"
+                            "func work() int { return forLinux() }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/a_windows.go"),
+                            "package pkg\n\nfunc forWindows() int { return 2 }\n\n"
+                            "func work() int { return forWindows() }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "pkg/use.go"),
+                            "package pkg\n\nvar Level = work()\n\n"
+                            "func Use() int { return work() }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "other/other.go"),
+                            "package other\n\nfunc work() int { return 3 }\n"),
+              0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Use", "test.pkg.work"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.work", "test.pkg.forLinux"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.work", "test.pkg.forWindows"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.use.go.__file__", "test.pkg.work"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg.Use", "test.other.work"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.pkg", "test.pkg.work"), 0);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+static int go_references_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_go_references");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "lib"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "app"), 0755));
+    ASSERT(cbm_mkdir_p(TH_PATH(repo, "mount-utils"), 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example\ngo 1.22\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "lib/lib.go"),
+                            "package lib\n\n"
+                            "type Impl struct {\n\tName string\n\tcount int\n}\n\n"
+                            "type Getter interface {\n\tGet() string\n}\n\n"
+                            "var Default = &Impl{}\n\n"
+                            "const Limit = 3\n\n"
+                            "func Helper() int { return Limit }\n"),
+              0);
+    /* The directory is mount-utils; the package it declares is mount. */
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "mount-utils/mount.go"),
+                            "package mount\n\n"
+                            "type Mounter struct{}\n\n"
+                            "func New() *Mounter { return nil }\n\n"
+                            "func (m *Mounter) Run() {}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "app/app.go"),
+                            "package app\n\n"
+                            "import (\n\t\"example/lib\"\n\t\"example/mount-utils\"\n)\n\n"
+                            "var Limit = 9\n\nvar Name = \"package\"\n\n"
+                            "func Reads(i *lib.Impl) int {\n"
+                            "\t_ = i.Name\n"
+                            "\treturn lib.Limit\n"
+                            "}\n\n"
+                            "func Writes(i *lib.Impl) {\n"
+                            "\ti.Name = \"x\"\n"
+                            "\tName = \"y\"\n"
+                            "}\n\n"
+                            "func Types(g []lib.Getter, m map[string]*lib.Impl) *lib.Impl {\n"
+                            "\treturn nil\n"
+                            "}\n\n"
+                            "func Shadowed(Limit int) int {\n"
+                            "\treturn Limit\n"
+                            "}\n\n"
+                            "func LocalWrite() {\n"
+                            "\tName := 1\n"
+                            "\tName = 2\n"
+                            "\t_ = Name\n"
+                            "}\n\n"
+                            "func Literal() lib.Impl {\n"
+                            "\treturn lib.Impl{Name: \"key\"}\n"
+                            "}\n\n"
+                            "func MapLiteral() map[string]int {\n"
+                            "\treturn map[string]int{Name: 1}\n"
+                            "}\n\n"
+                            "func Declared() {\n"
+                            "\tmount.New().Run()\n"
+                            "}\n"),
+              0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    /* A field through a declared type, a qualified constant, and not the namesakes. */
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Reads", "test.lib.Impl.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Reads", "test.lib.Limit"), 1);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Reads", "test.app.Limit"), 0);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Reads", "test.app.Name"), 0);
+    ASSERT_EQ(count_edge_between(db, "WRITES", "test.app.Writes", "test.lib.Impl.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "WRITES", "test.app.Writes", "test.app.Name"), 1);
+    /* Every named type inside the wrappers, under the declaring function. */
+    ASSERT_EQ(count_edge_between(db, "USES_TYPE", "test.app.Types", "test.lib.Getter"), 1);
+    ASSERT_EQ(count_edge_between(db, "USES_TYPE", "test.app.Types", "test.lib.Impl"), 1);
+    /* A parameter and a local hide the package-level names. */
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Shadowed", "test.app.Limit"), 0);
+    ASSERT_EQ(count_edge_between(db, "WRITES", "test.app.LocalWrite", "test.app.Name"), 0);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.LocalWrite", "test.app.Name"), 0);
+    /* A struct-literal key is the literal type's field, never the package variable it is
+     * spelled like. A map literal's bare key is an ordinary value. */
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Literal", "test.lib.Impl.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Literal", "test.app.Name"), 0);
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.MapLiteral", "test.app.Name"), 1);
+    /* The import binds mount, the package's declared name, though the path says mount-utils. */
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Declared", "test.mount-utils.New"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Declared", "test.mount-utils.Mounter.Run"),
+              1);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+TEST(resolver_stabilization_go_pipeline_references_sequential) {
+    return go_references_case(false);
+}
+TEST(resolver_stabilization_go_pipeline_references_parallel) {
+    return go_references_case(true);
+}
+TEST(resolver_stabilization_go_pipeline_twins_and_package_level_sequential) {
+    return go_twins_case(false);
+}
+TEST(resolver_stabilization_go_pipeline_twins_and_package_level_parallel) {
+    return go_twins_case(true);
+}
+
 TEST(resolver_stabilization_go_pipeline_mutation_changes_target_and_metadata) {
     const char *root = th_mktempdir("cbm_stabilization");
     ASSERT_NOT_NULL(root);
@@ -968,7 +1694,29 @@ SUITE(resolver_stabilization) {
     RUN_TEST(resolver_stabilization_go_missing_duplicate_and_transformed_carriers_abstain);
     RUN_TEST(resolver_stabilization_go_call_carriers_require_matching_source_identity);
     RUN_TEST(resolver_stabilization_go_three_package_alias_chain_and_registration_order);
-    RUN_TEST(resolver_stabilization_go_unknown_flow_and_shadowing_do_not_borrow_old_bindings);
+    RUN_TEST(resolver_stabilization_go_static_type_survives_flow_and_unknown_stays_unknown);
+    RUN_TEST(resolver_stabilization_go_calls_in_every_statement_form_are_visited);
+    RUN_TEST(resolver_stabilization_go_block_frames_shadow_exactly);
+    RUN_TEST(resolver_stabilization_go_tuple_results_bind_by_position);
+    RUN_TEST(resolver_stabilization_go_field_chains_follow_declared_field_types);
+    RUN_TEST(resolver_stabilization_go_interface_methods_are_their_own_declarations);
+    RUN_TEST(resolver_stabilization_go_embedding_follows_the_selector_rule);
+    RUN_TEST(resolver_stabilization_go_open_embedded_type_blocks_promotion);
+    RUN_TEST(resolver_stabilization_go_range_index_and_channel_yield_their_element);
+    RUN_TEST(resolver_stabilization_go_assertions_and_type_switch_clauses_use_the_written_type);
+    RUN_TEST(resolver_stabilization_go_literals_new_make_and_conversions_are_typed);
+    RUN_TEST(resolver_stabilization_go_package_variables_have_their_declared_type);
+    RUN_TEST(resolver_stabilization_go_defined_non_struct_types_have_method_sets);
+    RUN_TEST(resolver_stabilization_go_generic_declarations_keep_their_method_sets);
+    RUN_TEST(resolver_stabilization_go_build_tag_twins_are_one_target_but_results_must_agree);
+    RUN_TEST(resolver_stabilization_go_imported_members_keep_their_package_identity);
+    RUN_TEST(resolver_stabilization_go_syntax_error_costs_only_its_own_declaration);
+    RUN_TEST(resolver_stabilization_go_replace_directive_proves_a_sibling_module);
+    RUN_TEST(resolver_stabilization_go_workspace_use_proves_a_listed_module);
+    RUN_TEST(resolver_stabilization_go_pipeline_references_sequential);
+    RUN_TEST(resolver_stabilization_go_pipeline_references_parallel);
+    RUN_TEST(resolver_stabilization_go_pipeline_twins_and_package_level_sequential);
+    RUN_TEST(resolver_stabilization_go_pipeline_twins_and_package_level_parallel);
     RUN_TEST(resolver_stabilization_generic_type_shadow_never_binds_package_type);
     RUN_TEST(resolver_stabilization_generic_receiver_parameters_shadow_package_types);
     RUN_TEST(resolver_stabilization_captured_binding_does_not_regain_narrowed_authority);

@@ -784,7 +784,103 @@ TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget) {
     PASS();
 }
 
+static int rust_source_emits(const char *source, const char *target_name) {
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUST, "proj",
+                                             "lib.rs", 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    int emitted = -1;
+    if (result && graph && registry && add_result(graph, registry, result, "lib.rs", source)) {
+        char target[128];
+        snprintf(target, sizeof(target), "%s.%s", result->module_qn, target_name);
+        cbm_file_info_t file = {
+            .path = "/tmp/lib.rs", .rel_path = "lib.rs", .language = CBM_LANG_RUST};
+        cbm_pipeline_ctx_t ctx = {
+            .project_name = "proj", .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+        cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+        cbm_resolver_file_t input = {.ctx = &ctx,
+                                     .registry = registry,
+                                     .graph = graph,
+                                     .output = graph,
+                                     .result = result,
+                                     .rel_path = "lib.rs",
+                                     .module_qn = result->module_qn,
+                                     .language = CBM_LANG_RUST};
+        if (shared && cbm_shared_resolver_file(shared, &input))
+            emitted = emitted_target(graph, "CALLS", target);
+        cbm_shared_resolver_free(shared);
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    if (result)
+        cbm_free_result(result);
+    return emitted;
+}
+
+/* Two `impl From<_> for Error` both declare Error.from: one QN, so one graph node, whose edges
+ * are the union of every variant's body. meilisearch alone has hundreds of these, and every
+ * call inside them was void as source_declaration_identity_conflict. */
+TEST(resolver_pipeline_same_kind_declarations_sharing_a_qn_are_one_source) {
+    const char *source = "struct Error;\nstruct A;\nstruct B;\n"
+                         "fn helper() -> i32 { 1 }\n"
+                         "impl From<A> for Error {\n"
+                         "    fn from(a: A) -> Error { helper(); Error }\n"
+                         "}\n"
+                         "impl From<B> for Error {\n"
+                         "    fn from(b: B) -> Error { helper(); Error }\n"
+                         "}\n";
+    ASSERT_EQ(rust_source_emits(source, "helper"), 2);
+    PASS();
+}
+
+/* A struct and a function sharing a QN are different things: the node can stand for only one
+ * of them, so the function's body cannot speak for it. */
+TEST(resolver_pipeline_different_kinds_sharing_a_qn_stay_a_conflict) {
+    const char *source = "struct Twin { x: i32 }\n"
+                         "fn Twin() -> i32 { helper() }\n"
+                         "fn helper() -> i32 { 1 }\n";
+    ASSERT_EQ(rust_source_emits(source, "helper"), 0);
+    PASS();
+}
+
+/* USES_TYPE scopes were file + bare function name, which no node carries for a method's class
+ * or a Go package, so every signature type in those reported source_not_materialized. */
+TEST(resolver_pipeline_signature_type_refs_name_the_declaring_scope) {
+    const char *go = "package lib\n\ntype T struct{}\n\n"
+                     "func Make(t T) T { return t }\n\nfunc (t T) Same(o T) T { return o }\n";
+    CBMFileResult *result = cbm_extract_file(go, (int)strlen(go), CBM_LANG_GO, "proj", "lib/lib.go",
+                                             0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    int make = 0, same = 0, wrong = 0;
+    for (int i = 0; i < result->type_refs.count; i++) {
+        const char *scope = result->type_refs.items[i].enclosing_func_qn;
+        make += scope && !strcmp(scope, "proj.lib.Make");
+        same += scope && !strcmp(scope, "proj.lib.T.Same");
+        wrong += scope && strstr(scope, "lib.lib") != NULL;
+    }
+    cbm_free_result(result);
+    ASSERT_GT(make, 0);
+    ASSERT_GT(same, 0);
+    ASSERT_EQ(wrong, 0);
+    const char *ts = "interface T { x: number }\n"
+                     "class Service {\n  run(t: T): T { return t; }\n}\n";
+    result = cbm_extract_file(ts, (int)strlen(ts), CBM_LANG_TYPESCRIPT, "proj", "app.ts", 0, NULL,
+                              NULL);
+    ASSERT_NOT_NULL(result);
+    int method = 0;
+    for (int i = 0; i < result->type_refs.count; i++) {
+        const char *scope = result->type_refs.items[i].enclosing_func_qn;
+        method += scope && !strcmp(scope, "proj.app.Service.run");
+    }
+    cbm_free_result(result);
+    ASSERT_GT(method, 0);
+    PASS();
+}
+
 SUITE(resolver_pipeline) {
+    RUN_TEST(resolver_pipeline_same_kind_declarations_sharing_a_qn_are_one_source);
+    RUN_TEST(resolver_pipeline_different_kinds_sharing_a_qn_stay_a_conflict);
+    RUN_TEST(resolver_pipeline_signature_type_refs_name_the_declaring_scope);
     RUN_TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget);
     RUN_TEST(resolver_pipeline_shared_build_has_no_proof_work_budget);
     RUN_TEST(resolver_pipeline_graph_pool_has_no_proof_work_budget);
