@@ -54,6 +54,8 @@ typedef struct {
      * binding this row introduces. */
     uint32_t at_start;
     const cbm_resolve_js_import_t *js_import;
+    /* A module-level class's own `constructor`, which `new` runs. */
+    const char *js_constructor;
 } binding_name_t;
 
 typedef struct binding_pending_declaration {
@@ -3228,6 +3230,31 @@ static int js_compare_member(const void *left, const void *right) {
     return order ? order : (a->prototype > b->prototype) - (a->prototype < b->prototype);
 }
 
+/* `class X { constructor() {} }` at module level: what `new X()` runs. */
+static void js_settle_constructors(cbm_resolve_binding_index_t *index) {
+    if (index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE)
+        return;
+    for (int d = 0; d < index->result->defs.count; d++) {
+        const CBMDefinition *definition = &index->result->defs.items[d];
+        const char *qn = definition->qualified_name;
+        if (!definition->name || strcmp(definition->name, "constructor") || !qn)
+            continue;
+        const char *dot = strrchr(qn, '.');
+        const char *owner = dot ? dot : qn;
+        while (owner > qn && owner[-1] != '.')
+            owner--;
+        if (!dot || owner == dot)
+            continue;
+        const char *name = cbm_arena_strndup(index->arena, owner, (size_t)(dot - owner));
+        bool conflict = false;
+        binding_name_t *row =
+            name ? (binding_name_t *)js_module_row(index, name, JS_SPACE_VALUE, &conflict) : NULL;
+        if (row && !conflict && row->target && strlen(row->target) == (size_t)(dot - qn) &&
+            !strncmp(row->target, qn, (size_t)(dot - qn)))
+            row->js_constructor = qn;
+    }
+}
+
 /* Each member's declaration, by its extracted definition at exact lines or the
  * declaration an identifier names. Two rows for one member answer nothing. */
 static void js_settle_members(cbm_resolve_binding_index_t *index) {
@@ -3700,6 +3727,7 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
         audit_javascript_values(index);
         js_settle_exports(index);
         js_settle_members(index);
+        js_settle_constructors(index);
     }
     /* An explicit replacement of annotation storage can invoke user code
      * even when the annotation itself is a bare name. Do not infer the
@@ -4175,8 +4203,12 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
         (binding->flags & BINDING_TYPE_DECLARATION) && (binding->flags & BINDING_VALUE_TYPE))
         candidate.facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
     if (ecma && located->invocation && !dot && candidate.rule == CBM_RESOLVE_RULE_SCOPE_BINDING &&
-        (binding->flags & BINDING_TYPE_DECLARATION) && (binding->flags & BINDING_VALUE_TYPE))
-        candidate.facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+        (binding->flags & BINDING_TYPE_DECLARATION) && (binding->flags & BINDING_VALUE_TYPE)) {
+        if (binding->js_constructor)
+            candidate.target = binding->js_constructor;
+        else
+            candidate.facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+    }
     candidate.facts |= CBM_RESOLVE_FACT_LOOKUP_COMPLETE | CBM_RESOLVE_FACT_OCCURRENCE_EXACT;
     candidate.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
     candidate.reason = "exact_lexical_binding";

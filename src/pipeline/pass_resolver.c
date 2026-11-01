@@ -2764,8 +2764,14 @@ static cbm_resolve_result_t ecma_import_result(file_resolver_t *resolver,
         const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(resolver->file->graph, target);
         uint32_t facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
                          CBM_RESOLVE_FACT_IMPORT_BOUND;
-        if (invocation && node && node->label && !strcmp(node->label, "Class"))
-            facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+        if (invocation && node && node->label && !strcmp(node->label, "Class")) {
+            /* `new X()` runs X's own constructor when X declares one. */
+            const char *constructor = ecma_member_target(resolver, target, "constructor");
+            if (constructor)
+                target = constructor;
+            else
+                facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+        }
         result = (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_UNIQUE,
                                         .domain = CBM_RESOLVE_DOMAIN_PROJECT,
                                         .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,

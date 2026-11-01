@@ -338,6 +338,18 @@ static const MN_Golden mn_goldens[] = {
     {"mn_module_tsx_namespace", "run", "new App.Config(0.5)", "ns.App.Config.constructor",
      "        constructor(t: number) { this.threshold = Utils.normalise(t); }", "Method", 10, 0},
 };
+/* TypeScript forms the shared resolver proves now. Everything else stays a counted gap. */
+static bool mn_required(const MN_Golden *g) {
+    if (!g->target)
+        return false;
+    if (!strcmp(g->test, "mn_default_params_ts") || !strcmp(g->test, "mn_pattern_match_ts") ||
+        !strcmp(g->test, "mn_nested_function_ts"))
+        return true;
+    return (!strcmp(g->test, "mn_module_ts_namespace") ||
+            !strcmp(g->test, "mn_module_tsx_namespace")) &&
+           !strcmp(g->needle, "clamp(v, 0, 1)");
+}
+
 static bool mn_quality(const char *test, const char *filename, const char *content) {
     if (!strncmp(test, "test_", 5))
         test += 5;
@@ -360,7 +372,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                                             .declaration_text = "def exact_target():"},
                                  .mode = RQ_REQUIRED}};
     char ids[12][100];
-    size_t n = 1;
+    size_t n = 1, required = 1;
     for (size_t i = 0; i < sizeof(mn_goldens) / sizeof(mn_goldens[0]); i++) {
         const MN_Golden *g = mn_goldens + i;
         if (strcmp(test, g->test))
@@ -380,7 +392,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                        .label = g->label,
                        .declaration_line = g->line,
                        .declaration_text = g->declaration},
-            .mode = RQ_KNOWN_GAP,
+            .mode = mn_required(g) ? RQ_REQUIRED : RQ_KNOWN_GAP,
             .gap_id = g->target ? "construct-binding-proof-missing"
                                 : "callable-identity-not-materialized",
             .why =
@@ -394,6 +406,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                      "source bytes and structural assertions remain intact; each covered caller "
                      "now enumerates its project call sites and a required control checks the "
                      "same publication path."};
+        required += mn_required(g);
         n++;
     }
     if (n == 1)
@@ -404,7 +417,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
     bool ok = store && rq_check_project_declarations(store, lp.project, test, sources, 2, expected,
                                                      n, NULL, 0, &report, stderr);
     mn_cleanup(&lp, store);
-    return ok && report.genuine == n && report.found == 1 && report.missing == n - 1;
+    return ok && report.genuine == n && report.found == required && report.missing == n - required;
 }
 static MN_Metrics mn_quality_metrics(const char *filename, const char *content, const char *test,
                                      bool *quality) {
