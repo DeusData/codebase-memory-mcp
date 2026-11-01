@@ -22,8 +22,16 @@ exit 99
 EOF
 chmod +x "$WORK/bin/uname" "$WORK/bin/curl"
 
+# The stubs must be what install.sh sees, or this test proves nothing.
+if [ "$(PATH="$WORK/bin:$PATH" uname -o)" != "Android" ]; then
+  printf 'FAIL: the uname stub is not picked up from PATH\n' >&2
+  exit 1
+fi
+
 set +e
-output=$(PATH="$WORK/bin:$PATH" HOME="$WORK/home" bash "$ROOT/install.sh" --skip-config 2>&1)
+output=$(PATH="$WORK/bin:$PATH" HOME="$WORK/home" \
+  CBM_DOWNLOAD_URL="http://127.0.0.1:9/cbm-android-guard-test" \
+  bash "$ROOT/install.sh" --skip-config 2>&1)
 rc=$?
 set -e
 
