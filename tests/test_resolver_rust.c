@@ -1009,8 +1009,9 @@ TEST(resolver_rust_generic_signatures_at_a_use) {
         ASSERT_EQ(rust_edge(store, "CALLS", "src.main.unfixed", "src.main.Tr.act"), 0);
         /* Inside the generic scope T is known by its bound. */
         ASSERT_EQ(rust_edge(store, "CALLS", "src.main.inside", "src.main.Tr.act"), 1);
-        /* A block's own private members are visible in that block. */
-        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.block_local", "src.main.Local.own"), 1);
+        /* A block's own private members are visible in that block, so the walk selects
+         * own. The graph has no node for a block-level struct, and the outcome says so. */
+        ASSERT(rust_occurrence_reason(store, "CALLS", "l.own", "rust_declaration_not_materialized"));
     }
     PASS();
 }
@@ -1270,6 +1271,220 @@ TEST(resolver_rust_qn_collisions_withhold_the_edge) {
     PASS();
 }
 
+static int rust_occurrences_like(cbm_store_t *store, const char *relation, const char *pattern) {
+    sqlite3_stmt *statement = NULL;
+    int count = -1;
+    const char *sql = "SELECT count(*) FROM resolver_occurrences WHERE relation=?1 AND spelling LIKE ?2";
+    if (store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(statement, 1, relation, -1, SQLITE_STATIC);
+        sqlite3_bind_text(statement, 2, pattern, -1, SQLITE_STATIC);
+        if (sqlite3_step(statement) == SQLITE_ROW)
+            count = sqlite3_column_int(statement, 0);
+    }
+    sqlite3_finalize(statement);
+    return count;
+}
+
+/* async-openai keeps retired names commented out inside its use lists. */
+TEST(resolver_rust_use_list_comment_is_not_a_leaf) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod kept;\n"
+         "use kept::{\n    //gone, also_gone,\n    here,\n    /* gone_too */\n};\n"
+         "fn caller() { here(); }\n"
+         "fn main() {}\n"},
+        {"src/kept.rs", "pub fn here() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.kept.here"), 1);
+        ASSERT_EQ(rust_occurrences_like(store, "IMPORTS", "%gone%"), 0);
+    }
+    PASS();
+}
+
+/* A use takes every namespace it may see: routes-macros keeps a private `mod path`
+ * beside its exported `pub fn path`, and `pub use routes_macros::path` compiles. */
+TEST(resolver_rust_use_takes_the_namespace_it_may_see) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml", "[workspace]\nmembers = [\"m\", \"app\"]\n"},
+        {"m/Cargo.toml", "[package]\nname = \"m\"\nedition = \"2021\"\n"},
+        {"m/src/lib.rs", "mod path;\nmod hidden;\npub fn path() {}\n"},
+        {"m/src/path.rs", "pub fn helper() {}\n"},
+        {"m/src/hidden.rs", "pub fn helper() {}\n"},
+        {"app/Cargo.toml",
+         "[package]\nname = \"app\"\nedition = \"2021\"\n[dependencies]\nm = { path = \"../m\" }\n"},
+        {"app/src/lib.rs", "pub mod visible;\npub mod blocked;\n"},
+        {"app/src/visible.rs", "pub use m::path;\n"},
+        {"app/src/blocked.rs", "pub use m::hidden;\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT(rust_edge(store, "IMPORTS", "app.src.visible.rs.__file__", "m.src.lib.rs.__file__") >=
+               1);
+        /* Private in the only namespace that holds it: still not visible. */
+        ASSERT_EQ(rust_edges_from(store, "IMPORTS", "app.src.blocked.rs.__file__"), 0);
+        ASSERT(rust_occurrence_reason(store, "IMPORTS", "m::hidden", "rust_use_path_not_visible"));
+    }
+    PASS();
+}
+
+/* Two uses of one name in one namespace do not compile, so `use thiserror::Error` beside
+ * `use crate::Error` is the derive macro. Under cfg they really can name two things. */
+TEST(resolver_rust_external_use_beside_a_project_use_is_another_namespace) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nedition = \"2021\"\n"
+         "[dependencies]\nthiserror = \"1\"\nother = \"1\"\n"},
+        {"src/main.rs", "mod error;\nmod user;\nmod gated;\nfn main() {}\n"},
+        {"src/error.rs", "pub struct Error;\nimpl Error { pub fn build() -> Error { Error } }\n"},
+        {"src/user.rs",
+         "use thiserror::Error;\nuse crate::error::Error;\n"
+         "#[derive(Error, Debug)]\npub enum Local { A }\n"
+         "fn caller() { Error::build(); }\n"},
+        {"src/gated.rs",
+         "#[cfg(feature = \"x\")]\nuse other::Error;\n"
+         "#[cfg(not(feature = \"x\"))]\nuse crate::error::Error;\n"
+         "fn gated() { Error::build(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.user.caller", "src.error.Error.build"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.gated.gated"), 0);
+    }
+    PASS();
+}
+
+/* `pub use self::steps::SearchStep` in milli's lib.rs names an enum make_enum_progress!
+ * declares: the import is real, its module is known, the item itself stays unseen. */
+TEST(resolver_rust_reexport_of_a_macro_declared_item_keeps_its_module) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml", "[package]\nname = \"demo\"\nedition = \"2021\"\n"},
+        {"src/lib.rs",
+         "pub mod steps;\npub mod only;\npub mod absent;\npub mod user;\n"
+         "pub use self::steps::Step;\n"},
+        {"src/steps.rs", "make_steps! { pub enum Step { One } }\n"},
+        {"src/only.rs", "use crate::Step;\n"},
+        {"src/absent.rs", "use crate::Absent;\n"},
+        {"src/user.rs", "use crate::Step;\npub fn taker(step: Step) { let _ = step; }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "IMPORTS", "src.only.rs.__file__", "src.lib.rs.__file__"), 1);
+        /* No macro can supply it and nothing re-exports it. */
+        ASSERT_EQ(rust_edges_from(store, "IMPORTS", "src.absent.rs.__file__"), 0);
+        ASSERT(rust_occurrence_reason(store, "IMPORTS", "crate::Absent", "rust_use_path_unresolved"));
+        ASSERT(rust_occurrence_reason(store, "USAGE", "Step", "rust_macro_declared_item"));
+    }
+    PASS();
+}
+
+/* A file no crate root reaches has no dependency names to check a path against. */
+TEST(resolver_rust_unreached_file_reports_its_crate_as_unknown) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml", "[package]\nname = \"demo\"\nedition = \"2021\"\n"},
+        {"src/lib.rs", "pub fn root() {}\n"},
+        {"src/dead.rs", "use serde::Serialize;\nfn a() {}\nfn b() { a(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT(rust_occurrence_reason(store, "IMPORTS", "serde::Serialize", "rust_crate_root_unknown"));
+        /* Its own items still resolve. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.dead.b", "src.dead.a"), 1);
+    }
+    PASS();
+}
+
+/* FromIterator: `_` is the iterator's element. A map takes pairs, and Result<C, E> takes
+ * items of that wrapper. Nothing fills it when the element itself is not known. */
+TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "use std::collections::HashMap;\n"
+         "pub struct Thing;\nimpl Thing { pub fn run(&self) {} }\n"
+         "pub struct Other;\nimpl Other { pub fn run(&self) {} }\n"
+         "type Res<T> = std::result::Result<T, String>;\n"
+         "fn make() -> Vec<Thing> { Vec::new() }\n"
+         "fn results() -> Vec<Res<Thing>> { Vec::new() }\n"
+         "fn pairs() -> Vec<(i32, Other)> { Vec::new() }\n"
+         "fn annotated() { let all: Vec<_> = make().into_iter().collect(); for t in all { t.run(); } }\n"
+         "fn turbofish() { let all = make().into_iter().collect::<Vec<_>>(); for t in all { t.run(); } }\n"
+         "fn fallible() {\n"
+         "    let all = results().into_iter().collect::<Res<Vec<_>>>().unwrap();\n"
+         "    for t in all { t.run(); }\n"
+         "}\n"
+         "fn keyed() {\n"
+         "    let all: HashMap<_, _> = pairs().into_iter().collect();\n"
+         "    for (_, v) in all { v.run(); }\n"
+         "}\n"
+         "fn unknown_source() { let all: Vec<_> = other_crate::items().collect(); for t in all { t.run(); } }\n"
+         "fn boxed() -> Res<Box<dyn Iterator<Item = Res<Thing>> + 'static>> { todo!() }\n"
+         "fn through_a_box() {\n"
+         "    let mut all = boxed().unwrap().collect::<Res<Vec<_>>>().unwrap();\n"
+         "    all.pop().unwrap().run();\n"
+         "}\n"
+         "fn sorted(mut all: Vec<Thing>) { all.sort_by_key(|item| item.run()); }\n"
+         "fn compared(mut all: Vec<Thing>) { all.sort_by(|a, b| { a.run(); b.run(); todo!() }); }\n"
+         "fn folded(all: Vec<Other>) { all.into_iter().fold(0, |_sum, item| { item.run(); 0 }); }\n"
+         "fn best(all: Vec<Other>) { all.iter().max_by_key(|item| item.run()); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.annotated", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.turbofish", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.fallible", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.keyed", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.keyed", "src.main.Thing.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.unknown_source", "src.main.Thing.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.unknown_source", "src.main.Other.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_a_box", "src.main.Thing.run"), 1);
+        /* The element reaches the closure through the std signature of each method. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.sorted", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.compared", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.folded", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.folded", "src.main.Thing.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.best", "src.main.Other.run"), 1);
+        /* The placeholder is not a name that failed to resolve. */
+        ASSERT(rust_occurrence_reason(store, "USAGE", "_", "rust_inferred_type"));
+    }
+    PASS();
+}
+
+/* `let index; ... index = make()?;` from meilisearch's process_batch: Rust infers the binding
+ * from its first assignment. An annotated or initialized binding already has its type, and a
+ * binding shadowed by a later `let` is a different binding. */
+TEST(resolver_rust_deferred_let_takes_its_type_from_the_assignment) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub struct Thing;\nimpl Thing { pub fn run(&self) {} }\n"
+         "pub struct Other;\nimpl Other { pub fn run(&self) {} }\n"
+         "fn branches(flag: bool) {\n"
+         "    let chosen;\n"
+         "    if flag { chosen = Thing; } else { chosen = Thing; }\n"
+         "    chosen.run();\n"
+         "}\n"
+         "fn unassigned() {\n"
+         "    let never_set;\n"
+         "    never_set.run();\n"
+         "}\n"
+         "fn from_unknown() {\n"
+         "    let value;\n"
+         "    value = other_crate::make();\n"
+         "    value.run();\n"
+         "}\n"
+         "fn shadowed() {\n"
+         "    let first;\n"
+         "    first = Thing;\n"
+         "    let first = Other;\n"
+         "    first.run();\n"
+         "}\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.branches", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.unassigned"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.from_unknown", "src.main.Thing.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.shadowed", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.shadowed", "src.main.Thing.run"), 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
     RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
@@ -1289,6 +1504,13 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_generic_trait_impl_is_chosen_by_the_value_passed);
     RUN_TEST(resolver_rust_cfg_twins_are_one_identity_and_cfg_imports_are_not);
     RUN_TEST(resolver_rust_qn_collisions_withhold_the_edge);
+    RUN_TEST(resolver_rust_use_list_comment_is_not_a_leaf);
+    RUN_TEST(resolver_rust_use_takes_the_namespace_it_may_see);
+    RUN_TEST(resolver_rust_external_use_beside_a_project_use_is_another_namespace);
+    RUN_TEST(resolver_rust_reexport_of_a_macro_declared_item_keeps_its_module);
+    RUN_TEST(resolver_rust_unreached_file_reports_its_crate_as_unknown);
+    RUN_TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator);
+    RUN_TEST(resolver_rust_deferred_let_takes_its_type_from_the_assignment);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
