@@ -1997,6 +1997,14 @@ static void rs_type_name_site(rs_walk_t *w, TSNode site, const char *const *segs
             return;
         }
     }
+    /* `Self::Output`, `D::Error`: a member of a trait or impl, which has no graph node. */
+    int param_index = 0;
+    if (nseg == 2 && !absolute &&
+        (rs_is_self_type(segs[0]) || rs_genv_find(w->gens, segs[0], &param_index))) {
+        rs_sel_t sel = rs_sel_settled("rust_associated_type", CBM_RESOLVE_DOMAIN_UNKNOWN);
+        rs_emit(w, CBM_RUST_SITE_REF, start, end, &sel);
+        return;
+    }
     int consumed = 0;
     rs_ent_t ent = rs_resolve_path(&w->q, w->inst, w->blocks, w->nblocks, segs, nseg, absolute,
                                    RS_NS_TYPE, false, NULL, &consumed);
@@ -2178,6 +2186,17 @@ static const rs_field_t *rs_fields_of_sel(const rs_sel_t *sel) {
     return sel->ctor ? sel->ctor->fields : NULL;
 }
 
+/* `Self::Variant { .. }`: Self is the impl's own type, so the variant is its member. */
+static bool rs_sel_from_self_path(rs_walk_t *w, const rs_tsyn_t *path, rs_sel_t *sel) {
+    if (path->nseg != 2 || !rs_is_self_type(path->segs[0]) || !w->self_ty)
+        return false;
+    const rs_type_t *self_ty = rs_peel(w->self_ty);
+    if (self_ty->kind != RT_ITEM)
+        return false;
+    *sel = rs_sel_from_type_item(w, self_ty->item, path->segs[1]);
+    return true;
+}
+
 static void rs_bind_struct_pattern(rs_walk_t *w, TSNode node, const rs_type_t *type) {
     TSNode head = rs_field(node, "type");
     rs_tsyn_t *path = ts_node_is_null(head) ? NULL : rs_path_of(w, head);
@@ -2191,17 +2210,22 @@ static void rs_bind_struct_pattern(rs_walk_t *w, TSNode node, const rs_type_t *t
             fields = owner->fields;
             sel = rs_sel_from_item(w, (rs_item_t *)owner, RS_VIA_LOCAL);
         } else {
-            int consumed = 0;
-            rs_ent_t ent =
-                rs_resolve_path(&w->q, w->inst, w->blocks, w->nblocks, path->segs, path->nseg,
-                                path->absolute, RS_NS_TYPE, false, NULL, &consumed);
-            if (ent.kind == RS_ENT_ITEM && consumed == path->nseg - 1) {
-                sel = rs_sel_from_type_item(w, ent.item, path->segs[path->nseg - 1]);
-            } else if (consumed == path->nseg) {
-                sel = rs_sel_from_ent(w, &ent);
-                if (ent.kind == RS_ENT_ITEM) {
-                    owner = ent.item;
-                    fields = ent.item->fields;
+            if (!rs_sel_from_self_path(w, path, &sel)) {
+                int consumed = 0;
+                rs_ent_t ent =
+                    rs_resolve_path(&w->q, w->inst, w->blocks, w->nblocks, path->segs, path->nseg,
+                                    path->absolute, RS_NS_TYPE, false, NULL, &consumed);
+                if (ent.kind == RS_ENT_ITEM && consumed == path->nseg - 1) {
+                    sel = rs_sel_from_type_item(w, ent.item, path->segs[path->nseg - 1]);
+                } else if (consumed == path->nseg) {
+                    sel = rs_sel_from_ent(w, &ent);
+                    if (ent.kind == RS_ENT_ITEM) {
+                        owner = ent.item;
+                        fields = ent.item->fields;
+                    }
+                } else if (ent.kind == RS_ENT_UNKNOWN || ent.kind == RS_ENT_AMBIGUOUS) {
+                    /* The head's own outcome says more than "unsupported". */
+                    sel = rs_sel_from_ent(w, &ent);
                 }
             }
             if (sel.variant_enum) {
@@ -2795,23 +2819,29 @@ static const rs_type_t *rs_walk_struct_expr(rs_walk_t *w, TSNode node) {
             fields = owner->fields;
             sel = rs_sel_from_item(w, (rs_item_t *)owner, RS_VIA_LOCAL);
         } else {
-            int consumed = 0;
-            rs_env_t env = rs_env_here(w);
-            rs_ent_t ent =
-                rs_resolve_path(&w->q, w->inst, w->blocks, w->nblocks, path->segs, path->nseg,
-                                path->absolute, RS_NS_TYPE, false, NULL, &consumed);
-            if (ent.kind == RS_ENT_ITEM && consumed == path->nseg - 1) {
-                sel = rs_sel_from_type_item(w, ent.item, path->segs[path->nseg - 1]);
+            if (rs_sel_from_self_path(w, path, &sel)) {
                 result = sel.value_type ? sel.value_type : &RS_UNKNOWN_TYPE;
-            } else if (consumed == path->nseg) {
-                sel = rs_sel_from_ent(w, &ent);
-                if (ent.kind == RS_ENT_ITEM) {
-                    result = rs_lower(&env, path);
-                    const rs_type_t *peeled = rs_peel(result);
-                    owner = peeled->kind == RT_ITEM ? peeled->item : ent.item;
-                    fields = owner->fields;
-                } else if (ent.kind == RS_ENT_VARIANT) {
+            } else {
+                int consumed = 0;
+                rs_env_t env = rs_env_here(w);
+                rs_ent_t ent =
+                    rs_resolve_path(&w->q, w->inst, w->blocks, w->nblocks, path->segs, path->nseg,
+                                    path->absolute, RS_NS_TYPE, false, NULL, &consumed);
+                if (ent.kind == RS_ENT_ITEM && consumed == path->nseg - 1) {
+                    sel = rs_sel_from_type_item(w, ent.item, path->segs[path->nseg - 1]);
                     result = sel.value_type ? sel.value_type : &RS_UNKNOWN_TYPE;
+                } else if (consumed == path->nseg) {
+                    sel = rs_sel_from_ent(w, &ent);
+                    if (ent.kind == RS_ENT_ITEM) {
+                        result = rs_lower(&env, path);
+                        const rs_type_t *peeled = rs_peel(result);
+                        owner = peeled->kind == RT_ITEM ? peeled->item : ent.item;
+                        fields = owner->fields;
+                    } else if (ent.kind == RS_ENT_VARIANT) {
+                        result = sel.value_type ? sel.value_type : &RS_UNKNOWN_TYPE;
+                    }
+                } else if (ent.kind == RS_ENT_UNKNOWN || ent.kind == RS_ENT_AMBIGUOUS) {
+                    sel = rs_sel_from_ent(w, &ent);
                 }
             }
             if (sel.variant_enum) {

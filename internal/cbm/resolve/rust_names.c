@@ -1963,6 +1963,42 @@ static rs_ent_t rs_variant_ent(rs_item_t *item, const char *name, unsigned ns) {
     return rs_ent(RS_ENT_NONE, RS_VIA_NONE);
 }
 
+/* The variants of a standard enum are a closed list, so its glob can be read:
+ * `use std::ops::Bound::*;` binds three names in the block and hides nothing else. */
+static const char *const *rs_std_enum_variants(const char *path) {
+    static const char *const bound[] = {"Included", "Excluded", "Unbounded", NULL};
+    static const char *const ordering[] = {"Less", "Equal", "Greater", NULL};
+    static const char *const cow[] = {"Borrowed", "Owned", NULL};
+    static const char *const entry[] = {"Occupied", "Vacant", NULL};
+    static const char *const option[] = {"Some", "None", NULL};
+    static const char *const result[] = {"Ok", "Err", NULL};
+    static const char *const poll[] = {"Ready", "Pending", NULL};
+    static const char *const flow[] = {"Continue", "Break", NULL};
+    static const struct {
+        const char *path;
+        const char *const *variants;
+    } enums[] = {{"ops::Bound", bound},
+                 {"cmp::Ordering", ordering},
+                 {"borrow::Cow", cow},
+                 {"collections::hash_map::Entry", entry},
+                 {"collections::btree_map::Entry", entry},
+                 {"option::Option", option},
+                 {"result::Result", result},
+                 {"task::Poll", poll},
+                 {"ops::ControlFlow", flow}};
+    const char *tail = NULL;
+    if (path && !strncmp(path, "std::", 5))
+        tail = path + 5;
+    else if (path && !strncmp(path, "core::", 6))
+        tail = path + 6;
+    else if (path && !strncmp(path, "alloc::", 7))
+        tail = path + 7;
+    for (size_t i = 0; tail && i < sizeof(enums) / sizeof(enums[0]); i++)
+        if (!strcmp(enums[i].path, tail))
+            return enums[i].variants;
+    return NULL;
+}
+
 /* Step 3: globs. A name two globs bind differently is unusable in a program
  * that compiles, so such a use is outside the supported domain. */
 static rs_ent_t rs_glob_uses(rs_query_t *q, rs_inst_t *inst, const char *name, unsigned ns,
@@ -1976,14 +2012,23 @@ static rs_ent_t rs_glob_uses(rs_query_t *q, rs_inst_t *inst, const char *name, u
         int consumed = 0;
         rs_ent_t target = rs_resolve_path(q, inst, NULL, 0, use->segs, use->nseg, use->absolute,
                                           RS_NS_TYPE, true, &last, &consumed);
+        const char *const *std_variants =
+            target.kind == RS_ENT_EXTERNAL ? rs_std_enum_variants(target.external_path) : NULL;
         rs_ent_t next = rs_ent(RS_ENT_NONE, RS_VIA_NONE);
-        if (target.kind == RS_ENT_MODULE && consumed == use->nseg)
+        if (target.kind == RS_ENT_MODULE && consumed == use->nseg) {
             next = rs_lookup_ns(q, target.module, name, ns, inst);
-        else if (target.kind == RS_ENT_ITEM && target.item->kind == RS_ITEM_ENUM &&
-                 consumed == use->nseg)
+        } else if (target.kind == RS_ENT_ITEM && target.item->kind == RS_ITEM_ENUM &&
+                   consumed == use->nseg) {
             next = rs_variant_ent(target.item, name, ns);
-        else
+        } else if (std_variants) {
+            for (; *std_variants && (ns & (RS_NS_VALUE | RS_NS_TYPE)); std_variants++)
+                if (!strcmp(*std_variants, name))
+                    next = (rs_ent_t){.kind = RS_ENT_EXTERNAL,
+                                      .via = RS_VIA_GLOB,
+                                      .external_path = target.external_path};
+        } else {
             open_domain = true; /* external or unresolved: not enumerable */
+        }
         if (next.kind == RS_ENT_NOT_VISIBLE)
             continue;
         if (next.kind == RS_ENT_UNKNOWN) {
