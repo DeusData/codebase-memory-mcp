@@ -4,6 +4,7 @@
 #include "pipeline/pipeline.h"
 #include "resolve/binding.h"
 #include "resolve/policy.h"
+#include "resolve/stats.h"
 #include "store/store.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -1599,7 +1600,39 @@ TEST(resolver_js_project_manifest_type_decides_a_plain_file) {
     PASS();
 }
 
+/* TypeScript's own baselines are files with tens of thousands of top-level statements, and
+ * fetching a child by index walks from the first child: indexing that repository ran over
+ * 28 minutes in this one audit before it was stopped. One pass reads each statement once. */
+TEST(resolver_binding_js_http_default_audit_walks_the_top_level_once) {
+    enum { STATEMENTS = 4000, LINE_ROOM = 32 };
+    char *source = malloc((size_t)STATEMENTS * LINE_ROOM + LINE_ROOM);
+    ASSERT_NOT_NULL(source);
+    size_t length = 0;
+    for (int i = 0; i < STATEMENTS; i++)
+        length += (size_t)snprintf(source + length, LINE_ROOM, "const flat%d = %d;\n", i, i);
+    length += (size_t)snprintf(source + length, LINE_ROOM, "export default flat0;\n");
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)length, CBM_LANG_TYPESCRIPT, "test", "lib/flat.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_stats_t stats;
+    cbm_resolve_stats_reset(&stats);
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&stats);
+    cbm_resolve_binding_index_t *index =
+        cbm_resolve_binding_build(&arena, result, CBM_LANG_TYPESCRIPT, source, length);
+    cbm_resolve_stats_bind(previous);
+    ASSERT_NOT_NULL(index);
+    cbm_resolve_stats_snapshot_t seen = cbm_resolve_stats_snapshot(&stats);
+    ASSERT_EQ(seen.values[CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS], (uint64_t)STATEMENTS + 1);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(result);
+    free(source);
+    PASS();
+}
+
 SUITE(resolver_binding_js) {
+    RUN_TEST(resolver_binding_js_http_default_audit_walks_the_top_level_once);
     RUN_TEST(resolver_binding_js_ordinary_syntax_keeps_the_file_proved);
     RUN_TEST(resolver_binding_js_commonjs_syntax_proves_a_module);
     RUN_TEST(resolver_binding_js_module_extensions_and_manifest_prove_a_module);

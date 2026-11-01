@@ -1,5 +1,6 @@
 #include "binding.h"
 #include "source_adapter.h"
+#include "stats.h"
 #include "../helpers.h"
 #include "../lang_specs.h"
 #include <stdlib.h>
@@ -5089,11 +5090,35 @@ static bool http_literal(TSNode node) {
            kind_is(node, "false") || kind_is(node, "null");
 }
 
-static TSNode http_default_value(TSNode root) {
+/* ts_node_named_child(node, i) walks from the first child on every call, so an index loop
+ * is quadratic in the sibling count, and TypeScript's own baselines are files with that many
+ * top-level statements. One cursor pass snapshots the children. */
+static const TSNode *top_level_children(cbm_resolve_binding_index_t *index, TSNode root,
+                                        uint32_t *count) {
+    uint32_t expected = ts_node_named_child_count(root);
+    TSNode *children =
+        expected ? cbm_arena_alloc(index->arena, expected * sizeof(*children)) : NULL;
+    uint32_t found = 0;
+    if (children) {
+        TSTreeCursor cursor = ts_tree_cursor_new(root);
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            do {
+                TSNode child = ts_tree_cursor_current_node(&cursor);
+                if (ts_node_is_named(child) && found < expected)
+                    children[found++] = child;
+            } while (ts_tree_cursor_goto_next_sibling(&cursor));
+        }
+        ts_tree_cursor_delete(&cursor);
+    }
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, found);
+    *count = found;
+    return children;
+}
+
+static TSNode http_default_value(const TSNode *children, uint32_t count) {
     TSNode value = {0};
-    uint32_t count = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < count; i++) {
-        TSNode node = ts_node_named_child(root, i);
+        TSNode node = children[i];
         if (kind_is(node, "comment") || kind_is(node, "import_statement") ||
             kind_is(node, "lexical_declaration"))
             continue;
@@ -5107,12 +5132,11 @@ static TSNode http_default_value(TSNode root) {
     return value;
 }
 
-static TSNode http_default_initializer(cbm_resolve_binding_index_t *index, TSNode root,
-                                       const char *name) {
+static TSNode http_default_initializer(cbm_resolve_binding_index_t *index, const TSNode *children,
+                                       uint32_t count, const char *name) {
     TSNode selected = {0};
-    uint32_t count = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < count; i++) {
-        TSNode declaration = ts_node_named_child(root, i);
+        TSNode declaration = children[i];
         if (!kind_is(declaration, "lexical_declaration"))
             continue;
         if (!child_token(declaration, "const"))
@@ -5208,14 +5232,16 @@ static bool http_client_base(cbm_resolve_binding_index_t *index, TSNode call, co
 }
 
 static void audit_http_default(cbm_resolve_binding_index_t *index, TSNode root) {
-    TSNode value = http_default_value(root);
+    uint32_t count = 0;
+    const TSNode *children = top_level_children(index, root, &count);
+    TSNode value = http_default_value(children, count);
     const char *name = ts_node_is_null(value) ? NULL : node_text(index, value);
     const binding_name_t *binding = name ? find_name(index, name, strlen(name)) : NULL;
     if (!binding || (binding->flags & BINDING_BLOCKED) ||
         !(binding->flags & BINDING_VALUE_DECLARATION) || !binding->target ||
         ts_node_start_byte(value) < binding->at)
         return;
-    TSNode call = http_default_initializer(index, root, name);
+    TSNode call = http_default_initializer(index, children, count, name);
     TSNode function = field(call, "function");
     TSNode object = field(function, "object"), property = field(function, "property");
     const char *receiver = kind_is(object, "identifier") ? node_text(index, object) : NULL;
