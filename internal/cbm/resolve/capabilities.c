@@ -55,11 +55,23 @@ static const edge_row_t edge_rows[] = {
      "Exact declared namespace members; unproved aliases and competing candidates abstain."},
     {CBM_LANG_PHP, TYPED_EDGES | EDGE(USAGE),
      "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
-    {CBM_LANG_ELIXIR, EDGE(CALLS), NULL},
-    {CBM_LANG_ERLANG, EDGE(CALLS), NULL},
-    {CBM_LANG_ZIG, EDGE(CALLS), NULL},
-    {CBM_LANG_PERL, EDGE(CALLS), NULL},
-    {CBM_LANG_RUBY, EDGE(CALLS), NULL},
+    {CBM_LANG_ELIXIR, EDGE(IMPORTS) | EDGE(CALLS),
+     "alias, import, require and use of a module declared once in the project; a module declared "
+     "twice or outside the project abstains."},
+    {CBM_LANG_ERLANG, EDGE(IMPORTS) | EDGE(CALLS),
+     "-import and -behaviour of the module whose file bears its name, and -include next to the "
+     "source; a name borne by two files, -include_lib and macro paths abstain."},
+    {CBM_LANG_ZIG, EDGE(IMPORTS) | EDGE(CALLS),
+     "@import of a literal .zig path relative to the importing file; names mapped by the build "
+     "abstain."},
+    {CBM_LANG_PERL, EDGE(IMPORTS) | EDGE(CALLS),
+     "use of a module found under the lib directory of an ancestor of the importing file; other "
+     "@INC entries are not known and abstain."},
+    {CBM_LANG_HASKELL, EDGE(CALLS), NULL},
+    {CBM_LANG_OCAML, EDGE(CALLS), NULL},
+    {CBM_LANG_RUBY, EDGE(IMPORTS) | EDGE(CALLS),
+     "require_relative of a literal path, and require of a path under the lib directory of an "
+     "ancestor of the importing file; other load paths and interpolation abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
      "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
@@ -318,6 +330,20 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
             "Implicit self, self and Const receivers on the lexical class's ancestor chain; blocks "
             "that can rebind self, metaprogrammed names, unknown ancestors and reopened duplicates "
             "abstain. Constants inherited from an ancestor are not modelled.";
+        break;
+    case CBM_LANG_HASKELL:
+        out->adapter = "haskell_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation =
+            "Local bindings, top-level declarations, import lists and qualified imports against "
+            "the export list; re-exports, type-class dispatch and two providers abstain.";
+        break;
+    case CBM_LANG_OCAML:
+        out->adapter = "ocaml_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation =
+            "Sequential let scope, local shadowing, module aliases and compilation units in the "
+            "same directory; an open or include of an unknown module and functors abstain.";
         break;
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:

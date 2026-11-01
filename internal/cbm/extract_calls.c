@@ -381,7 +381,9 @@ static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, con
             strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0 ||
             /* PureScript: exp_apply's function head is an `exp_name` whose
              * text is the (possibly qualified) function name. */
-            strcmp(ck, "exp_name") == 0) {
+            strcmp(ck, "exp_name") == 0 ||
+            /* Haskell `Cfg.load x`: the qualified name is the call's head. */
+            strcmp(ck, "qualified") == 0) {
             return cbm_node_text(a, callee, source);
         }
         if (!fp_is_apply_kind(ck)) {

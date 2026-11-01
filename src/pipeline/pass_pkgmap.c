@@ -2851,9 +2851,74 @@ static bool rust_cargo_roots(rust_import_context_t *context, CBMFileResult **cac
     return success;
 }
 
+/* The compiler requires an Erlang module's name to equal its file's. Elixir names
+ * a module wherever it is declared, nested ones below their parent. */
+static bool source_module_put(CBMHashTable *map, const char *kind, const char *module,
+                              const char *rel) {
+    char key[PKGMAP_PATH_BUF];
+    int length = snprintf(key, sizeof(key), "%s\x1f%s", kind, module);
+    return length > 0 && (size_t)length < sizeof(key) && import_fact_put(map, key, rel);
+}
+
+static const char *elixir_full_module(const CBMFileResult *result, int index, char *out,
+                                      size_t capacity) {
+    const CBMDefinition *def = &result->defs.items[index];
+    int parent = -1;
+    uint32_t best = UINT32_MAX;
+    for (int d = 0; d < result->defs.count; d++) {
+        const CBMDefinition *other = &result->defs.items[d];
+        if (d == index || !other->label || strcmp(other->label, "Class") ||
+            other->start_line > def->start_line || other->end_line < def->end_line)
+            continue;
+        uint32_t span = other->end_line - other->start_line;
+        if (span < best) {
+            best = span;
+            parent = d;
+        }
+    }
+    if (parent < 0) {
+        int length = snprintf(out, capacity, "%s", def->name);
+        return length > 0 && (size_t)length < capacity ? out : NULL;
+    }
+    char prefix[PKGMAP_PATH_BUF];
+    if (!elixir_full_module(result, parent, prefix, sizeof(prefix)))
+        return NULL;
+    int length = snprintf(out, capacity, "%s.%s", prefix, def->name);
+    return length > 0 && (size_t)length < capacity ? out : NULL;
+}
+
+static bool source_module_facts(const cbm_file_info_t *files, int count, CBMFileResult **cache,
+                                CBMHashTable *map) {
+    for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_ERLANG) {
+            char module[PKGMAP_PATH_BUF];
+            const char *leaf = path_leaf(files[i].rel_path);
+            const char *dot = strrchr(leaf, '.');
+            int length = snprintf(module, sizeof(module), "%.*s",
+                                  dot ? (int)(dot - leaf) : (int)strlen(leaf), leaf);
+            if (length <= 0 || (size_t)length >= sizeof(module) ||
+                !source_module_put(map, "erlang_module", module, files[i].rel_path))
+                return false;
+        } else if (files[i].language == CBM_LANG_ELIXIR && cache && cache[i]) {
+            const CBMFileResult *result = cache[i];
+            for (int d = 0; d < result->defs.count; d++) {
+                const CBMDefinition *def = &result->defs.items[d];
+                char module[PKGMAP_PATH_BUF];
+                if (!def->label || strcmp(def->label, "Class") || !def->name)
+                    continue;
+                if (elixir_full_module(result, d, module, sizeof(module)) &&
+                    !source_module_put(map, "elixir_module", module, files[i].rel_path))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                        int count, CBMFileResult **cache, CBMHashTable *map) {
-    if (!ctx || !map || !build_compile_import_context(ctx, map))
+    if (!ctx || !map || !build_compile_import_context(ctx, map) ||
+        !source_module_facts(files, count, cache, map))
         return false;
     rust_import_context_t context = {.ctx = ctx, .map = map};
     for (int i = 0; i < count; i++)
@@ -4227,6 +4292,138 @@ static php_use_shape_t php_use_shape(const char *source_rel, const CBMImport *im
     return qualified ? PHP_USE_NAMESPACED : PHP_USE_GLOBAL;
 }
 
+/* A path joined under an ancestor's lib directory: `require 'a/b'` and `use A::B`
+ * search the load path, and a gem or distribution puts its own lib on it. The
+ * nearest ancestor holding the file is the distribution that owns the import. */
+static const cbm_gbuf_node_t *resolve_ancestor_lib_file(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *source_rel,
+                                                        const char *relative) {
+    char *directory = path_dirname(source_rel ? source_rel : "");
+    const cbm_gbuf_node_t *found = NULL;
+    char current[PKGMAP_PATH_BUF];
+    int length = directory ? snprintf(current, sizeof(current), "%s", directory) : -1;
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+    if (length < 0 || (size_t)length >= sizeof(current))
+        return NULL;
+    for (;;) {
+        char path[PKGMAP_PATH_BUF];
+        int written = current[0] && strcmp(current, ".")
+                          ? snprintf(path, sizeof(path), "%s/lib/%s", current, relative)
+                          : snprintf(path, sizeof(path), "lib/%s", relative);
+        if (written > 0 && (size_t)written < sizeof(path)) {
+            found = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+            if (found)
+                return found;
+        }
+        if (!current[0] || !strcmp(current, "."))
+            return NULL;
+        char *slash = strrchr(current, '/');
+        if (slash)
+            *slash = '\0';
+        else
+            current[0] = '\0';
+    }
+}
+
+static const cbm_gbuf_node_t *resolve_source_module(const cbm_pipeline_ctx_t *ctx,
+                                                    CBMHashTable *namespace_map, const char *kind,
+                                                    const char *module, bool *ambiguous) {
+    char key[PKGMAP_PATH_BUF];
+    int length = snprintf(key, sizeof(key), "%s\x1f%s", kind, module);
+    const char *rel = namespace_map && length > 0 && (size_t)length < sizeof(key)
+                          ? cbm_ht_get(namespace_map, key)
+                          : NULL;
+    if (!rel)
+        return NULL;
+    if (!strcmp(rel, ambiguous_pkgmap_value)) {
+        *ambiguous = true;
+        return NULL;
+    }
+    return cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, rel);
+}
+
+/* Import rules of the languages whose adapters live in internal/cbm/resolve. */
+static bool resolve_source_language_import(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                           const CBMImport *imp, CBMHashTable *namespace_map,
+                                           CBMLanguage lang, bool *ambiguous, const char **reason,
+                                           const cbm_gbuf_node_t **out) {
+    const char *path = imp->module_path;
+    size_t size = strlen(path);
+    char joined[PKGMAP_PATH_BUF];
+    char *directory = NULL;
+    *out = NULL;
+    switch (lang) {
+    case CBM_LANG_ZIG:
+        /* A bare name such as "std" is mapped by the build, not by a path. */
+        *reason = "zig_import_mapped_by_build";
+        if (size < 5 || strcmp(path + size - 4, ".zig") || path[0] == '/' || strchr(path, '\\'))
+            return true;
+        directory = path_dirname(source_rel);
+        *reason = "zig_relative_import";
+        if (directory && cbm_repo_rel_join(directory, path, joined, sizeof(joined)))
+            *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+        return true;
+    case CBM_LANG_RUBY: {
+        char file[PKGMAP_PATH_BUF];
+        bool has_extension = size > 3 && !strcmp(path + size - 3, ".rb");
+        int length = snprintf(file, sizeof(file), "%s%s", path, has_extension ? "" : ".rb");
+        if (length <= 0 || (size_t)length >= sizeof(file) || strstr(path, "#{")) {
+            *reason = "ruby_require_path_not_literal";
+            return true;
+        }
+        if (imp->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH) {
+            directory = path_dirname(source_rel);
+            *reason = "ruby_require_relative";
+            if (directory && cbm_repo_rel_join(directory, file, joined, sizeof(joined)))
+                *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+            return true;
+        }
+        *reason = "ruby_require_gem_lib";
+        *out = resolve_ancestor_lib_file(ctx, source_rel, file);
+        return true;
+    }
+    case CBM_LANG_PERL: {
+        /* `use A::B` loads A/B.pm from @INC; a distribution's lib is on it. */
+        char file[PKGMAP_PATH_BUF];
+        int length = snprintf(file, sizeof(file), "%s.pm", path);
+        if (length <= 0 || (size_t)length >= sizeof(file) || !strstr(path, "::")) {
+            /* A single word is most often a pragma; only a real file binds it. */
+            if (length <= 0 || (size_t)length >= sizeof(file)) {
+                *reason = "perl_module_name_too_long";
+                return true;
+            }
+        }
+        for (char *p = file; (p = strstr(p, "::"));) {
+            *p = '/';
+            memmove(p + 1, p + 2, strlen(p + 2) + 1);
+        }
+        *reason = "perl_use_distribution_lib";
+        *out = resolve_ancestor_lib_file(ctx, source_rel, file);
+        return true;
+    }
+    case CBM_LANG_ERLANG:
+        if (imp->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH) {
+            directory = path_dirname(source_rel);
+            *reason = "erlang_include_next_to_source";
+            if (directory && cbm_repo_rel_join(directory, path, joined, sizeof(joined)))
+                *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+            return true;
+        }
+        *reason = "erlang_module_is_its_file";
+        *out = resolve_source_module(ctx, namespace_map, "erlang_module", path, ambiguous);
+        return true;
+    case CBM_LANG_ELIXIR:
+        *reason = "elixir_declared_module";
+        *out = resolve_source_module(ctx, namespace_map, "elixir_module", path, ambiguous);
+        return true;
+    default:
+        return false;
+    }
+}
+
 static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ctx,
                                                     const char *source_rel,
                                                     const char *source_file_qn,
@@ -4246,6 +4443,10 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
         *reason = "unsupported_import_language";
         return NULL;
     }
+    const cbm_gbuf_node_t *source_language_target = NULL;
+    if (resolve_source_language_import(ctx, source_rel, imp, namespace_map, lang, ambiguous, reason,
+                                       &source_language_target))
+        return source_language_target;
     /* ECMAScript carriers retain raw StringLiteral spelling. Until escape
      * decoding is proved, a backslash must not become a filesystem separator
      * during File-QN lookup. This shared negative gate also protects callable

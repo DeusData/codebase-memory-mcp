@@ -31,6 +31,8 @@ static void parse_java_imports(CBMExtractCtx *ctx);
 static void parse_rust_imports(CBMExtractCtx *ctx);
 static void parse_c_imports(CBMExtractCtx *ctx);
 static void parse_ruby_imports(CBMExtractCtx *ctx);
+static void parse_erlang_imports(CBMExtractCtx *ctx);
+static void parse_elixir_imports(CBMExtractCtx *ctx);
 static void parse_lua_imports(CBMExtractCtx *ctx);
 static void parse_r_imports(CBMExtractCtx *ctx);
 static void parse_kotlin_imports(CBMExtractCtx *ctx);
@@ -2111,10 +2113,108 @@ static void parse_ruby_imports(CBMExtractCtx *ctx) {
             continue;
         }
 
+        /* require_relative names a path from this file; plain require searches
+         * the load path. An interpolated string names neither. */
+        const char *ruby_method = ruby_require_method(a, node, ctx->source);
         CBMImport imp = {.local_name = path_last(a, arg_text), .module_path = arg_text};
+        if (ruby_method && !strcmp(ruby_method, "require_relative") && !strstr(arg_text, "#{"))
+            imp.kind = CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH;
         push_import_at(ctx, node, imp);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+}
+
+/* `-module` names this file, so it is not a dependency. -import and -behaviour
+ * name another module, -include and -include_lib a header path. */
+static void parse_erlang_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        TSNode path = (TSNode){0};
+        bool header = false;
+        if (!strcmp(kind, "import_attribute")) {
+            path = ts_node_child_by_field_name(node, TS_FIELD("module"));
+        } else if (!strcmp(kind, "behaviour_attribute")) {
+            path = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        } else if (!strcmp(kind, "pp_include") || !strcmp(kind, "pp_include_lib")) {
+            path = ts_node_child_by_field_name(node, TS_FIELD("file"));
+            header = true;
+        }
+        if (ts_node_is_null(path))
+            continue;
+        char *text = strip_quotes(a, cbm_node_text(a, path, ctx->source));
+        if (!text || !text[0])
+            continue;
+        CBMImport imp = {.local_name = path_last(a, text), .module_path = text};
+        if (header && !strcmp(kind, "pp_include"))
+            imp.kind = CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH;
+        push_import_at(ctx, path, imp);
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* alias, import, require and use name a module wherever they appear in a module
+ * body. `alias A.{B, C}` is one dependency per member. Code inside quote belongs
+ * to the expansion site, so it names nothing here. */
+static void elixir_push_module(CBMExtractCtx *ctx, TSNode site, const char *module) {
+    if (!module || !module[0])
+        return;
+    CBMImport imp = {.local_name = path_last(ctx->arena, module), .module_path = module};
+    push_import_at(ctx, site, imp);
+}
+
+static void parse_elixir_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "call") != 0) {
+            ts_nstack_push_children(&stack, node);
+            continue;
+        }
+        TSNode target = ts_node_child_by_field_name(node, TS_FIELD("target"));
+        char *name = !ts_node_is_null(target) && !strcmp(ts_node_type(target), "identifier")
+                         ? cbm_node_text(a, target, ctx->source)
+                         : NULL;
+        if (name && !strcmp(name, "quote"))
+            continue;
+        if (!name || (strcmp(name, "alias") && strcmp(name, "import") && strcmp(name, "require") &&
+                      strcmp(name, "use"))) {
+            ts_nstack_push_children(&stack, node);
+            continue;
+        }
+        TSNode arguments = cbm_find_child_by_kind(node, "arguments");
+        TSNode first = ts_node_is_null(arguments) ? (TSNode){0} : ts_node_named_child(arguments, 0);
+        if (ts_node_is_null(first))
+            continue;
+        if (!strcmp(ts_node_type(first), "alias")) {
+            elixir_push_module(ctx, first, cbm_node_text(a, first, ctx->source));
+        } else if (!strcmp(ts_node_type(first), "dot")) {
+            TSNode left = ts_node_child_by_field_name(first, TS_FIELD("left"));
+            TSNode right = ts_node_child_by_field_name(first, TS_FIELD("right"));
+            if (ts_node_is_null(left) || ts_node_is_null(right) ||
+                strcmp(ts_node_type(left), "alias") || strcmp(ts_node_type(right), "tuple"))
+                continue;
+            const char *prefix = cbm_node_text(a, left, ctx->source);
+            uint32_t members = ts_node_named_child_count(right);
+            for (uint32_t i = 0; prefix && i < members; i++) {
+                TSNode member = ts_node_named_child(right, i);
+                if (strcmp(ts_node_type(member), "alias"))
+                    continue;
+                elixir_push_module(
+                    ctx, member,
+                    cbm_arena_sprintf(a, "%s.%s", prefix, cbm_node_text(a, member, ctx->source)));
+            }
+        }
+    }
 }
 
 // --- Lua imports ---
@@ -4929,8 +5029,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_r_imports(ctx);
         break;
     case CBM_LANG_ELIXIR:
-        // Elixir: import/use/alias/require are call nodes
-        parse_generic_imports(ctx, "call");
+        parse_elixir_imports(ctx);
         break;
     case CBM_LANG_BASH:
         parse_shell_source_imports(ctx);
@@ -4942,7 +5041,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_zig_imports(ctx);
         break;
     case CBM_LANG_ERLANG:
-        parse_generic_imports(ctx, "module_attribute");
+        parse_erlang_imports(ctx);
         break;
     case CBM_LANG_HASKELL:
         parse_haskell_imports(ctx);

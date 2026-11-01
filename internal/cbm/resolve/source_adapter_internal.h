@@ -91,6 +91,8 @@ extern const cbm_source_adapter_t cbm_source_adapter_erlang;
 extern const cbm_source_adapter_t cbm_source_adapter_zig;
 extern const cbm_source_adapter_t cbm_source_adapter_perl;
 extern const cbm_source_adapter_t cbm_source_adapter_ruby;
+extern const cbm_source_adapter_t cbm_source_adapter_haskell;
+extern const cbm_source_adapter_t cbm_source_adapter_ocaml;
 
 /* One walk of a class chain. A class appears once on a linearized chain, so a
  * revisit adds nothing: a cycle or a diamond cannot make the walk exponential. */
