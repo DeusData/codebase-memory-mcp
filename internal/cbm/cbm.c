@@ -1093,6 +1093,11 @@ static uint64_t parse_error_bytes(TSTree *tree) {
     return bytes;
 }
 
+static bool csharp_line_starts(const char *line, size_t room, const char *word) {
+    size_t length = strlen(word);
+    return room >= length && !strncmp(line, word, length);
+}
+
 /* C#: the grammar reads `#if` only where a whole statement or member can stand, and
  * does not know `ref partial struct`. Either can turn a whole file into one ERROR,
  * taking every type it declares with it. This view has the same length and the same
@@ -1115,9 +1120,10 @@ static char *csharp_parse_view(const char *source, uint32_t length, bool *hid_br
             word++;
         const char *line = source + word;
         size_t room = end - word;
-        bool opens = room >= 3 && !strncmp(line, "#if", 3);
-        bool switches = (room >= 5 && (!strncmp(line, "#else", 5) || !strncmp(line, "#elif", 5)));
-        bool closes = room >= 6 && !strncmp(line, "#endif", 6);
+        bool opens = csharp_line_starts(line, room, "#if");
+        bool switches =
+            csharp_line_starts(line, room, "#else") || csharp_line_starts(line, room, "#elif");
+        bool closes = csharp_line_starts(line, room, "#endif");
         bool directive = opens || switches || closes;
         if (opens && depth < MAX_DEPTH)
             inactive[depth++] = false;
