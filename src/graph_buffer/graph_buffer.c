@@ -393,6 +393,27 @@ bool cbm_gbuf_capture_imports(cbm_gbuf_t *gb, const cbm_resolve_import_snapshot_
     return !gb->resolution_failed;
 }
 
+bool cbm_gbuf_reserve_resolutions(cbm_gbuf_t *gb, size_t additional) {
+    if (!gb || gb->resolution_failed || additional > SIZE_MAX - gb->resolution_count)
+        return false;
+    size_t needed = gb->resolution_count + additional;
+    if (needed <= gb->resolution_capacity)
+        return true;
+    if (needed > SIZE_MAX / sizeof(*gb->resolutions))
+        return false;
+    cbm_resolve_record_t *rows =
+        cbm_realloc(CBM_MEM_CLASS_GBUF_INDEX, gb->resolutions, needed * sizeof(*rows));
+    if (!rows)
+        return false;
+    gb->resolutions = rows;
+    gb->resolution_capacity = needed;
+    return true;
+}
+
+size_t cbm_gbuf_resolution_count(const cbm_gbuf_t *gb) {
+    return gb ? gb->resolution_count : 0;
+}
+
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record) {
     if (!gb || !record || gb->resolution_failed)
         return false;
@@ -433,11 +454,28 @@ bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *reco
     row.scope = gb_intern(gb, record->scope ? record->scope : "");
     row.relation = gb_intern(gb, record->relation ? record->relation : "");
     row.spelling = gb_intern(gb, record->spelling ? record->spelling : "");
-    row.properties_json = gb_intern(gb, record->properties_json ? record->properties_json : "{}");
+    /* Most occurrences abstain, and their properties are read only to be stored.
+     * Their span and line make each string unique, so it would never be shared;
+     * without them it almost always is. An edge's properties stay whole. */
+    bool properties_ok;
+    if (record->properties_tail) {
+        row.properties_tail = gb_intern(gb, record->properties_tail);
+        properties_ok = row.properties_tail != NULL;
+    } else if (!record->emitted) {
+        char *tail = cbm_resolve_properties_tail(record, &row.properties_line);
+        row.properties_tail = tail ? gb_intern(gb, tail) : NULL;
+        row.properties_json = NULL;
+        properties_ok = row.properties_tail != NULL;
+        cbm_free(CBM_MEM_CLASS_RESOLVE, tail);
+    } else {
+        row.properties_json =
+            gb_intern(gb, record->properties_json ? record->properties_json : "{}");
+        properties_ok = row.properties_json != NULL;
+    }
     row.result.target = gb_intern(gb, record->result.target ? record->result.target : "");
     row.result.reason = gb_intern(gb, record->result.reason ? record->result.reason : "");
     if (!row.file_path || !row.scope || !row.relation || !row.spelling || !row.result.target ||
-        !row.result.reason || !row.properties_json || !row.content_identity ||
+        !row.result.reason || !properties_ok || !row.content_identity ||
         !row.configuration_identity) {
         gb->resolution_failed = true;
         return false;

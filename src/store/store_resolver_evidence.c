@@ -8,7 +8,6 @@
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
 #include <yyjson/yyjson.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,11 +25,6 @@
  * A NULL text id means the empty string. Rows are inserted in primary-key order
  * and no secondary index exists, so every b-tree grows at its right edge and a
  * page is written once; that is what keeps the WAL the size of the data. */
-#define TEXT_OF(alias, column)                                                              \
-    "COALESCE((SELECT value FROM resolver_text t WHERE t.pid=" alias ".pid AND t.id=" alias \
-    "." column "),'')"
-#define O_TEXT(column) TEXT_OF("o", column)
-#define F_TEXT(column) TEXT_OF("f", column)
 
 /* resolver_lookups derives a fact's lookup status from its own columns, and the
  * expression spells these enum values. */
@@ -38,173 +32,114 @@ _Static_assert(CBM_RESOLVE_ANALYSIS_COMPLETE == 1, "resolver_lookups view encode
 _Static_assert(CBM_RESOLVE_BINDING_UNIQUE == 1, "resolver_lookups view encodes this value");
 _Static_assert(CBM_RESOLVE_BINDING_AMBIGUOUS == 2, "resolver_lookups view encodes this value");
 
-static const char
-    resolver_schema
-        [] =
-            "CREATE TABLE IF NOT EXISTS resolver_projects(pid INTEGER PRIMARY KEY,project TEXT NOT "
-            "NULL "
-            "UNIQUE,rules_version INTEGER NOT NULL);"
-            "CREATE TABLE IF NOT EXISTS resolver_text(pid INTEGER NOT NULL,id INTEGER NOT "
-            "NULL,value TEXT "
-            "NOT NULL,PRIMARY KEY(pid,id)) WITHOUT ROWID;"
-            "CREATE TABLE IF NOT EXISTS resolver_occurrence_rows(pid INTEGER NOT NULL,ordinal "
-            "INTEGER NOT "
-            "NULL,file INTEGER,scope INTEGER,relation INTEGER,spelling INTEGER,start_byte INTEGER "
-            "NOT "
-            "NULL,span INTEGER NOT NULL,source_origin INTEGER NOT NULL,binding INTEGER NOT "
-            "NULL,domain "
-            "INTEGER NOT NULL,analysis INTEGER NOT NULL,rule INTEGER NOT NULL,facts INTEGER NOT "
-            "NULL,target INTEGER,candidate_count INTEGER NOT NULL,reason INTEGER,emitted INTEGER "
-            "NOT "
-            "NULL,props INTEGER,line INTEGER NOT NULL,content INTEGER,configuration INTEGER,proof "
-            "INTEGER "
-            "NOT NULL,source_binding_proof INTEGER NOT NULL,PRIMARY KEY(pid,ordinal)) WITHOUT "
-            "ROWID;"
-            "CREATE TABLE IF NOT EXISTS resolver_fact_rows(pid INTEGER NOT NULL,id INTEGER NOT "
-            "NULL,kind "
-            "INTEGER NOT NULL,digest BLOB NOT NULL,source_project INTEGER,file INTEGER,module "
-            "INTEGER,scope INTEGER,content INTEGER,configuration INTEGER,source_origin INTEGER NOT "
-            "NULL,lookup_domain INTEGER,lookup_key INTEGER,declaration INTEGER,binding_identity "
-            "INTEGER,type_identity INTEGER,detail INTEGER,start_byte INTEGER NOT NULL,end_byte "
-            "INTEGER "
-            "NOT NULL,origin INTEGER NOT NULL,flags INTEGER NOT NULL,lookup_closed INTEGER NOT "
-            "NULL,binding INTEGER NOT NULL,domain INTEGER NOT NULL,analysis INTEGER NOT NULL,rule "
-            "INTEGER "
-            "NOT NULL,facts INTEGER NOT NULL,target INTEGER,candidate_count INTEGER NOT "
-            "NULL,reason "
-            "INTEGER,predecessors_closed INTEGER NOT NULL,PRIMARY KEY(pid,id)) WITHOUT ROWID;"
-            "CREATE TABLE IF NOT EXISTS resolver_support_rows(pid INTEGER NOT NULL,fact INTEGER "
-            "NOT "
-            "NULL,ordinal INTEGER NOT NULL,premise INTEGER NOT NULL,PRIMARY KEY(pid,fact,ordinal)) "
-            "WITHOUT ROWID;"
-            "CREATE TABLE IF NOT EXISTS resolver_file_summaries(project TEXT NOT NULL,file_path "
-            "TEXT "
-            "NOT NULL,module TEXT NOT NULL,language INTEGER NOT NULL,raw_content_identity TEXT NOT "
-            "NULL,preprocessed_content_identity TEXT NOT NULL,configuration_identity TEXT NOT "
-            "NULL,raw_length INTEGER NOT NULL,preprocessed_length INTEGER NOT "
-            "NULL,extracted_summary TEXT "
-            "NOT NULL,derived_summary TEXT NOT NULL,complete INTEGER NOT NULL,PRIMARY "
-            "KEY(project,file_path));"
-            "CREATE TABLE IF NOT EXISTS resolver_derived_bindings(project TEXT NOT NULL,file_path "
-            "TEXT "
-            "NOT NULL,key TEXT NOT NULL,kind INTEGER NOT NULL,module INTEGER NOT NULL,closed "
-            "INTEGER NOT "
-            "NULL,binding INTEGER NOT NULL,domain INTEGER NOT NULL,analysis INTEGER NOT "
-            "NULL,target TEXT "
-            "NOT NULL,proof INTEGER NOT NULL,payload_json TEXT NOT NULL DEFAULT '{}',PRIMARY "
-            "KEY(project,file_path,key,kind));"
-            "CREATE VIEW IF NOT EXISTS "
-            "resolver_occurrences(project,ordinal,file_path,scope,relation,"
-            "spelling,start_byte,end_byte,source_origin,binding,domain,analysis,rule,facts,target,"
-            "candidate_count,reason,emitted,rules_version,properties_json) AS SELECT "
-            "p.project,o.ordinal,"
-            "" O_TEXT("file") "," O_TEXT("scope") "," O_TEXT("relation") "," O_TEXT(
-                "spelling") ","
-                            "o.start_byte,o.start_byte+o.span,o.source_origin,o.binding,o.domain,o."
-                            "analysis,o.rule,"
-                            "o.facts," O_TEXT("target") ",o.candidate_count," O_TEXT(
-                                "reason") ","
-                                          "o.emitted,p.rules_version,CASE WHEN o.line<0 "
-                                          "THEN " O_TEXT(
-                                              "props") " ELSE "
-                                                       "'{\"strategy\":\"shared_resolver\","
-                                                       "\"resolver_rule\":'||o.rule||',\"start_"
-                                                       "byte\":'||"
-                                                       "o.start_byte||',\"end_byte\":'||(o.start_"
-                                                       "byte+o.span)||',\"source_origin\":'||"
-                                                       "o.source_origin||CASE WHEN o.line>0 THEN "
-                                                       "replace(" O_TEXT(
-                                                           "props") ",char(1),"
-                                                                    "',\"line\":'||o.line) "
-                                                                    "ELSE " O_TEXT(
-                                                                        "props") " END END "
-                                                                                 "FROM "
-                                                                                 "resolver_"
-                                                                                 "projects p JOIN "
-                                                                                 "resolver_"
-                                                                                 "occurrence_rows "
-                                                                                 "o ON o.pid=p.pid;"
-                                                                                 "CREATE VIEW IF "
-                                                                                 "NOT EXISTS "
-                                                                                 "resolver_"
-                                                                                 "occurrence_"
-                                                                                 "evidence(project,"
-                                                                                 "ordinal,content_"
-                                                                                 "identity,"
-                                                                                 "configuration_"
-                                                                                 "identity,proof,"
-                                                                                 "source_binding_"
-                                                                                 "proof) AS SELECT "
-                                                                                 "p.project,o."
-                                                                                 "ordinal,"
-                                                                                 "" O_TEXT("conten"
-                                                                                           "t") "," O_TEXT(
-                                                                                     "configuratio"
-                                                                                     "n") ",o."
-                                                                                          "proof,o."
-                                                                                          "source_"
-                                                                                          "binding_"
-                                                                                          "proof "
-                                                                                          "FROM "
-                                                                                          "resolver"
-                                                                                          "_project"
-                                                                                          "s p "
-                                                                                          "JOIN "
-                                                                                          "resolver"
-                                                                                          "_occurre"
-                                                                                          "nce_"
-                                                                                          "rows o "
-                                                                                          "ON "
-                                                                                          "o.pid=p."
-                                                                                          "pid;"
-                                                                                          "CREATE "
-                                                                                          "VIEW IF "
-                                                                                          "NOT "
-                                                                                          "EXISTS "
-                                                                                          "resolver"
-                                                                                          "_facts("
-                                                                                          "project,"
-                                                                                          "id,kind,"
-                                                                                          "source_"
-                                                                                          "file,"
-                                                                                          "digest,"
-                                                                                          "payload)"
-                                                                                          " AS "
-                                                                                          "SELECT "
-                                                                                          "p."
-                                                                                          "project,"
-                                                                                          "f.id,f."
-                                                                                          "kind"
-                                                                                          "," F_TEXT(
-                                                                                              "fil"
-                                                                                              "e") ",lower(hex(f.digest)),json_object("
-                                                                                                   "'kind',f.kind,'project'," F_TEXT("source_project") ",'file'," F_TEXT("file") ","
-                                                                                                                                                                                 "'module'," F_TEXT(
-                                                                                                                                                                                     "module") ",'scope'," F_TEXT("scope") ","
-                                                                                                                                                                                                                           "'content_identity'," F_TEXT("content") ",'configuration_identity'," F_TEXT("configuration") ","
-                                                                                                                                                                                                                                                                                                                        "'source_origin',f.source_origin,'lookup_domain'," F_TEXT("lookup_domain") ","
-                                                                                                                                                                                                                                                                                                                                                                                                   "'lookup_key'," F_TEXT(
-                                                                                                                                                                                                                                                                                                                                                                                                       "lookup_key") ",'declaration_identity'," F_TEXT("declaration") ","
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                      "'binding_identity'," F_TEXT("binding_identity") ",'type_identity'," F_TEXT(
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                          "type_identity") ","
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           "'detail'," F_TEXT("detail") ",'start_byte',f.start_byte,'end_byte',f.end_byte,"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "'origin',f.origin,'flags',f.flags,'lookup_closed',f.lookup_closed,'binding',f.binding,"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "'domain',f.domain,'analysis',f.analysis,'rule',f.rule,'facts',f.facts,"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "'target'," F_TEXT(
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            "target") ",'candidate_count',f.candidate_count,"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      "'reason'," F_TEXT(
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          "reason") ",'predecessors_closed',f.predecessors_closed) "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "FROM resolver_projects p JOIN resolver_fact_rows f ON f.pid=p.pid;"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "CREATE VIEW IF NOT EXISTS resolver_supports(project,fact,ordinal,premise) AS SELECT "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "p.project,s.fact,s.ordinal,s.premise FROM resolver_projects p JOIN resolver_support_rows s "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "ON s.pid=p.pid;"
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "CREATE VIEW IF NOT EXISTS resolver_lookups(project,fact,domain,key,status) AS SELECT "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    "p.project,f.id," F_TEXT(
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "lookup_domain") "," F_TEXT("lookup_key") ","
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  "CASE WHEN f.analysis<>1 OR NOT f.predecessors_closed OR NOT f.lookup_closed THEN "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  "'incomplete' WHEN f.binding=2 THEN 'ambiguous' WHEN f.binding=1 THEN 'positive' ELSE "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  "'closed_negative' END FROM resolver_projects p JOIN resolver_fact_rows f ON f.pid=p.pid "
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  "WHERE f.lookup_domain IS NOT NULL AND f.lookup_key IS NOT NULL;";
+/* @o.file@ reads the string behind that id; schema_sql spells out the lookup. */
+static const char resolver_schema[] =
+    "CREATE TABLE IF NOT EXISTS resolver_projects(pid INTEGER PRIMARY KEY,"
+    "project TEXT NOT NULL UNIQUE,rules_version INTEGER NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS resolver_text(pid INTEGER NOT NULL,id INTEGER NOT NULL,"
+    "value TEXT NOT NULL,PRIMARY KEY(pid,id)) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS resolver_occurrence_rows(pid INTEGER NOT NULL,"
+    "ordinal INTEGER NOT NULL,file INTEGER,scope INTEGER,relation INTEGER,spelling INTEGER,"
+    "start_byte INTEGER NOT NULL,span INTEGER NOT NULL,source_origin INTEGER NOT NULL,"
+    "binding INTEGER NOT NULL,domain INTEGER NOT NULL,analysis INTEGER NOT NULL,"
+    "rule INTEGER NOT NULL,facts INTEGER NOT NULL,target INTEGER,"
+    "candidate_count INTEGER NOT NULL,reason INTEGER,emitted INTEGER NOT NULL,props INTEGER,"
+    "line INTEGER NOT NULL,content INTEGER,configuration INTEGER,proof INTEGER NOT NULL,"
+    "source_binding_proof INTEGER NOT NULL,PRIMARY KEY(pid,ordinal)) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS resolver_fact_rows(pid INTEGER NOT NULL,id INTEGER NOT NULL,"
+    "kind INTEGER NOT NULL,digest BLOB NOT NULL,source_project INTEGER,file INTEGER,"
+    "module INTEGER,scope INTEGER,content INTEGER,configuration INTEGER,"
+    "source_origin INTEGER NOT NULL,lookup_domain INTEGER,lookup_key INTEGER,"
+    "declaration INTEGER,binding_identity INTEGER,type_identity INTEGER,detail INTEGER,"
+    "start_byte INTEGER NOT NULL,end_byte INTEGER NOT NULL,origin INTEGER NOT NULL,"
+    "flags INTEGER NOT NULL,lookup_closed INTEGER NOT NULL,binding INTEGER NOT NULL,"
+    "domain INTEGER NOT NULL,analysis INTEGER NOT NULL,rule INTEGER NOT NULL,"
+    "facts INTEGER NOT NULL,target INTEGER,candidate_count INTEGER NOT NULL,reason INTEGER,"
+    "predecessors_closed INTEGER NOT NULL,PRIMARY KEY(pid,id)) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS resolver_support_rows(pid INTEGER NOT NULL,"
+    "fact INTEGER NOT NULL,ordinal INTEGER NOT NULL,premise INTEGER NOT NULL,"
+    "PRIMARY KEY(pid,fact,ordinal)) WITHOUT ROWID;"
+    "CREATE TABLE IF NOT EXISTS resolver_file_summaries(project TEXT NOT NULL,"
+    "file_path TEXT NOT NULL,module TEXT NOT NULL,language INTEGER NOT NULL,"
+    "raw_content_identity TEXT NOT NULL,preprocessed_content_identity TEXT NOT NULL,"
+    "configuration_identity TEXT NOT NULL,raw_length INTEGER NOT NULL,"
+    "preprocessed_length INTEGER NOT NULL,extracted_summary TEXT NOT NULL,"
+    "derived_summary TEXT NOT NULL,complete INTEGER NOT NULL,"
+    "PRIMARY KEY(project,file_path));"
+    "CREATE TABLE IF NOT EXISTS resolver_derived_bindings(project TEXT NOT NULL,"
+    "file_path TEXT NOT NULL,key TEXT NOT NULL,kind INTEGER NOT NULL,module INTEGER NOT NULL,"
+    "closed INTEGER NOT NULL,binding INTEGER NOT NULL,domain INTEGER NOT NULL,"
+    "analysis INTEGER NOT NULL,target TEXT NOT NULL,proof INTEGER NOT NULL,"
+    "payload_json TEXT NOT NULL DEFAULT '{}',PRIMARY KEY(project,file_path,key,kind));"
+    "CREATE VIEW IF NOT EXISTS resolver_occurrences(project,ordinal,file_path,scope,relation,"
+    "spelling,start_byte,end_byte,source_origin,binding,domain,analysis,rule,facts,target,"
+    "candidate_count,reason,emitted,rules_version,properties_json) AS "
+    "SELECT p.project,o.ordinal,@o.file@,@o.scope@,@o.relation@,@o.spelling@,o.start_byte,"
+    "o.start_byte+o.span,o.source_origin,o.binding,o.domain,o.analysis,o.rule,o.facts,"
+    "@o.target@,o.candidate_count,@o.reason@,o.emitted,p.rules_version,"
+    "CASE WHEN o.line<0 THEN @o.props@ ELSE "
+    "'{\"strategy\":\"shared_resolver\",\"resolver_rule\":'||o.rule||"
+    "',\"start_byte\":'||o.start_byte||',\"end_byte\":'||(o.start_byte+o.span)||"
+    "',\"source_origin\":'||o.source_origin||"
+    "CASE WHEN o.line>0 THEN replace(@o.props@,char(1),',\"line\":'||o.line) "
+    "ELSE @o.props@ END END "
+    "FROM resolver_projects p JOIN resolver_occurrence_rows o ON o.pid=p.pid;"
+    "CREATE VIEW IF NOT EXISTS resolver_occurrence_evidence(project,ordinal,content_identity,"
+    "configuration_identity,proof,source_binding_proof) AS "
+    "SELECT p.project,o.ordinal,@o.content@,@o.configuration@,o.proof,o.source_binding_proof "
+    "FROM resolver_projects p JOIN resolver_occurrence_rows o ON o.pid=p.pid;"
+    "CREATE VIEW IF NOT EXISTS resolver_facts(project,id,kind,source_file,digest,payload) AS "
+    "SELECT p.project,f.id,f.kind,@f.file@,lower(hex(f.digest)),json_object('kind',f.kind,"
+    "'project',@f.source_project@,'file',@f.file@,'module',@f.module@,'scope',@f.scope@,"
+    "'content_identity',@f.content@,'configuration_identity',@f.configuration@,"
+    "'source_origin',f.source_origin,'lookup_domain',@f.lookup_domain@,"
+    "'lookup_key',@f.lookup_key@,'declaration_identity',@f.declaration@,"
+    "'binding_identity',@f.binding_identity@,'type_identity',@f.type_identity@,"
+    "'detail',@f.detail@,'start_byte',f.start_byte,'end_byte',f.end_byte,'origin',f.origin,"
+    "'flags',f.flags,'lookup_closed',f.lookup_closed,'binding',f.binding,'domain',f.domain,"
+    "'analysis',f.analysis,'rule',f.rule,'facts',f.facts,'target',@f.target@,"
+    "'candidate_count',f.candidate_count,'reason',@f.reason@,"
+    "'predecessors_closed',f.predecessors_closed) "
+    "FROM resolver_projects p JOIN resolver_fact_rows f ON f.pid=p.pid;"
+    "CREATE VIEW IF NOT EXISTS resolver_supports(project,fact,ordinal,premise) AS "
+    "SELECT p.project,s.fact,s.ordinal,s.premise "
+    "FROM resolver_projects p JOIN resolver_support_rows s ON s.pid=p.pid;"
+    "CREATE VIEW IF NOT EXISTS resolver_lookups(project,fact,domain,key,status) AS "
+    "SELECT p.project,f.id,@f.lookup_domain@,@f.lookup_key@,CASE "
+    "WHEN f.analysis<>1 OR NOT f.predecessors_closed OR NOT f.lookup_closed THEN 'incomplete' "
+    "WHEN f.binding=2 THEN 'ambiguous' WHEN f.binding=1 THEN 'positive' "
+    "ELSE 'closed_negative' END "
+    "FROM resolver_projects p JOIN resolver_fact_rows f ON f.pid=p.pid "
+    "WHERE f.lookup_domain IS NOT NULL AND f.lookup_key IS NOT NULL;";
+
+/* A view reads 2-3 of a row's text columns far more often than all of them. A
+ * scalar lookup costs only the columns a query names, which a JOIN would not. */
+static char *schema_sql(void) {
+    size_t markers = 0;
+    for (const char *at = resolver_schema; *at; at++)
+        markers += *at == '@';
+    size_t capacity = sizeof(resolver_schema) + markers * 64;
+    char *out = cbm_alloc(CBM_MEM_CLASS_STORE, capacity);
+    if (!out)
+        return NULL;
+    char *to = out;
+    for (const char *at = resolver_schema; *at;) {
+        if (*at != '@') {
+            *to++ = *at++;
+            continue;
+        }
+        const char *name = at + 1;
+        const char *end = strchr(name, '@');
+        const char *dot = strchr(name, '.');
+        to += snprintf(to, capacity - (size_t)(to - out),
+                       "COALESCE((SELECT value FROM resolver_text t WHERE t.pid=%.*s.pid AND "
+                       "t.id=%.*s),'')",
+                       (int)(dot - name), name, (int)(end - name), name);
+        at = end + 1;
+    }
+    *to = '\0';
+    return out;
+}
 
 enum {
     DIGEST_BYTES = 32,
@@ -611,8 +546,10 @@ static bool project_id(sqlite3 *db, const char *project, sqlite3_int64 *pid) {
     return ok;
 }
 static bool reset_tables(sqlite3 *db, const char *project, sqlite3_int64 *pid) {
-    if (sqlite3_exec(db, resolver_schema, NULL, NULL, NULL) != SQLITE_OK ||
-        !project_id(db, project, pid))
+    char *schema = schema_sql();
+    bool created = schema && sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK;
+    cbm_free(CBM_MEM_CLASS_STORE, schema);
+    if (!created || !project_id(db, project, pid))
         return false;
     const char *by_pid[] = {"DELETE FROM resolver_text WHERE pid=?",
                             "DELETE FROM resolver_occurrence_rows WHERE pid=?",
@@ -641,55 +578,25 @@ static bool reset_tables(sqlite3 *db, const char *project, sqlite3_int64 *pid) {
 
 /* ── Occurrences ─────────────────────────────────────────────────── */
 
-/* An occurrence's properties are its own columns plus what only the call site
- * knows. pass_resolver's head is rebuilt by the view and the remainder is
- * interned without its line number, so calls that differ only by position share
- * one record. Any other shape is kept verbatim, which line<0 records. char(1)
- * marks the line: JSON cannot carry a raw control byte, and one that arrived
- * anyway forces the verbatim form, so the view's replace() always round-trips. */
+/* A row that produced no edge already arrives split; any other is split here. */
 static sqlite3_int64 properties_id(evidence_write_t *w, const cbm_resolve_record_t *row,
-                                   sqlite3_int64 *line) {
-    const char *json = row->properties_json ? row->properties_json : "{}";
-    char head[160];
-    int head_length = snprintf(
-        head, sizeof(head),
-        "{\"strategy\":\"shared_resolver\",\"resolver_rule\":%d,\"start_byte\":%u,\"end_byte\":%u,"
-        "\"source_origin\":%u",
-        (int)row->result.rule, row->start_byte, row->end_byte, row->source_origin);
-    *line = -1;
-    if (head_length <= 0 || (size_t)head_length >= sizeof(head) ||
-        strncmp(json, head, (size_t)head_length) || strchr(json, 1))
-        return dict_id(w, json, false);
-    const char *rest = json + head_length;
-    static const char key[] = ",\"line\":";
-    const char *at = strstr(rest, key);
-    *line = 0;
-    if (!at)
-        return dict_id(w, rest, false);
-    const char *digits = at + sizeof(key) - 1;
-    const char *end = digits;
-    sqlite3_int64 value = 0;
-    while (*end >= '0' && *end <= '9' && value < INT_MAX)
-        value = value * 10 + (*end++ - '0');
-    if (end == digits || *digits == '0' || (*end >= '0' && *end <= '9'))
-        return dict_id(w, rest, false);
-    size_t before = (size_t)(at - rest), after = strlen(end);
-    char *tail = cbm_alloc(CBM_MEM_CLASS_STORE, before + after + 2);
+                                   int32_t *line) {
+    if (row->properties_tail) {
+        *line = row->properties_line;
+        return dict_id(w, row->properties_tail, true);
+    }
+    char *tail = cbm_resolve_properties_tail(row, line);
     if (!tail)
         return -1;
-    memcpy(tail, rest, before);
-    tail[before] = 1;
-    memcpy(tail + before + 1, end, after + 1);
-    *line = value;
     sqlite3_int64 id = dict_id(w, tail, false);
-    cbm_free(CBM_MEM_CLASS_STORE, tail);
+    cbm_free(CBM_MEM_CLASS_RESOLVE, tail);
     return id;
 }
 static bool bind_occurrence(evidence_write_t *w, const cbm_resolve_record_t *row, size_t ordinal,
                             const evidence_id_t *proof, const evidence_id_t *binding) {
     sqlite3_stmt *s = w->occurrence;
     const cbm_resolve_result_t *r = &row->result;
-    sqlite3_int64 line = -1;
+    int32_t line = -1;
     return sqlite3_bind_int64(s, 1, w->pid) == SQLITE_OK &&
            sqlite3_bind_int64(s, 2, (sqlite3_int64)ordinal) == SQLITE_OK &&
            bind_id(w, s, 3, row->file_path) && bind_id(w, s, 4, row->scope) &&

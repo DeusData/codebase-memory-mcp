@@ -75,10 +75,13 @@ struct cbm_resolve_proof {
 };
 
 typedef struct cbm_resolve_proof_entry cbm_resolve_proof_entry_t;
+typedef struct cbm_resolve_proof_text cbm_resolve_proof_text_t;
 typedef struct cbm_resolve_proof_pool {
     CBMArena *arena;
     cbm_resolve_proof_entry_t **buckets;
     size_t capacity, count;
+    cbm_resolve_proof_text_t *texts;
+    size_t text_capacity, text_count;
     uint64_t work, work_limit;
     size_t node_limit, premise_limit;
     cbm_resolve_analysis_t failure;

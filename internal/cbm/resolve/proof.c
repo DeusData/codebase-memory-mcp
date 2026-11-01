@@ -14,6 +14,10 @@ struct cbm_resolve_proof_entry {
     cbm_resolve_proof_t node;
     struct cbm_resolve_proof_entry *next;
 };
+struct cbm_resolve_proof_text {
+    const char *text;
+    uint64_t hash;
+};
 
 typedef struct {
     const cbm_resolve_proof_t *source;
@@ -206,13 +210,54 @@ static bool grow_pool(cbm_resolve_proof_pool_t *pool) {
     pool->capacity = capacity;
     return true;
 }
+static cbm_resolve_proof_text_t *text_slot(cbm_resolve_proof_text_t *slots, size_t capacity,
+                                           const char *text, uint64_t hash) {
+    size_t at = (size_t)(hash ^ (hash >> 31)) & (capacity - 1);
+    while (slots[at].text && (slots[at].hash != hash || strcmp(slots[at].text, text)))
+        at = (at + 1) & (capacity - 1);
+    return &slots[at];
+}
+static bool grow_texts(cbm_resolve_proof_pool_t *pool) {
+    if (pool->text_capacity && pool->text_count < pool->text_capacity / 2)
+        return true;
+    size_t capacity = pool->text_capacity ? pool->text_capacity * 2 : 64;
+    if (capacity < pool->text_capacity || capacity > SIZE_MAX / sizeof(*pool->texts))
+        return false;
+    cbm_resolve_proof_text_t *slots = cbm_arena_calloc(pool->arena, capacity * sizeof(*slots));
+    if (!slots)
+        return false;
+    for (size_t i = 0; i < pool->text_capacity; i++)
+        if (pool->texts[i].text)
+            *text_slot(slots, capacity, pool->texts[i].text, pool->texts[i].hash) = pool->texts[i];
+    pool->texts = slots;
+    pool->text_capacity = capacity;
+    return true;
+}
+/* A fact repeats its project, file, scope and two content identities, and a
+ * project holds millions of facts: every distinct string is stored once per
+ * pool. Identity stays full-string comparison; sharing is only storage. */
 static bool own_text(cbm_resolve_proof_pool_t *pool, const char **field) {
     if (!*field || !**field) {
         *field = NULL;
         return true;
     }
-    *field = cbm_arena_strdup(pool->arena, *field);
-    return *field || proof_fail(pool, CBM_RESOLVE_ANALYSIS_FAILED);
+    if (!grow_texts(pool))
+        return proof_fail(pool, CBM_RESOLVE_ANALYSIS_FAILED);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *at = (const unsigned char *)*field; *at; at++) {
+        hash ^= *at;
+        hash *= UINT64_C(1099511628211);
+    }
+    cbm_resolve_proof_text_t *slot = text_slot(pool->texts, pool->text_capacity, *field, hash);
+    if (!slot->text) {
+        const char *copy = cbm_arena_strdup(pool->arena, *field);
+        if (!copy)
+            return proof_fail(pool, CBM_RESOLVE_ANALYSIS_FAILED);
+        *slot = (cbm_resolve_proof_text_t){.text = copy, .hash = hash};
+        pool->text_count++;
+    }
+    *field = slot->text;
+    return true;
 }
 static bool own_payload(cbm_resolve_proof_pool_t *pool, cbm_resolve_proof_view_t *v) {
     const char **fields[] = {&v->source.project,
@@ -234,9 +279,22 @@ static bool own_payload(cbm_resolve_proof_pool_t *pool, cbm_resolve_proof_view_t
             return false;
     return true;
 }
+/* Charges the same work as hashing. A clone's fingerprint is its source's: the
+ * payload is equal and its premises were cloned with the same fingerprints, so
+ * only the charge remains to be paid. Hashing was a fifth of the resolve pass. */
+static bool proof_charge(cbm_resolve_proof_pool_t *pool, const cbm_resolve_proof_view_t *v) {
+    const char *strings[16];
+    size_t count = proof_strings(v, strings);
+    for (size_t i = 0; i < count; i++)
+        if (!proof_step(pool, strlen(text_or_empty(strings[i])) + 1))
+            return false;
+    return true;
+}
 static const cbm_resolve_proof_t *intern(cbm_resolve_proof_pool_t *pool,
-                                         cbm_resolve_proof_view_t value) {
-    if (!proof_step(pool, 1) || !proof_hash(pool, &value) || !grow_pool(pool))
+                                         cbm_resolve_proof_view_t value, bool fingerprinted) {
+    if (!proof_step(pool, 1) ||
+        !(fingerprinted ? proof_charge(pool, &value) : proof_hash(pool, &value)) ||
+        !grow_pool(pool))
         return NULL;
     size_t slot = value.fingerprint & (pool->capacity - 1);
     for (cbm_resolve_proof_entry_t *e = pool->buckets[slot]; e; e = e->next) {
@@ -308,7 +366,7 @@ const cbm_resolve_proof_t *cbm_resolve_proof_leaf(cbm_resolve_proof_pool_t *pool
     }
     if (source)
         value.source = *source;
-    return intern(pool, value);
+    return intern(pool, value, false);
 }
 
 static size_t memo_hash(const cbm_resolve_proof_t *proof) {
@@ -395,7 +453,7 @@ static const cbm_resolve_proof_t *walk_node(proof_walk_t *walk, const cbm_resolv
     if (ok && walk->pool) {
         cbm_resolve_proof_view_t value = proof->value;
         value.premises = premises;
-        result = intern(walk->pool, value);
+        result = intern(walk->pool, value, true);
     } else if (ok && walk->visit(proof, walk->context)) {
         result = proof;
     }
@@ -579,7 +637,7 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
             value.outcome.target = NULL;
             value.outcome.candidate_count = 0;
         }
-        result = intern(pool, value);
+        result = intern(pool, value, false);
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, premises);
     return result;

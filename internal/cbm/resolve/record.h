@@ -15,6 +15,10 @@ typedef struct {
     const char *relation;
     const char *spelling;
     const char *properties_json;
+    /* Set instead of properties_json on a stored row that produced no edge; see
+     * cbm_resolve_properties_tail. */
+    const char *properties_tail;
+    int32_t properties_line;
     uint32_t start_byte;
     uint32_t end_byte;
     uint32_t source_origin;

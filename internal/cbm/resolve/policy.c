@@ -1,7 +1,55 @@
 #include "policy.h"
 #include "proof.h"
+#include "foundation/mem_core.h"
 
+#include <limits.h>
+#include <stdio.h>
 #include <string.h>
+
+char *cbm_resolve_properties_tail(const cbm_resolve_record_t *record, int32_t *line) {
+    const char *json = record->properties_json ? record->properties_json : "{}";
+    char head[160];
+    int head_length = snprintf(
+        head, sizeof(head),
+        "{\"strategy\":\"shared_resolver\",\"resolver_rule\":%d,\"start_byte\":%u,\"end_byte\":%u,"
+        "\"source_origin\":%u",
+        (int)record->result.rule, record->start_byte, record->end_byte, record->source_origin);
+    const char *rest = json;
+    size_t before = strlen(json);
+    const char *after = NULL;
+    *line = -1;
+    if (head_length > 0 && (size_t)head_length < sizeof(head) &&
+        !strncmp(json, head, (size_t)head_length) && !strchr(json, 1)) {
+        rest = json + head_length;
+        before = strlen(rest);
+        *line = 0;
+        static const char key[] = ",\"line\":";
+        const char *at = strstr(rest, key);
+        const char *digits = at ? at + sizeof(key) - 1 : NULL;
+        const char *end = digits;
+        int64_t value = 0;
+        while (end && *end >= '0' && *end <= '9' && value <= INT_MAX)
+            value = value * 10 + (*end++ - '0');
+        /* A line this form cannot rebuild from its integer stays in the text. */
+        if (end && end != digits && *digits != '0' && value <= INT_MAX &&
+            !(*end >= '0' && *end <= '9')) {
+            before = (size_t)(at - rest);
+            after = end;
+            *line = (int32_t)value;
+        }
+    }
+    size_t tail = after ? strlen(after) + 1 : 0;
+    char *out = cbm_alloc(CBM_MEM_CLASS_RESOLVE, before + tail + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, rest, before);
+    if (after) {
+        out[before] = 1;
+        memcpy(out + before + 1, after, tail - 1);
+    }
+    out[before + tail] = '\0';
+    return out;
+}
 
 uint32_t cbm_resolve_rule_required_facts(cbm_resolve_rule_t rule) {
     const uint32_t common = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE;

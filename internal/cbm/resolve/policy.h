@@ -22,6 +22,15 @@ bool cbm_resolve_record_site_proof(const cbm_resolve_record_t *record,
  * denotes a file dependency and does not yet carry a token span. */
 bool cbm_resolve_record_admit(const cbm_resolve_record_t *record);
 
+/* An occurrence's properties minus what its own columns already say, so calls
+ * that differ only by position share one string. The result is what follows
+ * pass_resolver's head, with char(1) in place of the line. *line is that line,
+ * 0 when there is none, or -1 when the record has any other shape and the result
+ * is its whole text. JSON cannot carry a raw control byte, and one that arrived
+ * anyway forces the whole form, so the split always reverses exactly. The caller
+ * frees the result with cbm_free(CBM_MEM_CLASS_RESOLVE, ...). */
+char *cbm_resolve_properties_tail(const cbm_resolve_record_t *record, int32_t *line);
+
 /* Zero denotes an unsupported rule. Exported for diagnostics and adapters;
  * setting these bits without performing the lookup is not valid evidence. */
 uint32_t cbm_resolve_rule_required_facts(cbm_resolve_rule_t rule);
