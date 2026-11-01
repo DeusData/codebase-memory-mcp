@@ -408,61 +408,58 @@ void cbm_pipeline_emit_def_route(cbm_gbuf_t *gb, int64_t func_id, const CBMDefin
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm,
              cbm_route_canon_path(def->route_path, cpath, sizeof(cpath)));
     char rprops[CBM_SZ_256];
-    snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
+    char esc_m[CBM_SZ_128];
+    cbm_json_escape(esc_m, sizeof(esc_m), rm);
+    (void)snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", esc_m);
     int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", def->route_path, route_qn,
                                             def->file_path ? def->file_path : rel, 0, 0, rprops);
-    char hprops[CBM_SZ_512];
+    char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
+                               closing brace */
     char esc_h[CBM_SZ_512];
     cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
-    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
+    (void)snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
     cbm_gbuf_insert_edge(gb, func_id, route_id, "HANDLES", hprops);
 }
 
 /* Phase 2a: Ensure all functions with route_path properties have Route+HANDLES edges.
  * During incremental indexing, only changed files get Route nodes from extraction.
  * This pass scans ALL Function/Method nodes and creates missing Route+HANDLES. */
-/* Extract a JSON string property value into buf. Returns true if found. */
-static bool extract_json_prop(const char *json, const char *key, char *buf, int bufsz) {
-    if (!json) {
+/* Extract the string property `key` of a parsed properties object into buf,
+ * with its escapes decoded. Returns true if found: a non-empty string with no
+ * NUL that fits buf. Nothing is copied otherwise. */
+static bool extract_json_prop(yyjson_val *root, const char *key, char *buf, size_t bufsz) {
+    yyjson_val *val = yyjson_obj_get(root, key);
+    const char *str = yyjson_get_str(val);
+    size_t len = yyjson_get_len(val);
+    if (!str || len == 0 || len >= bufsz || memchr(str, '\0', len)) {
         return false;
     }
-    char pattern[CBM_SZ_64];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
-    const char *p = strstr(json, pattern);
-    if (!p) {
-        return false;
-    }
-    p += strlen(pattern);
-    const char *end = strchr(p, '"');
-    if (!end || end <= p) {
-        return false;
-    }
-    int len = (int)(end - p);
-    if (len >= bufsz) {
-        return false;
-    }
-    memcpy(buf, p, (size_t)len);
-    buf[len] = '\0';
+    memcpy(buf, str, len + SKIP_ONE);
     return true;
 }
 
 /* Process a single Function/Method node: create Route+HANDLES if it has route_path.
  * Returns 1 if a new HANDLES edge was created, 0 otherwise. */
 static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *func) {
-    if (!func->properties_json) {
+    /* Most nodes carry no route: skip them before parsing their properties. */
+    if (!func->properties_json || !strstr(func->properties_json, "\"route_path\"")) {
         return 0;
     }
 
+    /* Properties hold source text as its bytes, which need not be UTF-8. */
+    yyjson_doc *doc = yyjson_read(func->properties_json, strlen(func->properties_json),
+                                  YYJSON_READ_ALLOW_INVALID_UNICODE);
+    yyjson_val *root = yyjson_doc_get_root(doc);
     char path[CBM_SZ_256];
-    if (!extract_json_prop(func->properties_json, "route_path", path, sizeof(path))) {
-        return 0;
-    }
-    if (path[0] != '/') {
-        return 0;
-    }
-
     char method[CBM_SZ_16] = "ANY";
-    extract_json_prop(func->properties_json, "route_method", method, sizeof(method));
+    bool routed = extract_json_prop(root, "route_path", path, sizeof(path)) && path[0] == '/';
+    if (routed) {
+        extract_json_prop(root, "route_method", method, sizeof(method));
+    }
+    yyjson_doc_free(doc);
+    if (!routed) {
+        return 0;
+    }
 
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
@@ -471,7 +468,9 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
     const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(gb, route_qn);
 
     char rprops[CBM_SZ_256];
-    snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", method);
+    char esc_m[CBM_SZ_128];
+    cbm_json_escape(esc_m, sizeof(esc_m), method);
+    (void)snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", esc_m);
     int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", path, route_qn,
                                             func->file_path ? func->file_path : "", 0, 0, rprops);
 
@@ -486,9 +485,12 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         }
     }
 
-    char hprops[CBM_SZ_512];
-    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}",
-             func->qualified_name ? func->qualified_name : "");
+    /* The same properties cbm_pipeline_emit_def_route gives the edge. */
+    char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
+                               closing brace */
+    char esc_h[CBM_SZ_512];
+    cbm_json_escape(esc_h, sizeof(esc_h), func->qualified_name ? func->qualified_name : "");
+    (void)snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
     cbm_gbuf_insert_edge(gb, func->id, route_id, "HANDLES", hprops);
     return SKIP_ONE;
 }
@@ -1180,6 +1182,17 @@ typedef struct {
     int files_seen;
 } sveltekit_ctx_t;
 
+/* The properties of a SvelteKit handler's HANDLES edge: its QN, escaped as
+ * every HANDLES edge's handler is. */
+static void sveltekit_handles_props(char *out, size_t outsz, const cbm_gbuf_node_t *child,
+                                    bool is_actions) {
+    char esc_h[CBM_SZ_512];
+    cbm_json_escape(esc_h, sizeof(esc_h),
+                    child->qualified_name ? child->qualified_name : child->name);
+    (void)snprintf(out, outsz, "{\"handler\":\"%s\",\"framework\":\"sveltekit\"%s}", esc_h,
+                   is_actions ? ",\"via\":\"actions_object\"" : "");
+}
+
 /* Process one File node: if it matches a SvelteKit server-side file,
  * synthesise a Route node and HANDLES edges from any handler functions
  * (or actions Variable) defined in the file. */
@@ -1256,10 +1269,9 @@ static void sveltekit_file_visitor(const cbm_gbuf_node_t *node, void *userdata) 
         }
         ctx->routes_created++;
 
-        char hprops[CBM_SZ_256];
-        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"framework\":\"sveltekit\"%s}",
-                 child->qualified_name ? child->qualified_name : child->name,
-                 is_actions ? ",\"via\":\"actions_object\"" : "");
+        char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
+                                   closing brace */
+        sveltekit_handles_props(hprops, sizeof(hprops), child, is_actions);
         cbm_gbuf_insert_edge(ctx->gb, child->id, route_id, "HANDLES", hprops);
         ctx->handles_created++;
     }

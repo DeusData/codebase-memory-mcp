@@ -40,7 +40,7 @@ jobs:
             group: linux
             cc: gcc
             cxx: g++
-          - os: macos-14
+          - os: macos-15
             group: macos
             cc: cc
             cxx: c++
@@ -55,7 +55,8 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
 
       - name: Run bug-reproduction board
         if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == matrix.group }}

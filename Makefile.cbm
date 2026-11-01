@@ -18,8 +18,24 @@
 # that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
 # ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
 # leaving CC/CXX unchanged there.
-override CC := $(CC) $(ARCHFLAGS)
-override CXX := $(CXX) $(ARCHFLAGS)
+#
+# Minimum macOS version (Apple targets only). Without one, clang takes the
+# minimum from the SDK it compiles against (LC_BUILD_VERSION minos), so a
+# release built on a macos-15 runner would refuse to start on macOS 14. 14.0
+# keeps every macOS that could run a release built on the macos-14 runner
+# (retired 2026-11-02). A flag folded into the drivers like ARCHFLAGS, not an
+# exported MACOSX_DEPLOYMENT_TARGET: it reaches every compile AND link on every
+# build path (build.sh, test.sh, direct make) and is part of each command line.
+# Detected from the compiler's target, not the host, so a cross compiler run
+# on a Mac is left untouched.
+MACOS_MIN_VERSION := 14.0
+IS_APPLE_TARGET := $(shell echo | $(CC) $(ARCHFLAGS) -dM -E - 2>/dev/null | grep -q '__APPLE__' && echo yes || echo no)
+MACOS_MIN_FLAGS :=
+ifeq ($(IS_APPLE_TARGET),yes)
+MACOS_MIN_FLAGS := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+endif
+override CC := $(CC) $(ARCHFLAGS) $(MACOS_MIN_FLAGS)
+override CXX := $(CXX) $(ARCHFLAGS) $(MACOS_MIN_FLAGS)
 
 # ── Common flags ─────────────────────────────────────────────────
 
@@ -45,8 +61,9 @@ endif
 
 # -Wdate-time: with -Werror, any use of __DATE__/__TIME__/__TIMESTAMP__ fails the
 # build. Build-time entropy is how one identical source tree produced a new hash
-# on every compile (see the local patch in vendored/mimalloc/src/options.c) —
-# once removed, it must not creep back through a new call site.
+# on every compile (mimalloc's version banner, patched locally until upstream
+# dropped the clock in v3.4.5; see vendored/mimalloc/PATCHES.md) — once
+# removed, it must not creep back through a new call site.
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Wno-unused-parameter -Wno-sign-compare -Wdate-time \
                 $(GCC_ONLY_FLAGS) \
@@ -182,8 +199,9 @@ endif
 ifeq ($(IS_MINGW),yes)
 # --no-insert-timestamp: the PE header otherwise carries the link wall clock, so
 # two Windows builds of identical source are never byte-identical and every
-# release is a brand-new file to a reputation system. Same motivation as the
-# mimalloc __DATE__ patch; ELF and Mach-O have no equivalent field to clear.
+# release is a brand-new file to a reputation system. Same motivation as
+# dropping mimalloc's __DATE__ banner; ELF and Mach-O have no equivalent field
+# to clear.
 WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -lbcrypt -Wl,--allow-multiple-definition -Wl,--stack,8388608 -Wl,--no-insert-timestamp -static
 endif
 
@@ -644,6 +662,18 @@ ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
+# MI_MINGW_UCRT64: since 3.5.3, mimalloc treats a MinGW build as having a
+# process-attach hook only when this is defined (src/prim/windows/prim.c);
+# upstream's CMake sets it, this Makefile must too. Without it src/prim/prim.c
+# also compiles its constructor, so _mi_auto_process_init runs twice (that
+# constructor plus the CRT TLS callback) and the second options flush writes a
+# stray newline to stderr before main: a blank first line on every run, which
+# failed smoke-win's one-line --version check. Every MinGW toolchain we build
+# with (MSYS2 CLANG64/CLANGARM64) is UCRT. 3.3.2 had no such condition.
+MIMALLOC_WIN_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_DEFINE := -DMI_MINGW_UCRT64=1
+endif
 # MI_DEBUG=0: the production allocator is mimalloc's RELEASE build. Its header
 # defaults to MI_DEBUG=2 unless NDEBUG is defined, and nothing here defined it,
 # so every shipped binary up to v0.11.0 ran mimalloc's debug build: internal
@@ -653,15 +683,39 @@ endif
 # work inside the allocator (2026-09-17). Committed-bytes accounting, which the
 # memory budget reads, is kept in every build (subproc stats, not MI_STAT).
 # The TEST build below keeps mimalloc's debug checks.
+# MI_PROFILE=0: mimalloc 3.5.2+ compiles its allocation-sampling profiler in by
+# default, which puts a sample countdown on the allocation path. The product
+# never uses it, so the production allocator leaves it out (the contract in
+# tests/test_prod_allocator_contract.sh checks the banner has no profiling line).
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
-                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 \
-                  $(MIMALLOC_OVERRIDE_DEFINE)
+                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 -DMI_PROFILE=0 \
+                  $(MIMALLOC_OVERRIDE_DEFINE) $(MIMALLOC_WIN_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
-                       -DMI_OVERRIDE=0
+                       -DMI_OVERRIDE=0 $(MIMALLOC_WIN_DEFINE)
+# MI_WIN_INIT_USE_FLS (MinGW TEST build only) is an EXPERIMENT (R32) for the
+# Windows test leg's nondeterministic crash: 1-3 suites die in their first
+# test with 0xC0000005 and no sanitizer report, seen only on trees with
+# mimalloc 3.5.3. 3.5.3 is the first version whose loader hooks are live on
+# MinGW: TLS callbacks in .CRT$XLB/.CRT$XLY run _mi_auto_process_init under the
+# loader lock and _mi_thread_done on every thread detach. With FLS,
+# src/prim/windows/prim.c compiles none of those hooks; process init runs once,
+# from the constructor in src/prim/prim.c (no double init), and thread-done
+# goes through a fiber-local destructor. MI_DEBUG=1 is what FLS needs to run at
+# all: the first thread init (src/init.c) associates the main theap before the
+# FLS key exists, which trips an internal assertion in prim.c and aborts every
+# MI_DEBUG=2 process at startup. Level 1 keeps the fill patterns, padding and
+# double-free checks and drops only the internal assertions. The production
+# allocator (MIMALLOC_CFLAGS) is unchanged. Drop or promote this when the
+# experiment ends.
+MIMALLOC_WIN_TEST_DEFINE :=
+ifeq ($(IS_MINGW),yes)
+MIMALLOC_WIN_TEST_DEFINE := -DMI_WIN_INIT_USE_FLS=1 -DMI_DEBUG=1
+MIMALLOC_CFLAGS_TEST += $(MIMALLOC_WIN_TEST_DEFINE)
+endif
 
 # sqlite3 (vendored amalgamation — compiled ourselves for ASan instrumentation)
 # SQLITE_ENABLE_FTS5: enables the FTS5 full-text search extension used by the
@@ -1386,6 +1440,7 @@ LLVM_BIN := $(shell brew --prefix llvm 2>/dev/null)/bin
 CLANG_TIDY ?= $(shell [ -x "$(LLVM_BIN)/clang-tidy" ] && echo "$(LLVM_BIN)/clang-tidy" || echo clang-tidy)
 CLANG_FORMAT ?= $(shell [ -x "$(LLVM_BIN)/clang-format" ] && echo "$(LLVM_BIN)/clang-format" || echo clang-format)
 CPPCHECK ?= cppcheck
+CPPCHECK_JOBS ?= 2
 
 # macOS SDK sysroot (needed for Homebrew LLVM to find system headers)
 SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
@@ -1410,10 +1465,16 @@ lint-tidy:
 lint-tidy-diff:
 	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
-# cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck: complementary analysis (config in .cppcheck). A build directory
+# retains whole-program analysis with parallel workers; each run owns its state.
 lint-cppcheck:
 	@echo "=== cppcheck ==="
-	@$(CPPCHECK) --enable=warning,style,performance,portability \
+	@set -e; \
+		cppcheck_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/cbm-cppcheck.XXXXXX"); \
+		trap 'status=$$?; rm -rf "$$cppcheck_dir" || :; exit "$$status"' EXIT; \
+		trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; \
+		$(CPPCHECK) -j$(CPPCHECK_JOBS) --cppcheck-build-dir="$$cppcheck_dir" \
+		--enable=warning,style,performance,portability \
 		--std=c11 --language=c \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \
