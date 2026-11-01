@@ -82,6 +82,18 @@ static inline void *intptr_to_ptr(intptr_t v) {
 static atomic_int g_pipeline_busy = 0;
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static atomic_int g_last_worker_count = 0;
+
+void cbm_pipeline_worker_count_test_reset(void) {
+    atomic_store(&g_last_worker_count, 0);
+}
+
+int cbm_pipeline_worker_count_test_last(void) {
+    return atomic_load(&g_last_worker_count);
+}
+#endif
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static atomic_bool g_persist_test_fail_after_stage_dump = false;
 static atomic_bool g_persist_test_cancel_after_predump = false;
 static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
@@ -204,6 +216,7 @@ struct cbm_pipeline {
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
+    bool background; /* reserve CPU headroom when no user is waiting */
 
     /* Snapshot of the artifact export failure of THIS run (set only by
      * export_after_publish failure, zeroed at run start, cleared on success).
@@ -953,6 +966,12 @@ void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
 
 const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
     return p ? p->export_error : "";
+}
+
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background) {
+    if (p) {
+        p->background = background;
+    }
 }
 
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
@@ -1816,17 +1835,42 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     }
 }
 
+/* Two workers is the smallest width that takes the parallel route. */
+enum { PL_PARALLEL_MIN_WORKERS = 2 };
+
+/* Background refreshes leave CPU headroom, but never drop below two workers
+ * while the foreground width is two or more. WHY: one worker sends the indexer
+ * down the sequential route, which still builds a different graph than the
+ * parallel route (fewer Route and HANDLES edges, churned CALLS). Until the two
+ * routes agree, an automatic refresh must not change the graph only because
+ * the host has two or fewer performance cores. */
+int cbm_pipeline_background_worker_width(int foreground, int headroom) {
+    if (foreground >= PL_PARALLEL_MIN_WORKERS && headroom < PL_PARALLEL_MIN_WORKERS) {
+        return PL_PARALLEL_MIN_WORKERS;
+    }
+    return headroom;
+}
+
 /* Effective worker count. The crash supervisor re-runs its worker single-
  * threaded (CBM_INDEX_SINGLE_THREAD=1) so a per-file marker can pin the EXACT
  * crasher; a parallel re-run would race the marker. Honour that override
  * everywhere the worker count drives the parallel/sequential decision, so the
  * whole extraction phase collapses to the deterministic sequential path. */
-static int effective_worker_count(bool initial) {
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p) {
     const char *st = getenv("CBM_INDEX_SINGLE_THREAD");
+    int workers;
     if (st && st[0] == '1') {
-        return 1;
+        workers = 1;
+    } else if (p && p->background) {
+        workers = cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                       cbm_default_worker_count(false));
+    } else {
+        workers = cbm_default_worker_count(true);
     }
-    return cbm_default_worker_count(initial);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    atomic_store(&g_last_worker_count, workers);
+#endif
+    return workers;
 }
 
 /* Resolve the DB path for this pipeline. Caller must free(). */
@@ -4181,7 +4225,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
+        if (cbm_pipeline_worker_count(p) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -4281,7 +4325,7 @@ static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = p->frozen ? 1 : effective_worker_count(true);
+    int worker_count = p->frozen ? 1 : cbm_pipeline_worker_count(p);
     if (p->frozen)
         frozen_observe(p, 0, 1);
     CBM_PROF_START(t_extract_total);
@@ -4412,7 +4456,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
          : mode_promoted
              ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
                                                           &baseline_count)
-             : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
+             : cbm_pipeline_build_semantic_manifest(p, p->project_name, p->repo_path, files,
                                                     file_count, p->excluded_dirs, p->excluded_count,
                                                     &p->git_ctx, p->userconfig, &baseline_manifest,
                                                     &baseline_count);

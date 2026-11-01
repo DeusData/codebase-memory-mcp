@@ -1662,6 +1662,7 @@ typedef struct {
      * itself instead, which is the edge a reader on another thread needs. */
     atomic_bool args_captured[APP_FAKE_MAX_ATTEMPTS];
     size_t memory_budgets[APP_FAKE_MAX_ATTEMPTS];
+    bool background_requests[APP_FAKE_MAX_ATTEMPTS];
 } app_fake_worker_context_t;
 
 typedef struct {
@@ -1729,6 +1730,8 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
                        args_json ? args_json : "");
         atomic_store(&context->args_captured[worker->attempt], true);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
+        context->background_requests[worker->attempt] =
+            cbm_mcp_get_bool_arg(args_json, "_cbm_background");
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
                            marker_file);
@@ -2546,6 +2549,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(first_initialized);
     ASSERT_TRUE(first_owned);
     ASSERT_TRUE(auto_policy_propagated);
+    ASSERT_TRUE(fake.background_requests[0]);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);
@@ -4287,6 +4291,7 @@ TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(subscribed);
     ASSERT_TRUE(worker_started);
+    ASSERT_FALSE(fixture.fake.background_requests[0]);
     ASSERT_TRUE(request_returned);
     ASSERT_TRUE(thread_joined);
     ASSERT_EQ(request.status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
@@ -4584,6 +4589,7 @@ TEST(daemon_application_final_cancel_drains_admitted_watcher_job) {
     ASSERT_TRUE(fixture_ready);
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(worker_started);
+    ASSERT_TRUE(fixture.fake.background_requests[0]);
     ASSERT_TRUE(job_active);
     ASSERT_EQ(watches_after_cancel, 0);
     ASSERT_TRUE(thread_joined);
@@ -7292,8 +7298,9 @@ typedef struct {
     uint32_t context_length;
 } app_async_fixture_t;
 
-static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *label,
-                                   bool permanent) {
+/* stored_config is optional; a test that needs auto_index passes its own. */
+static bool app_async_fixture_init_with_config(app_async_fixture_t *fixture, const char *label,
+                                               bool permanent, cbm_config_t *stored_config) {
     memset(fixture, 0, sizeof(*fixture));
     app_fake_worker_context_init(&fixture->fake);
     fixture->ops = (cbm_daemon_application_worker_ops_t){
@@ -7304,7 +7311,8 @@ static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *lab
         .log_path = app_fake_worker_log_path,
         .destroy = app_fake_worker_destroy,
     };
-    cbm_daemon_application_config_t config = {.worker_ops = &fixture->ops};
+    cbm_daemon_application_config_t config = {.config = stored_config,
+                                              .worker_ops = &fixture->ops};
     fixture->application = cbm_daemon_application_new(&config);
     if (!fixture->application) {
         return false;
@@ -7323,6 +7331,11 @@ static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *lab
     return fixture->project &&
            app_test_context_request(fixture->root, fixture->root, &fixture->context,
                                     &fixture->context_length);
+}
+
+static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *label,
+                                   bool permanent) {
+    return app_async_fixture_init_with_config(fixture, label, permanent, NULL);
 }
 
 static cbm_daemon_runtime_application_session_t *app_async_session(app_async_fixture_t *fixture,
@@ -7702,6 +7715,78 @@ TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call) {
  * the daemon's only live session is refused async (the daemon would stop and
  * cancel the job as soon as the command exits), while status stays allowed and
  * a long-lived MCP session on the same temporary daemon remains a valid host. */
+/* Automatic indexing (session auto-index, watcher re-index) marks its job
+ * _cbm_background so the worker leaves CPU headroom. The marker picks the
+ * worker count, never what is indexed, so an explicit index_repository for the
+ * same root still JOINS the automatic job already running for it, the contract
+ * the repo_path fold above restored, instead of being refused as an options
+ * conflict. The worker is held, so the join is observed while the job runs. */
+TEST(daemon_application_explicit_index_joins_running_auto_index_job) {
+    app_env_backup_t cache_environment;
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-join-cache-XXXXXX", cbm_tmpdir());
+    bool cache_ready =
+        cache_saved && cbm_mkdtemp(cache) != NULL && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    cbm_config_t *stored_config = cache_ready ? cbm_config_open(cache) : NULL;
+    bool config_ready = stored_config &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    app_async_fixture_t fixture;
+    bool setup = config_ready &&
+                 app_async_fixture_init_with_config(&fixture, "auto-join", true, stored_config);
+
+    cbm_daemon_runtime_application_session_t *automatic =
+        setup ? app_test_open(&fixture.callbacks, 7801) : NULL;
+    bool auto_started = automatic &&
+                        app_test_initialize_profile(&fixture.callbacks, automatic, fixture.root,
+                                                    CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL) &&
+                        app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    /* args_json is published by the args_captured release store; the
+     * background_requests slot is written after it, so read the args. */
+    bool auto_marked = auto_started &&
+                       app_wait_for_atomic_bool(&fixture.fake.args_captured[0], true) &&
+                       cbm_mcp_get_bool_arg(fixture.fake.args_json[0], "_cbm_background");
+
+    cbm_daemon_runtime_application_session_t *explicit_session =
+        auto_marked ? app_async_session(&fixture, 7802) : NULL;
+    char *joined =
+        explicit_session ? app_async_call_now(&fixture, explicit_session, ",\"async\":true") : NULL;
+    int starts_while_running = atomic_load(&fixture.fake.starts);
+    size_t active_while_running =
+        setup ? cbm_daemon_application_active_jobs(fixture.application) : 0;
+
+    if (explicit_session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, explicit_session);
+    }
+    if (automatic) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, automatic);
+        fixture.callbacks.session_close(fixture.callbacks.context, automatic);
+    }
+    bool stopped = !setup || app_async_fixture_finish(&fixture);
+    cbm_config_close(stored_config);
+    bool cleaned = !cache_ready || th_rmtree(cache) == 0;
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(auto_started);
+    ASSERT_TRUE(auto_marked);
+    ASSERT_NOT_NULL(explicit_session);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_FALSE(app_async_contains(joined, "different options"));
+    ASSERT_FALSE(app_async_contains(joined, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(joined, "\"joined\":true"));
+    ASSERT_EQ(starts_while_running, 1);
+    ASSERT_EQ(active_while_running, 1);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cleaned);
+    ASSERT_TRUE(cache_restored);
+    free(joined);
+    PASS();
+}
+
 TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon) {
     app_async_fixture_t fixture;
     bool setup = app_async_fixture_init(&fixture, "async-refuse", false);
@@ -8031,6 +8116,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_async_and_status_validation_errors);
     RUN_TEST(daemon_application_cancelled_sync_index_reply_offers_async);
     RUN_TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call);
+    RUN_TEST(daemon_application_explicit_index_joins_running_auto_index_job);
     RUN_TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon);
     RUN_TEST(daemon_application_unnamed_status_finds_async_job_of_root_owner_issue2134);
     RUN_TEST(daemon_application_unnamed_status_keeps_path_derived_key_issue2134);
