@@ -3402,6 +3402,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cross_registries.java =
             cbm_java_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
         b_ms[5] = (long)elapsed_ms(t_b);
+        cross_registries.oo =
+            cbm_pxc_build_oo_index(ctx, &cross_lsp_arena, cache, files, file_count);
         char b_buf[6][CBM_SZ_16];
         const char *b_name[6] = {"go", "python", "c", "cs", "ts", "java"};
         for (int bi = 0; bi < 6; bi++) {
@@ -3441,6 +3443,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     pipeline_phase_mark("parallel_resolve");
     log_result_arenas("post_resolve", cache, file_count);
     cbm_pxc_free_module_def_index(module_def_index);
+    cbm_oo_index_free(cross_registries.oo);
     cbm_arena_destroy(&cross_lsp_arena); /* releases all per-lang registries */
     free(all_defs);
     if (def_modules) {

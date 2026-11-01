@@ -1200,11 +1200,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         free(rels);
         /* Build complete language import domains before any dependency or
          * symbol binding is projected. Partial context cannot lend proof. */
-        if (namespace_map && !cbm_pipeline_import_context_build(ctx, files, file_count, local_cache,
-                                                                namespace_map)) {
-            cbm_pipeline_namespace_map_free(namespace_map);
-            namespace_map = NULL;
-        }
+        if (namespace_map)
+            (void)cbm_pipeline_import_context_build(ctx, files, file_count, local_cache,
+                                                    namespace_map);
         for (int i = 0; i < file_count; i++) {
             if (cbm_pipeline_check_cancel(ctx)) {
                 break;

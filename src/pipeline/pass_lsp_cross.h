@@ -37,6 +37,7 @@
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
+#include "lsp/oo_strict.h"
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 
@@ -151,9 +152,18 @@ typedef struct {
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
     CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    /* Java, Kotlin and C#: declaration index for strict static selection. */
+    struct cbm_oo_index *oo;
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
+
+/* Harvest the strict Java/Kotlin/C# declaration index over every file of the
+ * generation. NULL when the project has none of those files. The arena must
+ * outlive the resolve; release the index's tables with cbm_oo_index_free. */
+struct cbm_oo_index *cbm_pxc_build_oo_index(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                            CBMFileResult **cache, const cbm_file_info_t *files,
+                                            int file_count);
 
 /* Return the appropriate pre-built registry for a language, or NULL
  * if none was built (or language has no cross-LSP entrypoint). */

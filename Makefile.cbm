@@ -536,6 +536,10 @@ PIPELINE_SRCS = \
     internal/cbm/lsp/php_proof.c \
     internal/cbm/lsp/kotlin_proof.c \
     internal/cbm/lsp/cs_proof.c \
+    internal/cbm/lsp/oo_core.c \
+    internal/cbm/lsp/oo_java.c \
+    internal/cbm/lsp/oo_kotlin.c \
+    internal/cbm/lsp/oo_csharp.c \
     internal/cbm/lsp/rust_proof.c \
     internal/cbm/lsp/py_proof.c \
     internal/cbm/lsp/c_proof.c \
