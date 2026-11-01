@@ -66,13 +66,22 @@ typedef struct {
     bool invalid;
 } conditional_owner_t;
 
+typedef struct target_file {
+    const char *file;
+    struct target_file *next;
+} target_file_t;
+
 typedef struct {
     const char *file;
     const char *label;
     uint32_t start_line, end_line, second_start_line, second_end_line;
     unsigned declarations;
     conditional_owner_t *conditional;
+    /* Other files declaring this QN (Go build-tag twins, C declaration headers). */
+    target_file_t *other_files;
     bool ambiguous;
+    /* A different kind sharing the QN (C: struct and function) is no variant. */
+    bool mixed_kinds;
 } target_proof_t;
 
 typedef struct {
@@ -237,6 +246,15 @@ static const CBMFileResult *owner_source_view(const CBMFileResult *result, CBMLa
     return view;
 }
 
+static bool target_declared_in(const target_proof_t *target, const char *file) {
+    if (!strcmp(target->file, file))
+        return true;
+    for (const target_file_t *other = target->other_files; other; other = other->next)
+        if (!strcmp(other->file, file))
+            return true;
+    return false;
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
                        const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
@@ -246,6 +264,15 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
         prior->ambiguous |= !same_owner || prior->start_line != definition->start_line ||
                             prior->end_line != definition->end_line || language == CBM_LANG_PYTHON;
+        prior->mixed_kinds |= strcmp(prior->label, definition->label) != 0;
+        if (!target_declared_in(prior, file)) {
+            target_file_t *other = cbm_arena_calloc(&resolver->arena, sizeof(*other));
+            const char *copy = cbm_arena_strdup(&resolver->arena, file);
+            if (!other || !copy)
+                return false;
+            *other = (target_file_t){.file = copy, .next = prior->other_files};
+            prior->other_files = other;
+        }
         if (prior->declarations == 1 && same_owner) {
             prior->second_start_line = definition->start_line;
             prior->second_end_line = definition->end_line;
@@ -377,10 +404,41 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         !node->label)
         return false;
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
-    return proof && !proof->ambiguous && !strcmp(proof->file, node->file_path) &&
-           !strcmp(proof->label, node->label) && node->start_line >= 0 && node->end_line >= 0 &&
+    if (!proof)
+        return false;
+    /* Several declarations of one kind sharing a QN are one identity in this graph: one
+     * node whose `variants` keep every span and whose edges are the union of every body
+     * (graph_buffer.c, "Definition variants"). Rust `impl From<A> for E` beside
+     * `impl From<B> for E`, overloads and build-tag twins all land here, and any member
+     * reaches the same node, so selecting that node is exact whichever member a site
+     * means. The node must still be one the census recorded. */
+    if (proof->ambiguous)
+        return !proof->mixed_kinds && !strcmp(proof->label, node->label) &&
+               target_declared_in(proof, node->file_path);
+    return !strcmp(proof->file, node->file_path) && !strcmp(proof->label, node->label) &&
+           node->start_line >= 0 && node->end_line >= 0 &&
            proof->start_line == (uint32_t)node->start_line &&
            proof->end_line == (uint32_t)node->end_line;
+}
+
+/* The occurrence's enclosing declaration must be the source node, and that declaration
+ * must live in this file. For a variant set the winning span may be another member's, even
+ * in another file (Go build tags), so ownership is the census' list of declaring files. */
+static bool source_identity_holds(const file_resolver_t *resolver, const cbm_gbuf_node_t *source,
+                                  bool conditional) {
+    const char *file = resolver->file->rel_path;
+    if (!source->file_path)
+        return false;
+    const target_proof_t *proof =
+        resolver->shared && resolver->shared->complete && source->qualified_name
+            ? cbm_ht_get(resolver->shared->targets, source->qualified_name)
+            : NULL;
+    if (proof && proof->ambiguous && !proof->mixed_kinds && source != resolver->file_node)
+        return target_materialized(resolver, source) && target_declared_in(proof, file);
+    if (strcmp(source->file_path, file))
+        return false;
+    return source == resolver->file_node || (source->label && !strcmp(source->label, "Module")) ||
+           target_materialized(resolver, source) || conditional;
 }
 
 typedef struct {
@@ -2540,7 +2598,11 @@ static const cbm_gbuf_node_t *source_node(const file_resolver_t *resolver, const
     if (!scope || !scope[0])
         return resolver->file_node;
     const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(resolver->file->graph, scope);
-    return node && !cbm_pipeline_node_is_dir_container(node) ? node : NULL;
+    /* A package-level reference in a directory-module language carries the DIRECTORY
+     * module QN, which is the Folder shared by every file of the package. An anonymous
+     * callable's scope names no node at all. Either way the occurrence is in this file, the
+     * attribution every ordinary resolver uses (#787). */
+    return !node || cbm_pipeline_node_is_dir_container(node) ? resolver->file_node : node;
 }
 
 static bool callable_node(const cbm_gbuf_node_t *node) {
@@ -2592,6 +2654,44 @@ static const cbm_resolve_proof_t *local_occurrence_proof(const file_resolver_t *
         local, cbm_resolve_proof_leaf(context->pool, CBM_PROOF_SOURCE_FACT, &source, &key, &role)};
     return cbm_resolve_proof_derive(context->pool, CBM_PROOF_NAMED_JOIN, &source, &key, result,
                                     premises, 2, true);
+}
+
+/* The extraction carrier read this token in this role. A Go reference's proof attests the
+ * declaration, shared by every site that selects it. A package-level occurrence's proof
+ * names the module scope, which in a directory-module language is the shared Folder, while
+ * the edge starts at this file's node. Either way this ties that proof to the exact site. */
+static bool carrier_needs_site_proof(const file_resolver_t *resolver, const cbm_gbuf_node_t *source,
+                                     const char *scope, const cbm_resolve_result_t *result) {
+    if (!result->proof || !cbm_resolve_admit(result))
+        return false;
+    if (source == resolver->file_node && scope && scope[0] && strcmp(scope, source->qualified_name))
+        return true;
+    return resolver->file->language == CBM_LANG_GO &&
+           cbm_resolve_proof_view(result->proof)->key.start_byte == 0;
+}
+
+static const cbm_resolve_proof_t *carrier_occurrence_proof(const file_resolver_t *resolver,
+                                                           const char *source_qn, const char *name,
+                                                           const char *relation, uint32_t start,
+                                                           uint32_t end, CBMSourceOrigin origin,
+                                                           const cbm_resolve_result_t *result) {
+    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(resolver->bindings);
+    if (!context || !source_qn || !name)
+        return NULL;
+    cbm_resolve_proof_source_t source =
+        cbm_result_proof_source(resolver->file->result, origin, source_qn);
+    source.file = resolver->file->rel_path;
+    cbm_resolve_proof_key_t key = {.lookup_domain = source_qn,
+                                   .lookup_key = name,
+                                   .binding_identity = result->target,
+                                   .start_byte = start,
+                                   .end_byte = end,
+                                   .origin = (uint32_t)origin,
+                                   .detail = relation};
+    cbm_resolve_result_t site = *result;
+    site.proof = NULL;
+    site.reason = "extraction_carrier_occurrence";
+    return cbm_resolve_proof_leaf(context->pool, CBM_PROOF_SOURCE_FACT, &source, &key, &site);
 }
 
 /* Projection retains the complete source spelling and argument metadata.
@@ -2648,12 +2748,10 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     }
     const owner_variant_t *conditional =
         conditional_source_owner(resolver, source, start, end, origin);
-    if (source &&
-        (!source->file_path || strcmp(source->file_path, resolver->file->rel_path) ||
-         (source != resolver->file_node && (!source->label || strcmp(source->label, "Module")) &&
-          !target_materialized(resolver, source) && !conditional))) {
+    if (source && !source_identity_holds(resolver, source, conditional != NULL)) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
-        result.reason = "source_declaration_identity_conflict";
+        if (result.binding == CBM_RESOLVE_BINDING_UNIQUE)
+            result.reason = "source_declaration_identity_conflict";
     }
     if (target && !target_materialized(resolver, target)) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
@@ -2678,6 +2776,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     const cbm_resolve_proof_t *binding =
         local_occurrence_proof(resolver, source ? source->qualified_name : scope, name, relation,
                                start, end, origin, &result);
+    if (!binding && source && carrier_needs_site_proof(resolver, source, scope, &result))
+        binding = carrier_occurrence_proof(resolver, source->qualified_name, name, relation, start,
+                                           end, origin, &result);
     if (conditional && result.proof && cbm_resolve_admit(&result)) {
         /* Extend local authority rather than cloning shared export ancestors
          * into every worker. An export summary cannot attest a local site. */

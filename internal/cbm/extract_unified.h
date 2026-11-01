@@ -218,6 +218,9 @@ void cbm_finalize_lexical_usages(CBMExtractCtx *ctx, WalkState *state);
 void handle_throws(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
 void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state);
+/* The call-scope QN of one callable declaration node, NULL when it pushes no scope. */
+const char *cbm_declaration_scope_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                     WalkState *state);
 void handle_env_accesses(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                          WalkState *state);
 void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,

@@ -2493,6 +2493,11 @@ static bool push_python_default_owner(CBMExtractCtx *ctx, TSNode node, WalkState
     return true;
 }
 
+const char *cbm_declaration_scope_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                     WalkState *state) {
+    return compute_func_qn(ctx, node, spec, state);
+}
+
 static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                 WalkState *state, uint32_t depth) {
     for (int i = 0; i < state->scope_top; i++) {
