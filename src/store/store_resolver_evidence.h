@@ -17,5 +17,7 @@ bool cbm_store_resolver_view_definition_current(const char *sql);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* Rows between progress lines; 0 restores the production interval. */
 void cbm_store_resolver_test_set_progress_rows(uint64_t rows);
+/* Digests the last evidence write kept in memory. */
+size_t cbm_store_resolver_test_held_digests(void);
 #endif
 #endif
