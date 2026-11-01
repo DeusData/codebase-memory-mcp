@@ -2488,6 +2488,32 @@ TEST(discover_d_user_override_skips_dep_info_probe) {
     PASS();
 }
 
+/* .st is shared by IEC 61131-3 Structured Text, Pharo/Tonel and GNU Smalltalk
+ * and StringTemplate: only a file whose head opens with an IEC declaration
+ * keyword is indexed as Structured Text. */
+TEST(st_smalltalk_tonel_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_st_tonel", "Foo.class.st",
+                         "\"A Foo is a sample class\"\n"
+                         "Class {\n\t#name : #Foo,\n\t#superclass : #Object,\n"
+                         "\t#category : #Sample\n}\n\n"
+                         "{ #category : #accessing }\nFoo >> bar [\n\t^ 42\n]\n",
+                         &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(st_structured_text_indexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_st_iec", "FB_Motor.st",
+                         "// Motor control\n// Licensed under MIT\n"
+                         "FUNCTION_BLOCK FB_Motor\nVAR\n\tbOn : BOOL;\nEND_VAR\n"
+                         "END_FUNCTION_BLOCK\n",
+                         &lang));
+    ASSERT_EQ(lang, CBM_LANG_ST);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -2582,6 +2608,8 @@ SUITE(discover) {
     RUN_TEST(shebang_env_unsupported_option_unindexed);
     RUN_TEST(shebang_embedded_nul_unindexed);
     RUN_TEST(shebang_oversized_first_line_unindexed);
+    RUN_TEST(st_smalltalk_tonel_unindexed);
+    RUN_TEST(st_structured_text_indexed);
 
     /* .d: D source vs make/cargo dep-info */
     RUN_TEST(discover_d_dep_info_not_indexed_as_dlang);

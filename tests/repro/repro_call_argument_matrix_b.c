@@ -1031,6 +1031,30 @@ static const RoutineArgumentCase CHIALISP_CASE = ROUTINE_ARGUMENT_CASE(
     "CHIALISP", CBM_LANG_CHIALISP, "sample.clib", CHIALISP_INSIDE, CHIALISP_BARE, "list", "run",
     "accept", "watched", 1, 1, 0, "Chialisp list application and symbol-reference vocabulary");
 
+/* IEC 61131-3 Structured Text: a FUNCTION yields its result by assigning to its
+ * own name. */
+static const char ST_INSIDE[] = "FUNCTION accept : INT\n"
+                                "VAR_INPUT\n"
+                                "  value : INT;\n"
+                                "END_VAR\n"
+                                "accept := value;\n"
+                                "END_FUNCTION\n"
+                                "FUNCTION run : INT\n"
+                                "VAR_INPUT\n"
+                                "  watched : INT;\n"
+                                "END_VAR\n"
+                                "run := accept(watched);\n"
+                                "END_FUNCTION\n";
+static const char ST_BARE[] = "FUNCTION run : INT\n"
+                              "VAR_INPUT\n"
+                              "  watched : INT;\n"
+                              "END_VAR\n"
+                              "run := watched;\n"
+                              "END_FUNCTION\n";
+static const RoutineArgumentCase ST_CASE = ROUTINE_ARGUMENT_CASE(
+    "ST", CBM_LANG_ST, "sample.st", ST_INSIDE, ST_BARE, "call_expression", "run", "accept",
+    "watched", 1, 1, 0, "IEC 61131-3 FUNCTION application with a value argument");
+
 static const ModuleArgumentCase JUST_CASE = MODULE_ARGUMENT_CASE(
     "JUST", CBM_LANG_JUST, "justfile", JUST_INSIDE, JUST_BARE, "function_call", "uppercase",
     "watched", 1, 0, "Just expression call; recipe dependency is checked separately");
@@ -1223,6 +1247,7 @@ DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_udl, OBJECTSCRIPT_UDL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_routine, OBJECTSCRIPT_ROUTINE_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(plsql, PLSQL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(chialisp, CHIALISP_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(st, ST_CASE)
 
 #undef DEFINE_ROUTINE_ARGUMENT_TEST
 
@@ -1292,15 +1317,15 @@ TEST(repro_call_argument_matrix_b_domain_bitbake) {
 }
 
 enum {
-    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 39,
+    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 40,
     MODULE_ARGUMENT_LANGUAGE_COUNT = 4,
     DOMAIN_CONTROL_LANGUAGE_COUNT = 6,
     MATRIX_LANGUAGE_COUNT = ROUTINE_ARGUMENT_LANGUAGE_COUNT + MODULE_ARGUMENT_LANGUAGE_COUNT +
                             DOMAIN_CONTROL_LANGUAGE_COUNT,
 };
 
-_Static_assert(MATRIX_LANGUAGE_COUNT == 49,
-               "RACKET..CHIALISP call-capable matrix must contain exactly 49 "
+_Static_assert(MATRIX_LANGUAGE_COUNT == 50,
+               "RACKET..ST call-capable matrix must contain exactly 50 "
                "language rows");
 
 #define MATRIX_B_LANGUAGE_ROWS(X)                                                               \
@@ -1345,6 +1370,7 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 49,
       OBJECTSCRIPT_ROUTINE_CASE.identity.language)                                              \
     X(repro_call_argument_matrix_b_routine_plsql, PLSQL_CASE.identity.language)                 \
     X(repro_call_argument_matrix_b_routine_chialisp, CHIALISP_CASE.identity.language)           \
+    X(repro_call_argument_matrix_b_routine_st, ST_CASE.identity.language)                       \
     X(repro_call_argument_matrix_b_module_just, JUST_CASE.identity.language)                    \
     X(repro_call_argument_matrix_b_module_gotemplate, GOTEMPLATE_CASE.identity.language)        \
     X(repro_call_argument_matrix_b_module_linkerscript, LINKERSCRIPT_CASE.identity.language)    \
