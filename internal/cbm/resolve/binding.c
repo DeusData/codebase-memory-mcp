@@ -2108,9 +2108,20 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         if (index->site_count > before)
             index->sites[before].type_position = true;
     } else if (kind_is(node, "type_identifier") &&
-               kind_is(ts_node_parent(node), "type_parameter")) {
-        /* A type parameter shadows a same-named type wherever it is visible. */
-        add_name(index, node_text(index, node), 0, BINDING_BLOCKED | BINDING_TYPE_DECLARATION);
+               (kind_is(ts_node_parent(node), "type_parameter") ||
+                kind_is(ts_node_parent(node), "mapped_type_clause") ||
+                kind_is(ts_node_parent(node), "infer_type"))) {
+        /* `<T>`, `[K in Keys]` and `infer U` shadow a same-named type wherever they are
+         * visible. The other names of a mapped clause are ordinary references. */
+        if (!kind_is(ts_node_parent(node), "mapped_type_clause") ||
+            ts_node_eq(node, field(ts_node_parent(node), "name"))) {
+            add_name(index, node_text(index, node), 0, BINDING_BLOCKED | BINDING_TYPE_DECLARATION);
+        } else if (!state.import) {
+            size_t before = index->site_count;
+            add_site(index, node_text(index, node), node);
+            if (index->site_count > before)
+                index->sites[before].type_position = true;
+        }
     } else if (kind_is(node, "type_identifier") && !state.import && !declaration_name) {
         size_t before = index->site_count;
         add_site(index, node_text(index, node), node);

@@ -1522,9 +1522,18 @@ TEST(resolver_js_project_type_names_are_uses_type_never_usage) {
                    "export function annotated(a: Shape, b: Space.Inner) { return a as Shape; }\n"
                    "export function viaTypeof(c: typeof value) { return c; }\n"
                    "export function viaValue() { return value; }\n"},
+        /* These bind their own name, so a same-named module type is not what they use. */
+        {"scoped.ts", "type Mapped = string;\n"
+                      "type Inferred = number;\n"
+                      "type Keys = 'a' | 'b';\n"
+                      "export type M1 = { [Mapped in Keys]: Mapped };\n"
+                      "export type C1<T> = T extends Array<infer Inferred> ? Inferred : never;\n"},
     };
     js_project_t project = {0};
     ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "scoped.ts", "scoped.Keys"), 1);
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "scoped.ts", "scoped.Mapped"), 0);
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "scoped.ts", "scoped.Inferred"), 0);
     ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "annotated", "types.Shape"), 1);
     ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "annotated", "types.Space.Inner"), 1);
     /* A class field has no signature: the walk over type names is what finds it. */
