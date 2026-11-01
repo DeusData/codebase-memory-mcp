@@ -2693,7 +2693,7 @@ TEST(resolver_cpp_nested_aliases_and_protected_members) {
          .target = {.file = "access.h",
                     .suffix = "access.llvm.Parser.parse",
                     .label = "Method",
-                    .declaration_line = 18,
+                    .declaration_line = 17,
                     .declaration_text = "  int parse() { return 1; }"}},
     };
     const RQ_Forbidden forbidden[] = {
