@@ -585,8 +585,7 @@ static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, si
            bind_fact_text(w, s, 30, v->outcome.reason) &&
            sqlite3_bind_int(s, 31, v->predecessors_closed ? 1 : 0) == SQLITE_OK;
 }
-static bool write_fact(const cbm_resolve_proof_t *node, void *context) {
-    evidence_write_t *w = context;
+static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_t *node) {
     const cbm_resolve_proof_view_t *v = cbm_resolve_proof_view(node);
     if (!v || !source_matches(w, &v->source) || !grow_ids(w))
         return false;
@@ -625,6 +624,37 @@ static bool write_fact(const cbm_resolve_proof_t *node, void *context) {
         w->count++;
     }
     return ok;
+}
+
+/* Each distinct fact after its premises, so a fact id always follows the ids it
+ * cites. ids doubles as the visited set: a second hash table over the same nodes
+ * would cost a gigabyte on the largest repositories. Recursion is bounded because
+ * a node's depth is checked when it is made, and a cycle cannot be built from
+ * immutable nodes. */
+static bool write_facts_from(evidence_write_t *w, const cbm_resolve_proof_t *node) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_PROPAGATED_FACTS, 1);
+    if (find_id(w, node))
+        return true;
+    const cbm_resolve_proof_view_t *v = cbm_resolve_proof_view(node);
+    if (!v || (v->premise_count && !v->premises))
+        return false;
+    for (size_t i = 0; i < v->premise_count; i++)
+        if (!write_facts_from(w, v->premises[i]))
+            return false;
+    return write_fact(w, node);
+}
+static int compare_roots(const void *left, const void *right) {
+    return cbm_resolve_proof_compare(*(const cbm_resolve_proof_t *const *)left,
+                                     *(const cbm_resolve_proof_t *const *)right);
+}
+/* Roots are sorted structurally, so fact ids do not depend on occurrence order. */
+static bool write_facts(evidence_write_t *w, const cbm_resolve_proof_t **roots, size_t count) {
+    if (count > 1)
+        qsort(roots, count, sizeof(*roots), compare_roots);
+    for (size_t i = 0; i < count; i++)
+        if (!write_facts_from(w, roots[i]))
+            return false;
+    return true;
 }
 
 /* ── Generation reset ────────────────────────────────────────────── */
@@ -924,10 +954,8 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
                           .file_count = file_count,
                           .cache = cache};
     cbm_arena_init(&w.owned);
-    /* One node per distinct fact, so the population is the whole project: a
-     * node cap here refuses to publish a large enough repository. */
     ok = ok && reset_tables(db, project, &w.pid) && prepare_writer(&w) &&
-         cbm_resolve_proof_visit_roots(roots, root_count, SIZE_MAX, write_fact, &w);
+         write_facts(&w, roots, root_count);
     cbm_free(CBM_MEM_CLASS_STORE, roots);
     ok = ok && write_occurrences(&w, rows, count) &&
          write_summaries(&w, ordered_summaries, summary_count) &&
