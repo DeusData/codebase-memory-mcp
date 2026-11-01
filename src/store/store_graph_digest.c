@@ -161,7 +161,11 @@ static const gd_column_t gd_resolver_derived_bindings[] = {
     {"target", GD_T, 0, 0},  {"proof", GD_I, 0, 0},     {"payload_json", GD_T, 0, 0},
 };
 
-/* These descriptors and SQL strings are immutable; all other state is local. */
+/* These descriptors and SQL strings are immutable; all other state is local.
+ * A resolver query orders by the column itself: a text column compares by its bytes,
+ * exactly as CAST(... AS BLOB) does, but the planner can only walk an index for the
+ * plain column. A cast sorts every row in memory, which on the largest repositories
+ * is tens of gigabytes of reconstructed text. */
 static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
     {"projects", gd_projects, GD_COLUMNS(gd_projects), "PRAGMA main.table_xinfo('projects');",
      "SELECT name,indexed_at,root_path FROM main.projects ORDER BY CAST(name AS BLOB) ASC;"},
@@ -206,7 +210,7 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "project,ordinal,file_path,scope,relation,spelling,start_byte,end_byte,source_origin,binding,"
      "domain,analysis,rule,facts,target,candidate_count,reason,emitted,rules_version,properties_"
      "json FROM main.resolver_occurrences "
-     "ORDER BY CAST(project AS BLOB) ASC,ordinal ASC;"},
+     "ORDER BY project ASC,ordinal ASC;"},
     {"resolver_generations", gd_resolver_generations, GD_COLUMNS(gd_resolver_generations),
      "PRAGMA main.table_xinfo('resolver_generations');",
      "SELECT project,rules_version FROM main.resolver_generations "
@@ -214,21 +218,21 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
     {"resolver_facts", gd_resolver_facts, GD_COLUMNS(gd_resolver_facts),
      "PRAGMA main.table_xinfo('resolver_facts');",
      "SELECT project,id,kind,source_file,digest,payload FROM main.resolver_facts "
-     "ORDER BY CAST(project AS BLOB) ASC,id ASC;"},
+     "ORDER BY project ASC,id ASC;"},
     {"resolver_supports", gd_resolver_supports, GD_COLUMNS(gd_resolver_supports),
      "PRAGMA main.table_xinfo('resolver_supports');",
      "SELECT project,fact,ordinal,premise FROM main.resolver_supports "
-     "ORDER BY CAST(project AS BLOB) ASC,fact ASC,ordinal ASC;"},
+     "ORDER BY project ASC,fact ASC,ordinal ASC;"},
     {"resolver_lookups", gd_resolver_lookups, GD_COLUMNS(gd_resolver_lookups),
      "PRAGMA main.table_xinfo('resolver_lookups');",
      "SELECT project,fact,domain,key,status FROM main.resolver_lookups "
-     "ORDER BY CAST(project AS BLOB) ASC,fact ASC;"},
+     "ORDER BY project ASC,fact ASC;"},
     {"resolver_occurrence_evidence", gd_resolver_occurrence_evidence,
      GD_COLUMNS(gd_resolver_occurrence_evidence),
      "PRAGMA main.table_xinfo('resolver_occurrence_evidence');",
      "SELECT project,ordinal,content_identity,configuration_identity,proof,source_binding_proof "
      "FROM main.resolver_occurrence_evidence "
-     "ORDER BY CAST(project AS BLOB) ASC,ordinal ASC;"},
+     "ORDER BY project ASC,ordinal ASC;"},
     {"resolver_file_summaries", gd_resolver_file_summaries, GD_COLUMNS(gd_resolver_file_summaries),
      "PRAGMA main.table_xinfo('resolver_file_summaries');",
      "SELECT "

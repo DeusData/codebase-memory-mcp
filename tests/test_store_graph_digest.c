@@ -1398,6 +1398,45 @@ TEST(store_graph_digest_resolver_rows_and_bytes_obey_limits) {
     PASS();
 }
 
+/* The digest reads a whole generation. On compact rows that must be a walk in key
+ * order: a temp b-tree would hold every reconstructed row in memory at once. */
+static bool gd_plan_sorts(sqlite3 *db, const char *query) {
+    char sql[512];
+    snprintf(sql, sizeof(sql), "EXPLAIN QUERY PLAN %s", query);
+    sqlite3_stmt *plan = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &plan, NULL) != SQLITE_OK)
+        return true;
+    bool sorts = false;
+    while (sqlite3_step(plan) == SQLITE_ROW) {
+        const char *detail = (const char *)sqlite3_column_text(plan, 3);
+        sorts |= detail && strstr(detail, "TEMP B-TREE") != NULL;
+    }
+    sqlite3_finalize(plan);
+    return sorts;
+}
+
+TEST(store_graph_digest_resolver_views_read_in_key_order) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_resolver_replace(s, "p", NULL, 0), CBM_STORE_OK);
+    static const char *const queries[] = {
+        "SELECT project,ordinal,properties_json FROM main.resolver_occurrences "
+        "ORDER BY project ASC,ordinal ASC",
+        "SELECT project,id,payload FROM main.resolver_facts ORDER BY project ASC,id ASC",
+        "SELECT project,fact,ordinal,premise FROM main.resolver_supports "
+        "ORDER BY project ASC,fact ASC,ordinal ASC",
+        "SELECT project,fact,status FROM main.resolver_lookups ORDER BY project ASC,fact ASC",
+        "SELECT project,ordinal,proof FROM main.resolver_occurrence_evidence "
+        "ORDER BY project ASC,ordinal ASC"};
+    sqlite3 *db = cbm_store_get_db(s);
+    bool sorted = false;
+    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++)
+        sorted |= gd_plan_sorts(db, queries[i]);
+    cbm_store_close(s);
+    ASSERT_FALSE(sorted);
+    PASS();
+}
+
 TEST(store_graph_digest_resolver_live_schema_and_explicit_absence) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_graph_digest_t absent = {0}, present = {0};
@@ -1429,6 +1468,7 @@ SUITE(store_graph_digest) {
     RUN_TEST(store_graph_digest_resolver_partial_schema_and_bad_types_fail_closed);
     RUN_TEST(store_graph_digest_resolver_rows_and_bytes_obey_limits);
     RUN_TEST(store_graph_digest_resolver_live_schema_and_explicit_absence);
+    RUN_TEST(store_graph_digest_resolver_views_read_in_key_order);
 
     RUN_TEST(store_graph_digest_binds_unresolved_candidate_index);
     RUN_TEST(store_graph_digest_candidate_index_errors_are_not_legacy_absence);
