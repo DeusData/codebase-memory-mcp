@@ -1165,6 +1165,9 @@ typedef struct {
      * The core never reads, interprets or frees it. It is the only place for
      * such state: a static or thread-local cache is not. */
     void *doclink_state;
+    /* C#: the parse of the file itself when `root` reads it through a view that hid a branch of
+     * a conditional (cbm_parse_source_repairing_ex); null otherwise. Alive for this call only. */
+    TSNode unrepaired_root;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1280,6 +1283,12 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
  * same-length view of it. Offsets and lines are the source's own. */
 TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
                                    uint32_t source_len, TSParseOptions opts);
+/* As above. When the view that was used hid a branch of a conditional, *unrepaired receives the
+ * parse of the file itself, for a reader that must see what the view left out; the caller deletes
+ * it. Otherwise *unrepaired is left alone. */
+TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, const char *source,
+                                      uint32_t source_len, TSParseOptions opts,
+                                      TSTree **unrepaired);
 /* As above for C-family source. A word that can only be an attribute macro is left out
  * of the parse, so `class LLVM_ABI StringRef {` reads as the class. Offsets and positions
  * stay those of the real file. Every C-family whole-file parse goes through here, so the

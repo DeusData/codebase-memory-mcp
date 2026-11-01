@@ -1032,13 +1032,15 @@ TEST(doc_mentions_cs_scope_parse_errors) {
     ASSERT_NULL(strstr(s, "\nX\t"));
     cbm_free_result(r);
 
-    /* `ref partial struct` is not parsed as a declaration: its header is read
-     * from the text (kind, name; bases unknown), and the types after it stay
-     * in the namespace its closing brace seemed to end. */
+    /* The grammar does not read `ref partial struct`, and the parse view repairs
+     * only the plain spelling (csharp_parse_view), not one with a comment between
+     * the words. Not parsed as a declaration: its header is read from the text
+     * (kind, name; bases unknown), and the types after it stay in the namespace
+     * its closing brace seemed to end. */
     const char *early = "namespace Acme\n" /* 1 */
                         "{\n"
-                        "    public class Before { }\n"           /* 3 */
-                        "    public ref partial struct Iter<T>\n" /* 4 */
+                        "    public class Before { }\n"                           /* 3 */
+                        "    public ref /* stack only */ partial struct Iter<T>\n" /* 4 */
                         "    {\n"
                         "        public void End() { }\n"
                         "    }\n"                  /* 7 */
@@ -1057,6 +1059,24 @@ TEST(doc_mentions_cs_scope_parse_errors) {
     ASSERT_NOT_NULL(strstr(s, "T\t1\t8\t11\tc\t-\tAfter\t\t\n"));
     ASSERT_NOT_NULL(strstr(s, "M\t10\tv\t0\t2\tSize\t\t-\n")); /* of the third type */
     ASSERT_NULL(strstr(s, "T\t0\t")); /* nothing fell into the global namespace */
+    cbm_free_result(r);
+
+    /* The plain spelling is repaired before parsing: a complete declaration from
+     * the tree, with nothing hidden and its base list known to be empty. */
+    const char *repaired = "namespace Acme\n" /* 1 */
+                           "{\n"
+                           "    public ref partial struct Iter<T>\n" /* 3 */
+                           "    {\n"
+                           "        public void End() { }\n"
+                           "    }\n"                      /* 6 */
+                           "    public class After { }\n" /* 7 */
+                           "}\n";                         /* 8 */
+    r = dm_scope(repaired);
+    ASSERT_NOT_NULL(r);
+    s = r->doc_scope;
+    ASSERT_NOT_NULL(s);
+    ASSERT_NOT_NULL(strstr(s, "T\t1\t3\t6\tsp\t-\tIter\tT\t\n"));
+    ASSERT_NOT_NULL(strstr(s, "T\t1\t7\t7\tc\t-\tAfter\t\t\n"));
     cbm_free_result(r);
 
     /* Both branches of a conditional open the same block: one closing brace
@@ -3891,7 +3911,7 @@ static void dm_write_resolver_fixture(const char *tmp) {
         "namespace Acme.Rec\n"
         "{\n"
         "    public class Before { }\n"
-        "    public ref partial struct Iter\n"
+        "    public ref /* stack only */ partial struct Iter\n"
         "    {\n"
         "        public void End() { }\n"
         "    }\n"
@@ -4188,6 +4208,17 @@ TEST(doc_mentions_resolver_parse_errors) {
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_dm_pe_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     dm_write_resolver_fixture(tmp);
+    /* the plain spelling of what Recovered.cs cannot parse: repaired before parsing */
+    th_write_file(TH_PATH(tmp, "src/Other/RefPartial.cs"),
+                  "namespace Acme.RefPartial\n"
+                  "{\n"
+                  "    public ref partial struct Reader\n"
+                  "    {\n"
+                  "        public void End() { }\n"
+                  "    }\n"
+                  "    /// <summary><see cref=\"Reader\"/></summary>\n"
+                  "    public class UsesReader { }\n"
+                  "}\n");
     char db[512];
     snprintf(db, sizeof(db), "%s/res.db", tmp);
     ASSERT_EQ(dm_index(tmp, db, NULL), 0);
@@ -4196,6 +4227,9 @@ TEST(doc_mentions_resolver_parse_errors) {
     int n = 0;
     const char *rec = "src/Other/Recovered.cs";
 
+    /* a `ref partial struct` the parse view repairs has a node and is linked */
+    dm_edge(db, "RefPartial.UsesReader", "RefPartial.Reader", props, sizeof(props), &n);
+    ASSERT_EQ(n, 1);
     /* `Middle` follows a struct the grammar cannot parse; the tree puts it in
      * the global namespace, the braces keep it in Acme.Rec, where `Before` is */
     dm_edge(db, "Recovered.Middle", "Recovered.Before", props, sizeof(props), &n);

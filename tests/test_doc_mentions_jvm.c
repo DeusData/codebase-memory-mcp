@@ -430,11 +430,11 @@ TEST(doc_mentions_jvm_kotlin_scope_blob) {
     ASSERT(jt_has_line(s, "M\t6\tv\t\t0\tbodyProp\t\t-\t\t=\t1\t"));
     ASSERT(jt_has_line(s, "M\t7\tc\t\t0\tmember\t\tInt\t\t=\t0\tparam"));
     ASSERT(jt_has_line(s, "M\t10\tc\t\t0\tmember\t\tString\t\t=\t1\tparam"));
-    /* a nested type's node is flat: named below the file's module */
-    ASSERT(jt_has_line(s, "T\t13\t13\tc\tAlias.Nested\t\t\tNested\t1\t"));
-    /* an unnamed companion and its members: declared, no definitions */
-    ASSERT(jt_has_line(s, "T\t14\t16\tC\tAlias.Companion\t\t\t-\t0\t"));
-    ASSERT(jt_has_line(s, "M\t15\tv\t\t2\tLIMIT\t\t-\t\t-\t0\t"));
+    /* a nested type's node is named under its outer class: its logical path */
+    ASSERT(jt_has_line(s, "T\t13\t13\tc\tAlias.Nested\t\t\t=\t1\t"));
+    /* an unnamed companion has a node of its own, as its members do */
+    ASSERT(jt_has_line(s, "T\t14\t16\tC\tAlias.Companion\t\t\t=\t1\t"));
+    ASSERT(jt_has_line(s, "M\t15\tv\t\t2\tLIMIT\t\t-\t\t=\t1\t"));
     ASSERT(jt_has_line(s, "M\t17\tc\tK\t0\tAlias\t\tInt\t\t=\t1\tx"));
     /* an extension: its receiver as written; a type parameter stands for its
      * bound, one without a bound for any type */
@@ -1151,7 +1151,7 @@ TEST(doc_mentions_jvm_kotlin_families_and_reasons) {
     ASSERT_NOT_NULL(strstr(jt_props, "\"tier\":\"exact\""));
     ASSERT_EQ(jt_edge(db, widget, "far.Helper.Helper.run"), 1);
     /* a member of the companion object, named through its class */
-    ASSERT_EQ(jt_edge(db, widget, "k.Gadget.Factory.create"), 1);
+    ASSERT_EQ(jt_edge(db, widget, "k.Gadget.Gadget.Factory.create"), 1);
     /* a type alias has a node of its own */
     ASSERT_EQ(jt_edge(db, widget, "k.Gadget.Alias"), 1);
     /* throws */
@@ -1336,12 +1336,12 @@ TEST(doc_mentions_jvm_kotlin_levels) {
               0);
     /* 3 */
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3.own"), 1);
-    ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.Tools.make"), 1);
+    ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3.Tools.make"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3Base.inherited"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3.shared"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K3.K3.m", "kl.K3.K3Base.shared"), 0);
     /* 4 */
-    ASSERT_EQ(jt_edge(db, "kl.K4.K4.m", "kl.K4.Thing"), 1);
+    ASSERT_EQ(jt_edge(db, "kl.K4.K4.m", "kl.K4.K4.Thing"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K4.K4.m", "far.Thing.Thing"), 0);
     /* 5 */
     ASSERT_EQ(jt_edge(db, "kl.K5.K5", "far.Thing.Thing"), 1);
@@ -1358,11 +1358,11 @@ TEST(doc_mentions_jvm_kotlin_levels) {
     ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/kl/K8.kt", "listOf"), "external");
     ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/kl/K8.kt", "Runnable"), "external");
     /* 9 */
-    ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K4.Thing"), 1);
+    ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K4.K4.Thing"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "far.Thing.Thing"), 1);
     ASSERT_NOT_NULL(strstr(jt_props, "\"tier\":\"exact\""));
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "far.Funs.topFun"), 1);
-    ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.Tools.make"), 1);
+    ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3.Tools.make"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3Base.inherited"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3.shared"), 1);
     ASSERT_EQ(jt_edge(db, "kl.K9.K9", "kl.K3.K3Base.shared"), 0);
@@ -1785,12 +1785,12 @@ TEST(doc_mentions_jvm_kotlin_open_supertypes) {
               0);
     /* the class around instead of the package: the same rule */
     ASSERT_EQ(jt_rows(db, k4, "aid", "external"), 1);
-    ASSERT_EQ(dm_mentions_from(db, "gk.K4.Wrapped.m"), 0);
-    ASSERT_EQ(jt_edge(db, "gk.K4.Simple.m", "gk.K4.Outer.aid"), 1);
+    ASSERT_EQ(dm_mentions_from(db, "gk.K4.Outer.Wrapped.m"), 0);
+    ASSERT_EQ(jt_edge(db, "gk.K4.Outer.Simple.m", "gk.K4.Outer.aid"), 1);
     /* the companion object's supertypes count: its members are in the
      * class's scope. What the companion declares itself binds */
     ASSERT_EQ(jt_rows(db, k4, "helper", "external"), 1);
-    ASSERT_EQ(jt_edge(db, "gk.K4.Locked.m", "gk.K4.Lock.close"), 1);
+    ASSERT_EQ(jt_edge(db, "gk.K4.Locked.m", "gk.K4.Locked.Lock.close"), 1);
     ASSERT_EQ(dm_mentions_from(db, "gk.K4.Locked.m"), 1);
     jt_end(&r);
     PASS();
@@ -1822,8 +1822,22 @@ TEST(doc_mentions_jvm_kotlin_companion_inherits) {
              "\n"
              "/** [Entity.create] */\n"
              "class User\n");
+    /* an unnamed companion is named Companion, and has a node. A named one is
+     * not: `Named.Companion` declares nothing */
+    jt_write(&r, "src/main/kotlin/gk/K5b.kt",
+             "package gk\n"
+             "\n"
+             "class Named {\n"
+             "    companion object Tools\n"
+             "}\n"
+             "\n"
+             "/** [Entity.Companion], [Named.Companion] */\n"
+             "class CompanionUser\n");
     ASSERT_EQ(dm_index(r.repo, r.db, NULL), 0);
     const char *db = r.db;
+    ASSERT_EQ(jt_edge(db, "gk.K5b.CompanionUser", "gk.K5.Entity.Companion"), 1);
+    ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/gk/K5b.kt", "Entity.Companion"), "");
+    ASSERT_EQ(dm_mentions_from(db, "gk.K5b.CompanionUser"), 1);
     ASSERT_EQ(jt_edge(db, "gk.K5.Entity.m", "gk.K5.Maker.create"), 1);
     ASSERT_EQ(jt_edge(db, "gk.K5.Entity.m", "gk.Top.create"), 0);
     /* decoy: a name the companion's hierarchy does not have is the package's */
@@ -2171,13 +2185,25 @@ TEST(doc_mentions_jvm_kotlin_type_and_function) {
              "}\n"
              "\n"
              "fun Alias(text: String): Alias = Alias()\n");
-    /* the same idiom inside a type: a nested class and a member function */
+    /* the same idiom inside a type: a nested class is named under its outer
+     * class, so it shares `f.Holder.Holder.Part` with the member function, and
+     * the function, declared later, owns the node */
     jt_write(&r, "src/main/kotlin/f/Holder.kt",
              "package f\n"
              "\n"
              "class Holder {\n"
              "    class Part\n"
              "    fun Part(size: Int): Part = Part()\n"
+             "}\n");
+    /* a member function and a property of one name share one qualified name too,
+     * and the property, declared later, owns the node (R2dbcDatabase.kt in Exposed) */
+    jt_write(&r, "src/main/kotlin/f/Twin.kt",
+             "package f\n"
+             "\n"
+             "class Twin {\n"
+             "    /** A [Json]. */\n"
+             "    fun same() {}\n"
+             "    private val same = 1\n"
              "}\n");
     /* not the idiom: a class and a PROPERTY of one name stay ambiguous */
     jt_write(&r, "src/main/kotlin/f/Mode.kt", "package f\n\nclass Mode\n");
@@ -2229,13 +2255,28 @@ TEST(doc_mentions_jvm_kotlin_type_and_function) {
     ASSERT_EQ(jt_edge(db, "f.User.User", "f.Builders.Json"), 0);
     /* a qualifier is a type: the function is no candidate there */
     ASSERT_EQ(jt_edge(db, "f.User.User", "f.Json.Json.encode"), 1);
-    /* inside a type: the nested class, not the member function */
-    ASSERT_EQ(jt_edge(db, "f.User.User", "f.Holder.Part"), 1);
+    /* inside a type the class is what the reference names and it has no node:
+     * a graph gap, and never an edge to the member function that owns the QN.
+     * KNOWN GAP since nested types are named under their outer class; the old
+     * flat `f.Holder.Part` gave the class a node. Kind-disambiguated QNs would
+     * give it one back (graph_buffer.c, the same-QN collision rule). */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE qualified_name LIKE "
+                           "'%.f.Holder.Holder.Part' AND label = 'Method' AND start_line = 5"),
+              1);
+    ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/f/User.kt", "Holder.Part"), "graph_gap");
     ASSERT_EQ(jt_edge(db, "f.User.User", "f.Holder.Holder.Part"), 0);
     /* a class and a property: ambiguous, as before */
     ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/f/User.kt", "Mode"), "ambiguous");
     ASSERT_EQ(jt_edge(db, "f.User.User", "f.Mode.Mode"), 0);
-    ASSERT_EQ(dm_mentions_from(db, "f.User.User"), 3);
+    ASSERT_EQ(dm_mentions_from(db, "f.User.User"), 2);
+    /* the reference resolves, but the documented function has no node to leave
+     * from: a graph gap, never an edge from the property that owns the QN.
+     * KNOWN GAP for the same reason as the nested class above. */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE qualified_name LIKE "
+                           "'%.f.Twin.Twin.same' AND label = 'Variable' AND start_line = 6"),
+              1);
+    ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/f/Twin.kt", "Json"), "graph_gap");
+    ASSERT_EQ(dm_mentions_from(db, "f.Twin.Twin.same"), 0);
     /* the class has NO node: a graph gap, and no edge at all -- the node at
      * `f.Alias.Alias` is the function's */
     ASSERT_STR_EQ(jt_reason(db, "src/main/kotlin/f/GapUser.kt", "Alias"), "graph_gap");

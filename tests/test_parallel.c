@@ -14,6 +14,7 @@
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/shared_resolver.h"
 #include "pipeline/lsp_resolve.h"
+#include "lsp/oo_strict.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -490,6 +491,12 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     if (g_harness_cs_registry && all_defs) {
         harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
     }
+    /* Java, Kotlin and C# static selection needs the declaration index production
+     * builds beside the registries; without it this route could not bind them. */
+    if (all_defs) {
+        harness_registries.oo =
+            cbm_pxc_build_oo_index(&ctx, &cross_arena, result_cache, files, file_count);
+    }
     if (ok) {
         ctx.shared_resolver = cbm_shared_resolver_build(&ctx, files, file_count, result_cache);
         ok = ctx.shared_resolver != NULL;
@@ -510,6 +517,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     ctx.shared_resolver = NULL;
 
     cbm_pxc_free_module_def_index(module_def_index);
+    cbm_oo_index_free(harness_registries.oo);
     free(all_defs);
     cbm_arena_destroy(&cross_arena);
     if (def_modules) {
@@ -3464,8 +3472,9 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
                   "public partial class Thing { public void Alpha() { } }", 2},
                  {11, 10, "PartUser.Use", "t.Beta()", part_beta,
                   "public partial class Thing { public void Beta() { } }", 2}};
-    RQ_Expected expected[7] = {0};
-    for (int i = 0; i < 7; i++)
+    enum { N_MEMBER_CALLS = 7, N_EXPECTED = 9 };
+    RQ_Expected expected[N_EXPECTED] = {0};
+    for (int i = 0; i < N_MEMBER_CALLS; i++)
         expected[i] = (RQ_Expected){
             .case_id = i == 6 ? "partial-beta" : cases[i].caller,
             .site = {.file = rels[cases[i].source],
@@ -3477,13 +3486,33 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
                        .label = "Method",
                        .declaration_line = cases[i].line,
                        .declaration_text = cases[i].declaration},
-            .mode = RQ_KNOWN_GAP,
-            .gap_id = "csharp-cross-file-member-proof",
-            .why = "The namespace/partial-type receiver lookup lacks a complete admissible proof.",
-            .tried = "Preserved all twelve files, both using directions, enclosing and fully "
-                     "qualified namespaces, "
-                     "the multi-namespace file and both partial declarations; neither driver may "
-                     "bind a decoy."};
+            .mode = RQ_REQUIRED};
+    /* `using Contoso.Threading` and nothing nearer named Worker: the constructor
+     * call selects Contoso.Threading.Worker, the second namespace of Threading.cs,
+     * never the decoy Contoso.Decoy.Worker this file does not import. */
+    expected[N_MEMBER_CALLS] = (RQ_Expected){
+        .case_id = "Runner.Run-constructor",
+        .site = {.file = rels[8], .caller = "Runner.Run", .needle = "new Worker()"},
+        .relation = "CALLS",
+        .target = {.file = rels[7],
+                   .suffix = "cbm_cs_same_name.src.Ref.Threading.Worker",
+                   .label = "Class",
+                   .declaration_line = 3,
+                   .declaration_text = "    public class Worker { public void Start() { } }"},
+        .mode = RQ_REQUIRED};
+    expected[N_MEMBER_CALLS + 1] = (RQ_Expected){
+        .case_id = "PartUser.Use-partial-constructor",
+        .site = {.file = rels[11], .caller = "PartUser.Use", .needle = "new Thing()"},
+        .relation = "CALLS",
+        .target = {.file = rels[9],
+                   .declaration_line = 2,
+                   .declaration_text = "public partial class Thing { public void Alpha() { } }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "csharp-partial-type-identity",
+        .why = "Each partial piece of Thing has a node of its own (its QN carries its file), so "
+               "no one class node is the type this constructor call selects.",
+        .tried = "The members bind to the piece that declares them. The type itself has no single "
+                 "identity to bind to, and choosing a piece would be a guess."};
     RQ_Report quality[2] = {0};
     bool ok[2][N_CHECKS];
     bool all = true;
@@ -3491,21 +3520,22 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
         cbm_gbuf_t *gb = graphs[g];
         ASSERT(parallel_quality_check(gb, project,
                                       g ? "csharp-members-parallel" : "csharp-members-sequential",
-                                      sources, N_FILES, expected, 7, &quality[g]));
-        ASSERT_EQ(quality[g].genuine, 7);
-        ASSERT_EQ(quality[g].missing, 7);
-        ok[g][0] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
+                                      sources, N_FILES, expected, N_EXPECTED, &quality[g]));
+        ASSERT_EQ(quality[g].genuine, N_EXPECTED);
+        ASSERT_EQ(quality[g].found, N_EXPECTED - 1);
+        ASSERT_EQ(quality[g].missing, 1);
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
         ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
-        ok[g][2] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
+        ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
         ok[g][3] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", bo, "CALLS");
-        ok[g][4] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
+        ok[g][4] = has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
         ok[g][5] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", pf, "CALLS");
-        ok[g][6] = !has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
+        ok[g][6] = has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
         ok[g][7] = !has_edge_from_callable_to_qn(gb, "Report.Build", pf, "CALLS");
-        ok[g][8] = !has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
         ok[g][9] = !has_edge_from_callable_to_qn(gb, "Runner.Run", decoy_start, "CALLS");
-        ok[g][10] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
-        ok[g][11] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
+        ok[g][10] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
+        ok[g][11] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
         ok[g][12] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", decoy_beta, "CALLS");
         for (int k = 0; k < N_CHECKS; k++) {
             all = all && ok[g][k];
@@ -3562,8 +3592,8 @@ static bool parallel_quality_c_files(const char *root, cbm_file_info_t files[2],
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
  * the graph negatives therefore cannot pass by dropping synthesis. The
- * original alias/reference and operator occurrences remain quality debt; a
- * separate parse-complete alias source is required in both drivers. */
+ * reference and the operator bind in both drivers; the alias call in this file
+ * remains quality debt, and the same call in a file without a class is required. */
 TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
     static const char collision_source[] = "package collision\n"
                                            "class IntArray {\n"
@@ -3595,7 +3625,7 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                                  {.path = "app/Main.kt", .text = main_source},
                                  {.path = "quality/Alias.kt", .text = alias_source}};
     const RQ_Expected expected[] = {
-        {.case_id = "original-callable-alias-parse-gap",
+        {.case_id = "original-callable-alias-beside-class-member",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.aliasCaller",
                   .needle = "callback()",
@@ -3607,13 +3637,14 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                     .declaration_line = 8,
                     .declaration_text = "fun projectHandler(): Int = 7"},
          .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin_parse_incomplete_callable_identity",
-         .why = "The original file has a tree-sitter root error; strict proof entry correctly "
-                "rejects incomplete syntax.",
+         .gap_id = "kotlin_callable_alias_beside_class_member",
+         .why = "The file parses completely (asserted below), but this alias has no proof once the "
+                "file also declares a class with a member: the same call binds with `class Box` "
+                "gone or empty, as the parse-complete quality/Alias.kt row shows.",
          .tried = "Preserved the original generic/destructuring/loop fixture and raw carriers. "
-                  "Both drivers reach the root-error gate; file-level legacy flags do not certify "
-                  "a complete parse."},
-        {.case_id = "original-callable-reference-parse-gap",
+                  "Varied the file: a loop or destructuring does not block the alias, a class "
+                  "with one member function does. The call is left unbound in both drivers."},
+        {.case_id = "original-callable-reference",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.aliasCaller",
                   .needle = "projectHandler",
@@ -3757,14 +3788,14 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
     ASSERT(parallel_quality_check(sequential, project, "kotlin-protocol-0", sources, 3, expected, 5,
                                   &quality[0]));
     ASSERT_EQ(quality[0].genuine, 5);
-    ASSERT_EQ(quality[0].found, 2);
-    ASSERT_EQ(quality[0].missing, 3);
+    ASSERT_EQ(quality[0].found, 4);
+    ASSERT_EQ(quality[0].missing, 1);
     ASSERT_EQ(quality[0].required_missing + quality[0].wrong, 0);
     ASSERT(parallel_quality_check(parallel, project, "kotlin-protocol-1", sources, 3, expected, 5,
                                   &quality[1]));
     ASSERT_EQ(quality[1].genuine, 5);
-    ASSERT_EQ(quality[1].found, 2);
-    ASSERT_EQ(quality[1].missing, 3);
+    ASSERT_EQ(quality[1].found, 4);
+    ASSERT_EQ(quality[1].missing, 1);
     ASSERT_EQ(quality[1].required_missing + quality[1].wrong, 0);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
@@ -3785,9 +3816,9 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
 }
 
 /* Kotlin operator carriers and semantic joins remain required independently
- * of strict edge admission. All six genuine invocations remain counted quality
- * gaps until operator applicability has source proofs; false type-test/index
- * targets stay forbidden. A cross-file C control prevents empty graph parity. */
+ * of strict edge admission. All six genuine invocations bind to the operator
+ * their receiver's declared type selects; false type-test/index targets stay
+ * forbidden. A cross-file C control prevents empty graph parity. */
 TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
     static const char definitions_source[] =
         "package app\n"
@@ -4025,14 +4056,14 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
     ASSERT(parallel_quality_check(sequential, project, "kotlin-nonbinary-0", sources, 4, expected,
                                   7, &quality[0]));
     ASSERT_EQ(quality[0].genuine, 7);
-    ASSERT_EQ(quality[0].found, 1);
-    ASSERT_EQ(quality[0].missing, 6);
+    ASSERT_EQ(quality[0].found, 7);
+    ASSERT_EQ(quality[0].missing, 0);
     ASSERT_EQ(quality[0].required_missing + quality[0].wrong, 0);
     ASSERT(parallel_quality_check(parallel, project, "kotlin-nonbinary-1", sources, 4, expected, 7,
                                   &quality[1]));
     ASSERT_EQ(quality[1].genuine, 7);
-    ASSERT_EQ(quality[1].found, 1);
-    ASSERT_EQ(quality[1].missing, 6);
+    ASSERT_EQ(quality[1].found, 7);
+    ASSERT_EQ(quality[1].missing, 0);
     ASSERT_EQ(quality[1].required_missing + quality[1].wrong, 0);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
@@ -4587,12 +4618,7 @@ static const RQ_Expected PAR_JVM_EXPECTED[] = {
                 .label = "Method",
                 .declaration_line = 4,
                 .declaration_text = "    fun ping(javaService: JavaService): String {"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "jvm-reference-argument-proof",
-     .why = "Java applicability proves primitives only; this constructor argument needs exact JVM "
-            "reference compatibility.",
-     .tried = "Original Java/Kotlin fixture retained; source argument bridge rejects object "
-              "creation rather than trusting confidence."},
+     .mode = RQ_REQUIRED},
     {.case_id = "kotlin-java-package-access",
      .site = {.file = "src/main/kotlin/com/example/KotlinService.kt",
               .caller = "src.main.kotlin.com.example.KotlinService.KotlinService.ping",
@@ -4604,28 +4630,20 @@ static const RQ_Expected PAR_JVM_EXPECTED[] = {
                 .label = "Method",
                 .declaration_line = 10,
                 .declaration_text = "    String pong() {"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "jvm-package-access-proof",
-     .why = "Kotlin strict lookup does not yet prove same-package access to Java package-private "
-            "declarations.",
-     .tried = "Original com.example package and package-private service retained; public-only "
-              "proof lookup abstains."},
+     .mode = RQ_REQUIRED},
     {.case_id = "java-implicit-constructor",
      .site = {.file = "src/main/java/com/example/Example.java",
               .caller = "src.main.java.com.example.JavaCaller.call",
               .needle = "new JavaService()"},
      .relation = "CALLS",
+     /* No constructor is declared, so the class stands for the implicit one, as it
+      * does for every Java and C# `new` (test_resolver_oo.c). */
      .target = {.file = "src/main/java/com/example/Example.java",
-                .suffix = NULL,
-                .label = "Method",
+                .suffix = "src.main.java.com.example.JavaService",
+                .label = "Class",
                 .declaration_line = 9,
                 .declaration_text = "class JavaService {"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "java_implicit_constructor_identity_unmaterialized",
-     .why = "The implicit default constructor has no independently materialized callable identity; "
-            "the Class is not a CALLS target.",
-     .tried = "Counted the nested new JavaService() occurrence and anchored it to the declaring "
-              "class. A NULL target identity rejects every guessed node, including the Class."},
+     .mode = RQ_REQUIRED},
     {.case_id = "required-cross-file-scalar-control",
      .site = {.file = "src/main/kotlin/quality/Control.kt",
               .caller = "src.main.kotlin.quality.Control.direct",
@@ -4706,8 +4724,8 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     ASSERT(parallel_quality_check(gbuf, "com", "jvm-cross-file", PAR_JVM_SOURCES, 4,
                                   PAR_JVM_EXPECTED, 4, &quality));
     ASSERT_EQ(quality.genuine, 4);
-    ASSERT_EQ(quality.found, 1);
-    ASSERT_EQ(quality.missing, 3);
+    ASSERT_EQ(quality.found, 4);
+    ASSERT_EQ(quality.missing, 0);
     ASSERT_EQ(quality.required_missing + quality.wrong, 0);
 
     cbm_gbuf_free(gbuf);
@@ -5365,8 +5383,8 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
         ASSERT(parallel_quality_check(gbuf, "com", names[s], PAR_JVM_SOURCES, 4, PAR_JVM_EXPECTED,
                                       4, &quality));
         ASSERT_EQ(quality.genuine, 4);
-        ASSERT_EQ(quality.found, 1);
-        ASSERT_EQ(quality.missing, 3);
+        ASSERT_EQ(quality.found, 4);
+        ASSERT_EQ(quality.missing, 0);
         ASSERT_EQ(quality.required_missing + quality.wrong, 0);
 
         cbm_gbuf_free(gbuf);
@@ -6301,8 +6319,7 @@ TEST(parallel_php_vendor_types_never_bind_by_name_issue1186) {
  * calls fell to name-only strategies (the #1186 "useful calls at 0.38"). The
  * decoy App\Other\Svc shares the short name and the method, so a name-only
  * match cannot tell the two apart. Controls: the vendor-typed receiver
- * (`Client $c`) must stay unresolved, and the same-file calls keep their LSP
- * strategies. */
+ * (`Client $c`) must stay unresolved, and the same-file calls bind. */
 static const struct {
     const char *rel;
     const char *src;
@@ -6365,8 +6382,10 @@ static void php_xfile_count_edge(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
-/* The unresolved namespace case must reject every guessed receiver target.
- * php_xfile_run separately counts each original genuine call as quality debt. */
+/* One unresolved vendor import voids no other import: each project receiver
+ * binds to the class its own `use` names, and the decoy that shares a short
+ * name and a method gets nothing. Proof, not a strategy label, admits the edge,
+ * so no edge carries an LSP strategy. */
 static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
     static const char *const foo = "lib/Http/Foo.php";
     struct {
@@ -6375,11 +6394,11 @@ static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
         int want_total;
         int want_lsp;
     } checks[] = {
-        {"lib/Services/Svc.php", ".Svc.go", 0, 0}, /* $this->svc->go(), not $c->go() */
+        {"lib/Services/Svc.php", ".Svc.go", 1, 0}, /* $this->svc->go(), not $c->go() */
         {"lib/Other/Svc.php", ".Svc.go", 0, 0},    /* decoy: same short name + method */
-        {"lib/Repo/Repo.php", ".Repo.find", 0, 0}, /* aliased import */
-        {foo, ".Foo.local", 0, 0},                 /* same-file control */
-        {foo, ".Local.ping", 0, 0},                /* same-file control */
+        {"lib/Repo/Repo.php", ".Repo.find", 1, 0}, /* aliased import */
+        {foo, ".Foo.local", 1, 0},                 /* same-file control */
+        {foo, ".Local.ping", 1, 0},                /* same-file control */
     };
     int ok = 1;
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
@@ -6464,22 +6483,26 @@ static int php_xfile_run(const char *extra_use) {
                        .declaration_line =
                            cases[i].line + (extra_use && cases[i].target == 3 ? 1 : 0),
                        .declaration_text = cases[i].decl},
-            .mode = RQ_KNOWN_GAP,
-            .gap_id = "php-unresolved-import-namespace-proof",
-            .why = "The fixture's unresolved vendor import prevents a complete namespace proof.",
-            .tried =
-                "Preserved the promoted property, imported alias, vendor receiver, same-file "
-                "controls "
-                "and same-name decoy in both drivers, with and without the extra global import."};
+            .mode = RQ_REQUIRED};
+    /* The vendor receiver has no project declaration: Svc::go is its decoy. */
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "php-vendor-receiver-stays-unresolved",
+         .site = {.file = "lib/Http/Foo.php",
+                  .caller = "lib.Http.Foo.Foo.run",
+                  .needle = "$c->go()"},
+         .relation = "CALLS",
+         .any_target = true}};
     RQ_Report quality[2] = {0};
     bool quality_ok =
         seq && par &&
-        parallel_quality_check(seq, "cbm_par_phpxfile", "php-receiver-sequential", sources,
-                               PHP_XFILE_FILE_COUNT, expected, 4, &quality[0]) &&
-        parallel_quality_check(par, "cbm_par_phpxfile", "php-receiver-parallel", sources,
-                               PHP_XFILE_FILE_COUNT, expected, 4, &quality[1]) &&
-        quality[0].genuine == 4 && quality[0].missing == 4 && quality[1].genuine == 4 &&
-        quality[1].missing == 4;
+        parallel_quality_check_with_forbidden(seq, "cbm_par_phpxfile", "php-receiver-sequential",
+                                              sources, PHP_XFILE_FILE_COUNT, expected, 4, forbidden,
+                                              1, &quality[0]) &&
+        parallel_quality_check_with_forbidden(par, "cbm_par_phpxfile", "php-receiver-parallel",
+                                              sources, PHP_XFILE_FILE_COUNT, expected, 4, forbidden,
+                                              1, &quality[1]) &&
+        quality[0].genuine == 4 && quality[0].found == 4 && quality[0].missing == 0 &&
+        quality[1].genuine == 4 && quality[1].found == 4 && quality[1].missing == 0;
     for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++)
         free((void *)sources[i].text);
     int seq_ok = seq ? php_xfile_graph_ok(seq, "sequential") : 0;

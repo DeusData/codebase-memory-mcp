@@ -1098,7 +1098,7 @@ static uint64_t parse_error_bytes(TSTree *tree) {
  * taking every type it declares with it. This view has the same length and the same
  * lines: conditional directives and the branches after a file's first one are blank,
  * and so is that `ref`. Only a file the grammar could not otherwise read uses it. */
-static char *csharp_parse_view(const char *source, uint32_t length) {
+static char *csharp_parse_view(const char *source, uint32_t length, bool *hid_branch) {
     enum { MAX_DEPTH = 64 };
     char *view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)length + 1);
     if (!view)
@@ -1122,7 +1122,7 @@ static char *csharp_parse_view(const char *source, uint32_t length) {
         if (opens && depth < MAX_DEPTH)
             inactive[depth++] = false;
         else if (switches && depth > 0)
-            inactive[depth - 1] = true;
+            *hid_branch = inactive[depth - 1] = true;
         else if (closes && depth > 0)
             depth--;
         bool hidden = false;
@@ -1153,12 +1153,14 @@ static char *csharp_parse_view(const char *source, uint32_t length) {
     return view;
 }
 
-TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
-                                   uint32_t source_len, TSParseOptions opts) {
+TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, const char *source,
+                                      uint32_t source_len, TSParseOptions opts,
+                                      TSTree **unrepaired) {
     TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
     if (!tree || language != CBM_LANG_CSHARP || !ts_node_has_error(ts_tree_root_node(tree)))
         return tree;
-    char *view = csharp_parse_view(source, source_len);
+    bool hid_branch = false;
+    char *view = csharp_parse_view(source, source_len, &hid_branch);
     if (!view)
         return tree;
     ts_parser_reset(parser);
@@ -1167,11 +1169,19 @@ TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const
     if (!repaired)
         return tree;
     if (parse_error_bytes(repaired) < parse_error_bytes(tree)) {
-        ts_tree_delete(tree);
+        if (unrepaired && hid_branch)
+            *unrepaired = tree;
+        else
+            ts_tree_delete(tree);
         return repaired;
     }
     ts_tree_delete(repaired);
     return tree;
+}
+
+TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
+                                   uint32_t source_len, TSParseOptions opts) {
+    return cbm_parse_source_repairing_ex(parser, language, source, source_len, opts, NULL);
 }
 
 static CBM_TLS TSParser *tl_parser = NULL;
@@ -4367,10 +4377,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     bool c_family = language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
+    TSTree *unrepaired = NULL;
     TSTree *tree =
         c_family
             ? cbm_parse_c_source_defined(parser, source, (uint32_t)source_len, opts, extra_defines)
-            : cbm_parse_source_repairing(parser, language, source, (uint32_t)source_len, opts);
+            : cbm_parse_source_repairing_ex(parser, language, source, (uint32_t)source_len, opts,
+                                            &unrepaired);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }
@@ -4444,6 +4456,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .unrepaired_root = unrepaired ? ts_tree_root_node(unrepaired) : (TSNode){0},
         .macro_table = macro_table,
         .return_type_table = return_type_table,
         .walk_budget_nodes = cbm_walk_max_nodes(),
@@ -5170,6 +5183,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     /* Doc-comment references of the documented definitions, and the file's
      * doc-link scope: both read the complete docstrings and the tree. */
     cbm_doclinks_extract(&ctx);
+    if (unrepaired) {
+        ts_tree_delete(unrepaired);
+    }
 
     // Accumulate profiling counters
     atomic_fetch_add(&total_parse_ns, t1 - t0);
