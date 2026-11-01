@@ -56,6 +56,8 @@ static const rs_type_t RS_UNIT_TYPE = {.kind = RT_UNIT};
 typedef struct rs_binding {
     const char *name;
     const rs_type_t *type;
+    /* `let x;`: the first assignment settles the type. */
+    bool deferred;
     struct rs_binding *next;
 } rs_binding_t;
 
@@ -103,6 +105,9 @@ typedef struct {
     /* Added to node offsets while walking a re-parsed macro argument list. */
     int64_t site_delta;
     TSParser *parser;
+    /* The element of the last `.collect()` walked, and where that call ends. */
+    const rs_type_t *collected;
+    uint32_t collected_end;
     /* The first argument's type, when the call being selected has walked it. */
     const rs_type_t *call_arg0;
     /* Types the enclosing call gives a closure argument's parameters. */
@@ -628,13 +633,14 @@ static void rs_bind(rs_walk_t *w, const char *name, const rs_type_t *type) {
     }
     binding->name = name;
     binding->type = type ? type : &RS_UNKNOWN_TYPE;
+    binding->deferred = false;
     binding->next = w->scope->bindings;
     w->scope->bindings = binding;
 }
 
-static const rs_binding_t *rs_local(const rs_walk_t *w, const char *name) {
+static rs_binding_t *rs_local(const rs_walk_t *w, const char *name) {
     for (const rs_scope_t *scope = w->scope; scope; scope = scope->parent) {
-        for (const rs_binding_t *binding = scope->bindings; binding; binding = binding->next)
+        for (rs_binding_t *binding = scope->bindings; binding; binding = binding->next)
             if (!strcmp(binding->name, name))
                 return binding;
         if (scope->fn_boundary)
@@ -1313,6 +1319,30 @@ static const rs_type_t *rs_seq_element(const rs_type_t *type) {
                                   : rs_arg(type, 0);
 }
 
+/* FromIterator: `_` in the spelled collection is the iterator's element. A map takes
+ * (K, V); Result<C, E> and Option<C> take an item of that wrapper and collect C. */
+static const rs_type_t *rs_collect_into(CBMArena *arena, const rs_type_t *into,
+                                        const rs_type_t *element, int depth) {
+    if (!into || !element || into->kind != RT_EXT || element->kind == RT_UNKNOWN || depth > 2)
+        return into;
+    if (rs_is_seq(into) || rs_is_set(into))
+        return rs_arg(into, 0)->kind == RT_UNKNOWN ? rs_ext_type(arena, into->name, element, NULL)
+                                                   : into;
+    if (rs_is_map(into) && element->kind == RT_TUPLE && element->nargs == 2) {
+        const rs_type_t *key = rs_arg(into, 0), *value = rs_arg(into, 1);
+        return rs_ext_type(arena, into->name, key->kind == RT_UNKNOWN ? element->args[0] : key,
+                           value->kind == RT_UNKNOWN ? element->args[1] : value);
+    }
+    bool option =
+        rs_ext_is(into, "std::option::Option") && rs_ext_is(element, "std::option::Option");
+    if (option || (rs_ext_is_result(into) && rs_ext_is_result(element))) {
+        const rs_type_t *inner =
+            rs_collect_into(arena, rs_arg(into, 0), rs_arg(element, 0), depth + 1);
+        return rs_ext_type(arena, into->name, inner, into->nargs > 1 ? into->args[1] : NULL);
+    }
+    return into;
+}
+
 /* Parameter types the callee gives a closure passed to it. */
 static int rs_closure_params_for(rs_walk_t *w, const rs_type_t *receiver, const char *name,
                                  const rs_type_t **out) {
@@ -1347,13 +1377,45 @@ static int rs_closure_params_for(rs_walk_t *w, const rs_type_t *receiver, const 
         return 0;
     }
     if (type->kind == RT_ITER) {
+        static const char *const by_ref_key[] = {"max_by_key", "min_by_key", NULL};
+        static const char *const two_refs[] = {"max_by", "min_by", NULL};
         if (rs_name_in(name, by_value) || !strcmp(name, "position")) {
             out[0] = type->inner;
             return 1;
         }
-        if (rs_name_in(name, by_ref)) {
+        if (rs_name_in(name, by_ref) || rs_name_in(name, by_ref_key)) {
             out[0] = rs_ref_of(arena, type->inner);
             return 1;
+        }
+        if (rs_name_in(name, two_refs)) {
+            out[0] = out[1] = rs_ref_of(arena, type->inner);
+            return 2;
+        }
+        if (!strcmp(name, "fold") || !strcmp(name, "try_fold")) {
+            out[0] = &RS_UNKNOWN_TYPE;
+            out[1] = type->inner;
+            return 2;
+        }
+        if (!strcmp(name, "reduce")) {
+            out[0] = out[1] = type->inner;
+            return 2;
+        }
+        return 0;
+    }
+    if (rs_is_seq(type)) {
+        static const char *const element_ref[] = {
+            "sort_by_key",      "sort_by_cached_key", "sort_unstable_by_key", "retain",
+            "binary_search_by", "partition_point",    "binary_search_by_key", NULL};
+        static const char *const two_refs[] = {"sort_by", "sort_unstable_by", NULL};
+        static const char *const element_mut[] = {"retain_mut", "dedup_by_key", NULL};
+        const rs_type_t *reference = rs_ref_of(arena, rs_seq_element(type));
+        if (rs_name_in(name, element_ref) || rs_name_in(name, element_mut)) {
+            out[0] = reference;
+            return 1;
+        }
+        if (rs_name_in(name, two_refs) || !strcmp(name, "dedup_by")) {
+            out[0] = out[1] = reference;
+            return 2;
         }
     }
     return 0;
@@ -1876,6 +1938,12 @@ static void rs_type_name_site(rs_walk_t *w, TSNode site, const char *const *segs
                               bool absolute) {
     uint32_t start = ts_node_start_byte(site), end = ts_node_end_byte(site);
     if (nseg == 1 && !absolute) {
+        /* `Vec<_>` asks the compiler to infer: the placeholder names nothing. */
+        if (!strcmp(segs[0], "_")) {
+            rs_sel_t sel = rs_sel_settled("rust_inferred_type", CBM_RESOLVE_DOMAIN_UNKNOWN);
+            rs_emit(w, CBM_RUST_SITE_REF, start, end, &sel);
+            return;
+        }
         if (rs_is_self_type(segs[0])) {
             const rs_type_t *self_ty = w->self_ty ? rs_peel(w->self_ty) : NULL;
             rs_sel_t sel = self_ty && self_ty->kind == RT_ITEM
@@ -2551,6 +2619,8 @@ static const rs_type_t *rs_walk_path_call(rs_walk_t *w, TSNode call, TSNode call
     return rs_ctor_result(w, &sel);
 }
 
+static const rs_type_t *rs_element_of(rs_walk_t *w, const rs_type_t *iterable);
+
 static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode callee,
                                             TSNode arguments) {
     TSNode access = callee;
@@ -2602,11 +2672,17 @@ static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode ca
         if (!ts_node_is_null(first)) {
             rs_env_t env = rs_env_here(w);
             const rs_type_t *spelled = rs_lower(&env, rs_tsyn_from(&w->b, first));
-            if (!strcmp(name, "collect") || !strcmp(name, "sum") || !strcmp(name, "product"))
+            if (!strcmp(name, "collect"))
+                return rs_collect_into(w->arena, spelled, rs_element_of(w, receiver), 0);
+            if (!strcmp(name, "sum") || !strcmp(name, "product"))
                 return spelled;
             if (!strcmp(name, "parse"))
                 return rs_result_of(w->arena, spelled, NULL);
         }
+    } else if (!strcmp(name, "collect")) {
+        /* `let all: Vec<_> = it.collect();`: the let fills the placeholder. */
+        w->collected = rs_element_of(w, receiver);
+        w->collected_end = ts_node_end_byte(call);
     }
     return rs_ext_method_ret(w, receiver, name, args.closure_ret);
 }
@@ -2746,6 +2822,9 @@ static const rs_type_t *rs_element_of(rs_walk_t *w, const rs_type_t *iterable) {
     const rs_type_t *element = NULL;
     if (type->kind == RT_ITER)
         return type->inner;
+    /* Box<I> is an Iterator when I is: Box<dyn Iterator<Item = T>>. */
+    if (rs_ext_is(type, "std::boxed::Box") && rs_peel(rs_arg(type, 0))->kind == RT_ITER)
+        return rs_peel(rs_arg(type, 0))->inner;
     if (rs_is_seq(type))
         element = rs_seq_element(type);
     else if (rs_is_set(type) || rs_ext_is(type, "std::option::Option"))
@@ -3261,8 +3340,15 @@ static const rs_type_t *rs_walk_expr_inner(rs_walk_t *w, TSNode node, const char
         return array ? array : &RS_UNKNOWN_TYPE;
     }
     if (!strcmp(kind, "assignment_expression") || !strcmp(kind, "compound_assignment_expr")) {
-        (void)rs_walk_expr(w, rs_field(node, "right"));
-        (void)rs_walk_expr(w, rs_field(node, "left"));
+        const rs_type_t *assigned = rs_walk_expr(w, rs_field(node, "right"));
+        TSNode left = rs_field(node, "left");
+        (void)rs_walk_expr(w, left);
+        rs_binding_t *binding =
+            rs_is(left, "identifier") ? rs_local(w, rs_text(&w->b, left)) : NULL;
+        if (binding && binding->deferred && assigned->kind != RT_UNKNOWN) {
+            binding->type = assigned;
+            binding->deferred = false;
+        }
         return &RS_UNIT_TYPE;
     }
     if (!strcmp(kind, "binary_expression")) {
@@ -3437,12 +3523,17 @@ static void rs_walk_let(rs_walk_t *w, TSNode node, bool has_cfg) {
         const rs_type_t *value_type = rs_walk_expr(w, value);
         if (!type || type->kind == RT_UNKNOWN)
             type = value_type;
+        else if (w->collected && w->collected_end == ts_node_end_byte(value))
+            type = rs_collect_into(w->arena, type, w->collected, 0);
     }
     TSNode alternative = rs_field(node, "alternative");
     if (!ts_node_is_null(alternative))
         (void)rs_walk_expr(w, alternative);
     /* Two cfg-gated lets of one name may differ in type. */
-    rs_bind_pattern(w, rs_field(node, "pattern"), has_cfg ? &RS_UNKNOWN_TYPE : type);
+    TSNode pattern = rs_field(node, "pattern");
+    rs_bind_pattern(w, pattern, has_cfg ? &RS_UNKNOWN_TYPE : type);
+    if (!type && !has_cfg && rs_is(pattern, "identifier") && w->scope && w->scope->bindings)
+        w->scope->bindings->deferred = true;
 }
 
 static void rs_walk_block_item(rs_walk_t *w, TSNode node, const char *kind) {

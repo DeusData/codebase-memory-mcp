@@ -1889,6 +1889,8 @@ static rs_ent_t rs_local_items(rs_inst_t *inst, const char *name, unsigned ns, r
     return found;
 }
 
+#define RS_MACRO_DECLARED_ITEM "rust_macro_declared_item"
+
 static rs_ent_t rs_use_target(rs_query_t *q, rs_inst_t *inst, const rs_use_t *use, unsigned ns) {
     rs_inst_t *last = NULL;
     int consumed = 0;
@@ -1898,6 +1900,10 @@ static rs_ent_t rs_use_target(rs_query_t *q, rs_inst_t *inst, const rs_use_t *us
     if (rs_ent_found(&ent) && consumed < use->nseg && ent.kind != RS_ENT_EXTERNAL &&
         ent.kind != RS_ENT_UNKNOWN && ent.kind != RS_ENT_PRELUDE)
         return rs_ent(RS_ENT_NONE, RS_VIA_NONE);
+    /* The path stops in a module whose macros can declare the name: the import
+     * is real, only its target is unseen. */
+    if (ent.kind == RS_ENT_NONE && last && last->syn->has_macro_items)
+        return rs_ent_unknown(RS_MACRO_DECLARED_ITEM);
     return ent;
 }
 
@@ -1906,7 +1912,7 @@ static rs_ent_t rs_use_target(rs_query_t *q, rs_inst_t *inst, const rs_use_t *us
 static rs_ent_t rs_named_uses(rs_query_t *q, rs_inst_t *inst, const char *name, unsigned ns,
                               rs_inst_t *from) {
     rs_ent_t found = rs_ent(RS_ENT_NONE, RS_VIA_NONE);
-    bool hidden = false;
+    bool hidden = false, found_cfg = false;
     for (const rs_use_t *use = inst->syn->uses; use; use = use->next) {
         if (!use->local || strcmp(use->local, name) != 0)
             continue;
@@ -1922,14 +1928,26 @@ static rs_ent_t rs_named_uses(rs_query_t *q, rs_inst_t *inst, const char *name, 
             /* An unknown path cannot settle a name a known path also binds. */
             if (found.kind == RS_ENT_UNKNOWN) {
                 found = next;
+                found_cfg = use->has_cfg;
                 continue;
             }
             if (next.kind == RS_ENT_UNKNOWN)
                 continue;
+            /* One name twice in one namespace does not compile, so an external path
+             * beside a project one binds another namespace: `use thiserror::Error`
+             * is the derive beside `use crate::Error`. Under cfg they can be two. */
+            if (!found_cfg && !use->has_cfg &&
+                (found.kind == RS_ENT_EXTERNAL) != (next.kind == RS_ENT_EXTERNAL)) {
+                if (found.kind == RS_ENT_EXTERNAL)
+                    found = next;
+                continue;
+            }
             return rs_ent(RS_ENT_AMBIGUOUS, RS_VIA_NAMED);
         }
-        if (!rs_ent_found(&found))
+        if (!rs_ent_found(&found)) {
             found = next;
+            found_cfg = use->has_cfg;
+        }
     }
     if (!rs_ent_found(&found) && hidden)
         return rs_ent(RS_ENT_NOT_VISIBLE, RS_VIA_NAMED);
@@ -2159,7 +2177,12 @@ rs_ent_t rs_lookup_lexical(rs_query_t *q, rs_inst_t *inst, rs_inst_t *const *blo
                 return (rs_ent_t){
                     .kind = RS_ENT_PRELUDE, .via = RS_VIA_PATH, .external_path = values[i].path};
     }
-    return open_glob ? ent : rs_ent(RS_ENT_NONE, RS_VIA_NONE);
+    if (open_glob)
+        return ent;
+    /* No crate root reaches this file, so its dependency names are not known. */
+    if (module && module->crate && module->crate->orphan)
+        return rs_ent_unknown("rust_crate_root_unknown");
+    return rs_ent(RS_ENT_NONE, RS_VIA_NONE);
 }
 
 static rs_ent_t rs_path_head(rs_query_t *q, rs_inst_t *inst, rs_inst_t *const *blocks, int nblocks,
@@ -2310,6 +2333,7 @@ static cbm_rust_import_t rs_import_in(rs_query_t *q, rs_inst_t *inst, const rs_s
     cbm_rust_import_t out = {.reason = "rust_use_path_unresolved"};
     static const unsigned spaces[] = {RS_NS_TYPE, RS_NS_VALUE, RS_NS_MACRO};
     rs_inst_t *macro_module = NULL;
+    bool hidden = false;
     for (size_t i = 0; i < sizeof(spaces) / sizeof(spaces[0]); i++) {
         rs_inst_t *last = NULL;
         int consumed = 0;
@@ -2355,9 +2379,15 @@ static cbm_rust_import_t rs_import_in(rs_query_t *q, rs_inst_t *inst, const rs_s
             out.reason = "rust_use_path_ambiguous";
             return out;
         case RS_ENT_NOT_VISIBLE:
-            out.reason = "rust_use_path_not_visible";
-            return out;
+            /* A use takes every namespace it may see: a private `mod path` does
+             * not stop `pub fn path` from being imported. */
+            hidden = true;
+            continue;
         case RS_ENT_UNKNOWN:
+            if (ent.reason && !strcmp(ent.reason, RS_MACRO_DECLARED_ITEM)) {
+                macro_module = last ? last : inst;
+                continue;
+            }
             out.reason = ent.reason ? ent.reason : "rust_use_path_unknown";
             return out;
         }
@@ -2365,6 +2395,8 @@ static cbm_rust_import_t rs_import_in(rs_query_t *q, rs_inst_t *inst, const rs_s
     if (macro_module) {
         out.dependency_file = macro_module->syn->file->rel;
         out.reason = "declared_rust_module_path";
+    } else if (hidden) {
+        out.reason = "rust_use_path_not_visible";
     }
     return out;
 }

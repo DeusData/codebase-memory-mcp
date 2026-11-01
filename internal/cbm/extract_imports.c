@@ -1938,7 +1938,11 @@ static void rust_use_tree(CBMExtractCtx *ctx, TSNode node, const char *prefix, s
     if (strcmp(kind, "use_list") == 0) {
         uint32_t count = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < count; i++) {
-            rust_use_tree(ctx, ts_node_named_child(node, i), prefix, prefix_len);
+            TSNode leaf = ts_node_named_child(node, i);
+            const char *leaf_kind = ts_node_type(leaf);
+            if (strcmp(leaf_kind, "line_comment") != 0 && strcmp(leaf_kind, "block_comment") != 0) {
+                rust_use_tree(ctx, leaf, prefix, prefix_len);
+            }
         }
     } else if (strcmp(kind, "scoped_use_list") == 0) {
         TSNode path = ts_node_child_by_field_name(node, TS_FIELD("path"));
