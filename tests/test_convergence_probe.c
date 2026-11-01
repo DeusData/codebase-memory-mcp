@@ -363,8 +363,9 @@ static cbm_store_t *cp_index_parallel(CP_Proj *lp, const CP_File *meaningful, in
 /* These source-authored obligations close each listed caller/relation domain.
  * Missing genuine edges are counted quality debt; every other project target
  * fails the shared oracle. Original source bytes and extraction assertions stay
- * intact. An implicit Kotlin constructor has a real class source anchor but no
- * invented callable graph identity, matching the matrix constructor contract. */
+ * intact. A row flagged required is a failure when lost; any other is named debt.
+ * A constructor call targets the class node: a Kotlin primary constructor has no
+ * node of its own, and Python's class call selects the class, as its rows require. */
 typedef struct {
     const char *test, *gap, *why;
 } CP_QualityCase;
@@ -373,141 +374,126 @@ static const CP_QualityCase cp_quality_cases[] = {
      "The source proves module count bindings through global declarations, but Python has no "
      "audited READS/WRITES bridge."},
     {"cp_reads_writes_go_global", "reads-writes-go-global-proof",
-     "Both cache expressions read the package map value. Go has no audited READS bridge; element "
-     "mutation does not rebind cache."},
+     "Both cache expressions read the package map value and USAGE carries that read. Go emits no "
+     "READS relation; element mutation does not rebind cache."},
     {"cp_reads_writes_java_static_field", "reads-writes-java-static-field-proof",
-     "The source identifies each private Counter.count access exactly. Java has no audited "
-     "READS/WRITES bridge."},
+     "Each private Counter.count access is identified exactly and USAGE carries the reads. Java "
+     "emits no READS relation, and count++ has no write carrier because Java's assignment kinds "
+     "omit update_expression."},
     {"cp_reads_writes_cs_static_field", "reads-writes-cs-static-field-proof",
-     "The source identifies each private Registry._count access exactly. C# has no audited "
-     "READS/WRITES bridge."},
-    {"cp_async_csharp_task", "async-csharp-task-proof",
-     "RunAsync calls the exact same-class FetchAsync with a string parameter, but the source proof "
-     "audit excludes await expressions."},
-    {"cp_async_rust_await", "async-rust-await-proof",
-     "run invokes the exact lexical fetch function; await_expression currently prevents completion "
-     "of the Rust binding domain."},
-    {"cp_async_kotlin_suspend", "async-kotlin-suspend-proof",
-     "process invokes the declared fetchData function with String input. Suspend declaration and "
-     "caller modifiers currently lack audited proof."},
-    {"cp_operator_python_add", "operator-python-add-proof",
-     "Vec(...) in __add__ genuinely invokes its explicit __init__. Nonzero constructor arguments "
-     "and attribute f-string effects remain unproved. Untyped combine operands do not establish "
-     "Vec operator dispatch."},
+     "Each private Registry._count access is identified exactly and USAGE carries the reads. C# "
+     "emits no READS relation."},
     {"cp_operator_rust_add", "operator-rust-add-proof",
      "Typed Point operands select the source Add implementation, but trait/operator dispatch and "
      "derive attributes lack a complete proof domain."},
-    {"cp_operator_kotlin_plus", "operator-kotlin-plus-proof",
-     "Typed Vec operands select plus, while both method bodies construct Vec. Operator/data-class "
-     "receiver proof and primary-constructor callable identity remain unsupported."},
-    {"cp_interface_dispatch_rust_dyn", "interface-dispatch-rust-dyn-proof",
-     "run calls the exact describe function; describe statically selects Shape declarations for "
-     "its dyn receiver. Trait syntax prevents complete binding proof; no exact concrete Circle "
-     "dispatch is implied."},
-    {"cp_enum_variant_kotlin_sealed", "enum-variant-kotlin-sealed-proof",
-     "Each is branch proves its own Result subtype and display declaration. Smart-cast flow and "
-     "inherited sealed/data-class owners lack audited proof."},
-    {"cp_enum_variant_rust_impl", "enum-variant-rust-impl-proof",
-     "The enum receiver and opposite return type identify all three method sites. Enum owners, "
-     "owned receivers, format macro sites and chained return flow lack audited proof."},
-    {"cp_enum_method_java", "enum-method-java-proof",
-     "Both calls select directly declared Day methods. Enum owners do not receive complete-domain "
-     "facts, including their implicit Enum inheritance and possible constant-specific bodies."},
-    {"cp_interface_method_no_dup_function", "interface-method-no-dup-function-proof",
-     "The static target is Greeter.greet. Its String parameter and string literal lack audited "
-     "reference-type applicability; plain interface identity is not itself the missing "
-     "capability."},
 };
 typedef struct {
     const char *test, *caller, *relation;
     uint32_t start, end;
     const char *target, *label, *declaration;
     int line;
-    bool any_target;
+    bool any_target, required;
 } CP_Golden;
 static const CP_Golden cp_goldens[] = {
     {"cp_reads_writes_python_global", "increment", "READS", 50, 55, "count", "Variable",
-     "count = 0", 1, false},
+     "count = 0", 1, false, false},
     {"cp_reads_writes_python_global", "increment", "WRITES", 50, 55, "count", "Variable",
-     "count = 0", 1, false},
+     "count = 0", 1, false, false},
     {"cp_reads_writes_python_global", "get", "READS", 85, 90, "count", "Variable", "count = 0", 1,
-     false},
+     false, false},
     {"cp_reads_writes_python_global", "reset", "WRITES", 127, 132, "count", "Variable", "count = 0",
-     1, false},
+     1, false, false},
     {"cp_reads_writes_go_global", "Get", "READS", 133, 138, "cache", "Variable",
-     "var cache = map[string]string{}", 3, false},
+     "var cache = map[string]string{}", 3, false, false},
     {"cp_reads_writes_go_global", "Set", "READS", 76, 81, "cache", "Variable",
-     "var cache = map[string]string{}", 3, false},
+     "var cache = map[string]string{}", 3, false, false},
+    {"cp_reads_writes_go_global", "Get", "USAGE", 133, 138, "cache", "Variable",
+     "var cache = map[string]string{}", 3, false, true},
+    {"cp_reads_writes_go_global", "Set", "USAGE", 76, 81, "cache", "Variable",
+     "var cache = map[string]string{}", 3, false, true},
     {"cp_reads_writes_java_static_field", "Counter.increment", "READS", 102, 107, "Counter.count",
-     "Field", "    private static int count = 0;", 4, false},
+     "Field", "    private static int count = 0;", 4, false, false},
     {"cp_reads_writes_java_static_field", "Counter.increment", "WRITES", 102, 107, "Counter.count",
-     "Field", "    private static int count = 0;", 4, false},
+     "Field", "    private static int count = 0;", 4, false, false},
     {"cp_reads_writes_java_static_field", "Counter.value", "READS", 153, 158, "Counter.count",
-     "Field", "    private static int count = 0;", 4, false},
+     "Field", "    private static int count = 0;", 4, false, false},
     {"cp_reads_writes_java_static_field", "Counter.reset", "WRITES", 196, 201, "Counter.count",
-     "Field", "    private static int count = 0;", 4, false},
+     "Field", "    private static int count = 0;", 4, false, true},
+    {"cp_reads_writes_java_static_field", "Counter.increment", "USAGE", 102, 107, "Counter.count",
+     "Field", "    private static int count = 0;", 4, false, true},
+    {"cp_reads_writes_java_static_field", "Counter.value", "USAGE", 153, 158, "Counter.count",
+     "Field", "    private static int count = 0;", 4, false, true},
+    {"cp_reads_writes_cs_static_field", "Registry.Register", "USAGE", 117, 123, "Registry._count",
+     "Field", "        private static int _count = 0;", 3, false, true},
+    {"cp_reads_writes_cs_static_field", "Registry.Count", "USAGE", 173, 179, "Registry._count",
+     "Field", "        private static int _count = 0;", 3, false, true},
     {"cp_reads_writes_cs_static_field", "Registry.Register", "READS", 117, 123, "Registry._count",
-     "Field", "        private static int _count = 0;", 3, false},
+     "Field", "        private static int _count = 0;", 3, false, false},
     {"cp_reads_writes_cs_static_field", "Registry.Register", "WRITES", 117, 123, "Registry._count",
-     "Field", "        private static int _count = 0;", 3, false},
+     "Field", "        private static int _count = 0;", 3, false, true},
     {"cp_reads_writes_cs_static_field", "Registry.Count", "READS", 173, 179, "Registry._count",
-     "Field", "        private static int _count = 0;", 3, false},
+     "Field", "        private static int _count = 0;", 3, false, false},
     {"cp_async_csharp_task", "Svc.RunAsync", "CALLS", 258, 273, "Svc.FetchAsync", "Method",
-     "        async Task<string> FetchAsync(string url) {", 5, false},
+     "        async Task<string> FetchAsync(string url) {", 5, false, true},
     {"cp_async_rust_await", "run", "CALLS", 97, 107, "fetch", "Function",
-     "async fn fetch(url: &str) -> String { url.to_string() }", 1, false},
+     "async fn fetch(url: &str) -> String { url.to_string() }", 1, false, true},
     {"cp_async_kotlin_suspend", "process", "CALLS", 108, 122, "fetchData", "Function",
-     "suspend fun fetchData(url: String): String = url", 1, false},
-    {"cp_operator_python_add", "Vec.__add__", "CALLS", 125, 164, "Vec.__init__", "Method",
-     "    def __init__(self, x, y):", 2, false},
+     "suspend fun fetchData(url: String): String = url", 1, false, true},
+    {"cp_operator_python_add", "Vec.__add__", "CALLS", 125, 164, "Vec", "Class", "class Vec:", 1,
+     false, true},
     {"cp_operator_rust_add", "combine", "CALLS", 291, 296, "Point.add", "Method",
-     "    fn add(self, other: Point) -> Point {", 9, false},
+     "    fn add(self, other: Point) -> Point {", 9, false, false},
     {"cp_operator_kotlin_plus", "combine", "CALLS", 222, 227, "Vec.plus", "Method",
-     "    operator fun plus(other: Vec): Vec = Vec(x + other.x, y + other.y)", 2, false},
-    {"cp_operator_kotlin_plus", "Vec.plus", "CALLS", 82, 111, NULL, "Method",
-     "data class Vec(val x: Int, val y: Int) {", 1, false},
-    {"cp_operator_kotlin_plus", "Vec.minus", "CALLS", 154, 183, NULL, "Method",
-     "data class Vec(val x: Int, val y: Int) {", 1, false},
+     "    operator fun plus(other: Vec): Vec = Vec(x + other.x, y + other.y)", 2, false, true},
+    {"cp_operator_kotlin_plus", "Vec.plus", "CALLS", 82, 111, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    {"cp_operator_kotlin_plus", "Vec.minus", "CALLS", 154, 183, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    /* Kotlin records no USES_TYPE occurrence for a result type; USAGE names the class. */
+    {"cp_operator_kotlin_plus", "Vec.plus", "USAGE", 76, 79, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
+    {"cp_operator_kotlin_plus", "Vec.minus", "USAGE", 148, 151, "Vec", "Class",
+     "data class Vec(val x: Int, val y: Int) {", 1, false, true},
     {"cp_interface_dispatch_rust_dyn", "run", "CALLS", 406, 418, "describe", "Function",
-     "pub fn describe(s: &dyn Shape) -> f64 { s.area() + s.perimeter() }", 13, false},
+     "pub fn describe(s: &dyn Shape) -> f64 { s.area() + s.perimeter() }", 13, false, true},
     {"cp_interface_dispatch_rust_dyn", "describe", "CALLS", 321, 329, "Shape.area", "Method",
-     "    fn area(&self) -> f64;", 2, false},
+     "    fn area(&self) -> f64;", 2, false, true},
     {"cp_interface_dispatch_rust_dyn", "describe", "CALLS", 332, 345, "Shape.perimeter", "Method",
-     "    fn perimeter(&self) -> f64;", 3, false},
+     "    fn perimeter(&self) -> f64;", 3, false, true},
     {"cp_enum_variant_kotlin_sealed", "describe", "CALLS", 290, 301, "Result.Ok.display", "Method",
-     "        fun display(): String = \"OK: $value\"", 3, false},
+     "        fun display(): String = \"OK: $value\"", 3, false, true},
     {"cp_enum_variant_kotlin_sealed", "describe", "CALLS", 323, 334, "Result.Err.display", "Method",
-     "        fun display(): String = \"ERR: $msg\"", 6, false},
+     "        fun display(): String = \"ERR: $msg\"", 6, false, true},
     {"cp_enum_variant_rust_impl", "describe", "CALLS", 611, 620, "Direction.label", "Method",
-     "    pub fn label(&self) -> &str {", 4, false},
+     "    pub fn label(&self) -> &str {", 4, false, true},
     {"cp_enum_variant_rust_impl", "describe", "CALLS", 622, 634, "Direction.opposite", "Method",
-     "    pub fn opposite(&self) -> Direction {", 10, false},
+     "    pub fn opposite(&self) -> Direction {", 10, false, true},
     {"cp_enum_variant_rust_impl", "describe", "CALLS", 622, 642, "Direction.label", "Method",
-     "    pub fn label(&self) -> &str {", 4, false},
+     "    pub fn label(&self) -> &str {", 4, false, true},
     {"cp_enum_method_java", "DayUtil.describe", "CALLS", 264, 273, "Day.label", "Method",
-     "    public String label() { return name().toLowerCase(); }", 7, false},
+     "    public String label() { return name().toLowerCase(); }", 7, false, true},
     {"cp_enum_method_java", "DayUtil.describe", "CALLS", 277, 290, "Day.isWeekend", "Method",
-     "    public boolean isWeekend() { return this == SAT || this == SUN; }", 6, false},
+     "    public boolean isWeekend() { return this == SAT || this == SUN; }", 6, false, true},
     {"cp_interface_method_no_dup_function", "App.run", "CALLS", 239, 255, "Greeter.greet", "Method",
-     "    String greet(String name);", 4, false},
+     "    String greet(String name);", 4, false, true},
 };
 static const CP_Golden cp_forbidden[] = {
     {"cp_reads_writes_go_global", "Set", "WRITES", 76, 81, "cache", "Variable",
-     "var cache = map[string]string{}", 3, false},
+     "var cache = map[string]string{}", 3, false, false},
     {"cp_operator_python_add", "combine", "CALLS", 263, 268, "Vec.__add__", "Method",
-     "    def __add__(self, other):", 6, true},
+     "    def __add__(self, other):", 6, true, false},
     {"cp_operator_kotlin_plus", "combine", "CALLS", 222, 227, "Vec.minus", "Method",
-     "    operator fun minus(other: Vec): Vec = Vec(x - other.x, y - other.y)", 3, false},
+     "    operator fun minus(other: Vec): Vec = Vec(x - other.x, y - other.y)", 3, false, false},
     {"cp_interface_dispatch_rust_dyn", "describe", "CALLS", 321, 329, "Circle.area", "Method",
-     "    fn area(&self) -> f64 { std::f64::consts::PI * self.r * self.r }", 9, false},
+     "    fn area(&self) -> f64 { std::f64::consts::PI * self.r * self.r }", 9, false, false},
     {"cp_interface_dispatch_rust_dyn", "describe", "CALLS", 332, 345, "Circle.perimeter", "Method",
-     "    fn perimeter(&self) -> f64 { 2.0 * std::f64::consts::PI * self.r }", 10, false},
+     "    fn perimeter(&self) -> f64 { 2.0 * std::f64::consts::PI * self.r }", 10, false, false},
     {"cp_enum_variant_kotlin_sealed", "describe", "CALLS", 290, 301, "Result.Err.display", "Method",
-     "        fun display(): String = \"ERR: $msg\"", 6, false},
+     "        fun display(): String = \"ERR: $msg\"", 6, false, false},
     {"cp_enum_variant_kotlin_sealed", "describe", "CALLS", 323, 334, "Result.Ok.display", "Method",
-     "        fun display(): String = \"OK: $value\"", 3, false},
+     "        fun display(): String = \"OK: $value\"", 3, false, false},
     {"cp_interface_method_no_dup_function", "App.run", "CALLS", 239, 255, "SimpleGreeter.greet",
-     "Method", "    public String greet(String name) { return \"Hello \" + name; }", 8, false},
+     "Method", "    public String greet(String name) { return \"Hello \" + name; }", 8, false, false},
 };
 
 static RQ_Site cp_quality_site(const CP_Golden *golden, const char *file) {
@@ -530,8 +516,6 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
     for (size_t i = 0; i < sizeof(cp_quality_cases) / sizeof(cp_quality_cases[0]); i++)
         if (!strcmp(test, cp_quality_cases[i].test))
             quality = cp_quality_cases + i;
-    if (!quality)
-        return false;
     const CP_File files[] = {original[0],
                              {"quality_control.js",
                               "export function exact_target() { return 7; }\n"
@@ -566,10 +550,6 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
                     .declaration_text = "export function wrong_target() { return 9; }"}}};
     char ids[8][128], negative_ids[8][128];
     size_t n = 1, nf = 1, required = 1;
-    /* The Rust adapter admits these; losing one of them is a failure, not debt. */
-    bool admitted = !strcmp(test, "cp_async_rust_await") ||
-                    !strcmp(test, "cp_interface_dispatch_rust_dyn") ||
-                    !strcmp(test, "cp_enum_variant_rust_impl");
     for (size_t i = 0; i < sizeof(cp_goldens) / sizeof(cp_goldens[0]); i++) {
         const CP_Golden *golden = cp_goldens + i;
         if (strcmp(test, golden->test))
@@ -577,25 +557,23 @@ static bool cp_quality(const CP_File *original, int count, const char *test) {
         if (n == sizeof(expected) / sizeof(expected[0]))
             return false;
         snprintf(ids[n], sizeof(ids[n]), "%s-obligation-%zu", test, n);
-        expected[n] = (RQ_Expected){
-            .case_id = ids[n],
-            .site = cp_quality_site(golden, files[0].name),
-            .relation = golden->relation,
-            .target = cp_quality_target(golden, files[0].name),
-            .mode = admitted ? RQ_REQUIRED : RQ_KNOWN_GAP,
-            .gap_id =
-                golden->target ? quality->gap : "implicit-constructor-identity-not-materialized",
-            .why = golden->target
-                       ? quality->why
-                       : "This genuine primary-constructor call has no faithful callable "
-                         "graph identity. Its class declaration anchors the debt; it "
-                         "does not authorize a CALLS edge to a Class node.",
-            .tried =
+        if (!golden->required && !quality)
+            return false;
+        expected[n] = (RQ_Expected){.case_id = ids[n],
+                                    .site = cp_quality_site(golden, files[0].name),
+                                    .relation = golden->relation,
+                                    .target = cp_quality_target(golden, files[0].name),
+                                    .mode = golden->required ? RQ_REQUIRED : RQ_KNOWN_GAP};
+        if (!golden->required) {
+            expected[n].gap_id = quality->gap;
+            expected[n].why = quality->why;
+            expected[n].tried =
                 "The original v91 full-pipeline aggregate failed. Preserved its original "
                 "fixture bytes and extraction assertions; authored exact source occurrences "
                 "and declaration targets. The shared quality oracle and a separate required "
-                "exact-call control now run through both sequential and padded parallel indexing."};
-        required += admitted;
+                "exact-call control now run through both sequential and padded parallel indexing.";
+        }
+        required += golden->required;
         n++;
     }
     for (size_t i = 0; i < sizeof(cp_forbidden) / sizeof(cp_forbidden[0]); i++) {

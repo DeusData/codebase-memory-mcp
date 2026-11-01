@@ -10284,18 +10284,20 @@ TEST(probe_meson_subdir_edge) {
     cbm_store_t *store = gpf_index_files(&lp, files, 2);
     bool ok = store != NULL;
     sqlite3_stmt *row = NULL;
-    /* This import carrier retains legacy 0/0 coordinates; this assertion does
-     * not claim raw occurrence-span accuracy from those coordinates. */
+    /* The carrier records the literal's exact occurrence. */
+    const char *literal = strstr(files[0].content, "'lib'");
     const char *sql = "SELECT count(*) FROM resolver_occurrences r JOIN nodes s ON "
                       "s.project=r.project AND s.qualified_name=r.scope JOIN nodes t ON "
                       "t.project=r.project AND t.qualified_name=r.target JOIN edges e ON "
                       "e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
                       "WHERE r.project=?1 AND r.relation='IMPORTS' AND r.emitted=1 "
-                      "AND r.start_byte=0 AND r.end_byte=0 AND s.file_path='meson.build' "
+                      "AND r.start_byte=?2 AND r.end_byte=?3 AND s.file_path='meson.build' "
                       "AND s.label='File' AND t.file_path='lib/meson.build' AND t.label='File'";
     if (ok) {
         ok = sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &row, NULL) == SQLITE_OK &&
              sqlite3_bind_text(row, 1, lp.project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+             sqlite3_bind_int(row, 2, (int)(literal - files[0].content)) == SQLITE_OK &&
+             sqlite3_bind_int(row, 3, (int)(literal - files[0].content) + 5) == SQLITE_OK &&
              sqlite3_step(row) == SQLITE_ROW && sqlite3_column_int(row, 0) == 1 &&
              cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == 1;
     }

@@ -1192,7 +1192,7 @@ TEST(es_php_include_occurrence_spans_and_sealing_guards) {
                     valid = valid && !cbm_resolve_record_admit(&stale);
                 } else if (valid) {
                     valid = !cbm_resolve_record_admit(&rows[0]) &&
-                            !strcmp(rows[0].result.reason, "php_import_occurrence_invalid");
+                            !strcmp(rows[0].result.reason, "import_occurrence_invalid");
                 }
             }
         }
@@ -1601,6 +1601,16 @@ TEST(es_usage_crossfile_go) {
                     .label = "Struct",
                     .declaration_line = 3,
                     .declaration_text = "type Config struct {"},
+         .mode = RQ_REQUIRED},
+        /* cfg is declared Config, and Config declares Timeout: this read is the selected field. */
+        {.case_id = "typed-field-value-use",
+         .site = {.file = "main.go", .caller = "Create", .needle = "Timeout"},
+         .relation = "USAGE",
+         .target = {.file = "types.go",
+                    .suffix = "Config.Timeout",
+                    .label = "Field",
+                    .declaration_line = 4,
+                    .declaration_text = "    Timeout int"},
          .mode = RQ_REQUIRED}};
     static const RQ_Forbidden forbidden[] = {
         {.case_id = "annotation-is-not-value-usage",
@@ -1615,7 +1625,111 @@ TEST(es_usage_crossfile_go) {
                     .label = "Struct",
                     .declaration_line = 3,
                     .declaration_text = "type Config struct {"}}};
-    ASSERT_TRUE(es_binding_venues(f, 2, "go-parameter-type-role", expected, 1, forbidden, 2));
+    ASSERT_TRUE(es_binding_venues(f, 2, "go-parameter-type-role", expected, 2, forbidden, 2));
+    PASS();
+}
+
+#define ES_GO_CONFIG_ANNOTATION(index)                                                     \
+    {.case_id = "uses-type-" #index,                                                       \
+     .site = {.file = "main.go", .caller = "Build", .needle = "Config", .occurrence_index = index}, \
+     .relation = "USES_TYPE",                                                              \
+     .target = {.file = "types.go",                                                        \
+                .suffix = "Config",                                                        \
+                .label = "Struct",                                                         \
+                .declaration_line = 3,                                                     \
+                .declaration_text = "type Config struct {"},                               \
+     .mode = RQ_REQUIRED}
+#define ES_GO_CONFIG_NOT_USAGE(index)                                                      \
+    {.case_id = "annotation-not-usage-" #index,                                            \
+     .site = {.file = "main.go", .caller = "Build", .needle = "Config", .occurrence_index = index}, \
+     .relation = "USAGE",                                                                  \
+     .any_target = true}
+
+/* USAGE means a value. A written annotation is USES_TYPE alone, in any wrapper. A composite
+ * literal builds a value of its type, so it keeps USAGE beside its own USES_TYPE. */
+TEST(es_go_annotation_types_are_not_value_usage) {
+    static const ES_LangFile f[] = {
+        {"types.go", "package app\n\ntype Config struct {\n    Timeout int\n}\n"},
+        {"main.go", "package app\n\nfunc Build(base *Config, rest []Config) (Config, error) {\n"
+                    "    var next Config\n"
+                    "    _ = next\n"
+                    "    return Config{base.Timeout}, nil\n}\n"}};
+    static const RQ_Expected expected[] = {
+        ES_GO_CONFIG_ANNOTATION(0),
+        ES_GO_CONFIG_ANNOTATION(1),
+        ES_GO_CONFIG_ANNOTATION(2),
+        ES_GO_CONFIG_ANNOTATION(3),
+        ES_GO_CONFIG_ANNOTATION(4),
+        {.case_id = "literal-builds-a-value",
+         .site = {.file = "main.go", .caller = "Build", .needle = "Config", .occurrence_index = 4},
+         .relation = "USAGE",
+         .target = {.file = "types.go",
+                    .suffix = "Config",
+                    .label = "Struct",
+                    .declaration_line = 3,
+                    .declaration_text = "type Config struct {"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "typed-pointer-field-read",
+         .site = {.file = "main.go", .caller = "Build", .needle = "Timeout"},
+         .relation = "USAGE",
+         .target = {.file = "types.go",
+                    .suffix = "Config.Timeout",
+                    .label = "Field",
+                    .declaration_line = 4,
+                    .declaration_text = "    Timeout int"},
+         .mode = RQ_REQUIRED}};
+    static const RQ_Forbidden forbidden[] = {ES_GO_CONFIG_NOT_USAGE(0), ES_GO_CONFIG_NOT_USAGE(1),
+                                             ES_GO_CONFIG_NOT_USAGE(2), ES_GO_CONFIG_NOT_USAGE(3)};
+    ASSERT_TRUE(es_binding_venues(f, 2, "go-annotation-roles", expected, 7, forbidden, 4));
+    PASS();
+}
+
+/* A Go element assignment reads its operand and index and rebinds neither. A plain assignment
+ * to the same variable is the write. */
+TEST(es_go_index_assignment_reads_operand_and_index) {
+    static const ES_LangFile f[] = {{"table.go", "package app\n\n"
+                                                 "var table = map[string]int{}\n"
+                                                 "var key = \"k\"\n\n"
+                                                 "func Put(v int) {\n"
+                                                 "    table[key] = v\n}\n\n"
+                                                 "func Reset() {\n"
+                                                 "    table = nil\n}\n"}};
+    static const RQ_Target table = {.file = "table.go",
+                                    .suffix = "table",
+                                    .label = "Variable",
+                                    .declaration_line = 3,
+                                    .declaration_text = "var table = map[string]int{}"};
+    static const RQ_Target key = {.file = "table.go",
+                                  .suffix = "key",
+                                  .label = "Variable",
+                                  .declaration_line = 4,
+                                  .declaration_text = "var key = \"k\""};
+    const RQ_Expected expected[] = {
+        {.case_id = "operand-is-read",
+         .site = {.file = "table.go", .caller = "Put", .needle = "table", .occurrence_index = 1},
+         .relation = "USAGE",
+         .target = table,
+         .mode = RQ_REQUIRED},
+        {.case_id = "index-is-read",
+         .site = {.file = "table.go", .caller = "Put", .needle = "key", .occurrence_index = 1},
+         .relation = "USAGE",
+         .target = key,
+         .mode = RQ_REQUIRED},
+        {.case_id = "plain-assignment-writes",
+         .site = {.file = "table.go", .caller = "Reset", .needle = "table", .occurrence_index = 2},
+         .relation = "WRITES",
+         .target = table,
+         .mode = RQ_REQUIRED}};
+    static const RQ_Forbidden forbidden[] = {
+        {.case_id = "element-store-does-not-rebind-operand",
+         .site = {.file = "table.go", .caller = "Put", .needle = "table", .occurrence_index = 1},
+         .relation = "WRITES",
+         .any_target = true},
+        {.case_id = "element-store-does-not-rebind-index",
+         .site = {.file = "table.go", .caller = "Put", .needle = "key", .occurrence_index = 1},
+         .relation = "WRITES",
+         .any_target = true}};
+    ASSERT_TRUE(es_binding_venues(f, 1, "go-index-assignment-roles", expected, 3, forbidden, 2));
     PASS();
 }
 
@@ -1758,6 +1872,8 @@ SUITE(edge_structural) {
     RUN_TEST(es_usage_crossfile_python);
     RUN_TEST(es_usage_crossfile_typescript);
     RUN_TEST(es_usage_crossfile_go);
+    RUN_TEST(es_go_annotation_types_are_not_value_usage);
+    RUN_TEST(es_go_index_assignment_reads_operand_and_index);
 
     /* ── FAMILY 8: DATA_FLOWS cross-file ─────────────────────── */
     /* Expected GREEN: route-intermediated path, language-independent. */
