@@ -24,7 +24,6 @@ performed and the two negative cases can use a short deterministic deadline:
 Exit code: 0 == green, 1 == behavior regression, 2 == fixture/setup error.
 """
 
-import json
 import os
 import re
 import shutil
@@ -330,6 +329,25 @@ def assert_active_daemon_open(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
+def saved_ui_setting(binary, env, work):
+    """Return the persisted (ui_enabled, ui_port) pair as ``config get`` reports it.
+
+    ``config set`` keeps the UI keys in the shared settings database
+    (``_config.db``), not in ``config.json``.  Reading them back through the
+    product's own command checks the value every start path loads, whatever the
+    storage format.  Returns None when a read fails.
+    """
+    values = []
+    for key in ("ui_enabled", "ui_port"):
+        result = subprocess.run([binary, "config", "get", key], capture_output=True,
+                                timeout=10, env=env, cwd=work)
+        if result.returncode != 0:
+            print("diagnostic: config get %s failed:\n%s" % (key, output_text(result)[:700]))
+            return None
+        values.append(result.stdout.decode("utf-8", "replace").strip())
+    return tuple(values)
+
+
 def assert_persisted_ui_setting(binary, work, enabled=False, flags=()):
     name = "enabled" if enabled else "disabled"
     name += "-" + ("-".join(flag.lstrip("-") for flag in flags) or "bare")
@@ -339,7 +357,6 @@ def assert_persisted_ui_setting(binary, work, enabled=False, flags=()):
     probe.close()
     os.makedirs(cache, exist_ok=True)
     env = fixture_environment(work, cache, marker, 10000)
-    config_path = os.path.join(cache, "config.json")
     daemon_pid = 0
     try:
         for key, value in (("ui_enabled", str(enabled).lower()), ("ui_port", str(port))):
@@ -348,8 +365,11 @@ def assert_persisted_ui_setting(binary, work, enabled=False, flags=()):
             if configured.returncode != 0:
                 print("SETUP FAIL: could not persist UI setting:\n%s" % output_text(configured))
                 return False
-        with open(config_path, "rb") as handle:
-            original_config = handle.read()
+        original_setting = saved_ui_setting(binary, env, work)
+        if original_setting != (str(enabled).lower(), str(port)):
+            print("SETUP FAIL: config get does not report the saved UI setting (%s): %r" %
+                  (name, original_setting))
+            return False
         arguments = ["--port=%d" % port if flag == "--port" else flag for flag in flags]
         first = subprocess.run([binary, "daemon", "start", *arguments], capture_output=True,
                                timeout=30, env=env, cwd=work)
@@ -359,13 +379,12 @@ def assert_persisted_ui_setting(binary, work, enabled=False, flags=()):
             print("RED: daemon start failed with saved UI setting (%s):\n%s" %
                   (name, first_text[:700]))
             return False
-        with open(config_path, "rb") as handle:
-            current_config = handle.read()
+        current_setting = saved_ui_setting(binary, env, work)
         expected_enabled = enabled or bool(flags)
-        if (json.loads(current_config).get("ui_enabled") != expected_enabled or
-                (not expected_enabled and current_config != original_config)):
+        if (current_setting is None or current_setting[0] != str(expected_enabled).lower() or
+                (not expected_enabled and current_setting != original_setting)):
             print("RED: daemon start rewrote the saved UI setting (%s): %r" %
-                  (name, current_config))
+                  (name, current_setting))
             return False
         if expected_enabled:
             opened = subprocess.run([binary, "daemon", "start", "--open"], capture_output=True,
@@ -385,10 +404,11 @@ def assert_persisted_ui_setting(binary, work, enabled=False, flags=()):
                     print("RED: disabled UI was not preserved by %r:\n%s" %
                           (arguments, text[:700]))
                     return False
-            with open(config_path, "rb") as handle:
-                if handle.read() != original_config:
-                    print("RED: repeated daemon start rewrote disabled UI config")
-                    return False
+            repeated_setting = saved_ui_setting(binary, env, work)
+            if repeated_setting != original_setting:
+                print("RED: repeated daemon start rewrote disabled UI config: %r" %
+                      (repeated_setting,))
+                return False
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
                 connection.settimeout(0.5)
                 if connection.connect_ex(("127.0.0.1", port)) == 0:
