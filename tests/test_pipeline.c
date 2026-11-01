@@ -23261,12 +23261,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Function",
                 .declaration_line = 5,
                 .declaration_text = "def star_fn():"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.from_star_fn",
-     .why = "Ordered wildcard re-exports have no complete per-name binding proof after the later "
-            "star imports.",
-     .tried = "The explicit source declarations and star-import order were audited; the binding "
-              "index treats earlier names as blocked at a wildcard barrier."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.from_all_listed",
      .site = {.file = "app/main.py",
               .caller = "app.main.from_all_listed",
@@ -27832,9 +27827,10 @@ TEST(pipeline_swift_cross_package_import) {
     ASSERT(rq_check(s, proj, "swift-configured-package", sources, 4, expected, 2, NULL, 0, &quality,
                     stderr));
     ASSERT_EQ(quality.genuine, 2);
-    /* Any recovery must be exact and promoted by the oracle; retain the
-     * original independently located provider/importer graph check. */
-    ASSERT_EQ(found_exact_edge, quality.found > 0);
+    /* The required CALLS row is always found, so only a second found row is the
+     * import. Any recovery of it must be exact and promoted by the oracle; retain
+     * the original independently located provider/importer graph check. */
+    ASSERT_EQ(found_exact_edge, quality.found > 1);
 
     if (edges)
         cbm_store_free_edges(edges, ec);

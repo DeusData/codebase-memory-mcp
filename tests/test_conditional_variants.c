@@ -259,14 +259,15 @@ static const cv_golden_t cv_goldens[] = {
      0, "pick/common.go", "alpha", 3, "func alpha() {}"},
     {"cv_go_build_tag_files", "cv_go_build_tag_files-2", "pick/pick_posix.go", "Pick", "beta()", 0,
      "pick/common.go", "beta", 4, "func beta() {}"},
+    /* The one Pick node's stored span is its first file by path, pick_posix.go. */
     {"cv_go_build_tag_files", "cv_go_build_tag_files-3", "pick/common.go", "Caller", "Pick()", 0,
-     "pick/pick_windows.go", NULL, 4, "func Pick() { alpha() }"},
+     "pick/pick_posix.go", "Pick", 4, "func Pick() { beta() }"},
     {"cv_swift", "cv_swift-1", "pick.swift", "pick", "alpha()", 1, "pick.swift", "alpha", 1,
      "func alpha() {}"},
     {"cv_swift", "cv_swift-2", "pick.swift", "pick", "beta()", 1, "pick.swift", "beta", 2,
      "func beta() {}"},
-    {"cv_swift", "cv_swift-3", "pick.swift", "caller", "pick()", 2, "pick.swift", "pick", 4,
-     "func pick() { alpha() }"},
+    {"cv_swift", "cv_swift-3", "pick.swift", "caller", "pick()", 2, "pick.swift", "pick", 6,
+     "func pick() { beta() }"},
     {"cv_python_if", "cv_python_if-1", "pick.py", "pick", "alpha()", 1, "pick.py", "alpha", 2,
      "def alpha(): pass"},
     {"cv_python_if", "cv_python_if-2", "pick.py", "pick", "beta()", 1, "pick.py", "beta", 3,
@@ -296,19 +297,19 @@ static const cv_golden_t cv_goldens[] = {
     {"cv_erlang_ifdef", "cv_erlang_ifdef-2", "pick.erl", "pick", "beta()", 1, "pick.erl", "beta", 4,
      "beta() -> ok."},
     {"cv_erlang_ifdef", "cv_erlang_ifdef-3", "pick.erl", "caller", "pick()", 2, "pick.erl", "pick",
-     6, "pick() -> alpha()."},
+     8, "pick() -> beta()."},
     {"cv_haskell_cpp", "cv_haskell_cpp-1", "Pick.hs", "pick", "alpha x", 1, "Pick.hs", "alpha", 4,
      "alpha x = x"},
     {"cv_haskell_cpp", "cv_haskell_cpp-2", "Pick.hs", "pick", "beta x", 1, "Pick.hs", "beta", 6,
      "beta x = x"},
-    {"cv_haskell_cpp", "cv_haskell_cpp-3", "Pick.hs", "caller", "pick x", 2, "Pick.hs", "pick", 9,
-     "pick x = alpha x"},
+    {"cv_haskell_cpp", "cv_haskell_cpp-3", "Pick.hs", "caller", "pick x", 2, "Pick.hs", "pick", 12,
+     "pick x = beta x"},
     {"cv_haskell_cpp_elif_nested", "cv_haskell_cpp_elif_nested-1", "Pick.hs", "pick", "alpha x", 1,
      "Pick.hs", "alpha", 4, "alpha x = x"},
     {"cv_haskell_cpp_elif_nested", "cv_haskell_cpp_elif_nested-2", "Pick.hs", "pick", "beta x", 1,
      "Pick.hs", "beta", 6, "beta x = x"},
     {"cv_haskell_cpp_elif_nested", "cv_haskell_cpp_elif_nested-3", "Pick.hs", "caller", "pick x", 4,
-     "Pick.hs", "pick", 9, "pick x = x"},
+     "Pick.hs", "pick", 19, "pick x = beta x"},
     {"cv_fortran_preprocessed", "cv_fortran_preprocessed-1", "pick.F90", "pick", "call alpha()", 0,
      "pick.F90", "alpha", 3, "  subroutine alpha()"},
     {"cv_fortran_preprocessed", "cv_fortran_preprocessed-2", "pick.F90", "pick", "call beta()", 0,
@@ -332,7 +333,7 @@ static const cv_golden_t cv_goldens[] = {
     {"cv_elixir_compile_time_if", "cv_elixir_compile_time_if-2", "pick.ex", "pick", "beta()", 0,
      "pick.ex", "beta", 3, "  def beta, do: :ok"},
     {"cv_elixir_compile_time_if", "cv_elixir_compile_time_if-3", "pick.ex", "caller", "pick()", 0,
-     "pick.ex", "pick", 5, "    def pick, do: alpha()"},
+     "pick.ex", "pick", 7, "    def pick, do: beta()"},
     {"cv_c_platform_files", "cv_c_platform_files-1", "src/plat_win.c", "pick", "alpha()", 0,
      "src/plat.c", "alpha", 1, "void alpha(void) {}"},
     {"cv_c_platform_files", "cv_c_platform_files-2", "src/plat_posix.c", "pick", "beta()", 0,
@@ -384,7 +385,40 @@ static const cv_recovered_t cv_recovered[] = {
     {"cv_cuda-1", 4, 4, "__device__ void pick() { alpha(); }", NULL},
     {"cv_cuda-2", 6, 6, "__device__ void pick() { beta(); }", NULL},
     {"cv_cuda-3", 0, 0, NULL, NULL},
+    /* Each branch, build-tag file or compile-time clause is a variant of the one node, and an
+     * edge from it is true of the configurations that branch is in. The caller reaches that one
+     * node in every configuration, whichever branch the build keeps. */
+    {"cv_go_build_tag_files-1", 4, 4, "func Pick() { alpha() }", NULL},
+    {"cv_go_build_tag_files-2", 4, 4, "func Pick() { beta() }", NULL},
+    {"cv_go_build_tag_files-3", 0, 0, NULL, NULL},
+    {"cv_swift-1", 4, 4, "func pick() { alpha() }", NULL},
+    {"cv_swift-2", 6, 6, "func pick() { beta() }", NULL},
+    {"cv_swift-3", 0, 0, NULL, NULL},
+    {"cv_erlang_ifdef-1", 6, 6, "pick() -> alpha().", NULL},
+    {"cv_erlang_ifdef-2", 8, 8, "pick() -> beta().", NULL},
+    {"cv_erlang_ifdef-3", 0, 0, NULL, NULL},
+    {"cv_elixir_compile_time_if-1", 5, 5, "    def pick, do: alpha()", NULL},
+    {"cv_elixir_compile_time_if-2", 7, 7, "    def pick, do: beta()", NULL},
+    {"cv_elixir_compile_time_if-3", 0, 0, NULL, NULL},
+    /* Haskell: only what the raw parse shows. See cv_gap_why below for the other branches. */
+    {"cv_haskell_cpp-1", 9, 9, "pick x = alpha x", NULL},
+    {"cv_haskell_cpp-3", 0, 0, NULL, NULL},
+    {"cv_haskell_cpp_elif_nested-3", 0, 0, NULL, NULL},
 };
+
+/* The Haskell grammar reads only the first branch of a #if. Extraction parses one view per branch
+ * (cpp_branch_views.c), so definitions and calls of every branch exist, but the source adapter
+ * walks the raw parse and never sees a site outside the first branch. */
+static const char *cv_gap_why(const cv_golden_t *g) {
+    if (!strncmp(g->test, "cv_haskell_cpp", strlen("cv_haskell_cpp")))
+        return "The source adapter walks the raw parse, which holds only the first branch of a "
+               "#if: a call in a later branch is source_occurrence_not_modelled.";
+    return g->target ? "The strict resolver has no admitted binding for these conditional or "
+                       "build-selected declarations; each source relationship remains recall debt."
+                     : "The source call is genuine, but an unselected build cannot choose a "
+                       "physical implementation. Its declaration is only a debt anchor; no "
+                       "faithful graph target identity is asserted.";
+}
 
 static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, int count) {
     /* TEST(name) expands to test_##name; fixture keys use the public selector. */
@@ -462,17 +496,17 @@ static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, i
                 recovered
                     ? "This source-authored body call is recovered and must retain its exact "
                       "callable target; merged callers also require their authored variant."
-                : g->target
-                    ? "The strict resolver has no admitted binding for these conditional or "
-                      "build-selected declarations; each source relationship remains recall debt."
-                    : "The source call is genuine, but an unselected build cannot choose a "
-                      "physical implementation. Its declaration is only a debt anchor; no "
-                      "faithful graph target identity is asserted.",
+                    : cv_gap_why(g),
             .tried =
                 recovered
                     ? "v76 admitted the four C body calls and both Python body calls. The first "
                       "Python caller needs its exact stored 5-6 variant rather than the canonical "
                       "8-9 range; both source spans are authored independently of emitted rows."
+                : !strncmp(g->test, "cv_haskell_cpp", strlen("cv_haskell_cpp"))
+                    ? "The later-branch definition and call site exist with raw spans "
+                      "(extraction's branch views), and the first branch's call binds. Walking "
+                      "those views in the source adapter was not attempted; the call stays "
+                      "unbound, never guessed."
                     : "The original v69 canonical tests retained nodes and variant spans but "
                       "failed their CALLS checks. Exact source sites and targets replace "
                       "name-only positive queries without guessing a build configuration."};
@@ -1096,39 +1130,42 @@ static bool cv_incremental_quality(const char *db_path, const cv_file_t *files, 
                                 .mode = RQ_REQUIRED}};
     RQ_Forbidden forbidden[4] = {0};
     if (go) {
-        static const char *ids[] = {"go-variant-alpha", "go-variant-gamma", "go-variant-beta",
-                                    "go-selected-build-identity"};
-        static const char *paths[] = {"pick/pick_linux.go", "pick/pick_linux.go",
-                                      "pick/pick_windows.go", "pick/caller.go"};
-        static const char *needles[] = {"alpha()", "gammaFn()", "beta()", "Pick()"};
-        static const char *targets[] = {"pick.alpha", "pick.gammaFn", "pick.beta", NULL};
-        static const int lines[] = {3, 5, 4, 4};
-        static const char *decls[] = {"func alpha() {}", "func gammaFn() {}", "func beta() {}",
-                                      "func Pick() { alpha(); gammaFn() }"};
+        /* One Pick node holds both files' spans: a call in either file is that node's call, in
+         * the builds that keep the file. Its stored span is its first file by path. */
+        static const char *const linux_pick = "func Pick() { alpha(); gammaFn() }";
+        const char *windows_pick = second_edit ? "func Pick() {" : "func Pick() { beta() }";
+        const unsigned windows_end = second_edit ? 6 : 4;
+        const struct {
+            const char *id, *path, *caller, *needle, *variant;
+            unsigned variant_end;
+            const char *target_file, *target, *decl;
+            int line;
+        } rows[] = {
+            {"go-variant-alpha", "pick/pick_linux.go", "Pick", "alpha()", linux_pick, 4,
+             "pick/util.go", "pick.alpha", "func alpha() {}", 3},
+            {"go-variant-gamma", "pick/pick_linux.go", "Pick", "gammaFn()", linux_pick, 4,
+             "pick/util.go", "pick.gammaFn", "func gammaFn() {}", 5},
+            {"go-variant-beta", "pick/pick_windows.go", "Pick", "beta()", windows_pick, windows_end,
+             "pick/util.go", "pick.beta", "func beta() {}", 4},
+            {"go-caller-reaches-the-one-node", "pick/caller.go", "Caller", "Pick()", NULL, 0,
+             "pick/pick_linux.go", "pick.Pick", linux_pick, 4},
+        };
         for (size_t i = 0; i < 4; i++)
             expected[i + 1] = (RQ_Expected){
-                .case_id = ids[i],
-                .site = {.file = paths[i],
-                         .caller = i == 3 ? "Caller" : "Pick",
-                         .needle = needles[i]},
+                .case_id = rows[i].id,
+                .site = {.file = rows[i].path,
+                         .caller = rows[i].caller,
+                         .needle = rows[i].needle,
+                         .caller_variant_start_line = rows[i].variant ? 4 : 0,
+                         .caller_variant_end_line = rows[i].variant_end,
+                         .caller_variant_declaration = rows[i].variant},
                 .relation = "CALLS",
-                .target = {.file = i == 3 ? "pick/pick_linux.go" : "pick/util.go",
-                           .suffix = targets[i],
+                .target = {.file = rows[i].target_file,
+                           .suffix = rows[i].target,
                            .label = "Function",
-                           .declaration_line = lines[i],
-                           .declaration_text = decls[i]},
-                .mode = RQ_KNOWN_GAP,
-                .gap_id = i == 3 ? "conditional-variant-graph-identity"
-                                 : "conditional-variant-source-binding",
-                .tried = "The original conditional incremental fixture failed its CALLS "
-                         "expectations under strict admission. Both unchanged edited "
-                         "source snapshots are checked against a full rebuild; no build "
-                         "selection or variant coordinate mapping is invented.",
-                .why = i == 3
-                           ? "No selected build identifies a physical Pick declaration; the source "
-                             "call remains genuine debt until variant-aware identity is proved."
-                           : "Go build-conditional package binding lacks a complete proof; "
-                             "source-authored body calls remain counted quality debt."};
+                           .declaration_line = rows[i].line,
+                           .declaration_text = rows[i].decl},
+                .mode = RQ_REQUIRED};
     } else {
         static const char *ids[] = {"c-undeclared-alpha", "c-undeclared-gamma", "c-undeclared-beta",
                                     "c-undeclared-pick"};
@@ -1150,7 +1187,7 @@ static bool cv_incremental_quality(const char *db_path, const cv_file_t *files, 
         rq_check(p.store, p.project,
                  go ? "conditional-incremental-go" : "conditional-incremental-c", sources,
                  source_count, expected, go ? 5 : 1, forbidden, go ? 0 : 4, &report, stderr) &&
-        report.genuine == (go ? 5u : 1u) && report.found == 1 && report.missing == (go ? 4u : 0u);
+        report.genuine == (go ? 5u : 1u) && report.found == (go ? 5u : 1u) && report.missing == 0;
     if (go) {
         cv_result_t r = cv_measure(&p, "Pick", "alpha", "beta", "Caller");
         ok = ok && cv_expect_structure("Go incremental", r);
