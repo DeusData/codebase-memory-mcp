@@ -1347,8 +1347,8 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
  * ignores `server` and calls `setup(ctx)`, whose context provides the tool and
  * session hook domains. Registrations fail open per domain, so the matching
  * server() hook yields once its domain is registered. The post-compaction note
- * goes through a keyed session instruction (a <context> entry that survives
- * compaction), never the system prompt. */
+ * goes into the compaction request's messages, never the system prompt (pinned
+ * by the compaction test below). */
 TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
@@ -1370,10 +1370,8 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     ASSERT_NOT_NULL(output_fallback);
     ASSERT_TRUE(content_first < output_fallback);
     ASSERT_NULL(strstr(js, "if (result.content === undefined)"));
-    /* Compaction uses the durable session context channel, not the system
-     * prompt; older hosts without it skip reinjection. */
+    /* The V2 hooks read the session id with optional chaining (fail open). */
     ASSERT_NOT_NULL(strstr(js, "event?.sessionID"));
-    ASSERT_NOT_NULL(strstr(js, "ctx?.session?.instructions?.entry"));
     /* The plugin instance's location is not the session's location in a
      * multi-project server: resolve each session's directory. */
     ASSERT_NOT_NULL(strstr(js, "const dir = await dirFor("));
@@ -1383,8 +1381,6 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     /* No fallback to the plugin instance's location: that is not the session's
      * location in a multi-project server. */
     ASSERT_NULL(strstr(js, "ctx?.location?.directory"));
-    ASSERT_NOT_NULL(strstr(js, "key: 'codebase-memory-session-note'"));
-    ASSERT_NULL(strstr(js, "event.system.push"));
     ASSERT_NULL(strstr(js, "pendingReinject"));
     /* Registrations fail open per domain; the server() hooks yield per domain. */
     ASSERT_NOT_NULL(strstr(js, "toolHooksRegistered = true;"));
@@ -1396,6 +1392,42 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     /* The empty setup placeholder and the old named export must both be gone. */
     ASSERT_NULL(strstr(js, "setup() {}"));
     ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
+    free(js);
+    PASS();
+}
+
+/* #2204: on OpenCode 2 the post-compaction note stays inside the compaction,
+ * at the level the 1.18.x path uses (output.context). The `compaction` hook
+ * receives the compaction request, whose `messages` are the input the summary
+ * is built from, so the note is pushed there as a text message. It must never
+ * reach the system prompt: not through `event.system`, and not through a
+ * session instruction entry, which OpenCode renders into the system array of
+ * every later request. */
+TEST(client_adapter_opencode_v2_compaction_note_goes_into_the_compaction_messages) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    const char *hook = strstr(js, "ctx.session.hook('compaction'");
+    const char *push = strstr(js, "event.messages.push({");
+    const char *registered = strstr(js, "sessionHooksRegistered = true;");
+    ASSERT_NOT_NULL(hook);
+    ASSERT_NOT_NULL(push);
+    ASSERT_NOT_NULL(registered);
+    /* The push lives inside the compaction registration. */
+    ASSERT_TRUE(hook < push);
+    ASSERT_TRUE(push < registered);
+    /* A text message that carries the note. */
+    const char *role = strstr(push, "role: 'user',");
+    const char *text = strstr(push, "content: [{ type: 'text', text: note }],");
+    ASSERT_NOT_NULL(role);
+    ASSERT_NOT_NULL(text);
+    ASSERT_TRUE(role < registered);
+    ASSERT_TRUE(text < registered);
+    /* Fail open: a host whose event has no messages array skips reinjection. */
+    ASSERT_NOT_NULL(strstr(js, "if (!Array.isArray(event?.messages)) return;"));
+    /* Never the system prompt, and no session instruction entry. */
+    ASSERT_NULL(strstr(js, ".system"));
+    ASSERT_NULL(strstr(js, "instructions"));
+    ASSERT_NULL(strstr(js, "entry.put"));
     free(js);
     PASS();
 }
@@ -1472,6 +1504,7 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
+    RUN_TEST(client_adapter_opencode_v2_compaction_note_goes_into_the_compaction_messages);
     RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

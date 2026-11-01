@@ -57,8 +57,8 @@ char *cbm_client_adapter_pi(const char *binary_path);
  * server() path and recorded here so it is not rediscovered as a mystery.
  * OpenCode 2 ignores `server` and calls `setup(ctx)`, which registers
  * `execute.after` and `compaction` on the context domains. Each registration
- * fails open, and the post-compaction note is stored as a keyed session
- * instruction (`<context>` entry) instead of the system prompt.
+ * fails open, and the post-compaction note is added as a text message to the
+ * compaction request's `messages` (the summary input), never to `system`.
  *
  * Returns NULL on allocation failure or when binary_path is NULL/empty. */
 char *cbm_client_adapter_opencode(const char *binary_path);
