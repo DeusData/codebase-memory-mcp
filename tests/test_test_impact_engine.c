@@ -1547,7 +1547,8 @@ TEST(test_impact_engine_resolver_metadata_failures_are_uncertainty) {
              * Summary counts one abstention, but the exact emitted=0 visitor
              * returns none: this cannot be accepted as a complete empty load. */
             ASSERT_EQ(sqlite3_exec(cbm_store_get_db(f.c.store),
-                                   "UPDATE resolver_occurrences SET emitted=0.5", NULL, NULL, NULL),
+                                   "UPDATE resolver_occurrence_rows SET emitted=0.5", NULL, NULL,
+                                   NULL),
                       SQLITE_OK);
         }
         ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));

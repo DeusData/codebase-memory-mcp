@@ -1054,7 +1054,110 @@ TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error) {
     PASS();
 }
 
+/* An include written through a macro names no file this resolver can follow. The
+ * file with it must not gain an edge through a header it cannot prove it includes,
+ * and another file's literal include of that header still resolves. */
+TEST(resolver_c_macro_include_proves_nothing_for_its_file) {
+    char *root = th_mktempdir("cbm_c_macro_include");
+    ASSERT_NOT_NULL(root);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "lib.h"), "void helper(void);\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "lib.c"), "#include \"lib.h\"\nvoid helper(void) {}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "clean.c"),
+                            "#include \"lib.h\"\nvoid clean(void) { helper(); }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "macro.c"),
+                            "#define HEADER \"lib.h\"\n#include HEADER\n"
+                            "void through_macro(void) { helper(); }\n"),
+              0);
+    char db[1024];
+    snprintf(db, sizeof(db), "%s/index.db", root);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path(db) : NULL;
+    int proven = -1, through_macro = -1;
+    if (store) {
+        char sql[512];
+        sqlite3 *handle = cbm_store_get_db(store);
+        const char *count_edge = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                                 "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                                 "s.name='%s' AND t.name='helper'";
+        sqlite3_stmt *statement = NULL;
+        snprintf(sql, sizeof(sql), count_edge, "clean");
+        if (sqlite3_prepare_v2(handle, sql, -1, &statement, NULL) == SQLITE_OK &&
+            sqlite3_step(statement) == SQLITE_ROW)
+            proven = sqlite3_column_int(statement, 0);
+        sqlite3_finalize(statement);
+        statement = NULL;
+        snprintf(sql, sizeof(sql), count_edge, "through_macro");
+        if (sqlite3_prepare_v2(handle, sql, -1, &statement, NULL) == SQLITE_OK &&
+            sqlite3_step(statement) == SQLITE_ROW)
+            through_macro = sqlite3_column_int(statement, 0);
+        sqlite3_finalize(statement);
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    th_cleanup(root);
+    ASSERT_EQ(rc, 0);
+    /* Another file's call still resolves through its own literal include. */
+    ASSERT_EQ(proven, 1);
+    /* The macro's file has an unknown include, so it must not gain the same edge. */
+    ASSERT_EQ(through_macro, 0);
+    PASS();
+}
+
+/* clang's lexer tests include one header tens of thousands of times, past what one
+ * file's proof pool analyses. That file's imports are limited, and visibly so. It
+ * must not stop another file from publishing or resolving. */
+TEST(resolver_c_file_past_the_proof_limit_does_not_stop_publication) {
+    enum { LINES = 70000 };
+    char *root = th_mktempdir("cbm_c_many_includes");
+    ASSERT_NOT_NULL(root);
+    static const char line[] = "#include \"lib.h\"\n";
+    size_t bytes = (size_t)LINES * (sizeof(line) - 1) + 1;
+    char *many = malloc(bytes);
+    ASSERT_NOT_NULL(many);
+    for (size_t i = 0; i < LINES; i++)
+        memcpy(many + i * (sizeof(line) - 1), line, sizeof(line) - 1);
+    many[bytes - 1] = '\0';
+    ASSERT_EQ(th_write_file(TH_PATH(root, "many.h"), many), 0);
+    free(many);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "lib.h"), "void helper(void);\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "lib.c"), "#include \"lib.h\"\nvoid helper(void) {}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(root, "clean.c"),
+                            "#include \"lib.h\"\nvoid clean(void) { helper(); }\n"),
+              0);
+    char db[1024];
+    snprintf(db, sizeof(db), "%s/index.db", root);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_store_t *store = rc == 0 ? cbm_store_open_path(db) : NULL;
+    int proven = -1;
+    if (store) {
+        sqlite3_stmt *statement = NULL;
+        if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                               "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                               "JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND "
+                               "s.name='clean' AND t.name='helper'",
+                               -1, &statement, NULL) == SQLITE_OK &&
+            sqlite3_step(statement) == SQLITE_ROW)
+            proven = sqlite3_column_int(statement, 0);
+        sqlite3_finalize(statement);
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    th_cleanup(root);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(proven, 1);
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_file_past_the_proof_limit_does_not_stop_publication);
+    RUN_TEST(resolver_c_macro_include_proves_nothing_for_its_file);
     RUN_TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error);
     RUN_TEST(resolver_c_preprocessed_proofs_require_complete_explicit_configuration);
     RUN_TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships);

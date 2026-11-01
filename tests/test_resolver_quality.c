@@ -389,6 +389,56 @@ typedef enum {
     RQ_TEST_NO_ROW,
     RQ_TEST_UNRELATED
 } rq_test_mutation_t;
+
+/* The logical occurrence tables are read-only views over compact rows, so a fixture
+ * writes those rows, with its strings in the project's dictionary. */
+static sqlite3_int64 rq_test_text(sqlite3 *db, const char *value) {
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_int64 id = -1;
+    if (sqlite3_prepare_v2(db,
+                           "INSERT INTO resolver_text(pid,id,value) "
+                           "SELECT pid,(SELECT coalesce(max(id),0)+1 FROM resolver_text),?1 "
+                           "FROM resolver_projects WHERE project='rq' RETURNING id",
+                           -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(stmt, 1, value, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW)
+        id = sqlite3_column_int64(stmt, 0);
+    if (stmt && sqlite3_step(stmt) != SQLITE_DONE)
+        id = -1;
+    sqlite3_finalize(stmt);
+    return id;
+}
+
+typedef struct {
+    const char *file, *scope, *relation, *spelling, *target;
+    uint32_t start, end;
+    int origin, domain;
+} rq_test_row_t;
+
+static bool rq_test_row(sqlite3 *db, const rq_test_row_t *row) {
+    const char *texts[] = {row->file,   row->scope, row->relation, row->spelling,
+                           row->target, "fixture",  "{}"};
+    const char *sql =
+        "INSERT INTO resolver_occurrence_rows(pid,ordinal,file,scope,relation,spelling,start_byte,"
+        "span,source_origin,binding,domain,analysis,rule,facts,target,candidate_count,reason,"
+        "emitted,props,line,content,configuration,proof,source_binding_proof) "
+        "SELECT pid,(SELECT coalesce(max(ordinal)+1,0) FROM resolver_occurrence_rows),?1,?2,?3,?4,"
+        "?8,?9,?10,1,?11,0,0,0,?5,1,?6,1,?7,-1,NULL,NULL,0,0 "
+        "FROM resolver_projects WHERE project='rq'";
+    sqlite3_stmt *stmt = NULL;
+    bool ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK;
+    for (int i = 0; ok && i < 7; i++) {
+        sqlite3_int64 id = rq_test_text(db, texts[i]);
+        ok = id > 0 && sqlite3_bind_int64(stmt, i + 1, id) == SQLITE_OK;
+    }
+    ok = ok && sqlite3_bind_int64(stmt, 8, row->start) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 9, (sqlite3_int64)row->end - row->start) == SQLITE_OK &&
+         sqlite3_bind_int(stmt, 10, row->origin) == SQLITE_OK &&
+         sqlite3_bind_int(stmt, 11, row->domain) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
 static bool rq_test_emit(rq_test_store_t *fixture, rq_test_mutation_t mutation) {
     bool other = mutation == RQ_TEST_CALLER || mutation == RQ_TEST_UNRELATED;
     const char *scope = other ? "p.main.other(int)" : "p.main.caller(int)";
@@ -401,25 +451,19 @@ static bool rq_test_emit(rq_test_store_t *fixture, rq_test_mutation_t mutation) 
         start = (uint32_t)(strstr(source + fixture->end, "target(value)") - source);
         end = start + (uint32_t)strlen("target(value)");
     }
-    sqlite3_stmt *stmt = NULL;
     bool ok = true;
     if (mutation != RQ_TEST_NO_ROW) {
-        const char *sql = "INSERT INTO resolver_occurrences VALUES('rq',"
-                          "(SELECT coalesce(max(ordinal)+1,0) FROM resolver_occurrences),"
-                          "'main.c',?1,?2,'target',?3,?4,?5,1,1,0,0,0,?6,1,'fixture',1,?7,'{}')";
-        ok = sqlite3_prepare_v2(cbm_store_get_db(fixture->store), sql, -1, &stmt, NULL) ==
-                 SQLITE_OK &&
-             sqlite3_bind_text(stmt, 1, scope, -1, SQLITE_STATIC) == SQLITE_OK &&
-             sqlite3_bind_text(stmt, 2, relation, -1, SQLITE_STATIC) == SQLITE_OK &&
-             sqlite3_bind_int64(stmt, 3, start) == SQLITE_OK &&
-             sqlite3_bind_int64(stmt, 4, end) == SQLITE_OK &&
-             sqlite3_bind_int(stmt, 5,
-                              mutation == RQ_TEST_ORIGIN ? CBM_SOURCE_ORIGIN_PREPROCESSED
-                                                         : CBM_SOURCE_ORIGIN_RAW) == SQLITE_OK &&
-             sqlite3_bind_text(stmt, 6, target, -1, SQLITE_STATIC) == SQLITE_OK &&
-             sqlite3_bind_int(stmt, 7, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
-             sqlite3_step(stmt) == SQLITE_DONE;
-        sqlite3_finalize(stmt);
+        rq_test_row_t row = {.file = "main.c",
+                             .scope = scope,
+                             .relation = relation,
+                             .spelling = "target",
+                             .target = target,
+                             .start = start,
+                             .end = end,
+                             .origin = mutation == RQ_TEST_ORIGIN ? CBM_SOURCE_ORIGIN_PREPROCESSED
+                                                                  : CBM_SOURCE_ORIGIN_RAW,
+                             .domain = 1};
+        ok = rq_test_row(cbm_store_get_db(fixture->store), &row);
     }
     if (ok && mutation != RQ_TEST_NO_EDGE) {
         cbm_edge_t edge = {.project = "rq",
@@ -473,20 +517,24 @@ static bool rq_test_preprocessed(rq_test_store_t *fixture, RQ_Source sources[3],
     ok = ok &&
          sqlite3_prepare_v2(
              db,
-             "UPDATE resolver_occurrences SET start_byte=?1,end_byte=?2,source_origin=1 "
-             "WHERE project='rq' AND ordinal=0",
+             "UPDATE resolver_occurrence_rows SET start_byte=?1,span=?2-?1,source_origin=1 "
+             "WHERE ordinal=0",
              -1, &stmt, NULL) == SQLITE_OK &&
          sqlite3_bind_int64(stmt, 1, item->site.preprocessed_start_byte) == SQLITE_OK &&
          sqlite3_bind_int64(stmt, 2, item->site.preprocessed_end_byte) == SQLITE_OK &&
          sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
     stmt = NULL;
-    ok = ok &&
-         sqlite3_prepare_v2(db, "INSERT INTO resolver_occurrence_evidence VALUES('rq',0,?1,?2,0,0)",
+    sqlite3_int64 content = ok ? rq_test_text(db, digest) : -1;
+    sqlite3_int64 configuration =
+        ok ? rq_test_text(db, sources[0].preprocessed_configuration_identity) : -1;
+    ok = content > 0 && configuration > 0 &&
+         sqlite3_prepare_v2(db,
+                            "UPDATE resolver_occurrence_rows SET content=?1,configuration=?2 "
+                            "WHERE ordinal=0",
                             -1, &stmt, NULL) == SQLITE_OK &&
-         sqlite3_bind_text(stmt, 1, digest, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-         sqlite3_bind_text(stmt, 2, sources[0].preprocessed_configuration_identity, -1,
-                           SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 1, content) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 2, configuration) == SQLITE_OK &&
          sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);
     return ok;
@@ -517,19 +565,21 @@ TEST(resolver_quality_oracle_maps_one_preprocessed_occurrence_once) {
 
 TEST(resolver_quality_oracle_rejects_preprocessed_metadata_and_span_corruption) {
     static const char *const mutations[] = {
-        "UPDATE resolver_occurrences SET start_byte=start_byte+1",
+        "UPDATE resolver_occurrence_rows SET start_byte=start_byte+1,span=span-1",
         "UPDATE resolver_file_summaries SET preprocessed_content_identity='wrong' "
         "WHERE file_path='main.c'",
         "UPDATE resolver_file_summaries SET preprocessed_length=preprocessed_length+1 "
         "WHERE file_path='main.c'",
         "UPDATE resolver_file_summaries SET configuration_identity='wrong' "
         "WHERE file_path='main.c'",
-        "UPDATE resolver_occurrence_evidence SET content_identity='wrong'",
-        "UPDATE resolver_occurrence_evidence SET configuration_identity='wrong'",
-        "UPDATE resolver_occurrences SET source_origin=0",
-        "UPDATE resolver_occurrences SET source_origin=99",
-        "UPDATE resolver_occurrences SET start_byte=start_byte+4,end_byte=end_byte+4",
-        "DELETE FROM resolver_occurrence_evidence"};
+        "UPDATE resolver_text SET value='wrong' WHERE id="
+        "(SELECT content FROM resolver_occurrence_rows)",
+        "UPDATE resolver_text SET value='wrong' WHERE id="
+        "(SELECT configuration FROM resolver_occurrence_rows)",
+        "UPDATE resolver_occurrence_rows SET source_origin=0",
+        "UPDATE resolver_occurrence_rows SET source_origin=99",
+        "UPDATE resolver_occurrence_rows SET start_byte=start_byte+4",
+        "UPDATE resolver_occurrence_rows SET content=NULL,configuration=NULL"};
     for (size_t i = 0; i < sizeof(mutations) / sizeof(mutations[0]); i++) {
         rq_test_store_t fixture;
         ASSERT(rq_test_open(&fixture, true));
@@ -685,7 +735,7 @@ TEST(resolver_quality_oracle_requires_promotion_of_recovered_gap) {
     ASSERT(rq_test_check(&fixture, &item, &report));
     ASSERT_EQ(report.recovered_gaps, 0);
     ASSERT(sqlite3_exec(cbm_store_get_db(fixture.store),
-                        "DELETE FROM edges; DELETE FROM resolver_occurrences", NULL, NULL,
+                        "DELETE FROM edges; DELETE FROM resolver_occurrence_rows", NULL, NULL,
                         NULL) == SQLITE_OK);
     bool regressed = rq_test_check(&fixture, &item, &report);
     cbm_store_close(fixture.store);
@@ -1021,19 +1071,16 @@ static bool rq_builtin_emit(rq_test_store_t *fixture, const char *identity, cons
                          .start_line = 1,
                          .end_line = 1};
     fixture->target = cbm_store_upsert_node(fixture->store, &target);
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "INSERT INTO resolver_occurrences VALUES('rq',0,'tool.py',"
-                      "'rq.tool.lookup','CALLS','len',?1,?2,0,1,?3,0,0,0,?4,1,'fixture',1,?5,'{}')";
-    bool ok =
-        fixture->target > 0 &&
-        sqlite3_prepare_v2(cbm_store_get_db(fixture->store), sql, -1, &stmt, NULL) == SQLITE_OK &&
-        sqlite3_bind_int64(stmt, 1, fixture->start) == SQLITE_OK &&
-        sqlite3_bind_int64(stmt, 2, fixture->end) == SQLITE_OK &&
-        sqlite3_bind_int(stmt, 3, domain) == SQLITE_OK &&
-        sqlite3_bind_text(stmt, 4, identity, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-        sqlite3_bind_int(stmt, 5, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
-        sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
+    rq_test_row_t row = {.file = "tool.py",
+                         .scope = "rq.tool.lookup",
+                         .relation = "CALLS",
+                         .spelling = "len",
+                         .target = identity,
+                         .start = fixture->start,
+                         .end = fixture->end,
+                         .origin = CBM_SOURCE_ORIGIN_RAW,
+                         .domain = domain};
+    bool ok = fixture->target > 0 && rq_test_row(cbm_store_get_db(fixture->store), &row);
     cbm_edge_t edge = {.project = "rq",
                        .source_id = fixture->caller,
                        .target_id = fixture->target,
@@ -1143,21 +1190,17 @@ TEST(resolver_quality_oracle_rejects_malformed_external_expectations) {
  * external target at the golden span or a project target at any other span. */
 static bool rq_project_domain_extra(rq_test_store_t *fixture, int64_t target_id, const char *target,
                                     uint32_t start, uint32_t end, bool external) {
-    sqlite3 *db = cbm_store_get_db(fixture->store);
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "INSERT INTO resolver_occurrences VALUES('rq',1,'main.c',"
-                      "'p.main.caller(int)','CALLS','extra',?1,?2,0,1,?4,0,0,0,?3,1,"
-                      "'fixture',1,?5,'{}')";
-    bool ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
-              sqlite3_bind_int64(stmt, 1, start) == SQLITE_OK &&
-              sqlite3_bind_int64(stmt, 2, end) == SQLITE_OK &&
-              sqlite3_bind_text(stmt, 3, target, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
-              sqlite3_bind_int(stmt, 4,
-                               external ? CBM_RESOLVE_DOMAIN_EXTERNAL
-                                        : CBM_RESOLVE_DOMAIN_PROJECT) == SQLITE_OK &&
-              sqlite3_bind_int(stmt, 5, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
-              sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
+    rq_test_row_t row = {.file = "main.c",
+                         .scope = "p.main.caller(int)",
+                         .relation = "CALLS",
+                         .spelling = "extra",
+                         .target = target,
+                         .start = start,
+                         .end = end,
+                         .origin = CBM_SOURCE_ORIGIN_RAW,
+                         .domain =
+                             external ? CBM_RESOLVE_DOMAIN_EXTERNAL : CBM_RESOLVE_DOMAIN_PROJECT};
+    bool ok = rq_test_row(cbm_store_get_db(fixture->store), &row);
     cbm_edge_t edge = {
         .project = "rq", .source_id = fixture->caller, .target_id = target_id, .type = "CALLS"};
     return ok && cbm_store_insert_edge(fixture->store, &edge) > 0;

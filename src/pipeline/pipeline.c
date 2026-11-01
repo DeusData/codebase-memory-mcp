@@ -4170,7 +4170,7 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
         const cbm_resolve_summary_t *summaries =
             cbm_gbuf_resolver_summaries(generation->gbuf, &summary_count);
         ok = cbm_gbuf_resolutions_complete(generation->gbuf) &&
-             cbm_store_resolver_replace_generation(store, generation->project, rows, count, files,
+             cbm_store_resolver_publish_generation(store, generation->project, rows, count, files,
                                                    file_count, summaries,
                                                    summary_count) == CBM_STORE_OK;
     }

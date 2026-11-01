@@ -4877,6 +4877,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     int total_usages = 0;
     int total_semantic = 0;
     int total_lsp_overrides = 0;
+    size_t resolution_rows = 0;
+    for (int i = 0; i < worker_count; i++)
+        resolution_rows += cbm_gbuf_resolution_count(workers[i].local_edge_buf);
+    (void)cbm_gbuf_reserve_resolutions(ctx->gbuf, resolution_rows); /* a failure only costs room */
     for (int i = 0; i < worker_count; i++) {
         if (workers[i].local_edge_buf) {
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_edge_buf);

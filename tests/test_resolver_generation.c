@@ -4,9 +4,13 @@
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
 #include "store/store_resolver.h"
+#include "store/store_resolver_evidence.h"
+#include "foundation/compat.h"
+#include "foundation/log.h"
 #include <sqlite3.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char generation_source[] = "class Widget:\n"
                                         "    def run(self): pass\n"
@@ -859,45 +863,393 @@ static bool generation_corruption_is_unavailable(const char *sql) {
     return ok;
 }
 
+/* Corruption now targets what is actually stored. The logical names are views,
+ * so losing one of those, or any compact table beneath them, must read as
+ * unavailable, exactly as losing a whole table did before. */
 TEST(resolver_generation_missing_metadata_tables_are_unavailable) {
-    const char *tables[] = {"resolver_occurrences",
-                            "resolver_facts",
-                            "resolver_supports",
-                            "resolver_lookups",
-                            "resolver_occurrence_evidence",
-                            "resolver_file_summaries",
+    const char *tables[] = {"resolver_projects",       "resolver_text",
+                            "resolver_occurrence_rows", "resolver_fact_rows",
+                            "resolver_support_rows",   "resolver_file_summaries",
                             "resolver_derived_bindings"};
     for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
         char sql[128];
         snprintf(sql, sizeof(sql), "DROP TABLE %s", tables[i]);
         ASSERT(generation_corruption_is_unavailable(sql));
     }
-    PASS();
-}
-
-TEST(resolver_generation_missing_metadata_rows_are_unavailable) {
-    const char *tables[] = {"resolver_occurrences",
-                            "resolver_facts",
-                            "resolver_supports",
-                            "resolver_lookups",
-                            "resolver_occurrence_evidence",
-                            "resolver_file_summaries",
-                            "resolver_derived_bindings"};
-    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
-        char sql[160];
-        snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE project='proj'", tables[i]);
+    const char *views[] = {"resolver_occurrences", "resolver_facts", "resolver_supports",
+                           "resolver_lookups", "resolver_occurrence_evidence"};
+    for (size_t i = 0; i < sizeof(views) / sizeof(views[0]); i++) {
+        char sql[128];
+        snprintf(sql, sizeof(sql), "DROP VIEW %s", views[i]);
         ASSERT(generation_corruption_is_unavailable(sql));
     }
     PASS();
 }
 
+TEST(resolver_generation_missing_metadata_rows_are_unavailable) {
+    const char *deletes[] = {"DELETE FROM resolver_text WHERE pid=1",
+                             "DELETE FROM resolver_occurrence_rows WHERE pid=1",
+                             "DELETE FROM resolver_fact_rows WHERE pid=1",
+                             "DELETE FROM resolver_support_rows WHERE pid=1",
+                             "DELETE FROM resolver_file_summaries WHERE project='proj'",
+                             "DELETE FROM resolver_derived_bindings WHERE project='proj'"};
+    for (size_t i = 0; i < sizeof(deletes) / sizeof(deletes[0]); i++)
+        ASSERT(generation_corruption_is_unavailable(deletes[i]));
+    PASS();
+}
+
+/* A view can be swapped for one over other rows with the same columns. */
+TEST(resolver_generation_replaced_view_is_unavailable) {
+    ASSERT(generation_corruption_is_unavailable(
+        "DROP VIEW resolver_occurrence_evidence;"
+        "CREATE VIEW resolver_occurrence_evidence(project,ordinal,content_identity,"
+        "configuration_identity,proof,source_binding_proof) AS SELECT p.project,o.ordinal,'','',"
+        "1,1 FROM resolver_projects p JOIN resolver_occurrence_rows o ON o.pid=p.pid"));
+    PASS();
+}
+
 TEST(resolver_generation_modified_metadata_is_unavailable) {
     ASSERT(generation_corruption_is_unavailable(
-        "UPDATE resolver_occurrence_evidence SET proof=0 WHERE project='proj'"));
+        "UPDATE resolver_occurrence_rows SET proof=0 WHERE pid=1"));
+    ASSERT(generation_corruption_is_unavailable(
+        "UPDATE resolver_text SET value='lost' WHERE pid=1 AND id=1"));
     ASSERT(generation_corruption_is_unavailable(
         "UPDATE resolver_file_summaries SET derived_summary='lost' WHERE project='proj'"));
     ASSERT(generation_corruption_is_unavailable(
         "UPDATE resolver_derived_bindings SET target='wrong' WHERE project='proj'"));
+    PASS();
+}
+
+/* Everything a row carries must read back byte for byte through the views,
+ * including properties in shapes the compact form does not recognise. */
+typedef struct {
+    const char *relation;
+    const char *spelling;
+    cbm_resolve_rule_t rule;
+    uint32_t start, end, origin;
+    const char *properties; /* NULL reads back as the empty object */
+    const char *target;
+    const char *reason;
+} generation_round_trip_t;
+
+TEST(resolver_generation_views_read_back_every_stored_value) {
+    static const generation_round_trip_t cases[] = {
+        /* What pass_resolver writes for a call. */
+        {"CALLS", "run", CBM_RESOLVE_RULE_SCOPE_BINDING, 10, 13, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":1,\"start_byte\":10,\"end_byte\":13,"
+         "\"source_origin\":0,\"callee\":\"run\",\"line\":12,\"args\":[{\"i\":0,\"e\":\"x\"}]}",
+         "", "binding_not_found"},
+        /* The same call elsewhere shares one stored remainder. */
+        {"CALLS", "run", CBM_RESOLVE_RULE_SCOPE_BINDING, 90, 93, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":1,\"start_byte\":90,\"end_byte\":93,"
+         "\"source_origin\":0,\"callee\":\"run\",\"line\":40,\"args\":[{\"i\":0,\"e\":\"x\"}]}",
+         "", "binding_not_found"},
+        /* What it writes for a usage: no callee, no line. */
+        {"USAGE", "x", CBM_RESOLVE_RULE_NONE, 5, 6, 1,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":5,\"end_byte\":6,"
+         "\"source_origin\":1}",
+         "proj.mod.x", ""},
+        /* A callee spelling that looks like the line key stays inside its string. */
+        {"CALLS", "a,\"line\":7", CBM_RESOLVE_RULE_NONE, 1, 2, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":1,\"end_byte\":2,"
+         "\"source_origin\":0,\"callee\":\"a,\\\"line\\\":7\",\"line\":12}",
+         "", ""},
+        /* Decoys: anything but the exact head stays verbatim. */
+        {"CALLS", "other_rule", CBM_RESOLVE_RULE_SCOPE_BINDING, 1, 2, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":3,\"start_byte\":1,\"end_byte\":2,"
+         "\"source_origin\":0,\"line\":9}",
+         "", ""},
+        {"CALLS", "other_span", CBM_RESOLVE_RULE_NONE, 1, 2, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":1,\"end_byte\":22,"
+         "\"source_origin\":0,\"line\":9}",
+         "", ""},
+        {"USAGE", "adapter", CBM_RESOLVE_RULE_NONE, 0, 0, 0,
+         "{\"strategy\":\"docker\",\"line\":5,\"image\":\"a\"}", "", ""},
+        /* A line that does not reproduce from its integer value stays in the text. */
+        {"CALLS", "zero", CBM_RESOLVE_RULE_NONE, 3, 4, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":3,\"end_byte\":4,"
+         "\"source_origin\":0,\"line\":012}",
+         "", ""},
+        {"CALLS", "huge", CBM_RESOLVE_RULE_NONE, 3, 4, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":3,\"end_byte\":4,"
+         "\"source_origin\":0,\"line\":99999999999999}",
+         "", ""},
+        /* A raw marker byte cannot be confused with the line marker. */
+        {"CALLS", "marker", CBM_RESOLVE_RULE_NONE, 3, 4, 0,
+         "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":3,\"end_byte\":4,"
+         "\"source_origin\":0,\"callee\":\"\x01\",\"line\":8}",
+         "", ""},
+        {"USAGE", "none", CBM_RESOLVE_RULE_NONE, 7, 7, 0, NULL, "", ""},
+    };
+    enum { CASES = sizeof(cases) / sizeof(cases[0]) };
+    cbm_resolve_record_t rows[CASES];
+    memset(rows, 0, sizeof(rows));
+    for (size_t i = 0; i < CASES; i++) {
+        rows[i] = (cbm_resolve_record_t){.file_path = "src/deep/path/module.c",
+                                         .scope = "proj.src.deep.path.module.owner",
+                                         .relation = cases[i].relation,
+                                         .spelling = cases[i].spelling,
+                                         .properties_json = cases[i].properties,
+                                         .start_byte = cases[i].start,
+                                         .end_byte = cases[i].end,
+                                         .source_origin = cases[i].origin,
+                                         .content_identity = "content-identity",
+                                         .configuration_identity = "configuration-identity"};
+        rows[i].result.rule = cases[i].rule;
+        rows[i].result.target = cases[i].target;
+        rows[i].result.reason = cases[i].reason;
+        rows[i].result.facts = (uint32_t)i;
+        rows[i].result.candidate_count = (uint32_t)i + 2;
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_resolver_replace(store, "proj", rows, CASES), CBM_STORE_OK);
+    sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT project,file_path,scope,relation,spelling,start_byte,"
+                                 "end_byte,source_origin,rule,facts,target,candidate_count,reason,"
+                                 "emitted,rules_version,properties_json FROM resolver_occurrences "
+                                 "ORDER BY ordinal",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    for (size_t i = 0; i < CASES; i++) {
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "proj");
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), rows[i].file_path);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), rows[i].scope);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), rows[i].relation);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4), rows[i].spelling);
+        ASSERT_EQ(sqlite3_column_int64(stmt, 5), cases[i].start);
+        ASSERT_EQ(sqlite3_column_int64(stmt, 6), cases[i].end);
+        ASSERT_EQ(sqlite3_column_int64(stmt, 7), cases[i].origin);
+        ASSERT_EQ(sqlite3_column_int(stmt, 8), (int)cases[i].rule);
+        ASSERT_EQ(sqlite3_column_int64(stmt, 9), (sqlite3_int64)i);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 10), cases[i].target);
+        ASSERT_EQ(sqlite3_column_int64(stmt, 11), (sqlite3_int64)i + 2);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 12), cases[i].reason);
+        ASSERT_EQ(sqlite3_column_int(stmt, 13), 0);
+        ASSERT_EQ(sqlite3_column_int(stmt, 14), CBM_RESOLVER_RULES_VERSION);
+        ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 15),
+                      cases[i].properties ? cases[i].properties : "{}");
+    }
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_occurrence_evidence WHERE "
+                                "content_identity='content-identity' AND "
+                                "configuration_identity='configuration-identity'",
+                                0),
+              CASES);
+    /* The two calls that differ only by position share one stored remainder. */
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_occurrence_rows WHERE line IN "
+                                "(12,40) AND spelling=(SELECT id FROM resolver_text WHERE "
+                                "value='run')",
+                                0),
+              2);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(DISTINCT props) FROM resolver_occurrence_rows WHERE "
+                                "spelling=(SELECT id FROM resolver_text WHERE value='run')",
+                                0),
+              1);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* The cost contract, by page count rather than wall time. Every occurrence here
+ * repeats long project, file, scope and identity strings. Row storage must not
+ * repeat them: bytes per occurrence stay flat and far below the text they name,
+ * and the dictionary holds each string once. */
+static bool generation_storage_bytes(cbm_resolve_record_t *rows, size_t count, sqlite3_int64 *bytes,
+                                     sqlite3_int64 *texts) {
+    cbm_store_t *store = cbm_store_open_memory();
+    if (!store)
+        return false;
+    sqlite3 *db = cbm_store_get_db(store);
+    const char *project = "a-rather-long-project-name-derived-from-an-absolute-checkout-path";
+    bool ok = cbm_store_resolver_replace(store, project, rows, count) == CBM_STORE_OK;
+    if (ok) {
+        *bytes = (sqlite3_int64)generation_scalar(db, "PRAGMA page_count", 0) *
+                 (sqlite3_int64)generation_scalar(db, "PRAGMA page_size", 0);
+        *texts = generation_scalar(db, "SELECT count(*) FROM resolver_text", 0);
+    }
+    cbm_store_close(store);
+    return ok;
+}
+
+TEST(resolver_generation_storage_does_not_repeat_strings) {
+    enum { LARGE = 8192, SMALL = LARGE / 2, PROPERTY_BYTES = 256 };
+    cbm_resolve_record_t *rows = calloc(LARGE, sizeof(*rows));
+    char *properties = malloc((size_t)LARGE * PROPERTY_BYTES);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(properties);
+    const char *content = "8f2d3c6a1b7e49058c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b";
+    const char *configuration = "1b2a3f4e5d6c7b8a9f0e1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a7f8e9d0c1b2a";
+    for (int i = 0; i < LARGE; i++) {
+        char *json = properties + (size_t)i * PROPERTY_BYTES;
+        uint32_t start = 1000u + (uint32_t)i * 40u, end = start + 12u;
+        snprintf(json, PROPERTY_BYTES,
+                 "{\"strategy\":\"shared_resolver\",\"resolver_rule\":0,\"start_byte\":%u,"
+                 "\"end_byte\":%u,\"source_origin\":0,\"callee\":\"handle_request\",\"line\":%d,"
+                 "\"args\":[{\"i\":0,\"e\":\"ctx\"}]}",
+                 start, end, i + 1);
+        rows[i] = (cbm_resolve_record_t){
+            .file_path = "services/gateway/internal/transport/http/handlers/request_router.c",
+            .scope = "project.services.gateway.internal.transport.http.handlers.request_router."
+                     "dispatch",
+            .relation = "CALLS",
+            .spelling = "handle_request",
+            .properties_json = json,
+            .start_byte = start,
+            .end_byte = end,
+            .content_identity = content,
+            .configuration_identity = configuration};
+        rows[i].result.reason = "semantic_resolution_required";
+        rows[i].result.target = "";
+    }
+    sqlite3_int64 small_bytes = 0, large_bytes = 0, small_texts = 0, large_texts = 0;
+    bool ok = generation_storage_bytes(rows, SMALL, &small_bytes, &small_texts) &&
+              generation_storage_bytes(rows, LARGE, &large_bytes, &large_texts);
+    free(properties);
+    free(rows);
+    ASSERT_TRUE(ok);
+    /* Each row named over 400 bytes of text before compaction. */
+    ASSERT_LT(large_bytes / LARGE, 96);
+    ASSERT_LT(large_bytes, small_bytes * 5 / 2);
+    ASSERT_EQ(small_texts, large_texts);
+    PASS();
+}
+
+/* An abstained row's fact is composed when stored. Sealing two identical rows must
+ * still give them one fact, as interning did, and a row at another site its own;
+ * and the stored fact must cite the row's proof as its premise. */
+TEST(resolver_generation_abstained_rows_compose_one_fact_per_site) {
+    generation_fixture_t f;
+    ASSERT(generation_fixture_init(&f));
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    cbm_resolve_record_t row = f.rows[1];
+    ASSERT_FALSE(row.emitted);
+    ASSERT_NOT_NULL(row.result.proof);
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    row.start_byte += 100;
+    row.end_byte += 100;
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    ASSERT(cbm_gbuf_record_resolver_file(gb, &f.file));
+    ASSERT(cbm_gbuf_resolutions_own_shared(gb));
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(generation_store(store, gb), CBM_STORE_OK);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(generation_scalar(db, "SELECT count(*) FROM resolver_occurrence_evidence", 0), 3);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(DISTINCT proof) FROM resolver_occurrence_evidence "
+                                "WHERE proof>0",
+                                0),
+              2);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_facts WHERE kind=?",
+                                CBM_PROOF_OCCURRENCE_BINDING),
+              2);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_occurrence_evidence e LEFT JOIN "
+                                "resolver_facts f ON f.project=e.project AND f.id=e.proof "
+                                "WHERE f.id IS NULL OR f.kind<>?",
+                                CBM_PROOF_OCCURRENCE_BINDING),
+              0);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_occurrence_evidence e WHERE NOT "
+                                "EXISTS (SELECT 1 FROM resolver_supports s WHERE s.project="
+                                "e.project AND s.fact=e.proof)",
+                                0),
+              0);
+    cbm_store_close(store);
+    cbm_gbuf_free(gb);
+    generation_fixture_destroy(&f);
+    PASS();
+}
+
+/* A worker that logs nothing for 15 minutes is killed as hung, and a write that
+ * stores hundreds of millions of rows must not look like one. */
+static int generation_progress_lines;
+static void generation_progress_sink(const char *line) {
+    if (strstr(line, "msg=resolver.evidence.progress") && strstr(line, "rows="))
+        generation_progress_lines++;
+}
+
+TEST(resolver_generation_long_write_reports_progress) {
+    enum { ROWS = 64, EVERY = 8 };
+    cbm_resolve_record_t rows[ROWS];
+    memset(rows, 0, sizeof(rows));
+    for (int i = 0; i < ROWS; i++) {
+        rows[i].file_path = "src/module.c";
+        rows[i].scope = "project.src.module.owner";
+        rows[i].relation = "USAGE";
+        rows[i].spelling = "name";
+        rows[i].start_byte = (uint32_t)i;
+        rows[i].end_byte = (uint32_t)i + 1;
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    generation_progress_lines = 0;
+    cbm_store_resolver_test_set_progress_rows(EVERY);
+    cbm_log_set_sink_ex(generation_progress_sink, CBM_LOG_SINK_REPLACE);
+    int rc = cbm_store_resolver_replace(store, "proj", rows, ROWS);
+    cbm_log_set_sink(NULL);
+    cbm_store_resolver_test_set_progress_rows(0);
+    cbm_store_close(store);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(generation_progress_lines, ROWS / EVERY);
+    PASS();
+}
+
+/* A private stage must not hold every row twice while publishing: on the largest
+ * repositories that second copy decides whether the disk suffices. The seam commits
+ * often enough to show it on a small write, and the receipt still comes last. */
+TEST(resolver_generation_publish_keeps_the_wal_small) {
+    enum { ROWS = 6000 };
+    cbm_resolve_record_t *rows = calloc(ROWS, sizeof(*rows));
+    ASSERT_NOT_NULL(rows);
+    char (*names)[32] = malloc((size_t)ROWS * sizeof(*names));
+    ASSERT_NOT_NULL(names);
+    for (int i = 0; i < ROWS; i++) {
+        snprintf(names[i], sizeof(names[i]), "distinct_name_%d", i);
+        rows[i].file_path = "src/module.c";
+        rows[i].scope = "project.src.module.owner";
+        rows[i].relation = "USAGE";
+        rows[i].spelling = names[i];
+        rows[i].start_byte = (uint32_t)i;
+        rows[i].end_byte = (uint32_t)i + 1;
+    }
+    char dir[] = "/tmp/cbm_generation_wal_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char db_path[256], wal_path[256];
+    snprintf(db_path, sizeof(db_path), "%s/stage.db", dir);
+    snprintf(wal_path, sizeof(wal_path), "%s/stage.db-wal", dir);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    /* One page per commit batch is far below the row count's worth of pages. */
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(store), "PRAGMA wal_autocheckpoint=8", NULL, NULL, NULL),
+              SQLITE_OK);
+    cbm_store_resolver_test_set_progress_rows(256);
+    int rc = cbm_store_resolver_publish_generation(store, "proj", rows, ROWS, NULL, 0, NULL, 0);
+    cbm_store_resolver_test_set_progress_rows(0);
+    bool present = false;
+    int current = cbm_store_resolver_current(store, "proj", &present);
+    struct stat wal, db;
+    int wal_stat = stat(wal_path, &wal), db_stat = stat(db_path, &db);
+    cbm_store_close(store);
+    free(names);
+    free(rows);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(current, CBM_STORE_OK);
+    ASSERT_TRUE(present);
+    ASSERT_EQ(wal_stat, 0);
+    ASSERT_EQ(db_stat, 0);
+    ASSERT_GT(db.st_size, 0);
+    ASSERT_LT(wal.st_size, db.st_size);
     PASS();
 }
 
@@ -925,7 +1277,8 @@ TEST(resolver_generation_missing_guard_cannot_revive_other_project_receipts) {
     ASSERT_EQ(cbm_store_resolver_current(store, "first", &present), CBM_STORE_OK);
     ASSERT(present);
     ASSERT_EQ(sqlite3_exec(cbm_store_get_db(store),
-                           "DROP TRIGGER resolver_guard_resolver_facts_DELETE", NULL, NULL, NULL),
+                           "DROP TRIGGER resolver_guard_resolver_fact_rows_DELETE", NULL, NULL,
+                           NULL),
               SQLITE_OK);
     ASSERT_EQ(cbm_store_resolver_current(store, "first", &present), CBM_STORE_OK);
     ASSERT_FALSE(present);
@@ -945,9 +1298,9 @@ TEST(resolver_generation_missing_guard_cannot_revive_other_project_receipts) {
 
 TEST(resolver_generation_replaced_guard_is_not_trusted) {
     ASSERT(generation_corruption_is_unavailable(
-        "DROP TRIGGER resolver_guard_resolver_facts_DELETE;"
-        "CREATE TRIGGER resolver_guard_resolver_facts_DELETE AFTER DELETE ON resolver_facts "
-        "BEGIN SELECT 1; END"));
+        "DROP TRIGGER resolver_guard_resolver_fact_rows_DELETE;"
+        "CREATE TRIGGER resolver_guard_resolver_fact_rows_DELETE AFTER DELETE ON "
+        "resolver_fact_rows BEGIN SELECT 1; END"));
     PASS();
 }
 
@@ -957,7 +1310,13 @@ SUITE(resolver_generation) {
     RUN_TEST(resolver_generation_missing_metadata_tables_are_unavailable);
     RUN_TEST(resolver_generation_missing_metadata_rows_are_unavailable);
     RUN_TEST(resolver_generation_modified_metadata_is_unavailable);
+    RUN_TEST(resolver_generation_replaced_view_is_unavailable);
     RUN_TEST(resolver_generation_empty_project_has_complete_metadata);
+    RUN_TEST(resolver_generation_views_read_back_every_stored_value);
+    RUN_TEST(resolver_generation_storage_does_not_repeat_strings);
+    RUN_TEST(resolver_generation_long_write_reports_progress);
+    RUN_TEST(resolver_generation_abstained_rows_compose_one_fact_per_site);
+    RUN_TEST(resolver_generation_publish_keeps_the_wal_small);
     RUN_TEST(resolver_generation_persists_independent_facts_and_all_join_supports);
     RUN_TEST(resolver_generation_ids_ignore_occurrence_insertion_order);
     RUN_TEST(resolver_generation_source_mismatch_rolls_back_every_metadata_table);

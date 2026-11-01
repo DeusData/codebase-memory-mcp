@@ -349,22 +349,26 @@ static bool note_conditional_owners(cbm_shared_resolver_t *resolver, const CBMFi
     TSNode root = ts_tree_root_node(result->cached_tree);
     if (!owner_kind(root, "module") || ts_node_has_error(root))
         return true;
-    uint32_t count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode group = ts_node_named_child(root, i);
-        if (!owner_kind(group, "if_statement"))
-            continue;
-        TSNode first = owner_field(group, "consequence");
-        TSNode alternative = owner_field(group, "alternative");
-        TSNode second = owner_field(alternative, "body");
-        if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
-            !owner_kind(second, "block"))
-            continue;
-        if (!note_owner_branch(resolver, result, file, source, length, group, first, 1) ||
-            !note_owner_branch(resolver, result, file, source, length, group, second, 2))
-            return false;
+    /* A cursor, not an index loop: a fetch by index walks from the first child. */
+    bool ok = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode group = ts_tree_cursor_current_node(&cursor);
+            if (!owner_kind(group, "if_statement"))
+                continue;
+            TSNode first = owner_field(group, "consequence");
+            TSNode alternative = owner_field(group, "alternative");
+            TSNode second = owner_field(alternative, "body");
+            if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
+                !owner_kind(second, "block"))
+                continue;
+            ok = note_owner_branch(resolver, result, file, source, length, group, first, 1) &&
+                 note_owner_branch(resolver, result, file, source, length, group, second, 2);
+        } while (ok && ts_tree_cursor_goto_next_sibling(&cursor));
     }
-    return true;
+    ts_tree_cursor_delete(&cursor);
+    return ok;
 }
 
 static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_node_t *node) {
@@ -1789,6 +1793,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
             ok = collect_go_types(resolver, ctx, result, &files[f]);
         cbm_pipeline_result_release(result, loaded);
         if (!ok) {
+            cbm_log_error("resolver.build.error", "file", files[f].rel_path, "reason",
+                          "file_facts_failed");
             cbm_shared_resolver_free(resolver);
             return NULL;
         }
@@ -1797,6 +1803,7 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         !cbm_go_stabilization_register(resolver->go_types) || !stabilize_exports(resolver) ||
         !cbm_go_stabilization_seal(resolver->go_types) ||
         !prepare_python_queries(resolver, ctx, files, file_count, cache)) {
+        cbm_log_error("resolver.build.error", "reason", "settle_failed");
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -3042,8 +3049,12 @@ bool cbm_shared_resolver_capture_sources(const cbm_pipeline_ctx_t *ctx,
     bool ok = index != NULL;
     size_t count = 0;
     const cbm_resolve_file_t *recorded = cbm_gbuf_resolver_files(ctx->gbuf, &count);
-    for (size_t i = 0; ok && i < count; i++)
+    for (size_t i = 0; ok && i < count; i++) {
         ok = adapter_index_snapshot(index, &arena, &recorded[i]);
+        if (!ok)
+            cbm_log_error("resolver.sources.error", "file", recorded[i].file_path, "reason",
+                          "recorded_snapshots_conflict");
+    }
     for (int i = 0; ok && i < file_count; i++) {
         bool loaded = false;
         bool parked = ctx->spill && cbm_result_spill_has(ctx->spill, i);
@@ -3069,10 +3080,21 @@ bool cbm_shared_resolver_capture_sources(const cbm_pipeline_ctx_t *ctx,
         ok = cbm_resolve_capture_extraction_state(result) &&
              cbm_resolve_snapshot(result, files[i].rel_path, files[i].language, &snapshot,
                                   extracted_summary);
+        if (!ok) /* The whole publication stops here: it must say why. */
+            cbm_log_error("resolver.sources.error", "file", files[i].rel_path, "reason",
+                          "extraction_state_inconsistent");
         const cbm_resolve_file_t *old =
             ok && snapshot.file_path ? cbm_ht_get(index, snapshot.file_path) : NULL;
         if (ok && old) {
             ok = adapter_snapshot_equal(old, &snapshot);
+            if (!ok) {
+                cbm_log_error("resolver.sources.error", "file", files[i].rel_path, "reason",
+                              "snapshot_differs_from_adapter_capture");
+                cbm_log_error("resolver.sources.detail", "old_module", old->module, "new_module",
+                              snapshot.module, "old_summary", old->extracted_summary, "new_summary",
+                              snapshot.extracted_summary, "old_raw", old->raw_content_identity,
+                              "new_raw", snapshot.raw_content_identity);
+            }
         } else if (ok) {
             ok = cbm_gbuf_record_resolver_file(ctx->gbuf, &snapshot);
             if (ok) {

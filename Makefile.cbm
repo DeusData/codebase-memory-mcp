@@ -441,7 +441,8 @@ LSP_SRCS = $(CBM_DIR)/lsp_all.c
 # Makefile does not use compiler auto-dependency (-MMD) generation.
 LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
                  $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
-                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
+                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h \
+                            $(CBM_DIR)/resolve/*.h)
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c

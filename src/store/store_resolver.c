@@ -23,6 +23,27 @@ typedef struct {
 } resolver_table_t;
 static const resolver_table_t resolver_tables[] = {
     {"resolver_generations", "project,rules_version"},
+    {"resolver_projects", "pid,project,rules_version"},
+    {"resolver_text", "pid,id,value"},
+    {"resolver_occurrence_rows",
+     "pid,ordinal,file,scope,relation,spelling,start_byte,span,source_origin,binding,domain,"
+     "analysis,rule,facts,target,candidate_count,reason,emitted,props,line,content,configuration,"
+     "proof,source_binding_proof"},
+    {"resolver_fact_rows",
+     "pid,id,kind,digest,source_project,file,module,scope,content,configuration,source_origin,"
+     "lookup_domain,lookup_key,declaration,binding_identity,type_identity,detail,start_byte,"
+     "end_byte,origin,flags,lookup_closed,binding,domain,analysis,rule,facts,target,"
+     "candidate_count,reason,predecessors_closed"},
+    {"resolver_support_rows", "pid,fact,ordinal,premise"},
+    {"resolver_file_summaries",
+     "project,file_path,module,language,raw_content_identity,preprocessed_content_identity,"
+     "configuration_identity,raw_length,preprocessed_length,extracted_summary,derived_summary,"
+     "complete"},
+    {"resolver_derived_bindings",
+     "project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof,payload_json"}};
+/* The logical surface. Rows live in the compact tables above; each of these
+ * reads back the original columns and values. See store_resolver_evidence.c. */
+static const resolver_table_t resolver_views[] = {
     {"resolver_occurrences",
      "project,ordinal,file_path,scope,relation,spelling,start_byte,end_byte,source_origin,"
      "binding,domain,analysis,rule,facts,target,candidate_count,reason,emitted,rules_version,"
@@ -31,21 +52,15 @@ static const resolver_table_t resolver_tables[] = {
     {"resolver_supports", "project,fact,ordinal,premise"},
     {"resolver_lookups", "project,fact,domain,key,status"},
     {"resolver_occurrence_evidence",
-     "project,ordinal,content_identity,configuration_identity,proof,source_binding_proof"},
-    {"resolver_file_summaries",
-     "project,file_path,module,language,raw_content_identity,preprocessed_content_identity,"
-     "configuration_identity,raw_length,preprocessed_length,extracted_summary,derived_summary,"
-     "complete"},
-    {"resolver_derived_bindings",
-     "project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof,payload_json"}};
+     "project,ordinal,content_identity,configuration_identity,proof,source_binding_proof"}};
 
-static bool resolver_table_current(sqlite3 *db, const resolver_table_t *table) {
+static bool resolver_object_current(sqlite3 *db, const resolver_table_t *table, const char *type) {
     sqlite3_stmt *statement = NULL;
-    bool ok =
-        sqlite3_prepare_v2(db, "SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?", -1,
-                           &statement, NULL) == SQLITE_OK &&
-        resolver_bind_text(statement, 1, table->name) == SQLITE_OK &&
-        sqlite3_step(statement) == SQLITE_ROW;
+    bool ok = sqlite3_prepare_v2(db, "SELECT 1 FROM main.sqlite_schema WHERE type=? AND name=?", -1,
+                                 &statement, NULL) == SQLITE_OK &&
+              resolver_bind_text(statement, 1, type) == SQLITE_OK &&
+              resolver_bind_text(statement, 2, table->name) == SQLITE_OK &&
+              sqlite3_step(statement) == SQLITE_ROW;
     sqlite3_finalize(statement);
     if (!ok)
         return false;
@@ -59,13 +74,31 @@ static bool resolver_table_current(sqlite3 *db, const resolver_table_t *table) {
     return sqlite3_finalize(statement) == SQLITE_OK && ok;
 }
 
+static bool resolver_table_current(sqlite3 *db, const resolver_table_t *table) {
+    return resolver_object_current(db, table, "table");
+}
+
+/* Compact rows name their project by pid, the rest by name. */
+#define RESOLVER_RECEIPT_KEY(row)                                                    \
+    "k='" RESOLVER_RECEIPT_PREFIX "'||(SELECT project FROM resolver_projects WHERE " \
+    "pid=" row ".pid)"
+
+static bool resolver_table_has_pid(const char *table) {
+    return !strcmp(table, "resolver_text") || !strcmp(table, "resolver_occurrence_rows") ||
+           !strcmp(table, "resolver_fact_rows") || !strcmp(table, "resolver_support_rows");
+}
+
 static bool resolver_guard(sqlite3 *db, const char *table, int operation, bool install) {
     static const char *const operations[] = {"INSERT", "UPDATE", "DELETE"};
-    static const char *const predicates[] = {"k='" RESOLVER_RECEIPT_PREFIX "'||NEW.project",
-                                             "k='" RESOLVER_RECEIPT_PREFIX
-                                             "'||OLD.project OR k='" RESOLVER_RECEIPT_PREFIX
-                                             "'||NEW.project",
-                                             "k='" RESOLVER_RECEIPT_PREFIX "'||OLD.project"};
+    static const char *const by_name[] = {"k='" RESOLVER_RECEIPT_PREFIX "'||NEW.project",
+                                          "k='" RESOLVER_RECEIPT_PREFIX
+                                          "'||OLD.project OR k='" RESOLVER_RECEIPT_PREFIX
+                                          "'||NEW.project",
+                                          "k='" RESOLVER_RECEIPT_PREFIX "'||OLD.project"};
+    static const char *const by_pid[] = {
+        RESOLVER_RECEIPT_KEY("NEW"), RESOLVER_RECEIPT_KEY("OLD") " OR " RESOLVER_RECEIPT_KEY("NEW"),
+        RESOLVER_RECEIPT_KEY("OLD")};
+    const char *const *predicates = resolver_table_has_pid(table) ? by_pid : by_name;
     char name[128], sql[512];
     int n = snprintf(name, sizeof(name), "resolver_guard_%s_%s", table, operations[operation]);
     int length = snprintf(sql, sizeof(sql),
@@ -98,6 +131,17 @@ static bool resolver_guard(sqlite3 *db, const char *table, int operation, bool i
            sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
 }
 
+static bool resolver_view_definition_current(sqlite3 *db, const char *name) {
+    sqlite3_stmt *statement = NULL;
+    bool ok =
+        sqlite3_prepare_v2(db, "SELECT sql FROM main.sqlite_schema WHERE type='view' AND name=?",
+                           -1, &statement, NULL) == SQLITE_OK &&
+        resolver_bind_text(statement, 1, name) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW &&
+        cbm_store_resolver_view_definition_current((const char *)sqlite3_column_text(statement, 0));
+    return sqlite3_finalize(statement) == SQLITE_OK && ok;
+}
+
 static bool resolver_schema_current(sqlite3 *db, bool install) {
     const resolver_table_t meta = {"store_meta", "k,v"};
     if (!resolver_table_current(db, &meta))
@@ -109,6 +153,10 @@ static bool resolver_schema_current(sqlite3 *db, bool install) {
             if (!resolver_guard(db, resolver_tables[i].name, operation, install))
                 return false;
     }
+    for (size_t i = 0; i < sizeof(resolver_views) / sizeof(resolver_views[0]); i++)
+        if (!resolver_object_current(db, &resolver_views[i], "view") ||
+            !resolver_view_definition_current(db, resolver_views[i].name))
+            return false;
     return true;
 }
 
@@ -193,90 +241,28 @@ int cbm_store_resolver_requires_full(cbm_store_t *store, const char *project, bo
     return step == SQLITE_ROW || step == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
-static bool resolver_bind_row(sqlite3_stmt *stmt, const char *project,
-                              const cbm_resolve_record_t *row, size_t ordinal) {
-    const cbm_resolve_result_t *r = &row->result;
-    return resolver_bind_text(stmt, 1, project) == SQLITE_OK &&
-           sqlite3_bind_int64(stmt, 2, (sqlite3_int64)ordinal) == SQLITE_OK &&
-           resolver_bind_text(stmt, 3, row->file_path) == SQLITE_OK &&
-           resolver_bind_text(stmt, 4, row->scope) == SQLITE_OK &&
-           resolver_bind_text(stmt, 5, row->relation) == SQLITE_OK &&
-           resolver_bind_text(stmt, 6, row->spelling) == SQLITE_OK &&
-           sqlite3_bind_int64(stmt, 7, row->start_byte) == SQLITE_OK &&
-           sqlite3_bind_int64(stmt, 8, row->end_byte) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 9, (int)row->source_origin) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 10, (int)r->binding) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 11, (int)r->domain) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 12, (int)r->analysis) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 13, (int)r->rule) == SQLITE_OK &&
-           sqlite3_bind_int64(stmt, 14, r->facts) == SQLITE_OK &&
-           resolver_bind_text(stmt, 15, r->target) == SQLITE_OK &&
-           sqlite3_bind_int64(stmt, 16, r->candidate_count) == SQLITE_OK &&
-           resolver_bind_text(stmt, 17, r->reason) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 18, row->emitted ? 1 : 0) == SQLITE_OK &&
-           sqlite3_bind_int(stmt, 19, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
-           resolver_bind_text(stmt, 20, row->properties_json ? row->properties_json : "{}") ==
-               SQLITE_OK;
-}
-
 int cbm_store_resolver_replace(cbm_store_t *store, const char *project,
                                const cbm_resolve_record_t *rows, size_t count) {
     return cbm_store_resolver_replace_generation(store, project, rows, count, NULL, 0, NULL, 0);
 }
 
-int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *project,
-                                          const cbm_resolve_record_t *rows, size_t count,
-                                          const cbm_resolve_file_t *files, size_t file_count,
-                                          const cbm_resolve_summary_t *summaries,
-                                          size_t summary_count) {
+static int resolver_write_generation(cbm_store_t *store, const char *project,
+                                     const cbm_resolve_record_t *rows, size_t count,
+                                     const cbm_resolve_file_t *files, size_t file_count,
+                                     const cbm_resolve_summary_t *summaries, size_t summary_count,
+                                     bool commit_batches) {
     if (!store || !project || (!rows && count))
         return CBM_STORE_ERR;
     sqlite3 *db = cbm_store_get_db(store);
     const char *schema =
-        "CREATE TABLE IF NOT EXISTS resolver_occurrences ("
-        "project TEXT NOT NULL, ordinal INTEGER NOT NULL, file_path TEXT NOT NULL,"
-        "scope TEXT NOT NULL, relation TEXT NOT NULL, spelling TEXT NOT NULL,"
-        "start_byte INTEGER NOT NULL, end_byte INTEGER NOT NULL, source_origin INTEGER NOT NULL,"
-        "binding INTEGER NOT NULL, domain INTEGER NOT NULL, analysis INTEGER NOT NULL,"
-        "rule INTEGER NOT NULL, facts INTEGER NOT NULL, target TEXT NOT NULL,"
-        "candidate_count INTEGER NOT NULL, reason TEXT NOT NULL, emitted INTEGER NOT NULL,"
-        "rules_version INTEGER NOT NULL, properties_json TEXT NOT NULL, PRIMARY "
-        "KEY(project,ordinal));"
-        "CREATE INDEX IF NOT EXISTS resolver_occurrences_file "
-        "ON resolver_occurrences(project,file_path);"
         "CREATE TABLE IF NOT EXISTS resolver_generations (project TEXT PRIMARY KEY,"
         "rules_version INTEGER NOT NULL);";
     if (!db || sqlite3_exec(db, "SAVEPOINT resolver_replace", NULL, NULL, NULL) != SQLITE_OK)
         return CBM_STORE_ERR;
-    bool ok = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK;
+    bool ok = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
+              cbm_store_resolver_evidence(db, project, rows, count, files, file_count, summaries,
+                                          summary_count, commit_batches);
     sqlite3_stmt *stmt = NULL;
-    if (ok)
-        ok = sqlite3_prepare_v2(db, "DELETE FROM resolver_occurrences WHERE project=?", -1, &stmt,
-                                NULL) == SQLITE_OK;
-    if (ok)
-        ok = resolver_bind_text(stmt, 1, project) == SQLITE_OK && sqlite3_step(stmt) == SQLITE_DONE;
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-    if (ok)
-        ok = sqlite3_prepare_v2(db,
-                                "INSERT INTO resolver_occurrences VALUES"
-                                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                -1, &stmt, NULL) == SQLITE_OK;
-    for (size_t i = 0; ok && i < count; i++) {
-        /* A claimed emitted row must satisfy the same admission as its edge.
-         * A failed metadata write aborts publication, never fabricates zero. */
-        ok = (!rows[i].emitted || cbm_resolve_record_admit(&rows[i])) &&
-             resolver_bind_row(stmt, project, &rows[i], i) && sqlite3_step(stmt) == SQLITE_DONE;
-        if (ok)
-            cbm_resolve_stats_add(CBM_RESOLVE_STAT_STORED_RECORDS, 1);
-        sqlite3_reset(stmt);
-        sqlite3_clear_bindings(stmt);
-    }
-    sqlite3_finalize(stmt);
-    stmt = NULL;
-    if (ok)
-        ok = cbm_store_resolver_evidence(db, project, rows, count, files, file_count, summaries,
-                                         summary_count);
     if (ok)
         ok = sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO resolver_generations VALUES(?,?)", -1,
                                 &stmt, NULL) == SQLITE_OK;
@@ -297,6 +283,24 @@ int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *projec
     return sqlite3_exec(db, "RELEASE resolver_replace", NULL, NULL, NULL) == SQLITE_OK
                ? CBM_STORE_OK
                : CBM_STORE_ERR;
+}
+
+int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *project,
+                                          const cbm_resolve_record_t *rows, size_t count,
+                                          const cbm_resolve_file_t *files, size_t file_count,
+                                          const cbm_resolve_summary_t *summaries,
+                                          size_t summary_count) {
+    return resolver_write_generation(store, project, rows, count, files, file_count, summaries,
+                                     summary_count, false);
+}
+
+int cbm_store_resolver_publish_generation(cbm_store_t *store, const char *project,
+                                          const cbm_resolve_record_t *rows, size_t count,
+                                          const cbm_resolve_file_t *files, size_t file_count,
+                                          const cbm_resolve_summary_t *summaries,
+                                          size_t summary_count) {
+    return resolver_write_generation(store, project, rows, count, files, file_count, summaries,
+                                     summary_count, true);
 }
 
 static bool resolver_count_outcomes(sqlite3 *db, const char *project,
@@ -334,6 +338,16 @@ static bool resolver_count_outcomes(sqlite3 *db, const char *project,
     return sqlite3_finalize(stmt) == SQLITE_OK && step == SQLITE_DONE;
 }
 
+/* The currency check reads every table, so a refused read also fails it. That is an
+ * unreadable generation, which must not be reported as one that was never written. */
+static bool resolver_read_denied(sqlite3 *db) {
+    sqlite3_stmt *statement = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT project FROM main.resolver_occurrences LIMIT 0", -1,
+                                &statement, NULL);
+    sqlite3_finalize(statement);
+    return rc == SQLITE_AUTH;
+}
+
 int cbm_store_resolver_summary(cbm_store_t *store, const char *project,
                                cbm_resolve_counts_t *counts, bool *present) {
     if (!store || !project || !counts || !present)
@@ -344,7 +358,7 @@ int cbm_store_resolver_summary(cbm_store_t *store, const char *project,
     if (sqlite3_exec(db, "SAVEPOINT resolver_summary", NULL, NULL, NULL) != SQLITE_OK)
         return CBM_STORE_ERR;
     bool current = resolver_current(db, project);
-    bool ok = !current || resolver_count_outcomes(db, project, counts);
+    bool ok = current ? resolver_count_outcomes(db, project, counts) : !resolver_read_denied(db);
     ok = sqlite3_exec(db, "RELEASE resolver_summary", NULL, NULL, NULL) == SQLITE_OK && ok;
     if (!ok) {
         memset(counts, 0, sizeof(*counts));

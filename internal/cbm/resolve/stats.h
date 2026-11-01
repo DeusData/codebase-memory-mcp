@@ -9,13 +9,16 @@
  * declarations actually examined; PROPAGATED_FACTS counts visits to facts
  * consumed by derivation, cloning and persistence (not unique facts);
  * INVALIDATIONS counts binding versions replaced;
- * STORED_RECORDS counts successful resolver metadata row writes. */
+ * STORED_RECORDS counts successful resolver metadata row writes;
+ * SYNTAX_CHILD_STEPS counts the sibling steps taken to enumerate a node's named
+ * children, the cost that was quadratic when each child was fetched by index. */
 typedef enum {
     CBM_RESOLVE_STAT_LOOKUP_PROBES,
     CBM_RESOLVE_STAT_CANDIDATE_VISITS,
     CBM_RESOLVE_STAT_PROPAGATED_FACTS,
     CBM_RESOLVE_STAT_INVALIDATIONS,
     CBM_RESOLVE_STAT_STORED_RECORDS,
+    CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS,
     CBM_RESOLVE_STAT_COUNT
 } cbm_resolve_stat_t;
 

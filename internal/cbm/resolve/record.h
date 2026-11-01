@@ -15,6 +15,10 @@ typedef struct {
     const char *relation;
     const char *spelling;
     const char *properties_json;
+    /* Set instead of properties_json on a stored row that produced no edge; see
+     * cbm_resolve_properties_tail. */
+    const char *properties_tail;
+    int32_t properties_line;
     uint32_t start_byte;
     uint32_t end_byte;
     uint32_t source_origin;
@@ -26,6 +30,10 @@ typedef struct {
      * once by the coordinator before their shared arena is destroyed. */
     bool proof_borrowed;
     bool emitted;
+    /* A sealed row that produced no edge: its occurrence fact is composed from
+     * these columns when stored. No edge will ever read it back, and holding a
+     * node per abstention was the largest part of a large index's peak memory. */
+    bool envelope_pending;
 } cbm_resolve_record_t;
 
 /* Captured extraction summary, independent of derived lookup outcomes. */

@@ -30,6 +30,6 @@ cbm_resolve_stats_snapshot_t cbm_resolve_stats_snapshot(const cbm_resolve_stats_
 
 const char *cbm_resolve_stat_name(cbm_resolve_stat_t event) {
     static const char *const names[] = {"lookup_probes", "candidate_visits", "propagated_facts",
-                                        "invalidations", "stored_records"};
+                                        "invalidations", "stored_records",   "syntax_child_steps"};
     return (unsigned)event < CBM_RESOLVE_STAT_COUNT ? names[event] : "unknown";
 }

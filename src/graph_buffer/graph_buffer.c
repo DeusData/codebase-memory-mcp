@@ -393,6 +393,27 @@ bool cbm_gbuf_capture_imports(cbm_gbuf_t *gb, const cbm_resolve_import_snapshot_
     return !gb->resolution_failed;
 }
 
+bool cbm_gbuf_reserve_resolutions(cbm_gbuf_t *gb, size_t additional) {
+    if (!gb || gb->resolution_failed || additional > SIZE_MAX - gb->resolution_count)
+        return false;
+    size_t needed = gb->resolution_count + additional;
+    if (needed <= gb->resolution_capacity)
+        return true;
+    if (needed > SIZE_MAX / sizeof(*gb->resolutions))
+        return false;
+    cbm_resolve_record_t *rows =
+        cbm_realloc(CBM_MEM_CLASS_GBUF_INDEX, gb->resolutions, needed * sizeof(*rows));
+    if (!rows)
+        return false;
+    gb->resolutions = rows;
+    gb->resolution_capacity = needed;
+    return true;
+}
+
+size_t cbm_gbuf_resolution_count(const cbm_gbuf_t *gb) {
+    return gb ? gb->resolution_count : 0;
+}
+
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record) {
     if (!gb || !record || gb->resolution_failed)
         return false;
@@ -433,11 +454,28 @@ bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *reco
     row.scope = gb_intern(gb, record->scope ? record->scope : "");
     row.relation = gb_intern(gb, record->relation ? record->relation : "");
     row.spelling = gb_intern(gb, record->spelling ? record->spelling : "");
-    row.properties_json = gb_intern(gb, record->properties_json ? record->properties_json : "{}");
+    /* Most occurrences abstain, and their properties are read only to be stored.
+     * Their span and line make each string unique, so it would never be shared;
+     * without them it almost always is. An edge's properties stay whole. */
+    bool properties_ok;
+    if (record->properties_tail) {
+        row.properties_tail = gb_intern(gb, record->properties_tail);
+        properties_ok = row.properties_tail != NULL;
+    } else if (!record->emitted) {
+        char *tail = cbm_resolve_properties_tail(record, &row.properties_line);
+        row.properties_tail = tail ? gb_intern(gb, tail) : NULL;
+        row.properties_json = NULL;
+        properties_ok = row.properties_tail != NULL;
+        cbm_free(CBM_MEM_CLASS_RESOLVE, tail);
+    } else {
+        row.properties_json =
+            gb_intern(gb, record->properties_json ? record->properties_json : "{}");
+        properties_ok = row.properties_json != NULL;
+    }
     row.result.target = gb_intern(gb, record->result.target ? record->result.target : "");
     row.result.reason = gb_intern(gb, record->result.reason ? record->result.reason : "");
     if (!row.file_path || !row.scope || !row.relation || !row.spelling || !row.result.target ||
-        !row.result.reason || !row.properties_json || !row.content_identity ||
+        !row.result.reason || !properties_ok || !row.content_identity ||
         !row.configuration_identity) {
         gb->resolution_failed = true;
         return false;
@@ -497,29 +535,26 @@ bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
      * one constant-size join with its local source binding validation. */
     for (size_t i = 0; ok && i < gb->resolution_count; i++) {
         cbm_resolve_record_t *row = &gb->resolutions[i];
-        if (!row->result.proof)
+        if (!row->result.proof || row->envelope_pending)
             continue;
         /* Replaying the coordinator does not add another envelope or change
          * an already owned, admitted occurrence in this project. */
         if (cbm_resolve_record_admit(row) && row->result.proof->value.source.project &&
             !strcmp(row->result.proof->value.source.project, gb->project))
             continue;
-        const cbm_resolve_proof_t *premises[] = {row->result.proof, row->binding_proof};
-        cbm_resolve_proof_source_t source = {.project = gb->project,
-                                             .file = row->file_path,
-                                             .scope = row->scope,
-                                             .content_identity = row->content_identity,
-                                             .configuration_identity = row->configuration_identity,
-                                             .source_origin = row->source_origin};
-        cbm_resolve_proof_key_t key = {.lookup_domain = row->scope,
-                                       .lookup_key = row->spelling,
-                                       .start_byte = row->start_byte,
-                                       .end_byte = row->end_byte,
-                                       .origin = row->source_origin,
-                                       .binding_identity = row->result.target,
-                                       .detail = row->relation};
-        cbm_resolve_result_t outcome = row->result;
-        outcome.proof = NULL;
+        /* Nothing reads an abstained row's occurrence fact before it is stored, so
+         * the writer composes it there. See cbm_resolve_record_t.envelope_pending. */
+        if (!row->emitted) {
+            row->envelope_pending = true;
+            continue;
+        }
+        const cbm_resolve_proof_t *premises[2];
+        size_t premise_count = 0;
+        cbm_resolve_proof_source_t source;
+        cbm_resolve_proof_key_t key;
+        cbm_resolve_result_t outcome;
+        cbm_resolve_record_envelope(row, gb->project, &source, &key, &outcome, premises,
+                                    &premise_count);
         uint32_t supported = premises[0]->value.outcome.facts;
         if (row->binding_proof)
             supported |= row->binding_proof->value.outcome.facts;
@@ -553,7 +588,7 @@ bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
         }
         row->result.proof =
             cbm_resolve_proof_derive(&gb->proof_pool, CBM_PROOF_OCCURRENCE_BINDING, &source, &key,
-                                     &outcome, premises, row->binding_proof ? 2 : 1, true);
+                                     &outcome, premises, premise_count, true);
         ok = row->result.proof != NULL;
         if (ok && row->emitted && !cbm_resolve_record_admit(row)) {
             row->result.analysis = row->result.proof->value.outcome.analysis;

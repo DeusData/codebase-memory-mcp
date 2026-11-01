@@ -445,8 +445,9 @@ static generation_refresh_result_t generation_refresh_case(const char *invalidat
             sqlite3_exec(db, invalidate, NULL, NULL, NULL) == SQLITE_OK &&
             (!erase_projection ||
              sqlite3_exec(db,
-                          "DELETE FROM resolver_occurrences WHERE project='" RESOLVER_PROJECT
-                          "';DELETE FROM edges WHERE project='" RESOLVER_PROJECT
+                          "DELETE FROM resolver_occurrence_rows WHERE pid=(SELECT pid FROM "
+                          "resolver_projects WHERE project='" RESOLVER_PROJECT
+                          "');DELETE FROM edges WHERE project='" RESOLVER_PROJECT
                           "' AND type IN ('CALLS','USAGE');",
                           NULL, NULL, NULL) == SQLITE_OK);
         if (result.setup_ok) {
@@ -522,7 +523,7 @@ TEST(resolver_integration_missing_generation_rebuilds_unchanged_source) {
 
 TEST(resolver_integration_missing_facts_rebuilds_unchanged_source) {
     generation_refresh_result_t result =
-        generation_refresh_case("DROP TABLE resolver_facts;", false);
+        generation_refresh_case("DROP TABLE resolver_fact_rows;", false);
     ASSERT(result.setup_ok);
     ASSERT_EQ(result.run_rc, 0);
     ASSERT(result.forced_full);
@@ -537,7 +538,9 @@ TEST(resolver_integration_missing_facts_rebuilds_unchanged_source) {
 
 TEST(resolver_integration_missing_evidence_rebuilds_unchanged_source) {
     generation_refresh_result_t result = generation_refresh_case(
-        "DELETE FROM resolver_occurrence_evidence WHERE project='" RESOLVER_PROJECT "';", false);
+        "UPDATE resolver_occurrence_rows SET proof=0,source_binding_proof=0 WHERE pid=(SELECT pid "
+        "FROM resolver_projects WHERE project='" RESOLVER_PROJECT "');",
+        false);
     ASSERT(result.setup_ok);
     ASSERT_EQ(result.run_rc, 0);
     ASSERT(result.forced_full);
@@ -1251,6 +1254,8 @@ static bool non_utf8_generation_intact(const resolver_fixture_t *fixture) {
                                               "WHERE properties IS NOT NULL");
     int occurrence_failures = count_rows_failing_strict_json(
         store, "SELECT properties_json FROM resolver_occurrences");
+    occurrence_failures +=
+        count_rows_failing_strict_json(store, "SELECT payload FROM resolver_facts");
     int genuine = count_edge(store, RESOLVER_PROJECT ".main.caller", RESOLVER_PROJECT ".lib.target",
                              "CALLS");
     cbm_store_close(store);

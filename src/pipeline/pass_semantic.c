@@ -1,3 +1,4 @@
+#include "resolve/stats.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 /*
@@ -123,15 +124,51 @@ static bool semantic_is(TSNode node, const char *kind) {
     return !ts_node_is_null(node) && !strcmp(ts_node_type(node), kind);
 }
 
-static TSNode semantic_child(TSNode node, const char *kind) {
-    if (ts_node_is_null(node))
-        return (TSNode){0};
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
-        if (semantic_is(child, kind))
-            return child;
+/* ts_node_named_child(node, i) walks from the first child on every call, so an
+ * index loop is quadratic in the sibling count; TypeScript's declaration files
+ * held this pass for over 11 minutes on one root. One cursor pass snapshots the
+ * children, and the loops keep their early returns. */
+static bool semantic_named_list(CBMArena *arena, TSNode node, TSNode **out, uint32_t *count) {
+    uint32_t expected = ts_node_is_null(node) ? 0 : ts_node_named_child_count(node);
+    *out = NULL;
+    *count = 0;
+    if (!expected)
+        return true;
+    TSNode *children = cbm_arena_alloc(arena, (size_t)expected * sizeof(*children));
+    if (!children)
+        return false;
+    uint32_t found = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && found < expected)
+                children[found++] = child;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
-    return (TSNode){0};
+    ts_tree_cursor_delete(&cursor);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, found);
+    *out = children;
+    *count = found;
+    return found == expected;
+}
+
+static TSNode semantic_child(TSNode node, const char *kind) {
+    TSNode found = {0};
+    if (ts_node_is_null(node))
+        return found;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && semantic_is(child, kind)) {
+                found = child;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
 }
 
 static bool semantic_ecma(CBMLanguage language) {
@@ -254,8 +291,9 @@ static bool semantic_class_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline
                                  const CBMFileResult *result, const char *source, int length,
                                  TSNode root, const cbm_resolve_binding_index_t *index,
                                  CBMArena *temporary) {
-    uint32_t children = ts_node_named_child_count(root);
-    if (children > INT32_MAX)
+    TSNode *roots;
+    uint32_t children;
+    if (!semantic_named_list(temporary, root, &roots, &children) || children > INT32_MAX)
         return false;
     CBMLSPDef *facts = cbm_arena_calloc(temporary, (size_t)children * sizeof(*facts));
     semantic_class_t **classes = cbm_arena_calloc(temporary, (size_t)children * sizeof(*classes));
@@ -263,7 +301,7 @@ static bool semantic_class_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline
         return false;
     int count = 0;
     for (uint32_t i = 0; i < children; i++) {
-        TSNode node = ts_node_named_child(root, i);
+        TSNode node = roots[i];
         if (semantic_ecma(info->language) && semantic_is(node, "export_statement"))
             node = ts_node_child_by_field_name(node, "declaration", 11);
         bool class_node =
@@ -378,8 +416,9 @@ static bool semantic_php_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_c
                                semantic_source_t *file, const cbm_file_info_t *info,
                                const CBMFileResult *result, const char *source, int length,
                                TSNode root, CBMArena *temporary) {
-    uint32_t children = ts_node_named_child_count(root);
-    if (children > INT32_MAX)
+    TSNode *roots;
+    uint32_t children;
+    if (!semantic_named_list(temporary, root, &roots, &children) || children > INT32_MAX)
         return false;
     CBMLSPDef *facts = cbm_arena_calloc(temporary, (size_t)children * sizeof(*facts));
     semantic_class_t **classes = cbm_arena_calloc(temporary, (size_t)children * sizeof(*classes));
@@ -392,7 +431,7 @@ static bool semantic_php_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_c
     file->php_inert = true;
     int count = 0, includes = 0;
     for (uint32_t i = 0; i < children; i++) {
-        TSNode node = ts_node_named_child(root, i);
+        TSNode node = roots[i];
         if (semantic_is(node, "php_tag") || semantic_is(node, "comment"))
             continue;
         if (semantic_is(node, "expression_statement")) {
@@ -440,8 +479,12 @@ static bool semantic_php_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_c
                 entry->php_standalone = false;
         }
         TSNode body = ts_node_child_by_field_name(node, "body", 4);
-        for (uint32_t j = 0; !ts_node_is_null(body) && j < ts_node_named_child_count(body); j++) {
-            TSNode member = ts_node_named_child(body, j);
+        TSNode *members;
+        uint32_t member_count;
+        if (!semantic_named_list(temporary, body, &members, &member_count))
+            return false;
+        for (uint32_t j = 0; j < member_count; j++) {
+            TSNode member = members[j];
             if (semantic_is(member, "comment"))
                 continue;
             if (!semantic_is(member, "method_declaration") ||
@@ -530,6 +573,7 @@ typedef struct {
     CBMLSPDef *facts;
     semantic_class_t **entries;
     int count, capacity;
+    CBMArena *temporary;
 } semantic_types_t;
 
 static bool semantic_typed_language(CBMLanguage language) {
@@ -573,15 +617,21 @@ done:
 static bool semantic_named_children(TSNode node, const char *const *allowed) {
     if (ts_node_is_null(node))
         return false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
-        bool found = semantic_comment(child);
-        for (int j = 0; !found && allowed[j]; j++)
-            found = semantic_is(child, allowed[j]);
-        if (!found)
-            return false;
+    bool all = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child))
+                continue;
+            bool found = semantic_comment(child);
+            for (int j = 0; !found && allowed[j]; j++)
+                found = semantic_is(child, allowed[j]);
+            all = found;
+        } while (all && ts_tree_cursor_goto_next_sibling(&cursor));
     }
-    return true;
+    ts_tree_cursor_delete(&cursor);
+    return all;
 }
 
 static const char *semantic_typed_base(CBMArena *arena, TSNode node, const char *source,
@@ -674,8 +724,12 @@ static bool semantic_cs_types(semantic_types_t *types, TSNode root, const char *
         types->file->typed_complete = false;
         return true;
     }
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        TSNode node = ts_node_named_child(root, i);
+    TSNode *roots;
+    uint32_t roots_count;
+    if (!semantic_named_list(types->temporary, root, &roots, &roots_count))
+        return false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
         if (semantic_comment(node))
             continue;
         if (semantic_is(node, "namespace_declaration") ||
@@ -750,8 +804,12 @@ static bool semantic_cpp_types(semantic_types_t *types, TSNode root) {
     if (!semantic_typed_imports(types))
         return false;
     int includes = 0;
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        TSNode node = ts_node_named_child(root, i);
+    TSNode *roots;
+    uint32_t roots_count;
+    if (!semantic_named_list(types->temporary, root, &roots, &roots_count))
+        return false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
         if (!semantic_is(node, "preproc_include"))
             continue;
         TSNode path = ts_node_child_by_field_name(node, "path", 4);
@@ -774,8 +832,8 @@ static bool semantic_cpp_types(semantic_types_t *types, TSNode root) {
     }
     if (includes != types->result->imports.count)
         types->file->typed_complete = false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        TSNode node = ts_node_named_child(root, i);
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
         if (semantic_comment(node) || semantic_is(node, "preproc_include"))
             continue;
         static const char *const header[] = {"type_identifier", "base_class_clause",
@@ -829,8 +887,12 @@ static bool semantic_rust_impl(semantic_types_t *types, TSNode node) {
 static bool semantic_rust_types(semantic_types_t *types, TSNode root) {
     if (!semantic_typed_imports(types))
         return false;
-    for (uint32_t i = 0; i < ts_node_named_child_count(root); i++) {
-        TSNode node = ts_node_named_child(root, i);
+    TSNode *roots;
+    uint32_t roots_count;
+    if (!semantic_named_list(types->temporary, root, &roots, &roots_count))
+        return false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
         if (semantic_comment(node) || semantic_is(node, "function_item") ||
             semantic_is(node, "use_declaration"))
             continue;
@@ -876,7 +938,8 @@ static bool semantic_typed_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline
                               .info = info,
                               .result = result,
                               .source = source,
-                              .capacity = result->defs.count};
+                              .capacity = result->defs.count,
+                              .temporary = temporary};
     types.facts = cbm_arena_calloc(temporary, (size_t)types.capacity * sizeof(*types.facts));
     types.entries = cbm_arena_calloc(temporary, (size_t)types.capacity * sizeof(*types.entries));
     if (types.capacity && (!types.facts || !types.entries))

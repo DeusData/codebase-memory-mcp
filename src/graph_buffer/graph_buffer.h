@@ -26,6 +26,11 @@ typedef struct cbm_store cbm_store_t;
 /* Resolution diagnostics are separate from endpoint-deduplicated graph edges.
  * Each worker records into its own buffer; merge copies and interns strings. */
 bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record);
+/* Make room for rows about to be merged, at their exact number. A doubling array
+ * ends up to twice its contents and briefly holds both generations while the
+ * largest allocation of the resolve phase is copied. */
+bool cbm_gbuf_reserve_resolutions(cbm_gbuf_t *gb, size_t additional);
+size_t cbm_gbuf_resolution_count(const cbm_gbuf_t *gb);
 const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count);
 bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
 /* Analysis/publication failure prevents sealing this generation. */

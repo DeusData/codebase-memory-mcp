@@ -470,7 +470,9 @@ int cbm_mem_class_report_json(char *out, size_t size) {
 
 void cbm_mem_class_log(const char *tag) {
     cbm_mem_class_flush_thread();
-    char report[CBM_SZ_1K];
+    /* Every class active needs about 2 KB, and a report that does not fit logs
+     * nothing: the table vanished from each phase after the third of a large index. */
+    char report[CBM_SZ_4K];
     if (cbm_mem_class_report_json(report, sizeof(report)) <= 0) {
         return;
     }
