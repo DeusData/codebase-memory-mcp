@@ -571,6 +571,7 @@ typedef struct {
     oo_walk_t *w;
     j_text_t text;
     int depth;
+    bool static_method;
 } jw_t;
 
 static oo_value_t jw_expr(jw_t *j, TSNode node);
@@ -789,8 +790,9 @@ static oo_value_t jw_bare_call(jw_t *j, TSNode site, const char *name, int argc,
         }
         if (!r->value.type)
             continue;
+        /* JLS 15.12.3: a static method reaches no instance member by simple name. */
         if (oo_has_method_named(w, &r->value, name))
-            return jw_select_emit(j, site, &r->value, name, argc, args, false,
+            return jw_select_emit(j, site, &r->value, name, argc, args, j->static_method,
                                   "java-enclosing-class-member");
         /* An unknown supertype could declare the name, hiding every outer class. */
         if (!oo_hierarchy_complete(w->ix, r->value.type))
@@ -1323,7 +1325,7 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
         break;
     case 't':
         if (!strcmp(kind, "this"))
-            return jw_this_value(w);
+            return j->static_method ? oo_value_unknown() : jw_this_value(w);
         if (!strcmp(kind, "ternary_expression")) {
             (void)jw_expr(j, j_field(node, "condition"));
             TSNode first_node = j_field(node, "consequence");
@@ -1500,6 +1502,10 @@ static oo_value_t jw_expr(jw_t *j, TSNode node) {
 static void jw_method(jw_t *j, TSNode node) {
     oo_walk_t *w = j->w;
     oo_scope_t saved = w->scope;
+    bool saved_static = j->static_method;
+    TSNode modifiers = j_child(node, "modifiers");
+    const char *modifier_text = ts_node_is_null(modifiers) ? NULL : j_text(&j->text, modifiers);
+    j->static_method = modifier_text && strstr(modifier_text, "static") != NULL;
     w->scope.tparams =
         j_tparams(&j->text, j_field(node, "type_parameters"), &w->scope.tparam_count);
     oo_frame_t frame;
@@ -1515,6 +1521,7 @@ static void jw_method(jw_t *j, TSNode node) {
     (void)jw_expr(j, j_field(node, "body"));
     oo_frame_pop(w);
     w->scope = saved;
+    j->static_method = saved_static;
 }
 
 static void jw_field_declaration(jw_t *j, TSNode node) {
@@ -1528,6 +1535,9 @@ static void jw_field_declaration(jw_t *j, TSNode node) {
 }
 
 static void jw_class_body(jw_t *j, TSNode body, const oo_type_t *type) {
+    /* A class body inside a static method has instances of its own. */
+    bool saved_static = j->static_method;
+    j->static_method = false;
     uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
     for (uint32_t i = 0; i < count; i++) {
         TSNode member = ts_node_named_child(body, i);
@@ -1553,6 +1563,7 @@ static void jw_class_body(jw_t *j, TSNode body, const oo_type_t *type) {
             jw_type_decl(j, member, type);
         }
     }
+    j->static_method = saved_static;
 }
 
 static void jw_type_decl(jw_t *j, TSNode node, const oo_type_t *owner) {

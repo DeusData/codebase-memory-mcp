@@ -800,7 +800,8 @@ bool oo_closed_member(const oo_walk_t *w, const char *name) {
                     const char *spelled = super->ref ? super->ref->name : NULL;
                     const char *dot = spelled ? strrchr(spelled, '.') : NULL;
                     const char *leaf = dot ? dot + 1 : spelled;
-                    for (size_t t = 0; leaf && t < sizeof(OO_CLOSED_SUPERS) / sizeof(OO_CLOSED_SUPERS[0]); t++)
+                    for (size_t t = 0;
+                         leaf && t < sizeof(OO_CLOSED_SUPERS) / sizeof(OO_CLOSED_SUPERS[0]); t++)
                         if (!strcmp(OO_CLOSED_SUPERS[t].type, leaf) &&
                             oo_word_in(OO_CLOSED_SUPERS[t].members, name))
                             return true;
@@ -1098,15 +1099,22 @@ static bool oo_overrides(const oo_callable_t *earlier, const oo_callable_t *late
     return true;
 }
 
-typedef enum { OO_SCALAR_NONE, OO_SCALAR_INTEGER, OO_SCALAR_REAL, OO_SCALAR_BOOL, OO_SCALAR_CHAR, OO_SCALAR_STRING } oo_scalar_t;
+typedef enum {
+    OO_SCALAR_NONE,
+    OO_SCALAR_INTEGER,
+    OO_SCALAR_REAL,
+    OO_SCALAR_BOOL,
+    OO_SCALAR_CHAR,
+    OO_SCALAR_STRING
+} oo_scalar_t;
 
 static oo_scalar_t oo_scalar_of(const char *leaf) {
     static const char *const integers[] = {
-        "int",    "long",   "short",   "byte",   "sbyte",  "uint",   "ulong",  "ushort", "nint",
-        "nuint",  "Int",    "Long",    "Short",  "Byte",   "UInt",   "ULong",  "UShort", "UByte",
-        "Integer", "Int16", "Int32",   "Int64",  "UInt16", "UInt32", "UInt64", "SByte",  NULL};
-    static const char *const reals[] = {"float", "double", "decimal", "Float",
-                                        "Double", "Decimal", "Single", NULL};
+        "int",     "long",  "short", "byte",  "sbyte",  "uint",   "ulong",  "ushort", "nint",
+        "nuint",   "Int",   "Long",  "Short", "Byte",   "UInt",   "ULong",  "UShort", "UByte",
+        "Integer", "Int16", "Int32", "Int64", "UInt16", "UInt32", "UInt64", "SByte",  NULL};
+    static const char *const reals[] = {"float",  "double",  "decimal", "Float",
+                                        "Double", "Decimal", "Single",  NULL};
     static const char *const bools[] = {"boolean", "bool", "Boolean", NULL};
     static const char *const chars[] = {"char", "Char", "Character", NULL};
     static const char *const strings[] = {"String", "string", NULL};
@@ -1140,9 +1148,8 @@ static bool oo_scalar_mismatch(CBMLanguage language, const char *parameter,
         if (language == CBM_LANG_KOTLIN && to == OO_SCALAR_INTEGER && !value->small_literal &&
             strcmp(parameter_leaf, argument_leaf))
             return true;
-        static const char *const narrow[] = {"int",   "short", "byte",  "Int",     "Short",
-                                             "Byte",  "sbyte", "Int32", "Integer", "Int16",
-                                             "SByte", NULL};
+        static const char *const narrow[] = {"int",   "short", "byte",    "Int",   "Short", "Byte",
+                                             "sbyte", "Int32", "Integer", "Int16", "SByte", NULL};
         static const char *const wide[] = {"long", "Long", "Int64", NULL};
         return to == OO_SCALAR_INTEGER && oo_name_in(argument_leaf, wide) &&
                oo_name_in(parameter_leaf, narrow);
@@ -1204,10 +1211,17 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
              * or String literal is certainly not that class. */
             if (oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE)
                 return true;
-        } else if (parameter.external && argument->external && !parameter.dims && !argument->dims) {
-            if (oo_scalar_mismatch(callable->file ? callable->file->language : CBM_LANG_JAVA,
-                                   parameter.external, argument))
+        } else if (parameter.external && argument->external) {
+            if (parameter.dims != argument->dims) {
+                /* An array is not its element, and an element is not an array. */
+                if (oo_scalar_of(oo_leaf(parameter.external)) != OO_SCALAR_NONE &&
+                    oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE)
+                    return true;
+            } else if (!parameter.dims &&
+                       oo_scalar_mismatch(callable->file ? callable->file->language : CBM_LANG_JAVA,
+                                          parameter.external, argument)) {
                 return true;
+            }
         } else if (parameter.external && argument->type && oo_builtin_name(parameter.external)) {
             return true;
         }

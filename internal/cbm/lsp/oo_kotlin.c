@@ -2768,9 +2768,9 @@ static oo_value_t kw_literal(kw_t *k, TSNode node, const char *kind) {
         !strcmp(kind, "bin_literal")) {
         /* A decimal literal past Int's range has type Long (Kotlin spec 2.3.1). */
         const char *digits = kt_compact(&k->text, node);
-        bool beyond = digits && !strcmp(kind, "integer_literal") &&
-                      (strlen(digits) > 10 ||
-                       (strlen(digits) == 10 && strcmp(digits, "2147483647") > 0));
+        bool beyond =
+            digits && !strcmp(kind, "integer_literal") &&
+            (strlen(digits) > 10 || (strlen(digits) == 10 && strcmp(digits, "2147483647") > 0));
         oo_value_t value = oo_value_external(beyond ? "Long" : "Int");
         value.small_literal = !beyond;
         return value;
