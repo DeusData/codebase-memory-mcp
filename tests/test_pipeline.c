@@ -4570,6 +4570,12 @@ static int k8s_inc_index(const char *repo, const char *db) {
     }
     (void)cbm_pipeline_set_project_name(p, "k8sinc");
     cbm_pipeline_set_persistence(p, false);
+    /* A compose project's .env feeds its compose file: index secret files so the
+     * interpolation tests see it (they are skipped by default). */
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.index_secret_files = true;
+    cbm_pipeline_set_resource_policy(p, &policy);
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
     return rc;

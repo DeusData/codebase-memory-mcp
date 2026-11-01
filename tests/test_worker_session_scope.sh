@@ -75,7 +75,7 @@ run_worker() {
 # without one is refused ("missing or incomplete trusted worker policy").
 # This script plays the supervisor, so it sends what the supervisor sends --
 # both limits off, the default.
-policy='"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off"}'
+policy='"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off","index_secret_files":"false"}'
 
 response="${tmpdir}/scoped.response"
 if ! run_worker "{\"repo_path\":\"${repo}\",\"mode\":\"fast\",${policy}}" "${response}" \
