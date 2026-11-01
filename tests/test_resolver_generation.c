@@ -9,6 +9,7 @@
 #include <sqlite3.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char generation_source[] = "class Widget:\n"
                                         "    def run(self): pass\n"
@@ -1143,6 +1144,54 @@ TEST(resolver_generation_long_write_reports_progress) {
     PASS();
 }
 
+/* A private stage must not hold every row twice while publishing: on the largest
+ * repositories that second copy decides whether the disk suffices. The seam commits
+ * often enough to show it on a small write, and the receipt still comes last. */
+TEST(resolver_generation_publish_keeps_the_wal_small) {
+    enum { ROWS = 6000 };
+    cbm_resolve_record_t *rows = calloc(ROWS, sizeof(*rows));
+    ASSERT_NOT_NULL(rows);
+    char (*names)[32] = malloc((size_t)ROWS * sizeof(*names));
+    ASSERT_NOT_NULL(names);
+    for (int i = 0; i < ROWS; i++) {
+        snprintf(names[i], sizeof(names[i]), "distinct_name_%d", i);
+        rows[i].file_path = "src/module.c";
+        rows[i].scope = "project.src.module.owner";
+        rows[i].relation = "USAGE";
+        rows[i].spelling = names[i];
+        rows[i].start_byte = (uint32_t)i;
+        rows[i].end_byte = (uint32_t)i + 1;
+    }
+    char dir[] = "/tmp/cbm_generation_wal_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    char db_path[256], wal_path[256];
+    snprintf(db_path, sizeof(db_path), "%s/stage.db", dir);
+    snprintf(wal_path, sizeof(wal_path), "%s/stage.db-wal", dir);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    /* One page per commit batch is far below the row count's worth of pages. */
+    ASSERT_EQ(sqlite3_exec(cbm_store_get_db(store), "PRAGMA wal_autocheckpoint=8", NULL, NULL, NULL),
+              SQLITE_OK);
+    cbm_store_resolver_test_set_progress_rows(256);
+    int rc = cbm_store_resolver_publish_generation(store, "proj", rows, ROWS, NULL, 0, NULL, 0);
+    cbm_store_resolver_test_set_progress_rows(0);
+    bool present = false;
+    int current = cbm_store_resolver_current(store, "proj", &present);
+    struct stat wal, db;
+    int wal_stat = stat(wal_path, &wal), db_stat = stat(db_path, &db);
+    cbm_store_close(store);
+    free(names);
+    free(rows);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(current, CBM_STORE_OK);
+    ASSERT_TRUE(present);
+    ASSERT_EQ(wal_stat, 0);
+    ASSERT_EQ(db_stat, 0);
+    ASSERT_GT(db.st_size, 0);
+    ASSERT_LT(wal.st_size, db.st_size);
+    PASS();
+}
+
 TEST(resolver_generation_empty_project_has_complete_metadata) {
     cbm_store_t *store = cbm_store_open_memory();
     ASSERT_NOT_NULL(store);
@@ -1204,6 +1253,7 @@ SUITE(resolver_generation) {
     RUN_TEST(resolver_generation_views_read_back_every_stored_value);
     RUN_TEST(resolver_generation_storage_does_not_repeat_strings);
     RUN_TEST(resolver_generation_long_write_reports_progress);
+    RUN_TEST(resolver_generation_publish_keeps_the_wal_small);
     RUN_TEST(resolver_generation_persists_independent_facts_and_all_join_supports);
     RUN_TEST(resolver_generation_ids_ignore_occurrence_insertion_order);
     RUN_TEST(resolver_generation_source_mismatch_rolls_back_every_metadata_table);

@@ -196,6 +196,7 @@ typedef struct {
     type_digest_t *types;
     size_t type_count, type_capacity;
     uint64_t rows;
+    bool commit_batches;
     const cbm_resolve_file_t *const *files;
     size_t file_count;
     struct fact_text fact_text;
@@ -215,20 +216,24 @@ void cbm_store_resolver_test_set_progress_rows(uint64_t rows) {
 #else
 enum { progress_rows = PROGRESS_ROWS };
 #endif
-static void note_rows(evidence_write_t *w, const char *stage) {
+/* Every statement has been reset when this runs, so the commit can proceed. */
+static bool note_rows(evidence_write_t *w, const char *stage) {
     if (++w->rows % progress_rows)
-        return;
+        return true;
     char rows[32];
     (void)snprintf(rows, sizeof(rows), "%llu", (unsigned long long)w->rows);
     cbm_log_info("resolver.evidence.progress", "stage", stage, "rows", rows);
+    return !w->commit_batches ||
+           sqlite3_exec(w->db, "RELEASE resolver_replace;SAVEPOINT resolver_replace", NULL, NULL,
+                        NULL) == SQLITE_OK;
 }
 static bool finish_row(evidence_write_t *w, sqlite3_stmt *s, bool ok, const char *stage) {
     ok = ok && sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_reset(s);
     if (ok) {
         cbm_resolve_stats_add(CBM_RESOLVE_STAT_STORED_RECORDS, 1);
-        note_rows(w, stage);
+        ok = note_rows(w, stage);
     }
-    sqlite3_reset(s);
     return ok;
 }
 
@@ -1051,7 +1056,8 @@ static bool prepare_writer(evidence_write_t *w) {
 }
 bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_resolve_record_t *rows,
                                  size_t count, const cbm_resolve_file_t *files, size_t file_count,
-                                 const cbm_resolve_summary_t *summaries, size_t summary_count) {
+                                 const cbm_resolve_summary_t *summaries, size_t summary_count,
+                                 bool commit_batches) {
     if (!db || !project || (!rows && count) || (!files && file_count) ||
         (!summaries && summary_count) || count > (SIZE_MAX - summary_count) / 2 ||
         file_count > SIZE_MAX / sizeof(void *) || summary_count > SIZE_MAX / sizeof(void *))
@@ -1097,6 +1103,7 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     w->files = ordered_files;
     w->file_count = file_count;
     w->cache = cache;
+    w->commit_batches = commit_batches;
     cbm_arena_init(&w->owned);
     w->row_facts = count ? cbm_calloc(CBM_MEM_CLASS_STORE, count * sizeof(*w->row_facts)) : NULL;
     ok = ok && (!count || w->row_facts);

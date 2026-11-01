@@ -234,11 +234,11 @@ int cbm_store_resolver_replace(cbm_store_t *store, const char *project,
     return cbm_store_resolver_replace_generation(store, project, rows, count, NULL, 0, NULL, 0);
 }
 
-int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *project,
-                                          const cbm_resolve_record_t *rows, size_t count,
-                                          const cbm_resolve_file_t *files, size_t file_count,
-                                          const cbm_resolve_summary_t *summaries,
-                                          size_t summary_count) {
+static int resolver_write_generation(cbm_store_t *store, const char *project,
+                                     const cbm_resolve_record_t *rows, size_t count,
+                                     const cbm_resolve_file_t *files, size_t file_count,
+                                     const cbm_resolve_summary_t *summaries, size_t summary_count,
+                                     bool commit_batches) {
     if (!store || !project || (!rows && count))
         return CBM_STORE_ERR;
     sqlite3 *db = cbm_store_get_db(store);
@@ -249,7 +249,7 @@ int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *projec
         return CBM_STORE_ERR;
     bool ok = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
               cbm_store_resolver_evidence(db, project, rows, count, files, file_count, summaries,
-                                          summary_count);
+                                          summary_count, commit_batches);
     sqlite3_stmt *stmt = NULL;
     if (ok)
         ok = sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO resolver_generations VALUES(?,?)", -1,
@@ -271,6 +271,24 @@ int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *projec
     return sqlite3_exec(db, "RELEASE resolver_replace", NULL, NULL, NULL) == SQLITE_OK
                ? CBM_STORE_OK
                : CBM_STORE_ERR;
+}
+
+int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *project,
+                                          const cbm_resolve_record_t *rows, size_t count,
+                                          const cbm_resolve_file_t *files, size_t file_count,
+                                          const cbm_resolve_summary_t *summaries,
+                                          size_t summary_count) {
+    return resolver_write_generation(store, project, rows, count, files, file_count, summaries,
+                                     summary_count, false);
+}
+
+int cbm_store_resolver_publish_generation(cbm_store_t *store, const char *project,
+                                          const cbm_resolve_record_t *rows, size_t count,
+                                          const cbm_resolve_file_t *files, size_t file_count,
+                                          const cbm_resolve_summary_t *summaries,
+                                          size_t summary_count) {
+    return resolver_write_generation(store, project, rows, count, files, file_count, summaries,
+                                     summary_count, true);
 }
 
 static bool resolver_count_outcomes(sqlite3 *db, const char *project,
