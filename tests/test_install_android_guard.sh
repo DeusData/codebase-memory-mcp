@@ -7,6 +7,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/bin" "$WORK/home"
 cat >"$WORK/bin/uname" <<'EOF'
+#!/usr/bin/env bash
 case "$1" in
   -s) printf '%s\n' Linux ;;
   -m) printf '%s\n' aarch64 ;;
@@ -15,6 +16,7 @@ case "$1" in
 esac
 EOF
 cat >"$WORK/bin/curl" <<'EOF'
+#!/usr/bin/env bash
 printf 'curl must not run for Android/Termux\n' >&2
 exit 99
 EOF

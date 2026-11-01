@@ -278,6 +278,9 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
 
+echo "=== Step 0x2: installer Android/Termux guard contract (#1202) ==="
+bash "$ROOT/tests/test_install_android_guard.sh"
+
 # Step 0y: the Windows leg must not decide its verdict from an exit status that
 # the ssh/msys2_shell chain can mangle — a channel that turns 0 into 1 can turn
 # 1 into 0, and that direction reports a RED Windows leg as green. Runs
