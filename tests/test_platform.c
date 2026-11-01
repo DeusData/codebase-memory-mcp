@@ -16,6 +16,9 @@
 #include <unistd.h>
 #ifndef _WIN32
 #include <sys/stat.h> /* chmod for the symlink-policy mode legs */
+#include <errno.h>
+#include <sys/resource.h> /* getpriority for the worker-priority leg */
+#include <sys/wait.h>
 #endif
 
 #ifdef __linux__
@@ -1442,6 +1445,49 @@ TEST(regex_estimate_counts_brackets_and_escapes_literally) {
     PASS();
 }
 
+/* An index worker lowers its own priority (#2834). A non-root process cannot
+ * raise it back, so the helper runs in a forked child that reports its nice. */
+TEST(platform_lower_cpu_priority_nices_the_process) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX nice contract");
+#else
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    pid_t child = fork();
+    if (child == 0) {
+        (void)close(fds[0]);
+        /* report: lowered ok, nice after; then, from a nicer start, ok, target, nice after */
+        int report[5] = {cbm_lower_cpu_priority() ? 1 : 0, 0, 0, 0, 0};
+        errno = 0;
+        report[1] = getpriority(PRIO_PROCESS, 0);
+        if (errno != 0) {
+            report[0] = 0;
+        }
+        /* Never-raise leg: start nicer than the helper's level; it must leave it. */
+        report[3] = report[1] >= 15 ? 19 : 15;
+        if (setpriority(PRIO_PROCESS, 0, report[3]) == 0) {
+            report[2] = cbm_lower_cpu_priority() ? 1 : 0;
+            errno = 0;
+            report[4] = getpriority(PRIO_PROCESS, 0);
+        }
+        _exit(write(fds[1], report, sizeof(report)) == (ssize_t)sizeof(report) ? 0 : 1);
+    }
+    ASSERT_TRUE(child > 0);
+    (void)close(fds[1]);
+    int report[5] = {0, 0, 0, 0, 0};
+    ssize_t got = read(fds[0], report, sizeof(report));
+    (void)close(fds[0]);
+    int status = 0;
+    (void)waitpid(child, &status, 0);
+    ASSERT_EQ(got, (ssize_t)sizeof(report));
+    ASSERT_EQ(report[0], 1);
+    ASSERT_TRUE(report[1] >= CBM_LOW_CPU_PRIORITY_NICE);
+    ASSERT_EQ(report[2], 1);
+    ASSERT_EQ(report[4], report[3]);
+    PASS();
+#endif
+}
+
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
@@ -1477,6 +1523,7 @@ SUITE(platform) {
     RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
     RUN_TEST(platform_env_dup_honours_the_settings_resolver);
     RUN_TEST(platform_system_info);
+    RUN_TEST(platform_lower_cpu_priority_nices_the_process);
     RUN_TEST(regex_compile_refuses_oversized_expansion);
     RUN_TEST(regex_compile_accepts_expansion_under_budget);
     RUN_TEST(regex_compile_refuses_overlong_pattern);

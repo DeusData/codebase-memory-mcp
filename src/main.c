@@ -902,6 +902,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
          * own here, and only here (cbm_sqlite_dedicated_heap). */
         cbm_sqlite_dedicated_heap(true);
         cbm_memev_process_role("worker");
+        /* A full index saturates every core; run it below normal priority so
+         * interactive CLI/MCP queries are not starved. Before any indexing
+         * thread exists, so they all inherit it. Failure is harmless. */
+        if (!cbm_lower_cpu_priority()) {
+            cbm_log_info("index.worker.priority", "lowered", "false");
+        }
     }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
