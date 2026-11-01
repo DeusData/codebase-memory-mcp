@@ -9,6 +9,14 @@ LANG="${2:?}"
 REPO="${3:?}"
 RESULTS_DIR="${4:?}"
 
+OUT="$RESULTS_DIR/$LANG"
+mkdir -p "$OUT"
+# A handoff names this run's index or none: the evaluation loop reuses the
+# results directory, and a stale one would point the graph session at a root
+# step 8 has already removed. It goes before any setup step that can fail, so
+# a run that never reaches the index cannot leave an earlier one behind.
+rm -f -- "$OUT/runtime-root.txt"
+
 # The index must run against a daemon rendezvous and cache this run owns: only
 # CBM_RUNTIME_DIR moves the rendezvous, and without a private cache the
 # benchmark repository was indexed into the operator's live store (#1696).
@@ -58,13 +66,6 @@ REPO_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$REPO"
 # platform CPython supports here, so the three readings below are comparable
 # even though each comes from its own process.
 bench_now_ms() { python3 -c "import time; print(time.monotonic_ns() // 1000000)"; }
-
-OUT="$RESULTS_DIR/$LANG"
-mkdir -p "$OUT"
-# A handoff names this run's index or none: the evaluation loop reuses the
-# results directory, and a stale one would point the graph session at a root
-# step 8 has already removed.
-rm -f -- "$OUT/runtime-root.txt"
 
 echo "INDEX: $LANG ($REPO)"
 
