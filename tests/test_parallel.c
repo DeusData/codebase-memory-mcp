@@ -4261,13 +4261,15 @@ TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest) {
     const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
     const bool manifest_strategy =
         correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
-    if (!correct || unlisted || !manifest_strategy) {
+    if (!correct || unlisted || manifest_strategy) {
         printf("  issue56 manifest diagnostic: correct=%d unlisted=%d strategy=%d\n", correct_found,
                unlisted, manifest_strategy);
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_FALSE(correct_found);
+    /* The manifest names the dependency, so the call has a proved target. It is not a
+     * hybrid LSP row: the shared resolver admitted it. */
+    ASSERT_TRUE(correct_found);
     ASSERT_FALSE(unlisted);
     ASSERT_FALSE(manifest_strategy);
     PASS();
@@ -4283,13 +4285,14 @@ TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution) {
     const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
     const bool manifest_strategy =
         correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
-    if (!correct || wrong_local || !manifest_strategy) {
+    if (!correct || wrong_local || manifest_strategy) {
         printf("  issue56 local-shadow diagnostic: correct=%d wrong_local=%d strategy=%d\n",
                correct_found, wrong_local, manifest_strategy);
     }
     cbm_gbuf_free(gbuf);
 
-    ASSERT_FALSE(correct_found);
+    /* crate_a::helper() names the crate; the local helper of the same name is a decoy. */
+    ASSERT_TRUE(correct_found);
     ASSERT_FALSE(wrong_local);
     ASSERT_FALSE(manifest_strategy);
     PASS();
