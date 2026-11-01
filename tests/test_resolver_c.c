@@ -2428,10 +2428,14 @@ TEST(resolver_c_large_file_keeps_its_last_call) {
     size_t size = strlen(head) + (size_t)CALLS * strlen(line) + strlen(tail) + 1;
     char *text = malloc(size);
     ASSERT(text != NULL);
-    char *at = text + sprintf(text, "%s", head);
-    for (int i = 0; i < CALLS; i++)
-        at += sprintf(at, "%s", line);
-    sprintf(at, "%s", tail);
+    size_t used = 0;
+    memcpy(text, head, strlen(head));
+    used += strlen(head);
+    for (int i = 0; i < CALLS; i++) {
+        memcpy(text + used, line, strlen(line));
+        used += strlen(line);
+    }
+    memcpy(text + used, tail, strlen(tail) + 1);
     const RQ_Source sources[] = {{.path = "big.c", .text = text}};
     const RQ_Expected expected[] = {
         {.case_id = "last-call-of-a-large-file",
@@ -2633,7 +2637,92 @@ TEST(resolver_c_bare_macro_arguments_prove_nothing) {
     PASS();
 }
 
+/* Two forms from LLVM's APFloat and attribute parsers. `typedef detail::IEEEFloat IEEEFloat;`
+ * inside another class must not compete with the class of that name outside it, and a derived
+ * class reaches its base's protected members but not its private ones. */
+#define C_TU_ACCESS_HEADER                                                                      \
+    "#ifndef ACCESS_H\n"                                                                        \
+    "#define ACCESS_H\n"                                                                        \
+    "namespace llvm {\n"                                                                        \
+    "namespace detail {\n"                                                                      \
+    "class Inner {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  int outer();\n"                                                                          \
+    "private:\n"                                                                                \
+    "  int inner() const { return 1; }\n"                                                       \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "class Wrapper {\n"                                                                         \
+    "  typedef detail::Inner Inner;\n"                                                          \
+    "};\n"                                                                                      \
+    "class Parser {\n"                                                                          \
+    "protected:\n"                                                                              \
+    "  int parse() { return 1; }\n"                                                             \
+    "private:\n"                                                                                \
+    "  int secret() { return 2; }\n"                                                            \
+    "};\n"                                                                                      \
+    "class ArmParser : public Parser {\n"                                                       \
+    "public:\n"                                                                                 \
+    "  int run() { return parse(); }\n"                                                         \
+    "  int peek() { return secret(); }\n"                                                       \
+    "};\n"                                                                                      \
+    "int outside(ArmParser P);\n"                                                               \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_ACCESS_IMPL                                                                        \
+    "#include \"access.h\"\n"                                                                   \
+    "namespace llvm {\n"                                                                        \
+    "namespace detail {\n"                                                                      \
+    "int Inner::outer() { return inner(); }\n"                                                  \
+    "}\n"                                                                                       \
+    "int outside(ArmParser P) { return P.parse(); }\n"                                          \
+    "}\n"
+static const RQ_Source C_TU_ACCESS[] = {{.path = "access.h", .text = C_TU_ACCESS_HEADER},
+                                        {.path = "access.cpp", .text = C_TU_ACCESS_IMPL}};
+
+TEST(resolver_cpp_nested_aliases_and_protected_members) {
+    const RQ_Expected expected[] = {
+        {.case_id = "alias-inside-another-class-does-not-compete",
+         .site = {.file = "access.cpp", .caller = "access.Inner.outer", .needle = "inner()"},
+         .relation = "CALLS",
+         .target = {.file = "access.h",
+                    .suffix = "access.llvm.detail.Inner.inner",
+                    .label = "Method",
+                    .declaration_line = 9,
+                    .declaration_text = "  int inner() const { return 1; }"}},
+        {.case_id = "protected-member-from-a-derived-class",
+         .site = {.file = "access.h", .caller = "access.llvm.ArmParser.run", .needle = "parse()"},
+         .relation = "CALLS",
+         .target = {.file = "access.h",
+                    .suffix = "access.llvm.Parser.parse",
+                    .label = "Method",
+                    .declaration_line = 18,
+                    .declaration_text = "  int parse() { return 1; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "private-member-of-a-base",
+         .site = {.file = "access.h", .caller = "access.llvm.ArmParser.peek", .needle = "secret()"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "protected-member-from-outside",
+         .site = {.file = "access.cpp", .caller = "llvm.outside", .needle = "P.parse()"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-access",
+                             .sources = C_TU_ACCESS,
+                             .source_count = sizeof(C_TU_ACCESS) / sizeof(C_TU_ACCESS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_cpp_nested_aliases_and_protected_members);
     RUN_TEST(resolver_c_bare_macro_arguments_prove_nothing);
     RUN_TEST(resolver_cpp_known_gaps_stay_honest);
     RUN_TEST(resolver_c_large_file_keeps_its_last_call);
