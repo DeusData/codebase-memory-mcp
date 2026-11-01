@@ -33,7 +33,8 @@ typedef struct ocaml_open {
 
 typedef struct {
     cbm_source_walk_t *walk;
-    bool reference; /* the name being read is a value, not an application */
+    bool reference;     /* the name being read is a value, not an application */
+    uint32_t site_line; /* the occurrence being decided */
     const char *unit;
     ocaml_name_t *locals;
     ocaml_open_t *opens;
@@ -170,6 +171,17 @@ static const char *ocaml_module_unit(ocaml_ctx_t *ctx, const char *owner, const 
     const char *scope = owner;
     while (scope) {
         const cbm_source_decl_t *alias = cbm_source_lookup(ctx->walk, scope, key);
+        /* A module binding is sequential and not recursive: it is in scope only after
+         * its definition ends, so the same name inside its body or before it is another
+         * module. A structure's own key is a prefix of everything inside it. */
+        if (alias && alias->type && !alias->next) {
+            size_t length = strlen(alias->type);
+            bool inside = !(alias->flags & CBM_SOURCE_DECL_F_VALUE) &&
+                          !strncmp(ctx->unit, alias->type, length) &&
+                          (ctx->unit[length] == '\0' || ctx->unit[length] == '#');
+            if (inside || alias->line > ctx->site_line)
+                alias = NULL;
+        }
         if (alias) {
             if (alias->next || !alias->type)
                 return NULL;
@@ -209,6 +221,7 @@ static void ocaml_emit(ocaml_ctx_t *ctx, TSNode site, const char *target, cbm_re
 }
 
 static void ocaml_visit_application(ocaml_ctx_t *ctx, TSNode site, TSNode function, uint32_t at) {
+    ctx->site_line = ts_node_start_point(site).row + 1;
     if (!cbm_source_is(function, "value_path")) {
         ocaml_emit(ctx, site, NULL, CBM_RESOLVE_RULE_NONE, NULL, "ocaml_computed_function");
         return;

@@ -1385,7 +1385,10 @@ static const char ML_MAIN[] = "module L = Lib\n"
                               "let no_outside () = Printf.printf \"x\"\n"
                               "open Other\n"
                               "let calls_open () = opened 6\n"
-                              "let no_replaced () = local 7\n";
+                              "let no_replaced () = local 7\n"
+                              "module Lib = struct\n"
+                              "  let exported = Lib.exported\n"
+                              "end\n";
 
 #define ML_FILE "src/main.ml"
 #define ML_CALL(id, method, text, tfile, tsuffix, tline, tdecl)                                \
@@ -1407,6 +1410,9 @@ TEST(resolver_source_ocaml_sequential_scope_and_modules) {
                 "let exported x = x"),
         ML_CALL("open-of-a-known-unit", "calls_open", "opened 6", "src/other.ml", "other.opened", 1,
                 "let opened x = x"),
+        SL_USE_AT("module-is-not-in-scope-in-its-own-body", ML_FILE, "main.exported",
+                  "Lib.exported", 1, "src/lib.ml", "lib.exported", "Function", 1,
+                  "let exported x = x"),
         SL_USE_AT("function-read-as-a-value", ML_FILE, "main.uses_value", "local", 3, ML_FILE,
                   "main.local", "Function", 2, "let local x = x"),
     };
