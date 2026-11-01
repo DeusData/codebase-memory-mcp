@@ -231,7 +231,8 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
         out->limitation = "Lexical scope, declared static types and Go's selector rule for "
                           "embedding. Exported names behind an embedded type outside the project, "
-                          "results of function-typed values and competing targets abstain.";
+                          "a map's key type, a type parameter's constraint methods and competing "
+                          "targets abstain.";
         break;
     case CBM_LANG_C:
     case CBM_LANG_CPP:
