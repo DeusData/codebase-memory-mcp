@@ -1432,6 +1432,31 @@ TEST(client_adapter_opencode_v2_compaction_note_goes_into_the_compaction_message
     PASS();
 }
 
+/* #2204: Tool.Result allows `content: []`. appendResult adds a text part to a
+ * parts array only when the array already holds a part; an empty array falls
+ * through to the string `output` (or the unchanged result), so the note never
+ * becomes the whole content of a tool result. */
+TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    const char *parts =
+        strstr(js, "if (Array.isArray(result.content) && result.content.length > 0) {");
+    const char *add_part = strstr(js, "content.push({ type: 'text', text: extra });");
+    const char *output_fallback = strstr(js, "if (typeof result.output === 'string') {");
+    ASSERT_NOT_NULL(parts);
+    ASSERT_NOT_NULL(add_part);
+    ASSERT_NOT_NULL(output_fallback);
+    /* The only part-adding push sits inside the non-empty branch; the string
+     * output fallback, where `content: []` lands, comes after it. */
+    ASSERT_TRUE(parts < add_part);
+    ASSERT_TRUE(add_part < output_fallback);
+    ASSERT_NULL(strstr(add_part + 1, "content.push("));
+    /* No unguarded array branch is left. */
+    ASSERT_NULL(strstr(js, "if (Array.isArray(result.content)) {"));
+    free(js);
+    PASS();
+}
+
 /* augment() is awaited inline inside 'tool.execute.after', so a hook-augment
  * that never exits would stall every grep/glob/read completion in the host
  * session until the agent is restarted. The generated plugin must bound the
@@ -1505,6 +1530,7 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
     RUN_TEST(client_adapter_opencode_v2_compaction_note_goes_into_the_compaction_messages);
+    RUN_TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content);
     RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

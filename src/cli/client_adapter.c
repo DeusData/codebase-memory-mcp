@@ -491,14 +491,18 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
      * string/parts surface the model reads, output is the tool's schema-typed
      * value). Append to content first, then a string output; if neither text
      * surface exists, leave the result untouched so the tool's own output is
-     * never hidden. The caller assigns the returned result onto event.result. */
+     * never hidden. A parts array gets a new text part only when it already
+     * holds a part: `content: []` is a valid result, and a part added there
+     * would be the note alone, so an empty array falls through to the string
+     * output (or the unchanged result). The caller assigns the returned result
+     * onto event.result. */
     sb_append(&sb,
               "function appendResult(result, extra) {\n"
               "  if (!result || typeof result !== 'object') return result;\n"
               "  if (typeof result.content === 'string') {\n"
               "    return { ...result, content: result.content + '\\n' + extra };\n"
               "  }\n"
-              "  if (Array.isArray(result.content)) {\n"
+              "  if (Array.isArray(result.content) && result.content.length > 0) {\n"
               "    const content = result.content.slice();\n"
               "    for (let i = content.length - 1; i >= 0; i--) {\n"
               "      if (content[i] && content[i].type === 'text') {\n"
