@@ -61,7 +61,7 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_ERLANG, EDGE(IMPORTS) | EDGE(CALLS),
      "-import and -behaviour of the module whose file bears its name, and -include next to the "
      "source; a name borne by two files, -include_lib and macro paths abstain."},
-    {CBM_LANG_ZIG, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_ZIG, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "@import of a literal .zig path relative to the importing file; names mapped by the build "
      "abstain."},
     {CBM_LANG_PERL, EDGE(IMPORTS) | EDGE(CALLS),
