@@ -19,8 +19,9 @@ typedef struct {
     const char *imports;
 } edge_row_t;
 static const edge_row_t edge_rows[] = {
-    {CBM_LANG_GO, SOURCE_EDGES,
-     "Exact project package paths with configured roots; unresolved external packages abstain."},
+    {CBM_LANG_GO, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
+     "Exact project package paths from the source's module, its go.mod replace directives and "
+     "the enclosing go.work; every other package abstains."},
     {CBM_LANG_C, C_EDGES,
      "Literal include paths and configured search roots only; unproved preprocessing abstains."},
     {CBM_LANG_CPP, C_EDGES,
@@ -172,8 +173,8 @@ static void edge_capabilities(cbm_resolve_capabilities_t *out) {
             "nested builds and transformed manifests abstain.";
     if (out->language == CBM_LANG_GO)
         out->edges[CBM_RESOLVE_EDGE_WRITES].limitation =
-            "No admitted Go field/write bridge; assignment extraction remains a resolver quality "
-            "gap.";
+            "Package variables and fields selected through a declared static type. Writes through "
+            "an unknown operand and keys of a literal whose element type is elided abstain.";
 }
 
 bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *out) {
@@ -228,8 +229,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = "Exact declarations and typed receivers; unknown owners, effects and "
-                          "competing targets abstain.";
+        out->limitation = "Lexical scope, declared static types and Go's selector rule for "
+                          "embedding. Exported names behind an embedded type outside the project, "
+                          "results of function-typed values and competing targets abstain.";
         break;
     case CBM_LANG_C:
     case CBM_LANG_CPP:

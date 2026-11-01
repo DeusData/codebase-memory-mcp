@@ -21,7 +21,7 @@ typedef struct {
     size_t remaining;
     size_t reverse_head;
     const char *selector, *prefix, *suffix;
-    bool selected, select_type;
+    bool selected, select_type, element;
     CBMTypeKind wrapper;
     uint32_t version;
 } solver_node_t;
@@ -271,6 +271,15 @@ bool cbm_resolve_solver_type(cbm_resolve_solver_t *solver, const char *key, cons
     return solver->failure != CBM_SOLVER_FAILED;
 }
 
+bool cbm_resolve_solver_element(cbm_resolve_solver_t *solver, const char *key,
+                                const char *dependency, const char *prefix,
+                                const cbm_resolve_proof_t *audit) {
+    bool ok = cbm_resolve_solver_select_type(solver, key, dependency, prefix, "", audit);
+    if (ok && solver->failure == CBM_SOLVER_PENDING)
+        solver->nodes[solver->count - 1]->element = true;
+    return ok;
+}
+
 static int compare_nodes(const void *left, const void *right) {
     return strcmp((*(solver_node_t *const *)left)->result.key,
                   (*(solver_node_t *const *)right)->result.key);
@@ -364,14 +373,15 @@ static cbm_resolve_result_t outcome(const cbm_resolve_solver_result_t *result) {
     return value;
 }
 
+/* Declarations of one name under one target are one graph identity, whichever a build keeps,
+ * so they agree on what they select. Their results and fields are separate facts, and join
+ * only if those agree in turn. */
 static bool same_value(cbm_resolve_solver_value_t left, cbm_resolve_solver_value_t right) {
     return left.target && right.target && !strcmp(left.target, right.target) &&
            left.kind == right.kind && left.module == right.module &&
            left.fact_kind == right.fact_kind &&
            !strcmp(left.type_identity ? left.type_identity : "",
-                   right.type_identity ? right.type_identity : "") &&
-           !strcmp(left.declaration_identity ? left.declaration_identity : "",
-                   right.declaration_identity ? right.declaration_identity : "");
+                   right.type_identity ? right.type_identity : "");
 }
 
 static const cbm_resolve_proof_t *missing_proof(cbm_resolve_solver_t *solver,
@@ -438,7 +448,23 @@ static bool settle(cbm_resolve_solver_t *solver, solver_node_t *node, bool cycle
             result->status = CBM_SOLVER_AMBIGUOUS;
         }
     }
-    if (node->operation == SOLVER_TYPE && result->status == CBM_SOLVER_KNOWN && have_value) {
+    if (node->operation == SOLVER_TYPE && node->element && have_value &&
+        result->status == CBM_SOLVER_KNOWN) {
+        const CBMType *type = result->value.type;
+        const CBMType *inner = !type                            ? NULL
+                               : type->kind == CBM_TYPE_SLICE   ? type->data.slice.elem
+                               : type->kind == CBM_TYPE_POINTER ? type->data.pointer.elem
+                                                                : NULL;
+        const char *identity =
+            inner ? cbm_resolve_solver_type_identity(solver->arena, inner) : NULL;
+        if (identity) {
+            result->value.type = inner;
+            result->value.type_identity = identity;
+            result->value.fact_kind = CBM_SOLVER_FACT_TYPE;
+        } else {
+            result->status = CBM_SOLVER_UNSUPPORTED;
+        }
+    } else if (node->operation == SOLVER_TYPE && result->status == CBM_SOLVER_KNOWN && have_value) {
         const CBMType *type = result->value.type;
         if (!type || (node->wrapper != CBM_TYPE_NAMED && node->wrapper != CBM_TYPE_POINTER &&
                       node->wrapper != CBM_TYPE_SLICE)) {
@@ -561,7 +587,11 @@ bool cbm_resolve_solver_solve(cbm_resolve_solver_t *solver) {
             const char *identity = selector ? (node->select_type ? selector->value.type_identity
                                                                  : selector->value.target)
                                             : NULL;
-            if (selector && selector->status == CBM_SOLVER_KNOWN && identity && *identity) {
+            /* A wrapper's element is its own structure: there is nothing to look up. */
+            if (node->element && selector && selector->status == CBM_SOLVER_KNOWN &&
+                selector->value.type && selector->value.type->kind != CBM_TYPE_NAMED)
+                node->operation = SOLVER_TYPE;
+            else if (selector && selector->status == CBM_SOLVER_KNOWN && identity && *identity) {
                 const char *selected = cbm_arena_sprintf(solver->arena, "%s%s%s", node->prefix,
                                                          identity, node->suffix);
                 const char **keys = cbm_arena_alloc(solver->arena, 2 * sizeof(*keys));

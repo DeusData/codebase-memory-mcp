@@ -4483,9 +4483,10 @@ static cbm_resolve_record_t import_record(const CBMFileResult *result, const cha
 }
 
 /* Module discovery is inventory, not dependency authority. This bounded Go
- * rule proves only an import within the source's nearest module, with no
- * nested go.mod boundary at the destination. Workspace/replacement mappings
- * remain unknown until their source directives have an exact model. */
+ * rule proves an import within the source's nearest module, or one that module's
+ * own go.mod `replace` (or the enclosing go.work `use`) maps to a local directory,
+ * with no nested go.mod boundary at the destination. A required module with no such
+ * directive comes from the module cache even if a same-named directory exists here. */
 static bool go_module_declaration(char *source, char *module, size_t capacity) {
     if (strstr(source, "/*"))
         return false; /* Block-comment stripping is outside this finite reader. */
@@ -4557,29 +4558,196 @@ static bool go_module_owner(const cbm_pipeline_ctx_t *ctx, const char *path, boo
             owner[0] = '\0';
     }
 }
+/* The next significant token of one directive line, or NULL at its end or a comment. */
+static const char *go_directive_token(const char *cursor, char *token, size_t capacity) {
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r')
+        cursor++;
+    if (!*cursor || !strncmp(cursor, "//", 2))
+        return NULL;
+    size_t size = 0;
+    while (cursor[size] && !isspace((unsigned char)cursor[size]))
+        size++;
+    if (!size || size >= capacity || memchr(cursor, '"', size) || memchr(cursor, '`', size))
+        return NULL;
+    memcpy(token, cursor, size);
+    token[size] = '\0';
+    return cursor + size;
+}
+
+/* `old [version] => ./local` naming a directory. A module-cache target keeps a version and
+ * no leading dot, so it never matches; an absolute path lies outside the repository. */
+static bool go_replace_line(const char *line, const char *import, char *best, size_t *best_size,
+                            char *directory, size_t capacity) {
+    char old[PKGMAP_PATH_BUF], token[PKGMAP_PATH_BUF];
+    const char *cursor = go_directive_token(line, old, sizeof(old));
+    if (!cursor)
+        return false;
+    cursor = go_directive_token(cursor, token, sizeof(token));
+    if (cursor && strcmp(token, "=>"))
+        cursor = go_directive_token(cursor, token, sizeof(token));
+    if (!cursor || strcmp(token, "=>"))
+        return false;
+    cursor = go_directive_token(cursor, token, sizeof(token));
+    if (!cursor || (strncmp(token, "./", 2) && strncmp(token, "../", 3) && strcmp(token, ".")))
+        return false;
+    size_t size = strlen(old);
+    if (strncmp(import, old, size) || (import[size] && import[size] != '/') || size <= *best_size ||
+        strlen(token) >= capacity)
+        return false;
+    *best_size = size;
+    snprintf(best, PKGMAP_PATH_BUF, "%s", old);
+    snprintf(directory, capacity, "%s", token);
+    return true;
+}
+
+/* The module path and local directory of the longest replace matching this import. */
+static bool go_module_replacement(const cbm_pipeline_ctx_t *ctx, const char *owner,
+                                  const char *import, char *old, char *directory, size_t capacity) {
+    char relative[PKGMAP_PATH_BUF], absolute[PKGMAP_PATH_BUF];
+    if (!cbm_repo_rel_join(owner, "go.mod", relative, sizeof(relative)) ||
+        !import_absolute_path(ctx->repo_path, relative, absolute, sizeof(absolute)))
+        return false;
+    int length = 0;
+    char *source = pkgmap_read_file(absolute, &length);
+    if (!source || memchr(source, '\0', (size_t)length) || strstr(source, "/*")) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+        return false;
+    }
+    bool found = false, block = false;
+    size_t best = 0;
+    for (char *line = source; line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        while (*line == ' ' || *line == '\t' || *line == '\r')
+            line++;
+        if (block) {
+            if (*line == ')')
+                block = false;
+            else
+                found |= go_replace_line(line, import, old, &best, directory, capacity);
+        } else if (!strncmp(line, "replace", 7) && isspace((unsigned char)line[7])) {
+            const char *body = line + 7;
+            while (isspace((unsigned char)*body))
+                body++;
+            if (*body == '(')
+                block = true;
+            else
+                found |= go_replace_line(body, import, old, &best, directory, capacity);
+        }
+        line = next;
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+    return found;
+}
+
+/* The directory holding the nearest go.work above the source module. */
+static bool go_workspace_lists(const cbm_pipeline_ctx_t *ctx, const char *source_owner,
+                               const char *target_owner) {
+    char owner[PKGMAP_PATH_BUF];
+    if (snprintf(owner, sizeof(owner), "%s", source_owner) >= (int)sizeof(owner))
+        return false;
+    for (;;) {
+        char relative[PKGMAP_PATH_BUF], absolute[PKGMAP_PATH_BUF];
+        if (!cbm_repo_rel_join(owner, "go.work", relative, sizeof(relative)) ||
+            !import_absolute_path(ctx->repo_path, relative, absolute, sizeof(absolute)))
+            return false;
+        struct stat info;
+        if (stat(absolute, &info) == 0) {
+            if (!S_ISREG(info.st_mode))
+                return false;
+            break;
+        }
+        if ((errno != ENOENT && errno != ENOTDIR) || !*owner)
+            return false;
+        char *slash = strrchr(owner, '/');
+        if (slash)
+            *slash = '\0';
+        else
+            owner[0] = '\0';
+    }
+    char relative[PKGMAP_PATH_BUF], absolute[PKGMAP_PATH_BUF];
+    if (!cbm_repo_rel_join(owner, "go.work", relative, sizeof(relative)) ||
+        !import_absolute_path(ctx->repo_path, relative, absolute, sizeof(absolute)))
+        return false;
+    int length = 0;
+    char *source = pkgmap_read_file(absolute, &length);
+    if (!source || memchr(source, '\0', (size_t)length) || strstr(source, "/*")) {
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+        return false;
+    }
+    bool has_source = false, has_target = false, block = false;
+    for (char *line = source; line;) {
+        char *next = strchr(line, '\n');
+        if (next)
+            *next++ = '\0';
+        while (*line == ' ' || *line == '\t' || *line == '\r')
+            line++;
+        const char *entry = NULL;
+        if (block) {
+            if (*line == ')')
+                block = false;
+            else
+                entry = line;
+        } else if (!strncmp(line, "use", 3) && isspace((unsigned char)line[3])) {
+            const char *body = line + 3;
+            while (isspace((unsigned char)*body))
+                body++;
+            if (*body == '(')
+                block = true;
+            else
+                entry = body;
+        }
+        char token[PKGMAP_PATH_BUF], used[PKGMAP_PATH_BUF];
+        if (entry && go_directive_token(entry, token, sizeof(token)) &&
+            cbm_repo_rel_join(owner, token, used, sizeof(used))) {
+            has_source |= !strcmp(used, source_owner);
+            has_target |= !strcmp(used, target_owner);
+        }
+        line = next;
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+    return has_source && has_target;
+}
+
+static bool go_import_inside_module(const char *import, const char *module, const char *owner,
+                                    const char *target_path) {
+    char expected[PKGMAP_PATH_BUF];
+    size_t size = strlen(module);
+    if (strncmp(import, module, size) || (import[size] && import[size] != '/'))
+        return false;
+    const char *suffix = import + size;
+    if (*suffix)
+        suffix++;
+    return cbm_repo_rel_join(owner, suffix, expected, sizeof(expected)) &&
+           !strcmp(expected, target_path);
+}
+
 bool cbm_pipeline_go_import_owned(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const CBMImport *import, const cbm_gbuf_node_t *target) {
     if (!ctx || !source_rel || !import || !import->module_path || !target || !target->file_path ||
         !target->label || strcmp(target->label, "Folder"))
         return false;
     char source_owner[PKGMAP_PATH_BUF], source_module[PKGMAP_PATH_BUF],
-        target_owner[PKGMAP_PATH_BUF], target_module[PKGMAP_PATH_BUF], expected[PKGMAP_PATH_BUF];
+        target_owner[PKGMAP_PATH_BUF], target_module[PKGMAP_PATH_BUF];
     if (!go_module_owner(ctx, source_rel, false, source_owner, source_module,
                          sizeof(source_owner)) ||
         !go_module_owner(ctx, target->file_path, true, target_owner, target_module,
-                         sizeof(target_owner)) ||
-        strcmp(source_owner, target_owner) || strcmp(source_module, target_module))
+                         sizeof(target_owner)))
         return false;
-    size_t size = strlen(source_module);
-    if (strncmp(import->module_path, source_module, size) ||
-        (import->module_path[size] && import->module_path[size] != '/'))
+    if (!go_import_inside_module(import->module_path, target_module, target_owner,
+                                 target->file_path))
         return false;
-    const char *suffix = import->module_path + size;
-    if (*suffix)
-        suffix++;
-    if (!cbm_repo_rel_join(source_owner, suffix, expected, sizeof(expected)))
-        return false;
-    return !strcmp(expected, target->file_path);
+    if (!strcmp(source_owner, target_owner))
+        return !strcmp(source_module, target_module);
+    /* The source module's own directive decides first: `go` resolves that way when the
+     * module is built on its own, and a replacement names exactly one directory. */
+    char old[PKGMAP_PATH_BUF], directory[PKGMAP_PATH_BUF], mapped[PKGMAP_PATH_BUF];
+    if (go_module_replacement(ctx, source_owner, import->module_path, old, directory,
+                              sizeof(directory)))
+        return cbm_repo_rel_join(source_owner, directory, mapped, sizeof(mapped)) &&
+               !strcmp(mapped, target_owner) && !strcmp(old, target_module);
+    return go_workspace_lists(ctx, source_owner, target_owner);
 }
 
 /* Coordinator normalization before shared semantic resolution. The ordinary
