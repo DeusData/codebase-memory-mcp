@@ -82,10 +82,21 @@ static inline void *intptr_to_ptr(intptr_t v) {
 static atomic_int g_pipeline_busy = 0;
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static atomic_int g_last_worker_count = 0;
+
+void cbm_pipeline_worker_count_test_reset(void) {
+    atomic_store(&g_last_worker_count, 0);
+}
+
+int cbm_pipeline_worker_count_test_last(void) {
+    return atomic_load(&g_last_worker_count);
+}
+#endif
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static atomic_bool g_persist_test_fail_after_stage_dump = false;
 static atomic_bool g_persist_test_cancel_after_predump = false;
 static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
-static atomic_bool g_persist_test_fail_adr_capture = false;
 static cbm_pipeline_test_hook_fn g_persist_test_before_final_manifest = NULL;
 static void *g_persist_test_before_final_manifest_userdata = NULL;
 static cbm_pipeline_test_hook_fn g_persist_test_after_stage_created = NULL;
@@ -101,10 +112,6 @@ void cbm_pipeline_incremental_test_cancel_after_predump_once(void) {
 
 void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void) {
     atomic_store(&g_persist_test_cancel_after_destination_prepare, true);
-}
-
-void cbm_pipeline_incremental_test_fail_adr_capture_once(void) {
-    atomic_store(&g_persist_test_fail_adr_capture, true);
 }
 
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
@@ -162,7 +169,6 @@ void cbm_pipeline_persist_test_reset_faults(void) {
     atomic_store(&g_persist_test_fail_after_stage_dump, false);
     atomic_store(&g_persist_test_cancel_after_predump, false);
     atomic_store(&g_persist_test_cancel_after_destination_prepare, false);
-    atomic_store(&g_persist_test_fail_adr_capture, false);
     g_persist_test_before_final_manifest = NULL;
     g_persist_test_before_final_manifest_userdata = NULL;
     g_persist_test_after_stage_created = NULL;
@@ -210,6 +216,7 @@ struct cbm_pipeline {
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
+    bool background; /* reserve CPU headroom when no user is waiting */
 
     /* Snapshot of the artifact export failure of THIS run (set only by
      * export_after_publish failure, zeroed at run start, cleared on success).
@@ -276,10 +283,6 @@ struct cbm_pipeline {
     bool backup_succeeded;
     bool live_noop;
     const char *live_db_path; /* borrowed from cbm_pipeline_run */
-
-    /* ADR (project_summaries) captured before a full-reindex DB delete, so it
-     * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
-    char *saved_adr;
 
     /* Per-file LSP surfaces serialized at the collect_all_defs seam (the only
      * moment the result cache is alive), persisted by dump_and_persist_hashes
@@ -965,6 +968,12 @@ const char *cbm_pipeline_export_error(const cbm_pipeline_t *p) {
     return p ? p->export_error : "";
 }
 
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background) {
+    if (p) {
+        p->background = background;
+    }
+}
+
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name || !name[0]) {
         return false;
@@ -1472,9 +1481,6 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
-    free(p->saved_adr); /* freed here too: error paths can exit before the
-                         * restore in dump_and_persist_hashes runs. Issue #516. */
-    p->saved_adr = NULL;
     cbm_store_free_lsp_surfaces(p->surface_rows, p->surface_row_count);
     p->surface_rows = NULL;
     p->surface_row_count = 0;
@@ -1829,17 +1835,42 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     }
 }
 
+/* Two workers is the smallest width that takes the parallel route. */
+enum { PL_PARALLEL_MIN_WORKERS = 2 };
+
+/* Background refreshes leave CPU headroom, but never drop below two workers
+ * while the foreground width is two or more. WHY: one worker sends the indexer
+ * down the sequential route, which still builds a different graph than the
+ * parallel route (fewer Route and HANDLES edges, churned CALLS). Until the two
+ * routes agree, an automatic refresh must not change the graph only because
+ * the host has two or fewer performance cores. */
+int cbm_pipeline_background_worker_width(int foreground, int headroom) {
+    if (foreground >= PL_PARALLEL_MIN_WORKERS && headroom < PL_PARALLEL_MIN_WORKERS) {
+        return PL_PARALLEL_MIN_WORKERS;
+    }
+    return headroom;
+}
+
 /* Effective worker count. The crash supervisor re-runs its worker single-
  * threaded (CBM_INDEX_SINGLE_THREAD=1) so a per-file marker can pin the EXACT
  * crasher; a parallel re-run would race the marker. Honour that override
  * everywhere the worker count drives the parallel/sequential decision, so the
  * whole extraction phase collapses to the deterministic sequential path. */
-static int effective_worker_count(bool initial) {
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p) {
     const char *st = getenv("CBM_INDEX_SINGLE_THREAD");
+    int workers;
     if (st && st[0] == '1') {
-        return 1;
+        workers = 1;
+    } else if (p && p->background) {
+        workers = cbm_pipeline_background_worker_width(cbm_default_worker_count(true),
+                                                       cbm_default_worker_count(false));
+    } else {
+        workers = cbm_default_worker_count(true);
     }
-    return cbm_default_worker_count(initial);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    atomic_store(&g_last_worker_count, workers);
+#endif
+    return workers;
 }
 
 /* Resolve the DB path for this pipeline. Caller must free(). */
@@ -3139,38 +3170,39 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
-static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    if (atomic_exchange(&g_persist_test_fail_adr_capture, false)) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+static size_t stage_root_length(const char *path);
+
+/* Move a legacy ADR row (pre-sidecar, still in the graph DB's project_summaries)
+ * into the "<db>.adr.db" sidecar BEFORE a reindex unlinks the old generation —
+ * otherwise the row is lost on an upgrade whose first action is a full/format
+ * reindex. Read-only on the graph DB (migration writes only the sidecar, on its
+ * own connection). One-time via the sidecar's marker; a no-op when there is no
+ * legacy row. Returns true on success (safe to delete), false to preserve. */
+static bool adr_migrate_before_delete(const char *db_path) {
+    /* `db_path` in routing is a staging copy; the live generation (and the
+     * sidecar the reader looks for) is keyed to the FINAL path — the staging
+     * suffix stripped. Migrate against that, so the ADR lands in
+     * "<final>.adr.db", not a discarded stage's sidecar. */
+    size_t root_len = stage_root_length(db_path);
+    char final_path[4096];
+    if (root_len >= sizeof(final_path)) {
+        return false;
     }
-#endif
-    cbm_store_t *adr_store = cbm_store_open_path_query(db_path);
-    if (!adr_store) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    memcpy(final_path, db_path, root_len);
+    final_path[root_len] = '\0';
+    /* The live final DB must exist to carry a legacy ADR forward; if it does
+     * not (a first index), there is nothing to migrate — succeed. But
+     * cbm_store_open_path_query returns NULL on an open *failure* too, not only
+     * a missing file, so only proceed when the file genuinely does not exist;
+     * a real open failure must preserve-and-abort rather than publish over a
+     * legacy ADR it never moved. */
+    cbm_store_t *mig = cbm_store_open_path_query(final_path);
+    if (!mig) {
+        return !cbm_file_exists(final_path);
     }
-    cbm_adr_t existing = {0};
-    int adr_rc = cbm_store_adr_get(adr_store, p->project_name, &existing);
-    if (adr_rc == CBM_STORE_NOT_FOUND) {
-        cbm_store_close(adr_store);
-        free(p->saved_adr);
-        p->saved_adr = NULL;
-        return 0;
-    }
-    if (adr_rc != CBM_STORE_OK || !existing.content) {
-        cbm_store_adr_free(&existing);
-        cbm_store_close(adr_store);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-    char *saved = strdup(existing.content);
-    cbm_store_adr_free(&existing);
-    cbm_store_close(adr_store);
-    if (!saved) {
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
-    }
-    free(p->saved_adr);
-    p->saved_adr = saved;
-    return 0;
+    int rc = cbm_store_adr_migrate_once(mig);
+    cbm_store_close(mig);
+    return rc == CBM_STORE_OK;
 }
 
 static int remove_stage_files(const char *stage_path);
@@ -3276,11 +3308,19 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_log_info("pipeline.route", "path", "format_change_reindex", "stored_format",
                      itoa_buf(fmt));
         p->format_migration = true;
-        int adr_rc = capture_existing_adr(p, db_path);
+        /* Carry a legacy ADR into the sidecar before deleting the old graph DB;
+         * preserve and abort if that fails, so the decision record is never lost
+         * to a rebuild. The sidecar itself is untouched by cbm_remove_db_sidecars
+         * (it strips only -wal/-shm/-journal). */
+        if (!adr_migrate_before_delete(db_path)) {
+            cbm_log_warn("pipeline.route", "reason", "adr_migrate_failed");
+            free(db_path);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
         (void)cbm_unlink(db_path);
         (void)cbm_remove_db_sidecars(db_path);
         free(db_path);
-        return adr_rc != 0 ? adr_rc : CBM_PIPELINE_FORCE_FULL_REINDEX;
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
     }
 
     cbm_log_info("pipeline.route", "path", "incremental_manifest");
@@ -3293,9 +3333,13 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
      * no-op and successful-incremental routes -- the pipeline reports success
      * while every later reader finds no store. */
     if (rc == CBM_PIPELINE_FORCE_FULL_REINDEX) {
-        int adr_rc = capture_existing_adr(p, db_path);
-        if (adr_rc != 0) {
-            rc = adr_rc;
+        /* Carry a legacy ADR into the sidecar before deleting the old graph DB;
+         * preserve and abort if that fails. The sidecar survives the delete
+         * (cbm_remove_db_sidecars strips only -wal/-shm/-journal). */
+        if (!adr_migrate_before_delete(db_path)) {
+            cbm_log_warn("pipeline.route", "reason", "adr_migrate_failed");
+            free(db_path);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
         (void)cbm_unlink(db_path);
         (void)cbm_remove_db_sidecars(db_path);
@@ -3817,10 +3861,8 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
              cbm_store_upsert_lsp_surface_batch(store, generation->surface_rows,
                                                 generation->surface_row_count) == CBM_STORE_OK;
     }
-    if (ok && generation->adr_content) {
-        ok = cbm_store_adr_store(store, generation->project, generation->adr_content) ==
-             CBM_STORE_OK;
-    }
+    /* ADRs are NOT written here: they live in the "<db>.adr.db" sidecar, which
+     * this rebuild never touches, so there is nothing to re-apply. */
     /* Doc -> code candidates belong to the generation too: replaced inside
      * the staging store (the table is created here), so a reader never sees
      * candidates of another graph. */
@@ -4108,7 +4150,6 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         .cancelled = p->cancelled,
         .manifest = manifest,
         .manifest_count = manifest_count,
-        .adr_content = p->saved_adr,
         .coverage = cov,
         .coverage_count = cov_count,
         .coverage_meta =
@@ -4162,8 +4203,6 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         cbm_log_warn("index.ignored_capped", "stored", itoa_buf(p->ignored_count), "total",
                      itoa_buf(p->ignored_total));
     }
-    free(p->saved_adr);
-    p->saved_adr = NULL;
 
     free(db_path);
     return 0;
@@ -4186,7 +4225,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
+        if (cbm_pipeline_worker_count(p) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -4286,7 +4325,7 @@ static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = p->frozen ? 1 : effective_worker_count(true);
+    int worker_count = p->frozen ? 1 : cbm_pipeline_worker_count(p);
     if (p->frozen)
         frozen_observe(p, 0, 1);
     CBM_PROF_START(t_extract_total);
@@ -4417,7 +4456,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
          : mode_promoted
              ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
                                                           &baseline_count)
-             : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
+             : cbm_pipeline_build_semantic_manifest(p, p->project_name, p->repo_path, files,
                                                     file_count, p->excluded_dirs, p->excluded_count,
                                                     &p->git_ctx, p->userconfig, &baseline_manifest,
                                                     &baseline_count);

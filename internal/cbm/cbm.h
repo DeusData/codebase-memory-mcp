@@ -289,8 +289,9 @@ typedef struct {
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
-    /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
-     * the global namespace and every other language). Per type, because the
+    /* C# only: declared namespace of a TOP-LEVEL type, "" for the global
+     * namespace (proven only by a clean parse), NULL for nested types, an
+     * unknown namespace and every other language. Per type, because the
      * file-level namespace_name records only a file's first namespace. */
     const char *decl_namespace;
     CBMTestDefinitionRole test_role; /* NONE preserves legacy helper/test-file semantics */

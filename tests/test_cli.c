@@ -6180,6 +6180,149 @@ TEST(cli_zed_mcp_jsonc_comments) {
     PASS();
 }
 
+#ifndef _WIN32
+TEST(cli_install_agent_config_symlinks_issue2671) {
+    /* Refs #2671: dotfiles checkout pattern where agent config directory is a
+     * user-owned symlink into dotfiles under the user's home directory. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/Library/Application Support", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/Zed", parent_dir);
+#else
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/.config", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/zed", parent_dir);
+#endif
+
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
+
+    /* Dangling symlink and symlink to a regular file must remain undetected. */
+    char dangling_target[512];
+    snprintf(dangling_target, sizeof(dangling_target), "%s/dotfiles/missing-zed", tmpdir);
+    ASSERT_EQ(symlink(dangling_target, zed_link), 0);
+    bool dangling_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    ASSERT_EQ(symlink(dotfiles_settings, zed_link), 0);
+    bool file_link_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    /* Symlink resolving to a directory not owned by the invoking user must be refused. */
+    char foreign_dir[512];
+    const char *unowned_target = "/";
+    if (geteuid() == 0) {
+        snprintf(foreign_dir, sizeof(foreign_dir), "%s/dotfiles/foreign-zed", tmpdir);
+        test_mkdirp(foreign_dir);
+        ASSERT_EQ(chown(foreign_dir, 65534, 65534), 0);
+        unowned_target = foreign_dir;
+    }
+    ASSERT_EQ(symlink(unowned_target, zed_link), 0);
+    bool unowned_target_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    ASSERT_EQ(symlink(dotfiles_zed, zed_link), 0);
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT(!dangling_detected);
+    ASSERT(!file_link_detected);
+    ASSERT(!unowned_target_detected);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+
+TEST(cli_install_agent_config_file_symlink_issue2671) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-file-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/Library/Application Support/Zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#else
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/.config/zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#endif
+
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_settings_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  *  PATH management tests (port of TestCLI_InstallPATHAppend)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -9427,6 +9570,127 @@ TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
         FAIL("stdout capture failed");
     if (!warned)
         FAIL("dry-run must predict a refused hook-script rewrite (#1387)");
+    PASS();
+}
+
+/* #2204: the OpenCode adapter is an auto-loaded module, and the generated block
+ * tells readers to "remove the markers to take ownership". A marker-less file
+ * with content is the user's: appending the block to a hand-ported module
+ * produces a file the client cannot even parse (the prelude redeclares the
+ * user's own import and const names, and both sides declare a default export).
+ * The installer must leave that file alone, and the dry run must say so instead
+ * of promising a write it will not make. A dry run never writes, so the byte
+ * check below follows a REAL install: that is the run that appended. */
+TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+
+    /* An `opencode` CLI on the isolated PATH marks OpenCode as installed. */
+    char exe[512];
+    snprintf(exe, sizeof(exe), "%s/opencode", bin);
+    if (write_test_file(exe, "#!/bin/sh\nexit 0\n") != 0 || chmod(exe, 0755) != 0)
+        FAIL("opencode fixture failed");
+
+    char plugins_dir[512];
+    snprintf(plugins_dir, sizeof(plugins_dir), "%s/.config/opencode/plugins", home);
+    test_mkdirp(plugins_dir);
+    char plugin_path[768];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/cbm-augment.ts", plugins_dir);
+    const char foreign[] = "import { spawn } from 'node:child_process';\n"
+                           "const BIN = '/opt/other/codebase-memory-mcp';\n"
+                           "export default { id: 'codebase-memory-augment', setup() {} };\n";
+    if (write_test_file(plugin_path, foreign) != 0)
+        FAIL("foreign module fixture failed");
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    long plan_output_start = -1;
+    long plan_output_end = -1;
+    char *plan = NULL;
+    if (redirected) {
+        (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, true);
+        fflush(stdout);
+        /* The --plan receipt (#388) replays the same path with writes off. It
+         * must not list a module the run leaves alone, and it must print
+         * nothing: stdout carries the receipt JSON. */
+        plan_output_start = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
+        plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+        fflush(stdout);
+        /* The real install, the run #2204 is about. */
+        plan_output_end = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
+        (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, false);
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0)
+        close(saved_stdout);
+
+    char bytes[512] = {0};
+    FILE *file = cbm_fopen(plugin_path, "rb");
+    size_t got = file ? fread(bytes, 1U, sizeof(bytes) - 1U, file) : 0U;
+    if (file)
+        fclose(file);
+
+    /* Control: with the user's module gone the receipt does list the path, so
+     * the omission above cannot pass just because OpenCode went undetected. */
+    char *control_plan = NULL;
+    if (unlink(plugin_path) == 0)
+        control_plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+    client_detect_env_restore(&saved);
+
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+
+    /* Each phase owns its slice of stdout: [0, start) dry run, [start, end)
+     * plan mode, [end, len) real install, so no phase passes on another's
+     * line. Checked back to front, cutting the buffer at each boundary. */
+    bool sliced = plan_output_start >= 0 && plan_output_end >= plan_output_start &&
+                  (size_t)plan_output_end <= strlen(output);
+    bool reported =
+        sliced && strstr(output + plan_output_end, "cbm-augment.ts left untouched") != NULL;
+    if (sliced)
+        output[plan_output_end] = '\0';
+    bool plan_silent = sliced && strstr(output + plan_output_start, "cbm-augment.ts") == NULL;
+    if (sliced)
+        output[plan_output_start] = '\0';
+    bool warned =
+        sliced && strstr(output, "cbm-augment.ts") != NULL && strstr(output, "not ours") != NULL;
+    bool untouched = got == sizeof(foreign) - 1U && memcmp(bytes, foreign, got) == 0;
+    bool plan_omits = plan && strstr(plan, "cbm-augment.ts") == NULL;
+    bool control_lists = control_plan && strstr(control_plan, "cbm-augment.ts") != NULL;
+    free(plan);
+    free(control_plan);
+
+    test_rmdir_r(home);
+    if (!redirected)
+        FAIL("stdout capture failed");
+    if (!sliced)
+        FAIL("stdout capture lost a phase boundary");
+    if (!warned)
+        FAIL("dry-run must predict an untouched user-owned OpenCode module (#2204)");
+    if (!untouched)
+        FAIL("a real install must leave the user-owned OpenCode module byte-identical (#2204)");
+    if (!reported)
+        FAIL("a real install must report the user-owned OpenCode module as left untouched (#2204)");
+    if (!plan_omits)
+        FAIL("the install plan must not list a module the run leaves untouched (#2204)");
+    if (!plan_silent)
+        FAIL("plan mode must keep stdout for the receipt JSON (#2204)");
+    if (!control_lists)
+        FAIL("control: the install plan must list the module once it is not user-owned");
     PASS();
 }
 #endif
@@ -19675,6 +19939,10 @@ SUITE(cli) {
     RUN_TEST(cli_zed_mcp_preserves_settings);
     RUN_TEST(cli_zed_mcp_uninstall);
     RUN_TEST(cli_zed_mcp_jsonc_comments);
+#ifndef _WIN32
+    RUN_TEST(cli_install_agent_config_symlinks_issue2671);
+    RUN_TEST(cli_install_agent_config_file_symlink_issue2671);
+#endif
 
     /* PATH management (3 tests) */
     RUN_TEST(cli_ensure_path_append);
@@ -19759,6 +20027,7 @@ SUITE(cli) {
 #endif
 #ifndef _WIN32
     RUN_TEST(cli_dry_run_predicts_refused_hook_script_issue1387);
+    RUN_TEST(cli_extension_leaves_user_owned_module_untouched_issue2204);
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);

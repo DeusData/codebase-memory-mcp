@@ -2969,7 +2969,26 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path) {
 
 static bool dir_exists(const char *path) {
     cbm_path_info_t info = {0};
-    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_directory;
+    if (cbm_path_info_utf8(path, &info) != CBM_PATH_INFO_OK) {
+        return false;
+    }
+    if (info.is_directory) {
+        return true;
+    }
+#ifndef _WIN32
+    if (info.is_symlink) {
+        uid_t self = geteuid();
+        struct stat link_state;
+        if (lstat(path, &link_state) != 0 || !S_ISLNK(link_state.st_mode) ||
+            link_state.st_uid != self) {
+            return false;
+        }
+        struct stat target_state;
+        return stat(path, &target_state) == 0 && S_ISDIR(target_state.st_mode) &&
+               target_state.st_uid == self;
+    }
+#endif
+    return false;
 }
 
 /* Resolve the Claude Code config dir.
@@ -7713,6 +7732,13 @@ static const char *get_cache_dir(const char *home_dir) {
     return cbm_resolve_cache_dir();
 }
 
+/* A per-project ADR sidecar ("<db>.adr.db") sits in the cache beside its index
+ * but is not itself an index — exclude it from listing/counting. */
+static bool cli_is_adr_sidecar(const char *name, size_t len) {
+    const size_t ext = sizeof(".adr.db") - 1;
+    return len >= ext && strcmp(name + len - ext, ".adr.db") == 0;
+}
+
 int cbm_list_indexes(const char *home_dir) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
@@ -7727,6 +7753,7 @@ int cbm_list_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
+        /* cbm_is_project_index_db already excludes the ".adr.db" sidecar. */
         if (cbm_is_project_index_db(ent->name)) {
             printf("  %s/%s\n", cache_dir, ent->name);
             count++;
@@ -7750,9 +7777,18 @@ int cbm_remove_indexes(const char *home_dir) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        if (cbm_is_project_index_db(ent->name)) {
-            char path[CLI_BUF_1K];
-            snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+        bool is_index = cbm_is_project_index_db(ent->name);
+        /* A "<db>.adr.db" ADR sidecar is excluded from cbm_is_project_index_db,
+         * but a full index wipe must still remove it (and any orphan whose index
+         * is already gone) — otherwise the next re-index of that name inherits a
+         * stale ADR. It appears as its own dirent, so remove it directly. */
+        bool is_adr = cli_is_adr_sidecar(ent->name, strlen(ent->name));
+        if (!is_index && !is_adr) {
+            continue;
+        }
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+        if (is_index) {
             /* Also remove .db.tmp if present */
             char tmp_path[CLI_FIELD_1040];
             snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
@@ -7766,6 +7802,11 @@ int cbm_remove_indexes(const char *home_dir) {
              * its .db. Sidecars are not indexes, so count is unchanged. */
             cbm_remove_db_sidecars(path);
             cbm_remove_db_sidecars(tmp_path);
+        } else {
+            /* ADR sidecar: remove it and its own -wal/-shm/-journal; not an
+             * index, so count is unchanged. */
+            cbm_unlink(path);
+            cbm_remove_db_sidecars(path);
         }
     }
     cbm_closedir(d);
@@ -10058,6 +10099,35 @@ static void install_devin_durable_context(const cbm_agent_registry_context_t *re
 static void install_generated_client_extension(const char *label, const char *path,
                                                const char *binary_path,
                                                char *(*generate)(const char *), bool dry_run) {
+    /* #2204: a module that already carries content but none of our markers is
+     * the user's. The generated header promises "remove the markers to take
+     * ownership", and appending our prelude to a foreign module produces a file
+     * the client cannot even parse — the prelude redeclares the user's own
+     * import and const names, and both sides declare a default export. Probe
+     * ownership before generating so the preview names the refusal instead of
+     * promising a write the run will not make. A probe failure (-1) falls
+     * through to the write, which reports it through the usual error path. */
+    bool foreign =
+        cbm_text_managed_block_status(path, CBM_ADAPTER_MARKER_START, CBM_ADAPTER_MARKER_END) == 1;
+    if (foreign) {
+        /* The --plan receipt (#388) lists only writes the run will make, and
+         * its stdout carries the receipt JSON, so plan mode records nothing
+         * and prints nothing here. The dry run names the skip instead. */
+        if (g_install_plan) {
+            return;
+        }
+        if (dry_run) {
+            printf("  extension: %s would be skipped — the file there is not ours (no "
+                   "codebase-memory-mcp markers), so it is left untouched; delete it or add the "
+                   "markers to let the installer manage it\n",
+                   path);
+        } else {
+            printf("  extension: %s left untouched — the file there is not ours (no "
+                   "codebase-memory-mcp markers)\n",
+                   path);
+        }
+        return;
+    }
     if (g_install_plan) {
         plan_record(label, "extension", path);
         return;
@@ -11265,7 +11335,8 @@ static int count_db_indexes(const char *home) {
     int count = 0;
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
-        if (cbm_is_project_index_db(ent->name)) {
+        if (cbm_is_project_index_db(ent->name) &&
+            !cli_is_adr_sidecar(ent->name, strlen(ent->name))) {
             count++;
         }
     }

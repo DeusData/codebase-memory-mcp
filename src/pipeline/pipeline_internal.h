@@ -1587,9 +1587,9 @@ bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *s
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
 
-int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
-                                         const cbm_file_info_t *files, int file_count,
-                                         char **excluded_dirs, int excluded_count,
+int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *project,
+                                         const char *repo_path, const cbm_file_info_t *files,
+                                         int file_count, char **excluded_dirs, int excluded_count,
                                          const cbm_git_context_t *git_ctx,
                                          const cbm_userconfig_t *userconfig, cbm_file_hash_t **out,
                                          int *out_count);
@@ -1694,7 +1694,6 @@ typedef struct {
     atomic_int *cancelled;
     const cbm_file_hash_t *manifest;
     int manifest_count;
-    const char *adr_content;
     const cbm_coverage_row_t *coverage;
     int coverage_count;
     cbm_coverage_meta_t coverage_meta;
@@ -1960,7 +1959,6 @@ void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void);
-void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);

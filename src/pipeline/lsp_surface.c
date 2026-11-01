@@ -486,10 +486,12 @@ typedef struct {
     const CBMLSPDef *all_defs;
     const int *def_starts;
     cbm_lsp_surface_row_t *rows;
+    int file_count;
+    _Atomic int next_file;
     _Atomic bool failed;
 } surface_job_t;
 
-static void surface_row_one(int i, void *arg) {
+static void surface_row_build(int i, void *arg) {
     surface_job_t *job = (surface_job_t *)arg;
     if (atomic_load_explicit(&job->failed, memory_order_relaxed)) {
         return;
@@ -529,6 +531,45 @@ static void surface_row_one(int i, void *arg) {
     }
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static cbm_lsp_surface_row_observer_fn g_row_observer;
+static void *g_row_observer_ctx;
+
+void cbm_lsp_surface_test_set_row_observer(cbm_lsp_surface_row_observer_fn observer, void *ctx) {
+    g_row_observer = observer;
+    g_row_observer_ctx = ctx;
+}
+#endif
+
+static void surface_row_one(int i, void *arg) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (g_row_observer) {
+        g_row_observer(i, true, g_row_observer_ctx);
+    }
+#endif
+    surface_row_build(i, arg);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (g_row_observer) {
+        g_row_observer(i, false, g_row_observer_ctx);
+    }
+#endif
+}
+
+/* The pool also runs work on its caller. Dispatch at most one coarse job per
+ * allowed participant, each stealing files, so the total active row builders
+ * cannot exceed the pipeline budget even when the caller takes a job. */
+static void surface_rows_worker(int worker, void *arg) {
+    (void)worker;
+    surface_job_t *job = arg;
+    for (;;) {
+        int i = atomic_fetch_add_explicit(&job->next_file, 1, memory_order_relaxed);
+        if (i >= job->file_count) {
+            break;
+        }
+        surface_row_one(i, job);
+    }
+}
+
 int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *project,
                                CBMFileResult **cache, const cbm_file_info_t *files, int file_count,
                                const CBMLSPDef *all_defs, const int *def_starts,
@@ -550,10 +591,16 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
         .all_defs = all_defs,
         .def_starts = def_starts,
         .rows = rows,
+        .file_count = file_count,
     };
+    atomic_init(&job.next_file, 0);
     atomic_init(&job.failed, false);
-    cbm_parallel_for(file_count, surface_row_one, &job,
-                     (cbm_parallel_for_opts_t){.max_workers = 0, .force_pthreads = false});
+    int workers = cbm_pipeline_worker_count(ctx ? ctx->pipeline : NULL);
+    if (workers > file_count) {
+        workers = file_count;
+    }
+    cbm_parallel_for(workers, surface_rows_worker, &job,
+                     (cbm_parallel_for_opts_t){.max_workers = workers, .force_pthreads = false});
     if (atomic_load_explicit(&job.failed, memory_order_relaxed)) {
         cbm_store_free_lsp_surfaces(rows, file_count); /* untouched rows are all NULL */
         return -1;
