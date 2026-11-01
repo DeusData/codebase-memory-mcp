@@ -179,6 +179,14 @@ TEST(doc_links_md_repeated_headings) {
                       "See `app/three.py`.\n"; /* 13 */
     CBMFileResult *r = dm_extract(src, CBM_LANG_MARKDOWN, "CHANGES.md");
     ASSERT_NOT_NULL(r);
+    int fixes = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "Fixes") == 0) {
+            ASSERT_STR_EQ(r->defs.items[i].qualified_name, "p.CHANGES.Fixes");
+            fixes++;
+        }
+    }
+    ASSERT_EQ(fixes, 2);
     const CBMDocLink *one = md_token(r, "app/one.py");
     const CBMDocLink *two = md_token(r, "app/two.py");
     const CBMDocLink *three = md_token(r, "app/three.py");
@@ -190,6 +198,427 @@ TEST(doc_links_md_repeated_headings) {
     ASSERT_EQ(three->flags & CBM_DOCLINK_FLAG_FILE, 0);
     ASSERT_TRUE(md_ends_with(three->source_qn, "Unique"));
     cbm_free_result(r);
+    PASS();
+}
+
+/* Unchanged bare names have priority even when the bare title repeats. */
+TEST(doc_links_md_repeated_bare_name_priority) {
+    const char *sources[] = {
+        "# A.H\n# A.H\n# A\n## H\n# B\n## H\n",
+        "# A\n## H\n# B\n## H\n# A.H\n# A.H\n",
+    };
+    for (size_t k = 0; k < sizeof(sources) / sizeof(sources[0]); k++) {
+        CBMFileResult *r = dm_extract(sources[k], CBM_LANG_MARKDOWN, "names.md");
+        ASSERT_NOT_NULL(r);
+        int bare = 0;
+        int qualified = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            const CBMDefinition *d = &r->defs.items[i];
+            if (strcmp(d->name, "A.H") == 0) {
+                ASSERT_STR_EQ(d->qualified_name, "p.names.A.H");
+                bare++;
+            } else if (strcmp(d->name, "H") == 0 &&
+                       strcmp(d->qualified_name, "p.names.A.H~2") == 0) {
+                qualified++;
+            }
+        }
+        ASSERT_EQ(bare, 2);
+        ASSERT_EQ(qualified, 1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(doc_links_md_heading_suffix_reservations) {
+    CBMFileResult *r = dm_extract("# A.H\n# A.H~2\n# A.H~3\n"
+                                  "# A\n## H\n# B\n## H\n",
+                                  CBM_LANG_MARKDOWN, "names.md");
+    ASSERT_NOT_NULL(r);
+    int moved = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "A.H~2") == 0)
+            ASSERT_STR_EQ(d->qualified_name, "p.names.A.H~2");
+        if (strcmp(d->name, "A.H~3") == 0)
+            ASSERT_STR_EQ(d->qualified_name, "p.names.A.H~3");
+        if (strcmp(d->qualified_name, "p.names.A.H~4") == 0)
+            moved++;
+    }
+    ASSERT_EQ(moved, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A suffix must also leave room for a parent-qualified name in another run. */
+TEST(doc_links_md_generated_name_reservations) {
+    const char *src = "# A.H\n# A\n## H\n## H~2\n# B\n## H\n## H~2\n";
+    CBMFileResult *r = dm_extract(src, CBM_LANG_MARKDOWN, "names.md");
+    ASSERT_NOT_NULL(r);
+    int moved = 0;
+    int reserved = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->qualified_name, "p.names.A.H~3") == 0) {
+            ASSERT_STR_EQ(d->name, "H");
+            moved++;
+        }
+        if (strcmp(d->qualified_name, "p.names.A.H~2") == 0) {
+            ASSERT_STR_EQ(d->name, "H~2");
+            reserved++;
+        }
+    }
+    ASSERT_EQ(moved, 1);
+    ASSERT_EQ(reserved, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_links_md_distinct_chains_same_dotted_name) {
+    CBMFileResult *r =
+        dm_extract("# A.B\n## C\n# A\n## B\n### C\n### C\n", CBM_LANG_MARKDOWN, "names.md");
+    ASSERT_NOT_NULL(r);
+    int kept = 0;
+    int moved = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "C") != 0)
+            continue;
+        if (d->start_line == 2) {
+            ASSERT_STR_EQ(d->qualified_name, "p.names.A.B.C");
+            kept++;
+        } else {
+            ASSERT_STR_EQ(d->qualified_name, "p.names.A.B.C~2");
+            moved++;
+        }
+    }
+    ASSERT_EQ(kept, 1);
+    ASSERT_EQ(moved, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(doc_links_md_setext_parent_names) {
+    CBMFileResult *r =
+        dm_extract("A\n===\nH\n---\nB\n===\nH\n---\n", CBM_LANG_MARKDOWN, "names.md");
+    ASSERT_NOT_NULL(r);
+    int children = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "H") == 0) {
+            ASSERT_STR_EQ(d->qualified_name, d->start_line == 3 ? "p.names.A.H" : "p.names.B.H");
+            children++;
+        }
+    }
+    ASSERT_EQ(children, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Paragraph continuation markers are not part of a Setext heading title. */
+TEST(doc_links_md_quoted_setext_heading_text) {
+    const char *sources[] = {"First\nSecond\n---\n", "> First\n> Second\n> ---\n", "> H\n> ---\n"};
+    for (size_t k = 0; k < sizeof(sources) / sizeof(sources[0]); k++) {
+        CBMFileResult *r = dm_extract(sources[k], CBM_LANG_MARKDOWN, "names.md");
+        ASSERT_NOT_NULL(r);
+        int headings = 0;
+        for (int i = 0; i < r->defs.count; i++) {
+            const CBMDefinition *d = &r->defs.items[i];
+            if (strcmp(d->label, "Section") != 0)
+                continue;
+            /* Display names use the first line; the QN must retain every line. */
+            ASSERT_STR_EQ(d->name, k == 2 ? "H" : "First");
+            ASSERT_STR_EQ(d->qualified_name, k == 2 ? "p.names.H" : "p.names.First-Second");
+            headings++;
+        }
+        ASSERT_EQ(headings, 1);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Setext and ATX markers share hierarchy; block containers retain their own
+ * stacks even when a quote is visited between two outer headings. */
+TEST(doc_links_md_mixed_heading_container_scope) {
+    const char *src = "# Outside\n\nH\n---\n\n"
+                      "> # Quote\n>\n> H\n> ---\n\n"
+                      "H\n---\n\n# Later\n\nH\n---\n";
+    CBMFileResult *r = dm_extract(src, CBM_LANG_MARKDOWN, "names.md");
+    ASSERT_NOT_NULL(r);
+    int outside = 0;
+    int quote = 0;
+    int later = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "H") != 0)
+            continue;
+        if (strcmp(d->qualified_name, "p.names.Outside.H") == 0)
+            outside++;
+        if (strcmp(d->qualified_name, "p.names.Quote.H") == 0)
+            quote++;
+        if (strcmp(d->qualified_name, "p.names.Later.H") == 0)
+            later++;
+    }
+    ASSERT_EQ(outside, 2);
+    ASSERT_EQ(quote, 1);
+    ASSERT_EQ(later, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* An unnamed H1 still ends A's scope; it must not create an empty Section. */
+TEST(doc_links_md_empty_heading_resets_parent) {
+    CBMFileResult *r = dm_extract("# A\n## H\n#\n## H\n", CBM_LANG_MARKDOWN, "names.md");
+    ASSERT_NOT_NULL(r);
+    int children = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Section") == 0) {
+            ASSERT_TRUE(d->name && d->name[0]);
+        }
+        if (strcmp(d->name, "H") == 0) {
+            ASSERT_STR_EQ(d->qualified_name, d->start_line == 2 ? "p.names.A.H" : "p.names.H");
+            children++;
+        }
+    }
+    ASSERT_EQ(children, 2);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* This measures the collector's actual cursor moves/node visits, excluding
+ * hidden parser work. The former ts_node_parent root scans are established by
+ * runtime-source review, not retrospectively measured by this counter. */
+static uint64_t md_flat_collection_work(int n) {
+    size_t cap = (size_t)n * 32 + 1;
+    char *src = malloc(cap);
+    if (!src)
+        return 0;
+    size_t used = 0;
+    for (int i = 0; i < n; i++) {
+        used += (size_t)snprintf(src + used, cap - used, "# H%d\n", i);
+    }
+    CBMFileResult *r = dm_extract(src, CBM_LANG_MARKDOWN, "names.md");
+    free(src);
+    uint64_t steps = r ? r->markdown_collection_steps : 0;
+    cbm_free_result(r);
+    return steps;
+}
+
+TEST(doc_links_md_flat_collection_work) {
+    uint64_t small = md_flat_collection_work(128);
+    uint64_t large = md_flat_collection_work(256);
+    ASSERT_TRUE(small > 0);
+    ASSERT_TRUE(large < small * 3);
+    PASS();
+}
+
+/* Count name lookup/group checks, never elapsed time. Independent collision groups must
+ * not search every heading; a single group must not rescan assigned chains
+ * or restart its suffix search at ~2 for each new chain. */
+static uint64_t md_collision_work(int n, bool one_base) {
+    size_t cap = (size_t)n * 256 + 1;
+    char *src = malloc(cap);
+    if (!src)
+        return 0;
+    size_t used = 0;
+    for (int k = 0; k < n; k++) {
+        if (!one_base) {
+            used += (size_t)snprintf(src + used, cap - used,
+                                     "# P%d\n## H%d\n# Q%d\n## H%d\n# P%d.H%d\n", k, k, k, k, k, k);
+        } else {
+            /* 276 distinct partitions of 25 dotted components into three
+             * parent segments, all with the same final dotted name. */
+            int ordinal = 0;
+            int first = 1;
+            int second = 2;
+            for (int i = 1; i < 24; i++) {
+                for (int j = i + 1; j < 25; j++) {
+                    if (ordinal++ == k) {
+                        first = i;
+                        second = j;
+                    }
+                }
+            }
+            used += (size_t)snprintf(src + used, cap - used, "# a");
+            for (int i = 1; i < 25; i++) {
+                used += (size_t)snprintf(src + used, cap - used,
+                                         i == first    ? "\n## a"
+                                         : i == second ? "\n### a"
+                                                       : ".a");
+            }
+            used += (size_t)snprintf(src + used, cap - used, "\n#### H\n");
+        }
+    }
+    CBMFileResult *r = dm_extract(src, CBM_LANG_MARKDOWN, "names.md");
+    free(src);
+    uint64_t work = r ? r->markdown_name_checks : 0;
+    cbm_free_result(r);
+    return work;
+}
+
+TEST(doc_links_md_independent_collision_work) {
+    uint64_t small = md_collision_work(128, false);
+    uint64_t large = md_collision_work(256, false);
+    ASSERT_TRUE(small > 0);
+    ASSERT_TRUE(large < small * 3);
+    PASS();
+}
+
+TEST(doc_links_md_shared_collision_work) {
+    uint64_t small = md_collision_work(128, true);
+    uint64_t large = md_collision_work(256, true);
+    ASSERT_TRUE(small > 0);
+    ASSERT_TRUE(large < small * 3);
+    PASS();
+}
+
+/* MENTIONS edges from the Section whose qualified name ends with `src` to the
+ * node whose qualified name ends with `tgt`. */
+static int rep_edge(const char *db, const char *src, const char *tgt) {
+    char props[512];
+    int n = 0;
+    dm_edge(db, src, tgt, props, sizeof(props), &n);
+    return n;
+}
+
+/* #2586: two `## Implementation` headings under different parents had one
+ * qualified name, so the graph kept one Section (the last) and the references
+ * under both went to the File. A repeated heading is now qualified by the
+ * headings above it; a unique heading keeps its name alone. */
+TEST(doc_links_md_repeated_headings_by_parent_issue2586) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_rep_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "docs/repeated.md"), "# Service A\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::balance`.\n"
+                                                    "\n"
+                                                    "# Service B\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::post_entry`.\n"
+                                                    "\n"
+                                                    "```mermaid\n"
+                                                    "graph LR\n"
+                                                    "  Ledger --> Balance\n"
+                                                    "```\n"
+                                                    "\n"
+                                                    "## Notes\n"
+                                                    "\n"
+                                                    "See `src/ledger.py`.\n");
+    th_write_file(TH_PATH(tmp, "src/ledger.py"), "def post_entry(ledger, amount):\n"
+                                                 "    ledger.append(amount)\n"
+                                                 "    return balance(ledger)\n"
+                                                 "\n"
+                                                 "\n"
+                                                 "def balance(ledger):\n"
+                                                 "    return sum(ledger)\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+
+    /* two Sections, each qualified by its parent heading */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND name = 'Implementation' AND file_path = 'docs/repeated.md'"),
+              2);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-A.Implementation' "
+                           "AND start_line = 3"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-B.Implementation' "
+                           "AND start_line = 9"),
+              1);
+    /* unique headings keep their names */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' AND "
+                           "(qualified_name LIKE '%.repeated.Service-A' OR "
+                           "qualified_name LIKE '%.repeated.Notes')"),
+              2);
+
+    /* each reference from its own Section, none from the File */
+    ASSERT_EQ(rep_edge(db, "Service-A.Implementation", "ledger.balance"), 1);
+    ASSERT_EQ(rep_edge(db, "Service-B.Implementation", "ledger.post_entry"), 1);
+    ASSERT_EQ(rep_edge(db, "Service-A.Implementation", "ledger.post_entry"), 0);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "WHERE e.type = 'MENTIONS' AND s.label = 'File' "
+                           "AND s.file_path = 'docs/repeated.md'"),
+              0);
+
+    /* the diagram under the second heading is that Section's */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id WHERE e.type = 'DEFINES' "
+                           "AND t.label = 'Diagram' "
+                           "AND s.qualified_name LIKE '%.Service-B.Implementation'"),
+              1);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* #2586 review: a heading text may hold dots, so `# Service-A.Implementation`
+ * named the same as the qualified `## Implementation` under `# Service A`.
+ * The unique heading keeps its name; the qualified one takes `~2`. Five
+ * headings, five Sections, every reference from its own. */
+TEST(doc_links_md_repeated_heading_name_collision_issue2586) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlmd_col_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    th_write_file(TH_PATH(tmp, "docs/repeated.md"), "# Service A\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::balance`.\n"
+                                                    "\n"
+                                                    "# Service B\n"
+                                                    "\n"
+                                                    "## Implementation\n"
+                                                    "\n"
+                                                    "Uses `src/ledger.py::post_entry`.\n"
+                                                    "\n"
+                                                    "# Service-A.Implementation\n"
+                                                    "\n"
+                                                    "See `src/ledger.py`.\n");
+    th_write_file(TH_PATH(tmp, "src/ledger.py"), "def post_entry(ledger, amount):\n"
+                                                 "    ledger.append(amount)\n"
+                                                 "    return balance(ledger)\n"
+                                                 "\n"
+                                                 "\n"
+                                                 "def balance(ledger):\n"
+                                                 "    return sum(ledger)\n");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/md.db", tmp);
+    ASSERT_EQ(dm_index(tmp, db, NULL), 0);
+
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND file_path = 'docs/repeated.md'"),
+              5);
+    /* the unique heading keeps its name; the qualified one moves aside */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-A.Implementation' "
+                           "AND start_line = 13"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-A.Implementation~2' "
+                           "AND start_line = 3"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Section' "
+                           "AND qualified_name LIKE '%.repeated.Service-B.Implementation' "
+                           "AND start_line = 9"),
+              1);
+
+    /* each reference from its own Section, none from the File */
+    ASSERT_EQ(rep_edge(db, "Service-A.Implementation~2", "ledger.balance"), 1);
+    ASSERT_EQ(rep_edge(db, "Service-B.Implementation", "ledger.post_entry"), 1);
+    ASSERT_EQ(rep_edge(db, "repeated.Service-A.Implementation", "ledger.py.__file__"), 1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id = e.source_id "
+                           "WHERE e.type = 'MENTIONS' AND s.label = 'File' "
+                           "AND s.file_path = 'docs/repeated.md'"),
+              0);
+
+    th_cleanup(tmp);
     PASS();
 }
 
@@ -1142,6 +1571,19 @@ SUITE(doc_links_md) {
     dm_ship_held_families();
     RUN_TEST(doc_links_md_extract_tokens);
     RUN_TEST(doc_links_md_repeated_headings);
+    RUN_TEST(doc_links_md_repeated_bare_name_priority);
+    RUN_TEST(doc_links_md_heading_suffix_reservations);
+    RUN_TEST(doc_links_md_generated_name_reservations);
+    RUN_TEST(doc_links_md_distinct_chains_same_dotted_name);
+    RUN_TEST(doc_links_md_setext_parent_names);
+    RUN_TEST(doc_links_md_quoted_setext_heading_text);
+    RUN_TEST(doc_links_md_mixed_heading_container_scope);
+    RUN_TEST(doc_links_md_empty_heading_resets_parent);
+    RUN_TEST(doc_links_md_flat_collection_work);
+    RUN_TEST(doc_links_md_independent_collision_work);
+    RUN_TEST(doc_links_md_shared_collision_work);
+    RUN_TEST(doc_links_md_repeated_headings_by_parent_issue2586);
+    RUN_TEST(doc_links_md_repeated_heading_name_collision_issue2586);
     RUN_TEST(doc_links_md_classify_span);
     RUN_TEST(doc_links_md_resolve);
     RUN_TEST(doc_links_md_member_not_defined_issue2587);

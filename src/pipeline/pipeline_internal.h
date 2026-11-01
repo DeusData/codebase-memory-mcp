@@ -797,6 +797,22 @@ bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *proje
  * behind both passes' HTTP_CALLS / ASYNC_CALLS props (pass_parallel.c). */
 void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool with_line);
 
+/* Go 1.22 ServeMux registrations may name a method and a host before the path
+ * ("POST /v1/x", "GET api.example.com/v1/x", #2537). For a Go `Handle` /
+ * `HandleFunc` call, the path inside its first argument; NULL for any other
+ * language or callee (`store.Get("users/123")`), for a URL argument, and for an
+ * argument that is no such pattern (a plain "/v1/x" included). The one reader
+ * of that grammar behind both passes (pass_parallel.c). */
+const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang);
+
+/* The method of a route registration's Route: the verb its callee names
+ * (`router.GET`), else the method its Go ServeMux pattern names
+ * (`mux.HandleFunc("POST /v1/x", h)`, #2537), else the callee's own answer
+ * (ANY or NULL). `buf` (CBM_SZ_16) holds a pattern method. Shared by both
+ * passes so their Routes stay byte-identical (pass_parallel.c). */
+const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang, char *buf,
+                                          size_t buf_sz);
+
 /* Per-file index of the names a file's imports bind onto EXTERNAL modules:
  * local name -> the binding import. Built lazily, on the first call that
  * asks, from the file's extraction imports and its IMPORTS edges; one hash
@@ -1571,9 +1587,9 @@ bool cbm_pipeline_incremental_generation_exact(cbm_pipeline_t *p, cbm_store_t *s
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
 
-int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
-                                         const cbm_file_info_t *files, int file_count,
-                                         char **excluded_dirs, int excluded_count,
+int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *project,
+                                         const char *repo_path, const cbm_file_info_t *files,
+                                         int file_count, char **excluded_dirs, int excluded_count,
                                          const cbm_git_context_t *git_ctx,
                                          const cbm_userconfig_t *userconfig, cbm_file_hash_t **out,
                                          int *out_count);
@@ -1663,13 +1679,18 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *  11: Python local defs and classes bind through their enclosing lexical
  *      scope, including app-factory route handlers. Published version 10
  *      predates this resolution, so unchanged files rebuild once on upgrade.
- *  12: a Next.js App Router route handler, the HTTP verb Function a route.ts
+ *  12: repeated ATX and Setext Markdown headings use parent-qualified Section
+ *      names only when distinct parent chains separate them. Unchanged bare names
+ *      are preserved and dotted-name collisions are disambiguated before section
+ *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
+ *      and diagram owners agree.
+ *  13: a Next.js App Router route handler, the HTTP verb Function a route.ts
  *      / route.js under app/ or src/app/ exports, carries the route_path its
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
  *      so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1678,7 +1699,6 @@ typedef struct {
     atomic_int *cancelled;
     const cbm_file_hash_t *manifest;
     int manifest_count;
-    const char *adr_content;
     const cbm_coverage_row_t *coverage;
     int coverage_count;
     cbm_coverage_meta_t coverage_meta;
@@ -1944,7 +1964,6 @@ void cbm_pipeline_incremental_test_force_legacy_partial_once(void);
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_predump_once(void);
 void cbm_pipeline_incremental_test_cancel_after_destination_prepare_once(void);
-void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);

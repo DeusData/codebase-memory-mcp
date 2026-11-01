@@ -1260,6 +1260,45 @@ TEST(go_bare_ref_never_binds_field) {
     PASS();
 }
 
+TEST(go_bare_init_never_binds_init_namesake) {
+    /* Go cannot refer to a package init function, and a method or field
+     * named init needs a selector, so a bare `init` (a closure, a parameter,
+     * a `package init` clause) is always a local name. */
+    /* Every Go Function named init is a package init: refused for every
+     * registry strategy, same_module included (the pre-#1915 binding). */
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "same_module", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "import_map", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", NULL, "Function"));
+    /* A Method or Field namesake found by the name alone is refused. */
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Method"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "unique_name", "Method"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Field"));
+    /* ... but not one that an import- or module-aware strategy produced. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "same_module", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "import_map", "Method"));
+    /* lsp_* answers are kept: the sequential resolver emits them before its
+     * registry guards run, so refusing one here would split the resolvers. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "lsp_direct", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "lsp_direct", "Method"));
+    /* The member half of a selector (`w.init()`, `e.init`) is not bare. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, true, "init", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, true, "init", "suffix_match", "Field"));
+    /* Other names and other target kinds are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "initAll", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "Init", "suffix_match", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Module"));
+    /* Go only: elsewhere a bare `init()` is an ordinary call (a Java or C++
+     * method body calls its own init, a C or Python init is a function). */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(false, false, "init", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(false, false, "init", "same_module", "Function"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, NULL, "suffix_match", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", NULL));
+    PASS();
+}
+
 TEST(c_bare_ref_never_binds_field) {
     /* #2666: a C struct member is named only as the member half of `a.b`,
      * `a->b` or a designator `.b` (field_identifier → is_member_access). A
@@ -1431,6 +1470,72 @@ TEST(c_member_rule_covers_c_files_and_every_dot_h) {
     /* No other language, whatever the file is called. */
     ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_OBJC, "ui/View.h"));
     ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_GO, "pkg/a.go"));
+    PASS();
+}
+
+TEST(java_call_never_binds_data_member) {
+    /* A Java call expression never names data, so a CALLS bind that landed on
+     * a Variable or a Field is a spelling collision. The shape that produces
+     * it: a record's accessors are implicit, `p.x()` finds no declared `x()`,
+     * and the short-name registry hands back the first `x` in the tree — an
+     * unrelated class's private field. */
+    ASSERT_TRUE(cbm_java_suppress_call_to_data_member(true, "Field"));
+    ASSERT_TRUE(cbm_java_suppress_call_to_data_member(true, "Variable"));
+    /* Everything callable is kept, including the constructor's Class target. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Method"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Function"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Class"));
+    /* Other languages have callable data: a Kotlin property or a C function
+     * pointer is a name that is not a method and is called all the same. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Field"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Variable"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, NULL));
+    PASS();
+}
+
+TEST(generated_member_registers_by_qn_only) {
+    /* A generated member (a Java record's implicit accessor) is found by its
+     * qualified name, never by a short-name guess. The same member registered
+     * the ordinary way is exactly what the guess binds. */
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_qn_only(r, "proj.geo.Point.Point.y", "Method");
+    ASSERT_TRUE(cbm_registry_exists(r, "proj.geo.Point.Point.y"));
+    ASSERT_STR_EQ(cbm_registry_label_of(r, "proj.geo.Point.Point.y"), "Method");
+    const char **qns = NULL;
+    int n = -1;
+    ASSERT_EQ(cbm_registry_find_by_name(r, "y", &qns, &n), 0);
+    ASSERT_EQ(n, 0);
+    cbm_resolution_t res = cbm_registry_resolve(r, "v.y", "proj.app.Caller", NULL, NULL, 0);
+    ASSERT_NULL(res.qualified_name);
+    cbm_registry_add(r, "x", "proj.geo.Point.Point.x", "Method");
+    res = cbm_registry_resolve(r, "v.x", "proj.app.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.geo.Point.Point.x");
+    /* Degenerate input registers nothing. */
+    cbm_registry_add_qn_only(r, NULL, "Method");
+    cbm_registry_add_qn_only(r, "proj.geo.Point.Point.z", NULL);
+    cbm_registry_add_qn_only(NULL, "proj.geo.Point.Point.z", "Method");
+    ASSERT_EQ(cbm_registry_size(r), 2);
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(generated_member_mark_on_defs_and_nodes) {
+    static const char *const record[] = {"generated", "record", NULL};
+    static const char *const later[] = {"source", "openapi", "generated", "lombok", NULL};
+    static const char *const doc[] = {"id", "ADR-7", "status", "accepted", NULL};
+    static const char *const keyless[] = {"generated", NULL};
+    ASSERT_TRUE(cbm_def_props_generated(record));
+    ASSERT_TRUE(cbm_def_props_generated(later));
+    ASSERT_FALSE(cbm_def_props_generated(doc));
+    ASSERT_FALSE(cbm_def_props_generated(keyless)); /* a key without a value is no fact */
+    ASSERT_FALSE(cbm_def_props_generated(NULL));
+    ASSERT_TRUE(
+        cbm_node_props_generated("{\"parent_class\":\"p.Point\",\"generated\":\"record\"}"));
+    ASSERT_FALSE(cbm_node_props_generated("{\"parent_class\":\"p.Point\"}"));
+    /* The word inside a value is not the key. */
+    ASSERT_FALSE(cbm_node_props_generated("{\"docstring\":\"code generated by protoc\"}"));
+    ASSERT_FALSE(cbm_node_props_generated(NULL));
     PASS();
 }
 
@@ -2590,6 +2695,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(go_bare_init_never_binds_init_namesake);
     RUN_TEST(c_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
@@ -2597,6 +2703,9 @@ SUITE(registry) {
     RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
     RUN_TEST(c_member_access_binds_by_owner_only);
     RUN_TEST(c_member_rule_covers_c_files_and_every_dot_h);
+    RUN_TEST(java_call_never_binds_data_member);
+    RUN_TEST(generated_member_registers_by_qn_only);
+    RUN_TEST(generated_member_mark_on_defs_and_nodes);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
