@@ -599,10 +599,11 @@ typedef struct {
     TSRange *items;
     uint32_t count;
     uint32_t cap;
+    uint32_t source_len;
     bool failed;
 } CBMAttrWords;
 
-static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
+static void cbm_attr_range_add(CBMAttrWords *words, TSRange range) {
     if (words->failed) {
         return;
     }
@@ -617,8 +618,67 @@ static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
         words->items = grown;
         words->cap = cap;
     }
-    words->items[words->count++] = (TSRange){ts_node_start_point(word), ts_node_end_point(word),
-                                             ts_node_start_byte(word), ts_node_end_byte(word)};
+    words->items[words->count++] = range;
+}
+
+static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
+    cbm_attr_range_add(words, (TSRange){ts_node_start_point(word), ts_node_end_point(word),
+                                        ts_node_start_byte(word), ts_node_end_byte(word)});
+}
+
+static TSPoint cbm_attr_point_at(const char *source, TSNode from, uint32_t byte) {
+    TSPoint point = ts_node_start_point(from);
+    for (uint32_t i = ts_node_start_byte(from); i < byte; i++) {
+        if (source[i] == '\n') {
+            point.row++;
+            point.column = 0;
+        } else {
+            point.column++;
+        }
+    }
+    return point;
+}
+
+/* `win_T *curwin INIT( = NULL);` is how neovim declares every global. A parenthesis
+ * followed by `=` opens no parameter list and no argument list, so the word before it is a
+ * macro taking an initializer, and the word and its parentheses are left out together. */
+static void cbm_attr_initializer_macro(TSNode declaration, const char *source,
+                                       CBMAttrWords *words) {
+    uint32_t begin = ts_node_start_byte(declaration);
+    uint32_t end = ts_node_end_byte(declaration);
+    for (uint32_t i = begin; i + 1 < end; i++) {
+        if (source[i] != '(') {
+            continue;
+        }
+        uint32_t next = i + 1;
+        while (next < end && (source[next] == ' ' || source[next] == '\t')) {
+            next++;
+        }
+        if (next + 1 >= words->source_len || source[next] != '=' || source[next + 1] == '=') {
+            continue;
+        }
+        uint32_t word = i;
+        while (word > begin &&
+               (isalnum((unsigned char)source[word - 1]) || source[word - 1] == '_')) {
+            word--;
+        }
+        int depth = 0;
+        uint32_t close = i;
+        for (; close < words->source_len && source[close] != ';'; close++) {
+            depth += source[close] == '(';
+            depth -= source[close] == ')';
+            if (depth == 0) {
+                break;
+            }
+        }
+        if (word == i || close == words->source_len || source[close] == ';') {
+            continue;
+        }
+        cbm_attr_range_add(words, (TSRange){cbm_attr_point_at(source, declaration, word),
+                                            cbm_attr_point_at(source, declaration, close + 1), word,
+                                            close + 1});
+        return;
+    }
 }
 
 /* A macro's spelling: capitals, digits and underscores, too long to be a template
@@ -790,6 +850,9 @@ static void cbm_attr_collect(TSNode node, const char *source, CBMAttrWords *word
         if (declaration) {
             cbm_attr_check_declaration(child, source, words);
         }
+        if (!strcmp(kind, "declaration") && ts_node_has_error(child)) {
+            cbm_attr_initializer_macro(child, source, words);
+        }
         if (ts_node_has_error(child) || cbm_attr_is_container(kind)) {
             cbm_attr_collect(child, source, words, depth + 1);
         }
@@ -819,15 +882,19 @@ static bool cbm_attr_exclude_words(TSParser *parser, CBMAttrWords *words) {
         return false;
     }
     uint32_t from = 0;
+    uint32_t kept_count = 0;
     TSPoint from_point = {0, 0};
     for (uint32_t i = 0; i < unique; i++) {
-        kept[i] =
-            (TSRange){from_point, words->items[i].start_point, from, words->items[i].start_byte};
+        /* A word at the start of the file leaves nothing before it. */
+        if (words->items[i].start_byte > from) {
+            kept[kept_count++] = (TSRange){from_point, words->items[i].start_point, from,
+                                           words->items[i].start_byte};
+        }
         from = words->items[i].end_byte;
         from_point = words->items[i].end_point;
     }
-    kept[unique] = (TSRange){from_point, {UINT32_MAX, UINT32_MAX}, from, UINT32_MAX};
-    bool set = ts_parser_set_included_ranges(parser, kept, unique + 1);
+    kept[kept_count++] = (TSRange){from_point, {UINT32_MAX, UINT32_MAX}, from, UINT32_MAX};
+    bool set = ts_parser_set_included_ranges(parser, kept, kept_count);
     cbm_free(CBM_MEM_CLASS_EXTRACT, kept);
     return set;
 }
@@ -835,7 +902,7 @@ static bool cbm_attr_exclude_words(TSParser *parser, CBMAttrWords *words) {
 TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
                            TSParseOptions opts) {
     TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
-    CBMAttrWords words = {0};
+    CBMAttrWords words = {.source_len = source_len};
     for (int round = 0; tree && round < CBM_ATTR_MAX_ROUNDS; round++) {
         uint32_t before = words.count;
         cbm_attr_collect(ts_tree_root_node(tree), source, &words, 0);

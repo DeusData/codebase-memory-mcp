@@ -476,6 +476,65 @@ static void csp_method(csp_context_t *ctx, TSNode node, const char *owner, bool 
         CBM_SOURCE_DECL_KNOWN | (is_public ? CBM_SOURCE_DECL_PUBLIC : CBM_SOURCE_DECL_PRIVATE);
     csp_mark(ctx, node, qn, flags, csp_arity(ctx, decl));
 }
+/* A name a class body declares. Many have no graph node: a member function declared and
+ * not defined here, a pure virtual, a nested type, an enumerator, a using-declaration.
+ * Inside the class such a name still hides anything of that name outside it. */
+static void csp_member_name(csp_context_t *ctx, const char *klass, TSNode name, bool is_public) {
+    if (ts_node_is_null(name))
+        return;
+    const char *text = csp_text(ctx, name);
+    const char *scope_end = text ? strrchr(text, ':') : NULL;
+    CBMCDecl *fact = csp_add_decl(ctx, CBM_C_DECL_MEMBER_NAME, scope_end ? scope_end + 1 : text,
+                                  is_public ? 0 : CBM_C_DECL_NOT_PUBLIC);
+    if (fact)
+        fact->type_name = klass;
+}
+
+static void csp_note_member(csp_context_t *ctx, TSNode node, const char *klass, bool is_public) {
+    if (csp_is(node, "template_declaration")) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            csp_note_member(ctx, ts_node_named_child(node, i), klass, is_public);
+        return;
+    }
+    if (csp_is(node, "using_declaration")) {
+        uint32_t count = ts_node_named_child_count(node);
+        if (count)
+            csp_member_name(ctx, klass, ts_node_named_child(node, count - 1), is_public);
+        return;
+    }
+    if (csp_is(node, "alias_declaration")) {
+        csp_member_name(ctx, klass, csp_field(node, "name"), is_public);
+        return;
+    }
+    if (csp_is(node, "type_definition")) {
+        csp_member_name(ctx, klass, csp_field(node, "declarator"), is_public);
+        return;
+    }
+    TSNode function = csp_function_declarator(node);
+    if (!ts_node_is_null(function)) {
+        TSNode name = csp_field(function, "declarator");
+        if (csp_is(name, "field_identifier") || csp_is(name, "identifier"))
+            csp_member_name(ctx, klass, name, is_public);
+        return;
+    }
+    TSNode type = csp_field(node, "type");
+    if (ts_node_is_null(type) ||
+        (!csp_is(type, "struct_specifier") && !csp_is(type, "class_specifier") &&
+         !csp_is(type, "union_specifier") && !csp_is(type, "enum_specifier")))
+        return;
+    csp_member_name(ctx, klass, csp_field(type, "name"), is_public);
+    if (!csp_is(type, "enum_specifier"))
+        return;
+    TSNode body = csp_field(type, "body");
+    uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode enumerator = ts_node_named_child(body, i);
+        if (csp_is(enumerator, "enumerator"))
+            csp_member_name(ctx, klass, csp_field(enumerator, "name"), is_public);
+    }
+}
+
 /* A struct inside a preprocessor branch stays unknown: unlike a function, whose
  * callers cannot compile without it, a branch is how a project swaps one layout
  * for another, and member lookup cannot tell which one the includer gets. */
@@ -492,7 +551,7 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
         ctx->failed = true;
         return;
     }
-    bool complete = true, is_public = csp_is(node, "struct_specifier");
+    bool complete = true, body_complete = true, is_public = csp_is(node, "struct_specifier");
     TSTreeCursor header = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&header))
         do {
@@ -508,6 +567,7 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
             TSNode child = ts_tree_cursor_current_node(&cursor);
             if (!csp_budget(ctx, 0)) {
                 complete = false;
+                body_complete = false;
                 break;
             }
             if (!ts_node_is_named(child) || csp_is(child, "comment"))
@@ -518,13 +578,22 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
             } else if (csp_is(child, "function_definition") || csp_is(child, "field_declaration") ||
                        csp_is(child, "declaration")) {
                 csp_method(ctx, child, qn, is_public);
+                csp_note_member(ctx, child, name, is_public);
             } else {
                 complete = false;
+                if (csp_is(child, "template_declaration") || csp_is(child, "using_declaration") ||
+                    csp_is(child, "alias_declaration") || csp_is(child, "type_definition"))
+                    csp_note_member(ctx, child, name, is_public);
+                else if (!csp_is(child, "friend_declaration") &&
+                         !csp_is(child, "static_assert_declaration"))
+                    body_complete = false;
             }
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
     csp_mark(ctx, node, qn,
-             CBM_SOURCE_DECL_KNOWN | (complete ? CBM_SOURCE_CLASS_DOMAIN_COMPLETE : 0), -1);
+             CBM_SOURCE_DECL_KNOWN | (complete ? CBM_SOURCE_CLASS_DOMAIN_COMPLETE : 0) |
+                 (body_complete ? CBM_SOURCE_CLASS_BODY_COMPLETE : 0),
+             -1);
 }
 static bool csp_preprocessor_branch(TSNode node) {
     return csp_is(node, "preproc_if") || csp_is(node, "preproc_ifdef") ||

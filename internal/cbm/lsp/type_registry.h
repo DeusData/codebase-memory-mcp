@@ -50,7 +50,10 @@ enum {
      * PHP may apply them to exact positional values without coercion rules. */
     CBM_SOURCE_DECL_UNTYPED_VALUE_PARAMETERS = 1u << 13,
     /* C family: inside a preprocessor branch, so it exists in some configurations. */
-    CBM_SOURCE_DECL_CONDITIONAL = 1u << 14
+    CBM_SOURCE_DECL_CONDITIONAL = 1u << 14,
+    /* Every name the class body declares is recorded. Unlike DOMAIN_COMPLETE this says
+     * nothing about base classes, which a lookup searches itself. */
+    CBM_SOURCE_CLASS_BODY_COMPLETE = 1u << 15
 };
 
 // Registered function/method with full type signature.
@@ -82,7 +85,7 @@ typedef struct {
      * Unqualified source names retain their spelling until the language
      * adapter proves the declaration's type-name lookup domain. */
     const CBMType *source_signature;
-    int source_arity; /* C family: fixed parameter count + 1; 0 when not fixed. */
+    int source_arity;           /* C family: fixed parameter count + 1; 0 when not fixed. */
     const char *source_file_qn; /* C family: the File that holds this declaration. */
     const char *source_namespace;
 } CBMRegisteredFunc;

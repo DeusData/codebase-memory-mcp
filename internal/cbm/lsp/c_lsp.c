@@ -7097,10 +7097,20 @@ typedef struct {
     bool open;          /* a base class is not understood, so more may exist */
 } CMemberHit;
 
+/* One member, spelled with its signature on one side at most. */
+static bool c_same_member_target(const char *a, const char *b) {
+    bool a_signature = strchr(a, '(') != NULL, b_signature = strchr(b, '(') != NULL;
+    if (a_signature == b_signature)
+        return !strcmp(a, b);
+    size_t length = strlen(a_signature ? b : a);
+    return !strncmp(a, b, length);
+}
+
 static void c_member_hit_add(CMemberHit *hit, const char *target) {
-    if (hit->target && strcmp(hit->target, target))
+    if (hit->target && !c_same_member_target(hit->target, target))
         hit->conflict = true;
-    hit->target = target;
+    if (!hit->target || !strchr(hit->target, '('))
+        hit->target = target;
 }
 
 /* The member function this name selects in this class. A class's own declaration hides
@@ -7112,6 +7122,22 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
     if (!klass || depth > 8)
         return;
     bool same_class = ctx->proof_method_class && ctx->proof_method_class == klass;
+    /* What the class body says about this name, which a definition elsewhere does not:
+     * that it is declared at all, and with what access. */
+    bool declared = false;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind != CBM_C_DECL_MEMBER_NAME || strcmp(decl->name, name) || !decl->type_name ||
+            !klass->short_name || strcmp(decl->type_name, klass->short_name) ||
+            !klass->source_file_qn || strcmp(decl->file, klass->source_file_qn))
+            continue;
+        declared = true;
+        if (!same_class && (decl->flags & CBM_C_DECL_NOT_PUBLIC)) {
+            hit->open = true;
+            return;
+        }
+    }
     CMemberHit own = {0};
     CBMMethodIter iterator;
     cbm_registry_methods_chain(ctx->proof_registry, klass->qualified_name, name, &iterator);
@@ -7135,8 +7161,7 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
         const CBMCDecl *decl = link->decl;
         if (decl->kind != CBM_C_DECL_METHOD || strcmp(decl->name, name) || !decl->target ||
             !decl->type_name || !klass->short_name || strcmp(decl->type_name, klass->short_name) ||
-            !klass->source_file_qn || !strcmp(decl->file, klass->source_file_qn) ||
-            (decl->arity >= 0 && argc > decl->arity))
+            !klass->source_file_qn || (decl->arity >= 0 && argc > decl->arity))
             continue;
         if (c_proof_file_reaches(ctx, decl->file, klass->source_file_qn))
             c_member_hit_add(&own, decl->target);
@@ -7147,6 +7172,12 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
         c_member_hit_add(hit, own.target);
         return;
     }
+    /* The class declares this name and nothing here can be bound to it. It hides the
+     * bases and the enclosing scopes all the same. */
+    if (declared) {
+        hit->open = true;
+        return;
+    }
     for (int i = 0; klass->embedded_types && klass->embedded_types[i]; i++) {
         const CBMRegisteredType *base =
             c_proof_named_class(ctx, c_base_class_name(ctx, klass->embedded_types[i]), at);
@@ -7155,7 +7186,7 @@ static void c_proof_class_method(CLSPContext *ctx, const CBMRegisteredType *klas
         c_proof_class_method(ctx, base, name, argc, at, depth + 1, hit);
     }
     /* A class whose body is not fully understood may hold more. */
-    if (!(klass->source_flags & CBM_SOURCE_CLASS_DOMAIN_COMPLETE))
+    if (!(klass->source_flags & CBM_SOURCE_CLASS_BODY_COMPLETE))
         hit->open = true;
 }
 
@@ -10585,7 +10616,7 @@ bool cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_co
         cbm_arena_init(&file_arena);
 
         cbm_resolve_proof_pool_t copied_proofs;
-        cbm_resolve_proof_pool_init(&copied_proofs, arena, 0, 0, 0);
+        cbm_resolve_proof_pool_init_project(&copied_proofs, arena);
         CBMResolvedCallArray file_out;
         memset(&file_out, 0, sizeof(file_out));
 

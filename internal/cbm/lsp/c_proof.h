@@ -18,12 +18,14 @@ typedef enum {
     CBM_C_DECL_EXTERN_VALUE,  /* an extern object declaration */
     CBM_C_DECL_VALUE,         /* a graph Variable: object definition or enumerator */
     CBM_C_DECL_METHOD,        /* an out-of-line or inline member definition */
+    CBM_C_DECL_MEMBER_NAME,   /* any name a class body declares; type_name is the class */
 } CBMCDeclKind;
 
 enum {
     CBM_C_DECL_EXTERNAL = 1u << 0,    /* external linkage: not static, not an enumerator */
     CBM_C_DECL_C_LINKAGE = 1u << 1,   /* written under extern "C" */
     CBM_C_DECL_CONDITIONAL = 1u << 2, /* inside a preprocessor branch */
+    CBM_C_DECL_NOT_PUBLIC = 1u << 3,  /* a class member under private: or protected: */
 };
 
 typedef struct CBMCDecl {

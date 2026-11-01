@@ -2021,8 +2021,11 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     if (!dst_calls || !src_out)
         return;
 
+    /* Every proof of this file comes through here. Its size follows the file, and proof
+     * work counts hashed bytes, so a cap silently cost a large file its last rows, at a
+     * point that moved with the length of the checkout path. */
     cbm_resolve_proof_pool_t proof_pool;
-    cbm_resolve_proof_pool_init(&proof_pool, dst_arena, 0, 0, 0);
+    cbm_resolve_proof_pool_init_project(&proof_pool, dst_arena);
     cbm_resolve_proof_clone_session_t proofs;
     (void)cbm_resolve_proof_clone_begin(&proofs, &proof_pool);
     /* The complete source batch remains alive until clone_end. A shared
