@@ -690,7 +690,7 @@ static bool gd_table_header(gd_context_t *g, int index, bool present) {
     if (!gd_read_text(g, 0, &name) || !gd_read_text(g, 1, &type) || !gd_read_text(g, 2, &sql)) {
         return false;
     }
-    if (!gd_text_eq(name, table->name) || !gd_text_eq(type, "table")) {
+    if (!gd_text_eq(name, table->name) || !gd_text_eq(type, g->is_view[index] ? "view" : "table")) {
         return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
     }
     if (!gd_value(g, GD_TEXT, sql.data, sql.length)) {
