@@ -79,6 +79,10 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
  * Tests snapshot this monotonic
  * count before sending a notification. */
 uint64_t cbm_daemon_frontend_test_routed_cancellations(void);
+/* Budget in ms that the most recent session replay gave its context and UI
+ * settings requests. Recovery tests use distinct connect and startup budgets
+ * and compare. */
+uint32_t cbm_daemon_frontend_test_replay_timeout_ms(void);
 #endif
 
 /* Takes ownership of client and borrows cohort_manager for the complete call.

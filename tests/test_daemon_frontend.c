@@ -250,6 +250,11 @@ enum {
      * no-progress EOF
        drain so shutdown deterministically overlaps recovery. */
     FRONTEND_RECOVERY_EOF_RELEASE_MS = 16000,
+    /* Startup budget of the recovery bootstrap. It differs from the connect
+     * budget (FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS) so the recovery tests can
+     * tell which one the session replay waited on, and it is the larger one,
+     * as in production (1 s connect probe, 30 s startup). */
+    FRONTEND_RECOVERY_TEST_STARTUP_TIMEOUT_MS = 45000,
 };
 
 typedef enum {
@@ -818,7 +823,7 @@ static int frontend_recovery_child_run(const char *parent, frontend_recovery_mod
                 .identity = &fixture.identity,
                 .executable_path = "unused",
                 .connect_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
-                .startup_timeout_ms = FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS,
+                .startup_timeout_ms = FRONTEND_RECOVERY_TEST_STARTUP_TIMEOUT_MS,
             },
         .session_root = parent,
         .tool_profile = CBM_MCP_TOOL_PROFILE_ALL,
@@ -851,6 +856,14 @@ static int frontend_recovery_child_run(const char *parent, frontend_recovery_mod
     bool input_closed = input && fclose(input) == 0;
     bool output_closed = output && fclose(output) == 0;
     bool fixture_closed = frontend_eof_fixture_finish(&fixture);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    /* The replay restores what startup set within the startup budget. On the
+     * connect budget (a probe bound) a replacement daemon that answers slower
+     * than a probe would end an otherwise good recovery. Every mode replays. */
+    if (cbm_daemon_frontend_test_replay_timeout_ms() != FRONTEND_RECOVERY_TEST_STARTUP_TIMEOUT_MS) {
+        return 75;
+    }
+#endif
     return replacement_ready && request_ready && result == 0 && response_exact &&
                    requests == expected_requests && writer_ok && input_closed && output_closed &&
                    fixture_closed

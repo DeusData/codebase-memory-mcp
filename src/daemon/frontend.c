@@ -120,6 +120,7 @@ static atomic_uint_fast64_t frontend_test_monitor_observation_count = ATOMIC_VAR
 static atomic_uint_fast64_t frontend_test_worker_observation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_worker_idle_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_routed_cancellation_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast32_t frontend_test_replay_budget_ms = ATOMIC_VAR_INIT(0);
 
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor) {
     atomic_store_explicit(&frontend_test_monitor_observation_count, 0, memory_order_release);
@@ -151,6 +152,10 @@ uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void) {
 
 uint64_t cbm_daemon_frontend_test_routed_cancellations(void) {
     return atomic_load_explicit(&frontend_test_routed_cancellation_count, memory_order_acquire);
+}
+
+uint32_t cbm_daemon_frontend_test_replay_timeout_ms(void) {
+    return (uint32_t)atomic_load_explicit(&frontend_test_replay_budget_ms, memory_order_acquire);
 }
 #endif
 
@@ -528,7 +533,14 @@ static cbm_daemon_runtime_cancel_result_t frontend_cancel_active(frontend_state_
 
 static bool frontend_configure_client(cbm_daemon_runtime_client_t *client,
                                       const cbm_daemon_frontend_session_config_t *session) {
-    uint32_t timeout_ms = session->bootstrap.connect_timeout_ms;
+    /* The replay restores what startup set, so it waits within the startup
+     * budget like the first set_context and set_ui_config in main.c. The
+     * connect budget only bounds a probe (1 s in production): a replacement
+     * daemon whose UI save runs longer would end an otherwise good recovery. */
+    uint32_t timeout_ms = session->bootstrap.startup_timeout_ms;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    atomic_store_explicit(&frontend_test_replay_budget_ms, timeout_ms, memory_order_release);
+#endif
     if (cbm_daemon_application_client_set_context(
             client, session->session_root, session->allowed_root, session->tool_profile, NULL, NULL,
             timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
