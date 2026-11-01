@@ -1295,23 +1295,49 @@ static const rs_type_t *rs_result_of(CBMArena *arena, const rs_type_t *ok, const
     return rs_ext_type(arena, "std::result::Result", ok, err ? err : &RS_UNKNOWN_TYPE);
 }
 
+/* Containers whose signatures for the methods read here are std's: FxHashMap is an
+ * alias of std's type, and hashbrown, indexmap and bumpalo mirror that API. */
+static bool rs_ext_in(const rs_type_t *type, const char *const *paths) {
+    if (!type || type->kind != RT_EXT || !type->name)
+        return false;
+    return rs_name_in(type->name, paths);
+}
+
 static bool rs_is_map(const rs_type_t *type) {
-    return rs_ext_is(type, "std::collections::HashMap") ||
-           rs_ext_is(type, "std::collections::hash_map::HashMap") ||
-           rs_ext_is(type, "std::collections::BTreeMap") ||
-           rs_ext_is(type, "std::collections::btree_map::BTreeMap");
+    static const char *const maps[] = {"std::collections::HashMap",
+                                       "std::collections::hash_map::HashMap",
+                                       "std::collections::BTreeMap",
+                                       "std::collections::btree_map::BTreeMap",
+                                       "hashbrown::HashMap",
+                                       "hashbrown::hash_map::HashMap",
+                                       "indexmap::IndexMap",
+                                       "indexmap::map::IndexMap",
+                                       "fxhash::FxHashMap",
+                                       "rustc_hash::FxHashMap",
+                                       NULL};
+    return rs_ext_in(type, maps);
 }
 
 static bool rs_is_set(const rs_type_t *type) {
-    return rs_ext_is(type, "std::collections::HashSet") ||
-           rs_ext_is(type, "std::collections::hash_set::HashSet") ||
-           rs_ext_is(type, "std::collections::BTreeSet") ||
-           rs_ext_is(type, "std::collections::btree_set::BTreeSet");
+    static const char *const sets[] = {"std::collections::HashSet",
+                                       "std::collections::hash_set::HashSet",
+                                       "std::collections::BTreeSet",
+                                       "std::collections::btree_set::BTreeSet",
+                                       "hashbrown::HashSet",
+                                       "hashbrown::hash_set::HashSet",
+                                       "indexmap::IndexSet",
+                                       "indexmap::set::IndexSet",
+                                       "fxhash::FxHashSet",
+                                       "rustc_hash::FxHashSet",
+                                       NULL};
+    return rs_ext_in(type, sets);
 }
 
 static bool rs_is_seq(const rs_type_t *type) {
-    return rs_ext_is(type, "std::vec::Vec") || rs_ext_is(type, "std::collections::VecDeque") ||
-           type->kind == RT_ARRAY;
+    static const char *const seqs[] = {"std::vec::Vec", "std::collections::VecDeque",
+                                       "bumpalo::collections::Vec",
+                                       "bumpalo::collections::vec::Vec", NULL};
+    return type->kind == RT_ARRAY || rs_ext_in(type, seqs);
 }
 
 static const rs_type_t *rs_seq_element(const rs_type_t *type) {
@@ -1587,6 +1613,12 @@ static const rs_type_t *rs_map_method(rs_walk_t *w, const rs_type_t *type, const
     return &RS_UNKNOWN_TYPE;
 }
 
+static bool rs_anyhow_context_in_scope(rs_walk_t *w) {
+    rs_ent_t ent = rs_lookup_lexical(&w->q, w->inst, w->blocks, w->nblocks, "Context", RS_NS_TYPE);
+    return ent.kind == RS_ENT_EXTERNAL && ent.external_path &&
+           !strcmp(ent.external_path, "anyhow::Context");
+}
+
 /* Return type of a standard method on a known receiver; the probe already
  * found nothing on the project side. */
 static const rs_type_t *rs_ext_method_ret(rs_walk_t *w, const rs_type_t *receiver, const char *name,
@@ -1597,6 +1629,12 @@ static const rs_type_t *rs_ext_method_ret(rs_walk_t *w, const rs_type_t *receive
         type = rs_peel(type);
         if (type->kind == RT_ITER)
             return rs_iter_method(w, type, name, closure_ret);
+        /* anyhow::Context turns Option<T> and Result<T, E> into anyhow::Result<T>. */
+        if ((!strcmp(name, "context") || !strcmp(name, "with_context")) &&
+            (rs_ext_is(type, "std::option::Option") || rs_ext_is_result(type)) &&
+            rs_anyhow_context_in_scope(w))
+            return rs_result_of(arena, rs_arg(type, 0),
+                                rs_ext_type(arena, "anyhow::Error", NULL, NULL));
         if (rs_ext_is(type, "std::option::Option"))
             return rs_option_method(w, type, name, closure_ret);
         if (rs_ext_is_result(type))
@@ -2444,10 +2482,12 @@ static rs_args_t rs_walk_arguments(rs_walk_t *w, TSNode arguments, const rs_type
     out.count = rs_argument_nodes(arguments, nodes, RS_MAX_ARGS);
     for (int i = 0; i < out.count; i++) {
         const rs_type_t *declared[2] = {NULL, NULL};
+        /* `&|x| ...` is passed to a parameter declared `&impl Fn(..)`. */
+        bool closure = rs_is(nodes[i], "closure_expression") ||
+                       (rs_is(nodes[i], "reference_expression") &&
+                        rs_is(rs_field(nodes[i], "value"), "closure_expression"));
         int declared_count =
-            rs_is(nodes[i], "closure_expression")
-                ? rs_closure_params_from_fn(w, callee, self_ty, i - offset, declared)
-                : 0;
+            closure ? rs_closure_params_from_fn(w, callee, self_ty, i - offset, declared) : 0;
         const rs_type_t *const *given = declared_count ? declared : closure_params;
         w->nclosure_params = declared_count ? declared_count : closure_count;
         for (int p = 0; given && p < w->nclosure_params && p < 2; p++)
