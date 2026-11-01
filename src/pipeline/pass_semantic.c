@@ -36,6 +36,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
 #include <stdint.h>
 
 #include <stdio.h>
@@ -1812,6 +1813,19 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const cbm_semantic_bi
                                      cbm_semantic_base_edge_type(base_node), "{}");
                 (*inherits_count)++;
             }
+        }
+    }
+    /* Bases only the shared resolver can follow: reexports and star imports. */
+    for (size_t b = 0; lang == CBM_LANG_PYTHON; b++) {
+        const char *base_qn =
+            cbm_shared_resolver_python_base(ctx->shared_resolver, def->qualified_name, b);
+        if (!base_qn)
+            break;
+        const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
+        if (base_node && node->id != base_node->id) {
+            cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id,
+                                 cbm_semantic_base_edge_type(base_node), "{}");
+            (*inherits_count)++;
         }
     }
     if (def->decorators) {

@@ -1151,6 +1151,31 @@ static bool http_file_capture(cbm_shared_resolver_t *resolver, const cbm_pipelin
     return ok;
 }
 
+/* `import a.b` binds the package a, and a.c reads through it. A dotted root import
+ * therefore also needs a fact for a itself, once per file and only when no plain
+ * `import a` already provides one. */
+static bool python_root_fact_needed(const CBMFileResult *result, int position) {
+    const CBMImport *import = &result->imports.items[position];
+    if (import->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !import->module_path ||
+        !import->local_name || !strchr(import->module_path, '.') ||
+        !cbm_import_binds_runtime_name(import))
+        return false;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *other = &result->imports.items[i];
+        if (other->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !other->local_name ||
+            !other->module_path || strcmp(other->local_name, import->local_name) ||
+            !cbm_import_binds_runtime_name(other))
+            continue;
+        if (!strchr(other->module_path, '.') || i < position)
+            return false;
+    }
+    return true;
+}
+
+static const char *python_root_key(CBMArena *arena, const char *file, const char *local) {
+    return cbm_arena_sprintf(arena, "python_root:%zu:%s:%s", strlen(file), file, local);
+}
+
 static const char *python_nested_key(CBMArena *arena, const char *file, uint32_t at,
                                      const char *local) {
     return cbm_arena_sprintf(arena, "python_nested:%zu:%s:%u:%s", strlen(file), file, at, local);
@@ -1403,6 +1428,14 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
             python_export_import(resolver, ctx, result, file->rel_path, &arena, index, import,
                                  python_import_key(&resolver->arena, file->rel_path, i),
                                  cbm_resolve_binding_import(index, import->local_name), true, true);
+        if (ok && python_root_fact_needed(result, i)) {
+            CBMImport root = *import;
+            root.module_path = import->local_name;
+            ok = python_export_import(
+                resolver, ctx, result, file->rel_path, &arena, index, &root,
+                python_root_key(&resolver->arena, file->rel_path, import->local_name),
+                cbm_resolve_binding_import(index, import->local_name), false, false);
+        }
     }
     size_t nested = ok && file->language == CBM_LANG_PYTHON
                         ? cbm_resolve_binding_python_nested_count(index)
@@ -1998,6 +2031,20 @@ static CBMHashTable *python_import_map(CBMArena *arena, const char *file,
             return NULL;
         }
     }
+    for (int i = 0; i < result->imports.count; i++) {
+        if (!python_root_fact_needed(result, i))
+            continue;
+        const char *local = result->imports.items[i].local_name;
+        python_import_t *entry = cbm_arena_calloc(arena, sizeof(*entry));
+        const char *key = cbm_arena_strdup(arena, local);
+        const char *slot = python_root_key(arena, file, local);
+        if (!entry || !key || !slot) {
+            cbm_ht_free(map);
+            return NULL;
+        }
+        entry->slot = slot;
+        cbm_ht_set(map, key, entry);
+    }
     return map;
 }
 
@@ -2535,6 +2582,11 @@ bool cbm_shared_resolver_exports_complete(const cbm_shared_resolver_t *resolver)
 void cbm_shared_resolver_fact(const cbm_shared_resolver_t *resolver, const char *key,
                               cbm_resolve_solver_result_t *out) {
     cbm_resolve_solver_get(resolver ? resolver->solver : NULL, key, out);
+}
+
+const char *cbm_shared_resolver_python_base(const cbm_shared_resolver_t *resolver,
+                                            const char *qualified_name, size_t offset) {
+    return resolver ? cbm_py_members_base(resolver->python_members, qualified_name, offset) : NULL;
 }
 
 bool cbm_shared_resolver_owns_proof(const cbm_shared_resolver_t *resolver,

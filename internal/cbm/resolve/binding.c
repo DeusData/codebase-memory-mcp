@@ -42,6 +42,7 @@ typedef struct {
     const char *value_chain;
     uint32_t value_scope;
     bool value_none;
+    bool import_root;
 } binding_name_t;
 
 typedef struct binding_pending_declaration {
@@ -552,11 +553,19 @@ static bool supported_node(CBMLanguage language, const char *kind) {
                                          "nonlocal_statement",
                                          NULL};
     /* Expressions the ordinary walk audits through their children. */
-    static const char *const python_expressions[] = {
-        "list_splat",       "dictionary_splat",    "parenthesized_list_splat",
-        "ellipsis",         "except_group_clause", "print_statement",
-        "chevron",          "union_type",          "member_type",
-        "constrained_type", "splat_type",          NULL};
+    static const char *const python_expressions[] = {"list_splat",
+                                                     "dictionary_splat",
+                                                     "parenthesized_list_splat",
+                                                     "ellipsis",
+                                                     "except_group_clause",
+                                                     "print_statement",
+                                                     "chevron",
+                                                     "union_type",
+                                                     "member_type",
+                                                     "constrained_type",
+                                                     "splat_type",
+                                                     "line_continuation",
+                                                     NULL};
     /* Pattern identifiers bind, see python_target_role, as a type alias does. */
     static const char *const python_binders[] = {"match_statement",
                                                  "case_clause",
@@ -859,6 +868,14 @@ static void python_note_nested_import(cbm_resolve_binding_index_t *index, TSNode
     index->names[index->name_count - 1].nested_import = (uint32_t)index->python_nested_count;
 }
 
+static bool python_root_import_bound(const cbm_resolve_binding_index_t *index, const char *name) {
+    for (size_t i = 0; name && i < index->name_count; i++)
+        if (index->names[i].import_root && index->names[i].scope == index->current_scope &&
+            !strcmp(index->names[i].name, name))
+            return true;
+    return false;
+}
+
 static void note_import(cbm_resolve_binding_index_t *index, TSNode node, bool nested);
 
 /* Only annotation lookups see these names: runtime reads find a blocked binder. */
@@ -907,8 +924,13 @@ static void note_import(cbm_resolve_binding_index_t *index, TSNode node, bool ne
                 name = cbm_arena_strndup(index->arena, name, (size_t)(dot - name));
             }
         }
+        /* `import a.b` and `import a.c` bind the one package a, not two values. */
+        if (!from && ts_node_is_null(alias) && python_root_import_bound(index, name))
+            continue;
         size_t before = index->name_count;
         add_name(index, name, ts_node_start_byte(node), BINDING_IMPORT);
+        if (!from && ts_node_is_null(alias) && index->name_count > before)
+            index->names[index->name_count - 1].import_root = true;
         if (nested && index->name_count > before)
             python_note_nested_import(index, node, child, name);
     }
@@ -2974,11 +2996,13 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
                             !strcmp(field_name, "left") && !annotation_target &&
                             !ts_node_is_null(field(ts_node_parent(node), "right"));
         if (state.blocked && !function_name && lexical) {
+            size_t recorded = index->name_count;
             add_name(index, name, ts_node_start_byte(node),
                      module_value ? BINDING_VALUE_DECLARATION : BINDING_BLOCKED);
-            if (python)
+            bool binder = python && index->name_count > recorded;
+            if (binder)
                 python_note_binder_value(index, node, parent_kind, field_name);
-            if (python && state.scope && index->scopes[state.scope].class_scope &&
+            if (binder && state.scope && index->scopes[state.scope].class_scope &&
                 !annotation_target)
                 python_note_class_value(
                     index, name, node, index->names[index->name_count - 1].value_chain,

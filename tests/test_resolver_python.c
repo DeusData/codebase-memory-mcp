@@ -204,6 +204,7 @@ TEST(resolver_python_ordinary_syntax_keeps_the_file) {
         ("def run(value):\n    match value:\n        case [first, *rest]:\n"
          "            return local()\n"),
         "note: dict[str, int]\ndef run():\n    return local()\n",
+        "total = 1 + \\\n    2\ndef run():\n    return local()\n",
         "def run():\n    try:\n        return local()\n    except* ValueError:\n        pass\n"};
     for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
         char source[512];
@@ -330,6 +331,23 @@ TEST(resolver_python_import_forms_reach_the_declaration) {
         const python_proof_file_t files[] = {{"main.py", forms[i]}, util, decoy, pkg, other};
         ASSERT(python_expect(forms[i], files, 5, "CALLS", "pkg/util.py", "helper", "Function", 1));
         ASSERT(python_expect(forms[i], files, 5, "CALLS", "other/util.py", "helper", "Function", 0));
+    }
+    /* Two dotted imports of one package bind the same root. */
+    {
+        const python_proof_file_t files[] = {
+            {"main.py", "import pkg.util\nimport pkg.more\nimport pkg\n"
+                        "def run():\n    pkg.util.helper()\n    pkg.more.again()\n"},
+            util, pkg, {"pkg/more.py", "def again():\n    return 1\n"}};
+        ASSERT(python_expect("shared root", files, 4, "CALLS", "pkg/util.py", "helper", "Function", 1));
+        ASSERT(python_expect("shared root", files, 4, "CALLS", "pkg/more.py", "again", "Function", 1));
+    }
+    /* The bound package also reads the submodules another import loaded. */
+    {
+        const python_proof_file_t files[] = {
+            {"main.py", "import pkg.more\nimport pkg.util as u\n"
+                        "def run():\n    pkg.util.helper()\n"},
+            util, pkg, {"pkg/more.py", "def again():\n    return 1\n"}};
+        ASSERT(python_expect("through the root", files, 4, "CALLS", "pkg/util.py", "helper", "Function", 1));
     }
     /* A relative form, from inside the package. */
     {
@@ -521,6 +539,16 @@ TEST(resolver_python_self_selects_through_c3_order) {
         sqlite3_finalize(statement);
         cbm_store_close(store);
         th_cleanup(root);
+    }
+    /* The proven base is a real INHERITS edge, through a reexport or a star. */
+    {
+        const python_proof_file_t files[] = {
+            {"main.py", "import pkg\nfrom pkg import Base as Named\n"
+                        "class Dotted(pkg.Base):\n    pass\nclass Aliased(Named):\n    pass\n"},
+            {"pkg/__init__.py", "from pkg.impl import *\n"},
+            {"pkg/impl.py", "__all__ = ['Base']\nclass Base:\n    pass\nclass Decoy:\n    pass\n"}};
+        ASSERT(python_expect("reexported base", files, 3, "INHERITS", "pkg/impl.py", "Base", "Class", 2));
+        ASSERT(python_expect("reexported base decoy", files, 3, "INHERITS", "pkg/impl.py", "Decoy", "Class", 0));
     }
     /* What is not certain stops the walk, and own members never depend on it. */
     {

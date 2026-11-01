@@ -59,6 +59,12 @@ void cbm_py_members_apply_decorated(const cbm_py_members_t *members,
 /* Resolve bases and compute every class's MRO once. Afterwards read-only. */
 bool cbm_py_members_seal(cbm_py_members_t *members, const cbm_py_members_env_t *env);
 
+/* The project classes a class names as bases, in source order: NULL past the end.
+ * Bases reached through reexports and star imports are included, proven the same
+ * way member lookup proves them. */
+const char *cbm_py_members_base(const cbm_py_members_t *members, const char *qualified_name,
+                                size_t offset);
+
 /* The member declaration an attribute or call occurrence selects. False when no
  * static rule applies, leaving the caller's own outcome standing. */
 bool cbm_py_members_resolve(const cbm_py_members_t *members, const cbm_py_members_env_t *env,

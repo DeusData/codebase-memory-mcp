@@ -99,6 +99,8 @@ struct py_class {
      * own attributes are unknown. */
     const struct py_class **mro;
     uint32_t mro_count, reliable;
+    const struct py_class **direct; /* resolved written bases, opaque ones included */
+    uint32_t direct_count;
     bool opaque, duplicate, visiting, sealed, intercepts, custom_new;
     /* A base here or in the ancestry is unknown and could reorder what follows. */
     bool uncertain;
@@ -1293,6 +1295,8 @@ static void py_seal_class(const py_eval_t *eval, cbm_py_members_t *members, py_c
     }
     cls->mro = mro;
     cls->mro_count = mro_count;
+    cls->direct = direct;
+    cls->direct_count = direct_count;
     uint32_t reliable = 1;
     while (reliable < mro_count && !mro[reliable]->opaque)
         reliable++;
@@ -1385,6 +1389,20 @@ bool cbm_py_members_seal(cbm_py_members_t *members, const cbm_py_members_env_t *
     py_settle_returns(&eval, members);
     cbm_arena_destroy(&scratch);
     return true;
+}
+
+const char *cbm_py_members_base(const cbm_py_members_t *members, const char *qualified_name,
+                                size_t offset) {
+    const py_class_t *cls = members ? py_class(members, qualified_name) : NULL;
+    if (!cls)
+        return NULL;
+    for (uint32_t i = 0; i < cls->direct_count; i++) {
+        if (cls->direct[i]->opaque)
+            continue;
+        if (!offset--)
+            return cls->direct[i]->qualified_name;
+    }
+    return NULL;
 }
 
 /* ── Occurrences ─────────────────────────────────────────────────────── */
