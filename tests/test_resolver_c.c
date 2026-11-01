@@ -1213,7 +1213,7 @@ TEST(resolver_c_header_prototype_binds_external_definition_through_includes) {
         C_TU_EXPECT("direct-prototype", "src/t_string.c", "t_string.setCommand",
                     "addReply(c, helper(c))", "CALLS", "src/networking.c", "networking.addReply",
                     "Function", 2, "void addReply(client *c, int obj) { c->flags = obj; }"),
-        C_TU_EXPECT("same-file-static", "src/t_string.c", "t_string.setCommand", "helper(c))",
+        C_TU_EXPECT("same-file-static", "src/t_string.c", "t_string.setCommand", "helper(c)",
                     "CALLS", "src/t_string.c", "t_string.helper", "Function", 2,
                     "static int helper(client *c) { return c->flags; }"),
         C_TU_EXPECT("header-static-inline", "src/t_string.c", "t_string.setCommand", "sdsavail(s)",
@@ -1864,6 +1864,10 @@ TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
          .site = {.file = impl, .caller = "llvm.getAsInteger", .needle = "S.size()"},
          .relation = "CALLS",
          .target = size},
+        {.case_id = "overloaded-arrow-parameter-type",
+         .site = C_TU_WORD(use_file, use, "llvm.useArrow", "useArrow(", "Arrow"),
+         .relation = "USAGE",
+         .target = arrow_type},
         {.case_id = "pointer-member-type",
          .site = C_TU_WORD(use_file, use, "llvm.usePointer", "usePointer(", "StringRef"),
          .relation = "USAGE",
@@ -1924,7 +1928,6 @@ TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
     "#define FOR_ALL_TABS(tp) for (tabpage_T *(tp) = first_tabpage; (tp); (tp) = (tp)->tp_next)\n" \
     "#define LOG_LINE(s) log_line(s)\n"                                                         \
     "void log_line(const char *s);\n"                                                           \
-    "static inline int ascii_iswhite(int c) FUNC_ATTR_CONST { return c == 32; }\n"              \
     "#endif\n"
 #define C_TU_GAPS_SOURCE                                                                        \
     "#include \"gaps.h\"\n"                                                                     \
@@ -1939,8 +1942,7 @@ TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
     "  }\n"                                                                                     \
     "  return n;\n"                                                                             \
     "}\n"                                                                                       \
-    "void use_macro(void) { LOG_LINE(\"x\"); }\n"                                               \
-    "int use_attr(int c) { return ascii_iswhite(c); }\n"
+    "void use_macro(void) { LOG_LINE(\"x\"); }\n"
 static const RQ_Source C_TU_GAPS[] = {{.path = "gaps.h", .text = C_TU_GAPS_HEADER},
                                       {.path = "gaps.c", .text = C_TU_GAPS_SOURCE},
                                       {.path = "use_gaps.c", .text = C_TU_GAPS_USE}};
@@ -1977,21 +1979,6 @@ TEST(resolver_c_known_gaps_stay_honest) {
          .tried = "A macro of the name abstains wherever it is visible, so a same-named function "
                   "never takes the edge. Binding the Macro node as a call needs a decision on "
                   "what CALLS means for a macro."},
-        {.case_id = "attribute-macro-in-header",
-         .site = {.file = "use_gaps.c", .caller = "use_gaps.use_attr", .needle = "ascii_iswhite(c)"},
-         .relation = "CALLS",
-         .target = {.file = "gaps.h",
-                    .suffix = "gaps.ascii_iswhite",
-                    .label = "Function",
-                    .declaration_line = 10,
-                    .declaration_text =
-                        "static inline int ascii_iswhite(int c) FUNC_ATTR_CONST { return c == 32; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "c-attribute-macro-definition",
-         .why = "`.h` is parsed with the C++ grammar, which reads `f(int c) ATTR {` as a broken "
-                "definition named ATTR, so the function has no graph node to bind.",
-         .tried = "Traced with a tree dump on neovim's ascii_defs.h. The proof layer emits no "
-                  "rows from the bogus definition; recovering the name belongs in extraction."},
     };
     const CTUCase fixture = {.suite = "c-tu-gaps",
                              .sources = C_TU_GAPS,
@@ -2004,7 +1991,275 @@ TEST(resolver_c_known_gaps_stay_honest) {
     PASS();
 }
 
+/* `class LLVM_ABI Name {` and `bool f(int c) ATTR_A ATTR_B {` are how real libraries export
+ * things. Each form is only valid if a word is a macro, and the parse leaves that word out.
+ * The fixture keeps the macro undefined, as an unconfigured index sees it. */
+#define C_TU_ATTR_HEADER                                                                        \
+    "#ifndef ATTR_H\n"                                                                          \
+    "#define ATTR_H\n"                                                                          \
+    "namespace llvm {\n"                                                                        \
+    "class LLVM_GSL_POINTER StringRef {\n"                                                      \
+    "public:\n"                                                                                 \
+    "  LLVM_NODISCARD int size() const { return Length; }\n"                                    \
+    "  int empty() const LLVM_READONLY { return 0; }\n"                                         \
+    "  int Length;\n"                                                                           \
+    "};\n"                                                                                      \
+    "class LLVM_ABI Derived final : public StringRef {\n"                                       \
+    "};\n"                                                                                      \
+    "LLVM_NODISCARD StringRef makeRef();\n"                                                     \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_ATTR_C_HEADER                                                                      \
+    "#ifndef ASCII_H\n"                                                                         \
+    "#define ASCII_H\n"                                                                         \
+    "static inline int ascii_iswhite(int c) FUNC_ATTR_CONST { return c == 32; }\n"              \
+    "static inline int ascii_isdigit(int c) FUNC_ATTR_CONST FUNC_ATTR_INLINE { return c > 47; }\n" \
+    "#endif\n"
+#define C_TU_ATTR_USE                                                                           \
+    "#include \"attr.h\"\n"                                                                     \
+    "namespace llvm {\n"                                                                        \
+    "int useMember(StringRef S) { return S.size(); }\n"                                         \
+    "int useTrailing(StringRef S) { return S.empty(); }\n"                                      \
+    "int useField(StringRef *S) { return S->Length; }\n"                                        \
+    "int useBase(Derived D) { return D.size(); }\n"                                             \
+    "}\n"
+#define C_TU_ATTR_C_USE                                                                         \
+    "#include \"ascii.h\"\n"                                                                    \
+    "int use_one(int c) { return ascii_iswhite(c); }\n"                                         \
+    "int use_two(int c) { return ascii_isdigit(c); }\n"
+/* `struct timeval tv { 0 };` has the words of the macro form and is a variable, and
+ * `Foo Bar f();` does not say which word is the macro, so nothing is left out. */
+#define C_TU_ATTR_DECOY                                                                         \
+    "struct timeval { int s; };\n"                                                              \
+    "struct timeval tv { 0 };\n"                                                                \
+    "int decoy_var(void) { return tv.s; }\n"
+static const RQ_Source C_TU_ATTR[] = {{.path = "attr.h", .text = C_TU_ATTR_HEADER},
+                                      {.path = "ascii.h", .text = C_TU_ATTR_C_HEADER},
+                                      {.path = "use_attr.cpp", .text = C_TU_ATTR_USE},
+                                      {.path = "use_ascii.c", .text = C_TU_ATTR_C_USE},
+                                      {.path = "decoy.cpp", .text = C_TU_ATTR_DECOY}};
+
+TEST(resolver_c_attribute_macros_do_not_hide_declarations) {
+    const char *use = C_TU_ATTR_USE;
+    const char *decoy = C_TU_ATTR_DECOY;
+    const RQ_Target size = {.file = "attr.h",
+                            .suffix = "llvm.StringRef.size",
+                            .label = "Method",
+                            .declaration_line = 6,
+                            .declaration_text =
+                                "  LLVM_NODISCARD int size() const { return Length; }"};
+    const RQ_Target empty = {.file = "attr.h",
+                             .suffix = "llvm.StringRef.empty",
+                             .label = "Method",
+                             .declaration_line = 7,
+                             .declaration_text = "  int empty() const LLVM_READONLY { return 0; }"};
+    const RQ_Target length = {.file = "attr.h",
+                              .suffix = "llvm.StringRef.Length",
+                              .label = "Field",
+                              .declaration_line = 8,
+                              .declaration_text = "  int Length;"};
+    const RQ_Target string_ref = {.file = "attr.h",
+                                  .suffix = "llvm.StringRef",
+                                  .label = "Class",
+                                  .declaration_line = 4,
+                                  .declaration_text = "class LLVM_GSL_POINTER StringRef {"};
+    const RQ_Target timeval_type = {.file = "decoy.cpp",
+                                    .suffix = "decoy.timeval",
+                                    .label = "Class",
+                                    .declaration_line = 1,
+                                    .declaration_text = "struct timeval { int s; };"};
+    const RQ_Target timeval_field = {.file = "decoy.cpp",
+                                     .suffix = "decoy.timeval.s",
+                                     .label = "Field",
+                                     .declaration_line = 1,
+                                     .declaration_text = "struct timeval { int s; };"};
+    const RQ_Target timeval_var = {.file = "decoy.cpp",
+                                   .suffix = "decoy.tv",
+                                   .label = "Variable",
+                                   .declaration_line = 2,
+                                   .declaration_text = "struct timeval tv { 0 };"};
+    (void)timeval_type;
+    const RQ_Expected expected[] = {
+        {.case_id = "class-with-attribute-macro-has-its-members",
+         .site = {.file = "use_attr.cpp", .caller = "llvm.useMember", .needle = "S.size()"},
+         .relation = "CALLS",
+         .target = size},
+        {.case_id = "trailing-attribute-macro",
+         .site = {.file = "use_attr.cpp", .caller = "llvm.useTrailing", .needle = "S.empty()"},
+         .relation = "CALLS",
+         .target = empty},
+        {.case_id = "class-with-attribute-macro-is-a-class",
+         .site = C_TU_WORD("use_attr.cpp", use, "llvm.useField", "useField(", "StringRef"),
+         .relation = "USAGE",
+         .target = string_ref},
+        {.case_id = "field-of-class-with-attribute-macro",
+         .site = C_TU_WORD("use_attr.cpp", use, "llvm.useField", "S->Length", "Length"),
+         .relation = "USAGE",
+         .target = length},
+        {.case_id = "base-class-with-attribute-macros",
+         .site = {.file = "use_attr.cpp", .caller = "llvm.useBase", .needle = "D.size()"},
+         .relation = "CALLS",
+         .target = size},
+        {.case_id = "header-definition-one-attribute",
+         .site = {.file = "use_ascii.c", .caller = "use_ascii.use_one", .needle = "ascii_iswhite(c)"},
+         .relation = "CALLS",
+         .target = {.file = "ascii.h",
+                    .suffix = "ascii.ascii_iswhite",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text =
+                        "static inline int ascii_iswhite(int c) FUNC_ATTR_CONST { return c == 32; }"}},
+        {.case_id = "header-definition-two-attributes",
+         .site = {.file = "use_ascii.c", .caller = "use_ascii.use_two", .needle = "ascii_isdigit(c)"},
+         .relation = "CALLS",
+         .target = {.file = "ascii.h",
+                    .suffix = "ascii.ascii_isdigit",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "static inline int ascii_isdigit(int c) FUNC_ATTR_CONST "
+                                        "FUNC_ATTR_INLINE { return c > 47; }"}},
+        {.case_id = "brace-initialized-variable-stays-a-variable",
+         .site = C_TU_WORD("decoy.cpp", decoy, "decoy.decoy_var", "return tv", "tv"),
+         .relation = "USAGE",
+         .target = timeval_var},
+        {.case_id = "brace-initialized-variable-member",
+         .site = C_TU_WORD("decoy.cpp", decoy, "decoy.decoy_var", "tv.s", "s"),
+         .relation = "USAGE",
+         .target = timeval_field},
+    };
+    const CTUCase fixture = {.suite = "c-tu-attr",
+                             .sources = C_TU_ATTR,
+                             .source_count = sizeof(C_TU_ATTR) / sizeof(C_TU_ATTR[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* The forms LLVM uses for its most-called names: a prototype returning a reference, a
+ * static member through its class, and a member defined out of line inside a namespace
+ * block rather than under `using namespace`. */
+#define C_TU_SCOPED_HEADER                                                                      \
+    "#ifndef OSTREAM_H\n"                                                                       \
+    "#define OSTREAM_H\n"                                                                       \
+    "namespace llvm {\n"                                                                        \
+    "class raw_ostream {\n"                                                                     \
+    "public:\n"                                                                                 \
+    "  raw_ostream &write(int x);\n"                                                            \
+    "};\n"                                                                                      \
+    "raw_ostream &errs();\n"                                                                    \
+    "class Error {\n"                                                                           \
+    "public:\n"                                                                                 \
+    "  static Error success();\n"                                                               \
+    "private:\n"                                                                                \
+    "  static Error hidden();\n"                                                                \
+    "};\n"                                                                                      \
+    "namespace detail {\n"                                                                      \
+    "class Nested {\n"                                                                          \
+    "public:\n"                                                                                 \
+    "  int outer();\n"                                                                          \
+    "private:\n"                                                                                \
+    "  int inner() const { return 1; }\n"                                                       \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_SCOPED_IMPL                                                                        \
+    "#include \"ostream.h\"\n"                                                                  \
+    "namespace llvm {\n"                                                                        \
+    "raw_ostream &errs() { static raw_ostream S; return S; }\n"                                 \
+    "raw_ostream &raw_ostream::write(int x) { return *this; }\n"                                \
+    "Error Error::success() { return hidden(); }\n"                                             \
+    "Error Error::hidden() { return Error(); }\n"                                               \
+    "namespace detail {\n"                                                                      \
+    "int Nested::outer() { return inner(); }\n"                                                 \
+    "}\n"                                                                                       \
+    "}\n"
+#define C_TU_SCOPED_USE                                                                         \
+    "#include \"ostream.h\"\n"                                                                  \
+    "using namespace llvm;\n"                                                                   \
+    "void useRef() { errs(); }\n"                                                               \
+    "void useChain() { errs().write(1); }\n"                                                    \
+    "Error useStatic() { return Error::success(); }\n"                                          \
+    "Error useHidden() { return Error::hidden(); }\n"
+static const RQ_Source C_TU_SCOPED[] = {{.path = "lib/ostream.h", .text = C_TU_SCOPED_HEADER},
+                                        {.path = "lib/ostream.cpp", .text = C_TU_SCOPED_IMPL},
+                                        {.path = "lib/use.cpp", .text = C_TU_SCOPED_USE}};
+
+TEST(resolver_cpp_reference_prototypes_and_scoped_members) {
+    const char *use = C_TU_SCOPED_USE;
+    const RQ_Target errs = {.file = "lib/ostream.cpp",
+                            .suffix = "ostream.llvm.errs",
+                            .label = "Function",
+                            .declaration_line = 3,
+                            .declaration_text =
+                                "raw_ostream &errs() { static raw_ostream S; return S; }"};
+    const RQ_Target write = {.file = "lib/ostream.cpp",
+                             .suffix = "ostream.raw_ostream.write",
+                             .label = "Method",
+                             .declaration_line = 4,
+                             .declaration_text =
+                                 "raw_ostream &raw_ostream::write(int x) { return *this; }"};
+    const RQ_Expected expected[] = {
+        {.case_id = "prototype-returning-a-reference",
+         .site = C_TU_WORD("lib/use.cpp", use, "use.useRef", "useRef", "errs()"),
+         .relation = "CALLS",
+         .target = errs},
+        {.case_id = "chain-starts-at-the-reference",
+         .site = C_TU_WORD("lib/use.cpp", use, "use.useChain", "useChain", "errs()"),
+         .relation = "CALLS",
+         .target = errs},
+        {.case_id = "member-of-the-returned-reference",
+         .site = C_TU_WORD("lib/use.cpp", use, "use.useChain", "useChain", "errs().write(1)"),
+         .relation = "CALLS",
+         .target = write},
+        {.case_id = "static-member-through-its-class",
+         .site = {.file = "lib/use.cpp", .caller = "use.useStatic", .needle = "Error::success()"},
+         .relation = "CALLS",
+         .target = {.file = "lib/ostream.cpp",
+                    .suffix = "ostream.Error.success",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text = "Error Error::success() { return hidden(); }"}},
+        {.case_id = "private-member-from-inside-its-class",
+         .site = {.file = "lib/ostream.cpp", .caller = "ostream.Error.success", .needle = "hidden()"},
+         .relation = "CALLS",
+         .target = {.file = "lib/ostream.cpp",
+                    .suffix = "ostream.Error.hidden",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text = "Error Error::hidden() { return Error(); }"}},
+        {.case_id = "out-of-line-member-inside-a-namespace-block",
+         .site = {.file = "lib/ostream.cpp", .caller = "ostream.Nested.outer", .needle = "inner()"},
+         .relation = "CALLS",
+         .target = {.file = "lib/ostream.h",
+                    .suffix = "ostream.llvm.detail.Nested.inner",
+                    .label = "Method",
+                    .declaration_line = 20,
+                    .declaration_text = "  int inner() const { return 1; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "private-static-member-from-outside",
+         .site = {.file = "lib/use.cpp", .caller = "use.useHidden", .needle = "Error::hidden()"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-scoped",
+                             .sources = C_TU_SCOPED,
+                             .source_count = sizeof(C_TU_SCOPED) / sizeof(C_TU_SCOPED[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_cpp_reference_prototypes_and_scoped_members);
+    RUN_TEST(resolver_c_attribute_macros_do_not_hide_declarations);
     RUN_TEST(resolver_c_known_gaps_stay_honest);
     RUN_TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit);
     RUN_TEST(resolver_c_header_prototype_binds_external_definition_through_includes);
