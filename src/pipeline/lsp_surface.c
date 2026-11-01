@@ -34,8 +34,10 @@
 #include "yyjson/yyjson.h"
 
 /* 3: Go defs carry their parsed result list `|`-joined in "ret" (F-G8 D1);
- * a version-2 surface holds the raw result text and must be re-extracted. */
-enum { SURFACE_CODEC_VERSION = 3 };
+ * a version-2 surface holds the raw result text and must be re-extracted.
+ * 4: Go identity aliases carry their target in "al" (#2033); a version-3
+ * surface has no alias targets and must be re-extracted. */
+enum { SURFACE_CODEC_VERSION = 4 };
 
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
@@ -394,6 +396,7 @@ static char *surface_file_to_json(const CBMFileResult *result, CBMLanguage langu
         yyjson_mut_obj_add_bool(doc, o, "ir", d->is_rust_impl_relation);
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
+        add_str_or_null(doc, o, "al", d->alias_target);
         yyjson_mut_arr_add_val(lsp, o);
     }
     yyjson_mut_obj_add_val(doc, root, "lsp", lsp);
@@ -483,10 +486,12 @@ typedef struct {
     const CBMLSPDef *all_defs;
     const int *def_starts;
     cbm_lsp_surface_row_t *rows;
+    int file_count;
+    _Atomic int next_file;
     _Atomic bool failed;
 } surface_job_t;
 
-static void surface_row_one(int i, void *arg) {
+static void surface_row_build(int i, void *arg) {
     surface_job_t *job = (surface_job_t *)arg;
     if (atomic_load_explicit(&job->failed, memory_order_relaxed)) {
         return;
@@ -526,6 +531,45 @@ static void surface_row_one(int i, void *arg) {
     }
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static cbm_lsp_surface_row_observer_fn g_row_observer;
+static void *g_row_observer_ctx;
+
+void cbm_lsp_surface_test_set_row_observer(cbm_lsp_surface_row_observer_fn observer, void *ctx) {
+    g_row_observer = observer;
+    g_row_observer_ctx = ctx;
+}
+#endif
+
+static void surface_row_one(int i, void *arg) {
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (g_row_observer) {
+        g_row_observer(i, true, g_row_observer_ctx);
+    }
+#endif
+    surface_row_build(i, arg);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (g_row_observer) {
+        g_row_observer(i, false, g_row_observer_ctx);
+    }
+#endif
+}
+
+/* The pool also runs work on its caller. Dispatch at most one coarse job per
+ * allowed participant, each stealing files, so the total active row builders
+ * cannot exceed the pipeline budget even when the caller takes a job. */
+static void surface_rows_worker(int worker, void *arg) {
+    (void)worker;
+    surface_job_t *job = arg;
+    for (;;) {
+        int i = atomic_fetch_add_explicit(&job->next_file, 1, memory_order_relaxed);
+        if (i >= job->file_count) {
+            break;
+        }
+        surface_row_one(i, job);
+    }
+}
+
 int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *project,
                                CBMFileResult **cache, const cbm_file_info_t *files, int file_count,
                                const CBMLSPDef *all_defs, const int *def_starts,
@@ -547,10 +591,16 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
         .all_defs = all_defs,
         .def_starts = def_starts,
         .rows = rows,
+        .file_count = file_count,
     };
+    atomic_init(&job.next_file, 0);
     atomic_init(&job.failed, false);
-    cbm_parallel_for(file_count, surface_row_one, &job,
-                     (cbm_parallel_for_opts_t){.max_workers = 0, .force_pthreads = false});
+    int workers = cbm_pipeline_worker_count(ctx ? ctx->pipeline : NULL);
+    if (workers > file_count) {
+        workers = file_count;
+    }
+    cbm_parallel_for(workers, surface_rows_worker, &job,
+                     (cbm_parallel_for_opts_t){.max_workers = workers, .force_pthreads = false});
     if (atomic_load_explicit(&job.failed, memory_order_relaxed)) {
         cbm_store_free_lsp_surfaces(rows, file_count); /* untouched rows are all NULL */
         return -1;
@@ -670,6 +720,7 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->is_abstract = yyjson_get_bool(yyjson_obj_get(o, "ab"));
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
+        d->alias_target = arena_str_or_null(arena, yyjson_obj_get(o, "al"));
         if (!d->qualified_name || !d->short_name || !d->label) {
             /* A def the writer could not have produced: qn/sn/label are
              * unconditionally present in build_lsp_def output. Corrupt row. */

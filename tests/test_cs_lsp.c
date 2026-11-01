@@ -1226,6 +1226,174 @@ TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site) {
     PASS();
 }
 
+/* A qualified type name resolves its qualifier as a TYPE when no namespace
+ * binds it (nested types, #2120). A using alias whose target is qualified by
+ * the alias itself (`using Loop = Loop.Inner;`) or by a mutual alias re-enters
+ * that walk through the alias step forever: each `Loop` resolves the target
+ * `Loop.Inner`, whose qualifier is `Loop` again. The walk is depth-bounded;
+ * the file must still finish and resolve its ordinary calls. */
+TEST(cslsp_cyclic_alias_qualifier_terminates) {
+    const char *src = "using Loop = Loop.Inner;\n"
+                      "using Ping = Pong.Inner;\n"
+                      "using Pong = Ping.Inner;\n"
+                      "namespace App {\n"
+                      "    public class Svc { public void Go() { } }\n"
+                      "    public class Runner {\n"
+                      "        public void Run(Loop a, Ping b) {\n"
+                      "            var x = new Loop();\n"
+                      "            var y = new Ping.Leaf();\n"
+                      "            var s = new Svc();\n"
+                      "            s.Go();\n"
+                      "        }\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_cs(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "Runner.Run", "Svc.Go") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+static const CBMDefinition *find_def_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+/* A top-level C# type records its declared namespace; "" means the global
+ * namespace and is claimed only on a clean parse. The vendored grammar does
+ * not parse a `ref partial struct` with members, and error recovery dissolves
+ * the enclosing namespace, so the types after it surface with no namespace
+ * ancestor. Those must not read as global (they would hide every imported
+ * type of the same name); unknown (NULL) keeps them out of namespace binding
+ * exactly as before global-namespace binding existed. */
+TEST(cslsp_decl_namespace_global_needs_clean_parse) {
+    CBMFileResult *clean = extract_cs("public class Loose { }\n"
+                                      "namespace Acme.Lib { public class Kept { } }\n");
+    ASSERT(clean);
+    const CBMDefinition *loose = find_def_named(clean, "Loose");
+    const CBMDefinition *kept = find_def_named(clean, "Kept");
+    ASSERT(loose && kept);
+    ASSERT(loose->decl_namespace && strcmp(loose->decl_namespace, "") == 0);
+    ASSERT(kept->decl_namespace && strcmp(kept->decl_namespace, "Acme.Lib") == 0);
+    cbm_free_result(clean);
+
+    CBMFileResult *damaged = extract_cs("namespace Acme.Lib\n"
+                                        "{\n"
+                                        "    public ref partial struct Handler\n"
+                                        "    {\n"
+                                        "        public void Append(string value) { }\n"
+                                        "    }\n"
+                                        "    public static partial class Gadget { }\n"
+                                        "}\n");
+    ASSERT(damaged);
+    const CBMDefinition *gadget = find_def_named(damaged, "Gadget");
+    ASSERT(gadget);
+    if (gadget->decl_namespace && !gadget->decl_namespace[0])
+        printf("  Gadget after a parse error claims the global namespace\n");
+    ASSERT(!gadget->decl_namespace || gadget->decl_namespace[0]);
+    cbm_free_result(damaged);
+    PASS();
+}
+
+static bool has_resolved_row(const CBMResolvedCallArray *out, const char *caller_qn,
+                             const char *callee_qn) {
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *rc = &out->items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller_qn) == 0 &&
+            strcmp(rc->callee_qn, callee_qn) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* `partial` pieces of one namespaced type are separate registry entries, so
+ * a member declared on another piece still binds (#2120). Types declared in
+ * the GLOBAL namespace carry the empty namespace, and the same simple name
+ * there is a different type per assembly across a repository (each test
+ * project's own `Helper`). They must never pool as twins: the twin probe runs
+ * before the base-class walk, so pooling bound `h.Stop()` on ToolA's Helper
+ * to the unrelated ToolB Helper instead of ToolA's own base ToolABase. Runs
+ * the production Tier-2 C# registry builder over cross-file defs. */
+TEST(cslsp_global_namespace_types_are_not_partial_twins) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {
+        {.qualified_name = "p.ToolA.Helper.Helper",
+         .short_name = "Helper",
+         .label = "Class",
+         .def_module_qn = "p.ToolA.Helper",
+         .embedded_types = "p.ToolA.Base.ToolABase",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolA.Helper.Helper.Start",
+         .short_name = "Start",
+         .label = "Method",
+         .receiver_type = "p.ToolA.Helper.Helper",
+         .def_module_qn = "p.ToolA.Helper",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolA.Base.ToolABase",
+         .short_name = "ToolABase",
+         .label = "Class",
+         .def_module_qn = "p.ToolA.Base",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolA.Base.ToolABase.Stop",
+         .short_name = "Stop",
+         .label = "Method",
+         .receiver_type = "p.ToolA.Base.ToolABase",
+         .def_module_qn = "p.ToolA.Base",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolB.Helper.Helper",
+         .short_name = "Helper",
+         .label = "Class",
+         .def_module_qn = "p.ToolB.Helper",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolB.Helper.Helper.Stop",
+         .short_name = "Stop",
+         .label = "Method",
+         .receiver_type = "p.ToolB.Helper.Helper",
+         .def_module_qn = "p.ToolB.Helper",
+         .lang = CBM_LANG_CSHARP},
+    };
+    CBMTypeRegistry *reg =
+        cbm_cs_build_cross_registry(&arena, defs, (int)(sizeof(defs) / sizeof(defs[0])));
+    ASSERT_NOT_NULL(reg);
+    /* No namespace anywhere: both Helpers and the base live in the global
+     * namespace. The caller sits in ToolA's Helper file, so `new Helper()`
+     * binds ToolA's Helper through the same-module step, independent of
+     * registration order. */
+    const char *src = "public class Helper : ToolABase { public void Start() { } }\n"
+                      "public class Caller {\n"
+                      "    public void Go() {\n"
+                      "        var h = new Helper();\n"
+                      "        h.Start();\n"
+                      "        h.Stop();\n"
+                      "    }\n"
+                      "}\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_cs_lsp_cross_with_registry(&arena, src, (int)strlen(src), "p.ToolA.Helper", reg, NULL,
+                                       0, NULL, &out);
+    const char *caller = "p.ToolA.Helper.Caller.Go";
+    bool start_own = has_resolved_row(&out, caller, "p.ToolA.Helper.Helper.Start");
+    bool stop_base = has_resolved_row(&out, caller, "p.ToolA.Base.ToolABase.Stop");
+    bool stop_twin = has_resolved_row(&out, caller, "p.ToolB.Helper.Helper.Stop");
+    if (!start_own || !stop_base || stop_twin) {
+        printf("  start_own=%d stop_base=%d stop_unrelated_global_twin=%d\n", start_own, stop_base,
+               stop_twin);
+        for (int i = 0; i < out.count; i++) {
+            printf("    %s -> %s [%s]\n", out.items[i].caller_qn ? out.items[i].caller_qn : "?",
+                   out.items[i].callee_qn ? out.items[i].callee_qn : "?",
+                   out.items[i].strategy ? out.items[i].strategy : "?");
+        }
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(start_own);
+    ASSERT_TRUE(stop_base);
+    ASSERT_FALSE(stop_twin);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────── */
 
 SUITE(cs_lsp) {
@@ -1290,4 +1458,7 @@ SUITE(cs_lsp) {
     RUN_TEST(cslsp_stringbuilder_chain);
     RUN_TEST(cslsp_httpclient_chain);
     RUN_TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site);
+    RUN_TEST(cslsp_cyclic_alias_qualifier_terminates);
+    RUN_TEST(cslsp_global_namespace_types_are_not_partial_twins);
+    RUN_TEST(cslsp_decl_namespace_global_needs_clean_parse);
 }

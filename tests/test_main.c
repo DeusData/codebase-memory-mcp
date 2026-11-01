@@ -2122,7 +2122,49 @@ static int tf_role_dispatch(tf_phase_t phase, int argc, char **argv) {
 
 const char *cbm_test_program_path;
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define TF_MSAN_MIMALLOC_OUTPUT 1
+#endif
+#endif
+
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+#include <mimalloc.h>
+#include <sanitizer/msan_interface.h>
+
+/* MSan lane only. mimalloc is deliberately left uninstrumented there
+ * (build/msan/mimalloc.o is compiled without -fsanitize=memory), so MSan never
+ * sees it write its own stack. Its text output is the one place those stack
+ * bytes reach an MSan interceptor: a message formatted in a mimalloc stack
+ * buffer arrives at fputs still carrying the shadow an earlier instrumented
+ * frame left there, and MSan reports initialized bytes as uninitialized.
+ * mimalloc 3.5.3 prints an arena-alignment fallback warning on the x86-64 MSan
+ * lane, which tripped this in the mem suite. Routing mimalloc's output through
+ * this handler marks the finished text initialized before it reaches fputs. */
+static bool tf_msan_mi_output_live;
+
+static void tf_msan_mi_output(const char *msg, void *arg) {
+    (void)arg;
+    /* Registering replays mimalloc's delayed-output buffer into the handler.
+     * Its constructor already wrote all of that to stderr before main, so the
+     * replay would only repeat it behind a stray newline: skip it. */
+    if (!tf_msan_mi_output_live || !msg) {
+        return;
+    }
+    /* Mark the text initialized before reading even its first byte. */
+    __msan_unpoison_string(msg);
+    if (!msg[0]) {
+        return;
+    }
+    (void)fputs(msg, stderr);
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef TF_MSAN_MIMALLOC_OUTPUT
+    mi_register_output(tf_msan_mi_output, NULL);
+    tf_msan_mi_output_live = true;
+#endif
     cbm_test_program_path = tf_runner_image(argc, argv);
     int role_rc = tf_role_dispatch(TF_PHASE_RAW, argc, argv);
     if (role_rc >= 0) {
