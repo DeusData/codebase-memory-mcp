@@ -1263,6 +1263,10 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
         if (is_value_field(field)) {
             return false;
         }
+        /* `cache[key] = v` reads cache and key; only the element is stored. */
+        if (ctx->language == CBM_LANG_GO && strcmp(ts_node_type(parent), "index_expression") == 0) {
+            return false;
+        }
         bool assignment =
             (spec->assignment_node_types && cbm_kind_in_set(parent, spec->assignment_node_types)) ||
             kind_in_exact_set(ts_node_type(parent), occurrence->write_nodes);
@@ -1288,6 +1292,44 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
                 return true;
             }
             return occurrence->first_named_child_is_write && named_child_contains(parent, 0, node);
+        }
+        current = parent;
+    }
+    return false;
+}
+
+/* One token, one role. type_refs carries a Go parameter, result, var or conversion type
+ * as USES_TYPE at this exact span, so it is no USAGE. A composite literal builds a value
+ * of its type. A receiver has no USES_TYPE occurrence, and USES_TYPE reads a qualified
+ * type's whole spelling, not its member token, so those stay USAGE. */
+static bool is_go_annotation_type(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if (ctx->language != CBM_LANG_GO || strcmp(ts_node_type(node), "type_identifier") != 0) {
+        return false;
+    }
+    TSNode current = node;
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    while (!ts_node_is_null(current)) {
+        TSNode parent;
+        const char *field;
+        if (!occurrence_parent(cursor, current, &parent, &field)) {
+            return false;
+        }
+        const char *kind = ts_node_type(parent);
+        if (strcmp(kind, "qualified_type") == 0 || (field && strcmp(field, "receiver") == 0)) {
+            return false;
+        }
+        if (field && (strcmp(field, "parameters") == 0 || strcmp(field, "result") == 0) &&
+            (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "method_declaration") == 0 ||
+             strcmp(kind, "method_elem") == 0)) {
+            return true;
+        }
+        if (field && strcmp(field, "type") == 0) {
+            if (strcmp(kind, "var_spec") == 0 || strcmp(kind, "type_conversion_expression") == 0) {
+                return true;
+            }
+            if (strcmp(kind, "composite_literal") == 0) {
+                return false;
+            }
         }
         current = parent;
     }
@@ -2672,7 +2714,7 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         return;
     }
     if (is_binding_occurrence(ctx, node, spec, NULL) ||
-        is_write_occurrence(ctx, node, spec, NULL)) {
+        is_write_occurrence(ctx, node, spec, NULL) || is_go_annotation_type(ctx, node, NULL)) {
         return;
     }
     char *name = reference_name(ctx, node);
@@ -2854,7 +2896,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         }
         return;
     }
-    if (!reference_node) {
+    if (!reference_node || is_go_annotation_type(ctx, node, state)) {
         return;
     }
     if (is_write_occurrence(ctx, node, spec, state)) {

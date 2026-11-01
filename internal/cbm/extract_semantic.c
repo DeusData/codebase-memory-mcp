@@ -142,7 +142,8 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 // Resolve an assignment LHS node to the bare name being written.  Handles
 // common wrappers so WRITES resolve for more languages than a raw identifier:
 //   - expression_list (Go `x = ...` desugars left to expression_list[x])
-//   - index/subscript (`cache[k] = v` → write the base var `cache`)
+//   - index/subscript (`cache[k] = v` → write the base var `cache`; in Go it stores
+//     through the operand's map or slice, so the variable is read, never rebound)
 //   - field/member/selector access (`self.total = ...`, `obj.Field = ...` →
 //     write the trailing field name `total`/`Field`)
 // Returns NULL if no simple write target can be determined.
@@ -166,6 +167,9 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
     }
     // Indexed write: write the base operand's identifier (`cache[k]` → cache).
     if (strcmp(lk, "index_expression") == 0 || strcmp(lk, "subscript_expression") == 0) {
+        if (ctx->language == CBM_LANG_GO) {
+            return NULL;
+        }
         TSNode base = ts_node_child_by_field_name(left, TS_FIELD("operand"));
         if (ts_node_is_null(base)) {
             base = ts_node_child_by_field_name(left, TS_FIELD("object"));
