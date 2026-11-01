@@ -89,6 +89,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "graph_buffer/graph_buffer.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "lsp/c_lsp.h"
+#include "lsp/oo_strict.h"
 #include "lsp/py_lsp.h"
 #include "lsp/rust_cargo.h"
 #include "macro_table.h"
@@ -4491,17 +4492,19 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
         bool pending_lsp_site = pp_has_pending_lsp_site(result);
         bool unowned_c_member = pp_has_unowned_c_member(result, lang, rel);
         /* C and C++ values, fields and written types bind in the translation unit as
-         * well, so a file with no call left to resolve can still hold those sites. The
-         * sequential route has no such filter and the two routes must agree. */
-        bool c_family_sites =
-            (lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) &&
+         * well, and the Java, Kotlin and C# strict walk binds its own fields and types, so
+         * a file with no call left to resolve can still hold those sites. The sequential
+         * route has no such filter and the two routes must agree. */
+        bool value_sites =
+            (lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+             cbm_oo_language(lang)) &&
             (result->usages.count > 0 || result->rw.count > 0 || result->type_refs.count > 0);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (((semantic_sites > 0 || pending_lsp_site) &&
                (jvm_cross_lsp || rust_workspace_cross_lsp || pending_lsp_site ||
                 qualified_lsp_sites < semantic_sites)) ||
-              unowned_c_member || c_family_sites) &&
+              unowned_c_member || value_sites) &&
              !is_generated) ||
             result->has_test_definition_owners;
 
