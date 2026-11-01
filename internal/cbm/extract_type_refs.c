@@ -401,13 +401,38 @@ static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkSta
     extract_return_type_refs(ctx, node, func_qn);
 }
 
+/* Every name of a type, wherever it is written: an annotation, a field, a heritage
+ * clause, a generic argument, `as` and `satisfies`. Declaring it is not using it,
+ * and the last segment of `Ns.Type` belongs to the whole path. */
+static void process_ts_type_name(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "nested_type_identifier") != 0 && strcmp(kind, "type_identifier") != 0) {
+        return;
+    }
+    TSNode parent = ts_node_parent(node);
+    const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    bool declaring = strcmp(parent_kind, "class_declaration") == 0 ||
+                     strcmp(parent_kind, "abstract_class_declaration") == 0 ||
+                     strcmp(parent_kind, "class") == 0 ||
+                     strcmp(parent_kind, "interface_declaration") == 0 ||
+                     strcmp(parent_kind, "type_alias_declaration") == 0;
+    if (strcmp(parent_kind, "nested_type_identifier") == 0 ||
+        strcmp(parent_kind, "type_parameter") == 0 ||
+        (declaring && ts_node_eq(node, ts_node_child_by_field_name(parent, TS_FIELD("name"))))) {
+        return;
+    }
+    add_type_ref(ctx, cbm_node_text(ctx->arena, node, ctx->source), func_qn, node);
+}
+
 void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->function_node_types || !spec->function_node_types[0]) {
         return;
     }
 
     int before = ctx->result->type_refs.count;
-    if (cbm_kind_in_set(node, spec->function_node_types)) {
+    if (ts_family(ctx->language)) {
+        process_ts_type_name(ctx, node, state->enclosing_func_qn);
+    } else if (cbm_kind_in_set(node, spec->function_node_types)) {
         extract_signature_type_refs(ctx, node, state);
     } else {
         process_body_type_ref(ctx, node, state->enclosing_func_qn);

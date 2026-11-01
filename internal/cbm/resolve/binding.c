@@ -71,6 +71,8 @@ typedef struct {
     bool invocation;
     bool jsx_component;
     bool type_position;
+    /* The `Ns` of a type annotation's `Ns.Type`: spelled as a value, used as a type. */
+    bool type_path_root;
     /* A plain `a.b.c` member read. The occurrence is `c`; `a` is what binds. */
     const char *member_path;
     /* What `this` means here, when a member assignment or literal decides it. */
@@ -2090,10 +2092,15 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
             fail_index(index, CBM_RESOLVE_ANALYSIS_UNSUPPORTED, "dynamic_namespace_effect");
         }
         if (!state.import && !declaration_name && !state.js_no_site) {
-            if (state.js_binder)
+            if (state.js_binder) {
                 note_javascript_binder(index, node, name, &state);
-            else
+            } else {
+                size_t before = index->site_count;
                 add_site(index, name, node);
+                if (index->site_count > before && parent_kind &&
+                    !strcmp(parent_kind, "nested_type_identifier"))
+                    index->sites[before].type_path_root = true;
+            }
         }
     } else if (kind_is(node, "nested_type_identifier") && !state.import) {
         size_t before = index->site_count;
@@ -4203,6 +4210,18 @@ cbm_resolve_result_t cbm_resolve_binding_local(const cbm_resolve_binding_index_t
     result.target = binding->target;
     result.candidate_count = 1;
     return cbm_resolve_binding_validate(index, name, start, end, origin, result);
+}
+
+bool cbm_resolve_binding_js_type_occurrence(const cbm_resolve_binding_index_t *index,
+                                            const char *name, uint32_t start, uint32_t end,
+                                            CBMSourceOrigin origin) {
+    if (!index || !name || origin != CBM_SOURCE_ORIGIN_RAW || !index->sites ||
+        !javascript_language(index->language))
+        return false;
+    binding_site_t key = {.name = name, .start = start, .end = end};
+    const binding_site_t *site =
+        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    return site && (site->type_position || site->type_path_root);
 }
 
 cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_index_t *index,

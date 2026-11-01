@@ -1509,6 +1509,36 @@ TEST(resolver_js_project_members_parallel) {
     return js_project_members_case(55);
 }
 
+/* USAGE means a value. Kilo's `(input: Shape) => ...` and every other written type name
+ * belongs to USES_TYPE alone, including the ones no signature carries. */
+TEST(resolver_js_project_type_names_are_uses_type_never_usage) {
+    static const js_project_file_t files[] = {
+        {"types.ts", "export interface Shape { a: string }\n"
+                     "export class Kind {}\n"
+                     "export const value = 1;\n"
+                     "export namespace Space { export type Inner = string; }\n"},
+        {"use.ts", "import { Shape, Kind, value, Space } from \"./types\";\n"
+                   "export class Holder { field: Kind; }\n"
+                   "export function annotated(a: Shape, b: Space.Inner) { return a as Shape; }\n"
+                   "export function viaTypeof(c: typeof value) { return c; }\n"
+                   "export function viaValue() { return value; }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "annotated", "types.Shape"), 1);
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "annotated", "types.Space.Inner"), 1);
+    /* A class field has no signature: the walk over type names is what finds it. */
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "use.ts", "types.Kind"), 1);
+    ASSERT_EQ(js_project_edges(&project, "USAGE", "annotated", "types.Shape"), 0);
+    ASSERT_EQ(js_project_edges(&project, "USAGE", "annotated", "types.Space"), 0);
+    ASSERT_EQ(js_project_edges(&project, "USAGE", "use.ts", "types.Kind"), 0);
+    /* `typeof value` and a plain read both name the value, so both stay USAGE. */
+    ASSERT_EQ(js_project_edges(&project, "USAGE", "viaTypeof", "types.value"), 1);
+    ASSERT_EQ(js_project_edges(&project, "USAGE", "viaValue", "types.value"), 1);
+    js_project_free(&project);
+    PASS();
+}
+
 /* package.json `type` decides a file with no module syntax of its own. */
 TEST(resolver_js_project_manifest_type_decides_a_plain_file) {
     static const js_project_file_t files[] = {
@@ -1544,6 +1574,7 @@ SUITE(resolver_binding_js) {
     RUN_TEST(resolver_js_project_typescript_sequential);
     RUN_TEST(resolver_js_project_typescript_parallel);
     RUN_TEST(resolver_js_project_manifest_type_decides_a_plain_file);
+    RUN_TEST(resolver_js_project_type_names_are_uses_type_never_usage);
     RUN_TEST(resolver_js_project_members_sequential);
     RUN_TEST(resolver_js_project_members_parallel);
     RUN_TEST(resolver_js_project_same_named_nested_functions_settle_by_span);

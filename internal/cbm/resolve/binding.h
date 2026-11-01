@@ -72,6 +72,9 @@ const cbm_resolve_js_import_t *cbm_resolve_binding_js_import(const cbm_resolve_b
 cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_index_t *,
                                                    const char *name, uint32_t start, uint32_t end,
                                                    CBMSourceOrigin origin);
+/* This occurrence names a type, in a type annotation or as its `Ns` path root. */
+bool cbm_resolve_binding_js_type_occurrence(const cbm_resolve_binding_index_t *, const char *name,
+                                            uint32_t start, uint32_t end, CBMSourceOrigin origin);
 /* The exact source lines of the declaration this occurrence lexically names. */
 bool cbm_resolve_binding_js_declaration_lines(const cbm_resolve_binding_index_t *, const char *name,
                                               uint32_t start, uint32_t end, CBMSourceOrigin origin,

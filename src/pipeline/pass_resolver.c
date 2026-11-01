@@ -3076,6 +3076,17 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
     for (int u = 0; u < result->usages.count; u++) {
         const CBMUsage *usage = &result->usages.items[u];
         const char *relation = usage->kind == CBM_USAGE_CALL_REFERENCE ? "CALL_REFERENCE" : "USAGE";
+        /* USAGE means a value. A type annotation's name is USES_TYPE, from type_refs. */
+        if (usage->kind != CBM_USAGE_CALL_REFERENCE &&
+            cbm_resolve_binding_js_type_occurrence(resolver->bindings, usage->ref_name,
+                                                   usage->site_start_byte, usage->site_end_byte,
+                                                   usage->source_origin)) {
+            if (!record_result(resolver, usage->enclosing_func_qn, usage->ref_name, relation,
+                               usage->site_start_byte, usage->site_end_byte, usage->source_origin,
+                               unresolved("usage_names_a_type"), NULL))
+                return false;
+            continue;
+        }
         const semantic_site_t *site =
             find_semantic(resolver, usage->enclosing_func_qn, usage->site_start_byte,
                           usage->site_end_byte, usage->source_origin, CBM_RESOLVED_CALL_REFERENCE);

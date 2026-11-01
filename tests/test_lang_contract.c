@@ -2638,14 +2638,7 @@ TEST(contract_edge_commonjs_require_call_resolves_issue871) {
                     .suffix = "src.bs.doThing.doThing",
                     .label = "Function",
                     .declaration_line = 1,
-                    .declaration_text = "module.exports = async function doThing({ id }) {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "commonjs_callable_export_binding_unproven",
-         .why = "CommonJS module scope, require-bound callable identity, and the exported "
-                "async function expression lack a complete source proof.",
-         .tried = "Preserved the require, module.exports assignments, destructured parameter, "
-                  "and complete invocation. ESM-only binding and JavaScript assignment/"
-                  "destructuring audit gates abstain; no local Variable is a valid substitute."},
+                    .declaration_text = "module.exports = async function doThing({ id }) {"}},
         LANG_CONTRACT_ECMA_REQUIRED};
     const RQ_Forbidden forbidden[] = {
         {.case_id = "commonjs-import-alias-is-not-call-target",
