@@ -90,7 +90,7 @@ typedef struct {
     const char **bases; /* access paths, source order */
     uint32_t base_count;
     uint64_t subscripted; /* bit per base: written Base[...] */
-    bool metaclass;       /* written metaclass=... */
+    bool metaclass;       /* written metaclass=..., or a stdlib base that replaces its body */
     bool unknown_base;    /* a base expression that has no access path */
 } cbm_resolve_python_class_t;
 

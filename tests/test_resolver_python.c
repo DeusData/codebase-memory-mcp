@@ -1060,10 +1060,23 @@ TEST(resolver_python_class_body_values_can_be_replaced) {
          "from enum import Enum\nclass A(Enum):\n    RED = Field()\ndef run():\n"
          "    return A.RED.clean()\n",
          0},
-        {"external base",
-         "from external import Base\nclass A(Base):\n    title = Field()\n    def run(self):\n"
-         "        return self.title.clean()\n",
+        /* From django's tests: rf = RequestFactory() in a unittest.TestCase is what it says. */
+        {"external base keeps it",
+         "from unittest import TestCase\nclass A(TestCase):\n    title = Field()\n"
+         "    def run(self):\n        return self.title.clean()\n",
+         1},
+        {"aliased enum",
+         "import enum as e\nclass A(e.IntEnum):\n    RED = Field()\n    def run(self):\n"
+         "        return self.RED.clean()\n",
          0},
+        {"named tuple field",
+         "from typing import NamedTuple\nclass A(NamedTuple):\n    title = Field()\n"
+         "    def run(self):\n        return self.title.clean()\n",
+         0},
+        {"a project class named Enum",
+         "from lib.enum import Enum\nclass A(Enum):\n    RED = Field()\n    def run(self):\n"
+         "        return self.RED.clean()\n",
+         1},
         {"unknown base",
          "class A(make_base()):\n    title = Field()\n    def run(self):\n"
          "        return self.title.clean()\n",
@@ -1087,8 +1100,9 @@ TEST(resolver_python_class_body_values_can_be_replaced) {
                  "class Meta(type):\n    pass\nclass Field:\n    def clean(self):\n"
                  "        return 1\n%s",
                  cases[i].body);
-        const python_proof_file_t files[] = {{"main.py", source}};
-        ASSERT(python_expect(cases[i].what, files, 1, "CALLS", "main.py", "clean", "Method", cases[i].expected));
+        const python_proof_file_t files[] = {{"main.py", source},
+                                             {"lib/enum.py", "class Enum:\n    pass\n"}};
+        ASSERT(python_expect(cases[i].what, files, 2, "CALLS", "main.py", "clean", "Method", cases[i].expected));
     }
     PASS();
 }

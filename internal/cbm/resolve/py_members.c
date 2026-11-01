@@ -778,14 +778,15 @@ static bool py_instance_attribute(const py_eval_t *eval, const py_class_t *cls, 
 }
 
 /* A metaclass or __init_subclass__ can replace what a class body assigned: a Django field
- * reads as its column value, an Enum member as the enum. A base we cannot read can bring
- * either of them along. */
+ * reads as its column value, an Enum member as the enum. A base we cannot resolve at all
+ * could be anything. An external class is taken to keep it, as unittest.TestCase keeps
+ * rf = RequestFactory(); the known exceptions from the stdlib count as a metaclass. */
 static bool py_class_body_rewritable(const py_class_t *cls) {
     if (cls->uncertain)
         return true;
     for (uint32_t i = 0; i < cls->mro_count; i++) {
         const py_class_t *entry = cls->mro[i];
-        if (entry->opaque || entry->metaclass || py_own_member(entry, "__init_subclass__"))
+        if (entry->metaclass || py_own_member(entry, "__init_subclass__"))
             return true;
     }
     return false;

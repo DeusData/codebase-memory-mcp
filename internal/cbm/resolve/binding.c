@@ -1807,6 +1807,10 @@ static void python_note_class(cbm_resolve_binding_index_t *index, TSNode node, u
         }
         if (subscripted)
             entry->subscripted |= UINT64_C(1) << entry->base_count;
+        /* These replace what the class body assigned: an Enum member reads as the enum. */
+        const char *canonical = python_import_canonical(index, chain);
+        entry->metaclass |= canonical && (!strncmp(canonical, "enum.", 5) ||
+                                          !strcmp(canonical, "typing.NamedTuple"));
         entry->bases[entry->base_count++] = chain;
     }
 }
