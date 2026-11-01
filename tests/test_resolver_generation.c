@@ -1110,6 +1110,56 @@ TEST(resolver_generation_storage_does_not_repeat_strings) {
     PASS();
 }
 
+/* An abstained row's fact is composed when stored. Sealing two identical rows must
+ * still give them one fact, as interning did, and a row at another site its own;
+ * and the stored fact must cite the row's proof as its premise. */
+TEST(resolver_generation_abstained_rows_compose_one_fact_per_site) {
+    generation_fixture_t f;
+    ASSERT(generation_fixture_init(&f));
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    cbm_resolve_record_t row = f.rows[1];
+    ASSERT_FALSE(row.emitted);
+    ASSERT_NOT_NULL(row.result.proof);
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    row.start_byte += 100;
+    row.end_byte += 100;
+    ASSERT(cbm_gbuf_record_resolution(gb, &row));
+    ASSERT(cbm_gbuf_record_resolver_file(gb, &f.file));
+    ASSERT(cbm_gbuf_resolutions_own_shared(gb));
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(generation_store(store, gb), CBM_STORE_OK);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(generation_scalar(db, "SELECT count(*) FROM resolver_occurrence_evidence", 0), 3);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(DISTINCT proof) FROM resolver_occurrence_evidence "
+                                "WHERE proof>0",
+                                0),
+              2);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_facts WHERE kind=?",
+                                CBM_PROOF_OCCURRENCE_BINDING),
+              2);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_occurrence_evidence e LEFT JOIN "
+                                "resolver_facts f ON f.project=e.project AND f.id=e.proof "
+                                "WHERE f.id IS NULL OR f.kind<>?",
+                                CBM_PROOF_OCCURRENCE_BINDING),
+              0);
+    ASSERT_EQ(generation_scalar(db,
+                                "SELECT count(*) FROM resolver_occurrence_evidence e WHERE NOT "
+                                "EXISTS (SELECT 1 FROM resolver_supports s WHERE s.project="
+                                "e.project AND s.fact=e.proof)",
+                                0),
+              0);
+    cbm_store_close(store);
+    cbm_gbuf_free(gb);
+    generation_fixture_destroy(&f);
+    PASS();
+}
+
 /* A worker that logs nothing for 15 minutes is killed as hung, and a write that
  * stores hundreds of millions of rows must not look like one. */
 static int generation_progress_lines;
@@ -1253,6 +1303,7 @@ SUITE(resolver_generation) {
     RUN_TEST(resolver_generation_views_read_back_every_stored_value);
     RUN_TEST(resolver_generation_storage_does_not_repeat_strings);
     RUN_TEST(resolver_generation_long_write_reports_progress);
+    RUN_TEST(resolver_generation_abstained_rows_compose_one_fact_per_site);
     RUN_TEST(resolver_generation_publish_keeps_the_wal_small);
     RUN_TEST(resolver_generation_persists_independent_facts_and_all_join_supports);
     RUN_TEST(resolver_generation_ids_ignore_occurrence_insertion_order);

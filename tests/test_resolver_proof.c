@@ -460,7 +460,78 @@ TEST(resolver_proof_result_snapshot_replaces_standalone_before_donation) {
     PASS();
 }
 
+/* The writer composes an abstained row's fact rather than interning a node. The
+ * two must never disagree, or a fact's id and digest would depend on which path
+ * made it. Covers a complete outcome, an incomplete premise that revokes authority,
+ * repeated premises, and an open predecessor set. */
+TEST(resolver_proof_compose_builds_what_derive_interns) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    cbm_resolve_proof_pool_t pool;
+    cbm_resolve_proof_pool_init(&pool, &arena, 0, 0, 0);
+    const cbm_resolve_proof_t *complete =
+        proof_leaf(&pool, "project.a", CBM_RESOLVE_ANALYSIS_COMPLETE);
+    const cbm_resolve_proof_t *other = proof_leaf(&pool, "project.b", CBM_RESOLVE_ANALYSIS_COMPLETE);
+    const cbm_resolve_proof_t *unknown =
+        proof_leaf(&pool, "project.c", CBM_RESOLVE_ANALYSIS_UNKNOWN);
+    ASSERT_NOT_NULL(complete);
+    ASSERT_NOT_NULL(other);
+    ASSERT_NOT_NULL(unknown);
+    cbm_resolve_proof_source_t source = {.project = "proj",
+                                         .file = "main.py",
+                                         .scope = "proj.main.f",
+                                         .content_identity = "captured-bytes",
+                                         .configuration_identity = "grammar-config-v1"};
+    cbm_resolve_proof_key_t key = {.lookup_domain = "proj.main.f",
+                                   .lookup_key = "name",
+                                   .binding_identity = "project.a",
+                                   .start_byte = 4,
+                                   .end_byte = 8,
+                                   .detail = "CALLS"};
+    cbm_resolve_result_t outcome = proof_outcome("project.a");
+    struct {
+        const cbm_resolve_proof_t *premises[2];
+        size_t count;
+        bool closed;
+    } cases[] = {{{complete, other}, 2, true},
+                 {{other, complete}, 2, true},
+                 {{complete, unknown}, 2, true},
+                 {{complete, complete}, 2, true},
+                 {{complete, NULL}, 1, true},
+                 {{complete, other}, 2, false}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const cbm_resolve_proof_t *premises[2] = {cases[i].premises[0], cases[i].premises[1]};
+        cbm_resolve_proof_view_t composed;
+        ASSERT(cbm_resolve_proof_compose(&composed, CBM_PROOF_OCCURRENCE_BINDING, &source, &key,
+                                         &outcome, premises, cases[i].count, cases[i].closed));
+        const cbm_resolve_proof_t *derived = cbm_resolve_proof_derive(
+            &pool, CBM_PROOF_OCCURRENCE_BINDING, &source, &key, &outcome, cases[i].premises,
+            cases[i].count, cases[i].closed);
+        ASSERT_NOT_NULL(derived);
+        const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(derived);
+        ASSERT_EQ(composed.fingerprint, view->fingerprint);
+        ASSERT_EQ(composed.premise_count, view->premise_count);
+        ASSERT_EQ(composed.outcome.analysis, view->outcome.analysis);
+        ASSERT_EQ(composed.outcome.binding, view->outcome.binding);
+        ASSERT_EQ(composed.outcome.facts, view->outcome.facts);
+        ASSERT_EQ(cbm_resolve_proof_view_compare(&composed, view), 0);
+    }
+    /* A different site is a different fact, by order and not only by fingerprint. */
+    const cbm_resolve_proof_t *premises[1] = {complete};
+    cbm_resolve_proof_view_t here, there;
+    ASSERT(cbm_resolve_proof_compose(&here, CBM_PROOF_OCCURRENCE_BINDING, &source, &key, &outcome,
+                                     premises, 1, true));
+    key.start_byte = 5;
+    ASSERT(cbm_resolve_proof_compose(&there, CBM_PROOF_OCCURRENCE_BINDING, &source, &key, &outcome,
+                                     premises, 1, true));
+    there.fingerprint = here.fingerprint;
+    ASSERT(cbm_resolve_proof_view_compare(&here, &there) != 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 SUITE(resolver_proof) {
+    RUN_TEST(resolver_proof_compose_builds_what_derive_interns);
     RUN_TEST(resolver_proof_standalone_context_keeps_publication_identity_unknown);
     RUN_TEST(resolver_proof_result_snapshot_replaces_standalone_before_donation);
     RUN_TEST(resolver_proof_multiple_roots_have_canonical_shared_postorder);
