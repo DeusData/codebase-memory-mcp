@@ -869,6 +869,25 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
         "def update_returned(function):\n"
         "    def inner(*args):\n        return function(*args)\n"
         "    return update_wrapper(inner, function)\n"
+        "def both_arms(function):\n"
+        "    if function:\n"
+        "        def inner(*args):\n            return function(*args)\n"
+        "    else:\n"
+        "        def inner(*args):\n            return function(*args)\n"
+        "    return wraps(function)(inner)\n"
+        "def one_arm(function):\n"
+        "    if function:\n"
+        "        def inner(*args):\n            return function(*args)\n"
+        "    else:\n"
+        "        def inner(*args):\n            return None\n"
+        "    return wraps(function)(inner)\n"
+        "def one_arm_wrapped(function):\n"
+        "    if function:\n"
+        "        @wraps(function)\n"
+        "        def inner(*args):\n            return function(*args)\n"
+        "    else:\n"
+        "        def inner(*args):\n            return None\n"
+        "    return inner\n"
         "def hands_on(function):\n    return tagged('x')(function)\n"
         "def hands_on_direct(function):\n    return same(function)\n"
         "def hands_to_bad(function):\n    return replace(function)\n"
@@ -910,13 +929,15 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
         {"@same('x')", 0},     {"@external_deco", 0},  {"@same\n@replace", 0}, {"@same\n@logged", 1},
         {"@wraps_called", 1},  {"@updates", 1},        {"@update_returned", 1},
         {"@hands_on", 1},      {"@hands_on_direct", 1}, {"@hands_to_bad", 0},
+        {"@both_arms", 1},     {"@one_arm", 0},        {"@one_arm_wrapped", 0},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char source[768];
         snprintf(source, sizeof(source),
                  "from lib.deco import same, logged, tagged, either, replace, nothing, opaque, "
                  "swallow, conditional, generated, wraps_called, updates, update_returned, "
-                 "hands_on, hands_on_direct, hands_to_bad\nfrom external import external_deco\n"
+                 "hands_on, hands_on_direct, hands_to_bad, both_arms, one_arm, one_arm_wrapped\n"
+                 "from external import external_deco\n"
                  "%s\ndef target():\n    return 1\ndef run():\n    return target()\n",
                  cases[i].decorator);
         const python_proof_file_t files[] = {{"main.py", source}, decorators};

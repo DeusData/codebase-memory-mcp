@@ -1135,30 +1135,6 @@ static bool python_block_always_exits(TSNode block, unsigned depth) {
     return has_else;
 }
 
-/* The def named `name` in this function's own body, outside nested scopes. */
-static TSNode python_local_def(cbm_resolve_binding_index_t *index, TSNode node, const char *name,
-                               unsigned depth) {
-    if (ts_node_is_null(node) || depth > 24)
-        return (TSNode){0};
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
-        TSNode function = python_function_of(child);
-        if (!ts_node_is_null(function)) {
-            const char *text = node_text(index, field(function, "name"));
-            if (text && !strcmp(text, name))
-                return function;
-            continue;
-        }
-        if (kind_is(child, "class_definition") || kind_is(child, "lambda") ||
-            kind_is(child, "expression_statement") || kind_is(child, "return_statement"))
-            continue;
-        TSNode found = python_local_def(index, child, name, depth + 1);
-        if (!ts_node_is_null(found))
-            return found;
-    }
-    return (TSNode){0};
-}
-
 static bool python_calls_name(cbm_resolve_binding_index_t *index, TSNode node, const char *name,
                               unsigned depth) {
     if (ts_node_is_null(node) || depth > 48)
@@ -1232,6 +1208,62 @@ static unsigned python_decorator_shape(cbm_resolve_binding_index_t *index, TSNod
     return failed ? 0 : shape;
 }
 
+typedef bool (*python_def_check_t)(cbm_resolve_binding_index_t *, TSNode, const char *, unsigned);
+
+static bool python_def_calls(cbm_resolve_binding_index_t *index, TSNode function, const char *fn,
+                             unsigned depth) {
+    (void)depth;
+    return python_calls_name(index, field(function, "body"), fn, 0);
+}
+
+static bool python_def_wraps(cbm_resolve_binding_index_t *index, TSNode function, const char *fn,
+                             unsigned depth) {
+    (void)depth;
+    return python_wrapper_of(index, function, fn);
+}
+
+static bool python_def_decorates(cbm_resolve_binding_index_t *index, TSNode function,
+                                 const char *fn, unsigned depth) {
+    (void)fn;
+    return python_decorator_shape(index, function, depth) & CBM_PY_SHAPE_DIRECT;
+}
+
+static bool python_walk_local_defs(cbm_resolve_binding_index_t *index, TSNode node,
+                                   const char *name, const char *fn, python_def_check_t check,
+                                   unsigned check_depth, unsigned *found, unsigned depth) {
+    if (ts_node_is_null(node) || depth > 24)
+        return false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+        TSNode child = ts_node_named_child(node, i);
+        TSNode function = python_function_of(child);
+        if (!ts_node_is_null(function)) {
+            const char *text = node_text(index, field(function, "name"));
+            if (text && !strcmp(text, name)) {
+                (*found)++;
+                if (!check(index, function, fn, check_depth))
+                    return false;
+            }
+            continue;
+        }
+        if (kind_is(child, "class_definition") || kind_is(child, "lambda") ||
+            kind_is(child, "expression_statement") || kind_is(child, "return_statement"))
+            continue;
+        if (!python_walk_local_defs(index, child, name, fn, check, check_depth, found, depth + 1))
+            return false;
+    }
+    return true;
+}
+
+/* The defs of `name` in this function's own body, outside nested scopes. Either arm
+ * of a conditional pair can be the one bound at run time, so every def has to pass. */
+static bool python_local_defs_pass(cbm_resolve_binding_index_t *index, TSNode body,
+                                   const char *name, const char *fn, python_def_check_t check,
+                                   unsigned check_depth) {
+    unsigned found = 0;
+    return name && python_walk_local_defs(index, body, name, fn, check, check_depth, &found, 0) &&
+           found;
+}
+
 static bool python_is_parameter(cbm_resolve_binding_index_t *index, TSNode node,
                                 const char *parameter) {
     const char *text = parameter && kind_is(node, "identifier") ? node_text(index, node) : NULL;
@@ -1289,22 +1321,20 @@ static void python_classify_call_return(cbm_resolve_binding_index_t *index, TSNo
     TSNode body = field(owner, "body"), callee = field(value, "function");
     const char *name = kind_is(callee, "identifier") ? node_text(index, callee) : NULL;
     /* decorator(func), the both-ways form: a local decorator applied here. */
-    TSNode local = name ? python_local_def(index, body, name, 0) : (TSNode){0};
-    if (!ts_node_is_null(local) &&
-        (python_decorator_shape(index, local, depth + 1) & CBM_PY_SHAPE_DIRECT)) {
+    if (python_local_defs_pass(index, body, name, NULL, python_def_decorates, depth + 1)) {
         *shape |= CBM_PY_SHAPE_DIRECT;
         return;
     }
     TSNode first = python_call_argument(value, 0);
     const char *first_name = kind_is(first, "identifier") ? node_text(index, first) : NULL;
-    TSNode wrapper = first_name ? python_local_def(index, body, first_name, 0) : (TSNode){0};
+    bool wrapper_calls = parameter && python_local_defs_pass(index, body, first_name, parameter,
+                                                             python_def_calls, 0);
     /* wraps(fn)(g) and update_wrapper(g, fn): g calls fn. */
     if (kind_is(callee, "call")) {
         const char *outer = python_chain(index, field(callee, "function"), 0);
         const char *imported = outer ? python_import_canonical(index, outer) : NULL;
-        if (imported && !strcmp(imported, "functools.wraps") && !ts_node_is_null(wrapper) &&
-            python_is_parameter(index, python_call_argument(callee, 0), parameter) &&
-            python_calls_name(index, field(wrapper, "body"), parameter, 0)) {
+        if (imported && !strcmp(imported, "functools.wraps") && wrapper_calls &&
+            python_is_parameter(index, python_call_argument(callee, 0), parameter)) {
             *shape |= CBM_PY_SHAPE_DIRECT;
             return;
         }
@@ -1316,9 +1346,8 @@ static void python_classify_call_return(cbm_resolve_binding_index_t *index, TSNo
     }
     const char *spelled = python_chain(index, callee, 0);
     const char *imported = spelled ? python_import_canonical(index, spelled) : NULL;
-    if (imported && !strcmp(imported, "functools.update_wrapper") && !ts_node_is_null(wrapper) &&
-        python_is_parameter(index, python_call_argument(value, 1), parameter) &&
-        python_calls_name(index, field(wrapper, "body"), parameter, 0)) {
+    if (imported && !strcmp(imported, "functools.update_wrapper") && wrapper_calls &&
+        python_is_parameter(index, python_call_argument(value, 1), parameter)) {
         *shape |= CBM_PY_SHAPE_DIRECT;
         return;
     }
@@ -1338,18 +1367,14 @@ static void python_classify_return(cbm_resolve_binding_index_t *index, TSNode va
             *shape |= CBM_PY_SHAPE_DIRECT;
             return;
         }
-        TSNode local = name ? python_local_def(index, body, name, 0) : (TSNode){0};
-        if (ts_node_is_null(local)) {
-            *failed = true;
-            return;
-        }
-        if (parameter && (python_wrapper_of(index, local, parameter) ||
-                          (python_body_updates_wrapper(index, body, name, parameter, 0) &&
-                           python_calls_name(index, field(local, "body"), parameter, 0)))) {
+        if (parameter &&
+            (python_local_defs_pass(index, body, name, parameter, python_def_wraps, 0) ||
+             (python_body_updates_wrapper(index, body, name, parameter, 0) &&
+              python_local_defs_pass(index, body, name, parameter, python_def_calls, 0)))) {
             *shape |= CBM_PY_SHAPE_DIRECT;
             return;
         }
-        if (python_decorator_shape(index, local, depth + 1) & CBM_PY_SHAPE_DIRECT)
+        if (python_local_defs_pass(index, body, name, NULL, python_def_decorates, depth + 1))
             *shape |= CBM_PY_SHAPE_FACTORY;
         else
             *failed = true;
