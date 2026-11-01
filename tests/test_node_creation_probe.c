@@ -1023,12 +1023,7 @@ TEST(probe_kotlin_data_class) {
                     .suffix = "anonymous",
                     .declaration_line = 5,
                     .declaration_text = "        fun anonymous(): User = User(\"anon\", 0)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-data-companion-receiver",
-         .why = "Data-class construction, companion lookup and factory-result receiver propagation "
-                "exceed the audited direct ordinary-class subset.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+         .mode = RQ_REQUIRED},
         {.case_id = "probe_kotlin_data_class-2",
          .site =
              {.file = "User.kt", .caller = "demo", .needle = "u.greet()", .occurrence_index = 0},
@@ -1037,12 +1032,7 @@ TEST(probe_kotlin_data_class) {
                     .suffix = "greet",
                     .declaration_line = 2,
                     .declaration_text = "    fun greet(): String = \"Hi, I'm ${name}\""},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-data-companion-receiver",
-         .why = "Data-class construction, companion lookup and factory-result receiver propagation "
-                "exceed the audited direct ordinary-class subset.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+         .mode = RQ_REQUIRED}};
     NcpMetrics m = ncp_metrics_quality("User.kt",
                                        "data class User(val name: String, val age: Int) {\n"
                                        "    fun greet(): String = \"Hi, I'm ${name}\"\n\n"
@@ -1144,12 +1134,7 @@ TEST(probe_cs_class_methods) {
                     .suffix = "Add",
                     .declaration_line = 5,
                     .declaration_text = "        public int Add(int x) { return offset + x; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-field-constructor-owner-domain",
-         .why = "The field and constructor exclude this class from the method-only complete-owner "
-                "audit; the outer nested call also needs return-type propagation.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+         .mode = RQ_REQUIRED},
         {.case_id = "probe_cs_class_methods-2",
          .site = {.file = "Calc.cs", .caller = "Double", .needle = "Add(x)", .occurrence_index = 0},
          .relation = "CALLS",
@@ -1157,12 +1142,7 @@ TEST(probe_cs_class_methods) {
                     .suffix = "Add",
                     .declaration_line = 5,
                     .declaration_text = "        public int Add(int x) { return offset + x; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-field-constructor-owner-domain",
-         .why = "The field and constructor exclude this class from the method-only complete-owner "
-                "audit; the outer nested call also needs return-type propagation.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+         .mode = RQ_REQUIRED}};
     NcpMetrics m = ncp_metrics_quality("Calc.cs",
                                        "namespace App {\n"
                                        "    class Calc {\n"

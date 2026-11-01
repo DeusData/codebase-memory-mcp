@@ -4409,7 +4409,6 @@ static const cbm_gbuf_node_t *resolve_ancestor_lib_file(const cbm_pipeline_ctx_t
                                                         const char *source_rel,
                                                         const char *relative) {
     char *directory = path_dirname(source_rel ? source_rel : "");
-    const cbm_gbuf_node_t *found = NULL;
     char current[PKGMAP_PATH_BUF];
     int length = directory ? snprintf(current, sizeof(current), "%s", directory) : -1;
     cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
@@ -4421,7 +4420,8 @@ static const cbm_gbuf_node_t *resolve_ancestor_lib_file(const cbm_pipeline_ctx_t
                           ? snprintf(path, sizeof(path), "%s/lib/%s", current, relative)
                           : snprintf(path, sizeof(path), "lib/%s", relative);
         if (written > 0 && (size_t)written < sizeof(path)) {
-            found = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+            const cbm_gbuf_node_t *found =
+                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
             if (found)
                 return found;
         }
@@ -5077,11 +5077,13 @@ bool cbm_pipeline_go_import_owned(const cbm_pipeline_ctx_t *ctx, const char *sou
         return !strcmp(source_module, target_module);
     /* The source module's own directive decides first: `go` resolves that way when the
      * module is built on its own, and a replacement names exactly one directory. */
-    char old[PKGMAP_PATH_BUF], directory[PKGMAP_PATH_BUF], mapped[PKGMAP_PATH_BUF];
+    char old[PKGMAP_PATH_BUF], directory[PKGMAP_PATH_BUF];
     if (go_module_replacement(ctx, source_owner, import->module_path, old, directory,
-                              sizeof(directory)))
+                              sizeof(directory))) {
+        char mapped[PKGMAP_PATH_BUF];
         return cbm_repo_rel_join(source_owner, directory, mapped, sizeof(mapped)) &&
                !strcmp(mapped, target_owner) && !strcmp(old, target_module);
+    }
     return go_workspace_lists(ctx, source_owner, target_owner);
 }
 

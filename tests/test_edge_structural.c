@@ -842,12 +842,7 @@ TEST(es_calls_crossfile_csharp) {
                     .declaration_line = 3,
                     .declaration_text =
                         "        public static int Square(int x) { return x * x; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-internal-class-assembly-context",
-         .why = "Namespace equality does not establish internal accessibility across assembly "
-                "boundaries.",
-         .tried =
-             "Preserved the internal-class source and added an exact public-class counterpart."}};
+         .mode = RQ_REQUIRED}};
     ASSERT_TRUE(es_binding_venues(f, 2, "csharp-internal-assembly", uncertain, 1, NULL, 0));
     static const ES_LangFile visible[] = {
         {"Util.cs", "namespace App {\npublic class Util {\n"
@@ -1606,12 +1601,7 @@ TEST(es_usage_crossfile_go) {
                     .label = "Struct",
                     .declaration_line = 3,
                     .declaration_text = "type Config struct {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "go-parameter-type-projection",
-         .why = "A parameter annotation is a type use; the current Go bridge has no USES_TYPE "
-                "projection.",
-         .tried = "Preserved the source and replaced the aggregate USAGE floor with an exact type "
-                  "obligation."}};
+         .mode = RQ_REQUIRED}};
     static const RQ_Forbidden forbidden[] = {
         {.case_id = "annotation-is-not-value-usage",
          .site = {.file = "main.go", .caller = "Create", .needle = "Config"},

@@ -12652,16 +12652,7 @@ static bool python_module_init_sequential_quality(cbm_store_t *store, const char
                     .suffix = "pkg.helper.compute",
                     .declaration_line = 1,
                     .declaration_text = "def compute(value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PYTHON-INITIALIZED-SUBMODULE-ATTRIBUTE",
-         .why =
-             "The explicit initializer import binds compute and initializes pkg.helper, but the "
-             "shared export solver does not prove the implicit parent-module attribute installed "
-             "by that import. The closed-submodule rule requires an inert parent initializer.",
-         .tried = "Preserved from pkg import helper and the initializer from .helper import "
-                  "compute, with the exact pkg/helper.py declaration in sequential and parallel "
-                  "fixtures. The export audit records compute only; parent-namespace closure "
-                  "rejects the effectful initializer. Bare local calls remain required."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.module-init.bare-control",
          .site = {.file = "caller.py",
                   .caller = "caller.bare_call",
@@ -16974,42 +16965,6 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                   .end_byte = 69},
          .relation = "USAGE",
          .any_target = true},
-        {.case_id = "c.field.unconfigured-alpha-branch",
-         /* The fixture supplies no compile configuration selecting SOME_CONFIG or proving
-            NO_GLOBALS absent; binding availability is not established. */
-         .site = {.file = "guarded.c",
-                  .caller = "guarded.guarded_alpha",
-                  .start_byte = 108,
-                  .end_byte = 113},
-         .relation = "USAGE",
-         .any_target = true},
-        {.case_id = "c.field.unconfigured-beta-branch",
-         /* The fixture supplies no compile configuration selecting SOME_CONFIG or proving
-            NO_GLOBALS absent; binding availability is not established. */
-         .site = {.file = "guarded.c",
-                  .caller = "guarded.guarded_beta",
-                  .start_byte = 165,
-                  .end_byte = 170},
-         .relation = "USAGE",
-         .any_target = true},
-        {.case_id = "c.field.unconfigured-alpha-global",
-         /* The fixture supplies no compile configuration selecting SOME_CONFIG or proving
-            NO_GLOBALS absent; binding availability is not established. */
-         .site = {.file = "globals.c",
-                  .caller = "globals.read_alpha_global",
-                  .start_byte = 163,
-                  .end_byte = 168},
-         .relation = "USAGE",
-         .any_target = true},
-        {.case_id = "c.field.unconfigured-beta-global",
-         /* The fixture supplies no compile configuration selecting SOME_CONFIG or proving
-            NO_GLOBALS absent; binding availability is not established. */
-         .site = {.file = "globals.c",
-                  .caller = "globals.read_beta_global",
-                  .start_byte = 220,
-                  .end_byte = 225},
-         .relation = "USAGE",
-         .any_target = true},
     };
     RQ_Source sources[sizeof(files) / sizeof(files[0])] = {0};
     bool loaded = true;
@@ -18310,16 +18265,7 @@ static bool python_module_init_parallel_quality(cbm_store_t *store, const char *
                     .suffix = "pkg.helper.compute",
                     .declaration_line = 1,
                     .declaration_text = "def compute(value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PYTHON-INITIALIZED-SUBMODULE-ATTRIBUTE",
-         .why =
-             "The explicit initializer import binds compute and initializes pkg.helper, but the "
-             "shared export solver does not prove the implicit parent-module attribute installed "
-             "by that import. The closed-submodule rule requires an inert parent initializer.",
-         .tried = "Preserved from pkg import helper and the initializer from .helper import "
-                  "compute, with the exact pkg/helper.py declaration in sequential and parallel "
-                  "fixtures. The export audit records compute only; parent-namespace closure "
-                  "rejects the effectful initializer. Bare local calls remain required."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.module-init.parallel.bare-control",
          .site = {.file = "caller.py",
                   .caller = "caller.train",
@@ -18805,13 +18751,7 @@ static bool python_dunder_quality(cbm_store_t *store, const char *project, const
                     .suffix = "alpha.Alpha.__add__",
                     .declaration_line = 2,
                     .declaration_text = "    def __add__(self, other):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PYTHON-ARGUMENT-BEARING-METHOD-PROOF",
-         .why = "The Python member proof bridge currently admits zero ordinary arguments only; "
-                "this explicit typed call has one argument.",
-         .tried = "Preserved the Alpha annotation, exact __add__ declaration, and separate "
-                  "visible.py call. pyp_expression refuses argument-bearing member invocations; an "
-                  "ordinary lexical control is required in a different file."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.dunder.operator-call",
          .site = {.file = "combine.py",
                   .caller = "combine.combine",
@@ -21986,13 +21926,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "plain.Field.clean",
                     .declaration_line = 6,
                     .declaration_text = "    def clean(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-IMPLICIT-SELF-METHOD-PROOF",
-         .why = "The source adapter does not seed an implicit self receiver or prove "
-                "argument-bearing member invocation.",
-         .tried = "The original class/method declarations and value argument remain; pyp_function "
-                  "only declares explicitly typed parameters and pyp_expression only admits "
-                  "zero-argument member calls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-plain-inherited-validate",
          .site = {.file = "plain.py",
                   .caller = "plain.BooleanField.to_python",
@@ -22003,13 +21937,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "plain.Field.validate",
                     .declaration_line = 8,
                     .declaration_text = "    def validate(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-INHERITED-MEMBER-PROOF",
-         .why = "Inherited member lookup requires a completed receiver and method-resolution-order "
-                "proof.",
-         .tried = "The original Field/BooleanField hierarchy and exact method target remain; "
-                  "pyp_class_facts marks classes with bases incomplete. Existing INHERITS and "
-                  "lexical helper assertions still gate."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-plain-python-helper",
          .site = {.file = "plain.py",
                   .caller = "plain.BooleanField.to_python",
@@ -22043,13 +21971,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "plain.BooleanField.to_python",
                     .declaration_line = 11,
                     .declaration_text = "    def to_python(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-INHERITED-MEMBER-PROOF",
-         .why = "Inherited member lookup requires a completed receiver and method-resolution-order "
-                "proof.",
-         .tried = "The original Field/BooleanField hierarchy and exact method target remain; "
-                  "pyp_class_facts marks classes with bases incomplete. Existing INHERITS and "
-                  "lexical helper assertions still gate."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-plain-build-helper",
          .site = {.file = "plain.py",
                   .caller = "plain.build",
@@ -22093,13 +22015,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "pkg.Field.clean",
                     .declaration_line = 6,
                     .declaration_text = "    def clean(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-IMPLICIT-SELF-METHOD-PROOF",
-         .why = "The source adapter does not seed an implicit self receiver or prove "
-                "argument-bearing member invocation.",
-         .tried = "The original class/method declarations and value argument remain; pyp_function "
-                  "only declares explicitly typed parameters and pyp_expression only admits "
-                  "zero-argument member calls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-pkg-inherited-validate",
          .site = {.file = "pkg/__init__.py",
                   .caller = "pkg.BooleanField.to_python",
@@ -22110,13 +22026,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "pkg.Field.validate",
                     .declaration_line = 8,
                     .declaration_text = "    def validate(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-INHERITED-MEMBER-PROOF",
-         .why = "Inherited member lookup requires a completed receiver and method-resolution-order "
-                "proof.",
-         .tried = "The original Field/BooleanField hierarchy and exact method target remain; "
-                  "pyp_class_facts marks classes with bases incomplete. Existing INHERITS and "
-                  "lexical helper assertions still gate."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-pkg-python-helper",
          .site = {.file = "pkg/__init__.py",
                   .caller = "pkg.BooleanField.to_python",
@@ -22150,13 +22060,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "pkg.BooleanField.to_python",
                     .declaration_line = 11,
                     .declaration_text = "    def to_python(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-INHERITED-MEMBER-PROOF",
-         .why = "Inherited member lookup requires a completed receiver and method-resolution-order "
-                "proof.",
-         .tried = "The original Field/BooleanField hierarchy and exact method target remain; "
-                  "pyp_class_facts marks classes with bases incomplete. Existing INHERITS and "
-                  "lexical helper assertions still gate."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-pkg-build-helper",
          .site = {.file = "pkg/__init__.py",
                   .caller = "pkg.build",
@@ -22190,13 +22094,7 @@ static bool python_init_receiver_quality(cbm_store_t *store, const char *project
                     .suffix = "pkg.BooleanField.to_python",
                     .declaration_line = 11,
                     .declaration_text = "    def to_python(self, value):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-INHERITED-MEMBER-PROOF",
-         .why = "Inherited member lookup requires a completed receiver and method-resolution-order "
-                "proof.",
-         .tried = "The original Field/BooleanField hierarchy and exact method target remain; "
-                  "pyp_class_facts marks classes with bases incomplete. Existing INHERITS and "
-                  "lexical helper assertions still gate."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.init-consumer-helper",
          .site = {.file = "consumer.py",
                   .caller = "consumer.consume",
@@ -22632,13 +22530,7 @@ static bool python_field_receiver_quality(cbm_store_t *store, const char *projec
                     .suffix = "contracts.Contract.process_batch",
                     .declaration_line = 2,
                     .declaration_text = "    def process_batch(self) -> None:"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-ANNOTATED-FIELD-RECEIVER-PROOF",
-         .why = "A source annotation or constructor parameter has not been transferred into a "
-                "proved instance-field receiver fact.",
-         .tried = "The original annotated constructor, annotated assignment and class field are "
-                  "retained; pyp_member accepts only identifier receivers, while field reads and "
-                  "self assignments do not donate a type fact."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.field-annotated",
          .site = {.file = "loop.py",
                   .caller = "loop.run_typed",
@@ -22649,13 +22541,7 @@ static bool python_field_receiver_quality(cbm_store_t *store, const char *projec
                     .suffix = "contracts.Contract.process_batch",
                     .declaration_line = 2,
                     .declaration_text = "    def process_batch(self) -> None:"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-ANNOTATED-FIELD-RECEIVER-PROOF",
-         .why = "A source annotation or constructor parameter has not been transferred into a "
-                "proved instance-field receiver fact.",
-         .tried = "The original annotated constructor, annotated assignment and class field are "
-                  "retained; pyp_member accepts only identifier receivers, while field reads and "
-                  "self assignments do not donate a type fact."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.field-class",
          .site = {.file = "loop.py",
                   .caller = "loop.run_classlevel",
@@ -22666,13 +22552,7 @@ static bool python_field_receiver_quality(cbm_store_t *store, const char *projec
                     .suffix = "contracts.Contract.process_batch",
                     .declaration_line = 2,
                     .declaration_text = "    def process_batch(self) -> None:"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-ANNOTATED-FIELD-RECEIVER-PROOF",
-         .why = "A source annotation or constructor parameter has not been transferred into a "
-                "proved instance-field receiver fact.",
-         .tried = "The original annotated constructor, annotated assignment and class field are "
-                  "retained; pyp_member accepts only identifier receivers, while field reads and "
-                  "self assignments do not donate a type fact."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.field-make-control",
          .site = {.file = "trainer.py",
                   .caller = "trainer.Trainer.__init__",
@@ -22825,13 +22705,7 @@ static bool python_typechecking_receiver_quality(cbm_store_t *store, const char 
                     .suffix = "contracts.Contract.process_batch",
                     .declaration_line = 2,
                     .declaration_text = "    def process_batch(self) -> None:"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-TYPE-CHECKING-FIELD-PROOF",
-         .why = "Annotation-only imports and instance-field transfer require a separate proved "
-                "type namespace.",
-         .tried = "Both original TYPE_CHECKING imports and postponed annotations remain; the "
-                  "runtime Trainer() namesake is forbidden, and no runtime import proof is "
-                  "manufactured from an annotation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.typechecking-lexical-control",
          .site = {.file = "quality_control.py",
                   .caller = "quality_control.control",
@@ -22982,13 +22856,7 @@ static bool python_dotted_receiver_quality(cbm_store_t *store, const char *proje
                     .suffix = "pkg.mod.nodes.Context.__init__",
                     .declaration_line = 2,
                     .declaration_text = "    def __init__(self, line=-1):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.dotted-self",
          .site = {.file = "pkg/types.py",
                   .caller = "pkg.types.DottedType.run",
@@ -22999,13 +22867,7 @@ static bool python_dotted_receiver_quality(cbm_store_t *store, const char *proje
                     .suffix = "pkg.mod.nodes.Context.ctx_only_helper",
                     .declaration_line = 5,
                     .declaration_text = "    def ctx_only_helper(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.dotted-super",
          .site = {.file = "pkg/types.py",
                   .caller = "pkg.types.DottedType.describe",
@@ -23016,13 +22878,7 @@ static bool python_dotted_receiver_quality(cbm_store_t *store, const char *proje
                     .suffix = "pkg.mod.nodes.Context.describe",
                     .declaration_line = 8,
                     .declaration_text = "    def describe(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.dotted-plain",
          .site = {.file = "pkg/types.py",
                   .caller = "pkg.types.PlainType.run",
@@ -23033,13 +22889,7 @@ static bool python_dotted_receiver_quality(cbm_store_t *store, const char *proje
                     .suffix = "pkg.mod.nodes.Context.ctx_only_helper",
                     .declaration_line = 5,
                     .declaration_text = "    def ctx_only_helper(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.dotted-lexical-control",
          .site = {.file = "quality_control.py",
                   .caller = "quality_control.control",
@@ -23315,13 +23165,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Explicit:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_explicit_cls",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.attr_explicit_fn",
      .site = {.file = "app/main.py",
               .caller = "app.main.attr_explicit_fn",
@@ -23333,13 +23177,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Function",
                 .declaration_line = 5,
                 .declaration_text = "def explicit_fn():"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_explicit_fn",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.attr_star_cls",
      .site = {.file = "app/main.py",
               .caller = "app.main.attr_star_cls",
@@ -23351,13 +23189,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Star:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_star_cls",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.attr_star_fn",
      .site = {.file = "app/main.py",
               .caller = "app.main.attr_star_fn",
@@ -23369,13 +23201,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Function",
                 .declaration_line = 5,
                 .declaration_text = "def star_fn():"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_star_fn",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.attr_all_listed",
      .site = {.file = "app/main.py",
               .caller = "app.main.attr_all_listed",
@@ -23387,13 +23213,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 4,
                 .declaration_text = "class Listed:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_all_listed",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.attr_chain",
      .site = {.file = "app/main.py",
               .caller = "app.main.attr_chain",
@@ -23405,13 +23225,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Deep:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_chain",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.attr_renamed",
      .site = {.file = "app/main.py",
               .caller = "app.main.attr_renamed",
@@ -23423,13 +23237,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Orig:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.attr_renamed",
-     .why = "The parent from-import lacks a closed attribute-absence proof in this corpus with "
-            "module loads and namespace escapes.",
-     .tried = "The explicit re-export and target declaration were audited; the loaded-child and "
-              "unknown-effect barriers conservatively block package binding. Exact module-import "
-              "controls are required by pipeline_python_explicit_package_reexports_keep_identity."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.from_explicit",
      .site = {.file = "app/main.py",
               .caller = "app.main.from_explicit",
@@ -23441,17 +23249,12 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Explicit:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.from_explicit",
-     .why = "Ordered wildcard re-exports have no complete per-name binding proof after the later "
-            "star imports.",
-     .tried = "The explicit source declarations and star-import order were audited; the binding "
-              "index treats earlier names as blocked at a wildcard barrier."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.from_star_fn",
      .site = {.file = "app/main.py",
               .caller = "app.main.from_star_fn",
               .needle = "star_fn()",
-              .occurrence_index = 2},
+              .occurrence_index = 3},
      .relation = "CALLS",
      .target = {.file = "app/pkg/star_mod.py",
                 .suffix = "app.pkg.star_mod.star_fn",
@@ -23475,12 +23278,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 4,
                 .declaration_text = "class Listed:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.from_all_listed",
-     .why = "Ordered wildcard re-exports have no complete per-name binding proof after the later "
-            "star imports.",
-     .tried = "The explicit source declarations and star-import order were audited; the binding "
-              "index treats earlier names as blocked at a wildcard barrier."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.from_chain",
      .site = {.file = "app/main.py",
               .caller = "app.main.from_chain",
@@ -23492,12 +23290,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Deep:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.from_chain",
-     .why = "Ordered wildcard re-exports have no complete per-name binding proof after the later "
-            "star imports.",
-     .tried = "The explicit source declarations and star-import order were audited; the binding "
-              "index treats earlier names as blocked at a wildcard barrier."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.from_renamed",
      .site = {.file = "app/main.py",
               .caller = "app.main.from_renamed",
@@ -23557,13 +23350,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 4,
                 .declaration_text = "class CharField:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.sub_models",
-     .why = "The nested package depends on a wildcard export whose literal __all__ membership "
-            "lacks complete binding proof.",
-     .tried =
-         "The absolute fields import and literal CharField whitelist identify the declaration; "
-         "fixing the parent submodule binding alone cannot supply the absent star-export proof."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.chain_var_constructor",
      .site = {.file = "app/main.py",
               .caller = "app.main.chain_var",
@@ -23575,13 +23362,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Deep:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.chain_var_constructor",
-     .why = "The package requires exact submodule binding plus ordered wildcard re-export proof "
-            "for this name.",
-     .tried = "The exact submodule path and declaration were audited; the parent from-import needs "
-              "absence-checked submodule binding, and the package stars lack complete per-name "
-              "export facts."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.chain_var_method",
      .site = {.file = "app/main.py",
               .caller = "app.main.chain_var",
@@ -23593,12 +23374,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Method",
                 .declaration_line = 2,
                 .declaration_text = "    def dive(self):"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.chain_var_method",
-     .why = "The receiver type cannot be established through the unresolved package-attribute "
-            "constructor.",
-     .tried = "The local assignment and exact dive declaration were audited; constructor binding "
-              "must be proved before its class type can flow into x."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.ctl_from_cls",
      .site = {.file = "app/main.py",
               .caller = "app.main.ctl_from_cls",
@@ -23634,13 +23410,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Doc:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.doc_reexport",
-     .why = "The parent from-import lacks a closed attribute-absence proof in this corpus with "
-            "module loads and namespace escapes.",
-     .tried = "The explicit re-export and target declaration were audited; the loaded-child and "
-              "unknown-effect barriers conservatively block package binding. Exact module-import "
-              "controls are required by pipeline_python_explicit_package_reexports_keep_identity."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.go_reexport",
      .site = {.file = "app/main.py",
               .caller = "app.main.go_reexport",
@@ -23669,13 +23439,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Before:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.excl_barrier",
-     .why = "The try/import initialization is conservatively a namespace-effect barrier rather "
-            "than an absence of Before.",
-     .tried =
-         "The explicit Before binding and exception branch were audited; neither assignment "
-         "replaces Before, but per-binding effects across the optional import are not proven."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.excl_fstring",
      .site = {.file = "app/main.py",
               .caller = "app.main.excl_fstring",
@@ -23687,12 +23451,7 @@ static const RQ_Expected py_reexport_expected[] = {
                 .label = "Class",
                 .declaration_line = 1,
                 .declaration_text = "class Kept:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "python-reexport.excl_fstring",
-     .why = "Formatting a class during package initialization has no effect proof preserving its "
-            "export binding.",
-     .tried = "The fixture class has no custom metaclass and the f-string contains no assignment; "
-              "the old namespace barrier is an unsupported proof case, not a forbidden target."},
+     .mode = RQ_REQUIRED},
     {.case_id = "python-reexport.excl_go_submodule",
      .site = {.file = "app/main.py",
               .caller = "app.main.excl_go_submodule",
@@ -25747,13 +25506,7 @@ static bool python_local_class_receiver_quality(cbm_store_t *store, const char *
                     .suffix = "sc.Base.greet",
                     .declaration_line = 2,
                     .declaration_text = "    def greet(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-LOCAL-CLASS-RECEIVER-PROOF",
-         .why = "A class declared inside a function needs nested caller, implicit self and "
-                "inherited lookup proofs.",
-         .tried = "The original Local(Base) declaration and super/self sites remain. pyp_callers "
-                  "does not descend into function bodies to analyze nested classes, and inherited "
-                  "domains are incomplete."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.local-class-self",
          .site = {.file = "sc.py",
                   .caller = "sc.factory.Local.other",
@@ -25764,13 +25517,7 @@ static bool python_local_class_receiver_quality(cbm_store_t *store, const char *
                     .suffix = "sc.factory.Local.greet",
                     .declaration_line = 7,
                     .declaration_text = "        def greet(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-LOCAL-CLASS-RECEIVER-PROOF",
-         .why = "A class declared inside a function needs nested caller, implicit self and "
-                "inherited lookup proofs.",
-         .tried = "The original Local(Base) declaration and super/self sites remain. pyp_callers "
-                  "does not descend into function bodies to analyze nested classes, and inherited "
-                  "domains are incomplete."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.local-plain",
          .site = {.file = "sa.py",
                   .caller = "sa.uses_local",
@@ -25803,13 +25550,7 @@ static bool python_local_class_receiver_quality(cbm_store_t *store, const char *
                     .suffix = "sa.uses_decorated.helper",
                     .declaration_line = 14,
                     .declaration_text = "    def helper():"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-STATICMETHOD-LOCAL-CALLABLE-PROOF",
-         .why = "The builtin staticmethod wrapper is callable, but decorated callable identity is "
-                "outside the admitted source subset.",
-         .tried = "The original local helper has only the unshadowed builtin staticmethod "
-                  "decorator and no rebinding. Its Python callable wrapper delegates to that "
-                  "helper; the binding auditor conservatively blocks decorated declarations."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.module-before-local",
          .site = {.file = "sb.py",
                   .caller = "sb.uses_module",
@@ -25831,13 +25572,7 @@ static bool python_local_class_receiver_quality(cbm_store_t *store, const char *
                     .suffix = "sb.uses_local.helper",
                     .declaration_line = 9,
                     .declaration_text = "        def helper():"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-CONDITIONAL-LOCAL-CALLABLE-PROOF",
-         .why = "A function declaration under a compound statement has no admitted ordered join "
-                "proof.",
-         .tried = "The original condition is literal True, so uses_local calls its own helper. No "
-                  "source assignment overrides it; binding.c still blocks conditional declarations "
-                  "instead of proving the constant branch."}};
+         .mode = RQ_REQUIRED}};
     return pipeline_quality_files(store, project, "python-local-class", root, files,
                                   sizeof(files) / sizeof(files[0]), expected,
                                   sizeof(expected) / sizeof(expected[0]), NULL, 0);
@@ -25973,13 +25708,7 @@ static bool python_super_receiver_quality(cbm_store_t *store, const char *projec
                     .suffix = "base.CalendarEntity.__init__",
                     .declaration_line = 12,
                     .declaration_text = "    def __init__(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.c3-super-method",
          .site = {.file = "radarr.py",
                   .caller = "radarr.RadarrCalendarEntity.write_state",
@@ -25990,13 +25719,7 @@ static bool python_super_receiver_quality(cbm_store_t *store, const char *projec
                     .suffix = "base.CalendarEntity.write_state",
                     .declaration_line = 15,
                     .declaration_text = "    def write_state(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.c3-super-plain",
          .site = {.file = "radarr.py",
                   .caller = "radarr.PlainCalendar.write_state",
@@ -26007,13 +25730,7 @@ static bool python_super_receiver_quality(cbm_store_t *store, const char *projec
                     .suffix = "base.CalendarEntity.write_state",
                     .declaration_line = 15,
                     .declaration_text = "    def write_state(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.super-lexical-control",
          .site = {.file = "quality_control.py",
                   .caller = "quality_control.control",
@@ -26131,13 +25848,7 @@ static bool python_attribute_receiver_quality(cbm_store_t *store, const char *pr
                     .suffix = "base.CalendarEntity.write_state",
                     .declaration_line = 15,
                     .declaration_text = "    def write_state(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.c3-attribute-plain",
          .site = {.file = "radarr.py",
                   .caller = "radarr.PlainCalendar.refresh",
@@ -26148,13 +25859,7 @@ static bool python_attribute_receiver_quality(cbm_store_t *store, const char *pr
                     .suffix = "base.CalendarEntity.write_state",
                     .declaration_line = 15,
                     .declaration_text = "    def write_state(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.c3-attribute-typed",
          .site = {.file = "radarr.py",
                   .caller = "radarr.publish",
@@ -26165,13 +25870,7 @@ static bool python_attribute_receiver_quality(cbm_store_t *store, const char *pr
                     .suffix = "base.CalendarEntity.write_state",
                     .declaration_line = 15,
                     .declaration_text = "    def write_state(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-C3-MRO-MEMBER-PROOF",
-         .why = "The selected C3 declaration is genuine, but inherited lookup and super receiver "
-                "proofs are outside the admitted member subset.",
-         .tried = "The original class graph, base order and exact selected declaration remain; "
-                  "pyp_class_facts leaves inherited domains incomplete and pyp_member does not "
-                  "accept a super() receiver. Wrong depth-first targets stay forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.attribute-lexical-control",
          .site = {.file = "quality_control.py",
                   .caller = "quality_control.control",
@@ -26841,13 +26540,7 @@ static bool pyn_nested_class_quality(cbm_store_t *store, const char *project, co
                     .suffix = "sn.Outer.Inner.run",
                     .declaration_line = 10,
                     .declaration_text = "        def run(self, h: Helper):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-IMPLICIT-SELF-ARGUMENT-EFFECT-PROOF",
-         .why = "The source selects Inner.run, but the proof adapter does not seed implicit self "
-                "or prove argument-bearing member calls and their effects.",
-         .tried = "The original class and exact caller remain; pyp_function seeds only annotated "
-                  "parameters and pyp_expression admits zero-argument member calls. Helper() "
-                  "and the typed h.go() are required independently in both drivers."},
+         .mode = RQ_REQUIRED},
         {.case_id = "python.nested-decorated-caller",
          .site = {.file = "sn.py",
                   .caller = "sn.Outer.Decorated.run",
@@ -26858,14 +26551,7 @@ static bool pyn_nested_class_quality(cbm_store_t *store, const char *project, co
                     .suffix = "sn.Helper.go",
                     .declaration_line = 2,
                     .declaration_text = "    def go(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PY-DECORATED-CLASS-CALLER-PROOF",
-         .why = "This fixture's sole decorator unconditionally returns its class argument, so "
-                "the annotated receiver target is genuine; decorated caller identity is "
-                "outside the current source proof bridge.",
-         .tried = "The original deco(cls): return cls body and nested declaration remain. "
-                  "pyp_callers skips decorated_definition; the ordinary nested typed receiver "
-                  "is a required control. Any recovered exact edge requires promotion."}};
+         .mode = RQ_REQUIRED}};
     return pipeline_quality_files(store, project, "python-nested-class", root, files, 1, expected,
                                   sizeof(expected) / sizeof(expected[0]), NULL, 0);
 }
@@ -28140,13 +27826,7 @@ TEST(pipeline_swift_cross_package_import) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "public func coreValue() -> Int {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "SWIFT-CONFIGURED-MODULE-EXPORT",
-         .why = "The public function is a genuine member of the explicitly imported target, but no "
-                "shared Swift target-export and call-binding proof joins it to this occurrence.",
-         .tried = "The original public declaration and call remain literal anchors. The exact "
-                  "configured Folder import is counted separately; neither suffix matching nor "
-                  "target-wide name uniqueness proves this call."},
+         .mode = RQ_REQUIRED},
     };
     RQ_Report quality;
     ASSERT(rq_check(s, proj, "swift-configured-package", sources, 4, expected, 2, NULL, 0, &quality,
@@ -28246,13 +27926,7 @@ static bool python_inline_constructor_quality(cbm_store_t *store, const char *pr
                     .suffix = "store.Store.commit",
                     .declaration_line = 2,
                     .declaration_text = "    def commit(self):"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "PYTHON-INLINE-CONSTRUCTOR-RECEIVER",
-         .why = "The receiver is a call expression; the Python member proof bridge accepts "
-                "identifier receivers with a live type fact, not an inline constructor result.",
-         .tried = "Preserved the exact Store import, zero-argument construction, commit "
-                  "declaration and JavaScript namesake. The class invocation is required; "
-                  "pyp_member rejects the call-expression receiver before method lookup."}};
+         .mode = RQ_REQUIRED}};
     return pipeline_quality_files(store, project, "python-inline-constructor", root, files,
                                   sizeof(files) / sizeof(files[0]), expected,
                                   sizeof(expected) / sizeof(expected[0]), NULL, 0);
@@ -31293,7 +30967,7 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
     ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
     ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreImpl"), "Core/Sources/CoreImpl");
-    ASSERT_EQ(entries.count, 1);
+    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31318,7 +30992,7 @@ TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
-    ASSERT_EQ(entries.count, 1);
+    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31384,7 +31058,7 @@ TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "NestedDecoy"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "StringDecoy"));
-    ASSERT_EQ(entries.count, 1);
+    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31413,7 +31087,7 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "RemoteKit"));
-    ASSERT_EQ(entries.count, 1);
+    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }
@@ -31439,7 +31113,7 @@ TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Utils"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "UtilsPkg"));
-    ASSERT_EQ(entries.count, 1);
+    ASSERT_EQ(entries.count, 3); /* the target and its two membership facts */
     cbm_pkg_entries_free(&entries);
     PASS();
 }

@@ -1873,7 +1873,8 @@ static void python_note_class(cbm_resolve_binding_index_t *index, TSNode node, u
     cbm_resolve_python_class_t *entry = &classes[index->python_class_count++];
     *entry = (cbm_resolve_python_class_t){.qualified_name = index->scopes[scope].qualified_name,
                                           .scope = scope,
-                                          .header_scope = header_scope};
+                                          .header_scope = header_scope,
+                                          .at = ts_node_start_byte(node)};
     TSNode bases = field(node, "superclasses");
     uint32_t count = ts_node_is_null(bases) ? 0 : ts_node_named_child_count(bases);
     entry->bases = count ? cbm_arena_alloc(index->arena, count * sizeof(*entry->bases)) : NULL;

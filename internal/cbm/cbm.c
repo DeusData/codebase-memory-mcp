@@ -634,7 +634,8 @@ static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
         /* The expanded buffer holds the body in the name's place: `-DAPI=Junk` turns
          * `class API Foo` into `class Junk Foo`, and the body means what was configured. */
         const char *body = (*define)[name_len] ? *define + name_len + 1 : NULL;
-        if (body && strlen(body) == word_len && !strncmp(body, words->source + word_start, word_len)) {
+        if (body && strlen(body) == word_len &&
+            !strncmp(body, words->source + word_start, word_len)) {
             return;
         }
     }
@@ -1107,9 +1108,8 @@ static char *csharp_parse_view(const char *source, uint32_t length) {
     bool inactive[MAX_DEPTH] = {false};
     int depth = 0;
     for (uint32_t at = 0; at < length;) {
-        uint32_t end = at;
-        while (end < length && source[end] != '\n')
-            end++;
+        const char *newline = memchr(source + at, '\n', length - at);
+        uint32_t end = newline ? (uint32_t)(newline - source) : length;
         uint32_t word = at;
         while (word < end && (source[word] == ' ' || source[word] == '\t'))
             word++;

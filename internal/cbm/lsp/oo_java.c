@@ -639,7 +639,7 @@ static void jw_emit_type_mentions(jw_t *j, TSNode node, unsigned depth) {
 
 static void jw_bind_declared(jw_t *j, const char *name, TSNode type, oo_value_t initial, int dims) {
     oo_walk_t *w = j->w;
-    oo_value_t value = oo_value_unknown();
+    oo_value_t value;
     const char *spelling = j_is(type, "type_identifier") ? j_text(&j->text, type) : NULL;
     if (spelling && !strcmp(spelling, "var")) {
         value = initial;
@@ -1201,7 +1201,7 @@ static oo_value_t jw_method_reference(jw_t *j, TSNode node) {
     uint32_t count = ts_node_named_child_count(node);
     TSNode object = count ? ts_node_named_child(node, 0) : (TSNode){0};
     TSNode member = count > 1 ? ts_node_named_child(node, count - 1) : (TSNode){0};
-    oo_value_t receiver = oo_value_unknown();
+    oo_value_t receiver;
     if (j_is(object, "this") || j_is(object, "super"))
         receiver = jw_this_value(w);
     else if (j_is(object, "type_identifier") || j_is(object, "scoped_type_identifier") ||
@@ -1599,14 +1599,17 @@ void oo_java_resolve(oo_walk_t *w, TSNode root) {
     oo_import_t *imports = NULL;
     int import_count = 0;
     j_read_imports(&j.text, root, &imports, &import_count, &package);
-    oo_file_t file = {.rel = "",
-                      .package = package,
-                      .language = CBM_LANG_JAVA,
-                      .imports = imports,
-                      .import_count = import_count,
-                      .has_error = ts_node_has_error(root)};
-    w->f = &file;
-    w->scope = (oo_scope_t){.file = &file, .ns = ""};
+    oo_file_t *file = cbm_arena_alloc(w->arena, sizeof(*file));
+    if (!file)
+        return;
+    *file = (oo_file_t){.rel = "",
+                        .package = package,
+                        .language = CBM_LANG_JAVA,
+                        .imports = imports,
+                        .import_count = import_count,
+                        .has_error = ts_node_has_error(root)};
+    w->f = file;
+    w->scope = (oo_scope_t){.file = file, .ns = ""};
     uint32_t count = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_named_child(root, i);

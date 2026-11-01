@@ -79,9 +79,10 @@ static void ocaml_collect_binding(cbm_source_walk_t *walk, const char *owner, TS
         return;
     }
     const char *name = cbm_source_text(walk, pattern);
-    uint32_t line = ts_node_start_point(binding).row + 1;
-    if (name)
+    if (name) {
+        uint32_t line = ts_node_start_point(binding).row + 1;
         (void)cbm_source_declare(walk, owner, name, cbm_source_def_qn(walk, name, line), 0, line);
+    }
 }
 
 static void ocaml_collect_structure(cbm_source_walk_t *walk, const char *owner, TSNode structure,
@@ -175,10 +176,10 @@ static const char *ocaml_module_unit(ocaml_ctx_t *ctx, const char *owner, const 
          * its definition ends, so the same name inside its body or before it is another
          * module. A structure's own key is a prefix of everything inside it. */
         if (alias && alias->type && !alias->next) {
-            size_t length = strlen(alias->type);
+            size_t own = strlen(alias->type);
             bool inside = !(alias->flags & CBM_SOURCE_DECL_F_VALUE) &&
-                          !strncmp(ctx->unit, alias->type, length) &&
-                          (ctx->unit[length] == '\0' || ctx->unit[length] == '#');
+                          !strncmp(ctx->unit, alias->type, own) &&
+                          (ctx->unit[own] == '\0' || ctx->unit[own] == '#');
             if (inside || alias->line > ctx->site_line)
                 alias = NULL;
         }

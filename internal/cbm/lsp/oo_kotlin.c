@@ -1272,10 +1272,10 @@ static oo_value_t kw_ref(kw_t *k, const oo_typeref_t *ref) {
 
 /* Every type mention inside an annotation, at the identifier's own span. */
 static void kw_type_mentions(kw_t *k, TSNode node, unsigned depth) {
-    oo_walk_t *w = k->w;
     if (ts_node_is_null(node) || depth > 32)
         return;
     if (kt_is(node, "user_type")) {
+        oo_walk_t *w = k->w;
         uint32_t count = ts_node_named_child_count(node);
         /* The whole spelled path selects the leaf type. */
         const oo_typeref_t *ref = kt_typeref(&k->text, node);
@@ -2751,6 +2751,21 @@ static oo_value_t kw_this(kw_t *k, TSNode node) {
     return oo_value_unknown();
 }
 
+/* `if (c) ::a else ::b` selects at run time, so neither branch is the one callable this
+ * occurrence hands over. Each stays an ordinary reference to what it names. */
+static bool kw_reference_is_branch_alternative(TSNode reference) {
+    for (TSNode parent = ts_node_parent(reference); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (kt_is(parent, "if_expression") || kt_is(parent, "when_expression") ||
+            kt_is(parent, "elvis_expression"))
+            return true;
+        if (kt_is(parent, "value_arguments") || kt_is(parent, "assignment") ||
+            kt_is(parent, "property_declaration"))
+            return false;
+    }
+    return false;
+}
+
 static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
     oo_walk_t *w = k->w;
     TSNode member = kt_child(node, "simple_identifier");
@@ -2797,7 +2812,9 @@ static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
         }
     }
     if (target && target->graph_qn)
-        oo_emit_usage(w, member, target->graph_qn, CBM_RESOLVED_CALL_REFERENCE,
+        oo_emit_usage(w, member, target->graph_qn,
+                      kw_reference_is_branch_alternative(node) ? CBM_RESOLVED_VALUE_REFERENCE
+                                                               : CBM_RESOLVED_CALL_REFERENCE,
                       CBM_RESOLVE_RULE_TYPE_MEMBER, "kotlin-callable-reference");
     return oo_value_unknown();
 }
@@ -3389,14 +3406,17 @@ void oo_kotlin_resolve(oo_walk_t *w, TSNode root) {
     oo_import_t *imports = NULL;
     int import_count = 0;
     kt_read_imports(&k.text, root, &imports, &import_count, &package);
-    oo_file_t file = {.rel = w->rel_path,
-                      .package = package,
-                      .language = CBM_LANG_KOTLIN,
-                      .imports = imports,
-                      .import_count = import_count,
-                      .has_error = ts_node_has_error(root)};
-    w->f = &file;
-    w->scope = (oo_scope_t){.file = &file, .ns = package};
+    oo_file_t *file = cbm_arena_alloc(w->arena, sizeof(*file));
+    if (!file)
+        return;
+    *file = (oo_file_t){.rel = w->rel_path,
+                        .package = package,
+                        .language = CBM_LANG_KOTLIN,
+                        .imports = imports,
+                        .import_count = import_count,
+                        .has_error = ts_node_has_error(root)};
+    w->f = file;
+    w->scope = (oo_scope_t){.file = file, .ns = package};
     oo_frame_t frame;
     oo_frame_push(w, &frame);
     kw_top_level(&k, root, false);

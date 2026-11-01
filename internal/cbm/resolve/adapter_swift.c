@@ -898,8 +898,6 @@ static swift_ref_t swift_member(swift_ctx_t *ctx, const swift_ref_t *receiver, c
                                 const swift_args_t *args) {
     swift_ref_t ref = {.reason = "swift_receiver_type_unknown"};
     if (receiver->kind == SWIFT_MODULE) {
-        swift_ctx_t scoped = *ctx;
-        scoped.module = receiver->module;
         const cbm_source_decl_t *found = NULL;
         const char *owner = swift_module_owner(ctx->walk, receiver->module);
         const cbm_source_decl_t *first = owner ? cbm_source_lookup(ctx->walk, owner, name) : NULL;

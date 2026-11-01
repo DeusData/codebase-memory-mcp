@@ -615,10 +615,10 @@ static oo_value_t cw_ref(cw_t *c, const oo_typeref_t *ref) {
 }
 
 static void cw_type_mentions(cw_t *c, TSNode node, unsigned depth) {
-    oo_walk_t *w = c->w;
     if (ts_node_is_null(node) || depth > 32)
         return;
     if (cs_is(node, "identifier") || cs_is(node, "qualified_name") || cs_is(node, "generic_name")) {
+        oo_walk_t *w = c->w;
         const oo_typeref_t *mentioned = cs_typeref(&c->text, node);
         oo_value_t value = cw_ref(c, mentioned);
         if (value.type && value.type->graph_qn &&
@@ -1689,14 +1689,17 @@ void oo_csharp_resolve(oo_walk_t *w, TSNode root) {
     cw_t c = {.w = w, .text = {.arena = w->arena, .source = w->source, .length = w->length}};
     cs_imports_t imports = {0};
     cs_scan_usings(&c.text, &imports, root, "");
-    oo_file_t file = {.rel = w->rel_path,
-                      .package = "",
-                      .language = CBM_LANG_CSHARP,
-                      .imports = imports.items,
-                      .import_count = imports.count,
-                      .has_error = ts_node_has_error(root)};
-    w->f = &file;
-    w->scope = (oo_scope_t){.file = &file, .ns = ""};
+    oo_file_t *file = cbm_arena_alloc(w->arena, sizeof(*file));
+    if (!file)
+        return;
+    *file = (oo_file_t){.rel = w->rel_path,
+                        .package = "",
+                        .language = CBM_LANG_CSHARP,
+                        .imports = imports.items,
+                        .import_count = imports.count,
+                        .has_error = ts_node_has_error(root)};
+    w->f = file;
+    w->scope = (oo_scope_t){.file = file, .ns = ""};
     cw_namespace_items(&c, root);
     w->f = NULL;
 }

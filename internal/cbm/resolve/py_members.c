@@ -521,9 +521,14 @@ bool cbm_py_members_add_file(cbm_py_members_t *members, const cbm_resolve_bindin
             ok = false;
             break;
         }
-        for (uint32_t b = 0; b < source->base_count; b++)
-            entry->bases[b] = py_capture(members, index, &scratch, imports, source->bases[b],
-                                         source->header_scope);
+        /* A class statement reads its bases where it stands, so a sibling declared
+         * below it is no base of it. */
+        for (uint32_t b = 0; b < source->base_count; b++) {
+            unsigned steps = 0;
+            entry->bases[b] =
+                py_keep_ref(members, py_ref_of_chain(index, &scratch, imports, source->bases[b],
+                                                     source->header_scope, source->at, 0, &steps));
+        }
         cbm_ht_set(members->classes, key, entry);
         if (cbm_ht_get(members->classes, key) != entry) {
             ok = false;

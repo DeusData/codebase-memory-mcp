@@ -635,11 +635,7 @@ TEST(repro_call_argument_ts_pipeline_shapes) {
                     .label = "Function",
                     .declaration_line = 2,
                     .declaration_text = "function accept(cb: () => void): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "repro_call_argument_ts_pipeline_shapes-reference",
          .site = {.file = "main.ts", .caller = "main.argument", .start_byte = 104, .end_byte = 111},
          .relation = "CALL_REFERENCE",
@@ -648,11 +644,7 @@ TEST(repro_call_argument_ts_pipeline_shapes) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "function handler(): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
     };
     int failures =
         argument_reference_quality("repro_call_argument_ts_pipeline_shapes", same_file, 1, expected,
@@ -749,11 +741,7 @@ TEST(repro_call_argument_tsx_same_file_value_reference) {
                     .label = "Function",
                     .declaration_line = 2,
                     .declaration_text = "function accept(callback: () => void): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "repro_call_argument_tsx_same_file_value_reference-reference",
          .site =
              {.file = "main.tsx", .caller = "main.argument", .start_byte = 110, .end_byte = 117},
@@ -763,11 +751,7 @@ TEST(repro_call_argument_tsx_same_file_value_reference) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "function handler(): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
     };
     int failures = argument_reference_quality(
         "repro_call_argument_tsx_same_file_value_reference", files, 1, expected,
@@ -836,11 +820,7 @@ TEST(repro_call_argument_ts_family_forward_declared_value_reference) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "function accept(callback: () => void): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "typescript-forward-reference",
          .site =
              {.file = "forward.ts", .caller = "forward.argument", .start_byte = 82, .end_byte = 89},
@@ -850,11 +830,7 @@ TEST(repro_call_argument_ts_family_forward_declared_value_reference) {
                     .label = "Function",
                     .declaration_line = 3,
                     .declaration_text = "function handler(): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
     };
     static const RQ_Expected tsx_expected[] = {
         {.case_id = "tsx-forward-call",
@@ -868,11 +844,7 @@ TEST(repro_call_argument_ts_family_forward_declared_value_reference) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "function accept(callback: () => void): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "tsx-forward-reference",
          .site = {.file = "forward.tsx",
                   .caller = "forward.argument",
@@ -884,11 +856,7 @@ TEST(repro_call_argument_ts_family_forward_declared_value_reference) {
                     .label = "Function",
                     .declaration_line = 3,
                     .declaration_text = "function handler(): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
     };
     int failures = 0;
     failures += argument_reference_quality(
@@ -928,11 +896,7 @@ TEST(repro_call_argument_ts_nested_and_value_refs) {
                     .label = "Function",
                     .declaration_line = 5,
                     .declaration_text = "function register(options: CallbackOptions): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "nested-value-reference",
          .site = {.file = "main.ts",
                   .caller = "main.nestedArgument",
@@ -944,11 +908,7 @@ TEST(repro_call_argument_ts_nested_and_value_refs) {
                     .label = "Function",
                     .declaration_line = 4,
                     .declaration_text = "function handler(): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "value-consume-call",
          .site = {.file = "main.ts",
                   .caller = "main.valueArgument",
@@ -960,11 +920,7 @@ TEST(repro_call_argument_ts_nested_and_value_refs) {
                     .label = "Function",
                     .declaration_line = 6,
                     .declaration_text = "function consume(options: RuntimeOptions): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "value-object-reference",
          .site = {.file = "main.ts",
                   .caller = "main.valueArgument",
@@ -977,11 +933,7 @@ TEST(repro_call_argument_ts_nested_and_value_refs) {
                     .declaration_line = 3,
                     .declaration_text =
                         "const runtimeOptions: RuntimeOptions = { enabled: true };"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
     };
     RProj project;
     cbm_store_t *store =
@@ -1013,11 +965,7 @@ TEST(repro_call_argument_ts_member_ref) {
                     .label = "Function",
                     .declaration_line = 2,
                     .declaration_text = "function accept(cb: () => void): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "javascript-script-callable-scope",
-         .why = "Script global callable identity is outside the audited ECMAScript module scope.",
-         .tried = "Full MCP pipeline preserved these script bytes; imported module and receiver "
-                  "references remain required controls."},
+         .mode = RQ_REQUIRED},
         {.case_id = "repro_call_argument_ts_member_ref-reference",
          .site = {.file = "main.ts",
                   .caller = "main.memberArgument",
@@ -1073,12 +1021,7 @@ TEST(repro_call_argument_java_method_reference_edge) {
                     .label = "Method",
                     .declaration_line = 4,
                     .declaration_text = "  static void accept(Task callback) {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "java-functional-argument-applicability",
-         .why = "The Java proof bridge admits primitive invocation conversion, not "
-                "functional-interface target typing.",
-         .tried = "Original method reference remains required; the enclosing registrar call needs "
-                  "a separate applicability proof."},
+         .mode = RQ_REQUIRED},
         {.case_id = "repro_call_argument_java_method_reference_edge-reference",
          .site = {.file = "Main.java",
                   .caller = "Main.javaArgument",
@@ -1145,12 +1088,7 @@ TEST(repro_kotlin_bound_reference_uses_instance_type) {
                     .label = "Function",
                     .declaration_line = 3,
                     .declaration_text = "fun accept(callback: () -> Unit) {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-bound-callable-reference",
-         .why = "The Kotlin bridge admits unbound callable references only; the bound receiver "
-                "reference and its argument applicability are unproved.",
-         .tried = "Full pipeline with exact Service annotation abstains; the Other.handler decoy "
-                  "remains forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "kotlin-bound-reference",
          .site = {.file = "Main.kt",
                   .caller = "Main.boundReference",
@@ -1162,12 +1100,7 @@ TEST(repro_kotlin_bound_reference_uses_instance_type) {
                     .label = "Method",
                     .declaration_line = 1,
                     .declaration_text = "class Service { fun handler() {} }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-bound-callable-reference",
-         .why = "The Kotlin bridge admits unbound callable references only; the bound receiver "
-                "reference and its argument applicability are unproved.",
-         .tried = "Full pipeline with exact Service annotation abstains; the Other.handler decoy "
-                  "remains forbidden."},
+         .mode = RQ_REQUIRED},
     };
     RProj project;
     cbm_store_t *store =
@@ -1202,12 +1135,7 @@ TEST(repro_php_first_class_callable_reference_edge) {
                     .label = "Function",
                     .declaration_line = 3,
                     .declaration_text = "function accept(callable $cb): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "php-first-class-callable-identity",
-         .why = "PHP first-class callable construction and callable-typed argument applicability "
-                "are outside the simple-value proof subset.",
-         .tried = "Full MCP original fixture abstains; reference-as-invocation and wrong-target "
-                  "checks are retained."},
+         .mode = RQ_REQUIRED},
         {.case_id = "php-first-class-reference",
          .site =
              {.file = "main.php", .caller = "main.phpArgument", .start_byte = 111, .end_byte = 118},
@@ -1250,12 +1178,7 @@ TEST(repro_php_same_name_references_keep_occurrence_identity) {
                     .label = "Function",
                     .declaration_line = 4,
                     .declaration_text = "function accept(callable $callback): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "php-first-class-callable-identity",
-         .why = "PHP first-class callable construction and callable-typed argument applicability "
-                "are outside the simple-value proof subset.",
-         .tried = "Full MCP original fixture abstains; reference-as-invocation and wrong-target "
-                  "checks are retained."},
+         .mode = RQ_REQUIRED},
         {.case_id = "php-A-reference",
          .site =
              {.file = "main.php", .caller = "main.references", .start_byte = 199, .end_byte = 206},
@@ -1280,12 +1203,7 @@ TEST(repro_php_same_name_references_keep_occurrence_identity) {
                     .label = "Function",
                     .declaration_line = 4,
                     .declaration_text = "function accept(callable $callback): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "php-first-class-callable-identity",
-         .why = "PHP first-class callable construction and callable-typed argument applicability "
-                "are outside the simple-value proof subset.",
-         .tried = "Full MCP original fixture abstains; reference-as-invocation and wrong-target "
-                  "checks are retained."},
+         .mode = RQ_REQUIRED},
         {.case_id = "php-B-reference",
          .site =
              {.file = "main.php", .caller = "main.references", .start_byte = 224, .end_byte = 231},
@@ -1335,12 +1253,7 @@ TEST(repro_php_magic_first_class_reference_uses_reason_match) {
                     .label = "Function",
                     .declaration_line = 5,
                     .declaration_text = "function accept(callable $callback): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "php-magic-callable-dispatch",
-         .why = "PHP magic first-class callable dispatch and callable argument applicability have "
-                "no audited proof bridge.",
-         .tried = "Original __call declaration is preserved; a fabricated missing method remains "
-                  "forbidden."},
+         .mode = RQ_REQUIRED},
         {.case_id = "php-magic-reference",
          .site = {.file = "magic.php",
                   .caller = "magic.references",
@@ -2056,12 +1969,7 @@ TEST(repro_callable_reference_parallel_pipeline) {
                     .label = "Method",
                     .declaration_line = 3,
                     .declaration_text = "  static void acceptJava(JavaTask callback) {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "java-functional-argument-applicability",
-         .why = "The Java proof bridge admits primitive invocation conversion, not "
-                "functional-interface target typing.",
-         .tried = "Original method reference remains required; the enclosing registrar call needs "
-                  "a separate applicability proof."},
+         .mode = RQ_REQUIRED},
         {.case_id = "parallel-javaHandler-reference",
          .site = {.file = "JavaUse.java",
                   .caller = "JavaUse.javaReference",
@@ -2109,12 +2017,7 @@ TEST(repro_callable_reference_parallel_pipeline) {
                     .label = "Function",
                     .declaration_line = 3,
                     .declaration_text = "function acceptPhp(callable $callback): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "php-first-class-callable-identity",
-         .why = "PHP first-class callable construction and callable-typed argument applicability "
-                "are outside the simple-value proof subset.",
-         .tried = "Full MCP original fixture abstains; reference-as-invocation and wrong-target "
-                  "checks are retained."},
+         .mode = RQ_REQUIRED},
         {.case_id = "parallel-phpHandler-reference",
          .site = {.file = "php_use.php",
                   .caller = "php_use.phpReference",

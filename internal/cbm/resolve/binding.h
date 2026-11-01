@@ -117,6 +117,7 @@ typedef struct {
 typedef struct {
     const char *qualified_name;
     uint32_t scope, header_scope;
+    uint32_t at;        /* start of the class statement: its bases are read there */
     const char **bases; /* access paths, source order */
     uint32_t base_count;
     uint64_t subscripted; /* bit per base: written Base[...] */

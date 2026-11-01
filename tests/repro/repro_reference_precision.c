@@ -41,12 +41,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Variable",
                  .declaration_line = 1,
                  .declaration_text = "class Holder { val handler: Int = 1 }"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "kotlin_property_reference_does_not_borrow_same_name_function-1",
-      .why = "Kotlin property-reference receiver and property-value proof is not implemented by "
-             "the direct-method bridge.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_kotlin_property_reference_does_not_borrow_same_name_function",
      {.case_id = "kotlin_property_reference_does_not_borrow_same_name_function-2",
       .site = {.file = "Use.kt", .caller = "propertyReference", .start_byte = 30, .end_byte = 36},
@@ -160,6 +155,16 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 4,
                  .declaration_text = "def actual() -> int:"},
+      .mode = RQ_REQUIRED}},
+    {"repro_rust_callable_alias_invocation_targets_exact_value",
+     {.case_id = "rust_callable_alias_invocation_targets_exact_value-read",
+      .site = {.file = "aliases.rs", .caller = "aliasCaller", .start_byte = 110, .end_byte = 116},
+      .relation = "USAGE",
+      .target = {.file = "aliases.rs",
+                 .suffix = "aliases.actual",
+                 .label = "Function",
+                 .declaration_line = 2,
+                 .declaration_text = "fn actual() -> i32 { 2 }"},
       .mode = RQ_REQUIRED}},
     {"repro_rust_callable_alias_invocation_targets_exact_value",
      {.case_id = "rust_callable_alias_invocation_targets_exact_value-1",
@@ -290,12 +295,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 3,
                  .declaration_text = "  static void handler() {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_exact_function_value_is_call_reference-1",
-      .why = "Delegate or coderef argument values and callable-parameter applicability require an "
-             "audited proof bridge.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_csharp_exact_function_value_is_call_reference",
      {.case_id = "csharp_exact_function_value_is_call_reference-2",
       .site = {.file = "Refs.cs", .caller = "argument", .start_byte = 122, .end_byte = 137},
@@ -305,12 +305,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 4,
                  .declaration_text = "  static void accept(Action callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_exact_function_value_is_call_reference-2",
-      .why = "Delegate or coderef argument values and callable-parameter applicability require an "
-             "audited proof bridge.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_perl_exact_coderef_is_call_reference",
      {.case_id = "perl_exact_coderef_is_call_reference-1",
       .site = {.file = "refs.pl", .caller = "argument", .start_byte = 73, .end_byte = 82},
@@ -350,12 +345,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 1,
                  .declaration_text = "pub fn handler() {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "rust_direct_scoped_function_value_is_exact_reference-1",
-      .why = "Rust scoped callable-value extraction proves the target, but shared "
-             "callable-reference evidence is not yet bridged.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_rust_direct_scoped_function_value_is_exact_reference",
      {.case_id = "rust_direct_scoped_function_value_is_exact_reference-2",
       .site = {.file = "main.rs", .caller = "scoped_argument", .start_byte = 76, .end_byte = 99},
@@ -401,12 +391,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 4,
                  .declaration_text = "  static void accept(Action callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_member_method_group_is_exact_reference-2",
-      .why = "C# callable groups require exact delegate applicability and member/callable "
-             "evidence; generic arguments additionally require constructed callable identity.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_csharp_parenthesized_method_group_is_exact_reference",
      {.case_id = "csharp_parenthesized_method_group_is_exact_reference-1",
       .site = {.file = "ParenthesizedReference.cs",
@@ -419,12 +404,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 3,
                  .declaration_text = "  static void handler() {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_parenthesized_method_group_is_exact_reference-1",
-      .why = "C# callable groups require exact delegate applicability and member/callable "
-             "evidence; generic arguments additionally require constructed callable identity.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_csharp_parenthesized_method_group_is_exact_reference",
      {.case_id = "csharp_parenthesized_method_group_is_exact_reference-2",
       .site = {.file = "ParenthesizedReference.cs",
@@ -437,12 +417,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 4,
                  .declaration_text = "  static void accept(Action callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_parenthesized_method_group_is_exact_reference-2",
-      .why = "C# callable groups require exact delegate applicability and member/callable "
-             "evidence; generic arguments additionally require constructed callable identity.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_csharp_generic_method_group_is_exact_reference",
      {.case_id = "csharp_generic_method_group_is_exact_reference-1",
       .site = {.file = "GenericReference.cs",
@@ -473,12 +448,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 4,
                  .declaration_text = "  static void accept(Action callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_generic_method_group_is_exact_reference-2",
-      .why = "C# callable groups require exact delegate applicability and member/callable "
-             "evidence; generic arguments additionally require constructed callable identity.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_python_module_type_alias_shadow_fails_closed",
      {.case_id = "python_module_type_alias_shadow_fails_closed-1",
       .site = {.file = "use.py", .caller = "crossArgument", .start_byte = 109, .end_byte = 125},
@@ -488,12 +458,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 3,
                  .declaration_text = "def accept(fn):"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "python_module_type_alias_shadow_fails_closed-1",
-      .why = "Python type_alias_statement is outside the audited binding allowlist; its namespace "
-             "effects currently suppress independent direct calls.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_rust_cross_file_exact_function_value_is_call_reference",
      {.case_id = "rust_cross_file_exact_function_value_is_call_reference-1",
       .site = {.file = "main.rs", .caller = "crossArgument", .start_byte = 91, .end_byte = 98},
@@ -503,12 +468,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 1,
                  .declaration_text = "pub fn handler() {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "rust_cross_file_exact_function_value_is_call_reference-1",
-      .why = "Cross-file callable references need audited callable-value proof; C# delegate "
-             "applicability and assembly visibility also remain unproved.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_rust_cross_file_exact_function_value_is_call_reference",
      {.case_id = "rust_cross_file_exact_function_value_is_call_reference-2",
       .site = {.file = "main.rs", .caller = "crossArgument", .start_byte = 84, .end_byte = 99},
@@ -548,12 +508,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 4,
                  .declaration_text = "  static void accept(Action callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_cross_file_exact_function_value_is_call_reference-2",
-      .why = "Cross-file callable references need audited callable-value proof; C# delegate "
-             "applicability and assembly visibility also remain unproved.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_csharp_cross_file_callable_alias_invocation_targets_exact_value",
      {.case_id = "csharp_cross_file_callable_alias_invocation_targets_exact_value-1",
       .site = {.file = "Use.cs", .caller = "crossAliasCaller", .start_byte = 163, .end_byte = 173},
@@ -592,16 +547,11 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                .end_byte = 119},
       .relation = "CALLS",
       .target = {.file = "ReceiverAlias.kt",
-                 .suffix = NULL,
-                 .label = "Method",
+                 .suffix = "ReceiverAlias.Service",
+                 .label = "Class",
                  .declaration_line = 1,
                  .declaration_text = "class Service { fun run(): Int = 2 }"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "kotlin_receiver_bound_alias_invocation_targets_exact_method-1",
-      .why = "Kotlin receiver-bound callable aliases require exact receiver and captured-target "
-             "flow; implicit constructor identity is not materialized.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_kotlin_receiver_bound_alias_invocation_targets_exact_method",
      {.case_id = "kotlin_receiver_bound_alias_invocation_targets_exact_method-2",
       .site = {.file = "ReceiverAlias.kt",
@@ -632,12 +582,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 1,
                  .declaration_text = "class Service { fun run(): Int = 2 }"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "kotlin_receiver_bound_alias_invocation_targets_exact_method-3",
-      .why = "Kotlin receiver-bound callable aliases require exact receiver and captured-target "
-             "flow; implicit constructor identity is not materialized.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_kotlin_unknown_imported_property_is_not_callable_reference",
      {.case_id = "kotlin_unknown_imported_property_is_not_callable_reference-1",
       .site = {.file = "Use.kt",
@@ -761,13 +706,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 5,
                  .declaration_text = "  static void accept(Action callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "csharp_complex_function_value_stays_usage-1",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_csharp_complex_function_value_stays_usage",
      {.case_id = "csharp_complex_function_value_stays_usage-2",
       .site = {.file = "Complex.cs", .caller = "complex", .start_byte = 173, .end_byte = 180},
@@ -809,13 +748,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Method",
                  .declaration_line = 5,
                  .declaration_text = "  static void accept(Task callback) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "java_complex_method_reference_stays_usage-1",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_java_complex_method_reference_stays_usage",
      {.case_id = "java_complex_method_reference_stays_usage-2",
       .site = {.file = "Refs.java", .caller = "complex", .start_byte = 197, .end_byte = 204},
@@ -857,13 +790,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Class",
                  .declaration_line = 2,
                  .declaration_text = "class Refs {"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "java_complex_method_reference_stays_usage-4",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_java_complex_method_reference_stays_usage",
      {.case_id = "java_complex_method_reference_stays_usage-5",
       .site = {.file = "Refs.java", .caller = "complex", .start_byte = 207, .end_byte = 211},
@@ -873,13 +800,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Class",
                  .declaration_line = 2,
                  .declaration_text = "class Refs {"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "java_complex_method_reference_stays_usage-5",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_kotlin_complex_callable_reference_stays_usage",
      {.case_id = "kotlin_complex_callable_reference_stays_usage-1",
       .site = {.file = "Refs.kt", .caller = "complex", .start_byte = 101, .end_byte = 145},
@@ -889,13 +810,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 3,
                  .declaration_text = "fun accept(callback: () -> Unit) {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "kotlin_complex_callable_reference_stays_usage-1",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_kotlin_complex_callable_reference_stays_usage",
      {.case_id = "kotlin_complex_callable_reference_stays_usage-2",
       .site = {.file = "Refs.kt", .caller = "complex", .start_byte = 120, .end_byte = 127},
@@ -937,13 +852,7 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 4,
                  .declaration_text = "function accept(callable $callback): void {}"},
-      .mode = RQ_KNOWN_GAP,
-      .gap_id = "php_complex_first_class_callable_stays_usage-1",
-      .why = "Conditional callable values retain genuine target mentions, but complete source "
-             "binding, callable-argument applicability and value-reference proof are not yet "
-             "audited for this language/form.",
-      .tried = "Original full-MCP fixture retained; exact source occurrence and target declaration "
-               "reviewed; raw and forbidden assertions retained."}},
+      .mode = RQ_REQUIRED}},
     {"repro_php_complex_first_class_callable_stays_usage",
      {.case_id = "php_complex_first_class_callable_stays_usage-2",
       .site = {.file = "refs.php", .caller = "complex", .start_byte = 161, .end_byte = 168},
@@ -1049,6 +958,16 @@ static const RP_QualityGolden rp_quality_goldens[] = {
                  .label = "Function",
                  .declaration_line = 4,
                  .declaration_text = "def accept(fn):"},
+      .mode = RQ_REQUIRED}},
+    {"repro_python_alias_capture_precedes_later_import_rebinding",
+     {.case_id = "repro_python_alias_capture_precedes_later_import_rebinding-read",
+      .site = {.file = "use.py", .caller = "crossArgument", .start_byte = 138, .end_byte = 143},
+      .relation = "USAGE",
+      .target = {.file = "use.py",
+                 .suffix = "use.alias",
+                 .label = "Variable",
+                 .declaration_line = 3,
+                 .declaration_text = "alias = callback"},
       .mode = RQ_REQUIRED}},
     {"repro_python_alias_capture_precedes_later_import_rebinding",
      {.case_id = "repro_python_alias_capture_precedes_later_import_rebinding-reference",

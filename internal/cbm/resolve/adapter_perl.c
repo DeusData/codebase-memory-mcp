@@ -232,6 +232,7 @@ static void perl_collect_use(perl_ctx_t *ctx, TSNode use) {
     perl_set_bases(ctx, ctx->package, words.words, words.count, line, !literal);
 }
 
+// cppcheck-suppress constParameterCallback
 static void perl_declare_export(perl_ctx_t *ctx, const char *word, void *user) {
     const char *package = user;
     const char *name = word[0] == '&' ? word + 1 : word;
@@ -337,7 +338,6 @@ static void perl_collect_node(perl_ctx_t *ctx, TSNode node, unsigned depth) {
                 perl_collect_sub(ctx, child);
             } else if (cbm_source_is(child, "assignment_expression")) {
                 TSNode left = cbm_source_named_field(child, "left");
-                uint32_t line = ts_node_start_point(child).row + 1;
                 if (cbm_source_is(left, "localization_expression"))
                     left = ts_node_named_child(left, 0);
                 if (cbm_source_is(left, "glob")) {
@@ -349,7 +349,8 @@ static void perl_collect_node(perl_ctx_t *ctx, TSNode node, unsigned depth) {
                     if (cbm_source_is(array, "array"))
                         perl_collect_array(
                             ctx, cbm_source_text(ctx->walk, ts_node_named_child(array, 0)),
-                            cbm_source_named_field(child, "right"), line);
+                            cbm_source_named_field(child, "right"),
+                            ts_node_start_point(child).row + 1);
                 }
             } else if (cbm_source_is(child, "ambiguous_function_call_expression")) {
                 /* `push @ISA, 'X'` */
@@ -648,7 +649,6 @@ static void perl_visit_method_call(perl_ctx_t *ctx, TSNode node, const char *inv
         return;
     }
     const char *start = NULL;
-    const char *reason = "perl_invocant_class_unknown";
     if (cbm_source_is(invocant, "bareword")) {
         const char *text = cbm_source_text(ctx->walk, invocant);
         size_t length = text ? strlen(text) : 0;
@@ -667,7 +667,7 @@ static void perl_visit_method_call(perl_ctx_t *ctx, TSNode node, const char *inv
             start = ctx->package;
     }
     if (!start) {
-        perl_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL, reason);
+        perl_emit(ctx, node, NULL, CBM_RESOLVE_RULE_NONE, NULL, "perl_invocant_class_unknown");
         return;
     }
     const cbm_source_decl_t *decl = NULL;

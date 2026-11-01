@@ -1204,13 +1204,7 @@ TEST(handles_aspnet_csharp) {
                     .declaration_line = 3,
                     .declaration_text = "        public static string MapGet(string path, "
                                         "System.Func<string> handler) { return handler(); }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-delegate-registration",
-         .why = "System.Func<string> method-group applicability and string parameters are outside "
-                "the primitive C# proof subset, even with explicit assembly membership.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "aspnet-handler-get",
          .site = {.file = "Program.cs", .caller = "Program.Main", .needle = "GetProducts"},
          .relation = "CALL_REFERENCE",
@@ -1219,13 +1213,7 @@ TEST(handles_aspnet_csharp) {
                     .label = "Method",
                     .declaration_line = 9,
                     .declaration_text = "        static string GetProducts() { return \"[]\"; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-method-group-reference",
-         .why = "System.Func<string> method-group applicability and string parameters are outside "
-                "the primitive C# proof subset, even with explicit assembly membership.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "aspnet-map-post",
          .site = {.file = "Program.cs",
                   .caller = "Program.Main",
@@ -1237,13 +1225,7 @@ TEST(handles_aspnet_csharp) {
                     .declaration_line = 4,
                     .declaration_text = "        public static string MapPost(string path, "
                                         "System.Func<string> handler) { return handler(); }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-delegate-registration",
-         .why = "System.Func<string> method-group applicability and string parameters are outside "
-                "the primitive C# proof subset, even with explicit assembly membership.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "aspnet-handler-post",
          .site = {.file = "Program.cs", .caller = "Program.Main", .needle = "CreateProduct"},
          .relation = "CALL_REFERENCE",
@@ -1253,13 +1235,7 @@ TEST(handles_aspnet_csharp) {
                     .declaration_line = 10,
                     .declaration_text =
                         "        static string CreateProduct() { return \"{}\" ; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "csharp-method-group-reference",
-         .why = "System.Func<string> method-group applicability and string parameters are outside "
-                "the primitive C# proof subset, even with explicit assembly membership.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "required-exact-call",
          .site = {.file = "quality/control.mjs",
                   .caller = "caller",
@@ -2382,13 +2358,7 @@ TEST(http_calls_resttemplate_java) {
                     .declaration_line = 4,
                     .declaration_text = "    public Object getForObject(String url, Class<?> "
                                         "responseType) { return null; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "java-field-and-named-applicability",
-         .why = "Declared member storage and String/Object/Class<?> arguments lack source "
-                "type/flow applicability proof.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "resttemplate-placeOrder",
          .site = {.file = "OrderClient.java",
                   .caller = "OrderClient.placeOrder",
@@ -2400,13 +2370,7 @@ TEST(http_calls_resttemplate_java) {
                     .declaration_line = 5,
                     .declaration_text = "    public Object postForObject(String url, Object req, "
                                         "Class<?> responseType) { return null; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "java-field-and-named-applicability",
-         .why = "Declared member storage and String/Object/Class<?> arguments lack source "
-                "type/flow applicability proof.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "required-service-call",
          .site = {.file = "quality/service.mjs",
                   .caller = "request",
@@ -4013,13 +3977,7 @@ TEST(writes_java) {
                    .label = "Field",
                    .declaration_line = 4,
                    .declaration_text = "    private int count = 0;"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "java-declared-field-write",
-        .why = "reset writes the field in its own Counter class. A count field in Other is a "
-               "distinct declaration. Java write-target proofs are not yet admitted.",
-        .tried = "The original source is unchanged. This exact assignment is measured in both "
-                 "pipeline paths alongside a required supported call and a forbidden foreign "
-                 "target; no edge-count substitute can satisfy it."};
+        .mode = RQ_REQUIRED};
     const RQ_Target wrong = {.file = "Other.java",
                              .suffix = "Other.count",
                              .label = "Field",
@@ -4094,13 +4052,7 @@ TEST(writes_csharp) {
                    .label = "Field",
                    .declaration_line = 4,
                    .declaration_text = "        public int Port = 8080;"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "csharp-declared-field-write",
-        .why = "SetPort writes the Port field of its containing Config class; the lower-case port "
-               "is its parameter. C# write-target proofs are not yet admitted.",
-        .tried = "The original source is unchanged. This exact assignment is measured in both "
-                 "pipeline paths alongside a required supported call and a forbidden foreign "
-                 "target; no edge-count substitute can satisfy it."};
+        .mode = RQ_REQUIRED};
     const RQ_Target wrong = {.file = "Other.cs",
                              .suffix = "Other.Port",
                              .label = "Field",

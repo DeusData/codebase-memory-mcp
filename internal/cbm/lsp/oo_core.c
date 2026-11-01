@@ -671,7 +671,7 @@ oo_value_t oo_value_from_ref(oo_walk_t *w, const oo_typeref_t *ref, const oo_sco
     }
     if ((value.type || value.external) && ref->args && !value.arg_count) {
         int count = 0;
-        while (ref->args[count] && count < OO_ARG_SLOTS)
+        while (count < OO_ARG_SLOTS && ref->args[count])
             count++;
         oo_value_t *args = count ? cbm_arena_alloc(w->arena, (size_t)count * sizeof(*args)) : NULL;
         if (args) {

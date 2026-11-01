@@ -588,9 +588,8 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
      * source adapter states its own rule for what a shared name means. */
     if (proof->ambiguous)
         return !cbm_source_adapter_supported(resolver->file->language) &&
-               !ecma_language(resolver->file->language) && !proof->mixed_kinds &&
-               !proof->rebound && !strcmp(proof->label, node->label) &&
-               target_declared_in(proof, node->file_path);
+               !ecma_language(resolver->file->language) && !proof->mixed_kinds && !proof->rebound &&
+               !strcmp(proof->label, node->label) && target_declared_in(proof, node->file_path);
     if (strcmp(proof->file, node->file_path) || node->start_line < 0 || node->end_line < 0)
         return false;
     /* The upsert keeps one clause's span and label; all agreed on the file. */

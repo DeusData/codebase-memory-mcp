@@ -3624,13 +3624,7 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                     .label = "Function",
                     .declaration_line = 8,
                     .declaration_text = "fun projectHandler(): Int = 7"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin_parse_incomplete_callable_identity",
-         .why = "The original file has a tree-sitter root error; strict proof entry correctly "
-                "rejects incomplete syntax.",
-         .tried = "Preserved the original generic/destructuring/loop fixture and raw carriers. "
-                  "Both drivers reach the root-error gate; file-level legacy flags do not certify "
-                  "a complete parse."},
+         .mode = RQ_REQUIRED},
         {.case_id = "binary-plus-quality",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.operatorCaller",
@@ -3642,12 +3636,7 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                     .label = "Method",
                     .declaration_line = 13,
                     .declaration_text = "class Box { operator fun plus(other: Box): Box = this }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         {.case_id = "required-clean-callable-alias",
          .site = {.file = "quality/Alias.kt",
                   .caller = "quality.Alias.aliasControl",
@@ -3855,12 +3844,7 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                     .declaration_line = 2,
                     .declaration_text =
                         "class UnaryBox { operator fun unaryMinus(): UnaryBox = this }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         {.case_id = "membership",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.hasValue",
@@ -3873,12 +3857,7 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                     .declaration_line = 3,
                     .declaration_text =
                         "class Bag { operator fun contains(value: Int): Boolean = true }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         {.case_id = "negated-membership",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.lacksValue",
@@ -3891,12 +3870,7 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                     .declaration_line = 3,
                     .declaration_text =
                         "class Bag { operator fun contains(value: Int): Boolean = true }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         {.case_id = "index-read",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.lookup",
@@ -3909,12 +3883,7 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                     .declaration_line = 4,
                     .declaration_text =
                         "class Slots { operator fun get(index: Int): Int = index }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         {.case_id = "increment",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.increment",
@@ -3926,12 +3895,7 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                     .label = "Method",
                     .declaration_line = 6,
                     .declaration_text = "  operator fun inc(): Counter = this"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         {.case_id = "decrement",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.decrement",
@@ -3943,12 +3907,7 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                     .label = "Method",
                     .declaration_line = 7,
                     .declaration_text = "  operator fun dec(): Counter = this"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin-implicit-operator-proof",
-         .why = "Implicit operator occurrence and operator declaration applicability lack strict "
-                "source proof.",
-         .tried = "Preserved typed receiver fixture, raw carrier/semantic join and both drivers; "
-                  "confidence rows cannot authorize edges."},
+         .mode = RQ_REQUIRED},
         PAR_C_REQUIRED,
     };
     const char *project = "cbm_kt_nonbinary_operators";

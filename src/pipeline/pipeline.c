@@ -1910,20 +1910,22 @@ static char *fe_strdup(const char *s) {
 /* Private indices select only the frozen recorder's allocation boundaries. */
 enum { FROZEN_DIAG_GROW, FROZEN_DIAG_PATH, FROZEN_DIAG_REASON, FROZEN_DIAG_PHASE };
 
-static bool frozen_diag_fail_allocation(cbm_pipeline_t *p, unsigned allocation) {
+/* The diagnostic list's one allocator. Test builds can fail each allocation on purpose. */
+static void *frozen_diag_realloc(cbm_pipeline_t *p, unsigned allocation, void *block,
+                                 size_t bytes) {
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     static const cbm_pipeline_frozen_diag_fault_t faults[] = {
         CBM_PIPELINE_FROZEN_DIAG_FAULT_GROW, CBM_PIPELINE_FROZEN_DIAG_FAULT_PATH,
         CBM_PIPELINE_FROZEN_DIAG_FAULT_REASON, CBM_PIPELINE_FROZEN_DIAG_FAULT_PHASE};
     if (p->frozen->diagnostic_fault == faults[allocation]) {
         p->frozen->diagnostic_fault = CBM_PIPELINE_FROZEN_DIAG_FAULT_NONE;
-        return true;
+        return NULL;
     }
 #else
     (void)p;
     (void)allocation;
 #endif
-    return false;
+    return cbm_realloc(CBM_MEM_CLASS_OTHER, block, bytes);
 }
 
 static void frozen_diag_incomplete(cbm_pipeline_t *p, bool oom) {
@@ -1949,10 +1951,8 @@ static bool frozen_diag_reserve(cbm_pipeline_t *p) {
         frozen_diag_incomplete(p, false);
         return false;
     }
-    cbm_file_error_t *grown = frozen_diag_fail_allocation(p, FROZEN_DIAG_GROW)
-                                  ? NULL
-                                  : cbm_realloc(CBM_MEM_CLASS_OTHER, p->file_errors,
-                                                (size_t)capacity * sizeof(*p->file_errors));
+    cbm_file_error_t *grown = frozen_diag_realloc(p, FROZEN_DIAG_GROW, p->file_errors,
+                                                  (size_t)capacity * sizeof(*p->file_errors));
     if (!grown) {
         frozen_diag_incomplete(p, true);
         return false;
@@ -1968,9 +1968,7 @@ static char *frozen_diag_copy(cbm_pipeline_t *p, const char *source, unsigned al
         frozen_diag_incomplete(p, false);
         return NULL;
     }
-    char *copy = frozen_diag_fail_allocation(p, allocation)
-                     ? NULL
-                     : cbm_alloc(CBM_MEM_CLASS_OTHER, length + 1);
+    char *copy = frozen_diag_realloc(p, allocation, NULL, length + 1);
     if (!copy) {
         frozen_diag_incomplete(p, true);
         return NULL;
