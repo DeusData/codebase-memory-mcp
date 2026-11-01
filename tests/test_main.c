@@ -44,6 +44,7 @@ int tf_deselected_count = 0;
 #include <windows.h>
 #include "foundation/win_utf8.h" /* cbm_module_path_utf8 — the runner's own image */
 #else
+#include <sys/wait.h> /* waitpid: the process-tree probe root */
 #include <unistd.h>
 #ifdef __APPLE__
 #include <fcntl.h>
@@ -1968,6 +1969,100 @@ static int tf_role_env_isolation(int argc, char **argv) {
     return 0;
 }
 
+/* Process-tree memory probe coverage (test_subprocess.c). The root starts ONE
+ * descendant that charges a controlled amount of memory, so a tree total can
+ * be checked against an allocation only a descendant holds. The descendant
+ * publishes its pid by an atomic rename once every page is touched, then
+ * blocks until it is killed. The root exits when its descendant dies, so a
+ * failed setup ends the tree instead of leaving the test waiting. */
+static int tf_rss_tree_hold(const char *ready_path, const char *mib_text) {
+    char *end = NULL;
+    long mib = strtol(mib_text, &end, 10);
+    if (!end || *end != '\0' || mib < 0 || mib > 1024) {
+        return 81;
+    }
+    size_t bytes = (size_t)mib * 1024U * 1024U;
+    unsigned char *block = bytes > 0 ? malloc(bytes) : NULL;
+    if (bytes > 0 && !block) {
+        return 82;
+    }
+    if (block) {
+        memset(block, 0xA5, bytes);
+    }
+    char staged[1024];
+    int length = snprintf(staged, sizeof(staged), "%s.tmp", ready_path);
+    FILE *ready = length > 0 && (size_t)length < sizeof(staged) ? cbm_fopen(staged, "wb") : NULL;
+    if (!ready) {
+        return 83;
+    }
+#ifdef _WIN32
+    (void)fprintf(ready, "%lu\n", (unsigned long)GetCurrentProcessId());
+#else
+    (void)fprintf(ready, "%ld\n", (long)getpid());
+#endif
+    if (fclose(ready) != 0 || rename(staged, ready_path) != 0) {
+        return 84;
+    }
+    volatile unsigned char keep = block ? block[bytes - 1] : 0;
+    (void)keep;
+    for (;;) {
+#ifdef _WIN32
+        Sleep(INFINITE);
+#else
+        (void)pause();
+#endif
+    }
+}
+
+static int tf_role_rss_tree_hold(int argc, char **argv) {
+    return argc == 4 ? tf_rss_tree_hold(argv[2], argv[3]) : -1;
+}
+
+static int tf_role_rss_tree_root(int argc, char **argv) {
+    if (argc != 4) {
+        return -1;
+    }
+#ifdef _WIN32
+    char *self = cbm_module_path_utf8();
+    const char *child_argv[] = {self, "__cbm_rss_tree_hold", argv[2], argv[3], NULL};
+    char command_line[8192];
+    bool built = self && cbm_build_win_cmdline(command_line, sizeof(command_line), child_argv);
+    wchar_t *wide_self = built ? cbm_utf8_to_wide(self) : NULL;
+    wchar_t *wide_command = built ? cbm_utf8_to_wide(command_line) : NULL;
+    STARTUPINFOW startup;
+    ZeroMemory(&startup, sizeof(startup));
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child;
+    ZeroMemory(&child, sizeof(child));
+    /* The child joins this process's Job Object by default, which is the tree
+     * the probe under test enumerates. */
+    BOOL started = wide_self && wide_command &&
+                   CreateProcessW(wide_self, wide_command, NULL, NULL, FALSE, 0, NULL, NULL,
+                                  &startup, &child);
+    free(wide_self);
+    free(wide_command);
+    free(self);
+    if (!started) {
+        return 85;
+    }
+    CloseHandle(child.hThread);
+    (void)WaitForSingleObject(child.hProcess, INFINITE);
+    CloseHandle(child.hProcess);
+#else
+    pid_t child = fork();
+    if (child < 0) {
+        return 85;
+    }
+    if (child == 0) {
+        _exit(tf_rss_tree_hold(argv[2], argv[3]));
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+#endif
+    return 86; /* the descendant ended: end the tree */
+}
+
 /* Installation tests use this executable as a structurally real candidate.
  * Mirror the production binary's minimal verification contract. */
 static int tf_role_version(int argc, char **argv) {
@@ -2060,6 +2155,8 @@ typedef struct {
 static const tf_role_t tf_roles[] = {
     TF_ROLE(TF_PHASE_RAW, "__cbm_env_values", tf_role_env_values),
     TF_ROLE(TF_PHASE_RAW, "__cbm_env_isolation", tf_role_env_isolation),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_root", tf_role_rss_tree_root),
+    TF_ROLE(TF_PHASE_RAW, "__cbm_rss_tree_hold", tf_role_rss_tree_hold),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdin_probe", tf_role_subprocess_stdin_probe),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_subprocess_stdout_probe", tf_role_subprocess_stdout_probe),
     TF_ROLE(TF_PHASE_GIT_CLEAN, "__cbm_git_facts_diff_probe", tf_role_git_facts_diff_probe),

@@ -807,43 +807,123 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
 #endif
 }
 
-TEST(subprocess_tree_rss_measures_contained_descendants) {
-#ifdef _WIN32
-    SKIP_PLATFORM("native Job Object process-tree RSS runs on Windows CI");
-#else
-    char pid_path[64];
-    ASSERT_TRUE(make_tree_pid_path(pid_path));
-    cbm_subprocess_t *process = NULL;
-    ASSERT_EQ(spawn_ignoring_tree(pid_path, 0, 100, &process), 0);
-    pid_t parent_pid = 0;
-    pid_t grandchild_pid = 0;
-    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 3000);
-    uint64_t rss_bytes = 0;
-    cbm_proc_tree_rss_status_t rss_status =
-        ready ? cbm_subprocess_tree_rss_bytes(process, &rss_bytes) : CBM_PROC_TREE_RSS_ERROR;
-    bool cancel_accepted = cbm_subprocess_request_cancel(process);
-    cbm_proc_result_t result;
-    bool terminal = poll_until_terminal(process, 5000, &result);
-    uint64_t final_rss = UINT64_MAX;
-    cbm_proc_tree_rss_status_t final_rss_status =
-        terminal ? cbm_subprocess_tree_rss_bytes(process, &final_rss) : CBM_PROC_TREE_RSS_ERROR;
-    if (terminal) {
-        cbm_subprocess_destroy(process);
-    } else {
-        force_probe_cleanup(parent_pid, grandchild_pid);
-    }
-    (void)unlink(pid_path);
+/* ── Process-tree memory probe (every platform) ─────────────────────────────
+ * The test runner's __cbm_rss_tree_root role starts one __cbm_rss_tree_hold
+ * descendant that touches a controlled allocation and then publishes its pid.
+ * Waits below have no deadline: they end when the descendant is ready or the
+ * tree stops running, so the outcome, not a timer, decides the verdict. */
 
-    ASSERT_TRUE(ready);
-    ASSERT_EQ(rss_status, CBM_PROC_TREE_RSS_OK);
-    ASSERT_TRUE(rss_bytes > 0);
-    ASSERT_TRUE(cancel_accepted);
-    ASSERT_TRUE(terminal);
-    ASSERT_TRUE(result.tree_quiesced);
-    ASSERT_EQ(final_rss_status, CBM_PROC_TREE_RSS_EMPTY);
-    ASSERT_EQ(final_rss, 0);
+#define RSS_TREE_MIB UINT64_C(1048576)
+
+typedef struct {
+    bool spawned;
+    bool ready;
+    cbm_proc_tree_rss_status_t status;
+    uint64_t rss;
+    bool quiesced;
+    cbm_proc_tree_rss_status_t final_status;
+    uint64_t final_rss;
+} rss_tree_sample_t;
+
+static void rss_tree_pause(void) {
+    cbm_usleep(10000); /* poll interval only; nothing here is a deadline */
+}
+
+static bool rss_tree_wait_ready(const char *ready_path, cbm_subprocess_t *process) {
+    for (;;) {
+        FILE *ready = cbm_fopen(ready_path, "rb");
+        if (ready) {
+            long pid = 0;
+            int fields = fscanf(ready, "%ld", &pid);
+            (void)fclose(ready);
+            if (fields == 1 && pid > 0) {
+                return true;
+            }
+        }
+        cbm_proc_result_t ignored;
+        if (cbm_subprocess_poll(process, &ignored) != CBM_PROC_POLL_RUNNING) {
+            return false;
+        }
+        rss_tree_pause();
+    }
+}
+
+static bool rss_tree_finish(cbm_subprocess_t *process, rss_tree_sample_t *sample) {
+    (void)cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result;
+    for (;;) {
+        cbm_proc_poll_t state = cbm_subprocess_poll(process, &result);
+        if (state == CBM_PROC_POLL_TERMINAL) {
+            break;
+        }
+        if (state == CBM_PROC_POLL_ERROR) {
+            return false;
+        }
+        rss_tree_pause();
+    }
+    sample->final_status = cbm_subprocess_tree_rss_bytes(process, &sample->final_rss);
+    cbm_subprocess_destroy(process);
+    return result.tree_quiesced;
+}
+
+/* Measure one tree whose descendant holds `mib` MiB. */
+static rss_tree_sample_t rss_tree_sample(int mib) {
+    rss_tree_sample_t sample = {.status = CBM_PROC_TREE_RSS_ERROR,
+                                .final_status = CBM_PROC_TREE_RSS_ERROR,
+                                .final_rss = UINT64_MAX};
+    const char *made = th_mktempdir("cbm_rss_tree");
+    char dir[256];
+    char ready_path[300];
+    char mib_text[16];
+    if (!made || snprintf(dir, sizeof(dir), "%s", made) >= (int)sizeof(dir) ||
+        snprintf(ready_path, sizeof(ready_path), "%s/ready", dir) >= (int)sizeof(ready_path)) {
+        return sample;
+    }
+    (void)snprintf(mib_text, sizeof(mib_text), "%d", mib);
+    const char *argv[] = {cbm_test_program_path, "__cbm_rss_tree_root", ready_path, mib_text,
+                          NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = cbm_test_program_path;
+    opts.argv = argv;
+    opts.cancel_grace_ms = 100;
+    cbm_subprocess_t *process = NULL;
+    sample.spawned = cbm_subprocess_spawn(&opts, &process) == 0;
+    if (sample.spawned) {
+        sample.ready = rss_tree_wait_ready(ready_path, process);
+        if (sample.ready) {
+            sample.status = cbm_subprocess_tree_rss_bytes(process, &sample.rss);
+        }
+        sample.quiesced = rss_tree_finish(process, &sample);
+    }
+    th_cleanup(dir);
+    return sample;
+}
+
+/* Only the DESCENDANT allocates, so the difference between two otherwise
+ * identical trees is memory the probe can only have counted by measuring past
+ * the root. 128 MiB touched against a 96 MiB floor leaves room for allocator
+ * and page-rounding noise and none for a root-only total. */
+TEST(subprocess_tree_rss_measures_contained_descendants) {
+    rss_tree_sample_t idle = rss_tree_sample(0);
+    rss_tree_sample_t loaded = rss_tree_sample(128);
+    if (loaded.status == CBM_PROC_TREE_RSS_OK && idle.status == CBM_PROC_TREE_RSS_OK) {
+        printf("    tree rss: idle=%llu MiB loaded=%llu MiB\n",
+               (unsigned long long)(idle.rss / RSS_TREE_MIB),
+               (unsigned long long)(loaded.rss / RSS_TREE_MIB));
+    }
+    ASSERT_TRUE(idle.spawned);
+    ASSERT_TRUE(idle.ready);
+    ASSERT_EQ(idle.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(idle.rss > 0);
+    ASSERT_TRUE(loaded.spawned);
+    ASSERT_TRUE(loaded.ready);
+    ASSERT_EQ(loaded.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(loaded.rss >= idle.rss + 96 * RSS_TREE_MIB);
+    ASSERT_TRUE(idle.quiesced);
+    ASSERT_TRUE(loaded.quiesced);
+    ASSERT_EQ(loaded.final_status, CBM_PROC_TREE_RSS_EMPTY);
+    ASSERT_EQ(loaded.final_rss, 0);
     PASS();
-#endif
 }
 
 TEST(subprocess_natural_completion_is_cached_across_polls) {
