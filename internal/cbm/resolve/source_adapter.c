@@ -30,7 +30,7 @@ static const cbm_source_adapter_t *adapter_for(CBMLanguage language) {
         &cbm_source_adapter_php,     &cbm_source_adapter_elixir, &cbm_source_adapter_erlang,
         &cbm_source_adapter_perl,    &cbm_source_adapter_ruby,   &cbm_source_adapter_zig,
         &cbm_source_adapter_haskell, &cbm_source_adapter_ocaml,  &cbm_source_adapter_dart,
-        &cbm_source_adapter_swift,
+        &cbm_source_adapter_swift,   &cbm_source_adapter_scala,
     };
     for (size_t i = 0; i < sizeof(adapters) / sizeof(adapters[0]); i++)
         if (adapters[i]->language == language)

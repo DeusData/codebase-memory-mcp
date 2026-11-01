@@ -103,8 +103,9 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_MESON, EDGE(IMPORTS),
      "Complete literal subdir calls in an unconditional initial statement prefix; parent "
      "traversal, keyword arguments, conditions and prior unknown effects abstain."},
-    {CBM_LANG_SCALA, EDGE(IMPORTS),
-     "Exact declared namespace members only; no semantic binding proof bridge advertised."},
+    {CBM_LANG_SCALA, EDGE(IMPORTS) | EDGE(CALLS),
+     "Packages, imports by precedence, templates and their linearized parents; declared receiver "
+     "types and `new`. Inferred return types, infix calls and Java classes abstain."},
     {CBM_LANG_HCL, EDGE(IMPORTS) | EDGE(USAGE),
      "Terraform/OpenTofu literal local module sources and Terragrunt literal paths with audited "
      "parent-directory evaluation; remote, dynamic and ambiguous inputs abstain."},
@@ -390,6 +391,13 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
         out->limitation = "Supported source bindings only; no typed cross-file dispatch for the "
                           "containing language.";
+        break;
+    case CBM_LANG_SCALA:
+        out->adapter = "scala_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation = "Packages, imports by precedence, linearized parents; declared receiver "
+                          "types; inferred return types and infix calls abstain.";
         break;
     case CBM_LANG_SWIFT:
         out->adapter = "swift_source";

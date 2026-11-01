@@ -2741,7 +2741,8 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
         !callable_node(target) &&
         !((resolver->file->language == CBM_LANG_PYTHON ||
            resolver->file->language == CBM_LANG_DART ||
-           resolver->file->language == CBM_LANG_SWIFT) &&
+           resolver->file->language == CBM_LANG_SWIFT ||
+           resolver->file->language == CBM_LANG_SCALA) &&
           target->label &&
           (!strcmp(target->label, "Class") ||
            (resolver->file->language == CBM_LANG_SWIFT && !strcmp(target->label, "Struct"))) &&

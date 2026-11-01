@@ -1017,6 +1017,170 @@ TEST(resolver_source_swift_modules_lookup_and_receivers) {
     PASS();
 }
 
+/* ── Scala ─────────────────────────────────────────────────────────── */
+
+static const char SC_MAIN[] =
+    "package app\n"
+    "\n"
+    "import lib.Util\n"
+    "import lib.Wild._\n"
+    "import lib.{Renames => R}\n"
+    "\n"
+    "class Base {\n"
+    "  def fromBase(): Unit = ()\n"
+    "}\n"
+    "trait First {\n"
+    "  def both(): Unit = ()\n"
+    "}\n"
+    "trait Last {\n"
+    "  def both(): Unit = ()\n"
+    "}\n"
+    "case class Box(id: Int) {\n"
+    "  def put(): Unit = ()\n"
+    "  def self2: Box = this\n"
+    "}\n"
+    "object Box {\n"
+    "  def make(): Box = Box(1)\n"
+    "}\n"
+    "class Plain {\n"
+    "  def go(): Unit = ()\n"
+    "}\n"
+    "class Service(val box: Box, other: Box) extends Base with First with Last {\n"
+    "  val made = new Box(2)\n"
+    "  def ownM(): Unit = ()\n"
+    "  def callsOwn(): Unit = ownM()\n"
+    "  def callsThis(): Unit = this.ownM()\n"
+    "  def callsInherited(): Unit = fromBase()\n"
+    "  def callsLastTrait(): Unit = both()\n"
+    "  def callsClassParam(): Unit = box.put()\n"
+    "  def callsPrivateParam(): Unit = other.put()\n"
+    "  def callsField(): Unit = made.put()\n"
+    "  def callsParam(p: Box): Unit = p.put()\n"
+    "  def callsLocal(): Unit = { val l = new Box(3); l.put() }\n"
+    "  def callsTyped(): Unit = { val t: Box = Box.make(); t.put() }\n"
+    "  def callsCompanion(): Unit = Box.make()\n"
+    "  def callsChain(): Unit = Box.make().put()\n"
+    "  def callsCaseApply(): Unit = Box(4).put()\n"
+    "  def callsPlainNew(): Unit = new Plain().go()\n"
+    "  def callsPackageFn(): Unit = sameOther()\n"
+    "  def callsExplicitImport(): Unit = Util.help()\n"
+    "  def callsWildcard(): Unit = fromWild()\n"
+    "  def callsRenamed(): Unit = R.renamed()\n"
+    "  def noParamShadow(ownM: () => Unit): Unit = ownM()\n"
+    "  def noLambda(): Unit = List(1).map(ownM => ownM())\n"
+    "  def noMatch(o: Option[Box]): Unit = o match { case Some(box) => box.put(); case None => () "
+    "}\n"
+    "  def noGeneric[T](t: T): Unit = t.put()\n"
+    "  def noAbsent(p: Box): Unit = p.absent()\n"
+    "  def noUnknownImport(): Unit = notAnywhere()\n"
+    "  def localShadows(): Unit = { val box = new Plain(); box.go() }\n"
+    "}\n"
+    "class Open extends outside.Thing {\n"
+    "  def own(): Unit = ()\n"
+    "  def callsOwnOpen(): Unit = own()\n"
+    "  def noFromOutside(): Unit = sameOther()\n"
+    "}\n";
+static const char SC_OTHER[] = "package app\n"
+                               "\n"
+                               "def sameOther(): Unit = ()\n";
+static const char SC_LIB[] = "package lib\n"
+                             "\n"
+                             "object Util {\n"
+                             "  def help(): Unit = ()\n"
+                             "}\n"
+                             "object Wild {\n"
+                             "  def fromWild(): Unit = ()\n"
+                             "}\n"
+                             "object Renames {\n"
+                             "  def renamed(): Unit = ()\n"
+                             "}\n";
+static const char SC_OUTER[] = "package app\n"
+                               "\n"
+                               "import outside.Everything._\n"
+                               "\n"
+                               "class Shadowed {\n"
+                               "  def noOtherFile(): Unit = sameOther()\n"
+                               "  def sameUnit(): Unit = here()\n"
+                               "  def here(): Unit = ()\n"
+                               "}\n";
+
+#define SC_FILE "src/app/Main.scala"
+#define SC_CALL(id, method, text, at, tfile, tsuffix, label, tline, tdecl)                     \
+    SL_CALL_AT(id, SC_FILE, "Service." method, text, at, tfile, tsuffix, label, tline, tdecl)
+#define SC_DENY(id, method, text, at) SL_DENY_AT(id, SC_FILE, "Service." method, text, at)
+#define SC_PUT(id, method, text)                                                               \
+    SC_CALL(id, method, text, 0, SC_FILE, "Box.put", "Method", 17, "  def put(): Unit = ()")
+#define SC_MAKE(id, method, at)                                                                \
+    SC_CALL(id, method, "Box.make()", at, SC_FILE, "Box.make", "Method", 21,                   \
+            "  def make(): Box = Box(1)")
+
+TEST(resolver_source_scala_packages_precedence_and_receivers) {
+    static const RQ_Source sources[] = {
+        {.path = SC_FILE, .text = SC_MAIN},
+        {.path = "src/app/Other.scala", .text = SC_OTHER},
+        {.path = "src/lib/Util.scala", .text = SC_LIB},
+        {.path = "src/app/Outer.scala", .text = SC_OUTER},
+    };
+    static const RQ_Expected expected[] = {
+        SC_CALL("own-member", "callsOwn", "ownM()", 1, SC_FILE, "Service.ownM", "Method", 28,
+                "  def ownM(): Unit = ()"),
+        SC_CALL("this-member", "callsThis", "this.ownM()", 0, SC_FILE, "Service.ownM", "Method", 28,
+                "  def ownM(): Unit = ()"),
+        SC_CALL("superclass-member", "callsInherited", "fromBase()", 1, SC_FILE, "Base.fromBase",
+                "Method", 8, "  def fromBase(): Unit = ()"),
+        SC_CALL("last-mixed-trait-wins", "callsLastTrait", "both()", 2, SC_FILE, "Last.both",
+                "Method", 14, "  def both(): Unit = ()"),
+        SC_PUT("val-class-parameter", "callsClassParam", "box.put()"),
+        SC_PUT("plain-class-parameter", "callsPrivateParam", "other.put()"),
+        SC_PUT("field-from-new", "callsField", "made.put()"),
+        SC_PUT("declared-parameter", "callsParam", "p.put()"),
+        SC_PUT("local-from-new", "callsLocal", "l.put()"),
+        SC_MAKE("companion-method", "callsTyped", 0),
+        SC_PUT("declared-local", "callsTyped", "t.put()"),
+        SC_MAKE("object-method", "callsCompanion", 1),
+        SC_MAKE("object-method-in-a-chain", "callsChain", 2),
+        SC_PUT("declared-return-type", "callsChain", "Box.make().put()"),
+        SC_CALL("case-class-apply-constructs", "callsCaseApply", "Box(4)", 0, SC_FILE, "Main.Box",
+                "Class", 20, "object Box {"),
+        SC_PUT("member-of-a-constructed-case-class", "callsCaseApply", "Box(4).put()"),
+        SC_CALL("member-after-new", "callsPlainNew", "new Plain().go()", 0, SC_FILE, "Plain.go",
+                "Method", 24, "  def go(): Unit = ()"),
+        SC_CALL("another-file-of-the-package", "callsPackageFn", "sameOther()", 0,
+                "src/app/Other.scala", "Other.sameOther", "Function", 3,
+                "def sameOther(): Unit = ()"),
+        SC_CALL("explicit-import", "callsExplicitImport", "Util.help()", 0, "src/lib/Util.scala",
+                "Util.help", "Method", 4, "  def help(): Unit = ()"),
+        SC_CALL("wildcard-of-a-project-object", "callsWildcard", "fromWild()", 0,
+                "src/lib/Util.scala", "Wild.fromWild", "Method", 7, "  def fromWild(): Unit = ()"),
+        SC_CALL("renamed-import", "callsRenamed", "R.renamed()", 0, "src/lib/Util.scala",
+                "Renames.renamed", "Method", 10, "  def renamed(): Unit = ()"),
+        SC_CALL("local-shadows-parameter-with-its-own-type", "localShadows", "box.go()", 0, SC_FILE,
+                "Plain.go", "Method", 24, "  def go(): Unit = ()"),
+        SL_CALL_AT("own-member-under-an-outside-parent", SC_FILE, "Open.callsOwnOpen", "own()", 1,
+                   SC_FILE, "Open.own", "Method", 56, "  def own(): Unit = ()"),
+        SL_CALL_AT("own-unit-beats-an-outside-wildcard", "src/app/Outer.scala", "Shadowed.sameUnit",
+                   "here()", 0, "src/app/Outer.scala", "Shadowed.here", "Method", 8,
+                   "  def here(): Unit = ()"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SC_DENY("parameter-shadows-member", "noParamShadow", "ownM()", 3),
+        SC_DENY("lambda-parameter-shadows-member", "noLambda", "ownM()", 4),
+        SC_DENY("case-pattern-shadows-parameter", "noMatch", "box.put()", 1),
+        SC_DENY("generic-parameter", "noGeneric", "t.put()", 1),
+        SC_DENY("absent-may-be-an-implicit-conversion", "noAbsent", "p.absent()", 0),
+        SC_DENY("name-nowhere-in-project", "noUnknownImport", "notAnywhere()", 0),
+        SL_DENY_AT("package-member-under-an-outside-parent", SC_FILE, "Open.noFromOutside",
+                   "sameOther()", 1),
+        SL_DENY_AT("outside-wildcard-outranks-another-file", "src/app/Outer.scala",
+                   "Shadowed.noOtherFile", "sameOther()", 0),
+    };
+    ASSERT(sl_check("scala-rules", ".scala", "package filler\n\nobject Filler\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_elixir_modules_aliases_imports_and_arity);
     RUN_TEST(resolver_source_erlang_module_arity_export_and_import);
@@ -1025,4 +1189,5 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_ruby_ancestor_chain_and_self_rules);
     RUN_TEST(resolver_source_dart_lexical_scope_libraries_and_receivers);
     RUN_TEST(resolver_source_swift_modules_lookup_and_receivers);
+    RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
 }
