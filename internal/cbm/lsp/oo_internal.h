@@ -325,6 +325,8 @@ bool oo_type_shaped(const char *name);
 /* A member of a well-known external supertype whose member list is closed. A
  * free function of this name cannot be told apart from the inherited member. */
 bool oo_closed_member(const oo_walk_t *w, const char *name);
+/* A type parameter's name mentions the parameter, never its bound. */
+bool oo_names_tparam(const oo_walk_t *w, const char *name);
 /* The element a collection-like value yields, or unknown. */
 oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value);
 /* The declared result of a standard collection accessor, or unknown. */

@@ -340,16 +340,16 @@ TEST(resolver_kotlin_fixed_arguments_preserve_name_ambiguity_and_type_shadows) {
         ASSERT_EQ(calls, 0);
         ASSERT_EQ(references, 0);
     }
-    /* Arity excludes the zero-argument overload, and a function outranks a property of
-     * the name at one scope level (Kotlin spec 11.3): the call is selected. */
-    const char *selected[] = {"fun consume() {}\n", "val consume = unknown\n"};
+    /* Arity excludes the zero-argument overload, a function outranks a property of the
+     * name at one scope level (Kotlin spec 11.3), and Int is more specific than T. */
+    const char *selected[] = {"fun consume() {}\n", "val consume = unknown\n",
+                              "fun <T> consume(value: T) {}\n"};
     for (size_t i = 0; i < sizeof(selected) / sizeof(selected[0]); i++) {
         ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n", library, selected[i], &calls,
                                       &references));
         ASSERT_EQ(calls, 1);
     }
-    const char *competitors[] = {"fun <T> consume(value: T) {}\n", "class Int {}\n",
-                                 "typealias Int = String\n", "object Int {}\n"};
+    const char *competitors[] = {"class Int {}\n", "typealias Int = String\n", "object Int {}\n"};
     for (size_t i = 0; i < sizeof(competitors) / sizeof(competitors[0]); i++) {
         ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n", library, competitors[i],
                                       &calls, &references));

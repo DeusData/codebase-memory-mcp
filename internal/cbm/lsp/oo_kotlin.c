@@ -1288,7 +1288,8 @@ static void kw_type_mentions(kw_t *k, TSNode node, unsigned depth) {
             else
                 kw_type_mentions(k, child, depth + 1);
         }
-        if (value.type && value.type->graph_qn && !ts_node_is_null(last)) {
+        if (value.type && value.type->graph_qn && !ts_node_is_null(last) &&
+            !(ref && oo_names_tparam(w, ref->name))) {
             oo_emit_type_ref(w, last, value.type->graph_qn, "kotlin-type-name-lookup");
             oo_emit_usage(w, last, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
                           CBM_RESOLVE_RULE_DECLARED_TYPE, "kotlin-type-name-lookup");
@@ -2801,6 +2802,15 @@ static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
     return oo_value_unknown();
 }
 
+static bool kw_navigation_chain(TSNode target, uint32_t parts) {
+    if (parts < 2)
+        return false;
+    for (uint32_t p = 1; p < parts; p++)
+        if (!kt_is(ts_node_named_child(target, p), "navigation_suffix"))
+            return false;
+    return true;
+}
+
 static oo_value_t kw_literal(kw_t *k, TSNode node, const char *kind) {
     if (!strcmp(kind, "string_literal") || !strcmp(kind, "line_string_literal") ||
         !strcmp(kind, "multi_line_string_literal"))
@@ -2939,20 +2949,26 @@ static oo_value_t kw_expr_kind(kw_t *k, TSNode node, const char *kind) {
                 uint32_t parts = ts_node_named_child_count(child);
                 if (parts == 1) {
                     (void)kw_expr(k, ts_node_named_child(child, 0));
-                } else if (parts == 2 &&
-                           kt_is(ts_node_named_child(child, 1), "navigation_suffix")) {
+                } else if (kw_navigation_chain(child, parts)) {
+                    /* The grammar flattens `a.b.c`: it reads a and b, and writes c. */
                     oo_value_t receiver = kw_expr(k, ts_node_named_child(child, 0));
-                    TSNode name_node = kt_child(ts_node_named_child(child, 1), "simple_identifier");
-                    const char *name = kt_name(&k->text, name_node);
-                    if (receiver.type && name) {
+                    for (uint32_t p = 1; p < parts; p++) {
+                        TSNode name_node =
+                            kt_child(ts_node_named_child(child, p), "simple_identifier");
+                        const char *name = kt_name(&k->text, name_node);
                         oo_subst_t *subst = NULL;
-                        const oo_field_t *field = kt_find_property(w, &receiver, name, &subst);
+                        const oo_field_t *field = receiver.type && name
+                                                      ? kt_find_property(w, &receiver, name, &subst)
+                                                      : NULL;
                         if (field && field->graph_qn) {
                             oo_emit_usage(w, name_node, field->graph_qn,
                                           CBM_RESOLVED_VALUE_REFERENCE,
                                           CBM_RESOLVE_RULE_TYPE_MEMBER, "kotlin-receiver-property");
-                            oo_emit_rw(w, name_node, field->graph_qn, "kotlin-receiver-property");
+                            if (p == parts - 1)
+                                oo_emit_rw(w, name_node, field->graph_qn,
+                                           "kotlin-receiver-property");
                         }
+                        receiver = field ? kt_field_type(w, field, subst) : oo_value_unknown();
                     }
                 } else {
                     kw_children(k, child);

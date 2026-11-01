@@ -621,7 +621,7 @@ static void jw_type_leaf(jw_t *j, TSNode node) {
         return;
     oo_typeref_t ref = {.name = text};
     oo_value_t value = jw_ref(j, &ref);
-    if (value.type && value.type->graph_qn)
+    if (value.type && value.type->graph_qn && !oo_names_tparam(w, text))
         oo_emit_type_ref(w, node, value.type->graph_qn, "java-type-name-lookup");
 }
 

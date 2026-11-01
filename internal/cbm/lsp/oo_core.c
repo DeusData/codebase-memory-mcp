@@ -686,6 +686,10 @@ oo_value_t oo_value_from_ref(oo_walk_t *w, const oo_typeref_t *ref, const oo_sco
     return value;
 }
 
+bool oo_names_tparam(const oo_walk_t *w, const char *name) {
+    return name && oo_resolve_name(w->ix, &w->scope, name).status == OO_NAME_TPARAM;
+}
+
 bool oo_type_shaped(const char *name) {
     if (!name || name[0] < 'A' || name[0] > 'Z')
         return false;

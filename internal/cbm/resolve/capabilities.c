@@ -274,10 +274,13 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
         out->limitation =
             "The declaration static rules select: lexical scopes, import precedence, inherited "
-            "members over resolved supertypes, arity and known argument types. Competing "
-            "overloads, lambdas with an unreadable receiver, members hidden by an unindexed "
-            "supertype and unmodelled inference abstain. A type-shaped name is assumed not to be "
-            "a field of an unindexed supertype.";
+            "members over resolved supertypes, arity, known argument types and exact overload "
+            "matches. Competing overloads on different nodes, lambdas with an unreadable "
+            "receiver, members hidden by an unindexed supertype and unmodelled inference abstain. "
+            "A type-shaped name is assumed not to be a field of an unindexed supertype. Implicit "
+            "iterator and componentN calls share one span and are not emitted. A bare call inside "
+            "an extension on an external type abstains, because that type's members are unlisted. "
+            "A C# file the grammar cannot read is read without its later conditional branches.";
         break;
     case CBM_LANG_PHP:
         out->adapter = "php";

@@ -619,8 +619,10 @@ static void cw_type_mentions(cw_t *c, TSNode node, unsigned depth) {
     if (ts_node_is_null(node) || depth > 32)
         return;
     if (cs_is(node, "identifier") || cs_is(node, "qualified_name") || cs_is(node, "generic_name")) {
-        oo_value_t value = cw_ref(c, cs_typeref(&c->text, node));
-        if (value.type && value.type->graph_qn) {
+        const oo_typeref_t *mentioned = cs_typeref(&c->text, node);
+        oo_value_t value = cw_ref(c, mentioned);
+        if (value.type && value.type->graph_qn &&
+            !(mentioned && oo_names_tparam(w, mentioned->name))) {
             oo_emit_type_ref(w, node, value.type->graph_qn, "csharp-type-name-lookup");
             oo_emit_usage(w, node, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
                           CBM_RESOLVE_RULE_DECLARED_TYPE, "csharp-type-name-lookup");

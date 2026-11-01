@@ -114,6 +114,21 @@ static int oo_edges(const OOIndex *index, const char *type, const char *source, 
     return edges;
 }
 
+/* Emitted occurrences spelled exactly so: edges cannot tell a right site from a wrong one. */
+static int oo_emitted_spelled(const OOIndex *index, const char *spelling) {
+    sqlite3_stmt *statement = NULL;
+    int rows = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(index->store),
+                           "SELECT count(*) FROM resolver_occurrences WHERE emitted=1 AND spelling=?1",
+                           -1, &statement, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(statement, 1, spelling, -1, SQLITE_STATIC);
+        if (sqlite3_step(statement) == SQLITE_ROW)
+            rows = sqlite3_column_int(statement, 0);
+    }
+    sqlite3_finalize(statement);
+    return rows;
+}
+
 #define OO_EXPECT(type, source, target, expected)                                          \
     do {                                                                                   \
         int oo_got = oo_edges(&index, type, source, target);                               \
@@ -326,6 +341,8 @@ static const OOFile KOTLIN_FILES[] = {
      "    override fun iterator(): Iterator<Store> = TODO()\n"
      "}\n"
      "fun <T> middleVararg(first: Int, vararg rest: Store, block: () -> Unit): Int = 1\n"
+     "fun <TBOUND : Store> TBOUND.boundName(other: TBOUND): TBOUND = this\n"
+     "class Holder {\n    var count: Int = 0\n}\n"
      "fun String.shout(): String = this\n"
      "fun Int.onlyInt(): Int = this\n"},
     {"core/Tx.kt",
@@ -381,6 +398,9 @@ static const OOFile KOTLIN_FILES[] = {
      "class Main {\n"
      "    private val store = Store()\n"
      "    private val text: String? = null\n"
+     "    private val holder = Holder()\n"
+     "    fun writesMember() { holder.count = 2 }\n"
+     "    fun writesOwn() { this.holder.count = 3 }\n"
      "    fun externalExtension() { text?.shout() }\n"
      "    fun externalWrongReceiver() { text?.onlyInt() }\n"
      "    fun extensionProperty(s: Store) { s.extProp.get() }\n"
@@ -507,6 +527,16 @@ static int oo_kotlin_check(bool parallel) {
     /* An extension on a value whose type lies outside the project. */
     OO_EXPECT("CALLS", "Main.externalExtension", "Store.shout", 1);
     OO_EXPECT("CALLS", "Main.externalWrongReceiver", "Store.onlyInt", 0);
+    /* `holder.count = 2` writes count and reads holder. */
+    OO_EXPECT("WRITES", "Main.writesMember", "Store.Holder.count", 1);
+    OO_EXPECT("WRITES", "Main.writesMember", "Main.Main.holder", 0);
+    OO_EXPECT("USAGE", "Main.writesMember", "Main.Main.holder", 1);
+    OO_EXPECT("WRITES", "Main.writesOwn", "Store.Holder.count", 1);
+    /* A type parameter's name is not a mention of its bound. */
+    if (oo_emitted_spelled(&index, "TBOUND") != 0) {
+        printf("  FAIL %s:%d: a type parameter's name was bound\n", __FILE__, __LINE__);
+        failed++;
+    }
     /* An extension's receiver takes the standard library's subtypes, and only those. */
     OO_EXPECT("CALLS", "Main.listIsIterable", "Store.onIterable", 1);
     OO_EXPECT("CALLS", "Main.projectIsIterable", "Store.onIterable", 1);
