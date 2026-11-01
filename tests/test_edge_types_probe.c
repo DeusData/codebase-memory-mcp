@@ -562,6 +562,17 @@ TEST(calls_jsx_named_components_require_exact_binding) {
                     .declaration_line = 3,
                     .declaration_text = "export function exactTarget() { return 7; }"},
          .mode = RQ_REQUIRED},
+        /* `<UI.Widget />` reads that member of the namespace, whatever rendering it
+         * still takes to prove the invocation below. */
+        {.case_id = "member-component-value-usage",
+         .site = {.file = "member.tsx", .caller = "MemberView", .needle = "Widget"},
+         .relation = "USAGE",
+         .target = {.file = "component.tsx",
+                    .suffix = "component.Widget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function Widget({ label }: { label: string }) {"},
+         .mode = RQ_REQUIRED},
         {.case_id = "member-component-quality-gap",
          .site = {.file = "member.tsx",
                   .caller = "MemberView",
@@ -637,7 +648,7 @@ TEST(calls_jsx_named_components_require_exact_binding) {
                     .declaration_line = 1,
                     .declaration_text = "export function Widget() { return <span />; }"}}};
     ASSERT_TRUE(
-        et_jsx_quality(files, 13, sources, 13, expected, 4, forbidden, 9, 3, "jsx_exact_binding"));
+        et_jsx_quality(files, 13, sources, 13, expected, 5, forbidden, 9, 4, "jsx_exact_binding"));
     PASS();
 }
 

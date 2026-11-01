@@ -1881,10 +1881,14 @@ static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode no
                 index, (cbm_resolve_js_import_t){
                            .local = name, .source = source, .member = member, .is_require = true});
     } else if (direct && js_function_value(value)) {
-        add_name(index, name, 0,
+        /* Its own scope reads nothing before this line ran (TDZ, or undefined for
+         * `var`). A closure, its own body included, runs later and may name it. */
+        add_name(index, name, ts_node_end_byte(declarator),
                  BINDING_VALUE_DECLARATION | BINDING_FUNCTION_VALUE |
                      (state->named_export && module_level ? BINDING_EXPORTED : 0));
         js_set_lines(index, row, value);
+        if (index->name_count > row)
+            index->names[row].at_start = UINT32_MAX;
     } else if (direct && module_level) {
         bool is_const = kind_is(ts_node_parent(declarator), "lexical_declaration") &&
                         child_token(ts_node_parent(declarator), "const");

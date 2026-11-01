@@ -2664,8 +2664,8 @@ TEST(contract_edge_commonjs_require_call_resolves_issue871) {
     ASSERT(accepted);
     ASSERT_TRUE(!shadowed);
     ASSERT_EQ(report.genuine, 2); /* original exported-function call + required control */
-    ASSERT_EQ(report.found, 1);
-    ASSERT_EQ(report.missing, 1);
+    ASSERT_EQ(report.found, 2);
+    ASSERT_EQ(report.missing, 0);
     PASS();
 }
 
