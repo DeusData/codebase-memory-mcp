@@ -443,7 +443,7 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
                             NULL) == SQLITE_OK &&
          sqlite3_prepare_v2(db, "INSERT INTO resolver_lookups VALUES(?,?,?,?,?)", -1, &w.lookup,
                             NULL) == SQLITE_OK &&
-         cbm_resolve_proof_visit_roots(roots, root_count, 16u * 1024u * 1024u, write_fact, &w) &&
+         cbm_resolve_proof_visit_roots(roots, root_count, 0, write_fact, &w) &&
          write_occurrences(&w, rows, count) &&
          write_summaries(&w, ordered_summaries, summary_count) &&
          write_files(&w, ordered_summaries, summary_count);

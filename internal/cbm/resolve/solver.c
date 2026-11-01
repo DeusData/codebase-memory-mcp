@@ -4,9 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { SOLVER_DEFAULT_NODES = 1000000, SOLVER_DEFAULT_EDGES = 4000000 };
-#define SOLVER_DEFAULT_STEPS UINT64_C(16000000)
-
 typedef enum {
     SOLVER_LEAF,
     SOLVER_COPY,
@@ -59,9 +56,9 @@ cbm_resolve_solver_t *cbm_resolve_solver_new(CBMArena *arena, cbm_resolve_proof_
     solver->arena = arena;
     solver->pool = pool;
     solver->limits =
-        (cbm_resolve_solver_limits_t){.nodes = limits.nodes ? limits.nodes : SOLVER_DEFAULT_NODES,
-                                      .edges = limits.edges ? limits.edges : SOLVER_DEFAULT_EDGES,
-                                      .steps = limits.steps ? limits.steps : SOLVER_DEFAULT_STEPS};
+        (cbm_resolve_solver_limits_t){.nodes = limits.nodes ? limits.nodes : SIZE_MAX,
+                                      .edges = limits.edges ? limits.edges : SIZE_MAX,
+                                      .steps = limits.steps ? limits.steps : UINT64_MAX};
     return solver;
 }
 

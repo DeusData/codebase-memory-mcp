@@ -61,10 +61,12 @@ typedef struct cbm_resolve_solver cbm_resolve_solver_t;
  *
  * Registration then solve is single-threaded. Published results/proofs are
  * immutable. Keys, values and dependencies are copied into arena; audit roots
- * are cloned into pool. Both must outlive the solver. Zero limits use finite
- * defaults. Duplicate keys fail the whole solve closed, never last-wins.
- * Node/edge/step exhaustion makes EVERY result LIMITED, independent of input
- * order. Steps count node settlement and dependency indexing/inspection/
+ * are cloned into pool. Both must outlive the solver. A zero limit means no
+ * cap: one solver holds a whole project's facts, each settled once, so its size
+ * follows the input and a cap would only refuse a large enough repository. Only
+ * the memory core can refuse it. Duplicate keys fail the whole solve closed,
+ * never last-wins. An explicit node/edge/step limit makes EVERY result LIMITED
+ * when reached, independent of input order. Steps count node settlement and dependency indexing/inspection/
  * notification; stable-key sorting and indexed lookup do not spend semantic
  * budget. There are no corpus-wide repeated convergence passes. */
 cbm_resolve_solver_t *cbm_resolve_solver_new(CBMArena *arena, cbm_resolve_proof_pool_t *pool,

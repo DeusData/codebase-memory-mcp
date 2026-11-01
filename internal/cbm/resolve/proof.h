@@ -84,7 +84,10 @@ typedef struct cbm_resolve_proof_pool {
     cbm_resolve_analysis_t failure;
 } cbm_resolve_proof_pool_t;
 
-/* Zero limits select finite defaults. A pool is confined to its owning
+/* A zero limit means no cap: a pool holds one node per distinct fact and each
+ * operation is linear in its own text, so its total follows the input. A fixed
+ * default stopped a large enough file partway through, at a point that also
+ * depended on the length of the checkout path. A pool is confined to its owning
  * analysis thread; published nodes are immutable. Its arena must outlive
  * nodes, but pool storage may end after construction. Never allocate into a
  * shared registry's arena. */
