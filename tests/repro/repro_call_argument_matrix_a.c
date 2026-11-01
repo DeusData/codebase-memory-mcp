@@ -823,12 +823,16 @@ SEMANTIC_CASE(scss, SCSS, "main.scss",
               "@function bare($handler) {\n  @return $handler;\n}\n",
               "$handler", "call_expression", 2, 2);
 
-NATIVE_SCOPE_CASE(hcl, HCL, "main.tf", "locals {\n  watched = [1]\n  result = length(watched)\n}\n",
+/* A Terraform / OpenTofu module file (.tf, .tofu) leaves its references to
+ * the module resolver (pass_terraform.c) and extracts no generic calls or
+ * usages (probe_terraform_module_files_extract_no_generic_refs); the generic
+ * HCL behaviour checked here is that of every other HCL file. */
+NATIVE_SCOPE_CASE(hcl, HCL, "main.hcl", "locals {\n  watched = [1]\n  result = length(watched)\n}\n",
                   "function_call",
                   "HCL exposes built-in function applications but cannot declare user routines, "
                   "so local-expression references use exact global counts",
                   "length", NULL, "watched", NULL, NULL,
-                  "locals {\n  watched = [1]\n  result = watched\n}\n", "bare.tf", NULL, "watched",
+                  "locals {\n  watched = [1]\n  result = watched\n}\n", "bare.hcl", NULL, "watched",
                   NULL, 1, "variable_expr", "watched", 1, 1, 1, 0);
 
 /* This known-valid PL/pgSQL shape exercises the grammar-real `invocation` node.

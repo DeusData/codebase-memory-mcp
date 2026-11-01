@@ -138,6 +138,16 @@ void cbm_activation_transaction_note_refusal_for_testing(const char *predicate,
         activation_note_refusal(predicate, os_error);
     }
 }
+
+/* Test seam: the next `count` staging writes fail with errno = os_error, so a
+ * caller's report of a full disk is testable without filling one. */
+static unsigned int activation_write_failures_for_testing;
+static int activation_write_failure_errno_for_testing;
+
+void cbm_activation_transaction_write_failures_set_for_testing(unsigned int count, int os_error) {
+    activation_write_failures_for_testing = count;
+    activation_write_failure_errno_for_testing = os_error;
+}
 #endif
 
 #ifdef _WIN32
@@ -889,9 +899,72 @@ static bool activation_posix_acl_empty(int descriptor) {
     return cbm_macos_extended_acl_fd_is_empty(descriptor);
 }
 
+#ifdef __linux__
+/* Root of the per-user home tree and the account trusted to own it. Root and
+ * "/home" in production; the test seam substitutes a fixture tree and the test
+ * account, because the real layout needs root-owned entries to reproduce. */
+static const char *g_activation_home_root = "/home";
+static uid_t g_activation_home_owner = 0;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_activation_transaction_set_home_root_for_testing(const char *home_root,
+                                                          unsigned long owner_uid) {
+    g_activation_home_root = home_root ? home_root : "/home";
+    g_activation_home_owner = home_root ? (uid_t)owner_uid : 0;
+}
+#endif
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+/* Map a trusted symlink `link` (already lstat'd) onto its resolved target and
+ * append `rest`. The link and the target must both belong to `owner`; with
+ * accept_own_target the target may instead belong to the current account.
+ * Returns NULL when either check fails or the mapped path does not fit. */
+static char *activation_alias_map(const char *link, const struct stat *link_status, uid_t owner,
+                                  bool accept_own_target, const char *rest) {
+    char resolved[4096];
+    struct stat resolved_status;
+    if (link_status->st_uid != owner || !realpath(link, resolved) ||
+        lstat(resolved, &resolved_status) != 0 || !S_ISDIR(resolved_status.st_mode)) {
+        return NULL;
+    }
+    if (resolved_status.st_uid != owner &&
+        !(accept_own_target && resolved_status.st_uid == geteuid())) {
+        return NULL;
+    }
+    char mapped[4096];
+    int written = snprintf(mapped, sizeof(mapped), "%s%s", resolved, rest);
+    if (written <= 0 || (size_t)written >= sizeof(mapped)) {
+        return NULL;
+    }
+    return activation_string_copy(mapped);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+char *cbm_activation_transaction_map_alias_for_testing(const char *link,
+                                                       unsigned long link_owner_uid,
+                                                       unsigned long trusted_owner_uid,
+                                                       bool accept_own_target, const char *rest) {
+    /* Only link ownership is synthetic; the shared production helper resolves
+     * and checks the real target so distinct-owner cases need no chown/root. */
+    const struct stat link_status = {.st_uid = (uid_t)link_owner_uid};
+    return activation_alias_map(link, &link_status, (uid_t)trusted_owner_uid, accept_own_target,
+                                rest);
+}
+#endif
+#endif
+
 static char *activation_posix_walk_path(const char *directory) {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
+    /* macOS and immutable Linux layouts can expose writable trees through
+     * root-owned aliases (for example /tmp and /home on Atomic systems).
+     * Resolve only these trusted system aliases; arbitrary user symlinks must
+     * still fail the O_NOFOLLOW walk below. */
+#ifdef __linux__
+    const char *const aliases[] = {"/tmp", "/var", g_activation_home_root};
+#else
     static const char *const aliases[] = {"/tmp", "/var"};
+#endif
     for (size_t index = 0; index < sizeof(aliases) / sizeof(aliases[0]); index++) {
         const char *alias = aliases[index];
         size_t alias_length = strlen(alias);
@@ -899,28 +972,48 @@ static char *activation_posix_walk_path(const char *directory) {
             (directory[alias_length] != '\0' && directory[alias_length] != '/')) {
             continue;
         }
+        uid_t owner = 0;
+#ifdef __linux__
+        bool is_home = alias == g_activation_home_root;
+        if (is_home) {
+            owner = g_activation_home_owner;
+        }
+#endif
         struct stat alias_status;
-        char resolved[4096];
-        if (lstat(alias, &alias_status) != 0 || !S_ISLNK(alias_status.st_mode) ||
-            alias_status.st_uid != 0 || !realpath(alias, resolved)) {
+        if (lstat(alias, &alias_status) != 0) {
+            continue;
+        }
+        if (S_ISLNK(alias_status.st_mode)) {
+            return activation_alias_map(alias, &alias_status, owner, false,
+                                        directory + alias_length);
+        }
+#ifdef __linux__
+        /* Managed Linux hosts often keep /home a real directory and point the
+         * per-user entry elsewhere (/home/alice -> /local/home/alice, #2306).
+         * Trust that entry only inside a root-owned /home nobody else can
+         * write, and only when root owns the entry itself. Unlike the whole-
+         * alias case above, the target may belong to the current account:
+         * that is the normal shape of a relocated home, and an account can
+         * already write its own home, so it gains nothing it did not have. */
+        const char *name = directory + alias_length;
+        size_t name_length = *name == '/' ? strcspn(name + 1, "/") : 0;
+        if (!is_home || !S_ISDIR(alias_status.st_mode) || alias_status.st_uid != owner ||
+            (alias_status.st_mode & 0022) != 0 || name_length == 0) {
+            continue;
+        }
+        char entry[4096];
+        size_t entry_length = alias_length + 1U + name_length;
+        if (entry_length >= sizeof(entry)) {
             return NULL;
         }
-        struct stat resolved_status;
-        if (lstat(resolved, &resolved_status) != 0 || !S_ISDIR(resolved_status.st_mode) ||
-            resolved_status.st_uid != 0) {
-            return NULL;
+        memcpy(entry, directory, entry_length);
+        entry[entry_length] = '\0';
+        struct stat entry_status;
+        if (lstat(entry, &entry_status) == 0 && S_ISLNK(entry_status.st_mode)) {
+            return activation_alias_map(entry, &entry_status, owner, true,
+                                        directory + entry_length);
         }
-        size_t needed = strlen(resolved) + strlen(directory + alias_length) + 1U;
-        char *mapped = malloc(needed);
-        if (!mapped) {
-            return NULL;
-        }
-        int written = snprintf(mapped, needed, "%s%s", resolved, directory + alias_length);
-        if (written <= 0 || (size_t)written >= needed) {
-            free(mapped);
-            return NULL;
-        }
-        return mapped;
+#endif
     }
 #endif
     return activation_string_copy(directory);
@@ -1121,6 +1214,13 @@ static bool activation_native_sync(activation_native_file_t file) {
 
 static bool activation_native_write_all(activation_native_file_t file, const void *data,
                                         size_t length) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (activation_write_failures_for_testing > 0) {
+        activation_write_failures_for_testing--;
+        errno = activation_write_failure_errno_for_testing;
+        return false;
+    }
+#endif
     const unsigned char *cursor = data;
     while (length > 0) {
 #ifdef _WIN32
@@ -1605,6 +1705,16 @@ static void activation_failed_stage_cleanup(cbm_activation_transaction_t *transa
     }
 }
 
+/* A failed stage write reports IO with errno restored, after the cleanup, to
+ * the error of the call that failed (0 when none applies), so the caller can
+ * name it. */
+static cbm_activation_transaction_status_t activation_stage_io_failure(
+    cbm_activation_transaction_t *transaction, int os_error) {
+    activation_failed_stage_cleanup(transaction);
+    errno = os_error;
+    return CBM_ACTIVATION_TRANSACTION_IO;
+}
+
 cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     const char *target_path, const void *candidate, size_t candidate_size,
     cbm_activation_transaction_t **transaction_out) {
@@ -1630,11 +1740,20 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_bytes(
     }
     transaction->staged_exists = true;
     bool written = activation_native_write_all(staged, candidate, candidate_size);
+    int os_error = written ? 0 : errno;
     bool durable = written && activation_native_sync(staged);
+    if (written && !durable) {
+        os_error = errno;
+    }
     bool closed = activation_native_close(staged);
-    if (!written || !durable || !closed || !activation_sync_directory(transaction)) {
-        activation_failed_stage_cleanup(transaction);
-        return CBM_ACTIVATION_TRANSACTION_IO;
+    if (!closed && os_error == 0) {
+        os_error = errno;
+    }
+    if (!written || !durable || !closed) {
+        return activation_stage_io_failure(transaction, os_error);
+    }
+    if (!activation_sync_directory(transaction)) {
+        return activation_stage_io_failure(transaction, errno);
     }
     *transaction_out = transaction;
     return CBM_ACTIVATION_TRANSACTION_OK;
@@ -1784,28 +1903,45 @@ cbm_activation_transaction_status_t cbm_activation_transaction_stage_file(
     unsigned char buffer[64U * 1024U];
     size_t total = 0;
     bool copied = true;
+    int os_error = 0;
     for (;;) {
         size_t amount = 0;
         if (!activation_native_read(source, buffer, sizeof(buffer), &amount)) {
             copied = false;
+            os_error = errno;
             break;
         }
         if (amount == 0) {
             break;
         }
-        if (SIZE_MAX - total < amount || !activation_native_write_all(staged, buffer, amount)) {
+        if (SIZE_MAX - total < amount) {
             copied = false;
+            break;
+        }
+        if (!activation_native_write_all(staged, buffer, amount)) {
+            copied = false;
+            os_error = errno;
             break;
         }
         total += amount;
     }
     bool durable = copied && total > 0 && activation_native_sync(staged);
+    if (copied && total > 0 && !durable) {
+        os_error = errno;
+    }
     bool source_closed = activation_native_close(source);
+    if (!source_closed && os_error == 0) {
+        os_error = errno;
+    }
     bool staged_closed = activation_native_close(staged);
-    if (!copied || total == 0 || !durable || !source_closed || !staged_closed ||
-        !activation_sync_directory(transaction)) {
-        activation_failed_stage_cleanup(transaction);
-        return CBM_ACTIVATION_TRANSACTION_IO;
+    if (!staged_closed && os_error == 0) {
+        os_error = errno;
+    }
+    if (!copied || total == 0 || !durable || !source_closed || !staged_closed) {
+        return activation_stage_io_failure(transaction, os_error);
+    }
+    if (!activation_sync_directory(transaction)) {
+        return activation_stage_io_failure(transaction, errno);
     }
     *transaction_out = transaction;
     return CBM_ACTIVATION_TRANSACTION_OK;

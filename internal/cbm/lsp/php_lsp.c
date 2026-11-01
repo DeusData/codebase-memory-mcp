@@ -19,7 +19,9 @@
 
 #include "php_lsp.h"
 #include "lsp_node_iter.h"
+#include "lsp_work.h"
 #include "../helpers.h"
+#include "../../../src/foundation/hash_table.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -253,6 +255,17 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name) {
     return php_ns_to_dot(ctx->arena, name);
 }
 
+/* True when `qn` is, or lies under, the target of a class `use` the pipeline
+ * left unresolved: a type outside the project (cross-file mode only). */
+static bool php_external_qn(const PHPLSPContext *ctx, const char *qn) {
+    for (int i = 0; qn && i < ctx->external_use_count; i++) {
+        size_t n = strlen(ctx->external_use_qns[i]);
+        if (strncmp(qn, ctx->external_use_qns[i], n) == 0 && (qn[n] == '\0' || qn[n] == '.'))
+            return true;
+    }
+    return false;
+}
+
 /* Try to find a registered type for a "namespaced" QN.
  *
  * Lookup order:
@@ -265,13 +278,17 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name) {
  *
  * Step 4 is critical for PHP because the unified extractor builds QNs from
  * file paths but `use App\\Models\\User` produces an "App.Models.User" key.
- * Without short-name fallback, every cross-file class resolution would miss. */
+ * Without short-name fallback, every cross-file class resolution would miss.
+ * A QN named through a vendor `use` stops after step 1: `Saloon.Http.Request`
+ * is not the project's App.Http.Requests.Request (#1186). */
 static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, const char *qn) {
     if (!qn)
         return NULL;
     const CBMRegisteredType *t = cbm_registry_lookup_type(ctx->registry, qn);
     if (t)
         return t;
+    if (php_external_qn(ctx, qn))
+        return NULL;
 
     if (ctx->module_qn && ctx->module_qn[0]) {
         const char *combo = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, qn);
@@ -1352,39 +1369,45 @@ static bool php_callable_reference_has_dynamic_member_name(PHPLSPContext *ctx, T
  * USAGE passes attach the same exact token occurrence to a first-class
  * callable, including qualified free-function references. */
 static TSNode php_reference_callee_leaf(PHPLSPContext *ctx, TSNode expr) {
-    if (ts_node_is_null(expr) || php_dynamic_reference_expr(ctx, expr)) {
-        return (TSNode){0};
-    }
-
     static const char *const terminal_fields[] = {"property", "field", "attribute",
                                                   "method",   "name",  NULL};
-    for (int i = 0; terminal_fields[i]; i++) {
-        TSNode terminal = ts_node_child_by_field_name(expr, terminal_fields[i],
-                                                      (uint32_t)strlen(terminal_fields[i]));
-        if (!ts_node_is_null(terminal)) {
-            return php_reference_callee_leaf(ctx, terminal);
+    /* A loop for the same reason as terminal_callee_leaf: recursing once per
+     * wrapper level of the callee made stack use follow the nesting depth of
+     * the file. Same nodes, same order. */
+    for (;;) {
+        if (ts_node_is_null(expr) || php_dynamic_reference_expr(ctx, expr)) {
+            return (TSNode){0};
         }
-    }
 
-    const char *kind = ts_node_type(expr);
-    if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
-        strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
-        strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
-        strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
-        strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
-        strcmp(kind, "user_symbol") == 0) {
-        return expr;
-    }
+        TSNode terminal = {0};
+        for (int i = 0; terminal_fields[i] && ts_node_is_null(terminal); i++) {
+            terminal = ts_node_child_by_field_name(expr, terminal_fields[i],
+                                                   (uint32_t)strlen(terminal_fields[i]));
+        }
+        if (!ts_node_is_null(terminal)) {
+            expr = terminal;
+            continue;
+        }
 
-    uint32_t count = ts_node_named_child_count(expr);
-    if (count == 0) {
-        return (TSNode){0};
+        const char *kind = ts_node_type(expr);
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
+            strcmp(kind, "type_identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
+            strcmp(kind, "property_identifier") == 0 || strcmp(kind, "name") == 0 ||
+            strcmp(kind, "variable_name") == 0 || strcmp(kind, "attribute") == 0 ||
+            strcmp(kind, "symbol") == 0 || strcmp(kind, "sym_lit") == 0 ||
+            strcmp(kind, "user_symbol") == 0) {
+            return expr;
+        }
+
+        uint32_t count = ts_node_named_child_count(expr);
+        if (count == 0) {
+            return (TSNode){0};
+        }
+        bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
+                                strstr(kind, "member") || strstr(kind, "selector") ||
+                                strstr(kind, "navigation") || strstr(kind, "field_expression");
+        expr = ts_node_named_child(expr, terminal_is_last ? count - 1 : 0);
     }
-    bool terminal_is_last = strstr(kind, "qualified") || strstr(kind, "scoped") ||
-                            strstr(kind, "member") || strstr(kind, "selector") ||
-                            strstr(kind, "navigation") || strstr(kind, "field_expression");
-    return php_reference_callee_leaf(ctx,
-                                     ts_node_named_child(expr, terminal_is_last ? count - 1 : 0));
 }
 
 static TSNode php_callable_reference_leaf(PHPLSPContext *ctx, TSNode call, const char *kind) {
@@ -1408,6 +1431,33 @@ static void php_stamp_resolved_site(PHPLSPContext *ctx, int first, TSNode site) 
         ctx->resolved_calls->items[i].site_start_byte = ts_node_start_byte(site);
         ctx->resolved_calls->items[i].site_end_byte = ts_node_end_byte(site);
     }
+}
+
+/* The method of a class the index does not hold. When the class came from a
+ * vendor `use` (cross-file mode), the row is emitted above the pipeline's
+ * confidence floor as php_external_receiver: the receiver is PROVEN to be a
+ * type outside the project, so no name-only fallback may bind the call to a
+ * same-named project method (#1186). Otherwise the existing low-confidence
+ * `unindexed_strategy` row. */
+static void emit_external_or_unindexed(PHPLSPContext *ctx, const char *class_qn,
+                                       const char *method_name, const char *unindexed_strategy,
+                                       CBMResolvedKind kind) {
+    const char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name);
+    if (php_external_qn(ctx, class_qn)) {
+        emit_resolved_kind(ctx, target, "php_external_receiver", 0.95f, kind);
+        return;
+    }
+    emit_resolved_kind(ctx, target, unindexed_strategy, 0.55f, kind);
+}
+
+/* A method the registry DOES hold on a class reached through a vendor `use`
+ * (a seeded library type such as GuzzleHttp.Client) is just as far outside
+ * the project: the graph has no node for it either, so its row must carry the
+ * same php_external_receiver proof, or the pipeline falls through to a
+ * name-only binding of the call to a same-named project method (#1186). */
+static const char *php_receiver_strategy(const PHPLSPContext *ctx, const char *class_qn,
+                                         const char *strategy) {
+    return php_external_qn(ctx, class_qn) ? "php_external_receiver" : strategy;
 }
 
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
@@ -1709,7 +1759,8 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
         const char *strategy = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                    ? "php_method_typed"
                                    : "php_method_inherited";
-        emit_resolved_kind(ctx, f->qualified_name, strategy, 0.95f, kind);
+        emit_resolved_kind(ctx, f->qualified_name, php_receiver_strategy(ctx, class_qn, strategy),
+                           0.95f, kind);
         return;
     }
     /* Receiver known but method missing — magic __call? The call dispatches to
@@ -1727,8 +1778,7 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
      * at "<class_qn>.<method>" so the pipeline bridge can BLOCK the unified
      * extractor's likely-incorrect short-name fallback. The bridge filters
      * unknown targets and yields no edge — better than a wrong edge. */
-    emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                       "php_method_typed_unindexed", 0.55f, kind);
+    emit_external_or_unindexed(ctx, class_qn, method_name, "php_method_typed_unindexed", kind);
 }
 
 static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind kind) {
@@ -1757,6 +1807,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
                 strategy = "php_self_static";
             } else {
                 class_qn = php_resolve_class_name(ctx, cls);
+                strategy = php_receiver_strategy(ctx, class_qn, strategy);
             }
         }
     }
@@ -1787,8 +1838,7 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
     /* Class resolved (e.g., from a `use` clause), method unknown — emit
      * synthetic resolved call so the pipeline bridge can suppress the
      * unified extractor's name-fallback misroute. */
-    emit_resolved_kind(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                       "php_static_unindexed", 0.55f, kind);
+    emit_external_or_unindexed(ctx, class_qn, method_name, "php_static_unindexed", kind);
 }
 
 /* ── type narrowing ─────────────────────────────────────────────────
@@ -2707,8 +2757,10 @@ static void process_class_decl(PHPLSPContext *ctx, TSNode node) {
  * a `namespace_aliasing_clause` child wrapping the alias, or as a bare
  * sequence: qualified_name + literal `as` token + name. We accept both
  * shapes by treating the *second* name-like child as the alias when no
- * aliasing clause is present. */
-static void collect_use_clause(PHPLSPContext *ctx, TSNode use_clause, int kind) {
+ * aliasing clause is present. A grouped clause (`use A\B\{C as D}`) names
+ * its target relative to the group's namespace `prefix`. */
+static void collect_use_clause(PHPLSPContext *ctx, TSNode use_clause, int kind,
+                               const char *prefix) {
     TSNode name_node;
     memset(&name_node, 0, sizeof(name_node));
     TSNode alias_node;
@@ -2745,6 +2797,11 @@ static void collect_use_clause(PHPLSPContext *ctx, TSNode use_clause, int kind) 
     char *full = php_node_text(ctx, name_node);
     if (!full)
         return;
+    if (prefix && prefix[0]) {
+        full = cbm_arena_sprintf(ctx->arena, "%s\\%s", prefix, full);
+        if (!full)
+            return;
+    }
     char *dotted = php_ns_to_dot(ctx->arena, full);
     const char *local = NULL;
     if (!ts_node_is_null(alias_node)) {
@@ -2757,36 +2814,56 @@ static void collect_use_clause(PHPLSPContext *ctx, TSNode use_clause, int kind) 
     php_lsp_add_use(ctx, local, dotted, kind);
 }
 
-static void collect_use_declaration(PHPLSPContext *ctx, TSNode use_decl) {
-    /* Determine kind: function / const / class (default). */
-    int kind = CBM_PHP_USE_CLASS;
-    uint32_t nc = ts_node_child_count(use_decl);
-    /* tree-sitter-php emits `function` or `const` keyword children. */
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(use_decl, i);
-        if (ts_node_is_null(c))
+/* The `function` / `const` keyword of a use: an anonymous direct child of the
+ * declaration (flat form) or of one clause (grouped form
+ * `use A\{function f, const C, K}`). `fallback` when neither is present.
+ * Mirrors the extractor's php_use_kind (extract_imports.c). */
+static int php_use_keyword_kind(TSNode node, int fallback) {
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (ts_node_is_null(c) || ts_node_is_named(c))
             continue;
         const char *k = ts_node_type(c);
         if (strcmp(k, "function") == 0)
-            kind = CBM_PHP_USE_FUNCTION;
+            return CBM_PHP_USE_FUNCTION;
         if (strcmp(k, "const") == 0)
-            kind = CBM_PHP_USE_CONST;
+            return CBM_PHP_USE_CONST;
     }
+    return fallback;
+}
+
+static void collect_use_declaration(PHPLSPContext *ctx, TSNode use_decl) {
+    /* Determine kind: function / const / class (default). */
+    int kind = php_use_keyword_kind(use_decl, CBM_PHP_USE_CLASS);
+    uint32_t nc = ts_node_child_count(use_decl);
+    const char *prefix = NULL;
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_child(use_decl, i);
         if (ts_node_is_null(c) || !ts_node_is_named(c))
             continue;
         const char *k = ts_node_type(c);
         if (strcmp(k, "namespace_use_clause") == 0) {
-            collect_use_clause(ctx, c, kind);
+            collect_use_clause(ctx, c, kind, NULL);
+        } else if (strcmp(k, "namespace_name") == 0 || strcmp(k, "qualified_name") == 0 ||
+                   strcmp(k, "name") == 0) {
+            /* use App\{Foo}; — the group's namespace precedes the group. */
+            prefix = php_node_text(ctx, c);
         } else if (strcmp(k, "namespace_use_group") == 0) {
-            /* use App\\{Foo, Bar as B}; — recurse into clauses inside. */
+            /* use App\{Foo, Bar as B}; — recurse into clauses inside. Each
+             * clause names its target under the prefix, and carries its own
+             * `function` / `const` keyword when the declaration has none. */
             uint32_t gc = ts_node_child_count(c);
             for (uint32_t j = 0; j < gc; j++) {
                 TSNode gch = ts_node_child(c, j);
-                if (!ts_node_is_null(gch) && ts_node_is_named(gch) &&
-                    strcmp(ts_node_type(gch), "namespace_use_clause") == 0) {
-                    collect_use_clause(ctx, gch, kind);
+                if (ts_node_is_null(gch) || !ts_node_is_named(gch))
+                    continue;
+                const char *gk = ts_node_type(gch);
+                if (strcmp(gk, "namespace_use_clause") == 0 ||
+                    strcmp(gk, "namespace_use_group_clause") == 0) {
+                    int clause_kind =
+                        kind == CBM_PHP_USE_CLASS ? php_use_keyword_kind(gch, kind) : kind;
+                    collect_use_clause(ctx, gch, clause_kind, prefix);
                 }
             }
         }
@@ -3670,6 +3747,126 @@ static void apply_phpdoc_class_tags(PHPLSPContext *ctx, CBMTypeRegistry *reg, co
  *   - handle `as` aliasing: register method under the alias name too
  *   - skip insteadof (rare in practice; full support deferred)
  */
+/* The registry indices of each receiver's methods, in registration order.
+ * Flattening a trait used to visit EVERY registered function to find the
+ * trait's own, so a file whose classes use traits paid O(uses x functions),
+ * and the functions grow with every class flattened before: quadratic in the
+ * trait-using classes of one file (#1265). The registry is append-only, so
+ * the index catches up incrementally (indexed_upto) and never misses a
+ * function registered between two flattens. */
+typedef struct {
+    int *items;
+    int count;
+    int cap;
+} php_func_ids_t;
+
+struct php_trait_index {
+    CBMHashTable *by_receiver; /* receiver_type (borrowed) -> php_func_ids_t* */
+    int indexed_upto;          /* reg->funcs[0, indexed_upto) are indexed */
+    bool failed;               /* allocation failed: callers use the full scan */
+};
+
+static bool php_func_ids_push(CBMArena *arena, php_func_ids_t *ids, int func_index) {
+    if (ids->count == ids->cap) {
+        int cap = ids->cap ? ids->cap * 2 : 4;
+        int *items = (int *)cbm_arena_alloc(arena, (size_t)cap * sizeof(*items));
+        if (!items) {
+            return false;
+        }
+        if (ids->count > 0) {
+            memcpy(items, ids->items, (size_t)ids->count * sizeof(*items));
+        }
+        ids->items = items;
+        ids->cap = cap;
+    }
+    ids->items[ids->count++] = func_index;
+    return true;
+}
+
+/* Index every function registered since the last call. Returns false (and
+ * marks the index failed for good) on an allocation failure. */
+static bool php_trait_index_sync(PHPLSPContext *ctx, struct php_trait_index *ix,
+                                 const CBMTypeRegistry *reg) {
+    if (ix->failed) {
+        return false;
+    }
+    if (!ix->by_receiver) {
+        ix->by_receiver = cbm_ht_create(0);
+        if (!ix->by_receiver) {
+            ix->failed = true;
+            return false;
+        }
+    }
+    for (; ix->indexed_upto < reg->func_count; ix->indexed_upto++) {
+        CBM_LSP_WORK(1);
+        const char *receiver = reg->funcs[ix->indexed_upto].receiver_type;
+        if (!receiver) {
+            continue;
+        }
+        php_func_ids_t *ids = (php_func_ids_t *)cbm_ht_get(ix->by_receiver, receiver);
+        if (!ids) {
+            ids = (php_func_ids_t *)cbm_arena_alloc(ctx->arena, sizeof(*ids));
+            if (!ids) {
+                ix->failed = true;
+                return false;
+            }
+            memset(ids, 0, sizeof(*ids));
+            cbm_ht_set(ix->by_receiver, receiver, ids);
+        }
+        if (!php_func_ids_push(ctx->arena, ids, ix->indexed_upto)) {
+            ix->failed = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+static void php_trait_index_free(struct php_trait_index *ix) {
+    if (ix->by_receiver) {
+        cbm_ht_free(ix->by_receiver);
+        ix->by_receiver = NULL;
+    }
+}
+
+/* Copy one method `src` of the trait into class_qn (see
+ * flatten_trait_into_class). Reads src before registering, because
+ * cbm_registry_add_func may move reg->funcs. */
+static void flatten_trait_method(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
+                                 const char *canonical_trait_qn, const CBMRegisteredFunc *src,
+                                 const char *alias_for_method, const char *only_method_name) {
+    if (only_method_name && src->short_name && strcmp(src->short_name, only_method_name) != 0) {
+        return;
+    }
+    const char *new_short = alias_for_method ? alias_for_method : src->short_name;
+    if (!new_short)
+        return;
+    CBMRegisteredFunc rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, new_short);
+    rf.short_name = cbm_arena_strdup(ctx->arena, new_short);
+    rf.receiver_type = class_qn;
+    rf.min_params = src->min_params;
+
+    /* Self-substitute the return type: any NAMED(trait_qn) in the
+     * signature's return becomes NAMED(class_qn). */
+    const CBMType *new_sig = src->signature;
+    if (src->signature && src->signature->kind == CBM_TYPE_FUNC &&
+        src->signature->data.func.return_types) {
+        const CBMType *ret0 = src->signature->data.func.return_types[0];
+        if (ret0 && ret0->kind == CBM_TYPE_NAMED && ret0->data.named.qualified_name &&
+            strcmp(ret0->data.named.qualified_name, canonical_trait_qn) == 0) {
+            const CBMType **rets = (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
+            if (rets) {
+                rets[0] = cbm_type_named(ctx->arena, class_qn);
+                rets[1] = NULL;
+                new_sig = cbm_type_func_replace_returns(ctx->arena, src->signature, rets);
+            }
+        }
+    }
+    rf.signature = new_sig;
+    cbm_registry_add_func(reg, rf);
+}
+
 static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, const char *class_qn,
                                      const char *trait_qn, const char *alias_for_method,
                                      const char *only_method_name) {
@@ -3705,43 +3902,36 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
      * appends to reg->funcs, so the loop must never visit entries it adds
      * during iteration (a mutate-while-iterating hazard). */
     const int func_count_before = reg->func_count;
+    struct php_trait_index *ix = ctx->trait_index;
+    if (ix && php_trait_index_sync(ctx, ix, reg)) {
+        /* Only the trait's own methods, in registration order; the ids are
+         * ascending, so the snapshot bound ends the walk. No sync runs inside
+         * the loop, so the list cannot change under it. */
+        const php_func_ids_t *ids =
+            (const php_func_ids_t *)cbm_ht_get(ix->by_receiver, canonical_trait_qn);
+        for (int j = 0; ids && j < ids->count && ids->items[j] < func_count_before; j++) {
+            CBM_LSP_WORK(1);
+            if (CBM_LSP_WORK_CEILING_HIT()) {
+                break; /* test seam only (#765, #1265): see lsp_work.h */
+            }
+            flatten_trait_method(ctx, reg, class_qn, canonical_trait_qn, &reg->funcs[ids->items[j]],
+                                 alias_for_method, only_method_name);
+        }
+        return;
+    }
+    /* No index (no owning pass, or it could not allocate): the full scan,
+     * which yields the same methods in the same order. */
     for (int i = 0; i < func_count_before; i++) {
+        CBM_LSP_WORK(1);
+        if (CBM_LSP_WORK_CEILING_HIT()) {
+            break; /* test seam only (#765, #1265): see lsp_work.h */
+        }
         const CBMRegisteredFunc *src = &reg->funcs[i];
         if (!src->receiver_type || strcmp(src->receiver_type, canonical_trait_qn) != 0) {
             continue;
         }
-        if (only_method_name && src->short_name && strcmp(src->short_name, only_method_name) != 0) {
-            continue;
-        }
-        const char *new_short = alias_for_method ? alias_for_method : src->short_name;
-        if (!new_short)
-            continue;
-        CBMRegisteredFunc rf;
-        memset(&rf, 0, sizeof(rf));
-        rf.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, new_short);
-        rf.short_name = cbm_arena_strdup(ctx->arena, new_short);
-        rf.receiver_type = class_qn;
-        rf.min_params = src->min_params;
-
-        /* Self-substitute the return type: any NAMED(trait_qn) in the
-         * signature's return becomes NAMED(class_qn). */
-        const CBMType *new_sig = src->signature;
-        if (src->signature && src->signature->kind == CBM_TYPE_FUNC &&
-            src->signature->data.func.return_types) {
-            const CBMType *ret0 = src->signature->data.func.return_types[0];
-            if (ret0 && ret0->kind == CBM_TYPE_NAMED && ret0->data.named.qualified_name &&
-                strcmp(ret0->data.named.qualified_name, canonical_trait_qn) == 0) {
-                const CBMType **rets =
-                    (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
-                if (rets) {
-                    rets[0] = cbm_type_named(ctx->arena, class_qn);
-                    rets[1] = NULL;
-                    new_sig = cbm_type_func_replace_returns(ctx->arena, src->signature, rets);
-                }
-            }
-        }
-        rf.signature = new_sig;
-        cbm_registry_add_func(reg, rf);
+        flatten_trait_method(ctx, reg, class_qn, canonical_trait_qn, src, alias_for_method,
+                             only_method_name);
     }
 }
 
@@ -4142,6 +4332,16 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
      * Pass 2: classes and enums (which may `use Trait;` and need the
      * trait's signatures already patched).
      */
+    /* The index lives in the call's arena, not on this stack frame: ctx keeps
+     * a pointer to it for the duration of the pass. On an allocation failure
+     * it stays NULL and flatten_trait_into_class runs the full scan. */
+    struct php_trait_index *trait_index =
+        (struct php_trait_index *)cbm_arena_alloc(ctx->arena, sizeof(*trait_index));
+    if (trait_index) {
+        memset(trait_index, 0, sizeof(*trait_index));
+    }
+    struct php_trait_index *outer_index = ctx->trait_index;
+    ctx->trait_index = trait_index;
     for (int pass = 0; pass < 2; pass++) {
         TSNode stack[256];
         int top = 0;
@@ -4166,6 +4366,10 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
             }
         }
     }
+    if (trait_index) {
+        php_trait_index_free(trait_index);
+    }
+    ctx->trait_index = outer_index;
 }
 
 void cbm_php_refine_lsp_registry(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root) {
@@ -4297,6 +4501,17 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         }
     }
 
+    /* Index the registry (F12). Unindexed, every lookup below was a linear
+     * scan over the stdlib plus every definition of the file: O(lookups x
+     * definitions), quadratic in the size of one file. First-registered
+     * answers keep the result of that scan (the first registration of a
+     * duplicate QN wins), so the output does not change. Index memory goes to
+     * a scratch arena that dies with this call, as in cbm_run_php_lsp_cross. */
+    reg.index_first_registered = true;
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     /* Phase C: run the resolver. */
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
@@ -4326,6 +4541,11 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         ctx.use_count = 0;
     }
 
+    /* Trait flattening registered methods after the index was built; lookups
+     * would tail-scan them. Re-index once, first-registered as above, so the
+     * answers equal those of the indexed part followed by the tail scan. */
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
     php_lsp_process_file(&ctx, root);
 
     if (ctx.debug) {
@@ -4339,6 +4559,7 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
                     rc->confidence);
         }
     }
+    cbm_arena_destroy(&idx_arena);
 }
 
 /* ── Cross-file + batch ───────────────────────────────────────── */
@@ -4483,10 +4704,95 @@ void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegi
     }
 }
 
+static int php_pipeline_use_kind(CBMImportKind kind) {
+    if (kind == CBM_IMPORT_KIND_FUNCTION)
+        return CBM_PHP_USE_FUNCTION;
+    if (kind == CBM_IMPORT_KIND_CONST)
+        return CBM_PHP_USE_CONST;
+    return CBM_PHP_USE_CLASS;
+}
+
+/* Import edges name files, while the use table names symbols. Bind only a
+ * unique definition in that proven file; never use an unrelated short-name
+ * match to manufacture the imported symbol. Namespace aliases retain their
+ * source namespace spelling when no such definition exists. */
+static const char *php_pipeline_import_qn(PHPLSPContext *ctx, const CBMImport *imp,
+                                          const char *target, CBMLSPDef *defs, int def_count) {
+    const char *leaf = imp->module_path ? strrchr(imp->module_path, '\\') : NULL;
+    leaf = leaf ? leaf + 1 : imp->module_path;
+    if (!leaf || !leaf[0])
+        return target;
+    size_t target_len = strlen(target);
+    static const char file_suffix[] = ".__file__";
+    bool file = target_len >= sizeof(file_suffix) - 1 &&
+                strcmp(target + target_len - (sizeof(file_suffix) - 1), file_suffix) == 0;
+    size_t module_len = file ? target_len - (sizeof(file_suffix) - 1) : 0;
+    const char *found = NULL;
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        if (!def->qualified_name || !def->short_name || !def->label ||
+            strcmp(def->short_name, leaf) != 0)
+            continue;
+        bool in_file = file && def->def_module_qn && strlen(def->def_module_qn) == module_len &&
+                       strncmp(def->def_module_qn, target, module_len) == 0;
+        if (!in_file && strcmp(def->qualified_name, target) != 0)
+            continue;
+        bool kind_matches =
+            imp->kind == CBM_IMPORT_KIND_FUNCTION ? strcmp(def->label, "Function") == 0
+            : imp->kind == CBM_IMPORT_KIND_CONST
+                ? strcmp(def->label, "Constant") == 0 || strcmp(def->label, "Variable") == 0
+                : strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
+                      strcmp(def->label, "Trait") == 0 || strcmp(def->label, "Enum") == 0;
+        if (!kind_matches)
+            continue;
+        if (found && strcmp(found, def->qualified_name) != 0) {
+            found = NULL;
+            break;
+        }
+        found = def->qualified_name;
+    }
+    if (found)
+        return found;
+    const char *name = imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+    return php_ns_to_dot(ctx->arena, name);
+}
+
+static void php_collect_external_uses(PHPLSPContext *ctx, const CBMPHPImportBindings *bindings) {
+    if (!bindings || !bindings->targets || !bindings->imports)
+        return;
+    int count = bindings->imports->count;
+    ctx->external_use_qns =
+        cbm_arena_alloc(ctx->arena, (size_t)(count > 0 ? count : 1) * sizeof(char *));
+    if (!ctx->external_use_qns)
+        return;
+    for (int i = 0; i < count; i++) {
+        const CBMImport *imp = &bindings->imports->items[i];
+        if (imp->kind == CBM_IMPORT_KIND_DEFAULT && !bindings->targets[i] && imp->local_name &&
+            imp->local_name[0] && imp->module_path && imp->module_path[0]) {
+            const char *name =
+                imp->module_path[0] == '\\' ? imp->module_path + 1 : imp->module_path;
+            const char *qn = php_ns_to_dot(ctx->arena, name);
+            if (qn)
+                ctx->external_use_qns[ctx->external_use_count++] = qn;
+        }
+    }
+}
+
 void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                            const char *module_qn, CBMLSPDef *defs, int def_count,
                            const char **import_names, const char **import_qns, int import_count,
                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_php_lsp_cross_with_bindings(arena, source, source_len, module_qn, defs, def_count,
+                                        import_names, import_qns, import_count, cached_tree, out,
+                                        NULL);
+}
+
+void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, int source_len,
+                                         const char *module_qn, CBMLSPDef *defs, int def_count,
+                                         const char **import_names, const char **import_qns,
+                                         int import_count, TSTree *cached_tree,
+                                         CBMResolvedCallArray *out,
+                                         const CBMPHPImportBindings *bindings) {
     if (!arena || !source || source_len <= 0 || !out)
         return;
 
@@ -4498,7 +4804,7 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_php_only());
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -4526,11 +4832,23 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     /* Caller-supplied imports register first. process_file's own AST walk
      * adds file-internal `use` declarations on top of these. */
-    for (int i = 0; i < import_count; i++) {
-        if (import_names && import_qns && import_names[i] && import_qns[i]) {
-            php_lsp_add_use(&ctx, import_names[i], import_qns[i], CBM_PHP_USE_CLASS);
+    if (bindings && bindings->targets && bindings->imports) {
+        for (int i = 0; i < bindings->imports->count; i++) {
+            const CBMImport *imp = &bindings->imports->items[i];
+            if (imp->local_name && bindings->targets[i])
+                php_lsp_add_use(
+                    &ctx, imp->local_name,
+                    php_pipeline_import_qn(&ctx, imp, bindings->targets[i], defs, def_count),
+                    php_pipeline_use_kind(imp->kind));
+        }
+    } else {
+        for (int i = 0; i < import_count; i++) {
+            if (import_names && import_qns && import_names[i] && import_qns[i]) {
+                php_lsp_add_use(&ctx, import_names[i], import_qns[i], CBM_PHP_USE_CLASS);
+            }
         }
     }
+    int supplied_use_count = ctx.use_count;
 
     /* Class field collection — same flow as cbm_run_php_lsp. Walks the AST
      * to populate typed-property field maps so $this->prop and $obj->prop
@@ -4548,10 +4866,11 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
                 collect_use_declaration(&ctx, c);
             }
         }
+        php_collect_external_uses(&ctx, bindings);
         cbm_php_refine_lsp_registry(&ctx, &reg, root);
         ctx.current_namespace_qn = "";
         /* Reset to caller-supplied uses only — process_file re-adds AST uses. */
-        ctx.use_count = import_count;
+        ctx.use_count = supplied_use_count;
     }
 
     php_lsp_process_file(&ctx, root);

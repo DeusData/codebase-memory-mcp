@@ -7,6 +7,7 @@
 
 #include "foundation/constants.h"
 #include "mcp/mcp.h"
+#include "yyjson/yyjson.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -138,6 +139,165 @@ static void emit_header(adapter_sb_t *sb, const char *client) {
               "// are overwritten; edit outside it, or remove the markers to take ownership.\n");
 }
 
+static void append_typebox_type(adapter_sb_t *sb, yyjson_val *val, const char *description,
+                                bool include_description) {
+    yyjson_val *type_val = yyjson_obj_get(val, "type");
+    yyjson_val *enum_val = yyjson_obj_get(val, "enum");
+    yyjson_val *items_val = yyjson_obj_get(val, "items");
+    const char *type_str = yyjson_get_str(type_val);
+
+    if (type_str && strcmp(type_str, "string") == 0 && enum_val && yyjson_is_arr(enum_val) &&
+        yyjson_arr_size(enum_val) > 0) {
+        size_t enum_idx = 0;
+        size_t enum_max = yyjson_arr_size(enum_val);
+        size_t valid_count = 0;
+        for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+            if (yyjson_get_str(yyjson_arr_get(enum_val, enum_idx))) {
+                valid_count++;
+            }
+        }
+        if (valid_count > 0) {
+            sb_append(sb, "Type.String({ enum: [");
+            bool first_enum = true;
+            for (enum_idx = 0; enum_idx < enum_max; enum_idx++) {
+                const char *enum_str = yyjson_get_str(yyjson_arr_get(enum_val, enum_idx));
+                if (!enum_str) {
+                    continue;
+                }
+                if (!first_enum) {
+                    sb_append(sb, ", ");
+                }
+                first_enum = false;
+                sb_append_js_string(sb, enum_str);
+            }
+            sb_append(sb, "]");
+            if (include_description && description) {
+                sb_append(sb, ", description: ");
+                sb_append_js_string(sb, description);
+            }
+            sb_append(sb, " })");
+            return;
+        }
+    }
+
+    const char *typebox_name = "Any";
+    if (type_str && strcmp(type_str, "string") == 0) {
+        typebox_name = "String";
+    } else if (type_str && strcmp(type_str, "integer") == 0) {
+        typebox_name = "Integer";
+    } else if (type_str && strcmp(type_str, "number") == 0) {
+        typebox_name = "Number";
+    } else if (type_str && strcmp(type_str, "boolean") == 0) {
+        typebox_name = "Boolean";
+    }
+
+    if (type_str && strcmp(type_str, "array") == 0) {
+        sb_append(sb, "Type.Array(");
+        if (items_val) {
+            append_typebox_type(sb, items_val, NULL, false);
+        } else {
+            sb_append(sb, "Type.Any()");
+        }
+        if (include_description && description) {
+            sb_append(sb, ", { description: ");
+            sb_append_js_string(sb, description);
+            sb_append(sb, " }");
+        }
+        sb_append(sb, ")");
+        return;
+    }
+
+    sb_append(sb, "Type.");
+    sb_append(sb, typebox_name);
+    sb_append(sb, "(");
+    if (include_description && description) {
+        sb_append(sb, "{ description: ");
+        sb_append_js_string(sb, description);
+        sb_append(sb, " }");
+    }
+    sb_append(sb, ")");
+}
+
+static bool typebox_property_is_required(yyjson_val *required, const char *prop_name) {
+    if (!required || !yyjson_is_arr(required)) {
+        return false;
+    }
+    size_t idx = 0;
+    size_t max = yyjson_arr_size(required);
+    for (idx = 0; idx < max; idx++) {
+        const char *required_name = yyjson_get_str(yyjson_arr_get(required, idx));
+        if (required_name && strcmp(required_name, prop_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void convert_json_schema_to_typebox(adapter_sb_t *sb, const char *schema_str) {
+    if (!schema_str) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+
+    /* Parse the JSON schema to extract properties and convert to TypeBox */
+    yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    if (!doc) {
+        sb_append(sb, "Type.Object({})");
+        return;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!root) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    yyjson_val *properties = yyjson_obj_get(root, "properties");
+    yyjson_val *required = yyjson_obj_get(root, "required");
+    if (!properties) {
+        sb_append(sb, "Type.Object({})");
+        yyjson_doc_free(doc);
+        return;
+    }
+
+    sb_append(sb, "Type.Object({\n");
+
+    bool first_prop = true;
+    size_t idx = 0, max = 0;
+    yyjson_val *key = NULL, *val = NULL;
+
+    yyjson_obj_foreach(properties, idx, max, key, val) {
+        const char *prop_name = yyjson_get_str(key);
+        if (!prop_name) {
+            continue;
+        }
+
+        if (!first_prop) {
+            sb_append(sb, ",\n");
+        }
+        first_prop = false;
+
+        sb_append(sb, "      ");
+        sb_append(sb, prop_name);
+        sb_append(sb, ": ");
+
+        yyjson_val *description_val = yyjson_obj_get(val, "description");
+        const char *description = yyjson_get_str(description_val);
+        bool is_required = typebox_property_is_required(required, prop_name);
+        if (!is_required) {
+            sb_append(sb, "Type.Optional(");
+        }
+        append_typebox_type(sb, val, description, true);
+        if (!is_required) {
+            sb_append(sb, ")");
+        }
+    }
+
+    sb_append(sb, "\n    })");
+    yyjson_doc_free(doc);
+}
+
 char *cbm_client_adapter_pi(const char *binary_path) {
     if (!binary_path || !binary_path[0]) {
         return NULL;
@@ -157,7 +317,8 @@ char *cbm_client_adapter_pi(const char *binary_path) {
      * (pods CLI) or an old AgentTool arity cannot be mistaken for this file. */
     sb_append(&sb, "// Target: @earendil-works/pi-coding-agent >= 0.74.0 (verified 0.84.2)\n"
                    "// ToolDefinition.execute(toolCallId, params, signal, onUpdate, ctx)\n");
-    sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
+    sb_append(&sb, "import { spawn } from 'node:child_process';\n");
+    sb_append(&sb, "import { Type } from 'typebox';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
     sb_append(&sb, "';\n\n");
@@ -224,10 +385,8 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         sb_append(&sb, ",\n    description: ");
         sb_append_js_string(&sb, description ? description : "");
         sb_append(&sb, ",\n    parameters: ");
-        /* input_schema is compact JSON, which is a valid JavaScript object
-         * literal; embedding it directly keeps the generated module free of a
-         * JSON.parse indirection and of any escaping drift. */
-        sb_append(&sb, schema ? schema : "{}");
+        /* Convert JSON schema to TypeBox format */
+        convert_json_schema_to_typebox(&sb, schema);
         /* 0.84.2 calls execute(toolCallId, params, signal, onUpdate, ctx).
          * The previous (args, ctx) shape bound the call id as the MCP args. */
         sb_append(&sb, ",\n    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {\n");
@@ -268,89 +427,226 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
     sb_append(&sb, "// OpenCode already reaches every tool over MCP; this module adds the\n"
                    "// context surfaces other clients get through hook configuration: graph\n"
                    "// lookup after grep/glob, index-coverage notes after read, session-start\n"
-                   "// tier routing (carried on the first tool result of each session, since\n"
-                   "// OpenCode documents no context-output lifecycle hook), and reinjection\n"
-                   "// after compaction via the documented experimental surface.\n");
+                   "// tier routing (carried on the first tool result of each session), and\n"
+                   "// on OpenCode 1.18.x reinjection after compaction.\n"
+                   "//\n"
+                   "// Two runtimes load this module:\n"
+                   "// - OpenCode 1.18.x dispatches the hooks returned by server(ctx).\n"
+                   "// - OpenCode 2 ignores server and calls setup(ctx), which registers the\n"
+                   "//   tool hook on the context's tool domain. The registration fails open,\n"
+                   "//   and the server() tool hook yields once it has registered. OpenCode 2\n"
+                   "//   gets no note after compaction: no compaction channel has been run on\n"
+                   "//   a real 2.x host yet.\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
-    sb_append(&sb, "';\n\n");
+    sb_append(&sb, "';\n"
+                   "const AUGMENT_TIMEOUT_MS = 10000;\n\n");
 
     /* hook-augment requires hook_event_name; its default dialect accepts
      * Grep/Glob under PreToolUse, Read under PostToolUse, and the
      * SessionStart lifecycle event — and emits the Claude JSON envelope, so
      * the plugin unwraps additionalContext instead of pasting raw JSON into
-     * the tool output. Every failure path resolves to '' (fail open). */
+     * the tool output. Every failure path resolves to '' (fail open) —
+     * including a child that never exits: augment() is awaited inline in
+     * tool.execute.after, so a hung hook-augment would stall every
+     * grep/glob/read completion. The timer SIGKILLs the child and resolves
+     * ''; the promise keeps the first resolution, so the kill-triggered
+     * 'close' event cannot override it. Stream errors (EPIPE on a write
+     * still buffered when the child dies, spawn ENOENT) fire on child.stdin,
+     * not on the child, and would crash the host as an unhandled 'error'
+     * event — hence the stdin listener and the guarded end(). */
     sb_append(&sb, "function augment(payload) {\n"
                    "  return new Promise((resolve) => {\n"
                    "    const child = spawn(BIN, ['hook-augment'], {\n"
                    "      stdio: ['pipe', 'pipe', 'ignore'],\n"
                    "      env: { ...process.env, CBM_LOG_LEVEL: 'error' },\n"
                    "    });\n"
+                   "    // Stream errors fire on the stream, not the child.\n"
+                   "    child.stdin.on('error', () => {});\n"
+                   "    const timer = setTimeout(() => {\n"
+                   "      child.kill('SIGKILL');\n"
+                   "      child.stdout.destroy();\n"
+                   "      resolve('');\n"
+                   "    }, AUGMENT_TIMEOUT_MS);\n"
                    "    let out = '';\n"
                    "    child.stdout.on('data', (d) => (out += d.toString()));\n"
-                   "    child.on('error', () => resolve(''));\n"
+                   "    child.on('error', () => {\n"
+                   "      clearTimeout(timer);\n"
+                   "      resolve('');\n"
+                   "    });\n"
                    "    child.on('close', () => {\n"
+                   "      clearTimeout(timer);\n"
                    "      try {\n"
                    "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
                    "        resolve(typeof ctx === 'string' ? ctx : '');\n"
                    "      } catch { resolve(''); }\n"
                    "    });\n"
-                   "    child.stdin.end(JSON.stringify(payload));\n"
+                   "    try {\n"
+                   "      child.stdin.end(JSON.stringify(payload));\n"
+                   "    } catch { resolve(''); }\n"
                    "  });\n"
                    "}\n\n");
 
+    /* OpenCode 2 tool results are structured (Tool.Result: content is the
+     * string/parts surface the model reads, output is the tool's schema-typed
+     * value). Append to content first, then a string output; if neither text
+     * surface exists, leave the result untouched so the tool's own output is
+     * never hidden. A parts array gets a new text part only when it already
+     * holds a part: `content: []` is a valid result, and a part added there
+     * would be the note alone, so an empty array falls through to the string
+     * output (or the unchanged result). The caller assigns the returned result
+     * onto event.result. */
     sb_append(&sb,
-              "export const CodebaseMemory = async (ctx) => {\n"
-              "  const dir = ctx?.directory;\n"
-              "  const seen = new Set();\n"
-              "  const lifecycle = () =>\n"
-              "    augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
-              "  return {\n"
-              "    'tool.execute.after': async (input, output) => {\n"
-              "      if (typeof output?.output !== 'string') return;\n"
-              "      const pieces = [];\n"
-              "      const sid = input?.sessionID;\n"
-              "      if (typeof sid === 'string' && !seen.has(sid)) {\n"
-              "        seen.add(sid);\n"
-              "        pieces.push(await lifecycle());\n"
+              "function appendResult(result, extra) {\n"
+              "  if (!result || typeof result !== 'object') return result;\n"
+              "  if (typeof result.content === 'string') {\n"
+              "    return { ...result, content: result.content + '\\n' + extra };\n"
+              "  }\n"
+              "  if (Array.isArray(result.content) && result.content.length > 0) {\n"
+              "    const content = result.content.slice();\n"
+              "    for (let i = content.length - 1; i >= 0; i--) {\n"
+              "      if (content[i] && content[i].type === 'text') {\n"
+              "        content[i] = { ...content[i], text: content[i].text + '\\n' + extra };\n"
+              "        return { ...result, content };\n"
               "      }\n"
-              "      const args = input?.args ?? {};\n"
-              "      const search =\n"
-              "        input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
-              "      if (search) {\n"
-              "        pieces.push(await augment({\n"
-              "          hook_event_name: 'PreToolUse',\n"
-              "          tool_name: search,\n"
-              "          tool_input: args,\n"
-              "          cwd: dir,\n"
-              "        }));\n"
-              "      } else if (input?.tool === 'read') {\n"
-              "        const filePath = args.filePath ?? args.file_path ?? args.path;\n"
-              "        if (typeof filePath === 'string' && filePath) {\n"
-              "          pieces.push(await augment({\n"
-              "            hook_event_name: 'PostToolUse',\n"
-              "            tool_name: 'Read',\n"
-              "            tool_input: { file_path: filePath },\n"
-              "            cwd: dir,\n"
-              "          }));\n"
-              "        }\n"
-              "      }\n"
-              "      const extra = pieces.filter(Boolean).join('\\n');\n"
-              "      if (extra) {\n"
-              "        output.output += '\\n' + extra;\n"
-              "      }\n"
-              "    },\n"
-              "    // Documented (experimental) compaction surface: output.context is the\n"
-              "    // mutable array of context strings for the rebuilt session.\n"
-              "    'experimental.session.compacting': async (_input, output) => {\n"
-              "      const note = await lifecycle();\n"
-              "      if (note && Array.isArray(output?.context)) {\n"
-              "        output.context.push(note);\n"
-              "      }\n"
-              "    },\n"
-              "  };\n"
-              "};\n");
+              "    }\n"
+              "    content.push({ type: 'text', text: extra });\n"
+              "    return { ...result, content };\n"
+              "  }\n"
+              "  if (typeof result.output === 'string') {\n"
+              "    return { ...result, output: result.output + '\\n' + extra };\n"
+              "  }\n"
+              "  return result;\n"
+              "}\n\n");
+
+    /* A host that dispatches both server() and setup() with a tool domain must
+     * not append the note twice: the server() tool hook yields once setup()
+     * registered the tool domain. */
+    sb_append(&sb, "let toolHooksRegistered = false;\n\n");
+
+    sb_append(
+        &sb,
+        "export default {\n"
+        "  id: 'codebase-memory-augment',\n"
+        "  // OpenCode 1.18.x server runtime: reads default.server and dispatches\n"
+        "  // the hooks it returns.\n"
+        "  server: async (ctx) => {\n"
+        "    const dir = ctx?.directory;\n"
+        "    const seen = new Set();\n"
+        "    const lifecycle = () =>\n"
+        "      augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
+        "    return {\n"
+        "      'tool.execute.after': async (input, output) => {\n"
+        "        if (toolHooksRegistered) return;\n"
+        "        if (typeof output?.output !== 'string') return;\n"
+        "        const pieces = [];\n"
+        "        const sid = input?.sessionID;\n"
+        "        if (typeof sid === 'string' && !seen.has(sid)) {\n"
+        "          seen.add(sid);\n"
+        "          pieces.push(await lifecycle());\n"
+        "        }\n"
+        "        const args = input?.args ?? {};\n"
+        "        const search =\n"
+        "          input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
+        "        if (search) {\n"
+        "          pieces.push(await augment({\n"
+        "            hook_event_name: 'PreToolUse',\n"
+        "            tool_name: search,\n"
+        "            tool_input: args,\n"
+        "            cwd: dir,\n"
+        "          }));\n"
+        "        } else if (input?.tool === 'read') {\n"
+        "          const filePath = args.filePath ?? args.file_path ?? args.path;\n"
+        "          if (typeof filePath === 'string' && filePath) {\n"
+        "            pieces.push(await augment({\n"
+        "              hook_event_name: 'PostToolUse',\n"
+        "              tool_name: 'Read',\n"
+        "              tool_input: { file_path: filePath },\n"
+        "              cwd: dir,\n"
+        "            }));\n"
+        "          }\n"
+        "        }\n"
+        "        const extra = pieces.filter(Boolean).join('\\n');\n"
+        "        if (extra) {\n"
+        "          output.output += '\\n' + extra;\n"
+        "        }\n"
+        "      },\n"
+        "      // Documented (experimental) compaction surface: output.context is the\n"
+        "      // mutable array of context strings for the rebuilt session.\n"
+        "      'experimental.session.compacting': async (_input, output) => {\n"
+        "        const note = await lifecycle();\n"
+        "        if (note && Array.isArray(output?.context)) {\n"
+        "          output.context.push(note);\n"
+        "        }\n"
+        "      },\n"
+        "    };\n"
+        "  },\n"
+        "  // OpenCode 2 runtime: default.server is ignored and setup(ctx) registers\n"
+        "  // the tool hook on the context's tool domain. The registration fails\n"
+        "  // open, so a missing domain cannot break the host.\n"
+        "  async setup(ctx) {\n"
+        "    const seen = new Set();\n"
+        "    const dirs = new Map();\n"
+        "    const dirFor = async (sessionID) => {\n"
+        "      if (typeof sessionID !== 'string' || sessionID === '') return undefined;\n"
+        "      if (dirs.has(sessionID)) return dirs.get(sessionID);\n"
+        "      try {\n"
+        "        const session = await ctx.session.get({ sessionID });\n"
+        "        const dir = session?.location?.directory;\n"
+        "        if (typeof dir === 'string' && dir !== '') {\n"
+        "          dirs.set(sessionID, dir);\n"
+        "          return dir;\n"
+        "        }\n"
+        "      } catch {}\n"
+        "      return undefined;\n"
+        "    };\n"
+        "    const lifecycle = (dir) =>\n"
+        "      augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
+        "    if (ctx?.tool?.hook) {\n"
+        "      try {\n"
+        "        await ctx.tool.hook('execute.after', async (event) => {\n"
+        "          if (event?.status !== 'completed') return;\n"
+        "          const dir = await dirFor(event?.sessionID);\n"
+        "          if (!dir) return;\n"
+        "          const pieces = [];\n"
+        "          if (typeof event?.sessionID === 'string' && !seen.has(event.sessionID)) {\n"
+        "            seen.add(event.sessionID);\n"
+        "            pieces.push(await lifecycle(dir));\n"
+        "          }\n"
+        "          const args = event?.input ?? {};\n"
+        "          const search =\n"
+        "            event?.tool === 'grep' ? 'Grep' : event?.tool === 'glob' ? 'Glob' : null;\n"
+        "          if (search) {\n"
+        "            pieces.push(await augment({\n"
+        "              hook_event_name: 'PreToolUse',\n"
+        "              tool_name: search,\n"
+        "              tool_input: args,\n"
+        "              cwd: dir,\n"
+        "            }));\n"
+        "          } else if (event?.tool === 'read') {\n"
+        "            const filePath = args.filePath ?? args.file_path ?? args.path;\n"
+        "            if (typeof filePath === 'string' && filePath) {\n"
+        "              pieces.push(await augment({\n"
+        "                hook_event_name: 'PostToolUse',\n"
+        "                tool_name: 'Read',\n"
+        "                tool_input: { file_path: filePath },\n"
+        "                cwd: dir,\n"
+        "              }));\n"
+        "            }\n"
+        "          }\n"
+        "          const extra = pieces.filter(Boolean).join('\\n');\n"
+        "          if (extra) {\n"
+        "            event.result = appendResult(event.result, extra);\n"
+        "          }\n"
+        "        });\n"
+        "        toolHooksRegistered = true;\n"
+        "      } catch {\n"
+        "        // Fail open: the server() tool hook stays active.\n"
+        "      }\n"
+        "    }\n"
+        "  },\n"
+        "};\n");
 
     if (sb.failed) {
         free(sb.buf);

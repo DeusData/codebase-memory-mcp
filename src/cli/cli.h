@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "foundation/index_policy.h"
+
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
 /* ── Version ──────────────────────────────────────────────────── */
@@ -25,6 +27,18 @@ const char *cbm_cli_get_version(void);
 
 /* ── CLI tool arguments (flags / --args-file / --help) ────────── */
 
+/* Top-level `cli --help` text printed by run_cli() in src/main.c.
+ * Documents tool-level --format without adding a session-wide flag (#2102). */
+#define CBM_CLI_USAGE                                                                         \
+    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
+    "[json_args]\n"                                                                           \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
+    "  --json      Print the raw MCP result envelope\n"                                       \
+    "  Tools that accept format support --format tree|json (default: tree).\n"                \
+    "  --format json prints payload JSON; outer --json prints the full MCP envelope.\n"
+
 /* Convert `--flag value` / `--flag=value` / bare-boolean `--flag` arguments for
  * a tool into a JSON arguments object string, using the tool's input_schema to
  * type values (string/integer/boolean) and to collect repeated flags into
@@ -34,13 +48,24 @@ const char *cbm_cli_get_version(void);
  * must free. Caller frees the returned JSON string. */
 char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out);
 
+/* What a descriptor is, as far as the stdin argument gate cares. */
+typedef enum {
+    CBM_CLI_STDIN_TERMINAL = 0, /* interactive: nothing piped to read */
+    CBM_CLI_STDIN_FILE = 1,     /* regular file (`< args.json`): always reaches EOF */
+    CBM_CLI_STDIN_STREAM = 2,   /* pipe, socket, device: EOF only when the writer closes */
+} cbm_cli_stdin_kind_t;
+
+/* Classify an open descriptor: terminal (isatty), regular file (fstat), else stream. */
+cbm_cli_stdin_kind_t cbm_cli_stdin_kind(int fd);
+
 /* Decide whether `cli <tool>` may take its JSON arguments from stdin, given
  * that no --args-file, raw-JSON positional and no --flag form was supplied.
- * stdin_is_tty is the caller's isatty(0) result. True only for a non-terminal
- * stdin AND a tool whose input_schema declares at least one property; a
- * zero-argument tool such as list_projects must never read stdin, because an
- * inherited-but-never-closed pipe makes that read block forever (#1359). */
-bool cbm_cli_args_from_stdin_allowed(const char *tool_name, bool stdin_is_tty);
+ * Never from a terminal, never for a tool whose input_schema declares no
+ * properties. A regular file is read for any tool that takes arguments; a
+ * stream only for a tool with a REQUIRED argument. A tool callable without
+ * arguments (list_projects) is complete with `{}`, and an inherited stream
+ * nobody closes would block that read forever (#1359). */
+bool cbm_cli_args_from_stdin_allowed(const char *tool_name, cbm_cli_stdin_kind_t stdin_kind);
 
 /* Print per-tool help (usage + the tool's flags with type/description/required)
  * derived from its input_schema, to stdout. Returns 0 if the tool is known,
@@ -56,6 +81,54 @@ bool cbm_cli_mcp_result_is_error(const char *result);
  * a nominal success result. Preserve an existing failure code; otherwise turn
  * accepted cancellation into EXIT_FAILURE. */
 int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_cancelled);
+
+/* ── Index exit contract ──────────────────────────────────────────
+ *
+ * A freshness gate must not have to read anyone's account of itself: it reads
+ * the process status. `index_repository` therefore grades its own outcome.
+ *
+ *   0   indexed, quality at or above the thresholds
+ *   1   hard failure (pipeline fell over inside a reachable repository)
+ *   10  indexed, but below a quality threshold — a graph that exists and lies
+ *       about how much of the tree it covers is worse than no graph
+ *   11  target unavailable: repo_path is absent, unreadable, or not a directory
+ *
+ * 1 keeps its historical meaning so existing `|| fail` scripts are unaffected;
+ * 10 and 11 are new and carve out cases that used to return 0 and 1.
+ *
+ * STABLE CONTRACT: these four values are public. CI pipelines branch on them,
+ * so they are never renumbered or reused for another outcome. 2 is
+ * deliberately not a verdict: the binary already returns 2 for a usage error
+ * (an invalid --tool-profile), and shells and CI tooling read 2 that way, so a
+ * verdict on 2 could not be told apart from a mistyped command line.
+ *
+ * The contract is opt-in: it applies only when CBM_GATE is set to a non-empty
+ * value other than "0". Without it the CLI exits exactly as before, so a
+ * caller that never asked for grading never sees a new code.
+ *
+ * Thresholds, both overridable by environment:
+ *   CBM_GATE_MAX_UNUSABLE     (default 0)   absolute count of unparsable files
+ *   CBM_GATE_MAX_PARTIAL_PCT  (default 10)  parse_partial_count / files_indexed
+ * A threshold set to a negative value disables that check.
+ *
+ * The two numbers differ on purpose and must not be collapsed into one: a file
+ * that did not parse at all is a defect and gets no tolerance, while partial
+ * parsing marks constructs this grammar does not cover — a property of language
+ * support, not of index quality, and normal at a few percent in a large tree.
+ * A gate its own repository cannot pass gets switched off, which protects
+ * nothing. */
+enum {
+    CBM_CLI_EXIT_OK = 0,
+    CBM_CLI_EXIT_FAILURE = 1,
+    CBM_CLI_EXIT_QUALITY = 10,
+    CBM_CLI_EXIT_TARGET = 11,
+};
+
+/* Grade an index_repository result envelope. `base_status` is what the
+ * ordinary isError mapping already produced; it is preserved unless the
+ * payload justifies a more specific code. Unparsable payloads change
+ * nothing — silence is never upgraded into a verdict. */
+int cbm_cli_index_exit_status(const char *result, int base_status);
 
 /* ── Self-update: version comparison ──────────────────────────── */
 
@@ -75,7 +148,8 @@ const char *cbm_detect_shell_rc(const char *home_dir);
 
 /* Find a CLI binary by name.
  * Checks PATH first, then common install locations.
- * Returns static buffer — do NOT free. Returns "" if not found. */
+ * Returns a per-thread buffer, overwritten by the next call on that thread.
+ * Do NOT free. Returns "" if not found. */
 const char *cbm_find_cli(const char *name, const char *home_dir);
 
 /* ── File utilities ───────────────────────────────────────────── */
@@ -107,6 +181,11 @@ typedef struct {
 
 /* Get the array of skill definitions. */
 const cbm_skill_t *cbm_get_skills(void);
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+size_t cbm_cli_released_skill_content_count(void);
+const char *cbm_cli_released_skill_content_at(size_t index);
+#endif
 
 /* Install skills to skills_dir (e.g. ~/.claude/skills/).
  * If force is true, overwrite existing skills.
@@ -168,11 +247,11 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Detected coding agents on the system. */
 typedef struct {
-    bool claude_code;   /* ~/.claude/ exists */
+    bool claude_code;   /* settings.json, .claude.json, or claude CLI exists */
     bool codex;         /* $CODEX_HOME or ~/.codex exists */
     bool gemini;        /* Gemini settings or executable exists */
     bool zed;           /* platform-specific Zed config dir exists */
-    bool opencode;      /* opencode on PATH or config exists */
+    bool opencode;      /* opencode on PATH, config, or data dir exists */
     bool antigravity;   /* Antigravity CLI config or executable exists */
     bool aider;         /* aider on PATH */
     bool kilocode;      /* KiloCode globalStorage dir exists */
@@ -183,7 +262,7 @@ typedef struct {
     bool openclaw;      /* ~/.openclaw/ exists */
     bool kiro;          /* ~/.kiro/ exists */
     bool junie;         /* ~/.junie/ exists */
-    bool hermes;        /* ~/.hermes/ or hermes CLI exists */
+    bool hermes;        /* Hermes home (Windows: %LOCALAPPDATA%\hermes) or CLI */
     bool openhands;     /* ~/.openhands/ or openhands CLI exists */
     bool cline;         /* ~/.cline/ or cline CLI exists */
     bool warp;          /* Warp footprint or oz/oz-preview/warp-cli exists */
@@ -204,6 +283,13 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+/* #1180: the Hermes home as resolved on Windows (`windows`) or elsewhere, so
+ * the %LOCALAPPDATA%\hermes default and its legacy ~/.hermes fallback are
+ * exercised on every host. */
+void cbm_hermes_home_dir_for_testing(const char *home_dir, bool windows, char *out, size_t out_sz);
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
 /* #1558: client-selector vocabulary, exposed so a test can prove every token
  * resolves and an unknown one is rejected. */
 bool cbm_cli_clients_apply_selection_for_testing(const char *spec, cbm_detected_agents_t *detected);
@@ -217,6 +303,8 @@ void cbm_cli_set_client_selection_for_testing(const char *spec);
  * not recognisably foreign. Detection must be positive evidence — see the
  * implementation comment. */
 const char *cbm_cli_external_manager_name_for_testing(const char *self_path);
+/* #2722: override runtime binary self-path detection for testing. */
+void cbm_cli_set_self_path_override_for_test(const char *self_path);
 /* #1558: expose the config-key table so a test can prove a key is discoverable
  * (`config list`/`set` both walk it). */
 size_t cbm_cli_config_key_count_for_testing(void);
@@ -250,6 +338,9 @@ bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
 bool cbm_hook_augment_parse_bash_pattern_for_testing(const char *cmd, char *out, size_t out_sz);
+/* include_posttool false renders the previous lifecycle-only manifest. Release
+ * the result with cbm_free(CBM_MEM_CLASS_OTHER, ...). */
+char *cbm_build_copilot_hook_manifest_for_testing(const char *binary_path, bool include_posttool);
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
 int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
@@ -390,7 +481,8 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
  * Prints each file path to stdout. Returns count of .db files found. */
 int cbm_list_indexes(const char *home_dir);
 
-/* Remove all .db files in the cache directory. Returns count removed. */
+/* Remove every project index .db (and its sidecars) in the cache directory.
+ * Internal stores (_config.db, _cross_repo.db) are kept. Returns count removed. */
 int cbm_remove_indexes(const char *home_dir);
 
 /* ── Config store (persistent key-value, backed by _config.db) ── */
@@ -411,6 +503,11 @@ const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *defau
 /* Get a config value as bool. "true"/"1"/"on" → true. */
 bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val);
 
+/* A key the user set to a boolean ("true"/"1"/"on", "false"/"0"/"off"):
+ * true, with *value. Unset or unparseable: false, *value untouched -- the
+ * caller's own default applies (cbm_config_get_bool's reading). */
+bool cbm_config_get_bool_set(cbm_config_t *cfg, const char *key, bool *value);
+
 /* Get a config value as int. Returns default_val if not found or invalid. */
 int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val);
 
@@ -420,12 +517,19 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
+/* Load and validate the operator-controlled discovery policy. Invalid stored
+ * values fail closed instead of silently disabling a guard. */
+bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
+                                  char *error, size_t error_size);
+
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
+#define CBM_CONFIG_DOC_CANDIDATES "doc_candidates"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+#define CBM_CONFIG_WATCH_NON_GIT "watch_non_git"
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
@@ -439,6 +543,11 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
  * default (true), so a failure to open the config store never silently disables
  * the watcher. */
 bool cbm_config_watcher_enabled(cbm_config_t *cfg);
+
+/* Whether the watcher also polls NON-GIT project roots (default false, #1948).
+ * Non-git roots are otherwise never refreshed after their first index. Read
+ * once at daemon startup, like watcher_enabled. NULL-safe (NULL → false). */
+bool cbm_config_watch_non_git(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 
@@ -484,6 +593,12 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
 const char *cbm_cli_activation_runtime_parent_for_test(void);
+
+/* Internal integration-test seam: the activation scope read reports the active
+ * cohort's cache fingerprint as unreadable (blank), exactly what the scope
+ * decision sees when that field cannot be recovered. false restores the real
+ * read. Not a command-line or environment override. */
+void cbm_cli_set_activation_scope_cache_unreadable_for_test(bool unreadable);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
@@ -534,8 +649,11 @@ void cbm_hook_augment_arm_deadline(void);
 int cbm_hook_augment_deadline_ms_for_testing(void);
 #endif
 char *cbm_hook_augment_read_stdin(void);
-/* Pure no-op gate for the hook-client fast path (see hook_augment.c). */
-bool cbm_hook_augment_input_is_noop_bash(const char *input);
+/* Pure no-op gate for the hook-client fast path (see hook_augment.c). It also
+ * covers a forced search event, such as Copilot's PostToolUse; forced_event and
+ * dialect_name are borrowed and may be NULL. */
+bool cbm_hook_augment_input_is_noop_for(const char *input, const char *forced_event,
+                                        const char *dialect_name);
 /* Hand back stdin bytes main() consumed early; the next read returns them. */
 void cbm_hook_augment_prefetch_stdin(char *owned);
 

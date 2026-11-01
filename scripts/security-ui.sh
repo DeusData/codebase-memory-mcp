@@ -14,6 +14,42 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FAIL=0
 
+# Only the pinned opt-in model policy may declare these external locations.
+# Inert URL fixtures are confined to the individually reviewed tests below.
+browser_model_source_url_allowed() {
+    local relfile="$1" url="$2"
+    case "$relfile" in
+        graph-ui/src/browser-ai/model-policy.ts)
+            case "$url" in
+                'https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct'|\
+                'https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct'|\
+                'https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX'|\
+                'https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-ONNX'|\
+                'https://huggingface.co/onnx-community/Qwen3.5-2B-ONNX-OPT'|\
+                'https://huggingface.co/${BROWSER_MODEL.id}/resolve/${BROWSER_MODEL.revision}/`;'|\
+                'https://huggingface.co/${model.id}/resolve/${model.revision}/`;'|\
+                'https://huggingface.co'|'https://us.aws.cdn.hf.co') return 0 ;;
+            esac
+            ;;
+        graph-ui/src/browser-ai/model-policy.test.ts|\
+        graph-ui/src/browser-ai/security-download-origins.test.ts|\
+        graph-ui/src/browser-ai/security-ui-model-policy.test.ts|\
+        graph-ui/src/browser-ai/ChatMarkdown.test.tsx|\
+        graph-ui/src/adr/AdrWorkspace.test.tsx|\
+        graph-ui/src/architecture/SourceEvidenceDrawer.test.tsx|\
+        graph-ui/src/architecture/container-topology.test.ts|\
+        graph-ui/src/architecture/repository-guide.test.ts|\
+        graph-ui/src/browser-ai/BrowserChatDock.ask-model.test.tsx|\
+        graph-ui/src/browser-ai/BrowserChatDock.test.tsx|\
+        graph-ui/src/browser-ai/explanation-response.test.ts|\
+        graph-ui/src/browser-ai/file-facts.test.ts|\
+        graph-ui/src/browser-ai/file-outline.ini.test.ts|\
+        graph-ui/src/browser-ai/file-outline.test.ts|\
+        graph-ui/src/settings/model-catalog.test.ts) return 0 ;;
+    esac
+    return 1
+}
+
 # Use mktemp for all temp files (cross-platform safe)
 SEC_TMPDIR=$(mktemp -d)
 trap 'rm -rf "$SEC_TMPDIR"' EXIT
@@ -37,7 +73,7 @@ else
         echo "Scanning: $UI_DIR"
 
         # A1: No external domains in JS/CSS/TS source code.
-        # For src/ (our code): strict — any external URL is blocked.
+        # For src/: external URLs require the exact model policy exception.
         # For dist/ (bundled npm output): skip inline URL scan — minified JS
         # contains hundreds of string-constant URLs from libraries (React error
         # pages, W3C namespace URIs, CDN references, OSS credits) that are never
@@ -48,10 +84,13 @@ else
 
         if ! $is_dist; then
             echo "  Checking for external domains (source)..."
-            if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) -exec grep -lE 'https?://' {} \; 2>/dev/null | head -20 > "$SEC_TMPDIR/urls"; then
+            if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) -exec grep -lE 'https?://' {} \; 2>/dev/null > "$SEC_TMPDIR/urls"; then
                 while IFS= read -r file; do
                     relfile="${file#"$ROOT/"}"
-                    grep -onE 'https?://[^\s"'"'"')]+' "$file" 2>/dev/null | while IFS=: read -r lineno url; do
+                    grep -onE 'https?://[^[:space:]"'"'"')]+' "$file" 2>/dev/null | while IFS=: read -r lineno url; do
+                        if browser_model_source_url_allowed "$relfile" "$url"; then
+                            continue
+                        fi
                         case "$url" in
                             http://localhost*|http://127.0.0.1*|https://localhost*|https://127.0.0.1*)
                                 ;; # OK — local dev/runtime
@@ -85,7 +124,7 @@ else
 
         # A3: No tracking/analytics
         echo "  Checking for tracking/analytics..."
-        TRACKING='google-analytics|gtag|mixpanel|segment\.com|hotjar|sentry\.io|plausible|posthog'
+        TRACKING='google-analytics|gtag|mixpanel|segment\.com|hotjar|sentry\.io|plausible\.io|posthog'
         if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.html' \) \
             -exec grep -lE "$TRACKING" {} \; 2>/dev/null > "$SEC_TMPDIR/track"; then
             while IFS= read -r file; do

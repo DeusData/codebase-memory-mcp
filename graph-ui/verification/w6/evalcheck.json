@@ -1,0 +1,2378 @@
+{
+  "evalCheckPass": true,
+  "reasons": [],
+  "temperature": 0,
+  "seed": 42,
+  "questionCount": 44,
+  "modelsRun": 2,
+  "passRateTolerance": 0.05,
+  "bounds": {
+    "passRate": 0.6,
+    "citationCompliance": 0.9,
+    "appliesTo": "der Sieger JEDER Modellklasse, nicht das Feld im Schnitt",
+    "source": "docs/adr/0001-modellwahl.md (Abschnitt Entscheidung), tests/scaffold/w5b.test.mjs Zeilen 51 und 53, PLAN.md Abschnitt 5"
+  },
+  "baselineFile": "verification/w5/eval.json",
+  "comparisons": [
+    {
+      "modelClass": "A",
+      "name": "Qwen3.5-2B",
+      "recordedPassRate": 0.682,
+      "measuredPassRate": 0.682,
+      "passRateDelta": 0,
+      "improved": false,
+      "recordedCitation": 0.932,
+      "measuredCitation": 0.932,
+      "citationBound": 0.9,
+      "withinTolerance": true,
+      "reasons": []
+    },
+    {
+      "modelClass": "B",
+      "name": "gemma-4-E4B",
+      "recordedPassRate": 0.841,
+      "measuredPassRate": 0.841,
+      "passRateDelta": 0,
+      "improved": false,
+      "recordedCitation": 1,
+      "measuredCitation": 1,
+      "citationBound": 0.9,
+      "withinTolerance": true,
+      "reasons": []
+    }
+  ],
+  "measured": [
+    {
+      "modelClass": "A",
+      "name": "Qwen3.5-2B",
+      "file": "Qwen3.5-2B-Q4_K_M.gguf",
+      "contextTokens": 3072,
+      "quantisation": "Q4_K - Medium",
+      "port": 4400,
+      "readyMs": 20923,
+      "questions": 44,
+      "passRate": 0.682,
+      "citationCompliance": 0.932,
+      "citationMeasured": 44,
+      "citationUnmeasured": 0,
+      "meanTokPerSec": 86.236,
+      "failedQuestions": [
+        "who-01-de",
+        "what-04-en",
+        "what-05-de",
+        "what-08-en",
+        "what-09-de",
+        "what-10-en",
+        "err-05-de",
+        "err-06-en",
+        "if-01-de",
+        "if-02-en",
+        "if-06-en",
+        "entry-03-de",
+        "entry-04-en",
+        "cmp-02-en"
+      ],
+      "totalMs": 53763
+    },
+    {
+      "modelClass": "B",
+      "name": "gemma-4-E4B",
+      "file": "gemma-4-E4B-it-Q4_K_M.gguf",
+      "contextTokens": 8192,
+      "quantisation": "Q4_K - Medium",
+      "port": 4400,
+      "readyMs": 3224,
+      "questions": 44,
+      "passRate": 0.841,
+      "citationCompliance": 1,
+      "citationMeasured": 44,
+      "citationUnmeasured": 0,
+      "meanTokPerSec": 32.074,
+      "failedQuestions": [
+        "what-01-de",
+        "what-07-de",
+        "what-08-en",
+        "err-05-de",
+        "entry-03-de",
+        "entry-04-en",
+        "cmp-04-en"
+      ],
+      "totalMs": 53873
+    }
+  ],
+  "leftoverProcesses": 0,
+  "leftoverPortsChecked": [
+    4360,
+    4400,
+    4400
+  ],
+  "sidecarPort": {
+    "port": 4141,
+    "sockets": 2,
+    "usedByThisRun": false,
+    "affectsResult": false,
+    "note": "Der Produktport. Dieser Lauf startet dort nichts und beendet dort nichts. Die Zahl zaehlt jeden Prozess mit einem Socket auf dem Port, Server wie Client (lsof -ti), und beschreibt den Rechner, nicht diesen Lauf."
+  },
+  "method": "Nur die zwei in verification/w5/eval.json aufgezeichneten Klassensieger, alle Fragen aus eval/questions.json, dieselben Karten aus dem Produkt-Compiler, Temperatur 0 und Seed 42 (beides in src/chat/chat-client.ts). Verglichen wird die Trefferquote gegen die Aufzeichnung mit Toleranz 0.05 und die Zitattreue hart gegen die Grenze 0.9. Eine GESTIEGENE Trefferquote ist kein Fehler.",
+  "generatedAt": "2026-08-31T13:55:50.886Z",
+  "totalMs": 125004,
+  "error": null,
+  "extras": {
+    "leftovers": [
+      {
+        "port": 4360,
+        "listeners": 0
+      },
+      {
+        "port": 4400,
+        "listeners": 0
+      },
+      {
+        "port": 4400,
+        "listeners": 0
+      }
+    ],
+    "perQuestion": [
+      {
+        "name": "Qwen3.5-2B",
+        "results": [
+          {
+            "id": "who-01-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K3",
+                "K1",
+                "K4",
+                "K5",
+                "K6",
+                "K7",
+                "K8",
+                "K9",
+                "K10",
+                "K11"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "registerUserRoutes"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 122,
+            "tokensPerSecond": 63.246
+          },
+          {
+            "id": "who-02-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4",
+                "K5"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 210,
+            "tokensPerSecond": 91.275
+          },
+          {
+            "id": "who-03-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4",
+                "K5"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 60,
+            "tokensPerSecond": 72.674
+          },
+          {
+            "id": "who-04-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K3",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 103,
+            "tokensPerSecond": 85.011
+          },
+          {
+            "id": "who-05-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 167,
+            "tokensPerSecond": 93.06
+          },
+          {
+            "id": "who-06-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 103,
+            "tokensPerSecond": 84.599
+          },
+          {
+            "id": "who-07-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K5",
+                "K6"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 186,
+            "tokensPerSecond": 92.905
+          },
+          {
+            "id": "who-08-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 62,
+            "tokensPerSecond": 76.696
+          },
+          {
+            "id": "what-01-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K11",
+                "K5",
+                "K6",
+                "K7",
+                "K8"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 257,
+            "tokensPerSecond": 93.714
+          },
+          {
+            "id": "what-02-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K7"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 140,
+            "tokensPerSecond": 84.991
+          },
+          {
+            "id": "what-03-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K5"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 159,
+            "tokensPerSecond": 96.667
+          },
+          {
+            "id": "what-04-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": false,
+              "cited": [
+                "K4",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [
+                {
+                  "line": "No card covers it, and no other cards answer the question about what symbols hotspotScan calls.",
+                  "reason": "no-citation"
+                }
+              ],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": false,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 224,
+            "tokensPerSecond": 100
+          },
+          {
+            "id": "what-05-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K5",
+                "K6",
+                "K7"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "loadConfig",
+              "createApp"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 58,
+            "tokensPerSecond": 73.034
+          },
+          {
+            "id": "what-06-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K7"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 243,
+            "tokensPerSecond": 93.702
+          },
+          {
+            "id": "what-07-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 252,
+            "tokensPerSecond": 103.75
+          },
+          {
+            "id": "what-08-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "validate.ts"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 128,
+            "tokensPerSecond": 93.182
+          },
+          {
+            "id": "what-09-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": false,
+              "cited": [
+                "K1"
+              ],
+              "unknown": [],
+              "violations": [
+                {
+                  "line": "Calls `createUser` at line 41 in body order.",
+                  "reason": "no-citation"
+                },
+                {
+                  "line": "Calls `createUser` at line 23 via `create`.",
+                  "reason": "no-citation"
+                },
+                {
+                  "line": "No error type raised by `create`.",
+                  "reason": "no-citation"
+                }
+              ],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": false,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 154,
+            "tokensPerSecond": 94.518
+          },
+          {
+            "id": "what-10-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "getOrder"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 223,
+            "tokensPerSecond": 98.485
+          },
+          {
+            "id": "err-01-de",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K8",
+                "K9"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 76,
+            "tokensPerSecond": 61.503
+          },
+          {
+            "id": "err-02-en",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K5",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 183,
+            "tokensPerSecond": 91.76
+          },
+          {
+            "id": "err-03-de",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K4",
+                "K5"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 198,
+            "tokensPerSecond": 93.19
+          },
+          {
+            "id": "err-04-en",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 29,
+            "tokensPerSecond": 44.643
+          },
+          {
+            "id": "err-05-de",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K8",
+                "K9"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "DB_URL"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 140,
+            "tokensPerSecond": 69.307
+          },
+          {
+            "id": "err-06-en",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": true,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "insert"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 22,
+            "tokensPerSecond": 43.478
+          },
+          {
+            "id": "if-01-de",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K11",
+                "K9",
+                "K5"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "registerUserRoutes"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 428,
+            "tokensPerSecond": 99.019
+          },
+          {
+            "id": "if-02-en",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "registerUserRoutes"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 268,
+            "tokensPerSecond": 96.894
+          },
+          {
+            "id": "if-03-de",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 240,
+            "tokensPerSecond": 98.25
+          },
+          {
+            "id": "if-04-en",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K1",
+                "K3",
+                "K5",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 283,
+            "tokensPerSecond": 102.564
+          },
+          {
+            "id": "if-05-de",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K2",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 397,
+            "tokensPerSecond": 103.563
+          },
+          {
+            "id": "if-06-en",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K5",
+                "K6"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "createApp"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 449,
+            "tokensPerSecond": 105.442
+          },
+          {
+            "id": "entry-01-de",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 290,
+            "tokensPerSecond": 97.866
+          },
+          {
+            "id": "entry-02-en",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 93,
+            "tokensPerSecond": 58.947
+          },
+          {
+            "id": "entry-03-de",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "src/server.ts"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 262,
+            "tokensPerSecond": 96.829
+          },
+          {
+            "id": "entry-04-en",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": false,
+              "cited": [],
+              "unknown": [],
+              "violations": [
+                {
+                  "line": "src/config.ts:11 loadConfig src/config.ts:20 isProduction src/repo/db.ts:17 query src/repo/db.ts:31 insert src/routes/orders.ts:8 registerOrderRoutes src/routes/users.ts:7 registerUserRoutes",
+                  "reason": "no-citation"
+                }
+              ],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": false,
+            "truncated": false,
+            "missing": [
+              "src/server.ts"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 190,
+            "tokensPerSecond": 77.713
+          },
+          {
+            "id": "entry-05-de",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 290,
+            "tokensPerSecond": 93.662
+          },
+          {
+            "id": "cmp-01-de",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K10",
+                "K4",
+                "K8",
+                "K9"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 556,
+            "tokensPerSecond": 108.323
+          },
+          {
+            "id": "cmp-02-en",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "validateId"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 265,
+            "tokensPerSecond": 84.848
+          },
+          {
+            "id": "cmp-03-de",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K3",
+                "K4",
+                "K2",
+                "K6"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 215,
+            "tokensPerSecond": 86.957
+          },
+          {
+            "id": "cmp-04-en",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K4",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 177,
+            "tokensPerSecond": 100.45
+          },
+          {
+            "id": "over-01-de",
+            "klass": "overview",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 348,
+            "tokensPerSecond": 96.522
+          },
+          {
+            "id": "over-02-en",
+            "klass": "overview",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 212,
+            "tokensPerSecond": 86.735
+          },
+          {
+            "id": "over-03-de",
+            "klass": "overview",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 348,
+            "tokensPerSecond": 95.116
+          },
+          {
+            "id": "honest-01-de",
+            "klass": "other",
+            "deterministic": true,
+            "check": {
+              "ok": true,
+              "cited": [],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": true,
+              "measured": true
+            },
+            "citationOk": true,
+            "missing": [],
+            "forbiddenHits": []
+          },
+          {
+            "id": "honest-02-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": true,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 18,
+            "tokensPerSecond": 23.077
+          }
+        ]
+      },
+      {
+        "name": "gemma-4-E4B",
+        "results": [
+          {
+            "id": "who-01-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 91,
+            "tokensPerSecond": 18.409
+          },
+          {
+            "id": "who-02-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 149,
+            "tokensPerSecond": 36.594
+          },
+          {
+            "id": "who-03-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 45,
+            "tokensPerSecond": 22.047
+          },
+          {
+            "id": "who-04-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 75,
+            "tokensPerSecond": 32.338
+          },
+          {
+            "id": "who-05-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 50,
+            "tokensPerSecond": 22.631
+          },
+          {
+            "id": "who-06-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 114,
+            "tokensPerSecond": 37.333
+          },
+          {
+            "id": "who-07-de",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 50,
+            "tokensPerSecond": 22.695
+          },
+          {
+            "id": "who-08-en",
+            "klass": "who-calls",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 57,
+            "tokensPerSecond": 31.847
+          },
+          {
+            "id": "what-01-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "insert"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 147,
+            "tokensPerSecond": 29.094
+          },
+          {
+            "id": "what-02-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K7",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 89,
+            "tokensPerSecond": 32.895
+          },
+          {
+            "id": "what-03-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K2",
+                "K5",
+                "K6"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 195,
+            "tokensPerSecond": 43.632
+          },
+          {
+            "id": "what-04-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 77,
+            "tokensPerSecond": 36.446
+          },
+          {
+            "id": "what-05-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K5",
+                "K7",
+                "K6"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 74,
+            "tokensPerSecond": 30.414
+          },
+          {
+            "id": "what-06-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K5",
+                "K6",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 196,
+            "tokensPerSecond": 42.459
+          },
+          {
+            "id": "what-07-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "loadConfig"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 23,
+            "tokensPerSecond": 24.164
+          },
+          {
+            "id": "what-08-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "validate.ts"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 73,
+            "tokensPerSecond": 33.422
+          },
+          {
+            "id": "what-09-de",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K4",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 76,
+            "tokensPerSecond": 30.837
+          },
+          {
+            "id": "what-10-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K5",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 152,
+            "tokensPerSecond": 41.009
+          },
+          {
+            "id": "err-01-de",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K8"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 87,
+            "tokensPerSecond": 19.979
+          },
+          {
+            "id": "err-02-en",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 44,
+            "tokensPerSecond": 17.889
+          },
+          {
+            "id": "err-03-de",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 83,
+            "tokensPerSecond": 27.397
+          },
+          {
+            "id": "err-04-en",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 41,
+            "tokensPerSecond": 16.722
+          },
+          {
+            "id": "err-05-de",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K8"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "DB_URL"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 91,
+            "tokensPerSecond": 21.234
+          },
+          {
+            "id": "err-06-en",
+            "klass": "why-error",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 89,
+            "tokensPerSecond": 33.257
+          },
+          {
+            "id": "if-01-de",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 91,
+            "tokensPerSecond": 25.294
+          },
+          {
+            "id": "if-02-en",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 149,
+            "tokensPerSecond": 36.458
+          },
+          {
+            "id": "if-03-de",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 114,
+            "tokensPerSecond": 37.07
+          },
+          {
+            "id": "if-04-en",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 45,
+            "tokensPerSecond": 22.436
+          },
+          {
+            "id": "if-05-de",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 75,
+            "tokensPerSecond": 27.083
+          },
+          {
+            "id": "if-06-en",
+            "klass": "what-if",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K6",
+                "K5"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 131,
+            "tokensPerSecond": 33.79
+          },
+          {
+            "id": "entry-01-de",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 97,
+            "tokensPerSecond": 27.697
+          },
+          {
+            "id": "entry-02-en",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 97,
+            "tokensPerSecond": 48.223
+          },
+          {
+            "id": "entry-03-de",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "src/server.ts"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 299,
+            "tokensPerSecond": 53.657
+          },
+          {
+            "id": "entry-04-en",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "src/server.ts"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 299,
+            "tokensPerSecond": 53.756
+          },
+          {
+            "id": "entry-05-de",
+            "klass": "where-entry",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K6"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 142,
+            "tokensPerSecond": 28.233
+          },
+          {
+            "id": "cmp-01-de",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K3",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 173,
+            "tokensPerSecond": 30.112
+          },
+          {
+            "id": "cmp-02-en",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K6",
+                "K7",
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 148,
+            "tokensPerSecond": 32.527
+          },
+          {
+            "id": "cmp-03-de",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2",
+                "K3",
+                "K4"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 216,
+            "tokensPerSecond": 36.113
+          },
+          {
+            "id": "cmp-04-en",
+            "klass": "compare",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K1"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [
+              "query"
+            ],
+            "forbiddenHits": [],
+            "answerChars": 75,
+            "tokensPerSecond": 34.82
+          },
+          {
+            "id": "over-01-de",
+            "klass": "overview",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 226,
+            "tokensPerSecond": 37.255
+          },
+          {
+            "id": "over-02-en",
+            "klass": "overview",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 226,
+            "tokensPerSecond": 51.63
+          },
+          {
+            "id": "over-03-de",
+            "klass": "overview",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [
+                "K2"
+              ],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": false,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 184,
+            "tokensPerSecond": 50.874
+          },
+          {
+            "id": "honest-01-de",
+            "klass": "other",
+            "deterministic": true,
+            "check": {
+              "ok": true,
+              "cited": [],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": true,
+              "measured": true
+            },
+            "citationOk": true,
+            "missing": [],
+            "forbiddenHits": []
+          },
+          {
+            "id": "honest-02-en",
+            "klass": "what-is",
+            "deterministic": false,
+            "check": {
+              "ok": true,
+              "cited": [],
+              "unknown": [],
+              "violations": [],
+              "noCardOnly": true,
+              "measured": true
+            },
+            "citationOk": true,
+            "truncated": false,
+            "missing": [],
+            "forbiddenHits": [],
+            "answerChars": 17,
+            "tokensPerSecond": 7.396
+          }
+        ]
+      }
+    ],
+    "baseline": {
+      "generatedAt": "2026-08-29T00:15:39.440Z",
+      "temperature": 0,
+      "seed": 42,
+      "questionCount": 44
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 179
+    },
+    "compilerModules": 23,
+    "classes": [
+      {
+        "id": "who-01-de",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-02-en",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-03-de",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-04-en",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-05-de",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-06-en",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-07-de",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "who-08-en",
+        "declared": "who-calls",
+        "compiled": "who-calls"
+      },
+      {
+        "id": "what-01-de",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-02-en",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-03-de",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-04-en",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-05-de",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-06-en",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-07-de",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-08-en",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-09-de",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "what-10-en",
+        "declared": "what-is",
+        "compiled": "what-is"
+      },
+      {
+        "id": "err-01-de",
+        "declared": "why-error",
+        "compiled": "why-error"
+      },
+      {
+        "id": "err-02-en",
+        "declared": "why-error",
+        "compiled": "why-error"
+      },
+      {
+        "id": "err-03-de",
+        "declared": "why-error",
+        "compiled": "why-error"
+      },
+      {
+        "id": "err-04-en",
+        "declared": "why-error",
+        "compiled": "why-error"
+      },
+      {
+        "id": "err-05-de",
+        "declared": "why-error",
+        "compiled": "why-error"
+      },
+      {
+        "id": "err-06-en",
+        "declared": "why-error",
+        "compiled": "why-error"
+      },
+      {
+        "id": "if-01-de",
+        "declared": "what-if",
+        "compiled": "what-if"
+      },
+      {
+        "id": "if-02-en",
+        "declared": "what-if",
+        "compiled": "what-if"
+      },
+      {
+        "id": "if-03-de",
+        "declared": "what-if",
+        "compiled": "what-if"
+      },
+      {
+        "id": "if-04-en",
+        "declared": "what-if",
+        "compiled": "what-if"
+      },
+      {
+        "id": "if-05-de",
+        "declared": "what-if",
+        "compiled": "what-if"
+      },
+      {
+        "id": "if-06-en",
+        "declared": "what-if",
+        "compiled": "what-if"
+      },
+      {
+        "id": "entry-01-de",
+        "declared": "where-entry",
+        "compiled": "where-entry"
+      },
+      {
+        "id": "entry-02-en",
+        "declared": "where-entry",
+        "compiled": "where-entry"
+      },
+      {
+        "id": "entry-03-de",
+        "declared": "where-entry",
+        "compiled": "where-entry"
+      },
+      {
+        "id": "entry-04-en",
+        "declared": "where-entry",
+        "compiled": "where-entry"
+      },
+      {
+        "id": "entry-05-de",
+        "declared": "where-entry",
+        "compiled": "where-entry"
+      },
+      {
+        "id": "cmp-01-de",
+        "declared": "compare",
+        "compiled": "compare"
+      },
+      {
+        "id": "cmp-02-en",
+        "declared": "compare",
+        "compiled": "compare"
+      },
+      {
+        "id": "cmp-03-de",
+        "declared": "compare",
+        "compiled": "compare"
+      },
+      {
+        "id": "cmp-04-en",
+        "declared": "compare",
+        "compiled": "compare"
+      },
+      {
+        "id": "over-01-de",
+        "declared": "overview",
+        "compiled": "overview"
+      },
+      {
+        "id": "over-02-en",
+        "declared": "overview",
+        "compiled": "overview"
+      },
+      {
+        "id": "over-03-de",
+        "declared": "overview",
+        "compiled": "overview"
+      },
+      {
+        "id": "honest-01-de",
+        "declared": "other",
+        "compiled": "other"
+      },
+      {
+        "id": "honest-02-en",
+        "declared": "what-is",
+        "compiled": "what-is"
+      }
+    ],
+    "classDrift": []
+  }
+}

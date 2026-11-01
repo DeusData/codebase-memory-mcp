@@ -7,6 +7,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/constants.h"
+#include "../src/foundation/log.h"
 #include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -15,6 +16,7 @@
 #include <pipeline/artifact.h>
 #include <store/store.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <signal.h>
 #include <string.h>
@@ -83,6 +85,71 @@ TEST(poll_interval_small) {
     /* 500 files → 5000 + 1*1000 = 6000ms */
     ms = cbm_watcher_poll_interval_ms(500);
     ASSERT_EQ(ms, 6000);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  HARD INDEX-FAILURE BACKOFF
+ * ══════════════════════════════════════════════════════════════════ */
+
+TEST(index_backoff_no_failures_keeps_interval) {
+    /* The success and busy-skip paths must be completely unaffected. */
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 0), 5000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(60000, 0), 60000);
+    PASS();
+}
+
+TEST(index_backoff_doubles_per_failure) {
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 1), 10000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 2), 20000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 3), 40000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 4), 80000);
+    PASS();
+}
+
+TEST(index_backoff_reaches_ceiling_and_stays) {
+    /* 5000 << 6 = 320000, above the 5-minute ceiling. The shift is capped
+     * too, so an arbitrarily long failure streak cannot overflow the
+     * intermediate value or wrap back to a short delay. */
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 6), 300000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, 100), 300000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, INT_MAX), 300000);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(60000, INT_MAX), 300000);
+    PASS();
+}
+
+TEST(index_backoff_is_monotonic_and_bounded) {
+    /* The property that actually matters: the delay never decreases as the
+     * streak grows, and never exceeds the ceiling. This is what bounds the
+     * fork rate of a permanently failing project. */
+    int previous = cbm_watcher_index_backoff_ms(5000, 0);
+    for (int failures = 1; failures < 200; failures++) {
+        int delay = cbm_watcher_index_backoff_ms(5000, failures);
+        ASSERT_TRUE(delay >= previous);
+        ASSERT_TRUE(delay <= 300000);
+        previous = delay;
+    }
+    PASS();
+}
+
+TEST(index_backoff_degenerate_inputs) {
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(0, 5), 0);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(-1, 0), 0);
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(5000, -1), 5000);
+    PASS();
+}
+
+TEST(index_backoff_never_schedules_sooner_than_the_interval) {
+    /* An interval above the ceiling must not be SHORTENED by backing off:
+     * the clamp is a floor as well as a cap. Not reachable while
+     * POLL_MAX_MS < the ceiling, but the helper is exported, so its contract
+     * has to hold for what a caller can pass, not only for what today's
+     * constants produce. */
+    int over = 400000; /* > INDEX_FAIL_CEILING_MS */
+    ASSERT_EQ(cbm_watcher_index_backoff_ms(over, 0), over);
+    for (int failures = 1; failures < 20; failures++) {
+        ASSERT_TRUE(cbm_watcher_index_backoff_ms(over, failures) >= over);
+    }
     PASS();
 }
 
@@ -175,6 +242,66 @@ TEST(watcher_null_safety) {
     PASS();
 }
 
+TEST(watcher_project_status_tracks_registration) {
+    cbm_watcher_project_status_t status = cbm_watcher_project_status(NULL, "project-a");
+    ASSERT_FALSE(status.registered);
+    ASSERT_FALSE(status.running);
+
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_TRUE(cbm_watcher_watch(w, "project-a", "/unused/project-a"));
+    status = cbm_watcher_project_status(w, "project-a");
+    ASSERT_TRUE(status.registered);
+    ASSERT_FALSE(status.running);
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-b").registered);
+    ASSERT_FALSE(cbm_watcher_project_status(w, NULL).registered);
+
+    cbm_watcher_unwatch(w, "project-a");
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-a").registered);
+    ASSERT_TRUE(cbm_watcher_watch(w, "project-a", "/unused/project-a"));
+    cbm_watcher_stop(w);
+    status = cbm_watcher_project_status(w, "project-a");
+    ASSERT_TRUE(status.registered);
+    ASSERT_FALSE(status.running);
+    ASSERT_EQ(cbm_watcher_run(w, 10), 0);
+    ASSERT_FALSE(cbm_watcher_project_status(w, "project-a").running);
+    cbm_watcher_free(w);
+    PASS();
+}
+
+static void *watcher_status_run_thread(void *opaque) {
+    (void)cbm_watcher_run(opaque, 10);
+    return NULL;
+}
+
+TEST(watcher_project_status_tracks_run_loop) {
+    /* An empty watcher executes no Git commands. Once entered, running is a
+     * stable state until this test explicitly stops it, not a timing window. */
+    cbm_watcher_t *w = cbm_watcher_new(NULL, NULL, NULL);
+    ASSERT_NOT_NULL(w);
+    ASSERT_FALSE(cbm_watcher_project_status(w, NULL).running);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, watcher_status_run_thread, w), 0);
+    uint64_t deadline = cbm_now_ms() + 5000;
+    bool running = false;
+    do {
+        running = cbm_watcher_project_status(w, NULL).running;
+        if (!running)
+            cbm_usleep(1000);
+    } while (!running && cbm_now_ms() < deadline);
+
+    cbm_watcher_stop(w);
+    bool running_after_stop = cbm_watcher_project_status(w, NULL).running;
+    int joined = cbm_thread_join(&thread);
+    bool running_after_join = cbm_watcher_project_status(w, NULL).running;
+    cbm_watcher_free(w);
+    ASSERT_TRUE(running);
+    ASSERT_FALSE(running_after_stop);
+    ASSERT_EQ(joined, 0);
+    ASSERT_FALSE(running_after_join);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL WITH REAL GIT REPO
  * ══════════════════════════════════════════════════════════════════ */
@@ -187,6 +314,40 @@ static int index_callback(const char *name, const char *path, void *ud) {
     (void)ud;
     index_call_count++;
     return 0;
+}
+
+/* Self-diagnosing count check: this suite's flake family blocked two
+ * releases because a bare count assert cannot say WHY — print the
+ * committed/pending dirty signatures on mismatch, so the next occurrence
+ * names its cause (sigs equal = detection miss; different = reindex path).
+ * Use at any index_call_count assertion site. */
+static void wt_diagnose_count(cbm_watcher_t *w, const char *project, int got, int expected) {
+    if (got == expected) {
+        return;
+    }
+    uint64_t last = 0, pending = 0;
+    if (cbm_watcher_test_dirty_sigs(w, project, &last, &pending) == 0) {
+        printf("  watcher diagnose: count=%d expected=%d last_sig=%016llx pending_sig=%016llx "
+               "(%s)\n",
+               got, expected, (unsigned long long)last, (unsigned long long)pending,
+               last == pending ? "sigs EQUAL — the poll saw no new dirty state"
+                               : "sigs differ — detection fired, reindex path suspect");
+    } else {
+        printf("  watcher diagnose: count=%d expected=%d (project not watched?)\n", got, expected);
+    }
+}
+
+/* Wait-for-the-asserted-state (bounded) for REACH assertions only: reaching
+ * a count is safe to wait for, because #937 guarantees an unchanged dirty
+ * tree never increments — extra polls cannot overshoot a correct
+ * implementation. NEVER use this for must-stay-quiet assertions; those are
+ * genuinely about a fixed number of polls. */
+static int wt_poll_until_count(cbm_watcher_t *w, const char *project, int expected, int max_polls) {
+    for (int i = 0; i < max_polls && index_call_count < expected; i++) {
+        cbm_watcher_touch(w, project);
+        cbm_watcher_poll_once(w);
+    }
+    return index_call_count;
 }
 
 TEST(watcher_poll_no_projects) {
@@ -942,8 +1103,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     watcher_windows_image_identity_t expected_git;
     ASSERT_TRUE(watcher_windows_capture_image_identity(fake_git, &expected_git));
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? cbm_strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? cbm_strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -1077,8 +1238,8 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_TRUE(watcher_test_self_image(self));
     ASSERT_EQ(symlink(self, fake_git), 0);
 
-    const char *old_path_raw = getenv("PATH");
-    const char *old_marker_raw = getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
+    const char *old_path_raw = cbm_runtime_getenv("PATH");
+    const char *old_marker_raw = cbm_runtime_getenv(WATCHER_TEST_BLOCKING_GIT_MARKER_ENV);
     char *old_path = old_path_raw ? strdup(old_path_raw) : NULL;
     char *old_marker = old_marker_raw ? strdup(old_marker_raw) : NULL;
     size_t path_size = strlen(bin) + 2 + (old_path ? strlen(old_path) : 0);
@@ -1864,6 +2025,294 @@ TEST(watcher_failed_reindex_retries_issue937) {
     PASS();
 }
 
+/* The failure state machine the backoff feeds (#2015): the streak must count
+ * consecutive HARD failures and reset the moment one reindex succeeds. The
+ * delay it computes is covered by the index_backoff_* unit tests; what is
+ * covered here is the counter that selects which delay applies, because a
+ * streak that never increments — or never resets — silently reverts the
+ * backoff to the unbounded retry it exists to prevent, with every other test
+ * still green. Each poll is preceded by cbm_watcher_touch, which zeroes
+ * next_poll_ns, so this exercises the counter without depending on a clock. */
+TEST(watcher_index_failure_streak_increments_and_resets_issue2015) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_strk_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, failing_index_callback, NULL);
+
+    cbm_watcher_watch(w, "strk-repo", tmpdir);
+    failing_index_calls = 0;
+    failing_index_fail_first_n = 2; /* first TWO reindex attempts fail hard */
+
+    /* Baseline (clean tree): no reindex, so no failures yet. */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 0);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "strk-repo"), 0);
+
+    /* HEAD moves. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m add-world");
+
+    /* First hard failure → streak 1. */
+    cbm_watcher_touch(w, "strk-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 1);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "strk-repo"), 1);
+
+    /* Second consecutive hard failure → streak 2 (it accumulates; it is not
+     * a boolean, which is what makes the delay grow). */
+    cbm_watcher_touch(w, "strk-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 2);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "strk-repo"), 2);
+
+    /* Third attempt succeeds → streak resets, so a project that recovers
+     * returns to its normal cadence instead of staying backed off. */
+    cbm_watcher_touch(w, "strk-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 3);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "strk-repo"), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The delay WIRE-UP (#2015): a hard failure must leave SOME deadline behind,
+ * so the failing project is not re-polled on the very next cycle. Observable
+ * without a clock by simply not calling cbm_watcher_touch between polls —
+ * touch zeroes next_poll_ns, so a wire-up that never assigns one leaves it at
+ * 0 and the callback fires on every poll.
+ *
+ * Be precise about what this does NOT prove, because it is less than it looks.
+ * The code before this change also assigned a deadline here (the plain
+ * adaptive interval), so this test passes against the unfixed tree: it is a
+ * regression guard on the assignment existing, NOT a demonstration of the
+ * backoff.
+ *
+ * Measured, not assumed: replacing the backoff call with the pre-change
+ * `ctx->now + interval_ms * US_PER_MS` leaves this whole suite green at 82/82.
+ * No test in this file fails when the behavioural change is removed — the
+ * index_backoff_* tests still pass because they exercise the pure function
+ * directly, and the streak tests still pass because the counter is unaffected.
+ * What distinguishes backed-off from plain cadence is the delay's MAGNITUDE,
+ * and observing that needs a controllable clock the watcher does not have, or
+ * a further accessor exposing next_poll_ns. Both were judged out of scope; the
+ * gap is recorded here rather than papered over. */
+TEST(watcher_index_failure_backoff_gates_repolling_issue2015) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_gate_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, failing_index_callback, NULL);
+
+    cbm_watcher_watch(w, "gate-repo", tmpdir);
+    failing_index_calls = 0;
+    failing_index_fail_first_n = 100; /* never succeeds */
+
+    cbm_watcher_poll_once(w); /* baseline */
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m add-world");
+
+    /* One failure, forced by touch. */
+    cbm_watcher_touch(w, "gate-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 1);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "gate-repo"), 1);
+
+    /* Now poll repeatedly WITHOUT touching. The change is still pending (the
+     * baseline stays uncommitted per #937), so the ONLY thing that can stop a
+     * re-fork is the deadline the failure just scheduled. Before the backoff
+     * wire-up existed this project was re-forked at the poll cadence; with no
+     * deadline set at all it would fire on every one of these iterations. */
+    for (int i = 0; i < 5; i++) {
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(failing_index_calls, 1);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "gate-repo"), 1);
+
+    /* Control: the watcher is not simply dead — clearing the deadline lets the
+     * retry through, which is what keeps #937's at-least-once guarantee. */
+    cbm_watcher_touch(w, "gate-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 2);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "gate-repo"), 2);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The sustained-failure line must fire EXACTLY once, at the threshold — the
+ * other single-token mutation round 1 named (`==` widened to `>=`) would emit
+ * it on every failure from the threshold onward and turn a one-shot signal
+ * into the log spam the whole change is meant to avoid. */
+static int sustained_log_hits = 0;
+static void sustained_log_sink(const char *line) {
+    if (line && strstr(line, "watcher.index.sustained_failure") != NULL) {
+        sustained_log_hits++;
+    }
+}
+
+TEST(watcher_sustained_failure_logs_once_issue2015) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_sust_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, failing_index_callback, NULL);
+
+    cbm_watcher_watch(w, "sust-repo", tmpdir);
+    failing_index_calls = 0;
+    failing_index_fail_first_n = 100; /* never succeeds */
+
+    /* Baseline poll. Its outcome is not asserted: if a git probe fails here,
+     * the first loop poll takes the baseline instead. */
+    cbm_watcher_poll_once(w);
+
+    /* The change is a DIRTY worktree, not a commit. The baseline leaves the
+     * dirty signature at "clean known", so this change is seen whenever the
+     * baseline lands. A commit made before a late (or HEAD-less) baseline
+     * would be adopted as the baseline HEAD and never reindexed. */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
+
+    sustained_log_hits = 0;
+    cbm_log_set_sink(sustained_log_sink);
+
+    /* Drive well past the threshold (10): poll until the 14th failed reindex.
+     * A poll does not always reach the index callback: when one of its git
+     * probes fails transiently (spawn refused under runner load) it is a
+     * fail-closed no-op by design (#937) and the next poll retries. So the
+     * loop waits for the attempt count instead of assuming one per poll;
+     * touch clears the backoff deadline each time. Each poll runs at most one
+     * attempt for this single project, so the loop stops at exactly 14. A
+     * watcher that never reindexes hangs here, which the runner reports as a
+     * failure, never a pass. No-op polls cannot add log lines to the count:
+     * sustained_failure is emitted only on a failed index attempt, when the
+     * streak EQUALS the threshold. */
+    while (failing_index_calls < 14) {
+        cbm_watcher_touch(w, "sust-repo");
+        cbm_watcher_poll_once(w);
+    }
+
+    cbm_log_set_sink(NULL);
+
+    ASSERT_EQ(failing_index_calls, 14);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "sust-repo"), 14);
+    /* Exactly one, not four (11..14) and not zero. */
+    ASSERT_EQ(sustained_log_hits, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_index_failure_count_unknown_project) {
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    /* Unwatched and NULL inputs report -1, distinct from a watched project
+     * sitting at a legitimate 0. */
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "never-watched"), -1);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, NULL), -1);
+    ASSERT_EQ(cbm_watcher_index_failure_count(NULL, "x"), -1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* #2167: index_status reads the watch state through cbm_watcher_project_info.
+ * A registered project starts "pending" at the base cadence with no scan;
+ * the first poll completes its baseline and publishes the strategy plus a
+ * wall-clock scan time. Unwatched projects report false with *out zeroed. */
+TEST(watcher_project_info_publishes_scan_issue2167) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s/cbm_watcher_info_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    cbm_watcher_project_info_t info;
+    ASSERT_FALSE(cbm_watcher_project_info(w, "never-watched", &info));
+    ASSERT_EQ(info.poll_interval_ms, 0);
+    ASSERT_FALSE(cbm_watcher_project_info(NULL, "x", &info));
+
+    ASSERT_TRUE(cbm_watcher_watch(w, "info-proj", root));
+    ASSERT_TRUE(cbm_watcher_project_info(w, "info-proj", &info));
+    ASSERT_EQ(info.strategy, CBM_WATCHER_STRATEGY_PENDING);
+    ASSERT_EQ(info.poll_interval_ms, cbm_watcher_poll_interval_ms(0));
+    ASSERT_EQ(info.last_scan_unix_s, 0);
+
+    /* A plain directory (no git): the baseline decides it is never polled. */
+    int64_t before = (int64_t)time(NULL);
+    (void)cbm_watcher_poll_once(w);
+    ASSERT_TRUE(cbm_watcher_project_info(w, "info-proj", &info));
+    ASSERT_EQ(info.strategy, CBM_WATCHER_STRATEGY_NONE);
+    ASSERT_TRUE(info.last_scan_unix_s >= before);
+
+    cbm_watcher_unwatch(w, "info-proj");
+    ASSERT_FALSE(cbm_watcher_project_info(w, "info-proj", &info));
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    (void)cbm_rmdir(root);
+    PASS();
+}
+
 TEST(watcher_multiple_projects) {
     /* Create two temporary git repos */
     char tmpdirA[256];
@@ -1979,6 +2428,207 @@ TEST(watcher_non_git_skips) {
     cbm_watcher_touch(w, "nongit");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  NON-GIT TREE POLLING (#1948, opt-in)
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Bypass the adaptive interval and run one poll cycle; returns the number of
+ * reindexes that cycle performed. */
+static int nongit_poll(cbm_watcher_t *w, const char *project) {
+    cbm_watcher_touch(w, project);
+    return cbm_watcher_poll_once(w);
+}
+
+/* Control: with the opt-in OFF (the default) a non-git root is never
+ * refreshed, however its indexable files change. watcher_non_git_skips covers
+ * this with .txt files discovery ignores anyway; this uses a real source file
+ * so the ON tests below differ from it ONLY in the opt-in. */
+TEST(watcher_non_git_opt_in_off_never_polls_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_off_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "ng-off", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef gamma():\n    return 3\n");
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    th_write_file(TH_PATH(tmpdir, "new.py"), "def beta():\n    return 2\n");
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    ASSERT_EQ(remove(TH_PATH(tmpdir, "new.py")), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* #1948: a project indexed from a plain directory stayed frozen at its first
+ * index forever. With watch_non_git on, the watcher polls it by tree
+ * signature: the first poll after baseline catches up once (nothing records
+ * which tree state the index holds), then every edit, addition and deletion
+ * of an indexable file triggers exactly one reindex, and an untouched tree
+ * triggers none. */
+TEST(watcher_non_git_opt_in_detects_edit_add_delete_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_on_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+    th_write_file(TH_PATH(tmpdir, "pkg/util.py"), "def helper():\n    return 0\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_set_poll_non_git(w, true);
+    cbm_watcher_watch(w, "ng-on", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline: classification only */
+    ASSERT_EQ(index_call_count, 0);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1); /* at-least-once catch-up */
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0); /* untouched tree: stable */
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    /* Edit (the reporter's repro: append a function). */
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef gamma_uniquename():\n    return 2\n");
+    /* The adaptive interval still gates polling: no touch, no check. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    /* Add, in a subdirectory. */
+    th_write_file(TH_PATH(tmpdir, "pkg/extra.py"), "def extra():\n    return 4\n");
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    /* Delete. */
+    ASSERT_EQ(remove(TH_PATH(tmpdir, "pkg/extra.py")), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    ASSERT_EQ(index_call_count, 4);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* Simulates the daemon's index worker writing cbm's own output under the root
+ * on every successful reindex (the artifact re-export of #1953). */
+static int own_output_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)ud;
+    index_call_count++;
+    th_append_file(TH_PATH(path, CBM_ARTIFACT_DIR "/graph.py"), "# rewritten by index\n");
+    return 0;
+}
+
+/* The signature must only see what the indexer would index. Paths discovery
+ * skips — cbm's own .codebase-memory output, built-in skip dirs, .cbmignore'd
+ * paths, non-source files — never trigger, and in particular a reindex that
+ * rewrites cbm's own output must not look like a new change on the next poll
+ * (the runaway-reindex history of #841/#937/#1953). */
+TEST(watcher_non_git_opt_in_ignores_skipped_paths_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_ign_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+    th_write_file(TH_PATH(tmpdir, ".cbmignore"), "ignored/\n");
+    th_write_file(TH_PATH(tmpdir, CBM_ARTIFACT_DIR "/graph.py"), "# artifact\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, own_output_index_callback, NULL);
+    cbm_watcher_set_poll_non_git(w, true);
+    cbm_watcher_watch(w, "ng-ign", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);               /* baseline */
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 1); /* catch-up; rewrites own output */
+    /* The reindex's own write must not retrigger. */
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+
+    th_write_file(TH_PATH(tmpdir, "ignored/skip.py"), "def skipped():\n    return 0\n");
+    th_write_file(TH_PATH(tmpdir, "node_modules/dep/index.js"), "module.exports = 1;\n");
+    th_write_file(TH_PATH(tmpdir, "logo.png"), "not really a png\n");
+    th_append_file(TH_PATH(tmpdir, CBM_ARTIFACT_DIR "/graph.py"), "# touched\n");
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Positive control in the same tree: an indexable edit still triggers. */
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef beta():\n    return 2\n");
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The opt-in changes nothing for git roots: a clean repository does not get
+ * the tree strategy's catch-up reindex and still reacts to commits only. A
+ * plain folder under an unrelated dirty repository is tree-polled on its OWN
+ * files and never inherits the ancestor's dirty state. */
+TEST(watcher_non_git_opt_in_leaves_git_roots_unchanged_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_git_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+    wt_git(tmpdir, "add app.py");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_set_poll_non_git(w, true);
+    cbm_watcher_watch(w, "ng-git", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 0);
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef beta():\n    return 2\n");
+    wt_git(tmpdir, "commit -q -am second");
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 0);
+
+    /* Now a scratch folder under the (permanently dirty) repository. */
+    th_write_file(TH_PATH(tmpdir, "dirty.txt"), "uncommitted\n");
+    char nested[400];
+    snprintf(nested, sizeof(nested), "%s/scratch", tmpdir);
+    th_write_file(TH_PATH(nested, "notes.py"), "def note():\n    return 0\n");
+    cbm_watcher_unwatch(w, "ng-git");
+    cbm_watcher_watch(w, "ng-nested", nested);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);                  /* baseline: nested non-git */
+    ASSERT_EQ(nongit_poll(w, "ng-nested"), 1); /* tree catch-up */
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(nongit_poll(w, "ng-nested"), 0); /* ancestor dirt ignored */
+    }
+    th_append_file(TH_PATH(nested, "notes.py"), "\ndef more():\n    return 1\n");
+    ASSERT_EQ(nongit_poll(w, "ng-nested"), 1);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -2152,25 +2802,32 @@ TEST(watcher_continued_dirty) {
         th_append_file(_p, "dirty\n");
     }
 
-    /* First detection */
+    /* First detection — a REACH assert: wait for the state, bounded. */
+    {
+        int got = wt_poll_until_count(w, "cont-repo", 1, 5);
+        wt_diagnose_count(w, "cont-repo", got, 1);
+        ASSERT_EQ(got, 1);
+    }
+
+    /* Still dirty but UNCHANGED — must stay quiet (#937): fixed polls. */
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty but UNCHANGED — must stay quiet (#937) */
-    cbm_watcher_touch(w, "cont-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
-
-    /* A further edit is a NEW dirty state — detect again */
+    /* A further edit is a NEW dirty state — detect again. This exact site
+     * failed on the Windows leg (1 vs 2): stat()'s second-granularity
+     * st_mtime made two same-second edits hash identically. The signature
+     * now reads FILETIME precision; the reach-wait covers scheduling. */
     {
         char _p[1024];
         snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
         th_append_file(_p, "dirtier\n");
     }
-    cbm_watcher_touch(w, "cont-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 2);
+    {
+        int got = wt_poll_until_count(w, "cont-repo", 2, 5);
+        wt_diagnose_count(w, "cont-repo", got, 2);
+        ASSERT_EQ(got, 2);
+    }
 
     /* Commit to clean up, then poll — should not trigger */
     wt_git(tmpdir, "add file.txt");
@@ -2588,10 +3245,41 @@ TEST(watcher_fallback_still_detects) {
     PASS();
 }
 
+/* Reindex counts for watcher_poll_only_watched_projects, split by project:
+ * the watched one, and anything else. */
+static int ow_watched_calls = 0;
+static int ow_other_calls = 0;
+static int ow_index_callback(const char *name, const char *path, void *ud) {
+    (void)path;
+    (void)ud;
+    if (name && strcmp(name, "projA-ow") == 0) {
+        ow_watched_calls++;
+    } else {
+        ow_other_calls++;
+    }
+    return 0;
+}
+
 TEST(watcher_poll_only_watched_projects) {
-    /* Port of TestPollAllOnlyWatched:
-     * Two repos exist, only one is watched → only the watched one
-     * gets polled and can trigger reindex. */
+    /* Port of TestPollAllOnlyWatched (#49: the watcher polls its explicit
+     * watch list, never every project the store knows). Two repos exist and
+     * BOTH are registered in the store, as in the Go original; only A is
+     * watched. Contract: B never gets watcher state and is never reindexed,
+     * and A's change is reindexed.
+     *
+     * No verdict depends on one git probe succeeding. The earlier version
+     * asserted that ONE poll after the change reindexed exactly once, and it
+     * never registered B anywhere the watcher could see, so its B half could
+     * not fail. A poll whose git probe fails transiently (spawn refused under
+     * runner load) is a fail-closed no-op by design (#937: the baseline stays
+     * uncommitted and the next poll retries), so that assert read
+     * `index_call_count == 0, expected 1` on a loaded macOS runner. Holding
+     * one exhausted spawn with cbm_subprocess_force_spawn_eagain_for_testing
+     * at that poll reproduces the CI line exactly. The test now polls until
+     * A's reindex has happened, and after every poll asserts the states that
+     * hold whatever git answers: B has no watcher state and no reindex. A
+     * watcher that never reindexes A hangs here, which the runner reports as
+     * a failure, never a pass. */
     char tmpdirA[256];
     snprintf(tmpdirA, sizeof(tmpdirA), "/tmp/cbm_watcher_owA_XXXXXX");
     char tmpdirB[256];
@@ -2624,19 +3312,32 @@ TEST(watcher_poll_only_watched_projects) {
     wt_git(tmpdirB, "add b.txt");
     wt_git(tmpdirB, "commit -q -m init");
 
+    /* Both projects are known to the store. A watcher that polled stored
+     * projects instead of its watch list (the pre-#49 scan-all) adopts B. */
     cbm_store_t *store = cbm_store_open_memory();
-    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    ASSERT_EQ(cbm_store_upsert_project(store, "projA-ow", tmpdirA), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(store, "projB-ow", tmpdirB), CBM_STORE_OK);
+    cbm_watcher_t *w = cbm_watcher_new(store, ow_index_callback, NULL);
 
     /* Only watch A — B is NOT watched */
     cbm_watcher_watch(w, "projA-ow", tmpdirA);
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
-    index_call_count = 0;
+    ow_watched_calls = 0;
+    ow_other_calls = 0;
 
-    /* Baseline */
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 0);
+    /* Baseline poll. Its git outcome is not asserted: if a probe fails here,
+     * a later poll takes the baseline instead. A baseline poll never indexes,
+     * whatever git answers, and it must not adopt B. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(ow_watched_calls + ow_other_calls, 0);
+    ASSERT_EQ(cbm_watcher_index_failure_count(w, "projB-ow"), -1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
 
-    /* Make BOTH repos dirty */
+    /* Make BOTH repos dirty. A dirty worktree, not a commit: the baseline
+     * keeps the dirty signature at "clean known", so A's change is seen
+     * whenever the baseline lands, even if the baseline poll above failed. A
+     * commit made before a late baseline would be adopted as the baseline
+     * HEAD and never reindexed. */
     {
         char _p[1024];
         snprintf(_p, sizeof(_p), "%s/a.txt", tmpdirA);
@@ -2648,10 +3349,18 @@ TEST(watcher_poll_only_watched_projects) {
         th_append_file(_p, "dirty\n");
     }
 
-    /* Poll — only A should trigger (B is not watched) */
-    cbm_watcher_touch(w, "projA-ow");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
+    /* Poll until A's reindex. touch clears the adaptive interval so every
+     * poll checks A; each poll runs at most one attempt for A, so the loop
+     * stops at exactly one. After EVERY poll, B has no watcher state and no
+     * reindex, whether or not that poll's git probes succeeded. */
+    while (ow_watched_calls == 0) {
+        cbm_watcher_touch(w, "projA-ow");
+        cbm_watcher_poll_once(w);
+        ASSERT_EQ(ow_other_calls, 0);
+        ASSERT_EQ(cbm_watcher_index_failure_count(w, "projB-ow"), -1);
+        ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    }
+    ASSERT_EQ(ow_watched_calls, 1);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -3057,8 +3766,22 @@ TEST(watcher_callback_data_passed) {
 }
 
 TEST(watcher_unwatch_drains_pending_free) {
-    /* Unwatch moves project_state to pending_free; the next poll_once
-     * must drain it without crash or leak. */
+    /* Contract: unwatch parks the project's state on the deferred-free list
+     * (an in-flight poll snapshot may still hold it), and the NEXT poll_once
+     * frees it, exactly once, without admitting index work for the unwatched
+     * project.
+     *
+     * No assertion here depends on a git probe succeeding. The earlier
+     * version asserted as a precondition that one dirty poll reindexed
+     * exactly once, which needs every git subprocess of that poll to
+     * succeed. A transient probe failure (spawn refused under runner load, a
+     * non-zero exit) makes that poll a fail-closed no-op by design (#937:
+     * the baseline stays uncommitted and the next poll retries), so the
+     * precondition read 0 on loaded macos-14 runners. Holding a spawn
+     * failure with cbm_subprocess_force_spawn_eagain_for_testing reproduces
+     * that CI log exactly. Dirty-poll-reindexes stays covered by
+     * watcher_detects_dirty_worktree and watcher_modify_tracked_file; this
+     * test pins the drain itself, through the pending-free seam. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_df_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -3079,28 +3802,35 @@ TEST(watcher_unwatch_drains_pending_free) {
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
     cbm_watcher_watch(w, "df-repo", tmpdir);
     ASSERT_EQ(cbm_watcher_watch_count(w), 1);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
     index_call_count = 0;
 
-    /* Baseline */
+    /* Baseline: the state goes through a poll snapshot. Its outcome is not
+     * asserted; a baseline poll never indexes, whatever git answers. */
     cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 0);
 
-    /* Make dirty + detect change */
+    /* Leave a new dirty state behind: if the unwatched state were still
+     * polled, the next poll would index it. */
     {
         char p[300];
         th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
     }
     cbm_watcher_touch(w, "df-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
 
-    /* Unwatch — state moves to pending_free */
+    /* Unwatch: the state leaves the table and is parked, not freed. */
     cbm_watcher_unwatch(w, "df-repo");
     ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 1);
 
-    /* Next poll drains pending_free — no crash, no double-free */
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
+    /* The next poll drains it and admits no index work. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* A further poll finds nothing left to free (no double free). */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(cbm_watcher_test_pending_free_count(w), 0);
+    ASSERT_EQ(index_call_count, 0);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -3265,12 +3995,57 @@ TEST(watcher_null_watch_count) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+TEST(watcher_unicode_root_is_not_pruned_as_missing) {
+    char *parent = th_mktempdir("cbm_watch_utf8");
+    ASSERT_NOT_NULL(parent);
+    char root[CBM_SZ_4K];
+    snprintf(root, sizeof(root), "%s/\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E", parent);
+    ASSERT_EQ(th_mkdir_p(root), 0);
+    const char *saved = cbm_runtime_getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", "0", 1);
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_store_upsert_project(store, "unicode-root", root);
+    cbm_watcher_t *watcher = cbm_watcher_new(store, NULL, NULL);
+    cbm_watcher_watch(watcher, "unicode-root", root);
+    for (int i = 0; i < 8; i++) {
+        cbm_watcher_poll_once(watcher);
+    }
+    cbm_project_t info = {0};
+    bool kept = cbm_watcher_watch_count(watcher) == 1 &&
+                cbm_store_get_project(store, "unicode-root", &info) == CBM_STORE_OK;
+    cbm_project_free_fields(&info);
+    cbm_watcher_free(watcher);
+    cbm_store_close(store);
+    if (saved_copy) {
+        cbm_setenv("CBM_WATCHER_PRUNE_GRACE_S", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_WATCHER_PRUNE_GRACE_S");
+    }
+    free(saved_copy);
+    ASSERT_EQ(th_rmtree(parent), 0);
+    ASSERT_TRUE(kept);
+    PASS();
+}
+
 SUITE(watcher) {
+    RUN_TEST(watcher_unicode_root_is_not_pruned_as_missing);
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
     RUN_TEST(poll_interval_scaling);
     RUN_TEST(poll_interval_cap);
     RUN_TEST(poll_interval_small);
+    RUN_TEST(index_backoff_no_failures_keeps_interval);
+    RUN_TEST(index_backoff_doubles_per_failure);
+    RUN_TEST(index_backoff_reaches_ceiling_and_stays);
+    RUN_TEST(index_backoff_is_monotonic_and_bounded);
+    RUN_TEST(index_backoff_degenerate_inputs);
+    RUN_TEST(index_backoff_never_schedules_sooner_than_the_interval);
+    RUN_TEST(watcher_index_failure_streak_increments_and_resets_issue2015);
+    RUN_TEST(watcher_index_failure_backoff_gates_repolling_issue2015);
+    RUN_TEST(watcher_sustained_failure_logs_once_issue2015);
+    RUN_TEST(watcher_index_failure_count_unknown_project);
+    RUN_TEST(watcher_project_info_publishes_scan_issue2167);
 
     /* Lifecycle */
     RUN_TEST(watcher_create_free);
@@ -3279,6 +4054,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_stopped_rejects_new_registration);
     RUN_TEST(watcher_null_safety);
+    RUN_TEST(watcher_project_status_tracks_registration);
+    RUN_TEST(watcher_project_status_tracks_run_loop);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);
@@ -3311,6 +4088,10 @@ SUITE(watcher) {
 
     /* Non-git project */
     RUN_TEST(watcher_non_git_skips);
+    RUN_TEST(watcher_non_git_opt_in_off_never_polls_issue1948);
+    RUN_TEST(watcher_non_git_opt_in_detects_edit_add_delete_issue1948);
+    RUN_TEST(watcher_non_git_opt_in_ignores_skipped_paths_issue1948);
+    RUN_TEST(watcher_non_git_opt_in_leaves_git_roots_unchanged_issue1948);
 
     /* Adaptive interval behavior */
     RUN_TEST(watcher_interval_blocks_repoll);

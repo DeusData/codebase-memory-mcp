@@ -9,6 +9,10 @@
 #include "foundation/mem_core.h"
 #include <stdatomic.h>
 #include "store/store.h"
+#include "../src/foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/log.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ── Node operations ───────────────────────────────────────────── */
@@ -565,6 +569,7 @@ TEST(gbuf_upsert_same_qn_updates_all_fields) {
     ASSERT_EQ(id1, id2);
     ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
 
+    cbm_gbuf_settle_variants(gb);
     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, "pkg.fn");
     ASSERT_NOT_NULL(n);
     ASSERT_STR_EQ(n->label, "Method");
@@ -572,9 +577,218 @@ TEST(gbuf_upsert_same_qn_updates_all_fields) {
     ASSERT_STR_EQ(n->file_path, "new.go");
     ASSERT_EQ(n->start_line, 20);
     ASSERT_EQ(n->end_line, 30);
-    ASSERT_STR_EQ(n->properties_json, "{\"k\":\"v2\"}");
+    /* the winner's own properties, plus both definitions' spans: whichever
+     * label survives, a change in either body lands on this node */
+    ASSERT_STR_EQ(n->properties_json,
+                  "{\"k\":\"v2\",\"variants\":[{\"file_path\":\"new.go\",\"start_line\":20,"
+                  "\"end_line\":30},{\"file_path\":\"old.go\",\"start_line\":1,\"end_line\":10}]}");
 
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* PR C1: when a Macro and a definition share a QN, the definition owns it whichever
+ * line comes first; before, the later line won. C-preprocessor macros no longer get
+ * here (their QN ends in "#macro" and cannot equal a definition's). Chialisp does:
+ * `defmacro` / `defmac` defs are labelled Macro under a plain QN, so a macro and a
+ * `defun` of one name collide in one file or in a same-stem .clsp / .clib pair. */
+TEST(gbuf_upsert_definition_beats_same_qn_macro_c1) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    /* macro AFTER the function */
+    cbm_gbuf_upsert_node(gb, "Function", "assert", "p.cond.assert", "cond.clsp", 742, 779, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "assert", "p.cond.assert", "cond.clsp", 781, 782, "{}");
+    /* macro BEFORE the definition */
+    cbm_gbuf_upsert_node(gb, "Macro", "curry", "p.util.curry", "util.clib", 464, 465, "{}");
+    cbm_gbuf_upsert_node(gb, "Function", "curry", "p.util.curry", "util.clib", 3193, 3209, "{}");
+    /* a macro in the smaller path (.clib sorts before .clsp) still loses */
+    cbm_gbuf_upsert_node(gb, "Constant", "limit", "p.x.limit", "x.clsp", 653, 653, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "limit", "p.x.limit", "x.clib", 9, 10, "{}");
+    /* two macros: the classic contract (later line wins) is unchanged */
+    cbm_gbuf_upsert_node(gb, "Macro", "M", "p.m.M", "m.clib", 1, 2, "{}");
+    cbm_gbuf_upsert_node(gb, "Macro", "M", "p.m.M", "m.clib", 9, 10, "{}");
+
+    const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, "p.cond.assert");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Function");
+    ASSERT_EQ(n->start_line, 742);
+    n = cbm_gbuf_find_by_qn(gb, "p.util.curry");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Function");
+    ASSERT_EQ(n->start_line, 3193);
+    n = cbm_gbuf_find_by_qn(gb, "p.x.limit");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->label, "Constant");
+    ASSERT_STR_EQ(n->file_path, "x.clsp");
+    n = cbm_gbuf_find_by_qn(gb, "p.m.M");
+    ASSERT_NOT_NULL(n);
+    ASSERT_EQ(n->start_line, 9);
+    /* the label index follows the survivor: only the macro-vs-macro QN keeps one */
+    const cbm_gbuf_node_t **macros = NULL;
+    int macro_count = -1;
+    ASSERT_EQ(cbm_gbuf_find_by_label(gb, "Macro", &macros, &macro_count), 0);
+    ASSERT_EQ(macro_count, 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* The parallel merge (worker gbuf -> main gbuf) applies the same rule in both
+ * directions, so the survivor never depends on worker merge order. */
+TEST(gbuf_merge_definition_beats_same_qn_macro_c1) {
+    for (int order = 0; order < 2; order++) {
+        cbm_gbuf_t *dst = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *src = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *with_fn = order == 0 ? dst : src;
+        cbm_gbuf_t *with_macro = order == 0 ? src : dst;
+        cbm_gbuf_upsert_node(with_fn, "Function", "f", "p.a.f", "a.clsp", 10, 20, "{}");
+        cbm_gbuf_upsert_node(with_macro, "Macro", "f", "p.a.f", "a.clsp", 30, 31, "{}");
+        ASSERT_EQ(cbm_gbuf_merge(dst, src), 0);
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, "p.a.f");
+        ASSERT_NOT_NULL(n);
+        ASSERT_STR_EQ(n->label, "Function");
+        ASSERT_EQ(n->start_line, 10);
+        cbm_gbuf_free(dst);
+        cbm_gbuf_free(src);
+    }
+    PASS();
+}
+
+/* deckhouse pkg/log: a package function and three methods share the QN
+ * `pkg.log.Error` (Go method QNs carry no receiver). Every definition that
+ * collapsed into the node is a span a change can land in, so `variants`
+ * holds all four -- in every arrival order. A Function arriving between the
+ * methods used to replace the node's list, and logger.go's span came and went
+ * with worker scheduling. */
+TEST(gbuf_variants_cross_label_order_independent) {
+    static const struct {
+        const char *label;
+        const char *file;
+        int start;
+        int end;
+    } defs[] = {{"Method", "pkg/log/logger.go", 227, 232},
+                {"Function", "pkg/log/global.go", 83, 85},
+                {"Method", "pkg/log/fields_test.go", 76, 78},
+                {"Method", "pkg/log/fields_test.go", 85, 87}};
+    static const int perms[][4] = {{0, 1, 2, 3}, {1, 0, 2, 3}, {0, 2, 1, 3}, {3, 2, 1, 0},
+                                   {1, 3, 0, 2}, {2, 0, 3, 1}, {3, 1, 2, 0}, {0, 3, 1, 2}};
+    char first[1024] = "";
+    for (size_t p = 0; p < sizeof(perms) / sizeof(perms[0]); p++) {
+        cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+        for (int i = 0; i < 4; i++) {
+            int d = perms[p][i];
+            cbm_gbuf_upsert_node(gb, defs[d].label, "Error", "p.pkg.log.Error", defs[d].file,
+                                 defs[d].start, defs[d].end, "{}");
+        }
+        cbm_gbuf_settle_variants(gb);
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, "p.pkg.log.Error");
+        ASSERT_NOT_NULL(n);
+        ASSERT_NOT_NULL(n->properties_json);
+        ASSERT_NOT_NULL(
+            strstr(n->properties_json,
+                   "{\"file_path\":\"pkg/log/logger.go\",\"start_line\":227,\"end_line\":232}"));
+        ASSERT_NOT_NULL(
+            strstr(n->properties_json,
+                   "{\"file_path\":\"pkg/log/global.go\",\"start_line\":83,\"end_line\":85}"));
+        if (p == 0) {
+            snprintf(first, sizeof(first), "%s", n->properties_json);
+        } else {
+            ASSERT_STR_EQ(n->properties_json, first);
+        }
+        cbm_gbuf_free(gb);
+    }
+    PASS();
+}
+
+/* No count decides which spans a node keeps: 100 same-QN definitions (generated
+ * protobuf `String()` methods) keep all 100, whichever order they arrive in. */
+TEST(gbuf_variants_keep_every_span) {
+    enum { N_DEFS = 100 };
+    char *props[2] = {NULL, NULL};
+    for (int order = 0; order < 2; order++) {
+        cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+        for (int i = 0; i < N_DEFS; i++) {
+            int k = order == 0 ? i : N_DEFS - 1 - i;
+            char file[32];
+            snprintf(file, sizeof(file), "pb/m%03d.pb.go", k);
+            cbm_gbuf_upsert_node(gb, "Method", "String", "p.pb.String", file, 10, 12, "{}");
+        }
+        cbm_gbuf_settle_variants(gb);
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(gb, "p.pb.String");
+        ASSERT_NOT_NULL(n);
+        ASSERT_NOT_NULL(n->properties_json);
+        int spans = 0;
+        for (const char *s = n->properties_json; (s = strstr(s, "\"file_path\"")) != NULL; s++) {
+            spans++;
+        }
+        ASSERT_EQ(spans, N_DEFS);
+        props[order] = strdup(n->properties_json);
+        cbm_gbuf_free(gb);
+    }
+    ASSERT_STR_EQ(props[0], props[1]);
+    free(props[0]);
+    free(props[1]);
+    PASS();
+}
+
+/* Spans gathered in worker buffers travel with their nodes into the main
+ * buffer, whichever worker merges first. */
+TEST(gbuf_variants_travel_through_worker_merge) {
+    char first[512] = "";
+    for (int order = 0; order < 2; order++) {
+        cbm_gbuf_t *main_gb = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *w1 = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *w2 = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_upsert_node(w1, "Method", "X", "p.X", "a.go", 10, 12, "{}");
+        cbm_gbuf_upsert_node(w1, "Method", "X", "p.X", "b.go", 5, 6, "{}");
+        cbm_gbuf_upsert_node(w2, "Method", "X", "p.X", "c.go", 1, 2, "{}");
+        cbm_gbuf_upsert_node(w2, "Function", "X", "p.X", "d.go", 3, 4, "{}");
+        ASSERT_EQ(cbm_gbuf_merge(main_gb, order == 0 ? w1 : w2), 0);
+        ASSERT_EQ(cbm_gbuf_merge(main_gb, order == 0 ? w2 : w1), 0);
+        cbm_gbuf_settle_variants(main_gb);
+        const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(main_gb, "p.X");
+        ASSERT_NOT_NULL(n);
+        ASSERT_STR_EQ(n->properties_json,
+                      "{\"variants\":[{\"file_path\":\"a.go\",\"start_line\":10,\"end_line\":12},"
+                      "{\"file_path\":\"b.go\",\"start_line\":5,\"end_line\":6},"
+                      "{\"file_path\":\"c.go\",\"start_line\":1,\"end_line\":2},"
+                      "{\"file_path\":\"d.go\",\"start_line\":3,\"end_line\":4}]}");
+        if (order == 0) {
+            snprintf(first, sizeof(first), "%s", n->properties_json);
+        } else {
+            ASSERT_STR_EQ(n->properties_json, first);
+        }
+        cbm_gbuf_free(w1);
+        cbm_gbuf_free(w2);
+        cbm_gbuf_free(main_gb);
+    }
+    PASS();
+}
+
+/* The list is written once, on export: the properties come out the same
+ * whether the collision happened in the main buffer or in a worker's, after
+ * a later pass appended a key with its own number text. */
+TEST(gbuf_variants_written_once_at_export) {
+    char props[2][512];
+    for (int via_worker = 0; via_worker < 2; via_worker++) {
+        cbm_gbuf_t *main_gb = cbm_gbuf_new("test", "/tmp");
+        cbm_gbuf_t *w = via_worker ? cbm_gbuf_new("test", "/tmp") : main_gb;
+        cbm_gbuf_upsert_node(w, "Method", "X", "p.X", "a.go", 10, 12, "{\"k\":1}");
+        cbm_gbuf_upsert_node(w, "Method", "X", "p.X", "b.go", 5, 6, "{\"k\":1}");
+        if (via_worker) {
+            ASSERT_EQ(cbm_gbuf_merge(main_gb, w), 0);
+            cbm_gbuf_free(w);
+        }
+        cbm_gbuf_node_t *n = (cbm_gbuf_node_t *)cbm_gbuf_find_by_qn(main_gb, "p.X");
+        ASSERT_NOT_NULL(n);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%.*s,\"importance\":0.000000}",
+                 (int)strlen(n->properties_json) - 1, n->properties_json);
+        ASSERT_EQ(cbm_gbuf_node_set_properties_json(n, buf), 0);
+        cbm_gbuf_settle_variants(main_gb);
+        snprintf(props[via_worker], sizeof(props[0]), "%s", n->properties_json);
+        cbm_gbuf_free(main_gb);
+    }
+    ASSERT_STR_EQ(props[0], props[1]);
+    ASSERT_NOT_NULL(strstr(props[0], "\"importance\":0.000000,\"variants\":["));
     PASS();
 }
 
@@ -844,13 +1058,17 @@ TEST(gbuf_merge_overlapping_qns) {
     ASSERT_EQ(cbm_gbuf_node_count(dst), 3);
 
     /* Verify src fields won for the overlapping QN */
+    cbm_gbuf_settle_variants(dst);
     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(dst, "pkg.fn");
     ASSERT_NOT_NULL(n);
     ASSERT_STR_EQ(n->label, "Method");
     ASSERT_STR_EQ(n->name, "fn_new");
     ASSERT_STR_EQ(n->file_path, "new.go");
     ASSERT_EQ(n->start_line, 20);
-    ASSERT_STR_EQ(n->properties_json, "{\"from\":\"src\"}");
+    /* src's properties, plus both definitions' spans (same rule as upsert) */
+    ASSERT_STR_EQ(n->properties_json,
+                  "{\"from\":\"src\",\"variants\":[{\"file_path\":\"new.go\",\"start_line\":20,"
+                  "\"end_line\":30},{\"file_path\":\"old.go\",\"start_line\":1,\"end_line\":10}]}");
 
     /* Both unique nodes present */
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(dst, "pkg.unique_dst"));
@@ -1120,6 +1338,72 @@ TEST(gbuf_flush_skips_orphan_edges) {
     PASS();
 }
 
+/* ── Publish failure reporting ───────────────────────────────── */
+
+static char g_log_capture[4096];
+static CBMLogLevel g_prev_log_level;
+static CBMLogFormat g_prev_log_format;
+
+static void capture_log_sink(const char *line) {
+    size_t used = strlen(g_log_capture);
+    size_t avail = sizeof(g_log_capture) - used;
+    if (avail <= 1) {
+        return;
+    }
+    int n = snprintf(g_log_capture + used, avail, "%s\n", line);
+    if (n < 0 || (size_t)n >= avail) {
+        g_log_capture[sizeof(g_log_capture) - 1] = '\0';
+    }
+}
+
+static void capture_logs_start(void) {
+    g_log_capture[0] = '\0';
+    g_prev_log_level = cbm_log_get_level();
+    g_prev_log_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    /* The assertions below read the text encoding, so pin it rather than
+     * inherit whatever CBM_LOG_FORMAT left set. */
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink(capture_log_sink);
+}
+
+static const char *capture_logs_end(void) {
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(g_prev_log_level);
+    cbm_log_set_format(g_prev_log_format);
+    return g_log_capture;
+}
+
+/* A dump that publishes nothing has to say so, and say why. Renaming onto an
+ * existing directory is how test_sqlite_writer already forces the publish to
+ * fail; here it stands in for any host that denies the rename (#1620). */
+TEST(gbuf_dump_failure_logs_reason) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_gbuf_pub_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/repo");
+    ASSERT_NOT_NULL(gb);
+    int64_t id = cbm_gbuf_upsert_node(gb, "Function", "main", "pkg.main", "main.go", 1, 10, "{}");
+    ASSERT_GT(id, 0);
+
+    capture_logs_start();
+    int rc = cbm_gbuf_dump_to_sqlite(gb, dir);
+    const char *logs = capture_logs_end();
+
+    ASSERT(rc != 0);
+    ASSERT_NOT_NULL(strstr(logs, "gbuf.dump_failed"));
+    /* The reason survived the cleanup unlink. */
+    ASSERT_NOT_NULL(strstr(logs, "errno="));
+    ASSERT(strstr(logs, "errno=0 ") == NULL);
+    /* And the run is not also reported as a successful dump. */
+    ASSERT(strstr(logs, "msg=gbuf.dump ") == NULL);
+
+    cbm_gbuf_free(gb);
+    cbm_rmdir(dir);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* A worker buffer draws ids from the shared counter, so a dense id -> node
@@ -1180,6 +1464,12 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_null_qn);
     RUN_TEST(gbuf_upsert_empty_qn);
     RUN_TEST(gbuf_upsert_same_qn_updates_all_fields);
+    RUN_TEST(gbuf_upsert_definition_beats_same_qn_macro_c1);
+    RUN_TEST(gbuf_merge_definition_beats_same_qn_macro_c1);
+    RUN_TEST(gbuf_variants_cross_label_order_independent);
+    RUN_TEST(gbuf_variants_keep_every_span);
+    RUN_TEST(gbuf_variants_travel_through_worker_merge);
+    RUN_TEST(gbuf_variants_written_once_at_export);
     RUN_TEST(gbuf_upsert_long_qn);
     RUN_TEST(gbuf_find_by_qn_missing);
     RUN_TEST(gbuf_find_by_id_missing);
@@ -1221,4 +1511,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_shared_ids_null_fallback);
     RUN_TEST(gbuf_next_id_set_next_id_roundtrip);
     RUN_TEST(gbuf_next_id_null_safe);
+
+    /* Publish failure reporting */
+    RUN_TEST(gbuf_dump_failure_logs_reason);
 }

@@ -1274,6 +1274,27 @@ TEST(daemon_frontend_correlates_cancellation_to_exact_request) {
     PASS();
 }
 
+/* #2144 (a): the -32800 reply to a cancelled index_repository call is the one
+ * text a deadline-bound client can still read, so it names the async mode;
+ * other requests and unparseable input keep the plain message. */
+TEST(daemon_frontend_cancelled_index_reply_offers_async_issue2144) {
+    const char *index_reply = cbm_daemon_frontend_cancelled_error_message(
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"/r\"}}}");
+    ASSERT_NOT_NULL(strstr(index_reply, "Request cancelled"));
+    ASSERT_NOT_NULL(strstr(index_reply, "async: true"));
+    ASSERT_NOT_NULL(strstr(index_reply, "status: true"));
+    ASSERT_NULL(strchr(index_reply, '"'));
+    ASSERT_NULL(strchr(index_reply, '\\'));
+    ASSERT_STR_EQ(cbm_daemon_frontend_cancelled_error_message(
+                      "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\","
+                      "\"params\":{\"name\":\"search_graph\",\"arguments\":{}}}"),
+                  "Request cancelled");
+    ASSERT_STR_EQ(cbm_daemon_frontend_cancelled_error_message("not json"), "Request cancelled");
+    ASSERT_STR_EQ(cbm_daemon_frontend_cancelled_error_message(NULL), "Request cancelled");
+    PASS();
+}
+
 TEST(daemon_frontend_ignores_cancellation_text_in_string_content) {
     ASSERT_FALSE(cbm_daemon_frontend_is_cancellation_notification(
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
@@ -1659,6 +1680,7 @@ TEST(daemon_local_participant_monitor_joins_before_manager_teardown) {
 SUITE(daemon_frontend) {
     RUN_TEST(daemon_frontend_recognizes_exact_cancellation_notification);
     RUN_TEST(daemon_frontend_correlates_cancellation_to_exact_request);
+    RUN_TEST(daemon_frontend_cancelled_index_reply_offers_async_issue2144);
     RUN_TEST(daemon_frontend_ignores_cancellation_text_in_string_content);
     RUN_TEST(daemon_frontend_rejects_non_notification_cancellation_shapes);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
