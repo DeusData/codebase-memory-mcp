@@ -248,7 +248,11 @@ TEST(resolver_rust_inline_module_does_not_bind_top_level_namesake) {
     PASS();
 }
 
-TEST(resolver_rust_attributes_and_macros_do_not_donate_import_binding) {
+/* An attribute or macro next to a written item does not void that item: rustc rejects a
+ * second definition of one name in one namespace, so the written item is what the path
+ * names. This test used to pin abstention for these forms; that abstention is the gate
+ * that voided real files. A name only a macro could have produced stays unproved. */
+TEST(resolver_rust_attributes_and_macros_keep_an_explicit_item) {
     const char *libraries[] = {"#[cfg(feature=\"alternate\")]\npub fn target() {}\n",
                                "#![cfg(feature=\"alternate\")]\npub fn target() {}\n",
                                "#[transform]\npub fn target() {}\n",
@@ -259,12 +263,22 @@ TEST(resolver_rust_attributes_and_macros_do_not_donate_import_binding) {
                                            {"src/main.rs",
                                             "mod actual;\nuse crate::actual::target;\n"
                                             "fn caller() { target(); }\nfn main() {}\n"}};
-        int bindings = rust_proof_bindings(files, 2, "src/actual.rs", "target", "Function");
-        if (bindings)
-            fprintf(stderr, "Rust unsupported import binding %zu: %d\n", i, bindings);
-        ASSERT_EQ(bindings, 0);
-        ASSERT_EQ(rust_proof_edges(files, 2, "src/actual.rs", "target", "Function"), 0);
+        ASSERT_EQ(rust_proof_bindings(files, 2, "src/actual.rs", "target", "Function"), 1);
+        ASSERT_EQ(rust_proof_edges(files, 2, "src/actual.rs", "target", "Function"), 1);
     }
+    const rust_proof_file_t generated[] = {{"src/actual.rs", "generate_target!();\n"},
+                                           {"src/main.rs",
+                                            "mod actual;\nuse crate::actual::target;\n"
+                                            "fn caller() { target(); }\nfn main() {}\n"}};
+    ASSERT_EQ(rust_proof_bindings(generated, 2, "src/actual.rs", "target", "Function"), 0);
+    ASSERT_EQ(rust_proof_edges(generated, 2, "src/actual.rs", "target", "Function"), 0);
+    /* The use compiled, so the module's macro made the name: the file is still a dependency. */
+    ASSERT(rust_proof_imports(generated, 2, "src/actual.rs") > 0);
+    const rust_proof_file_t absent[] = {{"src/actual.rs", "pub fn other() {}\n"},
+                                        {"src/main.rs",
+                                         "mod actual;\nuse crate::actual::target;\nfn main() {}\n"}};
+    /* Without a macro nothing can supply the leaf. Only `mod actual;` depends on the file. */
+    ASSERT_EQ(rust_proof_imports(absent, 2, "src/actual.rs"), 1);
     PASS();
 }
 
@@ -411,12 +425,7 @@ static const RQ_Expected RUST_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Service.float",
                 .label = "Method",
                 .declaration_line = 7,
-                .declaration_text = " pub fn float(&self, value: f32) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "rust-float-literal",
-     .why = "floating literal representation and range are not audited",
-     .tried = "explicit f32 suffix is genuine but only primitive parameter facts and bounded "
-              "integer/bool literals are proved"},
+                .declaration_text = " pub fn float(&self, value: f32) {}"}},
     {.case_id = "local-literal-inference",
      .site = {.file = "src/main.rs", .caller = "gaps", .needle = "value.take(local)"},
      .relation = "CALLS",
@@ -424,12 +433,7 @@ static const RQ_Expected RUST_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Service.take",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " pub fn take(&self, value: i32) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "rust-local-literal-inference",
-     .why = "local literal type inference is not modeled",
-     .tried =
-         "the source infers i32 from the call; parameter-to-local copying is proved separately"},
+                .declaration_text = " pub fn take(&self, value: i32) {}"}},
     {.case_id = "generic-inference",
      .site = {.file = "src/main.rs", .caller = "gaps", .needle = "value.generic(1)"},
      .relation = "CALLS",
@@ -437,12 +441,7 @@ static const RQ_Expected RUST_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Service.generic",
                 .label = "Method",
                 .declaration_line = 8,
-                .declaration_text = " pub fn generic<T>(&self, value: T) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "rust-generic-inference",
-     .why = "generic source signatures and inference remain unsupported",
-     .tried = "the compiler infers an integer T; the bridge retains the complete unproved method "
-              "domain"},
+                .declaration_text = " pub fn generic<T>(&self, value: T) {}"}},
     {.case_id = "owned-receiver",
      .site = {.file = "src/main.rs", .caller = "owned", .needle = "value.take(1)"},
      .relation = "CALLS",
@@ -450,12 +449,7 @@ static const RQ_Expected RUST_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Service.take",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " pub fn take(&self, value: i32) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "rust-owned-receiver",
-     .why = "owned receiver autoref is not part of the audited reference candidate domain",
-     .tried = "the valid owned Service can borrow as &Service; only explicit shared-reference "
-              "facts are currently accepted"},
+                .declaration_text = " pub fn take(&self, value: i32) {}"}},
     {.case_id = "mutable-receiver",
      .site = {.file = "src/main.rs", .caller = "mutable", .needle = "value.take(2)"},
      .relation = "CALLS",
@@ -463,12 +457,7 @@ static const RQ_Expected RUST_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Service.take",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " pub fn take(&self, value: i32) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "rust-mutable-receiver",
-     .why = "mutable receiver reborrow/autoref remains unsupported",
-     .tried = "a mutable reference can call an &self method, but the current type fact "
-              "deliberately preserves that missing adaptation"},
+                .declaration_text = " pub fn take(&self, value: i32) {}"}},
     {.case_id = "constructor-receiver",
      .site = {.file = "src/main.rs", .caller = "owned_local", .needle = "c.run(2)"},
      .relation = "CALLS",
@@ -476,12 +465,7 @@ static const RQ_Expected RUST_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Calc.run",
                 .label = "Method",
                 .declaration_line = 26,
-                .declaration_text = " fn run(&self, y: i32) -> i32 { self.helper(y) }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "rust-constructor-receiver",
-     .why = "struct construction and owned-receiver autoref are not proved",
-     .tried = "the same-file private self call is required; this distinct constructor path remains "
-              "genuine quality debt"},
+                .declaration_text = " fn run(&self, y: i32) -> i32 { self.helper(y) }"}},
 };
 
 static const RQ_Forbidden RUST_PRIMITIVE_FORBIDDEN[] = {
@@ -586,8 +570,8 @@ TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs) {
         th_cleanup(root);
         ASSERT(ok);
         ASSERT_EQ(report.genuine, 16);
-        ASSERT_EQ(report.found, 10);
-        ASSERT_EQ(report.missing, 6);
+        ASSERT_EQ(report.found, 16);
+        ASSERT_EQ(report.missing, 0);
         ASSERT_EQ(report.required_missing + report.wrong, 0);
     }
     PASS();
@@ -625,12 +609,691 @@ TEST(resolver_rust_local_impl_preserves_import_domain) {
     PASS();
 }
 
+/* ── Rust's own name rules, on the forms real crates use ───────────── */
+
+/* Both drivers: one worker (sequential route) and four with enough files to take
+ * the parallel route. The occurrence outcome must not depend on the route. */
+static cbm_store_t *rust_workspace_index(const rust_proof_file_t *files, size_t count, int driver,
+                                         char **root_out) {
+    const char *root = th_mktempdir("cbm_rust_names");
+    if (!root)
+        return NULL;
+    char repo[768], database[768];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    bool ok = cbm_mkdir_p(repo, 0755);
+    for (size_t i = 0; ok && i < count; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", repo, files[i].path);
+        char *slash = strrchr(path, '/');
+        *slash = '\0';
+        ok = cbm_mkdir_p(path, 0755);
+        *slash = '/';
+        ok = ok && th_write_file(path, files[i].text) == 0;
+    }
+    for (int i = 0; ok && driver && i < 55; i++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/Filler%02d.rs", repo, i);
+        ok = th_write_file(path, "// unrelated source file\n") == 0;
+    }
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    ok = ok && (!old_workers || saved_workers);
+    cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+    ok = pipeline && cbm_pipeline_set_project_name(pipeline, "rs") && cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+    *root_out = strdup(root);
+    return store;
+}
+
+static void rust_workspace_done(cbm_store_t *store, char *root) {
+    if (store)
+        cbm_store_close(store);
+    if (root)
+        th_cleanup(root);
+    free(root);
+}
+
+/* Exact endpoints: the project is `rs`, so an endpoint is rs.<path>.<item>. */
+static int rust_edge(cbm_store_t *store, const char *relation, const char *source, const char *target) {
+    sqlite3_stmt *statement = NULL;
+    int count = -1;
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "JOIN nodes t ON t.id=e.target_id WHERE e.type=?1 "
+                      "AND s.qualified_name='rs.'||?2 AND t.qualified_name='rs.'||?3";
+    if (store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(statement, 1, relation, -1, SQLITE_STATIC);
+        sqlite3_bind_text(statement, 2, source, -1, SQLITE_STATIC);
+        sqlite3_bind_text(statement, 3, target, -1, SQLITE_STATIC);
+        if (sqlite3_step(statement) == SQLITE_ROW)
+            count = sqlite3_column_int(statement, 0);
+    }
+    sqlite3_finalize(statement);
+    return count;
+}
+
+static int rust_edges_from(cbm_store_t *store, const char *relation, const char *source) {
+    sqlite3_stmt *statement = NULL;
+    int count = -1;
+    const char *sql = "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
+                      "WHERE e.type=?1 AND s.qualified_name='rs.'||?2";
+    if (store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(statement, 1, relation, -1, SQLITE_STATIC);
+        sqlite3_bind_text(statement, 2, source, -1, SQLITE_STATIC);
+        if (sqlite3_step(statement) == SQLITE_ROW)
+            count = sqlite3_column_int(statement, 0);
+    }
+    sqlite3_finalize(statement);
+    return count;
+}
+
+/* The outcome the occurrence recorded, whether or not an edge came of it. */
+static bool rust_occurrence_reason(cbm_store_t *store, const char *relation, const char *spelling,
+                                   const char *reason) {
+    sqlite3_stmt *statement = NULL;
+    bool found = false;
+    const char *sql = "SELECT count(*) FROM resolver_occurrences WHERE relation=?1 AND spelling=?2 "
+                      "AND reason=?3 AND emitted=0";
+    if (store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &statement, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(statement, 1, relation, -1, SQLITE_STATIC);
+        sqlite3_bind_text(statement, 2, spelling, -1, SQLITE_STATIC);
+        sqlite3_bind_text(statement, 3, reason, -1, SQLITE_STATIC);
+        found = sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int(statement, 0) > 0;
+    }
+    sqlite3_finalize(statement);
+    return found;
+}
+
+#define RUST_ROUTES(store, root, files)                                                          \
+    for (int driver = 0; driver < 2; driver++)                                                   \
+        for (char *root = NULL, *once = (char *)1; once; once = NULL)                            \
+            for (cbm_store_t *store = rust_workspace_index(files, sizeof(files) / sizeof(files[0]), \
+                                                           driver, &root);                       \
+                 once; rust_workspace_done(store, root), once = NULL)
+
+/* One grouped import, a derive and a test module used to void the whole file. */
+TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax) {
+    static const rust_proof_file_t files[] = {
+        {"src/other.rs", "pub fn local() -> i32 { 9 }\n"},
+        {"src/main.rs",
+         "mod other;\n"
+         "use std::path::{Path, PathBuf};\n"
+         "use other::*;\n"
+         "#[derive(Debug, Clone)]\n"
+         "pub struct Config { pub root: PathBuf }\n"
+         "macro_rules! noop { () => {} }\n"
+         "noop!();\n"
+         "fn local() -> i32 { 1 }\n"
+         "fn caller() -> i32 { local() }\n"
+         "fn shadowed() -> i32 { let local = |x: i32| x; local(1) }\n"
+         "#[cfg(test)]\n"
+         "mod tests { use super::*; #[test] fn inner() { caller(); } }\n"
+         "fn main() { caller(); shadowed(); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        /* A local item shadows the glob: it cannot be other::local. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.main.local"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.other.local"), 0);
+        /* A closure binding hides the item for the rest of its block. */
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.shadowed"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.main", "src.main.caller"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.inner", "src.main.caller"), 1);
+    }
+    PASS();
+}
+
+/* serde_json::{json, Value} used to become one binding literally named `{json, Value}`. */
+TEST(resolver_rust_use_tree_binds_one_name_per_leaf) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml", "[package]\nname = \"demo\"\nedition = \"2021\"\n[dependencies]\nserde_json = \"1\"\n"},
+        {"src/lib.rs", "pub mod a;\npub mod glob_me;\n"},
+        {"src/a/mod.rs", "pub mod e;\npub fn b() {}\npub fn c() {}\n"},
+        {"src/a/e.rs", "pub fn f() {}\npub fn g() {}\n"},
+        {"src/glob_me.rs", "pub fn from_glob() {}\n"},
+        {"src/main.rs",
+         "use demo::a::{b, c as renamed, e::{self, f}};\n"
+         "use demo::glob_me::*;\n"
+         "use serde_json::{json, Value};\n"
+         "use std::collections::HashMap as Map;\n"
+         "fn caller(_v: Value, _m: Map<i32, i32>) {\n"
+         "    b();\n"
+         "    renamed();\n"
+         "    f();\n"
+         "    e::g();\n"
+         "    from_glob();\n"
+         "    let _ = json!(1);\n"
+         "}\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.a.mod.b"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.a.mod.c"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.a.e.f"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.a.e.g"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.glob_me.from_glob"), 1);
+        ASSERT(rust_edge(store, "IMPORTS", "src.main.rs.__file__", "src.a.mod.rs.__file__") >= 1);
+        ASSERT(rust_edge(store, "IMPORTS", "src.main.rs.__file__", "src.a.e.rs.__file__") >= 1);
+        ASSERT(rust_edge(store, "IMPORTS", "src.main.rs.__file__", "src.glob_me.rs.__file__") >= 1);
+        /* The renamed leaf binds its alias, not the original name. */
+        ASSERT(rust_occurrence_reason(store, "IMPORTS", "serde_json::Value",
+                                      "rust_external_crate_import"));
+        ASSERT(rust_occurrence_reason(store, "IMPORTS", "std::collections::HashMap",
+                                      "rust_external_crate_import"));
+    }
+    PASS();
+}
+
+/* Cargo decides crate names: lib-core is `lib_core`, and only a dependency is reachable. */
+TEST(resolver_rust_workspace_dependency_names_come_from_cargo) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[workspace]\nmembers = [\"app\", \"lib-core\", \"unrelated\"]\n"
+         "[workspace.package]\nedition = \"2021\"\n"
+         "[workspace.dependencies]\nlib-core = { path = \"lib-core\" }\n"},
+        {"lib-core/Cargo.toml", "[package]\nname = \"lib-core\"\nedition.workspace = true\n"},
+        {"named-lib/Cargo.toml", "[package]\nname = \"named-lib\"\nedition = \"2021\"\n[lib]\nname = \"short\"\n"},
+        {"named-lib/src/lib.rs", "pub fn in_named() {}\n"},
+        {"lib-core/src/lib.rs", "pub mod store;\npub use store::Store;\n"},
+        {"lib-core/src/store.rs",
+         "pub struct Store;\nimpl Store {\n pub fn new() -> Store { Store }\n pub fn get(&self) -> i32 { 1 }\n}\n"},
+        {"unrelated/Cargo.toml", "[package]\nname = \"unrelated\"\nedition = \"2021\"\n"},
+        {"unrelated/src/lib.rs", "pub struct Store;\nimpl Store { pub fn new() -> Store { Store } }\n"},
+        {"app/Cargo.toml",
+         "[package]\nname = \"app\"\nedition = \"2021\"\n[dependencies]\nlib-core.workspace = true\n"
+         "renamed = { path = \"../unrelated\", package = \"unrelated\" }\n"
+         "named-lib = { path = \"../named-lib\" }\n"},
+        {"app/src/main.rs",
+         "use lib_core::Store;\n"
+         "fn caller() -> i32 { let s = Store::new(); s.get() }\n"
+         "fn renamed_dep() { renamed::Store::new(); }\n"
+         "fn lib_name_wins() { short::in_named(); }\n"
+         "fn package_name_is_not_it() { named_lib::in_named(); }\n"
+         "fn not_a_dependency() { unrelated::Store::new(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.main.caller", "lib-core.src.store.Store.new"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.main.caller", "lib-core.src.store.Store.get"), 1);
+        ASSERT(rust_edge(store, "IMPORTS", "app.src.main.rs.__file__", "lib-core.src.lib.rs.__file__") >= 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.main.renamed_dep", "unrelated.src.lib.Store.new"), 1);
+        /* Code names a dependency by its [lib] name, not its package name. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "app.src.main.lib_name_wins", "named-lib.src.lib.in_named"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "app.src.main.package_name_is_not_it"), 0);
+        /* A crate the manifest does not list is no name in this crate. */
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "app.src.main.not_a_dependency"), 0);
+    }
+    PASS();
+}
+
+TEST(resolver_rust_inline_module_constant_is_a_declaration) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub mod main_key { pub const CREATED_AT: &str = \"created-at\"; }\n"
+         "fn caller() -> &'static str { main_key::CREATED_AT }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.caller", "src.main.CREATED_AT"), 1);
+    }
+    PASS();
+}
+
+TEST(resolver_rust_module_layout_and_relative_paths) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod flat;\nmod nested;\n#[path = \"odd/place.rs\"]\nmod moved;\nmod both;\n"
+         "fn caller() {\n"
+         "    flat::f();\n    nested::deep::d();\n    moved::m();\n    both::b();\n"
+         "}\nfn main() {}\n"},
+        {"src/flat.rs", "pub fn f() {}\n"},
+        {"src/nested/mod.rs", "pub mod deep;\npub(crate) fn up() {}\n"},
+        {"src/nested/deep.rs", "pub fn d() { super::up(); self::same(); crate::flat::f(); }\nfn same() {}\n"},
+        {"src/odd/place.rs", "pub fn m() {}\n"},
+        /* rustc rejects both files existing (E0761): neither is the module. */
+        {"src/both.rs", "pub fn b() {}\n"},
+        {"src/both/mod.rs", "pub fn b() {}\n"},
+        /* No `mod` reaches this file: its crate:: means nothing known. */
+        {"src/dead.rs", "pub fn live() { own(); crate::flat::f(); }\nfn own() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.flat.f"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.nested.deep.d"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.odd.place.m"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.nested.deep.d", "src.nested.mod.up"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.nested.deep.d", "src.nested.deep.same"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.nested.deep.d", "src.flat.f"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.both.b"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.both.mod.b"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.dead.live", "src.dead.own"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.dead.live", "src.flat.f"), 0);
+    }
+    PASS();
+}
+
+TEST(resolver_rust_visibility_blocks_private_items_and_reexports_pass) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod inner;\nmod facade;\n"
+         "fn caller() {\n"
+         "    inner::open();\n"
+         "    inner::hidden();\n"
+         "    facade::renamed();\n"
+         "    inner::Thing::new().visible();\n"
+         "    inner::Thing::new().private_method();\n"
+         "}\nfn main() {}\n"},
+        {"src/inner.rs",
+         "pub fn open() {}\nfn hidden() {}\n"
+         "pub struct Thing;\n"
+         "impl Thing {\n pub fn new() -> Thing { Thing }\n pub fn visible(&self) {}\n fn private_method(&self) {}\n}\n"},
+        {"src/facade.rs", "pub use crate::inner::open as renamed;\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.inner.open"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.inner.hidden"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.inner.Thing.visible"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.inner.Thing.private_method"), 0);
+    }
+    PASS();
+}
+
+TEST(resolver_rust_methods_follow_the_language_probe) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod model;\nmod greet;\nmod quiet;\n"
+         "use std::sync::Arc;\n"
+         "use model::{Guard, Store};\n"
+         "use greet::Greet;\n"
+         "fn typed(s: &Store) { s.inherent(); s.hello(); s.defaulted(); s.silent(); }\n"
+         "fn constructed() { let s = Store::new(); s.inherent(); }\n"
+         "fn through_arc(s: Arc<Store>) { s.inherent(); }\n"
+         "fn through_box() { let s = Box::new(Store::new()); s.inherent(); }\n"
+         "fn through_deref(g: Guard<Store>) { g.inherent(); }\n"
+         "fn through_field(g: &Holder) { g.store.inherent(); }\n"
+         "struct Holder { store: Store }\n"
+         "fn through_return() { Store::new().me().inherent(); }\n"
+         "fn through_option(o: Option<Store>) { o.unwrap().inherent(); }\n"
+         "fn through_iter(v: Vec<Store>) { for s in &v { s.inherent(); } v.iter().for_each(|s| s.inherent()); }\n"
+         "async fn through_await() { model::make().await.inherent(); }\n"
+         "fn bound<T: Greet>(t: T) { t.hello(); }\n"
+         "fn trait_object(t: &dyn Greet) { t.hello(); }\n"
+         "fn unknown(x: u32, y: Unknown) { x.inherent(); y.inherent(); }\n"
+         "fn shadowed(s: &Store) { let s = 5; s.inherent(); }\n"
+         "fn main() {}\n"},
+        {"src/model.rs",
+         "pub struct Store;\n"
+         "impl Store {\n pub fn new() -> Self { Self }\n pub fn me(&self) -> &Self { self }\n pub fn inherent(&self) {}\n}\n"
+         "impl crate::greet::Greet for Store { fn hello(&self) {} }\n"
+         "impl crate::quiet::Quiet for Store { fn silent(&self) {} }\n"
+         "pub async fn make() -> Store { Store }\n"
+         "pub struct Guard<D> { inner: D }\n"
+         "impl<D> std::ops::Deref for Guard<D> { type Target = D; fn deref(&self) -> &D { &self.inner } }\n"},
+        {"src/greet.rs", "pub trait Greet {\n fn hello(&self);\n fn defaulted(&self) {}\n}\n"},
+        {"src/quiet.rs", "pub trait Quiet { fn silent(&self); }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        const char *inherent = "src.model.Store.inherent";
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.typed", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.constructed", "src.model.Store.new"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.constructed", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_arc", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_box", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_deref", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_field", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_return", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_option", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_iter", inherent), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_await", inherent), 1);
+        /* A trait in scope: its impl's method, or its default body when not overridden. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.typed", "src.model.Store.hello"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.typed", "src.greet.Greet.defaulted"), 1);
+        /* The receiver's type is only known through a bound: the trait's declaration. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.bound", "src.greet.Greet.hello"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.trait_object", "src.greet.Greet.hello"), 1);
+        /* Quiet is not imported into main.rs, so `silent` is not callable there. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.typed", "src.model.Store.silent"), 0);
+        /* No receiver type, no method: not a project method named `inherent`. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.unknown", inherent), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.shadowed"), 0);
+    }
+    PASS();
+}
+
+/* impl Foo<A> { fn new(x) } and impl Foo<B> { fn new() } share one QN, so one graph node:
+ * neither signature can veto the other's call. An unfixed parameter is unknown to an
+ * outside caller, even when it has bounds: its bound's method may not be the one called. */
+TEST(resolver_rust_generic_signatures_at_a_use) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "struct A;\nstruct B;\n"
+         "impl A { fn from_a(&self) {} }\n"
+         "trait Tr { fn act(&self); }\n"
+         "impl Tr for A { fn act(&self) {} }\n"
+         "struct Foo<T> { value: T }\n"
+         "impl Foo<A> { fn new(x: i32) -> Self { todo!() } }\n"
+         "impl Foo<B> { fn new() -> Self { todo!() } }\n"
+         "type FooA = Foo<A>;\n"
+         "fn twins() { FooA::new(1); }\n"
+         "struct Holder<T: Tr> { held: T }\n"
+         "impl<T: Tr> Holder<T> { fn get(&self) -> &T { &self.held } fn new() -> Self { todo!() } }\n"
+         "fn fixed(h: Holder<A>) { h.get().from_a(); h.held.from_a(); }\n"
+         "fn unfixed() { let h = Holder::new(); h.get().act(); }\n"
+         "impl<T: Tr> Holder<T> { fn wrap(held: T) -> Self { Holder { held } } }\n"
+         "fn identity<V>(v: V) -> V { v }\n"
+         "fn from_argument(a: A, other: A) { let h = Holder::wrap(a); h.held.from_a();\n"
+         "    identity(other).from_a(); }\n"
+         "fn inside<T: Tr>(h: Holder<T>) { h.get().act(); }\n"
+         "fn block_local() {\n"
+         "    struct Local { private: i32 }\n"
+         "    impl Local { fn own(&self) -> i32 { self.private } }\n"
+         "    let l = Local { private: 1 };\n"
+         "    l.own();\n"
+         "}\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.twins", "src.main.Foo.new"), 1);
+        /* The argument fixes T, so the walk continues on A. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.fixed", "src.main.Holder.get"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.fixed", "src.main.A.from_a"), 1);
+        /* The value passed fixes T for `Self` and for the result. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.from_argument", "src.main.A.from_a"), 1);
+        /* Nothing fixes T at this use: `act` on it could be anyone's. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.unfixed", "src.main.Tr.act"), 0);
+        /* Inside the generic scope T is known by its bound. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.inside", "src.main.Tr.act"), 1);
+        /* A block's own private members are visible in that block. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.block_local", "src.main.Local.own"), 1);
+    }
+    PASS();
+}
+
+/* `<Foo as Tr>::bar` names Foo's impl of Tr, or Tr's default when Foo has none. */
+TEST(resolver_rust_qualified_trait_path) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "trait Tr { fn bar(); fn dflt() {} }\n"
+         "struct Foo;\nstruct Other;\n"
+         "impl Tr for Foo { fn bar() {} }\n"
+         "impl Tr for Other { fn bar() {} }\n"
+         "impl Foo { fn inherent() {} }\n"
+         "fn caller() { <Foo as Tr>::bar(); <Foo as Tr>::dflt(); <Foo>::inherent(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.main.Foo.bar"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.main.Other.bar"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.main.Tr.dflt"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.main.Foo.inherent"), 1);
+    }
+    PASS();
+}
+
+/* make_enum_progress! { enum X { .. } } inside a fn declares X for that block,
+ * hiding a module-level X. Real form: milli's upgrade steps. */
+TEST(resolver_rust_macro_declared_item_hides_module_name_in_its_block) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "macro_rules! progress { (enum $n:ident { $($v:ident),* }) => { enum $n { $($v),* } } }\n"
+         "struct Cleanup;\n"
+         "impl Cleanup { fn step() {} }\n"
+         "fn declares() {\n"
+         "    progress! { enum Cleanup { Step } };\n"
+         "    let _ = Cleanup::Step;\n"
+         "}\n"
+         "fn plain() { Cleanup::step(); let _ = Cleanup; }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.declares", "src.main.Cleanup"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.plain", "src.main.Cleanup.step"), 1);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.plain", "src.main.Cleanup"), 1);
+    }
+    PASS();
+}
+
+/* A closure's parameters are what the callee's signature says it passes. */
+TEST(resolver_rust_closure_parameters_come_from_the_callee_signature) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "struct Settings;\n"
+         "impl Settings { fn set(&mut self) {} }\n"
+         "struct Holder;\n"
+         "impl Holder {\n"
+         " fn update(&self, f: impl Fn(&mut Settings)) {}\n"
+         " fn generic<F: FnOnce(&mut Settings)>(&self, f: F) {}\n"
+         " fn bound_in_where<F>(&self, f: F) where F: FnMut(&mut Settings) {}\n"
+         " fn no_signature<F>(&self, f: F) {}\n"
+         "}\n"
+         "fn free(f: impl FnOnce(Settings)) {}\n"
+         "fn through_impl(h: Holder) { h.update(|s| s.set()); }\n"
+         "fn through_generic(h: Holder) { h.generic(|s| s.set()); }\n"
+         "fn through_where(h: Holder) { h.bound_in_where(|s| s.set()); }\n"
+         "fn through_free() { free(|mut s| s.set()); }\n"
+         "fn untyped(h: Holder) { h.no_signature(|s| s.set()); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        const char *set = "src.main.Settings.set";
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_impl", set), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_generic", set), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_where", set), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.through_free", set), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.untyped", set), 0);
+    }
+    PASS();
+}
+
+/* A blanket impl serves a type only if that type meets its project bounds. */
+TEST(resolver_rust_blanket_impl_needs_its_bounds_met) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "trait Marker {}\n"
+         "trait Extra { fn extra(&self) {} }\n"
+         "impl<T: Marker> Extra for T {}\n"
+         "struct Marked;\nimpl Marker for Marked {}\n"
+         "struct Plain;\n"
+         "fn meets(m: Marked) { m.extra(); }\n"
+         "fn misses(p: Plain) { p.extra(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.meets", "src.main.Extra.extra"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.misses"), 0);
+    }
+    PASS();
+}
+
+/* A project trait on Result serves a crate's Result<T> alias of it too. */
+TEST(resolver_rust_project_trait_on_external_type) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml", "[package]\nname = \"demo\"\nedition = \"2021\"\n[dependencies]\nheed = \"1\"\n"},
+        {"src/main.rs",
+         "trait WithIndex<T> { fn with_index(self, i: usize) -> Option<T>; }\n"
+         "impl<T, E> WithIndex<T> for Result<T, E> { fn with_index(self, i: usize) -> Option<T> { self.ok() } }\n"
+         "trait Shout { fn shout(&self) -> String; }\n"
+         "impl Shout for String { fn shout(&self) -> String { self.clone() } }\n"
+         "fn from_alias(r: heed::Result<u32>) { r.with_index(1); }\n"
+         "fn on_string(s: String) { s.shout(); }\n"
+         "fn other_method(s: String) { s.len(); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.from_alias", "src.main.Result.with_index"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.on_string", "src.main.String.shout"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.other_method"), 0);
+    }
+    PASS();
+}
+
+/* No work cap decides graph content: every call in a big file keeps its edge. A
+ * per-file proof pool with a node limit used to fail the sites past its limit. */
+TEST(resolver_rust_big_file_keeps_every_edge) {
+    enum { CALLERS = 4000 };
+    size_t capacity = (size_t)CALLERS * 48 + 128;
+    char *text = malloc(capacity);
+    ASSERT_NOT_NULL(text);
+    size_t used = (size_t)snprintf(text, capacity, "fn helper() {}\nfn main() {}\n");
+    for (int i = 0; i < CALLERS; i++)
+        used += (size_t)snprintf(text + used, capacity - used, "fn caller%d() { helper(); }\n", i);
+    const rust_proof_file_t files[] = {{"src/main.rs", text}};
+    char *root = NULL;
+    cbm_store_t *store = rust_workspace_index(files, 1, 0, &root);
+    ASSERT_NOT_NULL(store);
+    sqlite3_stmt *statement = NULL;
+    int edges = -1;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT count(*) FROM edges WHERE type='CALLS'", -1, &statement,
+                           NULL) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW)
+        edges = sqlite3_column_int(statement, 0);
+    sqlite3_finalize(statement);
+    rust_workspace_done(store, root);
+    free(text);
+    ASSERT_EQ(edges, CALLERS);
+    PASS();
+}
+
+/* assert_eq!, println!, vec! and friends take ordinary expressions of the caller.
+ * A macro we cannot read keeps its tokens unresolved: they may mean anything. */
+TEST(resolver_rust_std_macro_arguments_are_expressions) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "macro_rules! custom { ($($t:tt)*) => {} }\n"
+         "struct Store;\n"
+         "impl Store { fn get(&self) -> i32 { 1 } }\n"
+         "const LIMIT: i32 = 3;\n"
+         "fn helper(x: i32) -> i32 { x }\n"
+         "fn asserted(s: Store) {\n"
+         "    assert_eq!(helper(s.get()), 1, \"message {}\", LIMIT);\n"
+         "}\n"
+         "fn named_argument() { let helper = 1; println!(\"{helper}\", helper = helper); }\n"
+         "fn opaque() { custom!(helper(1), LIMIT); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.asserted", "src.main.helper"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.asserted", "src.main.Store.get"), 1);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.asserted", "src.main.LIMIT"), 1);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.named_argument", "src.main.helper"), 0);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.opaque"), 0);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.opaque", "src.main.LIMIT"), 0);
+    }
+    PASS();
+}
+
+/* thiserror's #[from] writes From impls the source never shows. `Error::from` on an
+ * unknown value must not land on the one impl that happens to be written out. */
+TEST(resolver_rust_generic_trait_impl_is_chosen_by_the_value_passed) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod hidden;\nmod explicit;\n"
+         "use hidden::{Error, Plain};\n"
+         "use explicit::{Two, A, B};\n"
+         "fn unknown_value(x: Unknown) { let _ = Error::from(x); }\n"
+         "fn known_plain(p: Plain) { let _ = Error::from(p); }\n"
+         "fn known_other(s: String) { let _ = Error::from(s); }\n"
+         "fn picks_a(a: A) { let _ = Two::from(a); }\n"
+         "fn picks_b(b: B) { let _ = Two::from(b); }\n"
+         "fn main() {}\n"},
+        {"src/hidden.rs",
+         "pub struct Plain;\n"
+         "#[derive(Debug, thiserror::Error)]\n"
+         "pub enum Error { #[error(\"io\")] Io(#[from] std::io::Error), #[error(\"plain\")] Plain }\n"
+         "impl From<Plain> for Error { fn from(_: Plain) -> Self { Error::Plain } }\n"},
+        {"src/explicit.rs", "pub mod for_a;\npub mod for_b;\npub struct Two;\npub struct A;\npub struct B;\n"},
+        {"src/explicit/for_a.rs", "use super::{A, Two};\nimpl From<A> for Two { fn from(_: A) -> Two { Two } }\n"},
+        {"src/explicit/for_b.rs", "use super::{B, Two};\nimpl From<B> for Two { fn from(_: B) -> Two { Two } }\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        const char *explicit_from = "src.hidden.Error.from";
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.unknown_value", explicit_from), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.known_other", explicit_from), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.known_plain", explicit_from), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.picks_a", "src.explicit.for_a.Two.from"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.picks_a", "src.explicit.for_b.Two.from"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.picks_b", "src.explicit.for_b.Two.from"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.picks_b", "src.explicit.for_a.Two.from"), 0);
+    }
+    PASS();
+}
+
+/* cfg twins of one name are one declaration; cfg-gated imports of one name are two. */
+TEST(resolver_rust_cfg_twins_are_one_identity_and_cfg_imports_are_not) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "mod one;\nmod two;\n"
+         "#[cfg(unix)]\nfn twin() {}\n#[cfg(not(unix))]\nfn twin() {}\n"
+         "#[cfg(feature = \"a\")]\nuse one::chosen;\n#[cfg(not(feature = \"a\"))]\nuse two::chosen;\n"
+         "fn caller() { twin(); }\n"
+         "fn gated() { chosen(); }\n"
+         "fn main() {}\n"},
+        {"src/one.rs", "pub fn chosen() {}\n"},
+        {"src/two.rs", "pub fn chosen() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.caller", "src.main.twin"), 1);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.gated"), 0);
+    }
+    PASS();
+}
+
+/* The graph has one node per QN, so a QN two scopes claim names neither faithfully. */
+TEST(resolver_rust_qn_collisions_withhold_the_edge) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "fn helper() {}\n"
+         "mod inner { pub fn helper() {} }\n"
+         "fn caller() { helper(); inner::helper(); }\n"
+         "pub struct Store { inner: i32, plain: i32 }\n"
+         "impl Store {\n"
+         " pub fn inner(&self) -> i32 { self.inner + self.plain }\n"
+         "}\n"
+         "fn getter(s: &Store) -> i32 { s.inner() }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.caller"), 0);
+        /* The method keeps its node, so the call is exact... */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.getter", "src.main.Store.inner"), 1);
+        /* ...the same-named field has none, and a field read is no method reference. */
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.Store.inner", "src.main.Store.inner"), 0);
+        ASSERT_EQ(rust_edge(store, "USAGE", "src.main.Store.inner", "src.main.Store.plain"), 1);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
+    RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
+    RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
+    RUN_TEST(resolver_rust_workspace_dependency_names_come_from_cargo);
+    RUN_TEST(resolver_rust_inline_module_constant_is_a_declaration);
+    RUN_TEST(resolver_rust_module_layout_and_relative_paths);
+    RUN_TEST(resolver_rust_visibility_blocks_private_items_and_reexports_pass);
+    RUN_TEST(resolver_rust_methods_follow_the_language_probe);
+    RUN_TEST(resolver_rust_macro_declared_item_hides_module_name_in_its_block);
+    RUN_TEST(resolver_rust_std_macro_arguments_are_expressions);
+    RUN_TEST(resolver_rust_big_file_keeps_every_edge);
+    RUN_TEST(resolver_rust_qualified_trait_path);
+    RUN_TEST(resolver_rust_generic_signatures_at_a_use);
+    RUN_TEST(resolver_rust_closure_parameters_come_from_the_callee_signature);
+    RUN_TEST(resolver_rust_blanket_impl_needs_its_bounds_met);
+    RUN_TEST(resolver_rust_project_trait_on_external_type);
+    RUN_TEST(resolver_rust_generic_trait_impl_is_chosen_by_the_value_passed);
+    RUN_TEST(resolver_rust_cfg_twins_are_one_identity_and_cfg_imports_are_not);
+    RUN_TEST(resolver_rust_qn_collisions_withhold_the_edge);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
     RUN_TEST(resolver_rust_inline_module_does_not_bind_top_level_namesake);
-    RUN_TEST(resolver_rust_attributes_and_macros_do_not_donate_import_binding);
+    RUN_TEST(resolver_rust_attributes_and_macros_keep_an_explicit_item);
     RUN_TEST(resolver_rust_import_alias_preserves_binding_name);
     RUN_TEST(resolver_rust_shared_reference_and_alias);
     RUN_TEST(resolver_rust_receiver_shadow_and_unsupported_flow_abstain);
