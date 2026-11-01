@@ -114,7 +114,7 @@ jobs:
         run: scripts/ci/codeql-retrace-vendored.sh "$RUNNER_TEMP/codeql-retrace.txt"
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -129,7 +129,7 @@ jobs:
         run: scripts/build.sh --reuse-vendored --retrace-from "$RUNNER_TEMP/codeql-retrace.txt"
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           category: "/language:${{ matrix.language }}"
 
