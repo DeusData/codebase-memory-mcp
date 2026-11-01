@@ -29,8 +29,8 @@ static int c_proven_count(const CBMResolvedCallArray *rows, const char *target) 
     int count = 0;
     for (int i = 0; i < rows->count; i++) {
         const CBMResolvedCall *row = &rows->items[i];
-        if (row->kind != CBM_RESOLVED_FIELD_REFERENCE && c_row_admitted(row) &&
-            (!target || !strcmp(row->callee_qn, target)))
+        if ((row->kind == CBM_RESOLVED_INVOCATION || row->kind == CBM_RESOLVED_CALL_REFERENCE) &&
+            c_row_admitted(row) && (!target || !strcmp(row->callee_qn, target)))
             count++;
     }
     return count;
@@ -304,7 +304,6 @@ TEST(resolver_c_quoted_header_fields_require_exact_source_owner) {
     const char *paths[] = {"alpha.h", "other.h", "beta.h"};
     const char *modules[] = {"test.alpha", "test.other", "test.beta"};
     int exact[7] = {0}, wrong[7] = {0};
-    uint32_t flags[7] = {0};
     for (int i = 0; i < 7; i++) {
         CBMArena arena;
         cbm_arena_init(&arena);
@@ -340,18 +339,24 @@ TEST(resolver_c_quoted_header_fields_require_exact_source_owner) {
                              .def_module_qn = "test.beta",
                              .source_start_line = 1,
                              .declaration_identity = "beta.h:Beta",
-                             .field_defs = "count:int|beta_only:int"}};
-        ASSERT(
-            cbm_c_collect_source_facts(&arena, header, (int)strlen(header), "test.alpha", defs, 1));
+                             .field_defs = "count:int|beta_only:int"},
+                            {.qualified_name = "test.alpha.@c-file-facts",
+                             .short_name = "@c-file-facts",
+                             .label = CBM_C_FILE_FACTS_LABEL,
+                             .def_module_qn = "test.alpha"}};
+        /* The header's facts carry its guard, which is how case 5 stays out. */
+        CBMCFileFacts header_facts = {0};
+        ASSERT(cbm_c_collect_file_facts(&arena, header, (int)strlen(header), "test.alpha",
+                                        CBM_LANG_CPP, defs, 1, &header_facts));
+        defs[3].c_file_facts = &header_facts;
         ASSERT(cbm_c_collect_source_facts(&arena, other, (int)strlen(other), "test.other", defs + 1,
                                           1));
         ASSERT(
             cbm_c_collect_source_facts(&arena, beta, (int)strlen(beta), "test.beta", defs + 2, 1));
-        flags[i] = defs[0].source_flags;
         CBMResolvedCallArray rows = {0};
         int imports = i == 2 ? 2 : i == 3 ? 0 : 1;
         int first = i == 4 ? 2 : 0;
-        c_cross(&arena, source, false, defs, 3, paths + first, modules + first, imports, &rows);
+        c_cross(&arena, source, false, defs, 4, paths + first, modules + first, imports, &rows);
         const char *sites[] = {strstr(source, "a->count =") + 3, strstr(source, "a->count +") + 3,
                                strstr(source, "a->alpha_only") + 3};
         const char *targets[] = {"test.alpha.Alpha.count", "test.alpha.Alpha.count",
@@ -359,7 +364,7 @@ TEST(resolver_c_quoted_header_fields_require_exact_source_owner) {
         unsigned seen = 0;
         for (int j = 0; j < rows.count; j++) {
             const CBMResolvedCall *row = &rows.items[j];
-            if (!c_row_admitted(row))
+            if (!c_row_admitted(row) || row->kind == CBM_RESOLVED_TYPE_REFERENCE)
                 continue;
             int matched = -1;
             for (int k = 0; k < 3; k++) {
@@ -389,20 +394,11 @@ TEST(resolver_c_quoted_header_fields_require_exact_source_owner) {
     for (int i = 2; i < 7; i++)
         ASSERT_EQ(exact[i], 0);
     ASSERT_EQ(exact[1], 3);
-    /* Quality gap C-GUARD-DECLARATION: all three guarded-header references
-     * genuinely target Alpha's fields. WHY: raw header text alone does not prove
-     * its declarations survived the caller's include-time macro environment.
-     * TRIED: the focused proof test resolves all three plain-header sites, but guarded source facts
-     * have flags=0. The five negative cases include a caller-suppressed guard and
-     * an inactive feature; simply descending through #if would make them wrong.
-     * Keep the independent three-site denominator and require promotion once
-     * configured/preprocessed declaration-presence proof recovers any site. */
-    fprintf(stderr,
-            "[RQ-UNIT] C-GUARD-DECLARATION genuine=6 found=%d missing=%d wrong=0 "
-            "guarded_flags=%u plain_flags=%u\n",
-            exact[0] + exact[1], 6 - exact[0] - exact[1], flags[0], flags[1]);
-    if (exact[0] != 0)
-        FAIL("C-GUARD-DECLARATION recovered: promote the exact recovered sites to required");
+    /* Every real C header is guarded, and every one of these three references
+     * targets Alpha's fields. The guard's one way to hide them, the caller defining
+     * it first, is case 5 above. An ordinary feature #ifdef around the struct, case
+     * 6, stays unknown. */
+    ASSERT_EQ(exact[0], 3);
     PASS();
 }
 
@@ -642,8 +638,11 @@ TEST(resolver_c_external_prototype_requires_compatible_unique_definition) {
         {"int lib_value(void); int run(void) { return lib_value(); }",
          "int lib_value(void) { return 7; }",
          "#ifdef FEATURE\nint lib_value(void) { return 9; }\n#endif", false, 0},
+        /* The only definition of this external name, written in a branch. A caller
+         * with a visible prototype either links to it or does not link to anything
+         * in this project, so this is the declaration the call selects. */
         {"int lib_value(void); int run(void) { return lib_value(); }",
-         "#ifdef FEATURE\nint lib_value(void) { return 7; }\n#endif", NULL, false, 0},
+         "#ifdef FEATURE\nint lib_value(void) { return 7; }\n#endif", NULL, false, 1},
         {"int lib_value(); int run() { return lib_value(); }",
          "extern \"C\" { int lib_value() { return 7; } }", NULL, true, 0},
         {"extern \"C\" { int lib_value(); } int run() { return lib_value(); }",
@@ -993,8 +992,8 @@ TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships) {
  * the first syntax error more than 16 levels under the root. The audit used to call
  * that a failure of the whole file, before the include table it reads later existed,
  * so the next declared binding dereferenced a NULL table and took the indexing worker
- * down. The boundary is the error's own position: earlier sites keep their proofs,
- * later ones do not, and declarations past it are simply not proven. */
+ * down. The boundary is the error's own position within its function: the sites after
+ * it there are unread, and the next complete function has its own scopes. */
 TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error) {
     const char *source = "#include \"lib.h\"\n"
                          "struct Holder { int value; };\n"
@@ -1014,10 +1013,14 @@ TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error) {
                          "#ifdef EXTRA\n"
                          "    } else if (n == 10) { n = 11;\n"
                          "#endif\n"
-                         "    } else { n = 12;\n"
+                         "    } else { n = 12; work();\n"
                          "    }\n"
                          "}\n"
                          "struct Holder shared_holder;\n"
+                         "void declares(int n) {\n"
+                         "    n = ( int work ;\n"
+                         "    work();\n"
+                         "}\n"
                          "void after(void) { work(); }\n";
     CBMLSPDef defs[] = {{.qualified_name = "test.main.work",
                          .declaration_identity = "fixture:test.main.work",
@@ -1035,9 +1038,13 @@ TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     c_cross(&arena, source, false, defs, 2, paths, modules, 1, &out);
-    uint32_t error_region = (uint32_t)(strstr(source, "#ifdef EXTRA") - source);
     uint32_t before_call = (uint32_t)(strstr(source, "work(); }") - source);
-    int before_proofs = 0, proofs_past_error = 0;
+    uint32_t split_call = (uint32_t)(strstr(source, "n = 12; work();") - source + strlen("n = 12; "));
+    uint32_t hidden_call =
+        (uint32_t)(strstr(source, "( int work ;\n    work();") - source + strlen("( int work ;\n    "));
+    uint32_t after_call = (uint32_t)(strstr(source, "after(void) { work(); }") - source +
+                                     strlen("after(void) { "));
+    int before_proofs = 0, split_proofs = 0, hidden_proofs = 0, after_proofs = 0, other = 0;
     for (int i = 0; i < out.count; i++) {
         const CBMResolvedCall *row = &out.items[i];
         if (row->kind == CBM_RESOLVED_FIELD_REFERENCE || !c_row_admitted(row) ||
@@ -1045,16 +1052,677 @@ TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error) {
             continue;
         if (row->site_start_byte == before_call)
             before_proofs++;
-        if (row->site_start_byte >= error_region)
-            proofs_past_error++;
+        else if (row->site_start_byte == split_call)
+            split_proofs++;
+        else if (row->site_start_byte == hidden_call)
+            hidden_proofs++;
+        else if (row->site_start_byte == after_call)
+            after_proofs++;
+        else
+            other++;
     }
     cbm_arena_destroy(&arena);
     ASSERT_EQ(before_proofs, 1);
-    ASSERT_EQ(proofs_past_error, 0);
+    /* The #ifdef split error holds no type, so nothing it swallowed can hide `work`. */
+    ASSERT_EQ(split_proofs, 1);
+    /* This one swallowed `int work`, a local that would hide the function. */
+    ASSERT_EQ(hidden_proofs, 0);
+    ASSERT_EQ(after_proofs, 1);
+    ASSERT_EQ(other, 0);
+    PASS();
+}
+
+/* ── Translation-unit rules, on the shapes real C projects use ───────────────
+ * Each fixture runs through both execution drivers. The sources are small copies
+ * of forms seen in redis and neovim, so a rule that only holds on tidy input
+ * fails here, and every positive sits beside the decoy that would falsify it. */
+typedef struct {
+    const char *suite;
+    const RQ_Source *sources;
+    size_t source_count;
+    const RQ_Expected *expected;
+    size_t expected_count;
+    const RQ_Forbidden *forbidden;
+    size_t forbidden_count;
+    const char *compile_commands; /* %s is the repository root */
+} CTUCase;
+
+static bool c_tu_run(const CTUCase *fixture, int driver) {
+    const char *root = th_mktempdir("cbm_c_tu");
+    if (!root)
+        return false;
+    char repo[768], database[768];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    bool ok = cbm_mkdir_p(repo, 0755);
+    for (size_t i = 0; ok && i < fixture->source_count; i++)
+        ok = th_write_file(TH_PATH(repo, fixture->sources[i].path), fixture->sources[i].text) == 0;
+    for (int i = 0; ok && i < 55; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "filler%02d.c", i);
+        ok = th_write_file(TH_PATH(repo, path), "/* unrelated source */\n") == 0;
+    }
+    if (ok && fixture->compile_commands) {
+        char config[2048];
+        snprintf(config, sizeof(config), fixture->compile_commands, repo);
+        ok = th_write_file(TH_PATH(repo, "compile_commands.json"), config) == 0;
+    }
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    ok = ok && (!old_workers || saved_workers);
+    cbm_setenv("CBM_WORKERS", driver ? "4" : "1", 1);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+    ok = pipeline && cbm_pipeline_set_project_name(pipeline, "c-tu") &&
+         cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+    RQ_Report report = {0};
+    ok = store &&
+         rq_check(store, "c-tu", fixture->suite, fixture->sources, fixture->source_count,
+                  fixture->expected, fixture->expected_count, fixture->forbidden,
+                  fixture->forbidden_count, &report, stderr) &&
+         ok;
+    if (store)
+        cbm_store_close(store);
+    th_cleanup(root);
+    ok = ok && report.genuine == fixture->expected_count && report.found == report.genuine &&
+         report.missing + report.wrong + report.metadata_errors == 0;
+    if (!ok)
+        fprintf(stderr, "[C-TU] %s driver=%d genuine=%zu found=%zu missing=%zu wrong=%zu meta=%zu\n",
+                fixture->suite, driver, report.genuine, report.found, report.missing, report.wrong,
+                report.metadata_errors);
+    return ok;
+}
+
+#define C_TU_EXPECT(id, file_, caller_, needle_, relation_, target_file, target_suffix, label_,  \
+                    line_, text_)                                                               \
+    {.case_id = id,                                                                             \
+     .site = {.file = file_, .caller = caller_, .needle = needle_},                             \
+     .relation = relation_,                                                                     \
+     .target = {.file = target_file,                                                            \
+                .suffix = target_suffix,                                                        \
+                .label = label_,                                                                \
+                .declaration_line = line_,                                                      \
+                .declaration_text = text_}}
+#define C_TU_FORBID(id, file_, caller_, needle_, relation_)                                     \
+    {.case_id = id,                                                                             \
+     .site = {.file = file_, .caller = caller_, .needle = needle_},                             \
+     .relation = relation_,                                                                     \
+     .any_target = true}
+
+/* The byte of `word` after the first `context` in text: an identifier's own span. */
+static uint32_t c_tu_at(const char *text, const char *context, const char *word) {
+    const char *from = strstr(text, context);
+    const char *found = from ? strstr(from, word) : NULL;
+    return found ? (uint32_t)(found - text) : 0;
+}
+#define C_TU_WORD(file_, text_, caller_, context, word)                                         \
+    {.file = file_,                                                                             \
+     .caller = caller_,                                                                         \
+     .start_byte = c_tu_at(text_, context, word),                                               \
+     .end_byte = c_tu_at(text_, context, word) + (uint32_t)strlen(word)}
+
+/* redis: `server.h` includes `sds.h`, callers include only `server.h`, and each
+ * function is defined in a .c file no caller includes. */
+static const RQ_Source C_TU_REDIS[] = {
+    {.path = "src/sds.h",
+     .text = "#ifndef __SDS_H\n#define __SDS_H\n#include <stddef.h>\n"
+             "typedef char *sds;\n"
+             "sds sdsnew(const char *init);\n"
+             "static inline int sdsavail(const sds s) { return s ? 1 : 0; }\n"
+             "#endif\n"},
+    {.path = "src/sds.c",
+     .text = "#include \"sds.h\"\n"
+             "static sds alloc_it(const char *init) { return (sds)init; }\n"
+             "sds sdsnew(const char *init) { return alloc_it(init); }\n"},
+    {.path = "src/server.h",
+     .text = "#ifndef __REDIS_H\n#define __REDIS_H\n#include \"sds.h\"\n"
+             "typedef struct client {\n    int flags;\n    sds querybuf;\n} client;\n"
+             "void addReply(client *c, int obj);\n"
+             "#endif\n"},
+    {.path = "src/networking.c",
+     .text = "#include \"server.h\"\n"
+             "void addReply(client *c, int obj) { c->flags = obj; }\n"},
+    {.path = "src/decoy.c",
+     .text = "static char *sdsnew(const char *init) { return (char *)init; }\n"
+             "char *decoy_use(void) { return sdsnew(\"x\"); }\n"},
+    {.path = "src/t_string.c",
+     .text = "#include \"server.h\"\n"
+             "static int helper(client *c) { return c->flags; }\n"
+             "void setCommand(client *c) {\n"
+             "    sds s = sdsnew(\"x\");\n"
+             "    addReply(c, helper(c));\n"
+             "    c->flags = sdsavail(s);\n"
+             "}\n"}};
+
+TEST(resolver_c_header_prototype_binds_external_definition_through_includes) {
+    const RQ_Expected expected[] = {
+        C_TU_EXPECT("transitive-prototype", "src/t_string.c", "t_string.setCommand",
+                    "sdsnew(\"x\")", "CALLS", "src/sds.c", "sds.sdsnew", "Function", 3,
+                    "sds sdsnew(const char *init) { return alloc_it(init); }"),
+        C_TU_EXPECT("direct-prototype", "src/t_string.c", "t_string.setCommand",
+                    "addReply(c, helper(c))", "CALLS", "src/networking.c", "networking.addReply",
+                    "Function", 2, "void addReply(client *c, int obj) { c->flags = obj; }"),
+        C_TU_EXPECT("same-file-static", "src/t_string.c", "t_string.setCommand", "helper(c))",
+                    "CALLS", "src/t_string.c", "t_string.helper", "Function", 2,
+                    "static int helper(client *c) { return c->flags; }"),
+        C_TU_EXPECT("header-static-inline", "src/t_string.c", "t_string.setCommand", "sdsavail(s)",
+                    "CALLS", "src/sds.h", "sds.sdsavail", "Function", 6,
+                    "static inline int sdsavail(const sds s) { return s ? 1 : 0; }"),
+        C_TU_EXPECT("static-stays-in-its-file", "src/decoy.c", "decoy.decoy_use", "sdsnew(\"x\")",
+                    "CALLS", "src/decoy.c", "decoy.sdsnew", "Function", 1,
+                    "static char *sdsnew(const char *init) { return (char *)init; }"),
+    };
+    const CTUCase fixture = {.suite = "c-tu-redis",
+                             .sources = C_TU_REDIS,
+                             .source_count = sizeof(C_TU_REDIS) / sizeof(C_TU_REDIS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Everything here looks like the positive above, and none of it is proved. */
+static const RQ_Source C_TU_ABSTAIN[] = {
+    /* Two programs in one repository, and neither copy includes the header. */
+    {.path = "dup.h", .text = "int dup_value(int v);\n"},
+    {.path = "one/dup_value.c", .text = "int dup_value(int v) { return v; }\n"},
+    {.path = "two/dup_value.c", .text = "int dup_value(int v) { return v + 1; }\n"},
+    {.path = "uses_dup.c",
+     .text = "#include \"dup.h\"\nint uses_dup(void) { return dup_value(1); }\n"},
+    /* A macro of the name: which function runs depends on the expansion. */
+    {.path = "wrapped.h",
+     .text = "#define wrapped(v) wrapped_impl(v)\nint wrapped(int v);\nint wrapped_impl(int v);\n"},
+    {.path = "wrapped.c", .text = "int wrapped(int v) { return v; }\n"},
+    {.path = "uses_wrapped.c",
+     .text = "#include \"wrapped.h\"\nint uses_wrapped(void) { return wrapped(1); }\n"},
+    /* No include declares it: a name alone is not a binding. */
+    {.path = "orphan.c", .text = "int orphan_value(int v) { return v; }\n"},
+    {.path = "uses_orphan.c", .text = "int uses_orphan(void) { return orphan_value(1); }\n"},
+    /* A parameter hides the function. */
+    {.path = "shadow.h", .text = "int shadowed(int v);\n"},
+    {.path = "shadow.c", .text = "int shadowed(int v) { return v; }\n"},
+    {.path = "uses_shadow.c",
+     .text = "#include \"shadow.h\"\nint uses_shadow(int (*shadowed)(int)) { return shadowed(1); }\n"},
+    /* The only definition is another file's static. */
+    {.path = "hidden.h", .text = "int hidden_value(int v);\n"},
+    {.path = "hidden.c", .text = "static int hidden_value(int v) { return v; }\n"},
+    {.path = "uses_hidden.c",
+     .text = "#include \"hidden.h\"\nint uses_hidden(void) { return hidden_value(1); }\n"},
+    /* A declaration whose parameters cannot match the definition's. */
+    {.path = "arity.h", .text = "struct box;\nint arity_value(struct box *b);\n"},
+    {.path = "arity.c",
+     .text = "struct box;\nint arity_value(struct box *b, int n) { return n; }\n"},
+    {.path = "uses_arity.c",
+     .text = "#include \"arity.h\"\nint uses_arity(struct box *b) { return arity_value(b); }\n"},
+    /* The include comes after the call. */
+    {.path = "late.h", .text = "int late_value(int v);\n"},
+    {.path = "late.c", .text = "int late_value(int v) { return v; }\n"},
+    {.path = "uses_late.c",
+     .text = "int uses_late(void) { return late_value(1); }\n#include \"late.h\"\n"},
+    /* A caller that defines the guard first keeps the header's declarations out. */
+    {.path = "guarded.h",
+     .text = "#ifndef GUARDED_H\n#define GUARDED_H\nint guarded_value(int v);\n#endif\n"},
+    {.path = "guarded.c", .text = "int guarded_value(int v) { return v; }\n"},
+    {.path = "uses_guarded.c",
+     .text = "#define GUARDED_H\n#include \"guarded.h\"\n"
+             "int uses_guarded(void) { return guarded_value(1); }\n"}};
+
+TEST(resolver_c_lookalike_calls_abstain) {
+    const RQ_Forbidden forbidden[] = {
+        C_TU_FORBID("two-definitions", "uses_dup.c", "uses_dup.uses_dup", "dup_value(1)", "CALLS"),
+        C_TU_FORBID("macro-of-the-name", "uses_wrapped.c", "uses_wrapped.uses_wrapped",
+                    "wrapped(1)", "CALLS"),
+        C_TU_FORBID("not-declared", "uses_orphan.c", "uses_orphan.uses_orphan", "orphan_value(1)",
+                    "CALLS"),
+        C_TU_FORBID("parameter-shadow", "uses_shadow.c", "uses_shadow.uses_shadow", "shadowed(1)",
+                    "CALLS"),
+        C_TU_FORBID("other-files-static", "uses_hidden.c", "uses_hidden.uses_hidden",
+                    "hidden_value(1)", "CALLS"),
+        C_TU_FORBID("arity-mismatch", "uses_arity.c", "uses_arity.uses_arity", "arity_value(b)",
+                    "CALLS"),
+        C_TU_FORBID("include-after-call", "uses_late.c", "uses_late.uses_late", "late_value(1)",
+                    "CALLS"),
+        C_TU_FORBID("guard-defined-first", "uses_guarded.c", "uses_guarded.uses_guarded",
+                    "guarded_value(1)", "CALLS"),
+    };
+    const CTUCase fixture = {.suite = "c-tu-abstain",
+                             .sources = C_TU_ABSTAIN,
+                             .source_count = sizeof(C_TU_ABSTAIN) / sizeof(C_TU_ABSTAIN[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Several definitions of one name in one repository: the one whose own file
+ * includes this header was compiled against this declaration. */
+static const RQ_Source C_TU_COPIES[] = {
+    {.path = "app/sds.h", .text = "char *sdsdup(const char *s);\n"},
+    {.path = "app/sds.c",
+     .text = "#include \"sds.h\"\nchar *sdsdup(const char *s) { return (char *)s; }\n"},
+    {.path = "copy/sds.h", .text = "char *sdsdup(const char *s);\n"},
+    {.path = "copy/sds.c",
+     .text = "#include \"sds.h\"\nchar *sdsdup(const char *s) { return (char *)s + 1; }\n"},
+    {.path = "app/main.c",
+     .text = "#include \"sds.h\"\nchar *app_copy(void) { return sdsdup(\"a\"); }\n"},
+    {.path = "copy/use.c",
+     .text = "#include \"sds.h\"\nchar *other_copy(void) { return sdsdup(\"v\"); }\n"}};
+
+TEST(resolver_c_copied_library_binds_the_copy_compiled_against_its_header) {
+    const RQ_Expected expected[] = {
+        C_TU_EXPECT("app-copy", "app/main.c", "main.app_copy", "sdsdup(\"a\")", "CALLS",
+                    "app/sds.c", "app.sds.sdsdup", "Function", 2,
+                    "char *sdsdup(const char *s) { return (char *)s; }"),
+        C_TU_EXPECT("other-copy", "copy/use.c", "use.other_copy", "sdsdup(\"v\")", "CALLS",
+                    "copy/sds.c", "copy.sds.sdsdup", "Function", 2,
+                    "char *sdsdup(const char *s) { return (char *)s + 1; }"),
+    };
+    const CTUCase fixture = {.suite = "c-tu-copies",
+                             .sources = C_TU_COPIES,
+                             .source_count = sizeof(C_TU_COPIES) / sizeof(C_TU_COPIES[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* The kernel shape behind the put_page audit: `-I include` selects one of two
+ * headers with the same spelling. Without the flag this spelling is a collision. */
+static const RQ_Source C_TU_KERNEL[] = {
+    {.path = "include/linux/mm.h",
+     .text = "struct page;\nstatic inline void put_page(struct page *page) { (void)page; }\n"},
+    {.path = "tools/include/linux/mm.h",
+     .text = "struct page;\nstatic inline void put_page(struct page *page) { (void)page; }\n"},
+    {.path = "arch/arm64/include/asm/kvm_pgtable.h",
+     .text = "struct kvm_pgtable_mm_ops {\n\tvoid (*put_page)(void *addr);\n};\n"},
+    {.path = "drivers/net/rx.c",
+     .text = "#include <linux/mm.h>\nvoid recv_free(struct page *page) { put_page(page); }\n"},
+    {.path = "drivers/net/unconfigured.c",
+     .text = "#include <linux/mm.h>\nvoid other_free(struct page *page) { put_page(page); }\n"}};
+
+TEST(resolver_c_configured_include_root_reaches_calls) {
+    const RQ_Expected expected[] = {
+        C_TU_EXPECT("configured-root", "drivers/net/rx.c", "rx.recv_free", "put_page(page)",
+                    "CALLS", "include/linux/mm.h", "include.linux.mm.put_page", "Function", 2,
+                    "static inline void put_page(struct page *page) { (void)page; }"),
+    };
+    const RQ_Forbidden forbidden[] = {
+        C_TU_FORBID("no-root-two-headers", "drivers/net/unconfigured.c", "unconfigured.other_free",
+                    "put_page(page)", "CALLS"),
+    };
+    const CTUCase fixture = {
+        .suite = "c-tu-kernel",
+        .sources = C_TU_KERNEL,
+        .source_count = sizeof(C_TU_KERNEL) / sizeof(C_TU_KERNEL[0]),
+        .expected = expected,
+        .expected_count = sizeof(expected) / sizeof(expected[0]),
+        .forbidden = forbidden,
+        .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0]),
+        .compile_commands = "[{\"directory\":\"%s\",\"file\":\"drivers/net/rx.c\","
+                            "\"command\":\"cc -I include -c drivers/net/rx.c\"}]"};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* The same fixture with no build configuration: the angle spelling names one
+ * project file, so it is the file any -I would select. */
+TEST(resolver_c_unique_include_spelling_reaches_calls_without_configuration) {
+    const RQ_Source sources[] = {
+        {.path = "include/linux/mm.h",
+         .text = "struct page;\nstatic inline void put_page(struct page *page) { (void)page; }\n"},
+        {.path = "arch/arm64/include/asm/kvm_pgtable.h",
+         .text = "struct kvm_pgtable_mm_ops {\n\tvoid (*put_page)(void *addr);\n};\n"},
+        {.path = "drivers/net/rx.c",
+         .text = "#include <linux/mm.h>\nvoid recv_free(struct page *page) { put_page(page); }\n"}};
+    const RQ_Expected expected[] = {
+        C_TU_EXPECT("unique-spelling", "drivers/net/rx.c", "rx.recv_free", "put_page(page)",
+                    "CALLS", "include/linux/mm.h", "include.linux.mm.put_page", "Function", 2,
+                    "static inline void put_page(struct page *page) { (void)page; }"),
+    };
+    const CTUCase fixture = {.suite = "c-tu-unique-spelling",
+                             .sources = sources,
+                             .source_count = sizeof(sources) / sizeof(sources[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* neovim: headers are spelled from a root under src/, and `foo.h` declares what
+ * `foo.c` exports through `foo.h.generated.h`, which the build writes. */
+static const RQ_Source C_TU_NEOVIM[] = {
+    {.path = "src/nvim/api/buffer.h",
+     .text = "#pragma once\n#include \"api/buffer.h.generated.h\"\n"},
+    {.path = "src/nvim/api/buffer.c",
+     .text = "#include \"nvim/api/buffer.h\"\n"
+             "#include \"api/buffer.c.generated.h\"\n"
+             "int nvim_buf_line_count(int buf) { return count_lines(buf); }\n"
+             "static int count_lines(int buf) { return buf; }\n"
+             "static int private_helper(int buf) { return buf; }\n"},
+    {.path = "src/nvim/window.c",
+     .text = "#include \"nvim/api/buffer.h\"\n"
+             "int win_lines(int buf) { return nvim_buf_line_count(buf); }\n"
+             "int win_private(int buf) { return private_helper(buf); }\n"}};
+
+TEST(resolver_c_generated_declaration_header_exposes_its_source) {
+    const RQ_Expected expected[] = {
+        C_TU_EXPECT("generated-header", "src/nvim/window.c", "window.win_lines",
+                    "nvim_buf_line_count(buf)", "CALLS", "src/nvim/api/buffer.c",
+                    "api.buffer.nvim_buf_line_count", "Function", 3,
+                    "int nvim_buf_line_count(int buf) { return count_lines(buf); }"),
+        C_TU_EXPECT("own-definition-declared-by-generated-header", "src/nvim/api/buffer.c",
+                    "buffer.nvim_buf_line_count", "count_lines(buf)", "CALLS",
+                    "src/nvim/api/buffer.c", "api.buffer.count_lines", "Function", 4,
+                    "static int count_lines(int buf) { return buf; }"),
+    };
+    const RQ_Forbidden forbidden[] = {
+        C_TU_FORBID("generated-header-holds-no-statics", "src/nvim/window.c", "window.win_private",
+                    "private_helper(buf)", "CALLS"),
+    };
+    const CTUCase fixture = {.suite = "c-tu-neovim",
+                             .sources = C_TU_NEOVIM,
+                             .source_count = sizeof(C_TU_NEOVIM) / sizeof(C_TU_NEOVIM[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Member access through typedefs, chains and extern objects, from redis. */
+#define C_TU_FIELDS_USE                                                                         \
+    "#include \"server.h\"\n"                                                                   \
+    "int read_flags(client *c) { return c->flags; }\n"                                          \
+    "int read_chain(client *c) { return c->db->id; }\n"                                         \
+    "int read_alias(client_ptr c) { return c->flags; }\n"                                       \
+    "int read_global(void) { return server.port; }\n"                                           \
+    "int read_deep(void) { return server.current->db->id; }\n"                                  \
+    "client *get_client(void);\n"                                                               \
+    "int read_returned(void) { return get_client()->flags; }\n"                                 \
+    "void write_flags(client *c) { c->flags = 1; }\n"                                           \
+    "void write_global(void) { server.port = 7; }\n"                                            \
+    "void bump_flags(client *c) { c->flags++; }\n"                                              \
+    "int local_shadow(void) { struct { int port; } server; server.port = 1; return server.port; }\n"
+static const RQ_Source C_TU_FIELDS[] = {
+    {.path = "src/server.h",
+     .text = "#ifndef SERVER_H\n#define SERVER_H\n"
+             "typedef struct redisDb {\n    int id;\n} redisDb;\n"
+             "typedef struct client {\n    int flags;\n    redisDb *db;\n"
+             "#ifdef USE_TLS\n    int tls;\n#endif\n} client;\n"
+             "typedef struct client *client_ptr;\n"
+             "struct redisServer {\n    int port;\n    client *current;\n};\n"
+             "extern struct redisServer server;\n"
+             "#endif\n"},
+    {.path = "src/server.c",
+     .text = "#include \"server.h\"\nstruct redisServer server;\n"
+             "client *get_client(void) { return server.current; }\n"},
+    {.path = "src/other.h", .text = "struct other {\n    int flags;\n};\n"},
+    {.path = "src/use.c", .text = C_TU_FIELDS_USE}};
+
+TEST(resolver_c_member_access_follows_written_declarations) {
+    const char *use = C_TU_FIELDS_USE;
+    const RQ_Target flags = {.file = "src/server.h",
+                             .suffix = "client.flags",
+                             .label = "Field",
+                             .declaration_line = 7,
+                             .declaration_text = "    int flags;"};
+    const RQ_Target id = {.file = "src/server.h",
+                          .suffix = "redisDb.id",
+                          .label = "Field",
+                          .declaration_line = 4,
+                          .declaration_text = "    int id;"};
+    const RQ_Target db = {.file = "src/server.h",
+                          .suffix = "client.db",
+                          .label = "Field",
+                          .declaration_line = 8,
+                          .declaration_text = "    redisDb *db;"};
+    const RQ_Target port = {.file = "src/server.h",
+                            .suffix = "redisServer.port",
+                            .label = "Field",
+                            .declaration_line = 15,
+                            .declaration_text = "    int port;"};
+    const RQ_Target current = {.file = "src/server.h",
+                               .suffix = "redisServer.current",
+                               .label = "Field",
+                               .declaration_line = 16,
+                               .declaration_text = "    client *current;"};
+    const RQ_Target client_type = {.file = "src/server.h",
+                                   .suffix = "server.client",
+                                   .label = "Class",
+                                   .declaration_line = 6,
+                                   .declaration_text = "typedef struct client {"};
+    const RQ_Target client_ptr = {.file = "src/server.h",
+                                  .suffix = "server.client_ptr",
+                                  .label = "Type",
+                                  .declaration_line = 13,
+                                  .declaration_text = "typedef struct client *client_ptr;"};
+    const RQ_Target global = {.file = "src/server.c",
+                              .suffix = "server.server",
+                              .label = "Variable",
+                              .declaration_line = 2,
+                              .declaration_text = "struct redisServer server;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "signature-type",
+         .site = C_TU_WORD("src/use.c", use, "use.read_flags", "read_flags(", "client"),
+         .relation = "USAGE",
+         .target = client_type},
+        {.case_id = "typedef-read",
+         .site = C_TU_WORD("src/use.c", use, "use.read_flags", "return c->flags", "flags"),
+         .relation = "USAGE",
+         .target = flags},
+        {.case_id = "chain-type",
+         .site = C_TU_WORD("src/use.c", use, "use.read_chain", "read_chain(", "client"),
+         .relation = "USAGE",
+         .target = client_type},
+        {.case_id = "chain-read-first",
+         .site = C_TU_WORD("src/use.c", use, "use.read_chain", "c->db->id", "db"),
+         .relation = "USAGE",
+         .target = db},
+        {.case_id = "chain-read-second",
+         .site = C_TU_WORD("src/use.c", use, "use.read_chain", "c->db->id", "id"),
+         .relation = "USAGE",
+         .target = id},
+        {.case_id = "pointer-typedef-type",
+         .site = C_TU_WORD("src/use.c", use, "use.read_alias", "read_alias(", "client_ptr"),
+         .relation = "USAGE",
+         .target = client_ptr},
+        {.case_id = "pointer-typedef-read",
+         .site = C_TU_WORD("src/use.c", use, "use.read_alias", "client_ptr c) { return c->", "flags"),
+         .relation = "USAGE",
+         .target = flags},
+        {.case_id = "extern-object",
+         .site = C_TU_WORD("src/use.c", use, "use.read_global", "return server.port", "server"),
+         .relation = "USAGE",
+         .target = global},
+        {.case_id = "extern-object-read",
+         .site = C_TU_WORD("src/use.c", use, "use.read_global", "return server.port", "port"),
+         .relation = "USAGE",
+         .target = port},
+        {.case_id = "extern-chain-object",
+         .site = C_TU_WORD("src/use.c", use, "use.read_deep", "server.current->db->id", "server"),
+         .relation = "USAGE",
+         .target = global},
+        {.case_id = "extern-chain-first",
+         .site = C_TU_WORD("src/use.c", use, "use.read_deep", "server.current->db->id", "current"),
+         .relation = "USAGE",
+         .target = current},
+        {.case_id = "extern-chain-second",
+         .site = C_TU_WORD("src/use.c", use, "use.read_deep", "server.current->db->id", "db"),
+         .relation = "USAGE",
+         .target = db},
+        {.case_id = "extern-chain-third",
+         .site = C_TU_WORD("src/use.c", use, "use.read_deep", "server.current->db->id", "id"),
+         .relation = "USAGE",
+         .target = id},
+        {.case_id = "returned-struct-read",
+         .site = C_TU_WORD("src/use.c", use, "use.read_returned", "get_client()->flags", "flags"),
+         .relation = "USAGE",
+         .target = flags},
+        {.case_id = "assignment-writes",
+         .site = C_TU_WORD("src/use.c", use, "use.write_flags", "c->flags = 1", "flags"),
+         .relation = "WRITES",
+         .target = flags},
+        {.case_id = "extern-assignment-writes",
+         .site = C_TU_WORD("src/use.c", use, "use.write_global", "server.port = 7", "port"),
+         .relation = "WRITES",
+         .target = port},
+        {.case_id = "increment-writes",
+         .site = C_TU_WORD("src/use.c", use, "use.bump_flags", "c->flags++", "flags"),
+         .relation = "WRITES",
+         .target = flags},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "block-scope-struct-hides-the-global",
+         .site = C_TU_WORD("src/use.c", use, "use.local_shadow", "server.port = 1", "port"),
+         .relation = "WRITES",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-fields",
+                             .sources = C_TU_FIELDS,
+                             .source_count = sizeof(C_TU_FIELDS) / sizeof(C_TU_FIELDS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* Bare value and type names: a global through its extern declaration, an
+ * enumerator from a header, a written type, each beside what would hide it. */
+#define C_TU_VALUES_USE                                                                         \
+    "#include \"server.h\"\n"                                                                   \
+    "int read_global(void) { return hz; }\n"                                                    \
+    "int read_enum(void) { return BLOCKED_LIST; }\n"                                            \
+    "mstime_t read_type(mstime_t when) { mstime_t next = when; return next; }\n"                \
+    "void write_global(void) { hz = 3; }\n"                                                     \
+    "int param_shadow(int hz) { return hz; }\n"                                                 \
+    "int local_shadow(void) { int hz = 1; return hz; }\n"                                       \
+    "int undeclared(void) { return not_declared_anywhere; }\n"                                  \
+    "int local_enum(void) { enum { BLOCKED_LIST = 9 }; return BLOCKED_LIST; }\n"                \
+    "int local_tag(void) { struct mstime_t { int v; } m; struct mstime_t *p = &m; return p->v; }\n"
+static const RQ_Source C_TU_VALUES[] = {
+    {.path = "src/server.h",
+     .text = "#ifndef SERVER_H\n#define SERVER_H\n"
+             "enum blocked_type {\n    BLOCKED_NONE,\n    BLOCKED_LIST\n};\n"
+             "typedef int mstime_t;\n"
+             "extern int hz;\n"
+             "#endif\n"},
+    {.path = "src/server.c", .text = "#include \"server.h\"\nint hz;\n"},
+    {.path = "src/elsewhere.c", .text = "static int hz;\nint read_static(void) { return hz; }\n"},
+    {.path = "src/use.c", .text = C_TU_VALUES_USE}};
+
+TEST(resolver_c_bare_values_and_types_bind_in_the_translation_unit) {
+    const char *use = C_TU_VALUES_USE;
+    const char *elsewhere = C_TU_VALUES[2].text;
+    const RQ_Target mstime = {.file = "src/server.h",
+                              .suffix = "server.mstime_t",
+                              .label = "Type",
+                              .declaration_line = 7,
+                              .declaration_text = "typedef int mstime_t;"};
+    const RQ_Target hz = {.file = "src/server.c",
+                          .suffix = "server.hz",
+                          .label = "Variable",
+                          .declaration_line = 2,
+                          .declaration_text = "int hz;"};
+    const RQ_Target blocked = {.file = "src/server.h",
+                               .suffix = "server.BLOCKED_LIST",
+                               .label = "Variable",
+                               .declaration_line = 5,
+                               .declaration_text = "    BLOCKED_LIST"};
+    const RQ_Target own_static = {.file = "src/elsewhere.c",
+                                  .suffix = "elsewhere.hz",
+                                  .label = "Variable",
+                                  .declaration_line = 1,
+                                  .declaration_text = "static int hz;"};
+    const RQ_Expected expected[] = {
+        {.case_id = "extern-object",
+         .site = C_TU_WORD("src/use.c", use, "use.read_global", "return hz", "hz"),
+         .relation = "USAGE",
+         .target = hz},
+        {.case_id = "header-enumerator",
+         .site = C_TU_WORD("src/use.c", use, "use.read_enum", "return BLOCKED_LIST", "BLOCKED_LIST"),
+         .relation = "USAGE",
+         .target = blocked},
+        {.case_id = "extern-object-write",
+         .site = C_TU_WORD("src/use.c", use, "use.write_global", "hz = 3", "hz"),
+         .relation = "WRITES",
+         .target = hz},
+        {.case_id = "own-file-static",
+         .site = C_TU_WORD("src/elsewhere.c", elsewhere, "elsewhere.read_static", "return hz", "hz"),
+         .relation = "USAGE",
+         .target = own_static},
+        {.case_id = "signature-return-type",
+         .site = C_TU_WORD("src/use.c", use, "use.read_type", "mstime_t read_type", "mstime_t"),
+         .relation = "USAGE",
+         .target = mstime},
+        {.case_id = "signature-parameter-type",
+         .site = C_TU_WORD("src/use.c", use, "use.read_type", "mstime_t when", "mstime_t"),
+         .relation = "USAGE",
+         .target = mstime},
+        {.case_id = "local-declaration-type",
+         .site = C_TU_WORD("src/use.c", use, "use.read_type", "mstime_t next", "mstime_t"),
+         .relation = "USAGE",
+         .target = mstime},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "parameter-hides-global",
+         .site = C_TU_WORD("src/use.c", use, "use.param_shadow", "return hz", "hz"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "block-scope-hides-global",
+         .site = C_TU_WORD("src/use.c", use, "use.local_shadow", "int hz = 1; return hz", "return hz"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "no-declaration",
+         .site = C_TU_WORD("src/use.c", use, "use.undeclared", "return not_", "not_declared_anywhere"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "block-enumerator-hides-header",
+         .site = C_TU_WORD("src/use.c", use, "use.local_enum", "return BLOCKED_LIST", "BLOCKED_LIST"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "block-tag-hides-header-type",
+         .site = C_TU_WORD("src/use.c", use, "use.local_tag", "struct mstime_t *p", "mstime_t"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-values",
+                             .sources = C_TU_VALUES,
+                             .source_count = sizeof(C_TU_VALUES) / sizeof(C_TU_VALUES[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
     PASS();
 }
 
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_header_prototype_binds_external_definition_through_includes);
+    RUN_TEST(resolver_c_lookalike_calls_abstain);
+    RUN_TEST(resolver_c_copied_library_binds_the_copy_compiled_against_its_header);
+    RUN_TEST(resolver_c_configured_include_root_reaches_calls);
+    RUN_TEST(resolver_c_unique_include_spelling_reaches_calls_without_configuration);
+    RUN_TEST(resolver_c_generated_declaration_header_exposes_its_source);
+    RUN_TEST(resolver_c_member_access_follows_written_declarations);
+    RUN_TEST(resolver_c_bare_values_and_types_bind_in_the_translation_unit);
     RUN_TEST(resolver_c_nested_syntax_error_bounds_proofs_at_the_error);
     RUN_TEST(resolver_c_preprocessed_proofs_require_complete_explicit_configuration);
     RUN_TEST(resolver_c_unverified_preprocessing_cannot_persist_relationships);

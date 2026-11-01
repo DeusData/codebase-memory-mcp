@@ -15659,8 +15659,8 @@ static void write_c_header_namesake_fixture(const char *tmp, int pad_files) {
                     "{\n"
                     "\tput_page(page);\n"
                     "}\n");
-    /* No include search roots configure this system spelling. A same-named
-     * project header is not evidence that the compiler would select it. */
+    /* No include search roots are configured, and exactly one project file ends in
+     * this spelling, so it is the file any -I could select: the real kernel shape. */
     write_temp_file(tmp, "drivers/net/unconfigured.c",
                     "#include <linux/mm.h>\n"
                     "void unconfigured_free(struct page *page) { put_page(page); }\n");
@@ -15744,7 +15744,7 @@ TEST(pipeline_c_call_reaches_header_function_beside_field) {
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
 
-    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Field"), 0);
 
     cbm_store_close(s);
@@ -15782,7 +15782,7 @@ TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
 
-    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Field"), 0);
 
     cbm_store_close(s);
