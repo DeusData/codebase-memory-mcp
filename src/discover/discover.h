@@ -58,9 +58,16 @@ CBMLanguage cbm_disambiguate_frm(const char *path);
  * CBM_LANG_RESCRIPT. On read failure, defaults to CBM_LANG_RESCRIPT. */
 CBMLanguage cbm_disambiguate_res(const char *path);
 
+/* Disambiguate .d files by reading first 4KB of content.
+ * Returns CBM_LANG_COUNT (not source) for a make-style dependency file written
+ * by rustc/cargo, gcc/clang -MD or CMake ("target ...: prereq ..."), otherwise
+ * CBM_LANG_DLANG. On read failure or any doubt, defaults to CBM_LANG_DLANG. */
+CBMLanguage cbm_disambiguate_d(const char *path);
+
 /* Disambiguate .inc files by reading first 4KB of content.
- * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
- * include (a "ROUTINE <Uppercase>" header), otherwise CBM_LANG_BITBAKE.
+ * Returns CBM_LANG_CPP for explicit C-family code, or
+ * CBM_LANG_OBJECTSCRIPT_ROUTINE for ObjectScript markers / a lone #define.
+ * BitBake recipe syntax and unknown content retain CBM_LANG_BITBAKE.
  * On read failure, defaults to CBM_LANG_BITBAKE. */
 CBMLanguage cbm_disambiguate_inc(const char *path);
 

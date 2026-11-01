@@ -75,13 +75,23 @@ static const char *ALWAYS_SKIP_DIR_SUFFIXES[] = {
     "storage/framework/views", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    /* Generated */
+    "generated", "gen", "auto-generated",
+    /* Tests */
+    "fixtures", "testdata", "test_data", "__tests__", "__mocks__", "__snapshots__", "__fixtures__",
+    "__test__",
+    /* Docs and samples */
+    "docs", "doc", "documentation", "examples", "example", "samples", "sample",
+    /* Assets */
+    "assets", "static", "public", "media",
+    /* Third-party */
+    "third_party", "thirdparty", "3rdparty",
+    /* Data and integration tests */
+    "migrations", "seeds", "e2e", "integration",
+    /* Localization */
+    "locale", "locales", "i18n", "l10n",
+    /* Tooling and build output */
+    "scripts", "tools", "hack", "bin", "build", "out", NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
@@ -343,6 +353,56 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
         return out[0] != '\0';
     }
 
+    return false;
+}
+
+/* JVM source-set language roots: src/<set>/<lang>/ in Maven and Gradle layouts. */
+static const char *JVM_SOURCE_LANG_DIRS[] = {"java", "kotlin", "scala", "groovy", NULL};
+
+static bool component_equals(const char *start, size_t len, const char *word) {
+    return strlen(word) == len && strncmp(start, word, len) == 0;
+}
+
+/* True when rel_path names a directory strictly below a JVM source root
+ * ("src/main/java/com/acme/target", "app/src/test/kotlin/x/tmp"). There every
+ * directory is a package, so a built-in skip name such as "target", "tmp" or
+ * "vendor" is an ordinary package name, not build output (#2661). The root
+ * itself and directories beside it ("src/main/target") are not packages. */
+bool cbm_discover_path_in_jvm_package(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    enum { JVM_MAX_COMPONENTS = 256 };
+    const char *starts[JVM_MAX_COMPONENTS];
+    size_t lens[JVM_MAX_COMPONENTS];
+    size_t count = 0;
+    const char *p = rel_path;
+    while (*p && count < JVM_MAX_COMPONENTS) {
+        while (*p == '/' || *p == '\\') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char *start = p;
+        while (*p && *p != '/' && *p != '\\') {
+            p++;
+        }
+        starts[count] = start;
+        lens[count] = (size_t)(p - start);
+        count++;
+    }
+    /* The language root sits at i + 2; the directory must be below it. */
+    for (size_t i = 0; i + 3 < count; i++) {
+        if (!component_equals(starts[i], lens[i], "src")) {
+            continue;
+        }
+        for (int l = 0; JVM_SOURCE_LANG_DIRS[l]; l++) {
+            if (component_equals(starts[i + 2], lens[i + 2], JVM_SOURCE_LANG_DIRS[l])) {
+                return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -803,8 +863,10 @@ static dir_verdict_t directory_verdict(const char *entry_name, const char *rel_p
                                        const gitignore_link_t *ignore_chain,
                                        const cbm_gitignore_t *global_gi,
                                        const cbm_gitignore_t *cbmignore) {
-    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) ||
-        cbm_discover_path_has_skip_suffix(rel_path)) {
+    bool builtin_skip = cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) &&
+                        (cbm_discover_is_safety_core_directory(entry_name) ||
+                         !cbm_discover_path_in_jvm_package(rel_path));
+    if (builtin_skip || cbm_discover_path_has_skip_suffix(rel_path)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
          * non-negatable safety core. Fall through so .gitignore/global/local

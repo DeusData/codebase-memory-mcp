@@ -230,6 +230,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                                  const CBMLangSpec *spec);
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
+static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
@@ -7110,6 +7111,24 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    /* Go allows any number of init() functions per package — even several in
+     * one file — and they all run at start-up. On the flat QN they all
+     * collided and the graph upsert kept ONE node per package, silently
+     * dropping the rest (#1910). Disambiguate with the #495 cfg-twin pattern:
+     * fold the file basename and the init's per-file ordinal into the QN.
+     * The ordinal (not the line) keeps the QN stable when code is edited
+     * above the function — the QN is node identity, and a line suffix would
+     * churn nodes on every unrelated insertion. Nothing ever joins on the
+     * plain QN — calling init explicitly is illegal in Go — and the
+     * call-scope side (compute_func_qn in extract_unified.c) and the Go LSP
+     * (process_function in lsp/go_lsp.c) name it through the same
+     * cbm_go_init_qn, so init-body calls keep their attribution. */
+    if (ctx->language == CBM_LANG_GO && strcmp(def.label, "Function") == 0 &&
+        strcmp(name, "init") == 0) {
+        def.qualified_name =
+            cbm_go_init_qn(a, def.qualified_name, ctx->rel_path, node, ctx->source);
+    }
+
     // C++/CUDA: out-of-line method definition (`Foo::bar` in a .cc/.cpp). The
     // class body in the header is declaration-only, so without this the
     // definition is recorded as a free Function. Promote it to a Method whose QN
@@ -7449,13 +7468,15 @@ static const char *extract_markdown_section_body(CBMExtractCtx *ctx, TSNode head
 
 /* Push a config-language definition that carries prose. push_simple_class_def
  * delegates here with no docstring. */
-static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
-                                      const char *label, const char *docstring) {
+/* Push a definition whose qualified name ends with `qn_name` (already QN-safe)
+ * rather than with its name. */
+static void push_class_def_qn(CBMExtractCtx *ctx, TSNode node, char *name, const char *qn_name,
+                              const char *label, const char *docstring) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_safe_segment(a, name));
+    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_name);
     def.label = label;
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -7463,6 +7484,11 @@ static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *nam
     def.is_exported = true;
     def.docstring = docstring;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
+                                      const char *label, const char *docstring) {
+    push_class_def_qn(ctx, node, name, qn_safe_segment(ctx->arena, name), label, docstring);
 }
 
 static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
@@ -7536,6 +7562,49 @@ static char *extract_atx_heading_text(CBMArena *a, TSNode node, const char *sour
     return NULL;
 }
 
+/* Setext paragraphs include block-container markers between lines. Keep the
+ * whole inline text, excluding only the parser's continuation spans. */
+static char *extract_setext_heading_text(CBMArena *a, TSNode node, const char *source) {
+    TSNode content = ts_node_child_by_field_name(node, TS_FIELD("heading_content"));
+    if (ts_node_is_null(content)) {
+        return NULL;
+    }
+    TSNode inline_node = cbm_find_child_by_kind(content, "inline");
+    if (!ts_node_is_null(inline_node)) {
+        content = inline_node;
+    }
+    uint32_t start = ts_node_start_byte(content);
+    uint32_t end = ts_node_end_byte(content);
+    char *text = (char *)cbm_arena_alloc(a, (size_t)(end - start) + SKIP_ONE);
+    if (!text) {
+        return NULL;
+    }
+    size_t written = 0;
+    uint32_t previous = start;
+    TSTreeCursor cursor = ts_tree_cursor_new(content);
+    for (;;) {
+        TSNode child = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(child), "block_continuation") == 0) {
+            uint32_t marker_start = ts_node_start_byte(child);
+            uint32_t marker_end = ts_node_end_byte(child);
+            memcpy(text + written, source + previous, marker_start - previous);
+            written += marker_start - previous;
+            previous = marker_end;
+        } else if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                ts_tree_cursor_delete(&cursor);
+                memcpy(text + written, source + previous, end - previous);
+                written += end - previous;
+                text[written] = '\0';
+                return text;
+            }
+        }
+    }
+}
+
 // Trim trailing whitespace/newlines from a heading name in-place.
 static char *trim_heading_name(char *name) {
     if (!name || !name[0]) {
@@ -7557,11 +7626,423 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
     if (strcmp(kind, "atx_heading") == 0) {
         name = extract_atx_heading_text(a, node, source);
     } else {
-        if (ts_node_child_count(node) > 0) {
-            name = cbm_node_text(a, ts_node_child(node, 0), source);
-        }
+        name = extract_setext_heading_text(a, node, source);
     }
     return trim_heading_name(name);
+}
+
+/* #2586: a heading name that repeats in a file (`## Implementation` under two
+ * parents) gave its Sections one qualified name, so the graph kept one node
+ * and the references under them fell back to the File. A repeated heading's
+ * qualified name therefore takes the names of the headings above it when
+ * those chains differ (`Service-A.Implementation`). Unique titles and repeats
+ * with only one parent chain keep their bare names. A heading text may itself
+ * hold dots, so a qualified name can equal another heading's final name (`# Service-A.
+ * Implementation`): the qualified one then takes `~2`, `~3`, ... until no
+ * other heading of the file has that name. Headings that repeat under the
+ * same parents too still share a name, as before. All final names are
+ * settled once per file, on the first heading. */
+typedef struct md_heading {
+    uint32_t start;       /* the heading node's first byte */
+    uint32_t scope_start; /* enclosing block container, excluding section wrappers */
+    uint32_t scope_end;
+    int level; /* ATX and Setext heading rank, 1–6 */
+    struct md_heading *parent;
+    const char *seg;          /* the heading's own QN-safe name */
+    const char *key;          /* repeated only: the chain's segments, '\n'-joined */
+    const char *qn_name;      /* the final QN segment */
+    bool qualified;           /* the name actually changed by adding parents */
+    struct md_heading *chain; /* first heading with this identity in a collision run */
+} md_heading_t;
+
+typedef struct {
+    md_heading_t *v; /* in document order */
+    int count;
+    uint64_t *checks;
+} md_headings_t;
+
+/* The QN-safe name of a heading node, or NULL. */
+static const char *md_heading_segment(CBMExtractCtx *ctx, CBMArena *a, TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (!is_markdown_heading_kind(kind)) {
+        return NULL;
+    }
+    char *name = extract_markdown_heading_name(a, node, kind, ctx->source);
+    return name ? qn_safe_segment(a, name) : NULL;
+}
+
+enum { MD_HEADING_LEVELS = 6 };
+
+/* Read the vendored grammar's explicit markers, including Setext headings:
+ * unlike ATX headings, those are not nested in section nodes by the parser. */
+static int md_heading_level(TSNode node) {
+    static const char *const atx_markers[MD_HEADING_LEVELS] = {
+        "atx_h1_marker", "atx_h2_marker", "atx_h3_marker",
+        "atx_h4_marker", "atx_h5_marker", "atx_h6_marker",
+    };
+    uint32_t n = ts_node_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *kind = ts_node_type(ts_node_child(node, i));
+        for (int level = 0; level < MD_HEADING_LEVELS; level++) {
+            if (strcmp(kind, atx_markers[level]) == 0) {
+                return level + SKIP_ONE;
+            }
+        }
+        if (strcmp(kind, "setext_h1_underline") == 0) {
+            return 1;
+        }
+        if (strcmp(kind, "setext_h2_underline") == 0) {
+            return PAIR_LEN;
+        }
+    }
+    return 0;
+}
+
+/* Scope frames follow cursor descent/ascent. Reuse popped frames so temporary
+ * storage grows with nesting depth, not with the number of blocks. */
+typedef struct md_scope {
+    uint32_t start;
+    uint32_t end;
+    int depth;
+    struct md_scope *previous;
+} md_scope_t;
+
+/* Visit every heading, including empty structural headings: count them (v
+ * NULL), or fill v. Never ask ts_node_parent to rediscover the path from the
+ * root: its preceding-sibling scan makes flat documents quadratic. */
+static int md_collect_headings(CBMExtractCtx *ctx, CBMArena *a, md_heading_t *v, int cap) {
+    int n = 0;
+    int depth = 0;
+    md_scope_t *scope = NULL;
+    md_scope_t *spare = NULL;
+    uint64_t *steps = &ctx->result->markdown_collection_steps;
+    if (ts_node_is_null(ctx->root)) {
+        return 0;
+    }
+    TSTreeCursor cur = ts_tree_cursor_new(ctx->root);
+    for (;;) {
+        (*steps)++;
+        TSNode node = ts_tree_cursor_current_node(&cur);
+        const char *kind = ts_node_type(node);
+        if (is_markdown_heading_kind(kind)) {
+            if (!v) {
+                n++;
+            } else if (n < cap) {
+                const char *seg = md_heading_segment(ctx, a, node);
+                v[n++] = (md_heading_t){.start = ts_node_start_byte(node),
+                                        .scope_start = scope ? scope->start : 0,
+                                        .scope_end = scope ? scope->end : 0,
+                                        .level = md_heading_level(node),
+                                        .seg = seg ? seg : "",
+                                        .qn_name = seg ? seg : ""};
+            }
+        } else {
+            (*steps)++;
+            if (ts_tree_cursor_goto_first_child(&cur)) {
+                if (v && strcmp(kind, "section") != 0) {
+                    md_scope_t *frame = spare;
+                    if (frame) {
+                        spare = frame->previous;
+                    } else {
+                        frame = (md_scope_t *)cbm_arena_alloc(a, sizeof(*frame));
+                    }
+                    if (!frame) {
+                        ts_tree_cursor_delete(&cur);
+                        return -1;
+                    }
+                    *frame = (md_scope_t){.start = ts_node_start_byte(node),
+                                          .end = ts_node_end_byte(node),
+                                          .depth = depth,
+                                          .previous = scope};
+                    scope = frame;
+                }
+                depth++;
+                continue;
+            }
+        }
+        for (;;) {
+            (*steps)++;
+            if (ts_tree_cursor_goto_next_sibling(&cur)) {
+                break;
+            }
+            (*steps)++;
+            if (!ts_tree_cursor_goto_parent(&cur)) {
+                ts_tree_cursor_delete(&cur);
+                return n;
+            }
+            depth--;
+            if (scope && scope->depth == depth) {
+                md_scope_t *previous = scope->previous;
+                scope->previous = spare;
+                spare = scope;
+                scope = previous;
+            }
+        }
+    }
+}
+
+static int md_by_seg(const void *x, const void *y) {
+    return strcmp((*(const md_heading_t *const *)x)->seg, (*(const md_heading_t *const *)y)->seg);
+}
+
+static int md_by_name(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    int c = strcmp(p->qn_name, q->qn_name);
+    return c ? c : (p->start > q->start) - (p->start < q->start);
+}
+
+static int md_by_scope(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    if (p->scope_start != q->scope_start) {
+        return (p->scope_start > q->scope_start) - (p->scope_start < q->scope_start);
+    }
+    if (p->scope_end != q->scope_end) {
+        return (p->scope_end > q->scope_end) - (p->scope_end < q->scope_end);
+    }
+    return (p->start > q->start) - (p->start < q->start);
+}
+
+/* Heading levels define hierarchy for both syntaxes. Each block container
+ * gets its own six-slot stack, so headings inside quotes or list items cannot
+ * become parents of headings outside them. Sorting by container and document
+ * position also restores the outer stack after a nested container ends. */
+static void md_assign_parents(md_heading_t **by, int n) {
+    qsort(by, (size_t)n, sizeof(*by), md_by_scope);
+    for (int i = 0; i < n;) {
+        int j = i;
+        md_heading_t *parents[MD_HEADING_LEVELS] = {0};
+        while (j < n && by[j]->scope_start == by[i]->scope_start &&
+               by[j]->scope_end == by[i]->scope_end) {
+            md_heading_t *h = by[j++];
+            if (h->level < 1 || h->level > MD_HEADING_LEVELS) {
+                continue;
+            }
+            for (int k = h->level - PAIR_LEN; k >= 0; k--) {
+                if (parents[k]) {
+                    h->parent = parents[k];
+                    break;
+                }
+            }
+            parents[h->level - SKIP_ONE] = h;
+            for (int k = h->level; k < MD_HEADING_LEVELS; k++) {
+                parents[k] = NULL;
+            }
+        }
+        i = j;
+    }
+}
+
+/* A repeated heading's chain: dot-joined for its QN and '\n'-joined for
+ * identity, since a QN-safe segment has no whitespace. At most six headings. */
+static bool md_heading_chain(CBMArena *a, md_heading_t *h) {
+    const char *dotted = h->seg;
+    const char *key = h->seg;
+    for (const md_heading_t *parent = h->parent; parent; parent = parent->parent) {
+        if (!parent->seg[0]) {
+            continue; /* unnamed headings reset levels but contribute no name */
+        }
+        dotted = cbm_arena_sprintf(a, "%s.%s", parent->seg, dotted);
+        key = cbm_arena_sprintf(a, "%s\n%s", parent->seg, key);
+        if (!dotted || !key) {
+            return false;
+        }
+    }
+    h->qn_name = dotted;
+    h->key = key;
+    return true;
+}
+
+/* The immutable, sorted initial names reserve both bare headings and parent
+ * chains before any suffix is assigned. Generated names from different bases
+ * cannot coincide: removing the final ~N recovers their distinct bases. */
+static bool md_name_taken(md_headings_t *hs, const char *const *reserved, int reserved_count,
+                          const char *name) {
+    int lo = 0;
+    int hi = reserved_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / PAIR_LEN;
+        (*hs->checks)++;
+        int c = strcmp(reserved[mid], name);
+        if (c == 0) {
+            return true;
+        }
+        if (c < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    return false;
+}
+
+static int md_by_key(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    int c = strcmp(p->key ? p->key : "", q->key ? q->key : "");
+    return c ? c : (p->start > q->start) - (p->start < q->start);
+}
+
+static int md_by_start(const void *x, const void *y) {
+    const md_heading_t *p = *(const md_heading_t *const *)x;
+    const md_heading_t *q = *(const md_heading_t *const *)y;
+    return (p->start > q->start) - (p->start < q->start);
+}
+
+/* Unchanged bare headings keep their names, including inseparable repeats.
+ * Otherwise the first chain keeps the name. Group identities once, then assign
+ * one suffix per chain in document order; no repeated scans of earlier chains
+ * and no restarting the suffix search at ~2. */
+static bool md_split_run(CBMArena *a, md_headings_t *hs, const char *const *reserved,
+                         int reserved_count, md_heading_t **run, int n) {
+    const char *base = run[0]->qn_name;
+    const char *keep = run[0]->key;
+    for (int i = 0; i < n; i++) {
+        if (!run[i]->qualified) {
+            keep = NULL;
+        }
+    }
+    qsort(run, (size_t)n, sizeof(*run), md_by_key);
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n) {
+            (*hs->checks)++;
+            if (strcmp(run[i]->key ? run[i]->key : "", run[j]->key ? run[j]->key : "") != 0) {
+                break;
+            }
+            j++;
+        }
+        for (int k = i; k < j; k++) {
+            run[k]->chain = run[i];
+        }
+        i = j;
+    }
+    qsort(run, (size_t)n, sizeof(*run), md_by_start);
+    int suffix = PAIR_LEN;
+    for (int i = 0; i < n; i++) {
+        md_heading_t *h = run[i];
+        if (!h->qualified || h->chain != h || (keep && strcmp(h->key, keep) == 0)) {
+            continue;
+        }
+        const char *name;
+        do {
+            name = cbm_arena_sprintf(a, "%s~%d", base, suffix++);
+            if (!name) {
+                return false;
+            }
+        } while (md_name_taken(hs, reserved, reserved_count, name));
+        h->qn_name = name;
+    }
+    for (int i = 0; i < n; i++) {
+        if (run[i]->qualified) {
+            run[i]->qn_name = run[i]->chain->qn_name;
+        }
+    }
+    return true;
+}
+
+static bool md_settle_names(CBMArena *a, md_headings_t *hs) {
+    int n = hs->count;
+    md_heading_t **by = (md_heading_t **)cbm_arena_alloc(a, (size_t)n * sizeof(*by));
+    const char **reserved = (const char **)cbm_arena_alloc(a, (size_t)n * sizeof(*reserved));
+    if (!by || !reserved) {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        by[i] = &hs->v[i];
+    }
+    md_assign_parents(by, n);
+    /* Empty headings are structural events only, never reserved names. */
+    n = 0;
+    for (int i = 0; i < hs->count; i++) {
+        if (hs->v[i].seg[0]) {
+            by[n++] = &hs->v[i];
+        }
+    }
+    qsort(by, (size_t)n, sizeof(*by), md_by_seg);
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n && strcmp(by[j]->seg, by[i]->seg) == 0) {
+            j++;
+        }
+        if (j - i > SKIP_ONE) {
+            bool distinct = false;
+            for (int k = i; k < j; k++) {
+                if (!md_heading_chain(a, by[k])) {
+                    return false;
+                }
+                (*hs->checks)++;
+                distinct |= strcmp(by[k]->key, by[i]->key) != 0;
+            }
+            for (int k = i; k < j; k++) {
+                if (!distinct) {
+                    by[k]->qn_name = by[k]->seg;
+                }
+                by[k]->qualified = strcmp(by[k]->qn_name, by[k]->seg) != 0;
+            }
+        }
+        i = j;
+    }
+    qsort(by, (size_t)n, sizeof(*by), md_by_name);
+    for (int i = 0; i < n; i++) {
+        reserved[i] = by[i]->qn_name;
+    }
+    for (int i = 0; i < n;) {
+        int j = i + SKIP_ONE;
+        while (j < n && strcmp(reserved[j], reserved[i]) == 0) {
+            j++;
+        }
+        if (j - i > SKIP_ONE && !md_split_run(a, hs, reserved, n, by + i, j - i)) {
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+static const md_headings_t *md_headings(CBMExtractCtx *ctx) {
+    if (ctx->md_headings) {
+        return (const md_headings_t *)ctx->md_headings;
+    }
+    CBMArena *a = doc_scratch(ctx);
+    md_headings_t *hs = (md_headings_t *)cbm_arena_alloc(a, sizeof(*hs));
+    if (!hs) {
+        return NULL;
+    }
+    hs->checks = &ctx->result->markdown_name_checks;
+    int cap = md_collect_headings(ctx, a, NULL, 0);
+    hs->v = cap > 0 ? (md_heading_t *)cbm_arena_alloc(a, (size_t)cap * sizeof(md_heading_t)) : NULL;
+    hs->count = hs->v ? md_collect_headings(ctx, a, hs->v, cap) : 0;
+    if (hs->count < 0) {
+        hs->count = 0;
+    }
+    if (hs->count > SKIP_ONE && !md_settle_names(a, hs)) {
+        hs->count = 0; /* every heading keeps its own name, as before */
+    }
+    ctx->md_headings = hs;
+    return hs;
+}
+
+/* The QN segment of a heading: its own name unless the file's names say
+ * otherwise. */
+static const char *md_heading_qn_name(CBMExtractCtx *ctx, TSNode heading, const char *seg) {
+    const md_headings_t *hs = md_headings(ctx);
+    uint32_t start = ts_node_start_byte(heading);
+    int lo = 0;
+    int hi = hs ? hs->count : 0;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) / PAIR_LEN);
+        if (hs->v[mid].start < start) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    if (hs && lo < hs->count && hs->v[lo].start == start && strcmp(hs->v[lo].seg, seg) == 0) {
+        return hs->v[lo].qn_name;
+    }
+    return seg;
 }
 
 // INI: extract section name from section node.
@@ -7665,7 +8146,10 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         return false;
     }
 
-    if (name && name[0]) {
+    if (name && name[0] && ctx->language == CBM_LANG_MARKDOWN) {
+        const char *seg = qn_safe_segment(a, name);
+        push_class_def_qn(ctx, node, name, md_heading_qn_name(ctx, node, seg), label, docstring);
+    } else if (name && name[0]) {
         push_simple_class_def_doc(ctx, node, name, label, docstring);
     }
     return true;
@@ -7906,9 +8390,15 @@ static const char *cs_namespace_decl_name(CBMArena *a, TSNode ns, const char *so
 /* Declared namespace of a C# type declaration: every enclosing namespace
  * block (outer to inner) under an optional file-scoped namespace, which the
  * grammar may attach either as an ancestor or as a preceding sibling of the
- * compilation unit's members. NULL = global namespace. The file-level
- * namespace_name keeps only the FIRST namespace of a file, which mislabels
- * every type of a multi-namespace file (#2120). */
+ * compilation unit's members. "" = the global namespace, NULL = unknown. The
+ * file-level namespace_name keeps only the FIRST namespace of a file, which
+ * mislabels every type of a multi-namespace file (#2120).
+ *
+ * "No namespace found" proves the global namespace only for a clean parse:
+ * error recovery can dissolve a namespace declaration around a construct the
+ * grammar does not know (a `ref partial struct` with members does it), leaving
+ * the types after it parented straight under the compilation unit. Calling
+ * those global would let them hide every imported type of the same name. */
 static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *source) {
     const char *acc = NULL;
     bool file_scoped = false;
@@ -7942,7 +8432,10 @@ static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *
             }
         }
     }
-    return acc;
+    if (acc) {
+        return acc;
+    }
+    return ts_node_has_error(top) ? NULL : "";
 }
 
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
@@ -8349,6 +8842,15 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
         def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
     }
     def.base_classes = class_base_names(a, node, ctx->source, ctx->language);
+    // Go identity alias `type A = B` (#2033): keep the aliased type text so the
+    // cross-file registries can set alias_of. A defined type `type A B` is a
+    // type_spec and never gets here with this kind.
+    if (ctx->language == CBM_LANG_GO && strcmp(kind, "type_alias") == 0) {
+        TSNode target = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        if (!ts_node_is_null(target)) {
+            def.alias_target = cbm_node_text(a, target, ctx->source);
+        }
+    }
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(ctx, node, name);
 
@@ -8356,6 +8858,10 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
 
     if (strcmp(label, "Enum") == 0) {
         extract_enum_members(ctx, node, class_qn);
+    }
+
+    if (ctx->language == CBM_LANG_JAVA && strcmp(kind, "record_declaration") == 0) {
+        extract_record_accessors(ctx, node, class_qn);
     }
 
     // Extract methods inside the class
@@ -9279,8 +9785,297 @@ static TSNode elixir_call_args(TSNode node) {
     return args;
 }
 
-// Handle Elixir def/defp/defmacro — extract function definition.
-static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char *macro) {
+/* Combine one folded clause's metric with the function's value so far. A clause
+ * whose walk could not finish reports CBM_WALK_METRIC_UNAVAILABLE, and so does
+ * the folded function: a sum that skipped that clause would read low on exactly
+ * the largest functions. */
+static int elixir_fold_metric_sum(int acc, int clause) {
+    if (acc < 0 || clause < 0) {
+        return CBM_WALK_METRIC_UNAVAILABLE;
+    }
+    return acc + clause;
+}
+
+static int elixir_fold_metric_max(int acc, int clause) {
+    if (acc < 0 || clause < 0) {
+        return CBM_WALK_METRIC_UNAVAILABLE;
+    }
+    return clause > acc ? clause : acc;
+}
+
+// Fold one more clause of an Elixir function into the def already pushed for
+// the previous clause. Every clause is its own `def` call, and an Elixir QN
+// carries neither module nor arity, so all of them compute one qualified name
+// and collide on a single graph node. cbm_gbuf_upsert_node breaks a same-QN
+// collision by keeping the LARGEST start_line, so the survivor was the last
+// clause in the file and get_code_snippet returned that clause as the whole
+// function: `def admin?(%__MODULE__{role: :admin}), do: true` /
+// `def admin?(%__MODULE__{}), do: false` read back as a predicate that always
+// returns false. One node per function is right, so widen its span instead.
+//
+// Two bounds keep the widened span honest, and a clause folds only if it clears
+// both:
+//   - Same module body. `scope` is the do_block the previous clause was written
+//     in, so a nested `defmodule` cannot merge with its parent: the QN carries
+//     no module, so `Outer.run` and `Outer.Inner.run` compute the same name and
+//     are array-adjacent when Inner is declared just above Outer's own clause.
+//   - Same group. Only the immediately preceding EXTRACTED definition is a
+//     candidate, so a def of another name between two same-named defs ends the
+//     group. That is a bound this code imposes, not a guarantee Elixir gives:
+//     the compiler only WARNS ("clauses with the same name and arity should be
+//     grouped together"), it warns per name AND arity while this QN is
+//     arity-free, and non-contiguous clauses do compile. Split clauses
+//     therefore keep separate nodes, which is the pre-existing behaviour.
+//     What the group bound does NOT exclude is a non-definition construct
+//     between two clauses: `@doc` / `@spec` are unary_operators, `use` /
+//     `alias` / `describe` are ordinary calls, and a `defimpl` block's inner
+//     defs are not extracted -- none of them push a def, so anything of that
+//     kind written between two clauses of one function ends up inside the
+//     widened span, and that is not rare. Measured by indexing one 970-file
+//     Elixir lib tree with the binary built from this commit's parent and with
+//     this one and diffing the `nodes` rows out of the two SQLite stores: 6,996
+//     Function nodes widen their span, none is added, none is lost and none
+//     narrows. Reading each widened span for a module-body construct written at
+//     the module's own two-space indent, which no clause body reaches, 169 of
+//     the 6,996 cover such a line. Counting each node once per kind, 123 cover
+//     a typespec attribute (@spec/@type/@typep/@opaque/@callback/
+//     @macrocallback), 100 an @doc or @typedoc, 46 a bare comment line, 14 an
+//     @impl, and none a `use`, `alias`, `import`, `require` or a module-level
+//     `quote`. Swallowed typespecs are the largest attribute kind, not an
+//     absent one.
+//
+// The widened span also admits a phantom call that a narrower span kept out,
+// which is why the head suppression in extract_calls.c travels with this fold
+// rather than after it. cbm.c flags self-recursion by finding the innermost
+// Function whose [start_line, end_line] contains a recorded call whose short
+// name matches the function's own, so any pre-existing phantom between the
+// first and the last clause becomes a self-edge as soon as the span covers it.
+// That cost is real and is measured rather than asserted away. Same corpus,
+// reading each flagged node's own source span for any line that names it as a
+// call, a capture or a pipe target, counting a one-line clause's body after
+// `, do:` as such a line: self_recursive Function nodes go 129 -> 430, and the
+// ones carrying no self-call form anywhere in their span go 6 -> 48. The lines
+// responsible are the typespec heads the widened span now covers -- `@spec
+// f(t) :: u` puts the declared name in a `call` node, and the unified walk
+// reads it as code -- a separate defect with a separate fix, not something this
+// fold can close.
+//
+// Skipping the typespec subtrees, later in this stack, closes that half: the
+// same method then reports 389 self_recursive Function nodes and 8 with no
+// self-call form, against 129 and 6 on the base. All 8 are the pre-existing
+// phantom a local variable sharing the function's name mints (`defp slug(value)
+// do slug = ...`), 6 of them already present on the base; the other 2 are
+// guarded clauses that only have a node of their own to be flagged on because
+// of this stack.
+//
+// What the fold and the head suppression together remove is 2,436 edges, none
+// of them added back: see elixir_call_is_definition_role in extract_calls.c.
+//
+// A clause whose macro differs (`def` foo/1 beside `defp` foo/2) still folds,
+// because the arity-free QN already puts both on one node; is_exported is then
+// the OR over the folded clauses, so a name any clause exports stays exported.
+// That OR changes a recorded flag, which the node diff confirms and which is
+// worth stating rather than leaving to be discovered: on the same corpus
+// exactly 6 Function nodes change is_exported, all false -> true and none the
+// other way. Each is a `def` clause written above a `defp` clause of the same
+// name, where the pre-patch last-clause-wins record reported a publicly
+// callable name as unexported. Verified against the source in every one: the
+// new value is the correct one.
+// `cx` is this clause's own complexity; a folded clause adds it to the function.
+// Returns true when the clause folded.
+static bool fold_elixir_clause(CBMExtractCtx *ctx, const char *qn, TSNode scope, TSNode node,
+                               uint32_t end_line, bool is_exported, const cbm_complexity_t *cx) {
+    if (!qn || ctx->result->defs.count <= 0 || ts_node_is_null(scope)) {
+        return false;
+    }
+    TSNode here = ts_node_parent(node);
+    if (ts_node_is_null(here) || !ts_node_eq(here, scope)) {
+        return false;
+    }
+    CBMDefinition *prev = &ctx->result->defs.items[ctx->result->defs.count - 1];
+    if (!prev->label || strcmp(prev->label, "Function") != 0 || !prev->qualified_name ||
+        strcmp(prev->qualified_name, qn) != 0) {
+        return false;
+    }
+    /* Only end_line moves. prev->start_line is already the minimum, so this
+     * takes no start_line argument: a clause folds only into the def pushed
+     * for the immediately preceding extracted clause of the same do_block, and
+     * extract_elixir_call pushes a do_block's children onto its stack in
+     * reverse index order so they pop in source order. A `start_line <
+     * prev->start_line` guard here would be unreachable; if that traversal
+     * ever stops being source-ordered, this is the line that has to change
+     * with it. */
+    if (end_line > prev->end_line) {
+        prev->end_line = end_line;
+    }
+    prev->is_exported = prev->is_exported || is_exported;
+    /* One node now stands for every clause, so its metrics cover every clause
+     * rather than the first: branch and loop counts add up, the nesting depths
+     * take the deepest clause, and each clause past the first is one more
+     * dispatch decision. A multi-clause function with no branch in any body is
+     * still a decision tree over its heads. `lines` follows the widened span. */
+    int cyclomatic = elixir_fold_metric_sum(prev->complexity, cx->cyclomatic);
+    prev->complexity = cyclomatic < 0 ? cyclomatic : cyclomatic + 1;
+    prev->cognitive = elixir_fold_metric_sum(prev->cognitive, cx->cognitive);
+    prev->loop_count = elixir_fold_metric_sum(prev->loop_count, cx->loop_count);
+    prev->loop_depth = elixir_fold_metric_max(prev->loop_depth, cx->loop_depth);
+    prev->max_access_depth = elixir_fold_metric_max(prev->max_access_depth, cx->max_access_depth);
+    prev->lines = (int)(prev->end_line - prev->start_line + TS_LINE_OFFSET);
+    return true;
+}
+
+/* True when node `n` spans exactly the text `lit`. Avoids an arena allocation
+ * per node in the complexity walk, which visits every node of every def. */
+static bool elixir_node_text_is(TSNode n, const char *source, const char *lit) {
+    if (ts_node_is_null(n)) {
+        return false;
+    }
+    uint32_t s = ts_node_start_byte(n);
+    uint32_t e = ts_node_end_byte(n);
+    size_t len = strlen(lit);
+    return (size_t)(e - s) == len && strncmp(source + s, lit, len) == 0;
+}
+
+/* Elixir has no branching NODE TYPES. `if`, `unless`, `case`, `cond`, `with`,
+ * `for`, `try` and `receive` are ordinary `call` nodes told apart only by the
+ * identifier in callee position, and every case/cond/fn/rescue arm is a
+ * `stab_clause`. lang_specs.c cannot express that — the Elixir branch table is
+ * `{"call"}`, which would score every function call as a decision — and
+ * cbm_compute_complexity matches on node type, so the generic path is unusable
+ * and every Elixir function shipped complexity 0.
+ *
+ * Counted here: the branching construct itself, every `stab_clause`, the
+ * short-circuit operators, and `when` guards. Container AND arm are both
+ * counted, which is the convention the generic tables already use — Go counts
+ * `expression_switch_statement` plus each `expression_case`, Python counts
+ * `try_statement` plus each `except_clause`. Cognitive weighting is Campbell's,
+ * identical to the generic walk (+1 plus the current nesting depth). */
+static bool elixir_is_branch_call(TSNode call, const char *source) {
+    if (ts_node_child_count(call) == 0) {
+        return false;
+    }
+    TSNode callee = ts_node_child(call, 0);
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "identifier") != 0) {
+        return false;
+    }
+    return elixir_node_text_is(callee, source, "if") ||
+           elixir_node_text_is(callee, source, "unless") ||
+           elixir_node_text_is(callee, source, "with") ||
+           elixir_node_text_is(callee, source, "for") ||
+           elixir_node_text_is(callee, source, "case") ||
+           elixir_node_text_is(callee, source, "cond") ||
+           elixir_node_text_is(callee, source, "try") ||
+           elixir_node_text_is(callee, source, "receive");
+}
+
+/* A comprehension (`for x <- xs, do: ...`) is Elixir's only real loop node.
+ * Enum.map/reduce iterate too, but they are plain function calls; counting them
+ * would make loop_depth meaningless, so they are left out. */
+static bool elixir_is_loop_call(TSNode call, const char *source) {
+    if (ts_node_child_count(call) == 0) {
+        return false;
+    }
+    TSNode callee = ts_node_child(call, 0);
+    return !ts_node_is_null(callee) && strcmp(ts_node_type(callee), "identifier") == 0 &&
+           elixir_node_text_is(callee, source, "for");
+}
+
+static bool elixir_is_branch_operator(TSNode node, const char *source) {
+    TSNode op = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    return elixir_node_text_is(op, source, "&&") || elixir_node_text_is(op, source, "||") ||
+           elixir_node_text_is(op, source, "and") || elixir_node_text_is(op, source, "or") ||
+           elixir_node_text_is(op, source, "when");
+}
+
+/* The pending frames live on the same growable stack as cbm_compute_complexity:
+ * a small on-stack first chunk that spills to the heap through
+ * cbm_walk_stack_reserve, so a wide body is never truncated and no thread pays
+ * for a large fixed array. If the stack cannot grow, every metric reports
+ * CBM_WALK_METRIC_UNAVAILABLE instead of a silently low count. */
+static void elixir_compute_complexity(TSNode node, const char *source, cbm_complexity_t *out) {
+    enum { ELIXIR_CX_STACK_INLINE = 512 };
+    struct elixir_cx_frame {
+        TSNode node;
+        int bdepth;
+        int ldepth;
+        int adepth;
+    };
+    struct elixir_cx_frame inline_stack[ELIXIR_CX_STACK_INLINE];
+    struct elixir_cx_frame *stack = inline_stack;
+    int cap = ELIXIR_CX_STACK_INLINE;
+    memset(out, 0, sizeof(*out));
+    int top = 0;
+    stack[top].node = node;
+    stack[top].bdepth = 0;
+    stack[top].ldepth = 0;
+    stack[top].adepth = 0;
+    top++;
+    while (top > 0) {
+        int cur = --top;
+        TSNode n = stack[cur].node;
+        int bdepth = stack[cur].bdepth;
+        int ldepth = stack[cur].ldepth;
+        int adepth = stack[cur].adepth;
+        const char *kind = ts_node_type(n);
+        bool is_branch = false;
+        if (strcmp(kind, "stab_clause") == 0) {
+            is_branch = true;
+        } else if (strcmp(kind, "call") == 0) {
+            is_branch = elixir_is_branch_call(n, source);
+        } else if (strcmp(kind, "binary_operator") == 0) {
+            is_branch = elixir_is_branch_operator(n, source);
+        }
+        int child_b = bdepth;
+        int child_l = ldepth;
+        /* `conn.assigns.user` nests as dot(dot(conn)), so consecutive `dot`
+         * nodes deepen the chain and anything else resets it. */
+        int child_a = 0;
+        if (strcmp(kind, "dot") == 0) {
+            child_a = adepth + 1;
+            if (child_a > out->max_access_depth) {
+                out->max_access_depth = child_a;
+            }
+        }
+        if (is_branch) {
+            out->cyclomatic++;
+            out->cognitive += 1 + bdepth;
+            child_b = bdepth + 1;
+        }
+        if (strcmp(kind, "call") == 0 && elixir_is_loop_call(n, source)) {
+            out->loop_count++;
+            int d = ldepth + 1;
+            if (d > out->loop_depth) {
+                out->loop_depth = d;
+            }
+            child_l = d;
+        }
+        uint32_t nc = ts_node_child_count(n);
+        if (!cbm_walk_stack_reserve((void **)&stack, &cap, top + (int)nc,
+                                    sizeof(struct elixir_cx_frame), inline_stack,
+                                    "elixir_compute_complexity")) {
+            out->cyclomatic = CBM_WALK_METRIC_UNAVAILABLE;
+            out->cognitive = CBM_WALK_METRIC_UNAVAILABLE;
+            out->loop_count = CBM_WALK_METRIC_UNAVAILABLE;
+            out->loop_depth = CBM_WALK_METRIC_UNAVAILABLE;
+            out->max_access_depth = CBM_WALK_METRIC_UNAVAILABLE;
+            break;
+        }
+        for (int i = (int)nc - 1; i >= 0; i--) {
+            stack[top].node = ts_node_child(n, (uint32_t)i);
+            stack[top].bdepth = child_b;
+            stack[top].ldepth = child_l;
+            stack[top].adepth = child_a;
+            top++;
+        }
+    }
+    cbm_walk_stack_release(stack, inline_stack);
+}
+
+// Handle Elixir def/defp/defmacro — extract function definition. `scope` is the
+// module body the previous clause was extracted from, and is updated to this
+// def's own module body; see fold_elixir_clause for what it bounds.
+static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char *macro,
+                                    TSNode *scope) {
     CBMArena *a = ctx->arena;
     TSNode args = elixir_call_args(node);
     if (ts_node_is_null(args)) {
@@ -9291,6 +10086,16 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
     if (ts_node_is_null(first_arg)) {
         return;
     }
+
+    // `def name(args) when guard` parses the whole head as a `when`
+    // binary_operator, so the name lives on its left operand rather than
+    // directly under the call. Without unwrapping it, every guarded clause is
+    // dropped, and a function whose clauses ALL carry guards never appears in
+    // the graph at all -- silently, since a missing definition is not an error.
+    // The unwrap lives in helpers.c because it peels only `when`: an operator
+    // definition (`def a + b`) is a binary_operator head too, and unwrapping
+    // that one would name the function after its own left parameter.
+    first_arg = cbm_elixir_def_head_unwrap_guard(first_arg);
 
     const char *fk = ts_node_type(first_arg);
     char *name = NULL;
@@ -9303,15 +10108,40 @@ static void extract_elixir_func_def(CBMExtractCtx *ctx, TSNode node, const char 
         return;
     }
 
+    const char *qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    uint32_t start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    uint32_t end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    bool is_exported = (strcmp(macro, "def") == 0 || strcmp(macro, "defmacro") == 0);
+    cbm_complexity_t cx;
+    elixir_compute_complexity(node, ctx->source, &cx);
+    bool folded = fold_elixir_clause(ctx, qn, *scope, node, end_line, is_exported, &cx);
+    *scope = ts_node_parent(node);
+    if (folded) {
+        return;
+    }
+
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = qn;
     def.label = "Function";
     def.file_path = ctx->rel_path;
-    def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
-    def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
-    def.is_exported = (strcmp(macro, "def") == 0 || strcmp(macro, "defmacro") == 0);
+    def.start_line = start_line;
+    def.end_line = end_line;
+    def.is_exported = is_exported;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+    def.complexity = cx.cyclomatic;
+    def.cognitive = cx.cognitive;
+    def.loop_count = cx.loop_count;
+    def.loop_depth = cx.loop_depth;
+    def.max_access_depth = cx.max_access_depth;
+    /* Fingerprint off the body, not the whole def call: including the head
+     * would make every clause of a name look alike. Elixir was the only
+     * language emitting Functions with no fingerprint at all, so it never
+     * appeared in similarity or duplicate results. Runs after `lines` — the
+     * AST profile reads it. */
+    TSNode fp_body = cbm_find_child_by_kind(node, "do_block");
+    compute_fingerprint(ctx, &def, ts_node_is_null(fp_body) ? node : fp_body);
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
@@ -9348,6 +10178,10 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
 // without recursion between extract_elixir_call ↔ extract_elixir_module_def.
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     (void)spec;
+    /* Module body the last extracted clause was written in; see
+     * fold_elixir_clause. Null until the first def, so nothing folds into a
+     * def left over from a previous top-level call node. */
+    TSNode def_scope = {0};
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_64);
     ts_nstack_push(&stack, node);
@@ -9370,12 +10204,17 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 
         if (strcmp(macro, "def") == 0 || strcmp(macro, "defp") == 0 ||
             strcmp(macro, "defmacro") == 0) {
-            extract_elixir_func_def(ctx, cur, macro);
+            extract_elixir_func_def(ctx, cur, macro, &def_scope);
         } else if (strcmp(macro, "if") == 0 || strcmp(macro, "unless") == 0) {
             /* A compile-time if/unless in a module body defines functions
              * under a condition: its do and else branches hold variants of the
              * same definitions (graph_buffer.c, "Definition variants"). The
-             * grammar nests the else_block inside the do_block. */
+             * grammar nests the else_block inside the do_block.
+             * The clause fold composes with this: fold_elixir_clause only
+             * folds a clause into one written in the same block, and each
+             * branch is its own block, so the clauses of one branch fold into
+             * one definition while the branches stay separate definitions that
+             * the graph buffer merges as variants of one identity. */
             TSNode branch = cbm_find_child_by_kind(cur, "do_block");
             for (int pass = 0; pass < 2 && !ts_node_is_null(branch); pass++) {
                 uint32_t bc = ts_node_child_count(branch);
@@ -9692,6 +10531,121 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
         if (is_enum_member_kind(ts_node_type(member))) {
             push_enum_member(ctx, member, member, &scope);
         }
+    }
+}
+
+/* Whether the record body declares this accessor itself (JLS §8.10.3 lets a
+ * record override any of them), so the implicit one is not emitted twice. */
+static bool record_declares_accessor(CBMExtractCtx *ctx, TSNode node, const char *comp_name) {
+    TSNode body = find_class_body(node, ctx->language);
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    uint32_t mc = ts_node_named_child_count(body);
+    for (uint32_t mi = 0; mi < mc; mi++) {
+        TSNode member = ts_node_named_child(body, mi);
+        if (strcmp(ts_node_type(member), "method_declaration") != 0) {
+            continue;
+        }
+        TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
+        if (ts_node_is_null(mname)) {
+            continue;
+        }
+        char *name = cbm_node_text(ctx->arena, mname, ctx->source);
+        if (!name || strcmp(name, comp_name) != 0) {
+            continue;
+        }
+        /* Same name, no parameters — that is the accessor. */
+        TSNode params = ts_node_child_by_field_name(member, TS_FIELD("parameters"));
+        if (ts_node_is_null(params)) {
+            return true;
+        }
+        /* Comments are named extras, not parameters. */
+        bool has_parameters = false;
+        uint32_t pc = ts_node_named_child_count(params);
+        for (uint32_t pi = 0; pi < pc; pi++) {
+            if (!ts_node_is_extra(ts_node_named_child(params, pi))) {
+                has_parameters = true;
+                break;
+            }
+        }
+        if (!has_parameters) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Java records: the compiler writes one accessor per component, so `p.x()`
+ * calls a method that appears nowhere in the source. Without a definition for
+ * it the call has nothing to resolve to and falls through to the project-wide
+ * name registry, which binds it to the first `x` in the tree — typically an
+ * unrelated class's private field. Emitting the accessors makes the record's
+ * own API visible, exactly as the language defines it (JLS §8.10.3). */
+static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    if (ts_node_is_null(params)) {
+        return;
+    }
+    uint32_t pc = ts_node_named_child_count(params);
+    for (uint32_t pi = 0; pi < pc; pi++) {
+        TSNode comp = ts_node_named_child(params, pi);
+        bool spread = strcmp(ts_node_type(comp), "spread_parameter") == 0;
+        if (!spread && strcmp(ts_node_type(comp), "formal_parameter") != 0) {
+            continue;
+        }
+        TSNode cname = ts_node_child_by_field_name(comp, TS_FIELD("name"));
+        TSNode ctype = ts_node_child_by_field_name(comp, TS_FIELD("type"));
+        if (spread) {
+            /* Java varargs have an unnamed type child and a nested declarator. */
+            TSNode decl = cbm_find_child_by_kind(comp, "variable_declarator");
+            if (ts_node_is_null(decl)) {
+                continue;
+            }
+            cname = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+            uint32_t nc = ts_node_named_child_count(comp);
+            for (uint32_t ci = 0; ci < nc; ci++) {
+                TSNode child = ts_node_named_child(comp, ci);
+                if (!ts_node_is_extra(child) && strcmp(ts_node_type(child), "modifiers") != 0) {
+                    ctype = child;
+                    break;
+                }
+            }
+        }
+        if (ts_node_is_null(cname)) {
+            continue;
+        }
+        char *comp_name = cbm_node_text(a, cname, ctx->source);
+        if (!comp_name || !comp_name[0] || record_declares_accessor(ctx, node, comp_name)) {
+            continue;
+        }
+        CBMDefinition adef;
+        memset(&adef, 0, sizeof(adef));
+        adef.name = comp_name;
+        adef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, comp_name);
+        adef.label = "Method";
+        adef.file_path = ctx->rel_path;
+        adef.start_line = ts_node_start_point(comp).row + TS_LINE_OFFSET;
+        adef.end_line = ts_node_end_point(comp).row + TS_LINE_OFFSET;
+        adef.lines = 1;
+        adef.parent_class = class_qn;
+        adef.is_exported = true;
+        if (!ts_node_is_null(ctype)) {
+            const char *type = cbm_node_text(a, ctype, ctx->source);
+            adef.return_type = spread && type ? cbm_arena_sprintf(a, "%s[]", type) : type;
+        }
+        /* The compiler writes this member and the source never spells it: its
+         * node says so, and the pipeline registers it by qualified name only,
+         * so no short-name guess can land on it. */
+        const char **kv = (const char **)cbm_arena_alloc(a, CBM_SZ_3 * sizeof(char *));
+        if (kv) {
+            kv[0] = CBM_PROP_GENERATED;
+            kv[SKIP_ONE] = "record";
+            kv[PAIR_LEN] = NULL;
+        }
+        adef.extra_props = kv;
+        cbm_defs_push(&ctx->result->defs, a, adef);
     }
 }
 
