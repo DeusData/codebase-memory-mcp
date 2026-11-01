@@ -737,22 +737,26 @@ TEST(probe_func_imports_edge) {
     ASSERT_TRUE(m.ok);
     /* The original directive lacks FunC's required semicolon. */
     ASSERT_EQ(m.imports, 0);
-    const GpdFile valid[] = {files[0], {"valid.fc", "#include \"utils.fc\";\n() valid() {}\n"}};
+    static const char valid_source[] = "#include \"utils.fc\";\n() valid() {}\n";
+    static const char literal[] = "\"utils.fc\"";
+    const int literal_start = (int)(strstr(valid_source, literal) - valid_source);
+    const GpdFile valid[] = {files[0], {"valid.fc", valid_source}};
     GpdProj lp;
     cbm_store_t *store = gpd_index_files(&lp, valid, 2);
     sqlite3_stmt *query = NULL;
-    /* Legacy import records have 0/0 spans. Require exact physical endpoints
-     * and matching persisted evidence without claiming an occurrence span. */
+    /* Require the exact literal occurrence, physical endpoints and matching evidence. */
     const char *sql = "SELECT count(*) FROM resolver_occurrences r "
                       "JOIN nodes s ON s.project=r.project AND s.qualified_name=r.scope "
                       "JOIN nodes t ON t.project=r.project AND t.qualified_name=r.target "
                       "JOIN edges e ON e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
                       "WHERE r.project=?1 AND r.relation='IMPORTS' AND r.emitted=1 "
-                      "AND r.start_byte=0 AND r.end_byte=0 AND s.file_path='valid.fc' "
+                      "AND r.start_byte=?2 AND r.end_byte=?3 AND s.file_path='valid.fc' "
                       "AND s.label='File' AND t.file_path='utils.fc' AND t.label='File'";
     bool ok = store && cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") == 1 &&
               sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) == SQLITE_OK &&
               sqlite3_bind_text(query, 1, lp.project, -1, SQLITE_STATIC) == SQLITE_OK &&
+              sqlite3_bind_int(query, 2, literal_start) == SQLITE_OK &&
+              sqlite3_bind_int(query, 3, literal_start + (int)strlen(literal)) == SQLITE_OK &&
               sqlite3_step(query) == SQLITE_ROW && sqlite3_column_int(query, 0) == 1;
     sqlite3_finalize(query);
     gpd_cleanup(&lp, store);

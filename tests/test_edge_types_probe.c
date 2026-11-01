@@ -2420,12 +2420,7 @@ TEST(http_calls_resttemplate_java) {
          .route_qn = "__route__GET__/api/orders",
          .property = "method",
          .value = "GET",
-         .required = false,
-         .gap_id = "resttemplate-receiver-service",
-         .why = "The literal endpoint is genuine; its declared field receiver and argument "
-                "applicability remain unproved.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .required = true},
         {.case_id = "resttemplate-route-placeOrder",
          .site = {.file = "OrderClient.java",
                   .caller = "OrderClient.placeOrder",
@@ -2440,12 +2435,7 @@ TEST(http_calls_resttemplate_java) {
          .route_qn = "__route__POST__/api/orders",
          .property = "method",
          .value = "POST",
-         .required = false,
-         .gap_id = "resttemplate-receiver-service",
-         .why = "The literal endpoint is genuine; its declared field receiver and argument "
-                "applicability remain unproved.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .required = true},
         {.case_id = "required-service-route",
          .site = {.file = "quality/service.mjs",
                   .caller = "request",
@@ -2731,13 +2721,7 @@ TEST(async_calls_celery_python) {
                     .declaration_line = 6,
                     .declaration_text =
                         "    def send_task(self, name, args=None): return (name, args)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "python-imported-instance-keyword-call",
-         .why = "Imported mutable instance identity and keyword/default arguments are outside the "
-                "receiver-only Python method proof subset.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "celery-order_shipped",
          .site = {.file = "tasks/order_tasks.py",
                   .caller = "dispatch_order_shipped",
@@ -2749,13 +2733,7 @@ TEST(async_calls_celery_python) {
                     .declaration_line = 6,
                     .declaration_text =
                         "    def send_task(self, name, args=None): return (name, args)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "python-imported-instance-keyword-call",
-         .why = "Imported mutable instance identity and keyword/default arguments are outside the "
-                "receiver-only Python method proof subset.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "required-celery-free-function",
          .site = {.file = "quality_client.py",
                   .caller = "invoke_control",
@@ -2807,10 +2785,11 @@ TEST(async_calls_celery_python) {
          .value = "celery",
          .required = false,
          .gap_id = "celery-imported-instance-service",
-         .why = "The literal topic is known, but the remote app instance and send_task argument "
-                "binding remain unproved.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
         {.case_id = "celery-topic-order_shipped",
          .site = {.file = "tasks/order_tasks.py",
                   .caller = "dispatch_order_shipped",
@@ -2827,10 +2806,11 @@ TEST(async_calls_celery_python) {
          .value = "celery",
          .required = false,
          .gap_id = "celery-imported-instance-service",
-         .why = "The literal topic is known, but the remote app instance and send_task argument "
-                "binding remain unproved.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
         {.case_id = "required-celery-classification",
          .site = {.file = "quality_client.py",
                   .caller = "invoke_control",
@@ -2904,13 +2884,7 @@ TEST(async_calls_celery_wall_stall_seam) {
                     .declaration_line = 6,
                     .declaration_text =
                         "    def send_task(self, name, args=None): return (name, args)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "python-imported-instance-keyword-call",
-         .why = "Imported mutable instance identity and keyword/default arguments are outside the "
-                "receiver-only Python method proof subset.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "celery-order_shipped",
          .site = {.file = "tasks/order_tasks.py",
                   .caller = "dispatch_order_shipped",
@@ -2922,13 +2896,7 @@ TEST(async_calls_celery_wall_stall_seam) {
                     .declaration_line = 6,
                     .declaration_text =
                         "    def send_task(self, name, args=None): return (name, args)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "python-imported-instance-keyword-call",
-         .why = "Imported mutable instance identity and keyword/default arguments are outside the "
-                "receiver-only Python method proof subset.",
-         .tried =
-             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
-             "fixture and required independent control retained. No permissive namesake fallback."},
+         .mode = RQ_REQUIRED},
         {.case_id = "required-stalled-module-call",
          .site = {.file = "quality_client.py",
                   .caller = "invoke_control",
@@ -2980,10 +2948,11 @@ TEST(async_calls_celery_wall_stall_seam) {
          .value = "celery",
          .required = false,
          .gap_id = "celery-imported-instance-service",
-         .why = "The literal topic is known, but the remote app instance and send_task argument "
-                "binding remain unproved.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
         {.case_id = "celery-topic-order_shipped",
          .site = {.file = "tasks/order_tasks.py",
                   .caller = "dispatch_order_shipped",
@@ -3000,10 +2969,11 @@ TEST(async_calls_celery_wall_stall_seam) {
          .value = "celery",
          .required = false,
          .gap_id = "celery-imported-instance-service",
-         .why = "The literal topic is known, but the remote app instance and send_task argument "
-                "binding remain unproved.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
         {.case_id = "required-celery-classification",
          .site = {.file = "quality_client.py",
                   .caller = "invoke_control",
@@ -3925,27 +3895,22 @@ TEST(writes_go) {
                                                      "func Reset() {\n"
                                                      "    store = nil\n}\n"}};
     const EtFile decoy = {"decoy/cache.go", "package foreign\nvar store map[string]string\n"};
-    const RQ_Expected gap = {
-        .case_id = "writes_go-exact-declaration-write",
-        .site = {.file = "cache.go",
-                 .caller = "cache.Reset",
-                 .needle = "store",
-                 .occurrence_index = 3},
-        .relation = "WRITES",
-        .target = {.file = "cache.go",
-                   .suffix = "cache.store",
-                   .label = "Variable",
-                   .declaration_line = 3,
-                   .declaration_text = "var store map[string]string"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "go-package-variable-write",
-        .why = "Reset assigns the declared package variable directly; it has no local shadow. The "
-               "Go bridge does not yet prove write-target occurrences.",
-        .tried = "The original source is unchanged. This exact assignment is measured in both "
-                 "pipeline paths alongside a required supported call and a forbidden foreign "
-                 "target; no edge-count substitute can satisfy it."};
+    /* Reset assigns the declared package variable directly; it has no local shadow. A Go
+     * package's identity is its directory, so this root file's names carry no "cache" part. */
+    const RQ_Expected gap = {.case_id = "writes_go-exact-declaration-write",
+                             .site = {.file = "cache.go",
+                                      .caller = "Reset",
+                                      .needle = "store",
+                                      .occurrence_index = 3},
+                             .relation = "WRITES",
+                             .target = {.file = "cache.go",
+                                        .suffix = "store",
+                                        .label = "Variable",
+                                        .declaration_line = 3,
+                                        .declaration_text = "var store map[string]string"},
+                             .mode = RQ_REQUIRED};
     const RQ_Target wrong = {.file = "decoy/cache.go",
-                             .suffix = "cache.store",
+                             .suffix = "decoy.store",
                              .label = "Variable",
                              .declaration_line = 2,
                              .declaration_text = "var store map[string]string"};
