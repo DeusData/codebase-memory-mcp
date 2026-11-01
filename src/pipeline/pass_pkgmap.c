@@ -6243,10 +6243,10 @@ char *cbm_pipeline_c_generated_source(const cbm_pipeline_ctx_t *ctx, const char 
     if (written <= 0 || (size_t)written >= sizeof(stem))
         return NULL;
     char *directory = path_dirname(includer);
-    bool near = directory && cbm_repo_rel_join(directory, stem, beside, sizeof(beside)) &&
-                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, beside);
+    bool found_beside = directory && cbm_repo_rel_join(directory, stem, beside, sizeof(beside)) &&
+                        cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, beside);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
-    if (near)
+    if (found_beside)
         return cbm_pipeline_fqn_compute(ctx->project_name, beside, "__file__");
     written = snprintf(key, sizeof(key), "@cbm:incpath:%s", stem);
     if (written <= 0 || (size_t)written >= sizeof(key))
