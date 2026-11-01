@@ -460,14 +460,19 @@ TEST(call_reference_python_decorated_member_barriers_reject_value_edges) {
             crc_edge_count(store, project.project, "CALL_REFERENCE", "argument", NULL, "handler");
         int call = crc_edge_count(store, project.project, "CALLS", "argument", NULL, "handler");
         rh_cleanup(&project, store);
-        ASSERT_EQ(usage, 0);
+        /* An instance store does not bar the read: a property is a data descriptor, so the
+         * read runs the getter whatever stores there. The other barriers do. */
+        ASSERT_EQ(usage, i == 2 ? 1 : 0);
         ASSERT_EQ(reference, 0);
         ASSERT_EQ(call, 0);
     }
     PASS();
 }
 
-TEST(call_reference_python_unknown_attribute_effects_revoke_value_proof) {
+/* Reading an attribute of something unknown says nothing about which declaration a typed
+ * receiver selects. Nearly every function body does it, so as a barrier it abstained on
+ * everything. A property read stays a read: never a reference and never a call. */
+TEST(call_reference_python_unknown_attribute_effects_keep_the_receiver_fact) {
     static const char *const statements[] = {"    unknown.attribute\n    accept(service.handler)\n",
                                              "    unknown.method(service.handler)\n"};
     for (size_t i = 0; i < sizeof(statements) / sizeof(statements[0]); i++) {
@@ -484,7 +489,7 @@ TEST(call_reference_python_unknown_attribute_effects_revoke_value_proof) {
             crc_edge_count(store, project.project, "CALL_REFERENCE", "argument", NULL, "handler");
         int call = crc_edge_count(store, project.project, "CALLS", "argument", NULL, "handler");
         rh_cleanup(&project, store);
-        ASSERT_EQ(usage, 0);
+        ASSERT_EQ(usage, 1);
         ASSERT_EQ(reference, 0);
         ASSERT_EQ(call, 0);
     }
@@ -849,7 +854,7 @@ SUITE(call_reference_contract) {
     RUN_TEST(call_reference_python_parenthesized_bound_method_is_exact);
     RUN_TEST(call_reference_python_instance_field_shadow_is_not_method);
     RUN_TEST(call_reference_python_property_value_stays_usage);
-    RUN_TEST(call_reference_python_unknown_attribute_effects_revoke_value_proof);
+    RUN_TEST(call_reference_python_unknown_attribute_effects_keep_the_receiver_fact);
     RUN_TEST(call_reference_python_cross_file_decorated_value_identity);
     RUN_TEST(call_reference_python_shadowed_property_name_is_only_a_value_binding);
     RUN_TEST(call_reference_python_decorated_member_barriers_reject_value_edges);

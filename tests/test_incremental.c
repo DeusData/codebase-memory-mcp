@@ -370,13 +370,7 @@ static const RQ_Expected fastapi_call_obligations[] = {
           .declaration_line = 36,
           .declaration_text =
               "def is_body_allowed_for_status_code(status_code: Union[int, str, None]) -> bool:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "fastapi-utils-formatted-value-export",
-     .why = "The exact imported function is genuine, but formatted-value effects elsewhere in "
-            "utils.py prevent the current whole-file export proof.",
-     .tried =
-         "Audited the explicit import and target declaration in pinned 0.99.1 source; "
-         "the full pipeline is checked against this source obligation without a name fallback."},
+     .mode = RQ_REQUIRED},
     {.case_id = "handler-validation-encoder",
      .site = {.file = "fastapi/exception_handlers.py",
               .caller = "fastapi.exception_handlers.request_validation_exception_handler",
@@ -388,13 +382,7 @@ static const RQ_Expected fastapi_call_obligations[] = {
                 .label = "Function",
                 .declaration_line = 29,
                 .declaration_text = "def jsonable_encoder("},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "fastapi-encoder-dynamic-namespace-export",
-     .why = "The exact imported function is genuine, but vars(obj) in encoders.py prevents the "
-            "current whole-file export proof.",
-     .tried =
-         "Audited the explicit import and target declaration in pinned 0.99.1 source; "
-         "the full pipeline is checked against this source obligation without a name fallback."},
+     .mode = RQ_REQUIRED},
     {.case_id = "handler-websocket-encoder",
      .site = {.file = "fastapi/exception_handlers.py",
               .caller = "fastapi.exception_handlers.websocket_request_validation_exception_handler",
@@ -406,13 +394,7 @@ static const RQ_Expected fastapi_call_obligations[] = {
                 .label = "Function",
                 .declaration_line = 29,
                 .declaration_text = "def jsonable_encoder("},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "fastapi-encoder-dynamic-namespace-export",
-     .why = "The exact imported function is genuine, but vars(obj) in encoders.py prevents the "
-            "current whole-file export proof.",
-     .tried =
-         "Audited the explicit import and target declaration in pinned 0.99.1 source; "
-         "the full pipeline is checked against this source obligation without a name fallback."},
+     .mode = RQ_REQUIRED},
 };
 
 /* Read bytes without executing/importing the external fixture. CRLF checkouts
@@ -531,7 +513,7 @@ static bool fastapi_call_quality(void) {
                                        sizeof(sources) / sizeof(sources[0]), expected,
                                        sizeof(expected) / sizeof(expected[0]), NULL, 0, &report,
                                        stderr) &&
-         report.genuine == 7 && report.found == 4 && report.missing == 3;
+         report.genuine == 7 && report.found == 7 && report.missing == 0;
     if (store)
         cbm_store_close(store);
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++)
@@ -542,9 +524,8 @@ static bool fastapi_call_quality(void) {
 }
 
 /* This consumer checks a physical File import, not a symbol-call occurrence.
- * Python import carriers currently have explicit legacy 0/0 coordinates; do
- * not pretend those are exact source spans. Require exact endpoints, current
- * generation, pinned source snapshots and agreement between row and edge. */
+ * Python import occurrences carry the exact clause span. Require exact endpoints,
+ * current generation, pinned source snapshots and agreement between row and edge. */
 static bool fastapi_physical_import(void) {
     static const char *const paths[] = {"fastapi/security/oauth2.py", "fastapi/security/utils.py"};
     RQ_Source sources[2] = {0};
