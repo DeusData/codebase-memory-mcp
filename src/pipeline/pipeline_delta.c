@@ -590,6 +590,39 @@ static char *delta_owner_props(const char *project, const char *name, const char
     return out;
 }
 
+/* `props` (a JSON object) with a generated member's mark (cbm.h
+ * CBM_PROP_GENERATED) added, or NULL when `generated` is NULL/empty
+ * (CBM_MEM_CLASS_OTHER; the caller frees). */
+static char *delta_generated_props(const char *props, const char *generated) {
+    if (!generated || !generated[0]) {
+        return NULL;
+    }
+    size_t pl = props ? strlen(props) : 0;
+    bool has_members = pl > PAIR_LEN && props[0] == '{' && props[pl - SKIP_ONE] == '}';
+    size_t cap = pl + PAIR_LEN * strlen(generated) + CBM_SZ_32;
+    char *out = (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t k = 0;
+    if (has_members) {
+        memcpy(out, props, pl - SKIP_ONE);
+        k = pl - SKIP_ONE;
+        out[k++] = ',';
+    } else {
+        out[k++] = '{';
+    }
+    k += (size_t)snprintf(out + k, cap - k, "\"%s\":\"", CBM_PROP_GENERATED);
+    for (const char *p = generated; *p && k + CBM_SZ_3 < cap; p++) {
+        if (*p == '"' || *p == '\\') {
+            out[k++] = '\\';
+        }
+        out[k++] = *p;
+    }
+    snprintf(out + k, cap - k, "\"}");
+    return out;
+}
+
 int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *gbuf) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
@@ -634,7 +667,12 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
      * goes by -- a Go method's QN has no receiver, a class-body variable's QN
      * no class. A document naming `Order.Reset` binds such a node through
      * its owner (doc_links_pdf.c), so a re-resolved document needs it too.
-     * Only where owner + name differs from the QN (delta_owner_props). */
+     * Only where owner + name differs from the QN (delta_owner_props).
+     *
+     * And a generated member's mark (a Java record's implicit accessor, a
+     * Method node): the registry seed reads it to register the member by
+     * qualified name only, as the full build does (cbm_node_props_generated);
+     * without it the proxy came back into the short-name index. */
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             db,
@@ -646,7 +684,10 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
             " start_line, end_line,"
             " CASE WHEN label IN ('Method','Variable')"
             " AND instr(properties, '\"parent_class\"') > 0"
-            " THEN json_extract(properties, '$.parent_class') END"
+            " THEN json_extract(properties, '$.parent_class') END,"
+            " CASE WHEN label = 'Method'"
+            " AND instr(properties, '\"" CBM_PROP_GENERATED "\"') > 0"
+            " THEN json_extract(properties, '$." CBM_PROP_GENERATED "') END"
             " FROM nodes"
             " WHERE project = ?1 AND label NOT IN"
             " ('Macro','Comment','Section','Branch','Commit','Tag')"
@@ -670,13 +711,16 @@ int64_t cbm_delta_preseed(cbm_store_t *store, const char *project, cbm_gbuf_t *g
         int start_line = sqlite3_column_int(stmt, 6);
         int end_line = sqlite3_column_int(stmt, 7);
         const char *parent = (const char *)sqlite3_column_text(stmt, 8);
+        const char *generated = (const char *)sqlite3_column_text(stmt, 9);
         char *owner_props =
             parent ? delta_owner_props(project, name, qn, parent, client_props) : NULL;
+        const char *props = owner_props ? owner_props : (client_props ? client_props : "{}");
+        char *generated_props = delta_generated_props(props, generated);
         /* Pin the gbuf id to the database id: proxies ARE their rows. */
         cbm_gbuf_set_next_id(gbuf, id);
-        int64_t got =
-            cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line, end_line,
-                                 owner_props ? owner_props : (client_props ? client_props : "{}"));
+        int64_t got = cbm_gbuf_upsert_node(gbuf, label, name, qn, fp ? fp : "", start_line,
+                                           end_line, generated_props ? generated_props : props);
+        cbm_free(CBM_MEM_CLASS_OTHER, generated_props);
         cbm_free(CBM_MEM_CLASS_OTHER, owner_props);
         if (got != id) {
             /* A QN collision inside the preseed set would silently split

@@ -578,8 +578,10 @@ TEST(doc_mentions_jvm_java_families_and_reasons) {
     jt_write(&r, "src/main/java/b/Helper.java", JT_HELPER);
     jt_write(&r, "src/main/java/a/Shapes.java", JT_SHAPES);
     jt_write(&r, "src/main/java/a/Widget.java", JT_WIDGET);
-    /* a real package in a directory the indexer skips by name */
-    jt_write(&r, "src/main/java/a/env/Config.java", "package a.env;\npublic class Config {}\n");
+    /* a real package in a layout discovery still skips by name: a plain
+     * src/<pkg>/ tree (the open part of #2661); below src/<set>/<lang>/ the
+     * same package is kept since #2724 */
+    jt_write(&r, "src/a/env/Config.java", "package a.env;\npublic class Config {}\n");
     jt_write(&r, "src/test/java/a/GadgetTests.java",
              "package a;\n/** Tests {@link Gadget}. */\npublic class GadgetTests {}\n");
     ASSERT_EQ(dm_index(r.repo, r.db, NULL), 0);
@@ -643,8 +645,8 @@ TEST(doc_mentions_jvm_java_families_and_reasons) {
     ASSERT_EQ(jt_edge(db, "a.Widget", "a.GadgetTests"), 0);
     /* ... while test code binds product code */
     ASSERT_EQ(jt_edge(db, "a.GadgetTests", "a.Gadget"), 1);
-    /* not_indexed: a package of the repository in a directory discovery
-     * skips, named by an import and by its qualified name */
+    /* not_indexed: a package of the repository in a layout discovery still
+     * skips by name, named by an import and by its qualified name */
     ASSERT_STR_EQ(jt_reason(db, w, "Config"), "not_indexed");
     ASSERT_STR_EQ(jt_reason(db, w, "a.env.Other"), "not_indexed");
     /* graph_gap: a package (no node), a record component, an interface
@@ -1117,8 +1119,10 @@ TEST(doc_mentions_jvm_kotlin_families_and_reasons) {
     jt_write(&r, "src/main/kotlin/far/Helper.kt",
              "package far\n\nclass Helper {\n    fun run() {}\n}\n");
     jt_write(&r, "src/main/kotlin/far/sub/Deep.kt", "package far.sub\n\nclass Deep\n");
-    /* a real package in a directory the indexer skips by name */
-    jt_write(&r, "src/main/kotlin/k/env/Config.kt", "package k.env\n\nclass Config\n");
+    /* a real package in a layout discovery still skips by name: a plain
+     * src/<pkg>/ tree (the open part of #2661); below src/<set>/<lang>/ the
+     * same package is kept since #2724 */
+    jt_write(&r, "src/k/env/Config.kt", "package k.env\n\nclass Config\n");
     jt_write(&r, "src/test/kotlin/k/GadgetTests.kt", "package k\n\nclass GadgetTests\n");
     jt_write(&r, "src/test/kotlin/k/samples/Samples.kt",
              "package k.samples\n\nfun widgetSample() {}\n");
@@ -1170,7 +1174,7 @@ TEST(doc_mentions_jvm_kotlin_families_and_reasons) {
     ASSERT_STR_EQ(jt_reason(db, w, "far.sub"), "graph_gap");
     /* test_only_target */
     ASSERT_STR_EQ(jt_reason(db, w, "GadgetTests"), "test_only_target");
-    /* not_indexed: a package of the repository in a directory discovery skips */
+    /* not_indexed: a package of the repository in a layout discovery still skips by name */
     ASSERT_STR_EQ(jt_reason(db, w, "k.env.Config"), "not_indexed");
     /* unparseable: a path with an empty name in it */
     ASSERT_STR_EQ(jt_reason(db, w, "Gadget..spin"), "unparseable");
