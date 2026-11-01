@@ -1623,6 +1623,79 @@ TEST(resolver_rust_glob_of_a_std_enum_binds_only_its_variants) {
     PASS();
 }
 
+/* Standard signatures that carry the element type through a chain. */
+TEST(resolver_rust_std_signatures_carry_the_element) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "use std::collections::HashMap;\n"
+         "use std::collections::hash_map::Entry;\n"
+         "#[derive(Default)]\npub struct Thing;\nimpl Thing { pub fn run(&self) {} }\n"
+         "pub struct Other;\nimpl Other { pub fn run(&self) {} }\n"
+         "fn entry_default(mut m: HashMap<i32, Thing>) { m.entry(1).or_default().run(); }\n"
+         "fn entry_with(mut m: HashMap<i32, Other>) { m.entry(1).or_insert_with(|| Other).run(); }\n"
+         "fn occupied(mut m: HashMap<i32, Other>) {\n"
+         "    match m.entry(1) {\n"
+         "        Entry::Occupied(mut e) => e.get_mut().run(),\n"
+         "        Entry::Vacant(v) => v.insert(Other).run(),\n"
+         "    }\n"
+         "}\n"
+         "fn best(all: Vec<Thing>) { all.into_iter().max_by_key(|_| 0).unwrap().run(); }\n"
+         "fn flat(all: Vec<Vec<Other>>) { for x in all.into_iter().flatten() { x.run(); } }\n"
+         "fn zipped(a: Vec<Thing>, b: Vec<Other>) {\n"
+         "    for (x, y) in a.into_iter().zip(b) { x.run(); y.run(); }\n"
+         "}\n"
+         "fn transposed(v: Option<Result<Thing, String>>) -> Result<(), String> {\n"
+         "    v.transpose()?.unwrap().run();\n"
+         "    Ok(())\n"
+         "}\n"
+         "fn windows(all: Vec<Other>) { for w in all.windows(2) { w[0].run(); } }\n"
+         "fn first_pair(m: std::collections::BTreeMap<i32, Thing>) {\n"
+         "    let (_, v) = m.first_key_value().unwrap();\n"
+         "    v.run();\n"
+         "}\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.entry_default", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.entry_default", "src.main.Other.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.entry_with", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.occupied", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.best", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.flat", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.zipped", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.zipped", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.transposed", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.windows", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.first_pair", "src.main.Thing.run"), 1);
+    }
+    PASS();
+}
+
+/* `_` is an anonymous token, so counting named children moved `v` in `(_, v)` onto the first
+ * element's type: the call landed on a method of the wrong type. */
+TEST(resolver_rust_underscore_holds_its_position) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub struct Thing;\nimpl Thing { pub fn run(&self) {} }\n"
+         "pub struct Other;\nimpl Other { pub fn run(&self) {} }\n"
+         "pub struct Pair(pub Thing, pub Other);\n"
+         "fn tuple(pairs: Vec<(Thing, Other)>) { for (_, v) in pairs { v.run(); } }\n"
+         "fn tuple_struct(p: Pair) { let Pair(_, v) = p; v.run(); }\n"
+         "fn visit(_f: impl Fn(Thing, Other)) {}\n"
+         "fn closure() { visit(|_, v| v.run()); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.tuple", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.tuple", "src.main.Thing.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.tuple_struct", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.tuple_struct", "src.main.Thing.run"), 0);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.closure", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.closure", "src.main.Thing.run"), 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
     RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
@@ -1653,6 +1726,8 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_every_named_type_in_a_signature_is_a_use);
     RUN_TEST(resolver_rust_self_variant_path_binds_its_fields);
     RUN_TEST(resolver_rust_glob_of_a_std_enum_binds_only_its_variants);
+    RUN_TEST(resolver_rust_std_signatures_carry_the_element);
+    RUN_TEST(resolver_rust_underscore_holds_its_position);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
