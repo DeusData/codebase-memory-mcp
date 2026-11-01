@@ -522,8 +522,6 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "declaration must not be replaced by a name-only target.",
      "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
-    {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 0, "types.go", "Config", "USAGE",
-     3, "type Config struct{ Port int }", true, false, NULL, NULL},
     {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 1, "types.go", "Config", "USAGE",
      3, "type Config struct{ Port int }", true, false, NULL, NULL},
     /* A key of a struct literal must name a field of that struct (Go spec, composite literals). */

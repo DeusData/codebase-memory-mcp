@@ -2751,16 +2751,17 @@ static oo_value_t kw_this(kw_t *k, TSNode node) {
     return oo_value_unknown();
 }
 
-/* `if (c) ::a else ::b` selects at run time, so neither branch is the one callable this
- * occurrence hands over. Each stays an ordinary reference to what it names. */
-static bool kw_reference_is_branch_alternative(TSNode reference) {
+/* `if (c) ::a else ::b` selects at run time and `"k" to ::a` builds a larger value, so the
+ * leaf is not the one callable this occurrence hands over. It stays an ordinary reference
+ * to what it names, as a Java ternary's alternatives do. */
+static bool kw_reference_is_composite_leaf(TSNode reference) {
     for (TSNode parent = ts_node_parent(reference); !ts_node_is_null(parent);
          parent = ts_node_parent(parent)) {
         if (kt_is(parent, "if_expression") || kt_is(parent, "when_expression") ||
-            kt_is(parent, "elvis_expression"))
+            kt_is(parent, "elvis_expression") || kt_is(parent, "infix_expression"))
             return true;
         if (kt_is(parent, "value_arguments") || kt_is(parent, "assignment") ||
-            kt_is(parent, "property_declaration"))
+            kt_is(parent, "property_declaration") || kt_is(parent, "statements"))
             return false;
     }
     return false;
@@ -2813,8 +2814,8 @@ static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
     }
     if (target && target->graph_qn)
         oo_emit_usage(w, member, target->graph_qn,
-                      kw_reference_is_branch_alternative(node) ? CBM_RESOLVED_VALUE_REFERENCE
-                                                               : CBM_RESOLVED_CALL_REFERENCE,
+                      kw_reference_is_composite_leaf(node) ? CBM_RESOLVED_VALUE_REFERENCE
+                                                           : CBM_RESOLVED_CALL_REFERENCE,
                       CBM_RESOLVE_RULE_TYPE_MEMBER, "kotlin-callable-reference");
     return oo_value_unknown();
 }
