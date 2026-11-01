@@ -23,6 +23,23 @@
                    .declaration_line = tline,                                                  \
                    .declaration_text = tdecl}                                                  \
     }
+#define SL_USE_AT(id, sfile, scaller, text, at, tfile, tsuffix, tlabel, tline, tdecl)          \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = sfile, .caller = scaller, .needle = text, .occurrence_index = at},    \
+        .relation = "USAGE",                                                                   \
+        .target = {.file = tfile,                                                              \
+                   .suffix = tsuffix,                                                          \
+                   .label = tlabel,                                                            \
+                   .declaration_line = tline,                                                  \
+                   .declaration_text = tdecl},                                                 \
+    }
+#define SL_NO_USE_AT(id, sfile, scaller, text, at)                                             \
+    {                                                                                          \
+        .case_id = id,                                                                         \
+        .site = {.file = sfile, .caller = scaller, .needle = text, .occurrence_index = at},    \
+        .relation = "USAGE", .any_target = true                                                \
+    }
 #define SL_DENY_AT(id, sfile, scaller, text, at)                                               \
     {                                                                                          \
         .case_id = id,                                                                         \
@@ -332,7 +349,10 @@ static const char ZIG_MAIN[] =
     "pub fn noAbsent() void { other.absent(); }\n"
     "pub fn noUndeclared() void { unknown_name(); }\n"
     "pub fn noGeneric() void { Box(u8).make(); }\n"
-    "fn Box(comptime T: type) type { return struct { pub fn make() void {} }; }\n";
+    "fn Box(comptime T: type) type { return struct { pub fn make() void {} }; }\n"
+    "const LIMIT = 3;\n"
+    "pub fn usesConst() u8 { return LIMIT; }\n"
+    "pub fn noMemberName(s: Thing) u8 { return s.LIMIT; }\n";
 static const char ZIG_OTHER[] = "pub fn helper() void {}\n"
                                 "fn hidden() void {}\n"
                                 "pub const Thing = struct {\n"
@@ -388,6 +408,8 @@ TEST(resolver_source_zig_containers_imports_and_declared_receivers) {
                  "src/sub/other.zig", "other.make", 5, "    pub fn make() !Thing { return .{}; }"),
         SL_CALL_AT("nested-container-sees-outer", ZIG_FILE, "main.callsOuter", "local()", 2,
                    ZIG_FILE, "main.local", "Function", 10, "fn local() void {}"),
+        SL_USE_AT("name-read-from-the-enclosing-container", ZIG_FILE, "main.usesConst", "LIMIT", 1,
+                  ZIG_FILE, "main.LIMIT", "Variable", 35, "const LIMIT = 3;"),
         ZIG_CALL("comptime-function-itself-is-a-call", "noGeneric", "Box(u8)", ZIG_FILE, "main.Box",
                  34, "fn Box(comptime T: type) type { return struct { pub fn make() void {} }; }"),
     };
@@ -400,6 +422,7 @@ TEST(resolver_source_zig_containers_imports_and_declared_receivers) {
         ZIG_DENY("absent-from-named-file", "noAbsent", "other.absent()"),
         ZIG_DENY("name-in-unimported-file", "noUndeclared", "unknown_name()"),
         ZIG_DENY("comptime-generic-result", "noGeneric", "Box(u8).make()"),
+        SL_NO_USE_AT("member-name-is-not-a-read", ZIG_FILE, "main.noMemberName", "LIMIT", 2),
         SL_DENY_AT("graph-node-shared-by-two-structs", "src/shared.zig", "shared.callsSame",
                    "same()", 1),
     };
@@ -752,6 +775,8 @@ static const char DART_MAIN[] =
     "  Extra give() => extra;\n"
     "  void callsDeep() { give().deep(); }\n"
     "  void callsCascade() { extra..casc(); }\n"
+    "  void mentions() { final f = topLocal; f(); }\n"
+    "  void noMemberName(Extra e) { e.topLocal; }\n"
     "}\n";
 static const char DART_PART[] = "part of 'main.dart';\n"
                                 "void fromPart() {}\n"
@@ -858,10 +883,14 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
                    DART_STORE_FILE, "Extra.deep", "Method", 12, "  void deep() {}"),
         SL_CALL_AT("cascade-selects-on-its-receiver", DART_FILE, "Chains.callsCascade", "..casc()",
                    0, DART_STORE_FILE, "Extra.casc", "Method", 13, "  void casc() {}"),
+        SL_USE_AT("function-read-as-a-value", DART_FILE, "Chains.mentions", "topLocal", 4,
+                  DART_FILE, "main.topLocal", "Function", 38, "void topLocal() {}"),
         SL_CALL_AT("own-member-under-an-outside-superclass", "lib/ext.dart", "W.callsOwnW",
                    "ownW()", 0, "lib/ext.dart", "W.ownW", "Method", 9, "  void ownW() {}"),
     };
     static const RQ_Forbidden forbidden[] = {
+        SL_NO_USE_AT("member-name-after-a-dot-is-not-a-read", DART_FILE, "Chains.noMemberName",
+                     "topLocal", 5),
         DART_DENY("parameter-shadows-member", "noShadow", "ownM()", 1),
         DART_DENY("local-function-shadows-library", "noLocalFn", "topLocal()", 1),
         DART_DENY("hidden-by-the-export", "noHidden", "hiddenName()", 0),
@@ -954,6 +983,7 @@ static const char SW_MAIN[] =
     "    func callsOwnMember() { own() }\n"
     "    func noFreeUnderOpenBase() { sameFile() }\n"
     "    func noInherited() { inheritedFromOutside() }\n"
+    "    func usesTypeName() -> Any { return Box.self }\n"
     "}\n";
 static const char SW_SECOND[] = "func otherFile() {}\n"
                                 "func byLabel(b: Int) {}\n"
@@ -1038,6 +1068,8 @@ TEST(resolver_source_swift_modules_lookup_and_receivers) {
                 "Main.Other", "Struct", 55, "struct Other { func put() {} }"),
         SL_CALL_AT("own-member-under-an-outside-superclass", SW_FILE, "Outside.callsOwnMember",
                    "own()", 1, SW_FILE, "Outside.own", "Method", 57, "    func own() {}"),
+        SL_USE_AT("type-read-as-a-value", SW_FILE, "Outside.usesTypeName", "Box", 11, SW_FILE,
+                  "Main.Box", "Struct", 6, "struct Box {"),
         SL_CALL_AT("testable-import-reaches-internal", "Tests/AppTests/T.swift", "T.testCalls",
                    "sameFile()", 0, SW_FILE, "Main.sameFile", "Function", 3, "func sameFile() {}"),
         SL_CALL_AT("no-target-still-decides-its-own-file", "Scripts/loose.swift",
@@ -1131,6 +1163,8 @@ static const char SC_MAIN[] =
     "  def noAbsent(p: Box): Unit = p.absent()\n"
     "  def noUnknownImport(): Unit = notAnywhere()\n"
     "  def localShadows(): Unit = { val box = new Plain(); box.go() }\n"
+    "  def mentionsObject(): Any = Util\n"
+    "  def noFieldName(p: Box): Any = p.Util\n"
     "}\n"
     "class Open extends outside.Thing {\n"
     "  def own(): Unit = ()\n"
@@ -1215,17 +1249,20 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
                 "src/lib/Util.scala", "Wild.fromWild", "Method", 7, "  def fromWild(): Unit = ()"),
         SC_CALL("renamed-import", "callsRenamed", "R.renamed()", 0, "src/lib/Util.scala",
                 "Renames.renamed", "Method", 10, "  def renamed(): Unit = ()"),
+        SL_USE_AT("object-read-as-a-value", SC_FILE, "Service.mentionsObject", "Util", 2,
+                  "src/lib/Util.scala", "Util.Util", "Class", 3, "object Util {"),
         SC_CALL("new-beside-a-shadowing-local", "localShadows", "new Plain()", 1, SC_FILE,
                 "Main.Plain", "Class", 23, "class Plain {"),
         SC_CALL("local-shadows-parameter-with-its-own-type", "localShadows", "box.go()", 0, SC_FILE,
                 "Plain.go", "Method", 24, "  def go(): Unit = ()"),
         SL_CALL_AT("own-member-under-an-outside-parent", SC_FILE, "Open.callsOwnOpen", "own()", 1,
-                   SC_FILE, "Open.own", "Method", 56, "  def own(): Unit = ()"),
+                   SC_FILE, "Open.own", "Method", 58, "  def own(): Unit = ()"),
         SL_CALL_AT("own-unit-beats-an-outside-wildcard", "src/app/Outer.scala", "Shadowed.sameUnit",
                    "here()", 0, "src/app/Outer.scala", "Shadowed.here", "Method", 8,
                    "  def here(): Unit = ()"),
     };
     static const RQ_Forbidden forbidden[] = {
+        SL_NO_USE_AT("field-name-is-not-a-read", SC_FILE, "Service.noFieldName", "Util", 3),
         SC_DENY("parameter-shadows-member", "noParamShadow", "ownM()", 3),
         SC_DENY("lambda-parameter-shadows-member", "noLambda", "ownM()", 4),
         SC_DENY("case-pattern-shadows-parameter", "noMatch", "box.put()", 1),
@@ -1244,6 +1281,149 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
     PASS();
 }
 
+/* ── Haskell ───────────────────────────────────────────────────────── */
+
+static const char HS_MAIN[] = "module Main where\n"
+                              "\n"
+                              "import Data.Maybe (fromMaybe)\n"
+                              "import Lib (exported)\n"
+                              "import qualified Lib as L\n"
+                              "import Other hiding (hidden)\n"
+                              "\n"
+                              "local :: Int -> Int\n"
+                              "local x = x\n"
+                              "\n"
+                              "callsLocal :: Int\n"
+                              "callsLocal = local 1\n"
+                              "\n"
+                              "callsImported :: Int\n"
+                              "callsImported = exported 1\n"
+                              "\n"
+                              "callsQualified :: Int\n"
+                              "callsQualified = L.exported 2\n"
+                              "\n"
+                              "callsOpen :: Int\n"
+                              "callsOpen = open 3\n"
+                              "\n"
+                              "usesValue :: [Int]\n"
+                              "usesValue = map local [1]\n"
+                              "\n"
+                              "noShadow :: (Int -> Int) -> Int\n"
+                              "noShadow local = local 4\n"
+                              "\n"
+                              "noOutside :: Int\n"
+                              "noOutside = fromMaybe 1 Nothing\n"
+                              "\n"
+                              "noHidden :: Int\n"
+                              "noHidden = hidden 5\n"
+                              "\n"
+                              "noNotListed :: Int\n"
+                              "noNotListed = notListed 6\n";
+static const char HS_LIB[] = "module Lib (exported) where\n"
+                             "\n"
+                             "exported :: Int -> Int\n"
+                             "exported x = x\n"
+                             "\n"
+                             "notListed :: Int -> Int\n"
+                             "notListed x = x\n";
+static const char HS_OTHER[] = "module Other where\n"
+                               "\n"
+                               "open :: Int -> Int\n"
+                               "open x = x\n"
+                               "\n"
+                               "hidden :: Int -> Int\n"
+                               "hidden x = x\n";
+
+#define HS_FILE "src/Main.hs"
+#define HS_CALL(id, method, text, tfile, tsuffix, tline, tdecl)                                \
+    SL_CALL_AT(id, HS_FILE, "Main." method, text, 0, tfile, tsuffix, "Function", tline, tdecl)
+#define HS_DENY(id, method, text) SL_DENY_AT(id, HS_FILE, "Main." method, text, 0)
+
+TEST(resolver_source_haskell_imports_and_scope) {
+    static const RQ_Source sources[] = {
+        {.path = HS_FILE, .text = HS_MAIN},
+        {.path = "src/Lib.hs", .text = HS_LIB},
+        {.path = "src/Other.hs", .text = HS_OTHER},
+    };
+    static const RQ_Expected expected[] = {
+        HS_CALL("top-level-function", "callsLocal", "local 1", HS_FILE, "Main.local", 9,
+                "local x = x"),
+        HS_CALL("name-in-an-import-list", "callsImported", "exported 1", "src/Lib.hs",
+                "Lib.exported", 4, "exported x = x"),
+        HS_CALL("qualified-alias", "callsQualified", "L.exported 2", "src/Lib.hs", "Lib.exported",
+                4, "exported x = x"),
+        HS_CALL("open-import", "callsOpen", "open 3", "src/Other.hs", "Other.open", 4,
+                "open x = x"),
+        SL_USE_AT("function-read-as-a-value", HS_FILE, "Main.usesValue", "local", 3, HS_FILE,
+                  "Main.local", "Function", 9, "local x = x"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        HS_DENY("parameter-shadows-the-function", "noShadow", "local 4"),
+        SL_NO_USE_AT("parameter-read-is-not-the-function", HS_FILE, "Main.noShadow", "local", 5),
+        HS_DENY("module-outside-the-project", "noOutside", "fromMaybe 1 Nothing"),
+        HS_DENY("hiding-clause-removes-it", "noHidden", "hidden 5"),
+        HS_DENY("not-in-the-export-list", "noNotListed", "notListed 6"),
+    };
+    ASSERT(sl_check("haskell-rules", ".hs", "module Filler where\n\nf :: Int\nf = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── OCaml ─────────────────────────────────────────────────────────── */
+
+static const char ML_MAIN[] = "module L = Lib\n"
+                              "let local x = x\n"
+                              "let calls_local () = local 1\n"
+                              "let calls_module () = Lib.exported 2\n"
+                              "let calls_alias () = L.exported 3\n"
+                              "let uses_value () = List.map local [1]\n"
+                              "let no_shadow local = local 4\n"
+                              "let no_after () = later 5\n"
+                              "let later x = x\n"
+                              "let no_outside () = Printf.printf \"x\"\n"
+                              "open Other\n"
+                              "let calls_open () = opened 6\n"
+                              "let no_replaced () = local 7\n";
+
+#define ML_FILE "src/main.ml"
+#define ML_CALL(id, method, text, tfile, tsuffix, tline, tdecl)                                \
+    SL_CALL_AT(id, ML_FILE, "main." method, text, 0, tfile, tsuffix, "Function", tline, tdecl)
+#define ML_DENY(id, method, text) SL_DENY_AT(id, ML_FILE, "main." method, text, 0)
+
+TEST(resolver_source_ocaml_sequential_scope_and_modules) {
+    static const RQ_Source sources[] = {
+        {.path = ML_FILE, .text = ML_MAIN},
+        {.path = "src/lib.ml", .text = "let exported x = x\n"},
+        {.path = "src/other.ml", .text = "let opened x = x\nlet local x = x\n"},
+    };
+    static const RQ_Expected expected[] = {
+        ML_CALL("earlier-let", "calls_local", "local 1", ML_FILE, "main.local", 2,
+                "let local x = x"),
+        ML_CALL("sibling-compilation-unit", "calls_module", "Lib.exported 2", "src/lib.ml",
+                "lib.exported", 1, "let exported x = x"),
+        ML_CALL("module-alias", "calls_alias", "L.exported 3", "src/lib.ml", "lib.exported", 1,
+                "let exported x = x"),
+        ML_CALL("open-of-a-known-unit", "calls_open", "opened 6", "src/other.ml", "other.opened", 1,
+                "let opened x = x"),
+        SL_USE_AT("function-read-as-a-value", ML_FILE, "main.uses_value", "local", 3, ML_FILE,
+                  "main.local", "Function", 2, "let local x = x"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        ML_DENY("parameter-shadows-the-let", "no_shadow", "local 4"),
+        SL_NO_USE_AT("parameter-read-is-not-the-let", ML_FILE, "main.no_shadow", "local", 5),
+        ML_DENY("let-is-not-yet-in-scope", "no_after", "later 5"),
+        ML_DENY("module-outside-the-project", "no_outside", "Printf.printf \"x\""),
+        ML_DENY("a-later-open-replaces-the-name", "no_replaced", "local 7"),
+    };
+    ASSERT(sl_check("ocaml-rules", ".ml", "let filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_elixir_modules_aliases_imports_and_arity);
     RUN_TEST(resolver_source_erlang_module_arity_export_and_import);
@@ -1253,4 +1433,6 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_dart_lexical_scope_libraries_and_receivers);
     RUN_TEST(resolver_source_swift_modules_lookup_and_receivers);
     RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
+    RUN_TEST(resolver_source_haskell_imports_and_scope);
+    RUN_TEST(resolver_source_ocaml_sequential_scope_and_modules);
 }

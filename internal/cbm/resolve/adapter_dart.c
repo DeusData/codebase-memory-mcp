@@ -1412,6 +1412,16 @@ static void dart_visit(dart_ctx_t *ctx, TSNode node, unsigned depth) {
         dart_visit_local_definition(ctx, node, depth);
         return;
     }
+    /* A member's name after a dot is spelled, not read, and so is a constructor's. */
+    if (!strcmp(kind, "unconditional_assignable_selector") ||
+        !strcmp(kind, "conditional_assignable_selector") || !strcmp(kind, "cascade_selector"))
+        return;
+    if (!strcmp(kind, "constructor_signature") || !strcmp(kind, "constant_constructor_signature") ||
+        !strcmp(kind, "factory_constructor_signature") ||
+        !strcmp(kind, "redirecting_factory_constructor_signature")) {
+        dart_visit_signature_types(ctx, node, depth + 1);
+        return;
+    }
     if (!strcmp(kind, "assignment_expression")) {
         /* A name assigned here is a variable from here on, whatever else it could be. */
         TSNode left = cbm_source_field(node, "left");

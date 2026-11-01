@@ -77,7 +77,7 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_SWIFT, EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "Modules from SwiftPM targets; lexical scope, extensions, inheritance and argument labels; "
      "declared and constructed receiver types. Xcode module membership abstains."},
-    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
+    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
      "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the pubspec "
      "name; declared and constructed receiver types along class, mixin and superclass chains. "
      "Collection element types, conditional imports and part-of by library name abstain."},
