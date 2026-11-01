@@ -3739,10 +3739,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         site_evidence->candidate_qn = target_node->qualified_name;
         _rc_t0 = extract_now_ns();
-        site_evidence->calls_emitted |= emit_service_edge(
-            ws->local_edge_buf, source_node, target_node, call, &res, module_qn, rc->registry,
-            rc->main_gbuf, imp_keys, imp_vals, imp_count, drop_plain_call, route_mount, lang,
-            site_evidence);
+        site_evidence->calls_emitted |=
+            emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
+                              rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                              drop_plain_call, route_mount, lang, site_evidence);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

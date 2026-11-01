@@ -104,8 +104,7 @@ static bool ecma_same_value(const ecma_entry_t *a, const cbm_resolve_js_export_t
     if (a->known != b->known || a->default_import != b->default_import ||
         a->is_object != b->is_object)
         return false;
-    if ((a->target != NULL) != (b->target != NULL) ||
-        (a->target && strcmp(a->target, b->target)))
+    if ((a->target != NULL) != (b->target != NULL) || (a->target && strcmp(a->target, b->target)))
         return false;
     if ((a->dependency != NULL) != (dependency != NULL) ||
         (a->dependency && strcmp(a->dependency, dependency)))
@@ -153,8 +152,8 @@ bool cbm_ecma_table_add(cbm_ecma_table_t *table, const cbm_pipeline_ctx_t *ctx, 
     size_t count = cbm_resolve_binding_js_export_count(index);
     for (size_t i = 0; i < count; i++) {
         const cbm_resolve_js_export_t *item = cbm_resolve_binding_js_export_at(index, i);
-        const char *dependency = item->source ? cbm_ecma_dependency(ctx, file, item->source, table->arena)
-                                              : NULL;
+        const char *dependency =
+            item->source ? cbm_ecma_dependency(ctx, file, item->source, table->arena) : NULL;
         if (!item->name && !item->whole) {
             ecma_star_t *star = cbm_arena_calloc(table->arena, sizeof(*star));
             if (!star)
@@ -233,8 +232,8 @@ cbm_ecma_table_t *cbm_ecma_surfaces_build(const cbm_pipeline_ctx_t *ctx,
             source ? cbm_resolve_binding_build_declared_module(&arena, result, files[f].language,
                                                                source, length, declared)
                    : NULL;
-        bool ok = !index || cbm_ecma_table_add(table, ctx, files[f].rel_path, result->module_qn,
-                                               index, NULL);
+        bool ok = !index ||
+                  cbm_ecma_table_add(table, ctx, files[f].rel_path, result->module_qn, index, NULL);
         cbm_arena_destroy(&arena);
         cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
         cbm_pipeline_result_release(result, loaded);
@@ -260,11 +259,11 @@ static void ecma_hop(ecma_walk_t *walk, const ecma_module_t *module, const char 
         return;
     if (module->audit)
         (void)cbm_resolve_lookup_support(walk->query, module->audit);
-    (void)cbm_resolve_lookup_observe(walk->query, module->module_qn ? module->module_qn : module->file,
-                                     name, value->status == CBM_ECMA_DECLARATION ? value->target
-                                                                                 : value->file,
-                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0,
-                                     true, "ecma_exported_name_observed");
+    (void)cbm_resolve_lookup_observe(
+        walk->query, module->module_qn ? module->module_qn : module->file, name,
+        value->status == CBM_ECMA_DECLARATION ? value->target : value->file,
+        CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+        "ecma_exported_name_observed");
 }
 
 static const ecma_module_t *ecma_module(const ecma_walk_t *walk, const char *file) {
@@ -314,7 +313,8 @@ static bool ecma_values_agree(const cbm_ecma_value_t *a, const cbm_ecma_value_t 
     const char *right = b->status == CBM_ECMA_DECLARATION ? b->target : b->file;
     if (!left || !right || strcmp(left, right))
         return false;
-    return (a->member != NULL) == (b->member != NULL) && (!a->member || !strcmp(a->member, b->member));
+    return (a->member != NULL) == (b->member != NULL) &&
+           (!a->member || !strcmp(a->member, b->member));
 }
 
 static cbm_ecma_value_t ecma_name(ecma_walk_t *walk, const char *file, const char *name) {

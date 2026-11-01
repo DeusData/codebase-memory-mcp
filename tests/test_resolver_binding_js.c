@@ -1305,26 +1305,15 @@ TEST(resolver_js_project_known_gaps_abstain_with_a_reason) {
          * `type` and module extensions are honored; a plain .js has neither. */
         {"web/page.js", "function pageCaller() { return pageHelper(); }\n"
                         "function pageHelper() { return 1; }\n"},
-        /* A prototype method through an instance: `new View().render()` in JavaScript.
-         * Needs value flow from the constructor through `prototype` assignment; a
-         * `View.prototype.x = other` anywhere changes it. Express uses this form. */
+        /* A prototype method through an instance from elsewhere: `new View().render()`
+         * in another file. `this.render()` inside View's own members binds (see the
+         * member test); this needs value flow from the constructor across files. */
         {"lib/view.js", "function View() {}\n"
                         "View.prototype.render = function render() { return 1; };\n"
                         "module.exports = View;\n"},
         {"lib/use.js", "const View = require('./view');\n"
                        "function protoCaller() { const v = new View(); return v.render(); }\n"
                        "module.exports = protoCaller;\n"},
-        /* `this` in a function assigned onto an object: its value is the runtime
-         * receiver. Express's `res.send` calls `this.set` this way. */
-        {"lib/res.js", "const res = {};\n"
-                       "res.set = function set() { return 1; };\n"
-                       "res.send = function send() { return this.set(); };\n"
-                       "module.exports = res;\n"},
-        /* An object literal's member: `api.run()` names a property, and extraction
-         * names that function flat, so a same-named function would be the wrong
-         * target. Needs an owner-qualified identity for literal members. */
-        {"src/api.ts", "const api = { run() { return 1; } };\n"
-                       "export function apiCaller() { return api.run(); }\n"},
         /* The value of a non-function const is invoked: `decode` holds whatever
          * makeDecoder returned. The existing callable rule withholds a Variable
          * target; whether CALLS may name a Variable is a contract question. */
@@ -1341,8 +1330,6 @@ TEST(resolver_js_project_known_gaps_abstain_with_a_reason) {
     ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
     ASSERT_EQ(js_project_edges(&project, "CALLS", "pageCaller", "web.page.pageHelper"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "protoCaller", "lib.view.render"), 0);
-    ASSERT_EQ(js_project_edges(&project, "CALLS", "send", "lib.res.set"), 0);
-    ASSERT_EQ(js_project_edges(&project, "CALLS", "apiCaller", "src.api.run"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "decodeCaller", "src.decode.decode"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "dynamicCaller", "lib.view.View"), 0);
     js_project_free(&project);
@@ -1375,6 +1362,70 @@ TEST(resolver_js_project_same_named_nested_functions_settle_by_span) {
     ASSERT_EQ(js_project_edges(&project, "CALLS", "handle", "src.a.helper"), 1);
     js_project_free(&project);
     PASS();
+}
+
+/* lib/response.js and lib/view.js of Express: members the file itself assigns. */
+static int js_project_members_case(int padding) {
+    static const js_project_file_t files[] = {
+        {"lib/res.js", "const res = {};\n"
+                       "res.set = res.header = function header() { return 1; };\n"
+                       "res.send = function send() {\n"
+                       "  const later = () => this.set();\n"
+                       "  this.header();\n"
+                       "  this.replaced();\n"
+                       "  this.missing();\n"
+                       "  function plain() { return this.set(); }\n"
+                       "  return later;\n"
+                       "};\n"
+                       "res.replaced = function replaced() { return 1; };\n"
+                       "function swap() { res.replaced = other; }\n"
+                       "function other() { return 1; }\n"
+                       "function direct() { return res.send(); }\n"
+                       "module.exports = res;\n"},
+        {"lib/view.js", "function View(name) { this.lookup(name); }\n"
+                        "View.prototype.lookup = function lookup(name) { return this.resolve(name); };\n"
+                        "View.prototype.resolve = function resolve(name) { return name; };\n"
+                        "View.prototype.anon = function () { return this.lookup(); };\n"
+                        "function NotProto() { this.lookup(); }\n"
+                        "module.exports = View;\n"},
+        {"src/api.ts", "const api = {\n"
+                       "  run() { return this.helper(); },\n"
+                       "  helper: () => 1,\n"
+                       "  named: function namedFn() { return 1; },\n"
+                       "};\n"
+                       "export function apiCaller() { return api.run(); }\n"
+                       "let moved = { go() { return 1; } };\n"
+                       "moved = other();\n"
+                       "export function movedCaller() { return moved.go(); }\n"
+                       "function other(): any { return null; }\n"},
+    };
+    js_project_t project = {0};
+    ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    /* Both names of `res.set = res.header = function header`. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "send", "lib.res.header"), 1);
+    /* An assignment in a function can replace it; nothing assigns `missing`. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "send", "lib.res.replaced"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "direct", "lib.res.send"), 1);
+    /* A plain nested function's `this` is not the owner's. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "plain", "lib.res.header"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "View", "lib.view.lookup"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "lookup", "lib.view.resolve"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "anon", "lib.view.lookup"), 1);
+    /* `NotProto` has no prototype member of that name. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "NotProto", "lib.view.lookup"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "apiCaller", "src.api.run"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "run", "src.api.helper"), 1);
+    /* A rewritten variable says nothing about its members any more. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "movedCaller", "src.api.go"), 0);
+    js_project_free(&project);
+    PASS();
+}
+
+TEST(resolver_js_project_members_sequential) {
+    return js_project_members_case(0);
+}
+TEST(resolver_js_project_members_parallel) {
+    return js_project_members_case(55);
 }
 
 /* package.json `type` decides a file with no module syntax of its own. */
@@ -1412,6 +1463,8 @@ SUITE(resolver_binding_js) {
     RUN_TEST(resolver_js_project_typescript_sequential);
     RUN_TEST(resolver_js_project_typescript_parallel);
     RUN_TEST(resolver_js_project_manifest_type_decides_a_plain_file);
+    RUN_TEST(resolver_js_project_members_sequential);
+    RUN_TEST(resolver_js_project_members_parallel);
     RUN_TEST(resolver_js_project_same_named_nested_functions_settle_by_span);
     RUN_TEST(resolver_js_project_known_gaps_abstain_with_a_reason);
     RUN_TEST(resolver_binding_js_index_exports_use_exact_source_identity);

@@ -25,7 +25,9 @@ enum {
      * extracted Function definition by exact source lines. */
     BINDING_FUNCTION_VALUE = 8192,
     /* Assigning a const is a runtime error, so a write cannot be a value flow. */
-    BINDING_CONST_VALUE = 16384
+    BINDING_CONST_VALUE = 16384,
+    /* Some write rebinds this variable: its members are no longer knowable. */
+    BINDING_WRITTEN = 32768
 };
 
 typedef enum {
@@ -71,6 +73,9 @@ typedef struct {
     bool type_position;
     /* A plain `a.b.c` member read. The occurrence is `c`; `a` is what binds. */
     const char *member_path;
+    /* What `this` means here, when a member assignment or literal decides it. */
+    const char *this_owner;
+    bool this_prototype;
     bool http_escape, http_factory_escape;
     const char *http_scope, *http_url;
 } binding_site_t;
@@ -97,6 +102,17 @@ typedef enum {
     JS_VALUE_REQUIRE,
     JS_VALUE_OBJECT
 } js_value_kind_t;
+
+/* `Owner.member = function ...`, `Owner.prototype.member = ...` or a member of the
+ * object literal `const Owner = {...}`, at module level. */
+#define JS_MEMBER_COMPUTED "[]"
+typedef struct {
+    const char *owner, *member;
+    const char *function_name, *local;
+    const char *target;
+    uint32_t start_line, end_line;
+    bool prototype, conflict;
+} js_member_t;
 
 typedef struct {
     const char *export_name;
@@ -161,6 +177,10 @@ struct cbm_resolve_binding_index {
     bool js_commonjs, js_whole_export, js_exports_rebound, js_exports_open;
     const char **js_export_aliases;
     size_t js_export_alias_count, js_export_alias_capacity;
+    js_member_t *js_members;
+    size_t js_member_count, js_member_capacity;
+    const char *current_this_owner;
+    bool current_this_prototype;
 };
 
 static bool kind_is(TSNode node, const char *kind) {
@@ -373,6 +393,8 @@ static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNod
         .pending = index->current_pending,
         .invocation = jsx || invocation_site(node),
         .jsx_component = jsx,
+        .this_owner = index->current_this_owner,
+        .this_prototype = index->current_this_prototype,
         .http_escape = ecma && http_escape(node, index, false),
         .http_factory_escape = ecma && http_escape(node, index, true),
         .http_scope =
@@ -738,7 +760,8 @@ typedef struct {
     /* ECMAScript: how an identifier here binds, what a declarator under this
      * statement declares, and whether the next block is a function body. */
     unsigned char js_binder, js_declaration, js_for_binder;
-    bool js_type_level, js_ambient, js_body, js_no_site;
+    bool js_type_level, js_ambient, js_body, js_no_site, js_this_prototype;
+    const char *js_this_owner;
 } binding_walk_t;
 
 /* Function defaults/annotations and class bases execute in the enclosing
@@ -801,7 +824,8 @@ static uint32_t python_child_scope(cbm_resolve_binding_index_t *index, TSNode no
         while (parent && scopes[parent].class_scope)
             parent = scopes[parent].parent;
     uint32_t id = (uint32_t)index->scope_count++;
-    scopes[id] = (binding_scope_t){.qualified_name = qn, .parent = parent, .class_scope = class_scope};
+    scopes[id] =
+        (binding_scope_t){.qualified_name = qn, .parent = parent, .class_scope = class_scope};
     return id;
 }
 
@@ -811,199 +835,55 @@ static bool javascript_language(CBMLanguage language) {
 }
 
 static bool supported_javascript_node(const char *kind) {
-    static const char *const syntax[] = {"program",
-                                         "function_declaration",
-                                         "generator_function_declaration",
-                                         "function_expression",
-                                         "generator_function",
-                                         "arrow_function",
-                                         "formal_parameters",
-                                         "identifier",
-                                         "statement_block",
-                                         "expression_statement",
-                                         "return_statement",
-                                         "call_expression",
-                                         "arguments",
-                                         "number",
-                                         "string",
-                                         "string_fragment",
-                                         "escape_sequence",
-                                         "comment",
-                                         "member_expression",
-                                         "property_identifier",
-                                         "binary_expression",
-                                         "unary_expression",
-                                         "ternary_expression",
-                                         "true",
-                                         "false",
-                                         "null",
-                                         "undefined",
-                                         "parenthesized_expression",
-                                         "array",
-                                         "object",
-                                         "pair",
-                                         "shorthand_property_identifier",
-                                         "subscript_expression",
-                                         "if_statement",
-                                         "else_clause",
-                                         "empty_statement",
-                                         "break_statement",
-                                         "continue_statement",
-                                         "while_statement",
-                                         "do_statement",
-                                         "for_statement",
-                                         "for_in_statement",
-                                         "throw_statement",
-                                         "try_statement",
-                                         "catch_clause",
-                                         "finally_clause",
-                                         "switch_statement",
-                                         "switch_body",
-                                         "switch_case",
-                                         "switch_default",
-                                         "await_expression",
-                                         "yield_expression",
-                                         "sequence_expression",
-                                         "lexical_declaration",
-                                         "variable_declaration",
-                                         "variable_declarator",
-                                         "assignment_expression",
-                                         "augmented_assignment_expression",
-                                         "update_expression",
-                                         "assignment_pattern",
-                                         "array_pattern",
-                                         "object_pattern",
-                                         "pair_pattern",
-                                         "rest_pattern",
-                                         "shorthand_property_identifier_pattern",
-                                         "object_assignment_pattern",
-                                         "spread_element",
-                                         "required_parameter",
-                                         "optional_parameter",
-                                         "type_annotation",
-                                         "predefined_type",
-                                         "type_identifier",
-                                         "generic_type",
-                                         "type_arguments",
-                                         "nested_type_identifier",
-                                         "array_type",
-                                         "union_type",
-                                         "intersection_type",
-                                         "parenthesized_type",
-                                         "literal_type",
-                                         "tuple_type",
-                                         "optional_type",
-                                         "rest_type",
-                                         "function_type",
-                                         "type_query",
-                                         "keyof_type",
-                                         "lookup_type",
-                                         "conditional_type",
-                                         "infer_type",
-                                         "type_predicate",
-                                         "type_predicate_annotation",
-                                         "asserts_annotation",
-                                         "asserts",
-                                         "type_parameters",
-                                         "type_parameter",
-                                         "constraint",
-                                         "default_type",
-                                         "object_type",
-                                         "property_signature",
-                                         "method_signature",
-                                         "call_signature",
-                                         "construct_signature",
-                                         "index_signature",
-                                         "mapped_type_clause",
-                                         "index_type_query",
-                                         "readonly_type",
-                                         "template_literal_type",
-                                         "template_string",
-                                         "template_substitution",
-                                         "regex",
-                                         "regex_pattern",
-                                         "regex_flags",
-                                         "non_null_expression",
-                                         "as_expression",
-                                         "satisfies_expression",
-                                         "type_assertion",
-                                         "new_expression",
-                                         "this",
-                                         "super",
-                                         "class_declaration",
-                                         "abstract_class_declaration",
-                                         "class",
-                                         "class_body",
-                                         "class_heritage",
-                                         "extends_clause",
-                                         "implements_clause",
-                                         "method_definition",
-                                         "public_field_definition",
-                                         "field_definition",
-                                         "private_property_identifier",
-                                         "accessibility_modifier",
-                                         "static_block",
-                                         "interface_declaration",
-                                         "extends_type_clause",
-                                         "interface_body",
-                                         "type_alias_declaration",
-                                         "enum_declaration",
-                                         "enum_body",
-                                         "enum_assignment",
-                                         "computed_property_name",
-                                         "import_statement",
-                                         "import_clause",
-                                         "named_imports",
-                                         "import_specifier",
-                                         "namespace_import",
-                                         "export_statement",
-                                         "export_clause",
-                                         "export_specifier",
-                                         "namespace_export",
-                                         "meta_property",
-                                         "jsx_element",
-                                         "jsx_opening_element",
-                                         "jsx_closing_element",
-                                         "jsx_self_closing_element",
-                                         "jsx_attribute",
-                                         "jsx_expression",
-                                         "jsx_text",
-                                         "jsx_namespace_name",
-                                         "jsx_fragment",
-                                         /* Tokens and statements that bind nothing. */
-                                         "optional_chain",
-                                         "hash_bang_line",
-                                         "html_comment",
-                                         "html_character_reference",
-                                         "debugger_statement",
-                                         "labeled_statement",
-                                         "statement_identifier",
-                                         "import",
-                                         "import_attribute",
-                                         "instantiation_expression",
-                                         "decorator",
-                                         "class_static_block",
-                                         "using_declaration",
-                                         /* Type-level forms have no runtime binder. */
-                                         "function_signature",
-                                         "abstract_method_signature",
-                                         "adding_type_annotation",
-                                         "opting_type_annotation",
-                                         "omitting_type_annotation",
-                                         "constructor_type",
-                                         "existential_type",
-                                         "flow_maybe_type",
-                                         "template_type",
-                                         "this_type",
-                                         "override_modifier",
-                                         /* Scopes and module forms with an explicit rule below. */
-                                         "ambient_declaration",
-                                         "internal_module",
-                                         "module",
-                                         "nested_identifier",
-                                         "import_alias",
-                                         "import_require_clause",
-                                         NULL};
+    static const char *const syntax[] = {
+        "program", "function_declaration", "generator_function_declaration", "function_expression",
+        "generator_function", "arrow_function", "formal_parameters", "identifier",
+        "statement_block", "expression_statement", "return_statement", "call_expression",
+        "arguments", "number", "string", "string_fragment", "escape_sequence", "comment",
+        "member_expression", "property_identifier", "binary_expression", "unary_expression",
+        "ternary_expression", "true", "false", "null", "undefined", "parenthesized_expression",
+        "array", "object", "pair", "shorthand_property_identifier", "subscript_expression",
+        "if_statement", "else_clause", "empty_statement", "break_statement", "continue_statement",
+        "while_statement", "do_statement", "for_statement", "for_in_statement", "throw_statement",
+        "try_statement", "catch_clause", "finally_clause", "switch_statement", "switch_body",
+        "switch_case", "switch_default", "await_expression", "yield_expression",
+        "sequence_expression", "lexical_declaration", "variable_declaration", "variable_declarator",
+        "assignment_expression", "augmented_assignment_expression", "update_expression",
+        "assignment_pattern", "array_pattern", "object_pattern", "pair_pattern", "rest_pattern",
+        "shorthand_property_identifier_pattern", "object_assignment_pattern", "spread_element",
+        "required_parameter", "optional_parameter", "type_annotation", "predefined_type",
+        "type_identifier", "generic_type", "type_arguments", "nested_type_identifier", "array_type",
+        "union_type", "intersection_type", "parenthesized_type", "literal_type", "tuple_type",
+        "optional_type", "rest_type", "function_type", "type_query", "keyof_type", "lookup_type",
+        "conditional_type", "infer_type", "type_predicate", "type_predicate_annotation",
+        "asserts_annotation", "asserts", "type_parameters", "type_parameter", "constraint",
+        "default_type", "object_type", "property_signature", "method_signature", "call_signature",
+        "construct_signature", "index_signature", "mapped_type_clause", "index_type_query",
+        "readonly_type", "template_literal_type", "template_string", "template_substitution",
+        "regex", "regex_pattern", "regex_flags", "non_null_expression", "as_expression",
+        "satisfies_expression", "type_assertion", "new_expression", "this", "super",
+        "class_declaration", "abstract_class_declaration", "class", "class_body", "class_heritage",
+        "extends_clause", "implements_clause", "method_definition", "public_field_definition",
+        "field_definition", "private_property_identifier", "accessibility_modifier", "static_block",
+        "interface_declaration", "extends_type_clause", "interface_body", "type_alias_declaration",
+        "enum_declaration", "enum_body", "enum_assignment", "computed_property_name",
+        "import_statement", "import_clause", "named_imports", "import_specifier",
+        "namespace_import", "export_statement", "export_clause", "export_specifier",
+        "namespace_export", "meta_property", "jsx_element", "jsx_opening_element",
+        "jsx_closing_element", "jsx_self_closing_element", "jsx_attribute", "jsx_expression",
+        "jsx_text", "jsx_namespace_name", "jsx_fragment",
+        /* Tokens and statements that bind nothing. */
+        "optional_chain", "hash_bang_line", "html_comment", "html_character_reference",
+        "debugger_statement", "labeled_statement", "statement_identifier", "import",
+        "import_attribute", "instantiation_expression", "decorator", "class_static_block",
+        "using_declaration",
+        /* Type-level forms have no runtime binder. */
+        "function_signature", "abstract_method_signature", "adding_type_annotation",
+        "opting_type_annotation", "omitting_type_annotation", "constructor_type",
+        "existential_type", "flow_maybe_type", "template_type", "this_type", "override_modifier",
+        /* Scopes and module forms with an explicit rule below. */
+        "ambient_declaration", "internal_module", "module", "nested_identifier", "import_alias",
+        "import_require_clause", NULL};
     return listed(kind, syntax);
 }
 
@@ -1130,9 +1010,8 @@ static void note_http_dependency(cbm_resolve_binding_index_t *index, TSNode node
 static const char JS_WHOLE_EXPORT_NAME[] = "module.exports";
 
 static js_raw_export_t *js_raw_export(cbm_resolve_binding_index_t *index) {
-    js_raw_export_t *items =
-        grow_array(index, index->js_raw_exports, index->js_raw_export_count,
-                   &index->js_raw_export_capacity, sizeof(*items));
+    js_raw_export_t *items = grow_array(index, index->js_raw_exports, index->js_raw_export_count,
+                                        &index->js_raw_export_capacity, sizeof(*items));
     if (!items)
         return NULL;
     index->js_raw_exports = items;
@@ -1215,12 +1094,13 @@ static void note_javascript_import(cbm_resolve_binding_index_t *index, TSNode no
         is_default = true;
     }
     index->names[index->name_count - 1].js_import = js_import_fact(
-        index, (cbm_resolve_js_import_t){.local = local,
-                                         .source = http_module_literal(index, field(statement, "source")),
-                                         .member = member_name,
-                                         .is_default = is_default,
-                                         .is_require = is_require,
-                                         .type_only = type_only});
+        index,
+        (cbm_resolve_js_import_t){.local = local,
+                                  .source = http_module_literal(index, field(statement, "source")),
+                                  .member = member_name,
+                                  .is_default = is_default,
+                                  .is_require = is_require,
+                                  .type_only = type_only});
     /* Retain the actual default import's module literal for the HTTP
      * domain. A mutable extraction carrier cannot replace that spelling. */
     if (!type_only && kind_is(node, "identifier") && parent_kind &&
@@ -1259,7 +1139,8 @@ static bool js_identifier_is(cbm_resolve_binding_index_t *index, TSNode node, co
 }
 
 static bool js_is_module_exports(cbm_resolve_binding_index_t *index, TSNode node) {
-    if (!kind_is(node, "member_expression") || !js_identifier_is(index, field(node, "object"), "module"))
+    if (!kind_is(node, "member_expression") ||
+        !js_identifier_is(index, field(node, "object"), "module"))
         return false;
     TSNode property = field(node, "property");
     uint32_t start = ts_node_start_byte(property), end = ts_node_end_byte(property);
@@ -1268,7 +1149,8 @@ static bool js_is_module_exports(cbm_resolve_binding_index_t *index, TSNode node
 }
 
 static bool js_require_call(cbm_resolve_binding_index_t *index, TSNode call, const char **source) {
-    if (!kind_is(call, "call_expression") || !js_identifier_is(index, field(call, "function"), "require"))
+    if (!kind_is(call, "call_expression") ||
+        !js_identifier_is(index, field(call, "function"), "require"))
         return false;
     TSNode args = field(call, "arguments");
     if (ts_node_is_null(args) || ts_node_named_child_count(args) != 1)
@@ -1334,9 +1216,9 @@ static void js_fill_value(cbm_resolve_binding_index_t *index, js_raw_export_t *r
     } else if (js_function_value(value) || kind_is(value, "method_definition")) {
         TSNode name = field(value, "name");
         raw->value = JS_VALUE_FUNCTION;
-        raw->function_name = kind_is(value, "method_definition")     ? node_text(index, name)
-                             : !ts_node_is_null(name)                ? node_text(index, name)
-                                                                     : fallback_name;
+        raw->function_name = kind_is(value, "method_definition") ? node_text(index, name)
+                             : !ts_node_is_null(name)            ? node_text(index, name)
+                                                                 : fallback_name;
         raw->start_line = ts_node_start_point(value).row + 1;
         raw->end_line = ts_node_end_point(value).row + 1;
     } else if (js_require_value(index, value, &source, &member)) {
@@ -1372,7 +1254,8 @@ static void js_export_object_members(cbm_resolve_binding_index_t *index, TSNode 
             js_raw_export_t *raw = js_raw_export(index);
             if (raw) {
                 raw->export_name = name;
-                js_fill_value(index, raw, kind_is(item, "pair") ? field(item, "value") : item, name);
+                js_fill_value(index, raw, kind_is(item, "pair") ? field(item, "value") : item,
+                              name);
                 /* A nested object has no declaration of its own. */
                 if (raw->value == JS_VALUE_OBJECT)
                     raw->value = JS_VALUE_UNKNOWN;
@@ -1381,6 +1264,200 @@ static void js_export_object_members(cbm_resolve_binding_index_t *index, TSNode 
             index->js_exports_open = true; /* spread or computed member */
         }
     }
+}
+
+static js_member_t *js_member_row(cbm_resolve_binding_index_t *index, const char *owner,
+                                  const char *member, bool prototype) {
+    js_member_t *items = grow_array(index, index->js_members, index->js_member_count,
+                                    &index->js_member_capacity, sizeof(*items));
+    if (!items || !owner || !member)
+        return NULL;
+    index->js_members = items;
+    js_member_t *row = &items[index->js_member_count++];
+    *row = (js_member_t){.owner = owner, .member = member, .prototype = prototype};
+    return row;
+}
+
+/* The function or identifier a member is given. Anything else is not a declaration
+ * the member could name, so the row stays a known conflict for that name. */
+static void js_member_value(cbm_resolve_binding_index_t *index, js_member_t *row, TSNode value,
+                            const char *fallback_name) {
+    value = js_unwrap_value(value);
+    if (kind_is(value, "identifier")) {
+        row->local = node_text(index, value);
+    } else if (js_function_value(value) || kind_is(value, "method_definition")) {
+        TSNode name = field(value, "name");
+        row->function_name = !ts_node_is_null(name) ? node_text(index, name) : fallback_name;
+        row->start_line = ts_node_start_point(value).row + 1;
+        row->end_line = ts_node_end_point(value).row + 1;
+    } else {
+        row->conflict = true;
+    }
+}
+
+static void note_javascript_object_members(cbm_resolve_binding_index_t *index, const char *owner,
+                                           TSNode object, bool prototype) {
+    uint32_t count = ts_node_named_child_count(object);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(object, i);
+        const char *member = NULL;
+        js_member_t *row = NULL;
+        if (kind_is(item, "spread_element")) {
+            (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+        } else if (kind_is(item, "shorthand_property_identifier")) {
+            member = node_text(index, item);
+            row = js_member_row(index, owner, member, prototype);
+            if (row)
+                row->local = member;
+        } else if (kind_is(item, "pair") || kind_is(item, "method_definition")) {
+            TSNode key = kind_is(item, "pair") ? field(item, "key") : field(item, "name");
+            if (!kind_is(key, "property_identifier")) {
+                (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+                continue;
+            }
+            member = node_text(index, key);
+            row = js_member_row(index, owner, member, prototype);
+            if (row)
+                js_member_value(index, row, kind_is(item, "pair") ? field(item, "value") : item,
+                                member);
+        }
+    }
+}
+
+/* `this` inside `Owner.member = function` and friends. An arrow keeps the `this`
+ * around it; any other function starts over unless a member assignment names it. */
+static void javascript_this_owner(cbm_resolve_binding_index_t *index, TSNode node,
+                                  binding_walk_t *state) {
+    if (kind_is(node, "arrow_function"))
+        return;
+    state->js_this_owner = NULL;
+    state->js_this_prototype = false;
+    TSNode parent = ts_node_parent(node);
+    TSNode object = (TSNode){0};
+    if (kind_is(node, "function_declaration")) {
+        /* A constructor function's `this` is its instance. */
+        if (state->scope == 0) {
+            state->js_this_owner = node_text(index, field(node, "name"));
+            state->js_this_prototype = true;
+        }
+        return;
+    }
+    while (kind_is(parent, "assignment_expression")) {
+        object = field(parent, "left");
+        parent = ts_node_parent(parent);
+    }
+    if (kind_is(object, "member_expression")) {
+        TSNode owner = field(object, "object");
+        if (kind_is(owner, "identifier")) {
+            state->js_this_owner = node_text(index, owner);
+            return;
+        }
+        if (kind_is(owner, "member_expression") &&
+            kind_is(field(owner, "object"), "identifier") &&
+            kind_is(field(owner, "property"), "property_identifier")) {
+            const char *property = node_text(index, field(owner, "property"));
+            if (property && !strcmp(property, "prototype")) {
+                state->js_this_owner = node_text(index, field(owner, "object"));
+                state->js_this_prototype = true;
+            }
+        }
+        return;
+    }
+    /* A member of `const Owner = {...}` or `Owner.prototype = {...}`. */
+    TSNode literal = kind_is(node, "method_definition") ? ts_node_parent(node) : ts_node_parent(parent);
+    if (!kind_is(literal, "object") || (!kind_is(node, "method_definition") && !kind_is(parent, "pair")))
+        return;
+    TSNode holder = ts_node_parent(literal);
+    if (kind_is(holder, "variable_declarator") && ts_node_eq(literal, field(holder, "value")) &&
+        kind_is(field(holder, "name"), "identifier")) {
+        state->js_this_owner = node_text(index, field(holder, "name"));
+    } else if (kind_is(holder, "assignment_expression") &&
+               ts_node_eq(literal, field(holder, "right"))) {
+        TSNode left = field(holder, "left");
+        if (kind_is(left, "member_expression") && kind_is(field(left, "object"), "identifier") &&
+            kind_is(field(left, "property"), "property_identifier")) {
+            const char *property = node_text(index, field(left, "property"));
+            if (property && !strcmp(property, "prototype")) {
+                state->js_this_owner = node_text(index, field(left, "object"));
+                state->js_this_prototype = true;
+            }
+        }
+    }
+}
+
+/* `owner[key] = v` and `owner.prototype[key] = v` can replace any member. */
+static void note_javascript_computed_write(cbm_resolve_binding_index_t *index, TSNode left,
+                                           const binding_walk_t *state) {
+    TSNode object = field(left, "object");
+    const char *owner = NULL;
+    bool prototype = false;
+    if (kind_is(object, "this")) {
+        owner = state->js_this_owner;
+        prototype = state->js_this_prototype;
+    } else if (kind_is(object, "identifier")) {
+        owner = node_text(index, object);
+    } else if (kind_is(object, "member_expression") &&
+               kind_is(field(object, "object"), "identifier") &&
+               kind_is(field(object, "property"), "property_identifier")) {
+        const char *middle = node_text(index, field(object, "property"));
+        if (middle && !strcmp(middle, "prototype")) {
+            owner = node_text(index, field(object, "object"));
+            prototype = true;
+        }
+    }
+    if (owner)
+        (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+}
+
+/* Writes that define or replace a member. Only a module-level assignment defines
+ * one; `this.x = v` or an assignment inside a function just makes x unknowable. */
+static void note_javascript_member_write(cbm_resolve_binding_index_t *index, TSNode left,
+                                         TSNode right, const binding_walk_t *state) {
+    TSNode object = field(left, "object");
+    TSNode property = field(left, "property");
+    if (!kind_is(property, "property_identifier"))
+        return;
+    const char *member = node_text(index, property);
+    if (!member)
+        return;
+    if (kind_is(object, "this")) {
+        if (state->js_this_owner) {
+            js_member_t *row =
+                js_member_row(index, state->js_this_owner, member, state->js_this_prototype);
+            if (row)
+                row->conflict = true;
+        }
+        return;
+    }
+    const char *owner = NULL;
+    bool prototype = false;
+    if (kind_is(object, "identifier")) {
+        owner = node_text(index, object);
+    } else if (kind_is(object, "member_expression") &&
+               kind_is(field(object, "object"), "identifier") &&
+               kind_is(field(object, "property"), "property_identifier")) {
+        const char *middle = node_text(index, field(object, "property"));
+        if (middle && !strcmp(middle, "prototype")) {
+            owner = node_text(index, field(object, "object"));
+            prototype = true;
+        }
+    }
+    /* `Owner.prototype = {...}` itself. Any other value replaces every member. */
+    if (owner && !prototype && !strcmp(member, "prototype")) {
+        TSNode value = js_unwrap_value(right);
+        if (kind_is(value, "object") && !state->scope)
+            note_javascript_object_members(index, owner, value, true);
+        else
+            (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, true);
+        return;
+    }
+    js_member_t *row = owner ? js_member_row(index, owner, member, prototype) : NULL;
+    if (!row)
+        return;
+    if (state->scope)
+        row->conflict = true;
+    else
+        js_member_value(index, row, right, member);
 }
 
 static void note_javascript_commonjs(cbm_resolve_binding_index_t *index, TSNode node,
@@ -1399,6 +1476,8 @@ static void note_javascript_commonjs(cbm_resolve_binding_index_t *index, TSNode 
         index->js_exports_rebound |= js_chain_writes_module_exports(index, right);
         return;
     }
+    if (kind_is(left, "subscript_expression"))
+        note_javascript_computed_write(index, left, state);
     if (kind_is(left, "subscript_expression") &&
         (js_identifier_is(index, field(left, "object"), "exports") ||
          js_is_module_exports(index, field(left, "object")))) {
@@ -1415,6 +1494,7 @@ static void note_javascript_commonjs(cbm_resolve_binding_index_t *index, TSNode 
         index->javascript_module = true;
         index->js_commonjs = true;
     }
+    note_javascript_member_write(index, left, right, state);
     /* A value assigned inside a function may or may not run. */
     if (state->scope) {
         index->js_exports_open |= whole || bare || member;
@@ -1436,7 +1516,7 @@ static void note_javascript_commonjs(cbm_resolve_binding_index_t *index, TSNode 
     }
     if (!kind_is(property, "property_identifier"))
         return;
-    const char *owner = bare || member ? NULL
+    const char *owner = bare || member                  ? NULL
                         : kind_is(object, "identifier") ? node_text(index, object)
                                                         : NULL;
     if (!bare && !member && !owner)
@@ -1464,8 +1544,8 @@ static void note_javascript_export(cbm_resolve_binding_index_t *index, TSNode no
     bool local_export = ts_node_is_null(source_node);
     const char *source = local_export ? NULL : http_module_literal(index, source_node);
     bool type_export = child_token(node, "type");
-    unsigned kind = type_export ? CBM_RESOLVE_EXPORT_TYPE
-                                : CBM_RESOLVE_EXPORT_VALUE | CBM_RESOLVE_EXPORT_TYPE;
+    unsigned kind =
+        type_export ? CBM_RESOLVE_EXPORT_TYPE : CBM_RESOLVE_EXPORT_VALUE | CBM_RESOLVE_EXPORT_TYPE;
     if (child_token(node, "default")) {
         js_raw_export_t *raw = module_level ? js_raw_export(index) : NULL;
         if (!raw)
@@ -1582,7 +1662,8 @@ static uint32_t javascript_new_scope(cbm_resolve_binding_index_t *index, const c
 }
 
 /* A var hoists to here. Scope 0 is the module's own function scope. */
-static uint32_t javascript_function_scope(const cbm_resolve_binding_index_t *index, uint32_t scope) {
+static uint32_t javascript_function_scope(const cbm_resolve_binding_index_t *index,
+                                          uint32_t scope) {
     while (scope && scope < index->scope_count && !index->scopes[scope].function_scope)
         scope = index->scopes[scope].parent;
     return scope;
@@ -1686,7 +1767,8 @@ static const char *js_require_pattern_member(cbm_resolve_binding_index_t *index,
                                              const char **source) {
     TSNode pattern = ts_node_parent(node);
     const char *member = NULL;
-    if (kind_is(node, "shorthand_property_identifier_pattern") && kind_is(pattern, "object_pattern")) {
+    if (kind_is(node, "shorthand_property_identifier_pattern") &&
+        kind_is(pattern, "object_pattern")) {
         member = node_text(index, node);
     } else if (kind_is(pattern, "pair_pattern") && ts_node_eq(node, field(pattern, "value")) &&
                kind_is(field(pattern, "key"), "property_identifier")) {
@@ -1697,14 +1779,15 @@ static const char *js_require_pattern_member(cbm_resolve_binding_index_t *index,
         return NULL;
     TSNode declarator = ts_node_parent(pattern);
     const char *property = NULL;
-    if (!kind_is(declarator, "variable_declarator") || !ts_node_eq(pattern, field(declarator, "name")) ||
+    if (!kind_is(declarator, "variable_declarator") ||
+        !ts_node_eq(pattern, field(declarator, "name")) ||
         !js_require_value(index, field(declarator, "value"), source, &property) || property)
         return NULL;
     return member;
 }
 
-static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode node, const char *name,
-                                   const binding_walk_t *state) {
+static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode node,
+                                   const char *name, const binding_walk_t *state) {
     if (state->js_binder == JS_BINDER_WRITE) {
         js_write(index, name, state->scope);
         add_site(index, name, node);
@@ -1722,7 +1805,8 @@ static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode no
     const binding_scope_t *scope = &index->scopes[index->current_scope];
     bool module_level = index->current_scope == 0 || scope->namespace_scope;
     TSNode declarator = ts_node_parent(node);
-    bool direct = kind_is(declarator, "variable_declarator") && ts_node_eq(node, field(declarator, "name"));
+    bool direct =
+        kind_is(declarator, "variable_declarator") && ts_node_eq(node, field(declarator, "name"));
     TSNode value = direct ? field(declarator, "value") : (TSNode){0};
     const char *source = NULL, *member = NULL;
     size_t row = index->name_count;
@@ -1759,6 +1843,9 @@ static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode no
     }
     if (direct && js_chain_writes_module_exports(index, value))
         js_export_alias(index, name);
+    if (direct && module_level && !state->js_ambient && index->current_scope == 0 &&
+        kind_is(js_unwrap_value(value), "object"))
+        note_javascript_object_members(index, name, js_unwrap_value(value), false);
     index->current_scope = site_scope;
 }
 
@@ -1786,6 +1873,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
     const char *kind = ts_node_type(node);
     state = javascript_child_context(parent_kind, field_name, state);
     index->current_scope = state.scope;
+    index->current_this_owner = state.js_this_owner;
+    index->current_this_prototype = state.js_this_prototype;
     if (!ts_node_is_named(node)) {
         return state;
     }
@@ -1835,7 +1924,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         TSNode name = field(node, "name");
         const binding_scope_t *scope = &index->scopes[state.scope];
         bool module_level = state.scope == 0 || scope->namespace_scope;
-        unsigned flags = namespace_kind ? BINDING_TYPE_DECLARATION | BINDING_VALUE_TYPE : declaration;
+        unsigned flags =
+            namespace_kind ? BINDING_TYPE_DECLARATION | BINDING_VALUE_TYPE : declaration;
         if (state.js_ambient)
             flags = BINDING_BLOCKED;
         else if (module_level && state.named_export)
@@ -1857,8 +1947,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         }
         if (namespace_kind) {
             const char *owner = scope->qualified_name;
-            const char *qn = text && owner ? cbm_arena_sprintf(index->arena, "%s.%s", owner, text)
-                                           : owner;
+            const char *qn =
+                text && owner ? cbm_arena_sprintf(index->arena, "%s.%s", owner, text) : owner;
             state.scope = javascript_new_scope(index, qn, state.scope, true, true);
             state.js_body = true;
             state.named_export = false;
@@ -1877,9 +1967,13 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
     }
 
     if (javascript_runtime_function(node)) {
+        javascript_this_owner(index, node, &state);
+        index->current_this_owner = state.js_this_owner;
+        index->current_this_prototype = state.js_this_prototype;
         const char *owner = index->scopes[state.scope].qualified_name;
         const char *qn =
-            owner ? cbm_arena_sprintf(index->arena, "%s.<function@%u>", owner, ts_node_start_byte(node))
+            owner ? cbm_arena_sprintf(index->arena, "%s.<function@%u>", owner,
+                                      ts_node_start_byte(node))
                   : cbm_arena_sprintf(index->arena, "%s.<function@%u>", index->result->module_qn,
                                       ts_node_start_byte(node));
         state.scope = javascript_new_scope(index, qn, state.scope, true, false);
@@ -1925,11 +2019,10 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         state.named_export = false;
     }
 
-    bool declaration_name = parent_kind && field_name && strcmp(field_name, "name") == 0 &&
-                            (javascript_declaration_kind(parent_kind) ||
-                             !strcmp(parent_kind, "function_signature") ||
-                             javascript_named_function_scope_kind(parent_kind) ||
-                             !strcmp(parent_kind, "class"));
+    bool declaration_name =
+        parent_kind && field_name && strcmp(field_name, "name") == 0 &&
+        (javascript_declaration_kind(parent_kind) || !strcmp(parent_kind, "function_signature") ||
+         javascript_named_function_scope_kind(parent_kind) || !strcmp(parent_kind, "class"));
     if (strcmp(kind, "identifier") == 0 || strcmp(kind, "shorthand_property_identifier") == 0 ||
         strcmp(kind, "shorthand_property_identifier_pattern") == 0) {
         const char *name = node_text(index, node);
@@ -1947,7 +2040,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         add_site(index, node_text(index, node), node);
         if (index->site_count > before)
             index->sites[before].type_position = true;
-    } else if (kind_is(node, "type_identifier") && kind_is(ts_node_parent(node), "type_parameter")) {
+    } else if (kind_is(node, "type_identifier") &&
+               kind_is(ts_node_parent(node), "type_parameter")) {
         /* A type parameter shadows a same-named type wherever it is visible. */
         add_name(index, node_text(index, node), 0, BINDING_BLOCKED | BINDING_TYPE_DECLARATION);
     } else if (kind_is(node, "type_identifier") && !state.import && !declaration_name) {
@@ -1956,7 +2050,8 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         if (index->site_count > before)
             index->sites[before].type_position = true;
     }
-    if (kind_is(node, "property_identifier") && kind_is(ts_node_parent(node), "member_expression") &&
+    if (kind_is(node, "property_identifier") &&
+        kind_is(ts_node_parent(node), "member_expression") &&
         ts_node_eq(node, field(ts_node_parent(node), "property")) &&
         js_plain_member_path(index, ts_node_parent(node))) {
         size_t before = index->site_count;
@@ -2740,13 +2835,14 @@ static size_t js_name_range(const cbm_resolve_binding_index_t *index, const char
 /* TypeScript keeps value and type names apart, so `type Error` does not shadow
  * the value Error and `export const Info` + `export type Info` do not collide. */
 static bool js_row_in_space(const binding_name_t *row, js_space_t space) {
-    bool type_only = (row->flags & BINDING_TYPE_IMPORT) ||
-                     ((row->flags & BINDING_TYPE_DECLARATION) && !(row->flags & BINDING_VALUE_TYPE));
+    bool type_only =
+        (row->flags & BINDING_TYPE_IMPORT) ||
+        ((row->flags & BINDING_TYPE_DECLARATION) && !(row->flags & BINDING_VALUE_TYPE));
     /* A parameter or block-local name lives in the value space alone. */
-    bool value_only = (row->flags & (BINDING_DECLARATION | BINDING_VALUE_DECLARATION)) != 0 ||
-                      ((row->flags & BINDING_BLOCKED) &&
-                       !(row->flags & (BINDING_TYPE_IMPORT | BINDING_TYPE_DECLARATION |
-                                       BINDING_VALUE_TYPE)));
+    bool value_only =
+        (row->flags & (BINDING_DECLARATION | BINDING_VALUE_DECLARATION)) != 0 ||
+        ((row->flags & BINDING_BLOCKED) &&
+         !(row->flags & (BINDING_TYPE_IMPORT | BINDING_TYPE_DECLARATION | BINDING_VALUE_TYPE)));
     if (space == JS_SPACE_VALUE)
         return !type_only;
     if (space == JS_SPACE_TYPE)
@@ -2769,6 +2865,7 @@ static void js_apply_writes(cbm_resolve_binding_index_t *index) {
                 if (!js_row_in_space(row, JS_SPACE_VALUE))
                     continue;
                 found = true;
+                row->flags |= BINDING_WRITTEN;
                 /* A write never changes which declaration a variable names. It
                  * replaces a callable, an import or a const's only value. */
                 if (!(row->flags & BINDING_VALUE_DECLARATION) ||
@@ -2839,15 +2936,16 @@ static void audit_javascript_values(cbm_resolve_binding_index_t *index) {
                     continue;
                 /* `export const Info` + `export type Info`: the type's definition
                  * shares this QN and backs the other row, not this one. */
-                if (definition->label && (!strcmp(definition->label, "Type") ||
-                                          !strcmp(definition->label, "Interface")))
+                if (definition->label &&
+                    (!strcmp(definition->label, "Type") || !strcmp(definition->label, "Interface")))
                     continue;
                 binding->value_definitions++;
                 if (!definition->label || strcmp(definition->label, "Variable") ||
                     definition->parent_class || !lines)
                     binding->flags |= BINDING_BLOCKED;
             } else if (binding->scope &&
-                       (binding->flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION)) && lines) {
+                       (binding->flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION)) &&
+                       lines) {
                 binding->value_definitions++;
                 binding->target = definition->qualified_name;
             }
@@ -2859,8 +2957,8 @@ static void audit_javascript_values(cbm_resolve_binding_index_t *index) {
             if (binding->value_definitions != 1)
                 binding->flags |= BINDING_BLOCKED;
             else if (binding->flags & BINDING_FUNCTION_VALUE)
-                binding->flags = (binding->flags & ~(unsigned)BINDING_VALUE_DECLARATION) |
-                                 BINDING_DECLARATION;
+                binding->flags =
+                    (binding->flags & ~(unsigned)BINDING_VALUE_DECLARATION) | BINDING_DECLARATION;
         } else if (binding->scope &&
                    (binding->flags & (BINDING_DECLARATION | BINDING_TYPE_DECLARATION)) &&
                    binding->value_definitions != 1) {
@@ -2900,9 +2998,8 @@ static const char *js_function_target(cbm_resolve_binding_index_t *index,
         return NULL;
     CBMDefinition probe = {.name = raw->function_name, .start_line = raw->start_line};
     const CBMDefinition *key = &probe;
-    const CBMDefinition **found =
-        bsearch(&key, sorted, (size_t)index->result->defs.count, sizeof(*sorted),
-                js_compare_definition);
+    const CBMDefinition **found = bsearch(&key, sorted, (size_t)index->result->defs.count,
+                                          sizeof(*sorted), js_compare_definition);
     if (!found || !(*found)->label ||
         (strcmp((*found)->label, "Function") && strcmp((*found)->label, "Class")) ||
         (*found)->end_line != raw->end_line)
@@ -2920,10 +3017,9 @@ static bool js_owner_is_alias(const cbm_resolve_binding_index_t *index, const ch
 static void js_settle_identifier(cbm_resolve_binding_index_t *index, const js_raw_export_t *raw,
                                  cbm_resolve_js_export_t *out) {
     bool conflict = false;
-    const binding_name_t *row =
-        js_module_row(index, raw->local,
-                      raw->kind == CBM_RESOLVE_EXPORT_TYPE ? JS_SPACE_TYPE : JS_SPACE_VALUE,
-                      &conflict);
+    const binding_name_t *row = js_module_row(
+        index, raw->local, raw->kind == CBM_RESOLVE_EXPORT_TYPE ? JS_SPACE_TYPE : JS_SPACE_VALUE,
+        &conflict);
     /* A same-named value and type can leave together in one specifier. */
     if (!row && raw->kind != CBM_RESOLVE_EXPORT_TYPE)
         row = js_module_row(index, raw->local, JS_SPACE_TYPE, &conflict);
@@ -2937,11 +3033,11 @@ static void js_settle_identifier(cbm_resolve_binding_index_t *index, const js_ra
     } else if (row->target) {
         out->known = true;
         out->target = row->target;
-        out->kind = ((row->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE |
-                                    BINDING_VALUE_DECLARATION))
-                         ? CBM_RESOLVE_EXPORT_VALUE
-                         : 0) |
-                    ((row->flags & BINDING_TYPE_DECLARATION) ? CBM_RESOLVE_EXPORT_TYPE : 0);
+        out->kind =
+            ((row->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE | BINDING_VALUE_DECLARATION))
+                 ? CBM_RESOLVE_EXPORT_VALUE
+                 : 0) |
+            ((row->flags & BINDING_TYPE_DECLARATION) ? CBM_RESOLVE_EXPORT_TYPE : 0);
     }
 }
 
@@ -2985,8 +3081,8 @@ static void js_settle_exports(cbm_resolve_binding_index_t *index) {
             .name = row->name,
             .target = blocked ? NULL : row->target,
             .known = !blocked && row->target,
-            .kind = ((row->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE |
-                                    BINDING_VALUE_DECLARATION)) &&
+            .kind = ((row->flags &
+                      (BINDING_DECLARATION | BINDING_VALUE_TYPE | BINDING_VALUE_DECLARATION)) &&
                              (row->flags & BINDING_EXPORTED)
                          ? CBM_RESOLVE_EXPORT_VALUE
                          : 0) |
@@ -3028,6 +3124,53 @@ static void js_settle_exports(cbm_resolve_binding_index_t *index) {
                 js_settle_identifier(index, &alias, out);
             }
             break;
+        }
+    }
+}
+
+static int js_compare_member(const void *left, const void *right) {
+    const js_member_t *a = left, *b = right;
+    int order = strcmp(a->owner, b->owner);
+    if (!order)
+        order = strcmp(a->member, b->member);
+    return order ? order : (a->prototype > b->prototype) - (a->prototype < b->prototype);
+}
+
+/* Each member's declaration, by its extracted definition at exact lines or the
+ * declaration an identifier names. Two rows for one member answer nothing. */
+static void js_settle_members(cbm_resolve_binding_index_t *index) {
+    if (!index->js_member_count || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE)
+        return;
+    qsort(index->js_members, index->js_member_count, sizeof(*index->js_members), js_compare_member);
+    int definitions = index->result->defs.count;
+    const CBMDefinition **sorted =
+        definitions ? cbm_arena_alloc(index->arena, (size_t)definitions * sizeof(*sorted)) : NULL;
+    if (definitions && !sorted) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "binding_member_allocation");
+        return;
+    }
+    for (int d = 0; d < definitions; d++)
+        sorted[d] = &index->result->defs.items[d];
+    if (definitions)
+        qsort(sorted, (size_t)definitions, sizeof(*sorted), js_compare_definition);
+    for (size_t m = 0; m < index->js_member_count; m++) {
+        js_member_t *row = &index->js_members[m];
+        if (m + 1 < index->js_member_count && !js_compare_member(row, row + 1))
+            row->conflict = row[1].conflict = true;
+        if (row->conflict)
+            continue;
+        if (row->function_name && definitions) {
+            js_raw_export_t raw = {.function_name = row->function_name,
+                                   .start_line = row->start_line,
+                                   .end_line = row->end_line};
+            row->target = js_function_target(index, sorted, &raw);
+        } else if (row->local) {
+            bool conflict = false;
+            const binding_name_t *binding =
+                js_module_row(index, row->local, JS_SPACE_VALUE, &conflict);
+            if (binding && !conflict && !(binding->flags & BINDING_BLOCKED) &&
+                (binding->flags & BINDING_DECLARATION))
+                row->target = binding->target;
         }
     }
 }
@@ -3330,8 +3473,8 @@ static bool javascript_module_by_source(const CBMFileResult *result, CBMLanguage
         return true;
     const char *file = result ? result->source_file : NULL;
     const char *extension = file ? strrchr(file, '.') : NULL;
-    return extension && (!strcmp(extension, ".mjs") || !strcmp(extension, ".cjs") ||
-                         !strcmp(extension, ".jsx"));
+    return extension &&
+           (!strcmp(extension, ".mjs") || !strcmp(extension, ".cjs") || !strcmp(extension, ".jsx"));
 }
 
 cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
@@ -3435,7 +3578,8 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
                         fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED,
                                    "python_symbol_scope_allocation");
                 } else {
-                    index->scopes[0] = (binding_scope_t){.qualified_name = scope, .function_scope = true};
+                    index->scopes[0] =
+                        (binding_scope_t){.qualified_name = scope, .function_scope = true};
                     index->scope_count = 1;
                 }
             }
@@ -3463,6 +3607,7 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
         js_apply_writes(index);
         audit_javascript_values(index);
         js_settle_exports(index);
+        js_settle_members(index);
     }
     /* An explicit replacement of annotation storage can invoke user code
      * even when the annotation itself is a bare name. Do not infer the
@@ -3714,8 +3859,7 @@ static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t
                                                cbm_resolve_lookup_t *query, js_space_t space) {
     for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
         bool present;
-        const binding_name_t *found =
-            find_scoped_name(index, name, length, scope, &present, space);
+        const binding_name_t *found = find_scoped_name(index, name, length, scope, &present, space);
         /* An ECMAScript block that holds no such name adds nothing to the proof
          * beyond this file's own source fact. Blocks nest deeply; the occupied
          * scope and the module scope are what the lookup establishes. */
@@ -3765,10 +3909,9 @@ bool cbm_resolve_binding_import_occurrence(const cbm_resolve_binding_index_t *in
             ? bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site)
             : NULL;
     const binding_name_t *binding = find_name(index, local_name, strlen(local_name));
-    const binding_name_t *visible =
-        site ? find_lexical_name(index, local_name, strlen(local_name), site->scope, NULL,
-                                 JS_SPACE_VALUE)
-             : NULL;
+    const binding_name_t *visible = site ? find_lexical_name(index, local_name, strlen(local_name),
+                                                             site->scope, NULL, JS_SPACE_VALUE)
+                                         : NULL;
     return site && site->invocation && binding && visible == binding && !binding->http_escaped &&
            site->http_scope && site->http_url &&
            !strcmp(site->http_scope, call->enclosing_func_qn) &&
@@ -3779,8 +3922,8 @@ const cbm_resolve_js_import_t *cbm_resolve_binding_js_import(
     const cbm_resolve_binding_index_t *index, const char *name, uint32_t start, uint32_t end,
     CBMSourceOrigin origin, const char **path, bool *type_position) {
     if (!index || !javascript_language(index->language) ||
-        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name || origin != CBM_SOURCE_ORIGIN_RAW ||
-        end <= start || !index->sites || !index->site_count)
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name ||
+        origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !index->sites || !index->site_count)
         return NULL;
     binding_site_t key = {.name = name, .start = start, .end = end};
     const binding_site_t *site =
@@ -3992,6 +4135,73 @@ cbm_resolve_result_t cbm_resolve_binding_local(const cbm_resolve_binding_index_t
     return cbm_resolve_binding_validate(index, name, start, end, origin, result);
 }
 
+cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_index_t *index,
+                                                   const char *name, uint32_t start, uint32_t end,
+                                                   CBMSourceOrigin origin) {
+    cbm_resolve_lookup_t query;
+    binding_query_begin(index, &query, name, start, end, origin);
+    cbm_resolve_result_t result = {.reason = "js_member_unavailable"};
+    const char *dot = name ? strchr(name, '.') : NULL;
+    if (!index || !javascript_language(index->language) ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !dot || strchr(dot + 1, '.') ||
+        origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !index->sites || !index->site_count)
+        return binding_query_finish(index, &query, result);
+    binding_site_t key = {.name = name, .start = start, .end = end};
+    const binding_site_t *site =
+        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    if (!site || !site->invocation)
+        return binding_query_finish(index, &query, result);
+    size_t root = (size_t)(dot - name);
+    const char *owner = NULL;
+    bool prototype = false;
+    if (root == 4 && !strncmp(name, "this", 4)) {
+        owner = site->this_owner;
+        prototype = site->this_prototype;
+    } else {
+        const binding_name_t *binding =
+            find_lexical_name(index, name, root, site->scope, &query, JS_SPACE_VALUE);
+        if (binding && binding->scope == 0 && !binding->js_import)
+            owner = binding->name;
+    }
+    if (!owner)
+        return binding_query_finish(index, &query, result);
+    bool conflict = false;
+    const binding_name_t *holder = js_module_row(index, owner, JS_SPACE_VALUE, &conflict);
+    if (!holder || conflict || (holder->flags & (BINDING_BLOCKED | BINDING_WRITTEN)) ||
+        holder->js_import)
+        return binding_query_finish(index, &query, result);
+    js_member_t probe = {.owner = owner, .member = dot + 1, .prototype = prototype};
+    const js_member_t *row =
+        index->js_member_count ? bsearch(&probe, index->js_members, index->js_member_count,
+                                         sizeof(*index->js_members), js_compare_member)
+                               : NULL;
+    js_member_t computed = {.owner = owner, .member = JS_MEMBER_COMPUTED, .prototype = prototype};
+    if (row && index->js_member_count &&
+        bsearch(&computed, index->js_members, index->js_member_count, sizeof(*index->js_members),
+                js_compare_member))
+        row = NULL;
+    (void)cbm_resolve_lookup_observe(&query, owner, dot + 1, row ? row->target : NULL,
+                                     row && row->target ? CBM_RESOLVE_BINDING_UNIQUE
+                                                        : CBM_RESOLVE_BINDING_UNRESOLVED,
+                                     CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+                                     row && row->target ? "js_member_declaration_observed"
+                                                        : "js_member_declaration_absent");
+    if (!row || !row->target || row->conflict)
+        return binding_query_finish(index, &query, result);
+    result = (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                    .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                    .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                    .rule = CBM_RESOLVE_RULE_SCOPE_BINDING,
+                                    .facts = CBM_RESOLVE_FACT_EXACT_TARGET |
+                                             CBM_RESOLVE_FACT_SCOPE_BOUND |
+                                             CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                                             CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+                                    .target = row->target,
+                                    .candidate_count = 1,
+                                    .reason = "js_member_declaration"};
+    return binding_query_finish(index, &query, result);
+}
+
 const char *cbm_resolve_binding_status(const cbm_resolve_binding_index_t *index) {
     return index ? index->reason : "binding_allocation_failed";
 }
@@ -4020,8 +4230,8 @@ unsigned cbm_resolve_binding_export_kind(const cbm_resolve_binding_index_t *inde
                 (row->flags & BINDING_BLOCKED) ||
                 !(row->flags & (BINDING_EXPORTED | BINDING_TYPE_EXPORTED)))
                 return 0;
-            if ((row->flags & (BINDING_DECLARATION | BINDING_VALUE_TYPE |
-                               BINDING_VALUE_DECLARATION)) &&
+            if ((row->flags &
+                 (BINDING_DECLARATION | BINDING_VALUE_TYPE | BINDING_VALUE_DECLARATION)) &&
                 (row->flags & BINDING_EXPORTED))
                 merged |= CBM_RESOLVE_EXPORT_VALUE;
             if (row->flags & BINDING_TYPE_DECLARATION)

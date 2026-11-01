@@ -57,7 +57,8 @@ static void add_binding(TSLSPContext *ctx, TSNode declaration, TSNode name, TSNo
                         bool write) {
     struct CBMTSProofAudit *audit = ctx->proof_audit;
     if (!kind(name, "identifier") && !kind(name, "type_identifier") &&
-        !kind(name, "shorthand_property_identifier_pattern") && !kind(name, "property_identifier")) {
+        !kind(name, "shorthand_property_identifier_pattern") &&
+        !kind(name, "property_identifier")) {
         audit->complete = false;
         return;
     }
@@ -96,9 +97,9 @@ static TSNode pattern_scope(TSNode node) {
             return binding_scope(at, true);
         if (kind(at, "for_in_statement"))
             return at;
-        if (!kind(at, "object_pattern") && !kind(at, "array_pattern") && !kind(at, "rest_pattern") &&
-            !kind(at, "pair_pattern") && !kind(at, "assignment_pattern") &&
-            !kind(at, "object_assignment_pattern"))
+        if (!kind(at, "object_pattern") && !kind(at, "array_pattern") &&
+            !kind(at, "rest_pattern") && !kind(at, "pair_pattern") &&
+            !kind(at, "assignment_pattern") && !kind(at, "object_assignment_pattern"))
             break;
         at = ts_node_parent(at);
     }
@@ -129,7 +130,8 @@ static void audit_write_target(TSLSPContext *ctx, TSNode write, TSNode target, u
     struct CBMTSProofAudit *audit = ctx->proof_audit;
     if (ts_node_is_null(target) || depth > TS_PROOF_DEPTH) {
         audit->complete = false;
-    } else if (kind(target, "identifier") || kind(target, "shorthand_property_identifier_pattern")) {
+    } else if (kind(target, "identifier") ||
+               kind(target, "shorthand_property_identifier_pattern")) {
         add_binding(ctx, write, target, write, true);
     } else if (kind(target, "member_expression")) {
         TSNode property = field(target, "property");
@@ -450,16 +452,19 @@ static const char *declared_field_type(TSLSPContext *ctx, TSNode owner, const ch
             if (!method || strcmp(method, "constructor"))
                 continue;
             TSNode parameters = field(member, "parameters");
-            uint32_t params = ts_node_is_null(parameters) ? 0 : ts_node_named_child_count(parameters);
+            uint32_t params =
+                ts_node_is_null(parameters) ? 0 : ts_node_named_child_count(parameters);
             for (uint32_t p = 0; p < params; p++) {
                 TSNode parameter = ts_node_named_child(parameters, p);
-                if (!kind(parameter, "required_parameter") && !kind(parameter, "optional_parameter"))
+                if (!kind(parameter, "required_parameter") &&
+                    !kind(parameter, "optional_parameter"))
                     continue;
                 bool property = false;
                 uint32_t parts = ts_node_named_child_count(parameter);
                 for (uint32_t c = 0; c < parts; c++) {
                     TSNode part = ts_node_named_child(parameter, c);
-                    property |= kind(part, "accessibility_modifier") || kind(part, "override_modifier");
+                    property |=
+                        kind(part, "accessibility_modifier") || kind(part, "override_modifier");
                 }
                 for (uint32_t c = 0; c < ts_node_child_count(parameter); c++)
                     property |= kind(ts_node_child(parameter, c), "readonly");
@@ -608,9 +613,9 @@ cbm_resolve_method_result_t cbm_ts_proof_method(TSLSPContext *ctx, TSNode receiv
         if (base && binding) {
             const CBMType *held = cbm_scope_lookup(ctx->current_scope, binding);
             /* The receiver must really be the subclass the search started from. */
-            if (!synthetic && (!held || held->kind != CBM_TYPE_NAMED ||
-                               !held->data.named.qualified_name ||
-                               strcmp(held->data.named.qualified_name, owner->qualified_name)))
+            if (!synthetic &&
+                (!held || held->kind != CBM_TYPE_NAMED || !held->data.named.qualified_name ||
+                 strcmp(held->data.named.qualified_name, owner->qualified_name)))
                 return missing;
             binding = cbm_arena_sprintf(ctx->arena, "%s<:%s", binding, base->qualified_name);
             owner = base;

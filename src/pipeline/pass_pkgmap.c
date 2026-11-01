@@ -543,8 +543,8 @@ static void parse_package_json(const char *source, int source_len, const char *r
     if (main_entry && main_entry[0]) {
         char main_path[PKGMAP_PATH_BUF];
         char relative[PKGMAP_PATH_BUF];
-        int written = snprintf(relative, sizeof(relative), "%s%s",
-                               main_entry[0] == '.' ? "" : "./", main_entry);
+        int written = snprintf(relative, sizeof(relative), "%s%s", main_entry[0] == '.' ? "" : "./",
+                               main_entry);
         if (written > 0 && (size_t)written < sizeof(relative) &&
             cbm_repo_rel_join(directory, relative, main_path, sizeof(main_path)))
             node_collect(entries, "main", directory, NULL, main_path);
@@ -3936,10 +3936,10 @@ static char *ecma_surface_binding(const cbm_pipeline_ctx_t *ctx, const char *fil
                                   const CBMImport *import) {
     if (!ctx->ecma_surfaces)
         return NULL;
-    cbm_ecma_value_t value =
-        import->is_default ? cbm_ecma_default(ctx->ecma_surfaces, file, NULL)
-        : import->member   ? cbm_ecma_lookup(ctx->ecma_surfaces, file, import->member, NULL)
-                           : (cbm_ecma_value_t){.status = CBM_ECMA_UNKNOWN};
+    cbm_ecma_value_t value = import->is_default ? cbm_ecma_default(ctx->ecma_surfaces, file, NULL)
+                             : import->member
+                                 ? cbm_ecma_lookup(ctx->ecma_surfaces, file, import->member, NULL)
+                                 : (cbm_ecma_value_t){.status = CBM_ECMA_UNKNOWN};
     if (value.status == CBM_ECMA_DECLARATION && value.target && !value.member)
         return strdup(value.target);
     if (value.status == CBM_ECMA_NAMESPACE && value.file)
@@ -4175,7 +4175,7 @@ bool cbm_pipeline_node_declared_module(const char *source_rel) {
 static const cbm_gbuf_node_t *ecma_directory_entry(const cbm_pipeline_ctx_t *ctx,
                                                    const char *source_rel, const char *module_path,
                                                    CBMLanguage language) {
-    static const char *const typescript[] = {".ts", ".tsx", ".js",  ".jsx", ".mts",
+    static const char *const typescript[] = {".ts",  ".tsx", ".js",  ".jsx", ".mts",
                                              ".mjs", ".cts", ".cjs", NULL};
     static const char *const javascript[] = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", NULL};
     char source_dir[PKGMAP_PATH_BUF], directory[PKGMAP_PATH_BUF], candidate[PKGMAP_PATH_BUF];

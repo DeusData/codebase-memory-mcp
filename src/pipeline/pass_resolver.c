@@ -437,8 +437,8 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         !node->label)
         return false;
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
-    if (!proof || proof->ambiguous || strcmp(proof->file, node->file_path) || node->start_line < 0 ||
-        node->end_line < 0)
+    if (!proof || proof->ambiguous || strcmp(proof->file, node->file_path) ||
+        node->start_line < 0 || node->end_line < 0)
         return false;
     if (proof->merged_label && !strcmp(proof->merged_label, node->label) &&
         proof->merged_start_line == (uint32_t)node->start_line &&
@@ -1184,8 +1184,8 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
     if (ok && file->language == CBM_LANG_PYTHON)
         ok = capture_python_namespace(resolver, result, file->rel_path, index);
     if (ok && ecma_language(file->language)) {
-        const char *key = cbm_arena_sprintf(&arena, "ecma_module:%zu:%s", strlen(file->rel_path),
-                                            file->rel_path);
+        const char *key =
+            cbm_arena_sprintf(&arena, "ecma_module:%zu:%s", strlen(file->rel_path), file->rel_path);
         const cbm_resolve_proof_t *audit =
             key ? export_audit(resolver, result, file->rel_path, key, result->module_qn, 0,
                                cbm_resolve_binding_js_exports_complete(index) ||
@@ -2639,8 +2639,8 @@ static const char *ecma_dependency(file_resolver_t *resolver, const char *source
     const char *known = cbm_ht_get(resolver->ecma_dependencies, source);
     if (known)
         return known == none ? NULL : known;
-    const char *file = cbm_ecma_dependency(resolver->file->ctx, resolver->file->rel_path, source,
-                                           resolver->arena);
+    const char *file =
+        cbm_ecma_dependency(resolver->file->ctx, resolver->file->rel_path, source, resolver->arena);
     char *key = cbm_arena_strdup(resolver->arena, source);
     if (key)
         cbm_ht_set(resolver->ecma_dependencies, key, (void *)(file ? file : none));
@@ -2726,8 +2726,8 @@ static cbm_resolve_result_t ecma_import_result(file_resolver_t *resolver,
             rest = NULL;
             break;
         }
-        const char *member = cbm_arena_strndup(
-            resolver->arena, segment, rest ? (size_t)(rest - segment) : strlen(segment));
+        const char *member = cbm_arena_strndup(resolver->arena, segment,
+                                               rest ? (size_t)(rest - segment) : strlen(segment));
         if (!member) {
             query.failed = true;
             return ecma_finish(&query, result);
@@ -2784,6 +2784,10 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
         bool type_position = false;
         const cbm_resolve_js_import_t *import = cbm_resolve_binding_js_import(
             resolver->bindings, name, start, end, origin, &path, &type_position);
+        cbm_resolve_result_t member =
+            cbm_resolve_binding_js_member(resolver->bindings, name, start, end, origin);
+        if (cbm_resolve_admit(&member))
+            return member;
         if (import) {
             cbm_resolve_result_t proof =
                 ecma_import_result(resolver, import, path, invocation, type_position);

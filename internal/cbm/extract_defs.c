@@ -720,8 +720,16 @@ static bool js_node_is_exports_object(TSNode node, const char *source) {
     if (strcmp(kind, "identifier") == 0) {
         return end - start == 7 && memcmp(source + start, "exports", 7) == 0;
     }
-    return strcmp(kind, "member_expression") == 0 && end - start == 14 &&
-           memcmp(source + start, "module.exports", 14) == 0;
+    if (strcmp(kind, "member_expression") != 0) {
+        return false;
+    }
+    /* `Owner.prototype.method = function () {}` declares a method just as plainly. */
+    enum { PROTOTYPE_SUFFIX = 10 };
+    if (end - start > PROTOTYPE_SUFFIX &&
+        memcmp(source + end - PROTOTYPE_SUFFIX, ".prototype", PROTOTYPE_SUFFIX) == 0) {
+        return true;
+    }
+    return end - start == 14 && memcmp(source + start, "module.exports", 14) == 0;
 }
 
 /* `exports.helper = function () {}` and `module.exports = { helper: function () {} }`
