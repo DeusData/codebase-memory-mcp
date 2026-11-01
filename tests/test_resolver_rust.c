@@ -1394,6 +1394,9 @@ TEST(resolver_rust_unreached_file_reports_its_crate_as_unknown) {
  * items of that wrapper. Nothing fills it when the element itself is not known. */
 TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator) {
     static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nedition = \"2021\"\n"
+         "[dependencies]\nbumpalo = \"3\"\nhashbrown = \"0.15\"\nother_crate = \"1\"\n"},
         {"src/main.rs",
          "use std::collections::HashMap;\n"
          "pub struct Thing;\nimpl Thing { pub fn run(&self) {} }\n"
@@ -1537,23 +1540,23 @@ TEST(resolver_rust_anyhow_context_keeps_the_success_type) {
 TEST(resolver_rust_every_named_type_in_a_signature_is_a_use) {
     static const rust_proof_file_t files[] = {
         {"src/main.rs",
-         "pub struct A;\npub struct B;\npub struct C;\npub struct D;\n"
-         "fn wrapped(a: &A, b: Option<B>) -> Result<Vec<C>, String> { todo!() }\n"
-         "fn local() { let held: Vec<D> = Vec::new(); drop(held); }\n"
-         "fn bound(it: impl Iterator<Item = A>) { drop(it); }\n"
-         "fn generic<B>(value: B) { drop(value); }\n"
+         "pub struct Alpha;\npub struct Beta;\npub struct Gamma;\npub struct Delta;\n"
+         "fn wrapped(a: &Alpha, b: Option<Beta>) -> Result<Vec<Gamma>, String> { todo!() }\n"
+         "fn local() { let held: Vec<Delta> = Vec::new(); drop(held); }\n"
+         "fn bound(it: impl Iterator<Item = Alpha>) { drop(it); }\n"
+         "fn generic<Beta>(value: Beta) { drop(value); }\n"
          "fn main() {}\n"}};
     RUST_ROUTES(store, root, files) {
         ASSERT_NOT_NULL(store);
-        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.A"), 1);
-        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.B"), 1);
-        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.C"), 1);
-        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.local", "src.main.D"), 1);
-        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.bound", "src.main.A"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.Alpha"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.Beta"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.Gamma"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.local", "src.main.Delta"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.bound", "src.main.Alpha"), 1);
         /* `Item` names a member of the trait; it is no use of a type in scope. */
         ASSERT_EQ(rust_occurrences_like(store, "USES_TYPE", "Item"), 0);
         /* The parameter hides the struct of the same name. */
-        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.generic", "src.main.B"), 0);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.generic", "src.main.Beta"), 0);
         ASSERT_EQ(rust_occurrences_like(store, "USES_TYPE", "%&%"), 0);
     }
     PASS();
