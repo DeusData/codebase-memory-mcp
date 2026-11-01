@@ -1251,6 +1251,8 @@ static bool non_utf8_generation_intact(const resolver_fixture_t *fixture) {
                                               "WHERE properties IS NOT NULL");
     int occurrence_failures = count_rows_failing_strict_json(
         store, "SELECT properties_json FROM resolver_occurrences");
+    occurrence_failures +=
+        count_rows_failing_strict_json(store, "SELECT payload FROM resolver_facts");
     int genuine = count_edge(store, RESOLVER_PROJECT ".main.caller", RESOLVER_PROJECT ".lib.target",
                              "CALLS");
     cbm_store_close(store);

@@ -4,6 +4,7 @@
 #include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
+#include "foundation/str_util.h"
 #include "resolve/policy.h"
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
@@ -537,6 +538,20 @@ static bool note_type_digest(evidence_write_t *w, const cbm_resolve_proof_view_t
     memcpy(row->digest, digest, DIGEST_BYTES);
     return true;
 }
+/* resolver_facts builds its payload from these strings, and a payload must stay
+ * strict JSON, as fact_json's was. Source text that is not UTF-8 is stored as
+ * fact_json would have written it. A plain fact has already been checked. */
+static bool bind_fact_text(evidence_write_t *w, sqlite3_stmt *s, int col, const char *value) {
+    if (w->fact_text.plain || !value || cbm_utf8_valid(value, strlen(value)))
+        return bind_id(w, s, col, value);
+    size_t length = 0;
+    char *clean = cbm_utf8_lossy_dup(CBM_MEM_CLASS_STORE, value, strlen(value), &length);
+    if (!clean)
+        return false;
+    bool ok = bind_optional(s, col, dict_id(w, clean, false));
+    cbm_free(CBM_MEM_CLASS_STORE, clean);
+    return ok;
+}
 static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, size_t id,
                       const unsigned char *digest) {
     sqlite3_stmt *s = w->fact;
@@ -544,15 +559,17 @@ static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, si
            sqlite3_bind_int64(s, 2, (sqlite3_int64)id) == SQLITE_OK &&
            sqlite3_bind_int(s, 3, (int)v->kind) == SQLITE_OK &&
            sqlite3_bind_blob(s, 4, digest, DIGEST_BYTES, SQLITE_STATIC) == SQLITE_OK &&
-           bind_id(w, s, 5, v->source.project) && bind_id(w, s, 6, v->source.file) &&
-           bind_id(w, s, 7, v->source.module) && bind_id(w, s, 8, v->source.scope) &&
-           bind_id(w, s, 9, v->source.content_identity) &&
-           bind_id(w, s, 10, v->source.configuration_identity) &&
+           bind_fact_text(w, s, 5, v->source.project) && bind_fact_text(w, s, 6, v->source.file) &&
+           bind_fact_text(w, s, 7, v->source.module) && bind_fact_text(w, s, 8, v->source.scope) &&
+           bind_fact_text(w, s, 9, v->source.content_identity) &&
+           bind_fact_text(w, s, 10, v->source.configuration_identity) &&
            sqlite3_bind_int64(s, 11, v->source.source_origin) == SQLITE_OK &&
-           bind_id(w, s, 12, v->key.lookup_domain) && bind_id(w, s, 13, v->key.lookup_key) &&
-           bind_id(w, s, 14, v->key.declaration_identity) &&
-           bind_id(w, s, 15, v->key.binding_identity) && bind_id(w, s, 16, v->key.type_identity) &&
-           bind_id(w, s, 17, v->key.detail) &&
+           bind_fact_text(w, s, 12, v->key.lookup_domain) &&
+           bind_fact_text(w, s, 13, v->key.lookup_key) &&
+           bind_fact_text(w, s, 14, v->key.declaration_identity) &&
+           bind_fact_text(w, s, 15, v->key.binding_identity) &&
+           bind_fact_text(w, s, 16, v->key.type_identity) &&
+           bind_fact_text(w, s, 17, v->key.detail) &&
            sqlite3_bind_int64(s, 18, v->key.start_byte) == SQLITE_OK &&
            sqlite3_bind_int64(s, 19, v->key.end_byte) == SQLITE_OK &&
            sqlite3_bind_int64(s, 20, v->key.origin) == SQLITE_OK &&
@@ -563,9 +580,9 @@ static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, si
            sqlite3_bind_int(s, 25, (int)v->outcome.analysis) == SQLITE_OK &&
            sqlite3_bind_int(s, 26, (int)v->outcome.rule) == SQLITE_OK &&
            sqlite3_bind_int64(s, 27, v->outcome.facts) == SQLITE_OK &&
-           bind_id(w, s, 28, v->outcome.target) &&
+           bind_fact_text(w, s, 28, v->outcome.target) &&
            sqlite3_bind_int64(s, 29, v->outcome.candidate_count) == SQLITE_OK &&
-           bind_id(w, s, 30, v->outcome.reason) &&
+           bind_fact_text(w, s, 30, v->outcome.reason) &&
            sqlite3_bind_int(s, 31, v->predecessors_closed ? 1 : 0) == SQLITE_OK;
 }
 static bool write_fact(const cbm_resolve_proof_t *node, void *context) {
