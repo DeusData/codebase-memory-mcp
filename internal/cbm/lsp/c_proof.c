@@ -540,6 +540,23 @@ static void csp_note_member(csp_context_t *ctx, TSNode node, const char *klass, 
  * callers cannot compile without it, a branch is how a project swaps one layout
  * for another, and member lookup cannot tell which one the includer gets. */
 static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
+                      const char *typedef_name);
+
+/* `union vval_union { ... } vval;` defines a type where it declares a member. Extraction
+ * names it under the outer class or directly under the outer's scope depending on the form,
+ * and only the name it used has an entry, so the other call finds nothing. */
+static void csp_nested_class(csp_context_t *ctx, TSNode member, const char *outer,
+                             const char *parent) {
+    TSNode type = csp_field(member, "type");
+    if ((!csp_is(type, "struct_specifier") && !csp_is(type, "class_specifier") &&
+         !csp_is(type, "union_specifier")) ||
+        ts_node_is_null(csp_field(type, "body")))
+        return;
+    csp_class(ctx, type, outer, NULL);
+    csp_class(ctx, type, parent, NULL);
+}
+
+static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
                       const char *typedef_name) {
     TSNode body = csp_field(node, "body"), name_node = csp_field(node, "name");
     if (ts_node_is_null(body) || (!csp_is(name_node, "type_identifier") && !typedef_name) ||
@@ -584,6 +601,7 @@ static void csp_class(csp_context_t *ctx, TSNode node, const char *parent,
                        csp_is(child, "declaration")) {
                 csp_method(ctx, child, qn, access);
                 csp_note_member(ctx, child, name, access);
+                csp_nested_class(ctx, child, qn, parent);
             } else {
                 complete = false;
                 if (csp_is(child, "template_declaration") || csp_is(child, "using_declaration") ||

@@ -9538,6 +9538,20 @@ static const CBMType *c_parse_return_type_text(CBMArena *a, const char *text,
     if (!text || !text[0])
         return cbm_type_unknown();
 
+    /* An aggregate defined where its member is declared, `union vval_union { ... } vval;`,
+     * has its whole body in the type text. The tag before it is the type. */
+    const char *body_open = strchr(text, '{');
+    const char *body_close = body_open ? strrchr(body_open, '}') : NULL;
+    if (body_close) {
+        size_t prefix = (size_t)(body_open - text);
+        while (prefix > 0 && text[prefix - 1] == ' ')
+            prefix--;
+        const char *joined = cbm_arena_sprintf(a, "%.*s%s", (int)prefix, text, body_close + 1);
+        if (!joined)
+            return cbm_type_unknown();
+        text = joined;
+    }
+
     // Skip const/volatile qualifiers and the elaborated-type keyword: a member
     // declared `struct Ops *ops;` has the type text `struct Ops`, and the
     // struct is registered as `Ops`.
