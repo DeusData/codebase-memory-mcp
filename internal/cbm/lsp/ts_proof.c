@@ -528,11 +528,13 @@ static const CBMRegisteredType *receiver_type(TSLSPContext *ctx, TSNode receiver
     return NULL;
 }
 
-static bool declares_method(const CBMRegisteredType *type, const char *name) {
+/* method_names exists only for this file's own classes, swept from its AST. A class
+ * of another file answers by the methods registered with that exact receiver. */
+static bool declares_method(TSLSPContext *ctx, const CBMRegisteredType *type, const char *name) {
     for (int i = 0; type->method_names && type->method_names[i]; i++)
         if (!strcmp(type->method_names[i], name))
             return true;
-    return false;
+    return cbm_registry_lookup_method(ctx->registry, type->qualified_name, name) != NULL;
 }
 
 /* The nearest class up the extends chain that declares this method. A base the
@@ -550,7 +552,7 @@ static const CBMRegisteredType *inherited_owner(TSLSPContext *ctx, const CBMRegi
         if (base->is_interface)
             continue;
         const CBMRegisteredType *owner =
-            declares_method(base, name) ? base : inherited_owner(ctx, base, name, depth + 1);
+            declares_method(ctx, base, name) ? base : inherited_owner(ctx, base, name, depth + 1);
         if (!owner || (found && found != owner))
             return NULL;
         found = owner;
@@ -608,7 +610,7 @@ cbm_resolve_method_result_t cbm_ts_proof_method(TSLSPContext *ctx, TSNode receiv
     /* A module const has no scope entry in a function; its proof is the declaration. */
     if (kind(receiver, "identifier") && binding && !cbm_scope_lookup(ctx->current_scope, binding))
         synthetic = true;
-    if (!declares_method(owner, name) && !ctx->js_mode) {
+    if (!declares_method(ctx, owner, name) && !ctx->js_mode) {
         const CBMRegisteredType *base = inherited_owner(ctx, owner, name, 0);
         if (base && binding) {
             const CBMType *held = cbm_scope_lookup(ctx->current_scope, binding);

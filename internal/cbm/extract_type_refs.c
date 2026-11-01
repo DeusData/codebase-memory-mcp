@@ -208,7 +208,12 @@ static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *
 static void extract_ts_body_type_refs(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                       const char *func_qn) {
     if (strcmp(kind, "as_expression") == 0 || strcmp(kind, "satisfies_expression") == 0) {
-        extract_type_field_ref(ctx, node, func_qn);
+        /* The grammar gives no `type` field: the type follows the expression, and
+         * `x as const` has none at all. */
+        uint32_t named = ts_node_named_child_count(node);
+        if (named > 1) {
+            add_ts_annotation_refs(ctx, ts_node_named_child(node, named - 1), func_qn, 0);
+        }
     } else if (strcmp(kind, "type_arguments") == 0) {
         uint32_t nc = ts_node_child_count(node);
         for (uint32_t i = 0; i < nc; i++) {
