@@ -2370,9 +2370,9 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
              report.genuine == 3 && report.found == 1 && report.missing == 2 &&
              !report.required_missing && !report.wrong && ok;
         if (store) {
-            /* The required direct IMPORTS control has legacy 0/0 coordinates.
-             * Check exact physical endpoints and row/edge agreement without
-             * claiming that those coordinates identify an exact raw site. */
+            /* The required direct IMPORTS control now carries the URI literal's exact
+             * bytes, which this pins along with the physical endpoints and agreement
+             * between the row and the edge. It used to carry 0/0 legacy coordinates. */
             ok = generic_count(store,
                                "SELECT count(*) FROM resolver_occurrences r JOIN nodes s ON "
                                "s.project=r.project AND s.qualified_name=r.scope JOIN nodes t "
@@ -2382,7 +2382,7 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
                                "e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
                                "WHERE r.project='dart-uri' AND r.relation='IMPORTS' AND "
                                "r.emitted=1 "
-                               "AND r.start_byte=0 AND r.end_byte=0 AND "
+                               "AND r.start_byte=7 AND r.end_byte=20 AND "
                                "s.file_path='direct.dart' "
                                "AND s.label='File' AND t.file_path='stub.dart' AND "
                                "t.label='File'") == 1 &&

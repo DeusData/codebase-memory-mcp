@@ -1065,6 +1065,26 @@ static void swift_emit_call(swift_ctx_t *ctx, TSNode call, const swift_ref_t *re
                           reason, ref->kind == SWIFT_TYPE ? CBM_RESOLVE_FACT_CLASS_CALLABLE : 0);
 }
 
+/* A name read as a value or a type follows the same lookup as a call's. */
+static void swift_visit_reference(swift_ctx_t *ctx, TSNode node) {
+    const char *name = cbm_source_text(ctx->walk, node);
+    if (!name)
+        return;
+    swift_ref_t ref = swift_name(ctx, name, NULL);
+    /* A method name read bare is left out: lookup merges it with inherited properties
+     * and overloads, and only the expected type picks among them. */
+    if (ref.kind != SWIFT_TYPE || !ref.decl)
+        return;
+    const char *identity = NULL;
+    cbm_source_decl_t single = *ref.decl;
+    single.next = NULL;
+    const char *target = cbm_source_unique_qn(&single, &identity);
+    cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, target,
+                         ref.via_import ? CBM_RESOLVE_RULE_IMPORT_BINDING
+                                        : CBM_RESOLVE_RULE_SCOPE_BINDING,
+                         ref.decl->owner, target ? ref.reason : identity);
+}
+
 /* ── Phase two: the walk ───────────────────────────────────────────── */
 
 static void swift_visit(swift_ctx_t *ctx, TSNode node, unsigned depth);
@@ -1091,10 +1111,17 @@ static void swift_visit_children(swift_ctx_t *ctx, TSNode node, unsigned depth) 
     bool more = ts_tree_cursor_goto_first_child(&cursor);
     const char *field = NULL;
     const char *pending = NULL;
+    bool case_form =
+        (cbm_source_is(node, "if_statement") || cbm_source_is(node, "guard_statement")) &&
+        cbm_source_token(node, "case");
+    bool seen_case_value = false;
     TSNode child = swift_cursor_named(&cursor, &more, &field);
     while (!ts_node_is_null(child)) {
         bool bound = field && !strcmp(field, "bound_identifier");
-        if (bound) {
+        /* `if case .b = z` keeps the case's name as a plain condition. */
+        if (case_form && cbm_source_is(child, "simple_identifier") && !seen_case_value) {
+            seen_case_value = true;
+        } else if (bound) {
             if (pending)
                 swift_bind(ctx, pending, NULL);
             pending = cbm_source_text(ctx->walk, child);
@@ -1159,8 +1186,14 @@ static void swift_visit_function(swift_ctx_t *ctx, TSNode node, unsigned depth) 
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_named_child(node, i);
-        if (cbm_source_is(child, "parameter") || cbm_source_is(child, "modifiers") ||
-            swift_type_kind(child) || cbm_source_is(child, "simple_identifier") ||
+        if (cbm_source_is(child, "parameter")) {
+            uint32_t parts = ts_node_named_child_count(child);
+            for (uint32_t p = 0; p < parts; p++)
+                if (swift_type_kind(ts_node_named_child(child, p)))
+                    swift_visit(ctx, ts_node_named_child(child, p), depth + 1);
+            continue;
+        }
+        if (cbm_source_is(child, "modifiers") || cbm_source_is(child, "simple_identifier") ||
             cbm_source_is(child, "type_parameters") || cbm_source_is(child, "type_constraints"))
             continue;
         swift_visit(ctx, child, depth + 1);
@@ -1264,6 +1297,23 @@ static void swift_visit(swift_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
     const char *kind = ts_node_type(node);
+    if (!strcmp(kind, "simple_identifier") || !strcmp(kind, "type_identifier")) {
+        swift_visit_reference(ctx, node);
+        return;
+    }
+    /* Spelled names, not reads. */
+    if (!strcmp(kind, "navigation_suffix") || !strcmp(kind, "value_argument_label") ||
+        !strcmp(kind, "attribute") || !strcmp(kind, "modifiers") ||
+        !strcmp(kind, "import_declaration"))
+        return;
+    /* `.foo` is a member of the type the context expects, never a name in scope. */
+    if (!strcmp(kind, "prefix_expression") && cbm_source_token(node, ".")) {
+        uint32_t parts = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < parts; i++)
+            if (!cbm_source_is(ts_node_named_child(node, i), "simple_identifier"))
+                swift_visit(ctx, ts_node_named_child(node, i), depth + 1);
+        return;
+    }
     if (!strcmp(kind, "class_declaration") || !strcmp(kind, "protocol_declaration")) {
         swift_visit_type(ctx, node, depth);
         return;
@@ -1363,4 +1413,5 @@ static void swift_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_swift = {.language = CBM_LANG_SWIFT,
                                                        .collect = swift_collect,
                                                        .resolve = swift_resolve,
-                                                       .one_name_one_node = true};
+                                                       .one_name_one_node = true,
+                                                       .decides_references = true};

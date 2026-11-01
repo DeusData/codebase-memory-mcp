@@ -587,7 +587,7 @@ static const char *perl_invocant(perl_ctx_t *ctx, TSNode sub) {
     TSNode single = cbm_source_field(left, "variable");
     if (cbm_source_is(single, "scalar"))
         return right && !strcmp(right, "shift") ? cbm_source_text(ctx->walk, single) : NULL;
-    TSNode first = cbm_source_field(left, "variables");
+    TSNode first = cbm_source_named_field(left, "variables");
     return right && !strcmp(right, "@_") && cbm_source_is(first, "scalar")
                ? cbm_source_text(ctx->walk, first)
                : NULL;

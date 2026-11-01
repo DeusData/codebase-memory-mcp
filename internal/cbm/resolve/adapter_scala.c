@@ -974,6 +974,32 @@ static void scala_emit(scala_ctx_t *ctx, TSNode site, const scala_ref_t *ref, in
                           selected.decl ? selected.decl->owner : NULL, reason, facts);
 }
 
+/* A name read as a value or a type follows the same lookup as a call's. A template
+ * reached by a type name is the class; by a term, the object. */
+static void scala_visit_reference(scala_ctx_t *ctx, TSNode node, bool type_position) {
+    const char *name = cbm_source_text(ctx->walk, node);
+    if (!name || !strcmp(name, "this") || !strcmp(name, "super"))
+        return;
+    scala_ref_t ref = scala_name(ctx, name, -1);
+    const cbm_source_decl_t *decl = NULL;
+    if (ref.kind == SCALA_FUNCTION && !type_position)
+        decl = ref.decl;
+    else if (ref.kind == SCALA_CLASS)
+        decl = ref.decl;
+    else if (ref.kind == SCALA_TEMPLATE)
+        decl = type_position ? ref.decl : ref.object_decl;
+    if (!decl)
+        return;
+    const char *identity = NULL;
+    cbm_source_decl_t single = *decl;
+    single.next = NULL;
+    const char *target = cbm_source_unique_qn(&single, &identity);
+    cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, target,
+                         ref.via_import ? CBM_RESOLVE_RULE_IMPORT_BINDING
+                                        : CBM_RESOLVE_RULE_SCOPE_BINDING,
+                         decl->owner, target ? ref.reason : identity);
+}
+
 /* ── Phase two: the walk ───────────────────────────────────────────── */
 
 static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth);
@@ -983,8 +1009,14 @@ static void scala_visit_children(scala_ctx_t *ctx, TSNode node, unsigned depth) 
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
-            if (ts_node_is_named(child))
-                scala_visit(ctx, child, depth + 1);
+            if (!ts_node_is_named(child))
+                continue;
+            /* A field's name and a named argument's are spelled, not read. */
+            const char *field = ts_tree_cursor_current_field_name(&cursor);
+            if (cbm_source_is(child, "identifier") && field &&
+                (!strcmp(field, "field") || !strcmp(field, "left") || !strcmp(field, "name")))
+                continue;
+            scala_visit(ctx, child, depth + 1);
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
     ts_tree_cursor_delete(&cursor);
@@ -1101,6 +1133,19 @@ static void scala_visit_function(scala_ctx_t *ctx, TSNode node, unsigned depth, 
     scala_import_t *saved_imports = ctx->block_imports;
     const char *saved_params = ctx->type_params;
     ctx->type_params = scala_type_params(ctx->walk, node, ctx->type_params);
+    uint32_t parts = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < parts; i++) {
+        TSNode list = ts_node_named_child(node, i);
+        uint32_t params = cbm_source_is(list, "parameters") ? ts_node_named_child_count(list) : 0;
+        for (uint32_t p = 0; p < params; p++) {
+            TSNode type = cbm_source_field(ts_node_named_child(list, p), "type");
+            if (!ts_node_is_null(type))
+                scala_visit(ctx, type, depth + 1);
+        }
+    }
+    TSNode returned = cbm_source_field(node, "return_type");
+    if (!ts_node_is_null(returned))
+        scala_visit(ctx, returned, depth + 1);
     scala_bind_parameters(ctx, node);
     TSNode body = cbm_source_field(node, "body");
     if (!ts_node_is_null(body))
@@ -1138,6 +1183,13 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
     const char *kind = ts_node_type(node);
+    if (!strcmp(kind, "identifier") || !strcmp(kind, "type_identifier")) {
+        scala_visit_reference(ctx, node, kind[0] == 't');
+        return;
+    }
+    if (!strcmp(kind, "package_clause") || !strcmp(kind, "modifiers") ||
+        !strcmp(kind, "annotation"))
+        return;
     if (scala_template_kind(node)) {
         scala_visit_template(ctx, node, depth);
         return;
@@ -1270,4 +1322,5 @@ static void scala_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_scala = {.language = CBM_LANG_SCALA,
                                                        .collect = scala_collect,
                                                        .resolve = scala_resolve,
-                                                       .one_name_one_node = true};
+                                                       .one_name_one_node = true,
+                                                       .decides_references = true};

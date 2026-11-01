@@ -5604,14 +5604,21 @@ int cbm_pipeline_php_import_map(const cbm_gbuf_t *graph, const char *project,
     const char *const *targets = bindings.targets ? bindings.targets : bindings.proven_targets;
     int count = 0;
     bool ok = keys && values && by_local;
-    for (int i = 0; ok && i < capacity; i++) {
-        const CBMImport *import = &result->imports.items[i];
-        if (!import->local_name || !import->local_name[0])
-            continue;
-        char *value = targets ? php_bound_class(graph, project, import, targets[i]) : NULL;
-        if (!value)
-            value = strdup("");
-        ok = python_map_put(by_local, keys, values, &count, import->local_name, value);
+    /* This map answers for class names. `use` and `use function` of one local name
+     * bind in separate tables, so a function or constant import speaks here only for
+     * a name no class import holds, which keeps it a veto of a guessed class. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; ok && i < capacity; i++) {
+            const CBMImport *import = &result->imports.items[i];
+            if (!import->local_name || !import->local_name[0] ||
+                (import->kind == CBM_IMPORT_KIND_DEFAULT) != (pass == 0) ||
+                (pass == 1 && cbm_ht_has(by_local, import->local_name)))
+                continue;
+            char *value = targets ? php_bound_class(graph, project, import, targets[i]) : NULL;
+            if (!value)
+                value = strdup("");
+            ok = python_map_put(by_local, keys, values, &count, import->local_name, value);
+        }
     }
     cbm_pipeline_php_vendor_names_free(&bindings);
     cbm_ht_free(by_local);

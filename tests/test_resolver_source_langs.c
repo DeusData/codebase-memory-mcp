@@ -388,6 +388,8 @@ TEST(resolver_source_zig_containers_imports_and_declared_receivers) {
                  "src/sub/other.zig", "other.make", 5, "    pub fn make() !Thing { return .{}; }"),
         SL_CALL_AT("nested-container-sees-outer", ZIG_FILE, "main.callsOuter", "local()", 2,
                    ZIG_FILE, "main.local", "Function", 10, "fn local() void {}"),
+        ZIG_CALL("comptime-function-itself-is-a-call", "noGeneric", "Box(u8)", ZIG_FILE, "main.Box",
+                 34, "fn Box(comptime T: type) type { return struct { pub fn make() void {} }; }"),
     };
     static const RQ_Forbidden forbidden[] = {
         ZIG_DENY("build-mapped-import", "noBuild", "zls.helper()"),
@@ -501,6 +503,8 @@ TEST(resolver_source_perl_packages_exporter_and_method_resolution) {
                 "Base.new", 3, "sub new {"),
         PL_CALL("ampersand-reaches-sub-named-as-builtin", "builtin_sigil", "&length('x')", PL_FILE,
                 "Main.length", 8, "sub length { return 3; }"),
+        PL_CALL("class-method-beside-a-rebound-invocant", "no_rebound", "Foo::Base->new",
+                "lib/Foo/Base.pm", "Base.new", 3, "sub new {"),
     };
     static const RQ_Forbidden forbidden[] = {
         SL_DENY_AT("builtin-not-overridden-by-a-sub", PL_FILE, "Main.no_builtin", "length('x')", 1),
@@ -826,7 +830,7 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
         DART_CALL("last-mixin-wins", "callsLastMixin", "both()", DART_BASE_FILE, "Later.both",
                   "Method", 10, "  void both() {}"),
         DART_CALL("library-function-beats-inherited-member", "callsLibraryFirst", "fromLibrary()",
-                  DART_FILE, "main.fromLibrary", "Function", 38, "void fromLibrary() {}"),
+                  DART_FILE, "main.fromLibrary", "Function", 37, "void fromLibrary() {}"),
         DART_SAVE("declared-field-receiver", "callsField", "store.save"),
         DART_SAVE("field-initialized-by-constructor", "callsInferred", "made.save"),
         DART_SAVE("declared-parameter-receiver", "callsParam", "p.save"),
@@ -837,7 +841,7 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
         DART_CALL("static-method-on-class", "callsStatic", "Store.make", DART_STORE_FILE,
                   "Store.make", "Method", 4, "  static Store make() => Store();"),
         DART_CALL("library-top-level", "callsTop", "topLocal()", DART_FILE, "main.topLocal",
-                  "Function", 39, "void topLocal() {}"),
+                  "Function", 38, "void topLocal() {}"),
         DART_CALL("through-package-uri-and-export", "callsBarrel", "helper()", DART_STORE_FILE,
                   "store.helper", "Function", 7, "void helper() {}"),
         DART_CALL("prefix-with-show", "callsPrefix", "s.helper", DART_STORE_FILE, "store.helper",
@@ -846,10 +850,10 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
                   "main_part.fromPart", "Function", 2, "void fromPart() {}"),
         DART_STORE_CLASS("new-expression", "callsNew", "new Store()"),
         SL_CALL_AT("part-sees-its-library", "lib/main_part.dart", "main_part.partCalls",
-                   "topLocal()", 0, DART_FILE, "main.topLocal", "Function", 39,
+                   "topLocal()", 0, DART_FILE, "main.topLocal", "Function", 38,
                    "void topLocal() {}"),
         SL_CALL_AT("function-with-a-declared-return-type", DART_FILE, "Chains.callsDeep", "give()",
-                   0, DART_FILE, "Chains.give", "Method", 42, "  Extra give() => extra;"),
+                   0, DART_FILE, "Chains.give", "Method", 41, "  Extra give() => extra;"),
         SL_CALL_AT("member-deep-in-a-selector-chain", DART_FILE, "Chains.callsDeep", ".deep()", 0,
                    DART_STORE_FILE, "Extra.deep", "Method", 12, "  void deep() {}"),
         SL_CALL_AT("cascade-selects-on-its-receiver", DART_FILE, "Chains.callsCascade", "..casc()",
@@ -942,6 +946,7 @@ static const char SW_MAIN[] =
     "    func noValueCall() { box() }\n"
     "    func noCaseBinding(o: Box?) { switch o { case .some(let box): box.put(); default: break } "
     "}\n"
+    "    func noImplicitMember() { use(.ownM) }\n"
     "}\n"
     "struct Other { func put() {} }\n"
     "class Outside: NSObject {\n"
@@ -1028,11 +1033,11 @@ TEST(resolver_source_swift_modules_lookup_and_receivers) {
         SW_CALL("member-of-imported-type", "callsImportedType", "LibType().run()", 0, SW_LIB_FILE,
                 "LibType.run", "Method", 5, "    public func run() {}"),
         SW_CALL("local-shadows-property-with-its-own-type", "localShadowsProperty", "box.put()", 1,
-                SW_FILE, "Other.put", "Method", 56, "struct Other { func put() {} }"),
+                SW_FILE, "Other.put", "Method", 55, "struct Other { func put() {} }"),
         SW_CALL("initializer-of-the-shadowing-local", "localShadowsProperty", "Other()", 0, SW_FILE,
-                "Main.Other", "Struct", 56, "struct Other { func put() {} }"),
+                "Main.Other", "Struct", 55, "struct Other { func put() {} }"),
         SL_CALL_AT("own-member-under-an-outside-superclass", SW_FILE, "Outside.callsOwnMember",
-                   "own()", 1, SW_FILE, "Outside.own", "Method", 58, "    func own() {}"),
+                   "own()", 1, SW_FILE, "Outside.own", "Method", 57, "    func own() {}"),
         SL_CALL_AT("testable-import-reaches-internal", "Tests/AppTests/T.swift", "T.testCalls",
                    "sameFile()", 0, SW_FILE, "Main.sameFile", "Function", 3, "func sameFile() {}"),
         SL_CALL_AT("no-target-still-decides-its-own-file", "Scripts/loose.swift",
@@ -1048,6 +1053,13 @@ TEST(resolver_source_swift_modules_lookup_and_receivers) {
         SW_DENY("generic-parameter", "noGeneric", "t.put()", 0),
         SW_DENY("call-of-a-value", "noValueCall", "box()", 0),
         SW_DENY("case-binding-shadows-property", "noCaseBinding", "box.put()", 2),
+        {.case_id = "implicit-member-is-not-a-name-in-scope",
+         .site = {.file = SW_FILE,
+                  .caller = "Service.noImplicitMember",
+                  .needle = "ownM",
+                  .occurrence_index = 7},
+         .relation = "USAGE",
+         .any_target = true},
         SL_DENY_AT("free-function-under-an-outside-superclass", SW_FILE,
                    "Outside.noFreeUnderOpenBase", "sameFile()", 2),
         SL_DENY_AT("member-of-an-outside-superclass", SW_FILE, "Outside.noInherited",
@@ -1180,7 +1192,7 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
         SC_PUT("field-from-new", "callsField", "made.put()"),
         SC_PUT("declared-parameter", "callsParam", "p.put()"),
         SC_CALL("new-constructs-the-class", "callsLocal", "new Box(3)", 0, SC_FILE, "Main.Box",
-                "Class", 20, "object Box {"),
+                "Class", 16, "case class Box(id: Int) {"),
         SC_PUT("local-from-new", "callsLocal", "l.put()"),
         SC_MAKE("companion-method", "callsTyped", 0),
         SC_PUT("declared-local", "callsTyped", "t.put()"),
@@ -1188,7 +1200,7 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
         SC_MAKE("object-method-in-a-chain", "callsChain", 2),
         SC_PUT("declared-return-type", "callsChain", "Box.make().put()"),
         SC_CALL("case-class-apply-constructs", "callsCaseApply", "Box(4)", 0, SC_FILE, "Main.Box",
-                "Class", 20, "object Box {"),
+                "Class", 16, "case class Box(id: Int) {"),
         SC_PUT("member-of-a-constructed-case-class", "callsCaseApply", "Box(4).put()"),
         SC_CALL("new-of-a-class-with-no-companion", "callsPlainNew", "new Plain()", 0, SC_FILE,
                 "Main.Plain", "Class", 23, "class Plain {"),

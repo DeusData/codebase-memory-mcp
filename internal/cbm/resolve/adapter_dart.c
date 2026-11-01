@@ -45,6 +45,7 @@ typedef struct {
     const char *library; /* project path; NULL when the library is not visible to this table */
     const char *prefix;
     const char *show, *hide;
+    bool conditional; /* its library depends on the build's configuration */
 } dart_directive_t;
 
 typedef struct {
@@ -604,8 +605,8 @@ static void dart_read_directives(dart_ctx_t *ctx, const char *library, const cha
         const char *path = dart_uri_library(ctx->walk, d->file, parts[0]);
         if (path && !cbm_source_lookup(ctx->walk, path, DART_LIBRARY_RECORD))
             path = NULL;
-        items[(*out_count)++] =
-            (dart_directive_t){path, parts[1][0] ? parts[1] : NULL, parts[2], parts[3]};
+        items[(*out_count)++] = (dart_directive_t){path, parts[1][0] ? parts[1] : NULL, parts[2],
+                                                   parts[3], !parts[0][0]};
     }
 }
 
@@ -669,6 +670,12 @@ static const cbm_source_decl_t *dart_import_search(dart_ctx_t *ctx, const char *
                            (prefix && import->prefix && !strcmp(prefix, import->prefix));
         if (!same_prefix || !dart_filter_passes(import->show, import->hide, name))
             continue;
+        /* Which file this import reads is a build fact. It can be a project file, so
+         * unlike a package outside the project it can collide with another import. */
+        if (import->conditional) {
+            *reason = "dart_conditional_import_may_provide_name";
+            return NULL;
+        }
         bool conflict = false;
         cbm_source_chain_t chain = {0};
         const cbm_source_decl_t *found =
@@ -1124,6 +1131,32 @@ static dart_ref_t dart_result_of(dart_ctx_t *ctx, const dart_ref_t *callee) {
     return ref;
 }
 
+/* A name read as a value follows the same lookup as a call's. */
+static void dart_emit_reference(dart_ctx_t *ctx, TSNode node, const dart_ref_t *ref) {
+    if ((ref->kind != DART_FUNCTION && ref->kind != DART_CLASS) || !ref->decl)
+        return;
+    const char *identity = NULL;
+    const char *target = cbm_source_unique_qn(ref->decl, &identity);
+    cbm_source_emit_node(ctx->walk, node, CBM_SOURCE_SITE_REFERENCE, target,
+                         ref->via_import ? CBM_RESOLVE_RULE_IMPORT_BINDING
+                                         : CBM_RESOLVE_RULE_SCOPE_BINDING,
+                         ref->decl->owner, target ? ref->reason : identity);
+}
+
+static void dart_visit_type_reference(dart_ctx_t *ctx, TSNode node) {
+    const char *name = cbm_source_text(ctx->walk, node);
+    if (!name || dart_list_has(ctx->type_params, name))
+        return;
+    const char *reason = NULL;
+    bool via_import = false;
+    const cbm_source_decl_t *cls = dart_type_decl(ctx, ctx->library, name, &reason, &via_import);
+    if (!cls || cls->next)
+        return;
+    dart_ref_t ref = dart_ref_of_class(cls);
+    ref.via_import = via_import;
+    dart_emit_reference(ctx, node, &ref);
+}
+
 /* Dart keeps an expression's selectors as siblings of its head. This walks one
  * such sequence left to right, tracking what each prefix denotes. */
 static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned depth,
@@ -1176,15 +1209,22 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
         } else {
             current = (dart_ref_t){.reason = "dart_computed_receiver"};
             if (cbm_source_is(child, "identifier")) {
-                const char *name = (resolve_every_name || cbm_source_is(next, "selector") ||
-                                    cbm_source_is(next, "cascade_section"))
-                                       ? cbm_source_text(ctx->walk, child)
-                                       : NULL;
-                if (name)
+                /* A declaration's own name is not a read of anything. */
+                bool declared =
+                    ts_node_eq(child, cbm_source_field(node, "name")) ||
+                    cbm_source_is(node, "label") ||
+                    (cbm_source_is(node, "initialized_identifier") && ts_node_is_null(previous));
+                const char *name = declared ? NULL : cbm_source_text(ctx->walk, child);
+                if (name) {
                     current = dart_name(ctx, name);
+                    if (!cbm_source_is(next, "selector"))
+                        dart_emit_reference(ctx, child, &current);
+                }
             } else if (cbm_source_is(child, "this")) {
                 if (ctx->class_key)
                     current = (dart_ref_t){.kind = DART_INSTANCE, .class_key = ctx->class_key};
+            } else if (cbm_source_is(child, "type_identifier")) {
+                dart_visit_type_reference(ctx, child);
             } else {
                 dart_visit(ctx, child, depth + 1);
             }
@@ -1194,6 +1234,21 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
     }
     ts_tree_cursor_delete(&cursor);
     return current;
+}
+
+static void dart_visit_signature_types(dart_ctx_t *ctx, TSNode node, unsigned depth) {
+    if (!cbm_source_step(ctx->walk, depth))
+        return;
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (cbm_source_is(child, "type_identifier"))
+            dart_visit_type_reference(ctx, child);
+        else if (cbm_source_is(child, "type_arguments") || dart_parameters_holder(child) ||
+                 cbm_source_is(child, "formal_parameter") ||
+                 cbm_source_is(child, "getter_signature"))
+            dart_visit_signature_types(ctx, child, depth + 1);
+    }
 }
 
 static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode body,
@@ -1230,6 +1285,9 @@ static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode b
             dart_bind_parameters(ctx, signature, depth + 1);
         }
     }
+    /* A signature's types are read in its own type-parameter scope. */
+    if (!ts_node_is_null(signature) && !cbm_source_is(signature, "formal_parameter_list"))
+        dart_visit_signature_types(ctx, signature, depth + 1);
     if (!ts_node_is_null(body))
         dart_visit(ctx, body, depth + 1);
     ctx->locals = saved;
@@ -1354,6 +1412,18 @@ static void dart_visit(dart_ctx_t *ctx, TSNode node, unsigned depth) {
         dart_visit_local_definition(ctx, node, depth);
         return;
     }
+    if (!strcmp(kind, "assignment_expression")) {
+        /* A name assigned here is a variable from here on, whatever else it could be. */
+        TSNode left = cbm_source_field(node, "left");
+        TSNode target =
+            cbm_source_is(left, "assignable_expression") && ts_node_named_child_count(left) == 1
+                ? ts_node_named_child(left, 0)
+                : (TSNode){0};
+        (void)dart_visit_sequence(ctx, node, depth, false);
+        if (cbm_source_is(target, "identifier"))
+            dart_bind(ctx, cbm_source_text(ctx->walk, target), NULL);
+        return;
+    }
     if (!strcmp(kind, "pattern_variable_declaration")) {
         /* The value first, in the scope before these names exist. */
         uint32_t count = ts_node_named_child_count(node);
@@ -1407,4 +1477,5 @@ static void dart_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_dart = {.language = CBM_LANG_DART,
                                                       .collect = dart_collect,
                                                       .resolve = dart_resolve,
-                                                      .before_binding_rules = true};
+                                                      .before_binding_rules = true,
+                                                      .decides_references = true};

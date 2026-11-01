@@ -74,10 +74,10 @@ static const edge_row_t edge_rows[] = {
      "ancestor of the importing file; other load paths and interpolation abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
      "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
-    {CBM_LANG_SWIFT, EDGE(CALLS),
+    {CBM_LANG_SWIFT, EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "Modules from SwiftPM targets; lexical scope, extensions, inheritance and argument labels; "
      "declared and constructed receiver types. Xcode module membership abstains."},
-    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the pubspec "
      "name; declared and constructed receiver types along class, mixin and superclass chains. "
      "Collection element types, conditional imports and part-of by library name abstain."},
@@ -103,7 +103,7 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_MESON, EDGE(IMPORTS),
      "Complete literal subdir calls in an unconditional initial statement prefix; parent "
      "traversal, keyword arguments, conditions and prior unknown effects abstain."},
-    {CBM_LANG_SCALA, EDGE(IMPORTS) | EDGE(CALLS),
+    {CBM_LANG_SCALA, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
      "Packages, imports by precedence, templates and their linearized parents; declared receiver "
      "types and `new`. Inferred return types, infix calls and Java classes abstain."},
     {CBM_LANG_HCL, EDGE(IMPORTS) | EDGE(USAGE),

@@ -2541,6 +2541,8 @@ static cbm_resolve_result_t dart_name_result(file_resolver_t *resolver, const ch
     return *cached;
 }
 
+static bool callable_node(const cbm_gbuf_node_t *node);
+
 /* An adapter's decision for this exact occurrence, never its spelling. */
 static cbm_resolve_result_t source_adapter_result(file_resolver_t *resolver, const char *name,
                                                   uint32_t start, uint32_t end,
@@ -2568,14 +2570,20 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
         !cbm_source_adapter_has_binding_rules(file->language))
         return source_adapter_result(resolver, name, start, end, origin, invocation);
     if (file->language == CBM_LANG_DART) {
+        cbm_resolve_result_t proof = dart_name_result(resolver, name);
+        proof = cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
+        /* The older rules keep what they prove, unless that is a class they cannot
+         * call, which is the adapter's constructor rule to decide. */
+        const cbm_gbuf_node_t *selected =
+            proof.target ? cbm_gbuf_find_by_qn(file->graph, proof.target) : NULL;
+        if (cbm_resolve_admit(&proof) && (!invocation || callable_node(selected)))
+            return proof;
         cbm_resolve_result_t decided =
             source_adapter_result(resolver, name, start, end, origin, invocation);
         if (decided.target)
             return decided;
-        cbm_resolve_result_t proof = dart_name_result(resolver, name);
-        proof = cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
         /* Both abstained: the occurrence's own reason says more than the file's. */
-        if (invocation && !cbm_resolve_admit(&proof))
+        if (invocation)
             proof.reason = decided.reason;
         return proof;
     }

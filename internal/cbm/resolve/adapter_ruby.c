@@ -360,7 +360,7 @@ static ruby_lookup_t ruby_own(const ruby_ctx_t *ctx, const char *owner, const ch
     if (!first)
         return RUBY_ABSENT;
     const char *reason = NULL;
-    if (!cbm_source_unique_qn(first, &reason))
+    if (first->next || !cbm_source_unique_qn(first, &reason))
         return RUBY_AMBIGUOUS;
     for (const cbm_source_decl_t *decl = first; decl; decl = decl->next)
         if (decl->flags & (CBM_SOURCE_DECL_F_CONDITIONAL | CBM_SOURCE_DECL_F_OPEN))
