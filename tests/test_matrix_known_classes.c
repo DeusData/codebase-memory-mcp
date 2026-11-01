@@ -133,9 +133,9 @@ static void mkc_cleanup(MKC_Proj *lp, cbm_store_t *store) {
 
 /* Each obligation below is authored from its fixture, independently of emitted
  * rows. Missing edges remain quality debt; invented targets fail the oracle.
- * Unsupported implicit constructors retain a real source declaration anchor
- * with no fabricated callable identity. The explicit C# operator also retains
- * its unmapped callable identity as debt. Unknown receiver sites are forbidden. */
+ * A class stands for a constructor that has no node of its own: a primary constructor
+ * in the class header, a synthesized apply, or a Swift init. The evidence marks it as a
+ * class call. Unknown receiver sites are forbidden. */
 typedef struct {
     const char *test, *caller, *needle, *target, *declaration, *label;
     int line;
@@ -143,14 +143,14 @@ typedef struct {
     bool required;
 } MKC_Golden;
 static const MKC_Golden mkc_goldens[] = {
-    {"mkc_c1_scala_constructor_new", "make", "new Widget(n)", NULL,
-     "class Widget(val name: String) {", "Method", 1, 0, false},
-    {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0)", NULL,
-     "case class Point(x: Double, y: Double) {", "Method", 1, 0, false},
+    {"mkc_c1_scala_constructor_new", "make", "new Widget(n)", "Widget",
+     "class Widget(val name: String) {", "Class", 1, 0, true},
+    {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0)", "Point",
+     "case class Point(x: Double, y: Double) {", "Class", 1, 0, true},
     {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0).dist()", "dist",
      "  def dist(): Double = math.sqrt(x*x + y*y)", "Method", 2, 0, true},
-    {"mkc_c1_swift_initializer", "make", "Widget(name: n)", "init",
-     "    init(name: String) { self.name = name }", "Method", 3, 0, false},
+    {"mkc_c1_swift_initializer", "make", "Widget(name: n)", "Widget", "class Widget {", "Class", 1, 0,
+     true},
     {"mkc_c1_ruby_type_new", "make", "Widget.new(name)", "initialize", "  def initialize(name)",
      "Method", 2, 0, true},
     {"mkc_c1_rust_new_samefile", "run", "Point::new(3.0, 4.0)", "new",
@@ -177,12 +177,12 @@ static const MKC_Golden mkc_goldens[] = {
      "Method", 8, 0, false},
     {"mkc_c2_kotlin_operator_plus", "run", "a + b", "plus",
      "    operator fun plus(other: Vec2): Vec2 =", "Method", 2, 0, true},
-    {"mkc_c2_csharp_operator_plus", "Run", "a + b", NULL,
+    {"mkc_c2_csharp_operator_plus", "Run", "a + b", "operator+",
      "        public static Vec2 operator+(Vec2 a, Vec2 b) {", "Method", 5, 0, false},
     {"mkc_c2_csharp_operator_plus", "Run", "(a + b).Dot(b)", "Dot",
      "        public float Dot(Vec2 o) { return X*o.X + Y*o.Y; }", "Method", 8, 0, false},
     {"mkc_c2_csharp_operator_plus", "operator+", "new Vec2(a.X + b.X, a.Y + b.Y)", "Vec2",
-     "        public Vec2(float x, float y) { X = x; Y = y; }", "Method", 4, 0, false},
+     "        public Vec2(float x, float y) { X = x; Y = y; }", "Method", 4, 0, true},
     {"mkc_c2_scala_symbolic_method", "run", "a + b", "+",
      "  def +(other: Vec2): Vec2 = Vec2(x + other.x, y + other.y)", "Method", 2, 0, false},
     {"mkc_c2_scala_symbolic_method", "run", "(a + b).dot(b)", "dot",
@@ -258,12 +258,29 @@ static const MKC_Golden mkc_goldens[] = {
      "    make(name: string): Widget { return new Widget(name); }", "Method", 7, 0, true},
     {"mkc_c8_typescript_constructor_samefile", "run", "this.make(name).label()", "label",
      "    label(): string { return this.name; }", "Method", 3, 0, false},
-    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget(name)", NULL,
-     "class Widget(val name: String) {", "Method", 1, 0, false},
+    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget(name)", "Widget",
+     "class Widget(val name: String) {", "Class", 1, 0, true},
     {"mkc_c8_kotlin_constructor_samefile", "run", "make(name)", "make",
      "fun make(name: String): Widget = Widget(name)", "Function", 5, 0, true},
     {"mkc_c8_kotlin_constructor_samefile", "run", "make(name).label()", "label",
      "    fun label(): String = name", "Method", 2, 0, true},
+};
+/* The harness audits a known target under every role. A class named in a signature is
+ * referenced there, in these languages as USAGE and as USES_TYPE, apart from the call. */
+typedef struct {
+    const char *test, *caller, *needle, *relation, *target, *declaration;
+    int line;
+    unsigned occurrence;
+} MKC_TypeMention;
+static const MKC_TypeMention mkc_type_mentions[] = {
+    {"mkc_c1_scala_constructor_new", "make", "Widget", "USAGE", "Widget",
+     "class Widget(val name: String) {", 1, 1},
+    {"mkc_c1_scala_constructor_new", "make", "Widget", "USES_TYPE", "Widget",
+     "class Widget(val name: String) {", 1, 1},
+    {"mkc_c1_swift_initializer", "make", "Widget", "USAGE", "Widget", "class Widget {", 1, 1},
+    {"mkc_c1_swift_initializer", "make", "Widget", "USES_TYPE", "Widget", "class Widget {", 1, 1},
+    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget", "USAGE", "Widget",
+     "class Widget(val name: String) {", 1, 1},
 };
 typedef struct {
     const char *test, *caller, *needle;
@@ -327,9 +344,7 @@ static bool mkc_quality(const MKC_File *original, int count, const char *test) {
             .why = g->target
                        ? "This source-authored call requires a complete language binding and "
                          "receiver/overload proof to its exact callable declaration."
-                       : "The genuine call has no faithful callable graph identity. A class "
-                         "anchor for an implicit constructor, or an explicit operator anchor, "
-                         "records debt without accepting a Class as a callable target.",
+                       : "The genuine call has no faithful callable graph identity.",
             .tried = "The original v69 production harness failed its aggregate call floor. "
                      "Preserved fixture bytes and replaced that floor with exact source "
                      "occurrences/declarations. Direct make calls remain required source "
@@ -340,6 +355,28 @@ static bool mkc_quality(const MKC_File *original, int count, const char *test) {
         if (!strcmp(test, "mkc_c2_python_dunder_add"))
             expected[n].dispatch_group = "python-class-initialization";
         required += g->required;
+        n++;
+    }
+    for (size_t i = 0; i < sizeof(mkc_type_mentions) / sizeof(mkc_type_mentions[0]); i++) {
+        const MKC_TypeMention *g = mkc_type_mentions + i;
+        if (strcmp(test, g->test))
+            continue;
+        if (n == sizeof(expected) / sizeof(expected[0]))
+            return false;
+        snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
+        expected[n] = (RQ_Expected){.case_id = ids[n],
+                                    .site = {.file = original[0].name,
+                                             .caller = g->caller,
+                                             .needle = g->needle,
+                                             .occurrence_index = g->occurrence},
+                                    .relation = g->relation,
+                                    .target = {.file = original[0].name,
+                                               .suffix = g->target,
+                                               .label = "Class",
+                                               .declaration_line = g->line,
+                                               .declaration_text = g->declaration},
+                                    .mode = RQ_REQUIRED};
+        required++;
         n++;
     }
     for (size_t i = 0; i < sizeof(mkc_forbidden) / sizeof(mkc_forbidden[0]); i++) {
@@ -654,6 +691,78 @@ TEST(mkc_c2_csharp_operator_plus) {
                                   "}\n"}};
     /* Exact source obligations and unsupported-binding gaps are tracked above. */
     ASSERT_TRUE(mkc_quality(f, 1, __func__));
+    PASS();
+}
+
+/* A C# operator's body has its own node, also when the operator is overloaded or spelled
+ * with a space or a word. A call in it belongs to that operator, never to the file. */
+TEST(mkc_c2_csharp_operator_overloads) {
+    static const char source[] =
+        "namespace App {\n"
+        "    struct Vec2 {\n"
+        "        public float X;\n"
+        "        public Vec2(float x) { X = x; }\n"
+        "        public static Vec2 operator+(Vec2 a, Vec2 b) { return new Vec2(a.X + b.X); }\n"
+        "        public static Vec2 operator+(Vec2 a, float b) { return new Vec2(a.X + b); }\n"
+        "        public static Vec2 operator -(Vec2 a, Vec2 b) { return new Vec2(a.X - b.X); }\n"
+        "        public static bool operator true(Vec2 a) { return Check(a); }\n"
+        "        static bool Check(Vec2 a) { return true; }\n"
+        "    }\n"
+        "}\n";
+    const MKC_File files[] = {{"Vec.cs", source}};
+    const RQ_Source sources[] = {{.path = "Vec.cs", .text = source}};
+    const RQ_Target ctor = {.file = "Vec.cs",
+                            .suffix = "Vec2.Vec2",
+                            .label = "Method",
+                            .declaration_line = 4,
+                            .declaration_text = "        public Vec2(float x) { X = x; }"};
+    const RQ_Target check = {.file = "Vec.cs",
+                             .suffix = "Vec2.Check",
+                             .label = "Method",
+                             .declaration_line = 9,
+                             .declaration_text =
+                                 "        static bool Check(Vec2 a) { return true; }"};
+    const RQ_Expected expected[] = {
+        {.case_id = "first-plus",
+         .site = {.file = "Vec.cs",
+                  .caller = "Vec2.operator+",
+                  .needle = "new Vec2(a.X + b.X)",
+                  .caller_variant_start_line = 5,
+                  .caller_variant_end_line = 5,
+                  .caller_variant_declaration = "        public static Vec2 operator+(Vec2 a, Vec2 "
+                                                "b) { return new Vec2(a.X + b.X); }"},
+         .relation = "CALLS",
+         .target = ctor,
+         .mode = RQ_REQUIRED},
+        {.case_id = "second-plus",
+         .site = {.file = "Vec.cs",
+                  .caller = "Vec2.operator+",
+                  .needle = "new Vec2(a.X + b)",
+                  .caller_variant_start_line = 6,
+                  .caller_variant_end_line = 6,
+                  .caller_variant_declaration = "        public static Vec2 operator+(Vec2 a, float "
+                                                "b) { return new Vec2(a.X + b); }"},
+         .relation = "CALLS",
+         .target = ctor,
+         .mode = RQ_REQUIRED},
+        {.case_id = "minus",
+         .site = {.file = "Vec.cs", .caller = "Vec2.operator-", .needle = "new Vec2(a.X - b.X)"},
+         .relation = "CALLS",
+         .target = ctor,
+         .mode = RQ_REQUIRED},
+        {.case_id = "word",
+         .site = {.file = "Vec.cs", .caller = "Vec2.operator true", .needle = "Check(a)"},
+         .relation = "CALLS",
+         .target = check,
+         .mode = RQ_REQUIRED}};
+    MKC_Proj project;
+    cbm_store_t *store = mkc_index(&project, files, 1);
+    RQ_Report report = {0};
+    bool ok = store && rq_check_project_declarations(store, project.project, __func__, sources, 1,
+                                                     expected, 4, NULL, 0, &report, stderr);
+    mkc_cleanup(&project, store);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(report.found, 4);
     PASS();
 }
 
@@ -1309,6 +1418,7 @@ SUITE(matrix_known_classes) {
     RUN_TEST(mkc_c2_kotlin_operator_plus);
     /* C2-G: C# operator+ — red=bug */
     RUN_TEST(mkc_c2_csharp_operator_plus);
+    RUN_TEST(mkc_c2_csharp_operator_overloads);
     /* C2-H: Scala symbolic method — uncertain/red=bug */
     RUN_TEST(mkc_c2_scala_symbolic_method);
     /* C2-I: Ruby def + — uncertain/red=bug */

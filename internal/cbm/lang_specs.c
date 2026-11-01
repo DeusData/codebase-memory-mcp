@@ -369,10 +369,10 @@ static const char *cpp_assign_types[] = {"assignment_expression", "update_expres
 static const char *cpp_throw_types[] = {"throw_statement", NULL};
 
 // ==================== C# ====================
-static const char *cs_func_types[] = {"destructor_declaration",      "local_function_statement",
-                                      "function_pointer_type",       "constructor_declaration",
-                                      "anonymous_method_expression", "lambda_expression",
-                                      "method_declaration",          NULL};
+static const char *cs_func_types[] = {
+    "destructor_declaration",  "local_function_statement",    "function_pointer_type",
+    "constructor_declaration", "anonymous_method_expression", "lambda_expression",
+    "method_declaration",      "operator_declaration",        NULL};
 static const char *cs_class_types[] = {"class_declaration",
                                        "struct_declaration",
                                        "enum_declaration",

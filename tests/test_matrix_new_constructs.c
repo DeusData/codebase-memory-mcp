@@ -249,8 +249,8 @@ static const MN_Golden mn_goldens[] = {
      "    pub fn enqueue(&mut self, item: T) { self.buf.push_back(item); }", "Method", 7, 0, true},
     {"mn_extension_rust_impl", "demo", "q.dequeue()", "dequeue",
      "    pub fn dequeue(&mut self) -> Option<T> { self.buf.pop_front() }", "Method", 8, 0, true},
-    {"mn_record_kotlin_data_class", "anon", "User(\"anon\", 0)", NULL,
-     "data class User(val name: String, val age: Int) {", "Method", 1, 0, false},
+    {"mn_record_kotlin_data_class", "anon", "User(\"anon\", 0)", "User",
+     "data class User(val name: String, val age: Int) {", "Class", 1, 0, true},
     {"mn_record_kotlin_data_class", "run", "User.anon()", "anon",
      "        fun anon(): User = User(\"anon\", 0)", "Method", 6, 0, true},
     {"mn_record_kotlin_data_class", "run", "User.anon().greet()", "greet",
@@ -402,9 +402,9 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                 g->target
                     ? "Generic/conditional, namespace or effectful value binding needs a complete "
                       "proof to this independently authored callable declaration."
-                    : "The genuine invocation targets a returned closure or implicit constructor. "
-                      "Its source anchor records the missing callable identity without accepting "
-                      "a variable or class node as the target.",
+                    : "The genuine invocation targets a returned closure. Its source anchor "
+                      "records the missing callable identity without accepting a variable node "
+                      "as the target.",
             .tried = "The original full production harness failed its v69 call floor. Original "
                      "source bytes and structural assertions remain intact; each covered caller "
                      "now enumerates its project call sites and a required control checks the "
@@ -414,6 +414,25 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
     }
     if (n == 1)
         return false;
+    /* The harness audits a known target under every role: `anon(): User` names the class
+     * it also constructs, and that signature is a USAGE of it. */
+    if (!strcmp(test, "mn_record_kotlin_data_class")) {
+        if (n == sizeof(expected) / sizeof(expected[0]))
+            return false;
+        snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
+        expected[n] = (RQ_Expected){
+            .case_id = ids[n],
+            .site = {.file = filename, .caller = "anon", .needle = "User", .occurrence_index = 1},
+            .relation = "USAGE",
+            .target = {.file = filename,
+                       .suffix = "User",
+                       .label = "Class",
+                       .declaration_line = 1,
+                       .declaration_text = "data class User(val name: String, val age: Int) {"},
+            .mode = RQ_REQUIRED};
+        required++;
+        n++;
+    }
     MN_LangProj lp;
     cbm_store_t *store = mn_index_files(&lp, files, 2);
     RQ_Report report = {0};

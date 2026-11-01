@@ -866,6 +866,11 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
     for (int tmpl_depth = 0; tmpl_depth < MAX_TEMPLATE_DEPTH; tmpl_depth++) {
         const char *kind = ts_node_type(node);
 
+        // C#: an overloaded operator has no name field, its token names it.
+        if (lang == CBM_LANG_CSHARP && strcmp(kind, "operator_declaration") == 0) {
+            return ts_node_child_by_field_name(node, TS_FIELD("operator"));
+        }
+
         if (lang == CBM_LANG_HASKELL && strcmp(kind, "signature") == 0) {
             TSNode null_node = {0};
             return null_node;
@@ -9291,9 +9296,10 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 
     const char *ck = ts_node_type(child);
 
-    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
-         lang == CBM_LANG_GLSL) &&
-        strcmp(ck, "function_definition") == 0) {
+    if (((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+          lang == CBM_LANG_GLSL) &&
+         strcmp(ck, "function_definition") == 0) ||
+        (lang == CBM_LANG_CSHARP && strcmp(ck, "operator_declaration") == 0)) {
         return cbm_resolve_func_name(child, lang);
     }
 
