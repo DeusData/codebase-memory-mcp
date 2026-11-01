@@ -229,9 +229,11 @@ TEST(resolver_binding_generic_unmodeled_library_context_is_not_complete) {
         cbm_resolve_binding_build(&arena, result, CBM_LANG_DART, dart, strlen(dart));
     ASSERT(!cbm_resolve_binding_namespace_complete(index));
     ASSERT_STR_EQ(cbm_resolve_binding_status(index), "dart_library_namespace_expansion_required");
+    /* Swift's module membership is now read from SwiftPM targets by its adapter,
+     * which decides per occurrence; this index only attests those sites. */
     cbm_resolve_binding_index_t *swift =
         cbm_resolve_binding_build(&arena, NULL, CBM_LANG_SWIFT, "", 0);
-    ASSERT_STR_EQ(cbm_resolve_binding_status(swift), "swift_build_module_membership_required");
+    ASSERT_STR_EQ(cbm_resolve_binding_status(swift), "source_adapter_binding");
     cbm_arena_destroy(&arena);
     cbm_free_result(result);
     PASS();

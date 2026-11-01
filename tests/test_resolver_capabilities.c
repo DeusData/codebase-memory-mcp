@@ -22,7 +22,7 @@ TEST(resolver_capability_is_never_an_occurrence_proof) {
     ASSERT(capability.proof_subsets & CBM_RESOLVE_CAP_MEMBER);
     cbm_resolve_result_t missing = {0};
     ASSERT(!cbm_resolve_admit(&missing));
-    ASSERT(cbm_resolve_capabilities(CBM_LANG_SWIFT, &capability));
+    ASSERT(cbm_resolve_capabilities(CBM_LANG_JULIA, &capability));
     ASSERT_EQ(capability.proof_subsets, 0);
     ASSERT(cbm_resolve_capabilities(CBM_LANG_LUA, &capability));
     ASSERT_EQ(capability.proof_subsets, CBM_RESOLVE_CAP_SCOPE);
@@ -71,7 +71,7 @@ TEST(resolver_capabilities_report_supported_subsets_and_quality_gaps) {
     ASSERT_EQ(edge.availability, CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
     ASSERT(cbm_resolve_edge_capability(CBM_LANG_DART, "WRITES", &edge));
     ASSERT_EQ(edge.availability, CBM_RESOLVE_EDGE_UNSUPPORTED);
-    const CBMLanguage unsupported[] = {CBM_LANG_SWIFT, CBM_LANG_JULIA, CBM_LANG_JSON};
+    const CBMLanguage unsupported[] = {CBM_LANG_JULIA, CBM_LANG_JSON};
     for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
         cbm_resolve_capabilities_t capability;
         ASSERT(cbm_resolve_capabilities(unsupported[i], &capability));
@@ -80,10 +80,10 @@ TEST(resolver_capabilities_report_supported_subsets_and_quality_gaps) {
     }
     /* Syntax extraction and legacy semantic engines cannot enable a relation
      * without an admitted producer. Missing coverage remains a quality gap. */
-    cbm_resolve_capabilities_t swift;
-    ASSERT(cbm_resolve_capabilities(CBM_LANG_SWIFT, &swift));
-    ASSERT(swift.syntax_declarations);
-    ASSERT_EQ(swift.edges[CBM_RESOLVE_EDGE_CALLS].availability, CBM_RESOLVE_EDGE_UNSUPPORTED);
+    cbm_resolve_capabilities_t julia;
+    ASSERT(cbm_resolve_capabilities(CBM_LANG_JULIA, &julia));
+    ASSERT(julia.syntax_declarations);
+    ASSERT_EQ(julia.edges[CBM_RESOLVE_EDGE_CALLS].availability, CBM_RESOLVE_EDGE_UNSUPPORTED);
     PASS();
 }
 

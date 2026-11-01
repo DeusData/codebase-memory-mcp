@@ -74,6 +74,9 @@ static const edge_row_t edge_rows[] = {
      "ancestor of the importing file; other load paths and interpolation abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
      "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
+    {CBM_LANG_SWIFT, EDGE(CALLS),
+     "Modules from SwiftPM targets; lexical scope, extensions, inheritance and argument labels; "
+     "declared and constructed receiver types. Xcode module membership abstains."},
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
      "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the pubspec "
      "name; declared and constructed receiver types along class, mixin and superclass chains. "
@@ -389,7 +392,12 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                           "containing language.";
         break;
     case CBM_LANG_SWIFT:
-        out->limitation = "Swift build-module membership and binding proofs unimplemented.";
+        out->adapter = "swift_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation = "Modules from SwiftPM targets; outside those, a file decides only for "
+                          "itself. Implicit member expressions and collection element types "
+                          "abstain.";
         break;
     default:
         break;

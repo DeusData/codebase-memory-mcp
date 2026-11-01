@@ -541,6 +541,7 @@ PIPELINE_SRCS = \
     internal/cbm/resolve/adapter_haskell.c \
     internal/cbm/resolve/adapter_ocaml.c \
     internal/cbm/resolve/adapter_dart.c \
+    internal/cbm/resolve/adapter_swift.c \
     internal/cbm/resolve/symbols.c \
     internal/cbm/lsp/ts_proof.c \
     internal/cbm/lsp/php_proof.c \

@@ -673,10 +673,356 @@ TEST(resolver_source_ruby_ancestor_chain_and_self_rules) {
     PASS();
 }
 
+/* ── Dart ──────────────────────────────────────────────────────────── */
+
+static const char DART_MAIN[] =
+    "import 'package:counter/barrel.dart';\n"
+    "import 'src/store.dart' as s show helper;\n"
+    "part 'main_part.dart';\n"
+    "\n"
+    "class Counter extends Base with Mix, Later {\n"
+    "  final Store store;\n"
+    "  final made = Store();\n"
+    "  Counter(this.store);\n"
+    "  void callsOwn() { ownM(); }\n"
+    "  void callsInherited() { fromBase(); }\n"
+    "  void callsMixin() { fromMix(); }\n"
+    "  void callsLastMixin() { both(); }\n"
+    "  void callsLibraryFirst() { fromLibrary(); }\n"
+    "  void callsField() { store.save(); }\n"
+    "  void callsInferred() { made.save(); }\n"
+    "  void callsParam(Store p) { p.save(); }\n"
+    "  void callsLocal() { final l = Store(); l.save(); }\n"
+    "  void callsTyped() { Store t = Store.named(); t.save(); }\n"
+    "  void callsStatic() { Store.make(); }\n"
+    "  void callsTop() { topLocal(); }\n"
+    "  void callsBarrel() { helper(); }\n"
+    "  void callsPrefix() { s.helper(); }\n"
+    "  void callsPart() { fromPart(); }\n"
+    "  void callsNew() { new Store(); }\n"
+    "  void noShadow(void Function() ownM) { ownM(); }\n"
+    "  void noLocalFn() { void topLocal() {} topLocal(); }\n"
+    "  void noHidden() { hiddenName(); }\n"
+    "  void noPrivate() { _private(); }\n"
+    "  void noUnimported() { unimported(); }\n"
+    "  void noUnknown(dynamic d) { d.save(); }\n"
+    "  void noUntyped(x) { x.save(); }\n"
+    "  void noPrefixShow() { s.notShown(); }\n"
+    "  void noClosureParam() { [1].map((ownM) => ownM()); }\n"
+    "  void noValueCall() { store(); }\n"
+    "  void ownM() {}\n"
+    "}\n"
+    "void fromLibrary() {}\n"
+    "void topLocal() {}\n";
+static const char DART_PART[] = "part of 'main.dart';\n"
+                                "void fromPart() {}\n"
+                                "void partCalls() { topLocal(); }\n";
+static const char DART_BARREL[] = "export 'src/store.dart' hide hiddenName;\n"
+                                  "export 'src/base.dart';\n";
+static const char DART_STORE[] = "class Store {\n"
+                                 "  Store();\n"
+                                 "  Store.named();\n"
+                                 "  static Store make() => Store();\n"
+                                 "  void save() {}\n"
+                                 "}\n"
+                                 "void helper() {}\n"
+                                 "void notShown() {}\n"
+                                 "void _private() {}\n"
+                                 "void hiddenName() {}\n";
+static const char DART_BASE[] = "abstract class Base {\n"
+                                "  void fromBase() {}\n"
+                                "  void fromLibrary() {}\n"
+                                "}\n"
+                                "mixin Mix {\n"
+                                "  void fromMix() {}\n"
+                                "  void both() {}\n"
+                                "}\n"
+                                "mixin Later {\n"
+                                "  void both() {}\n"
+                                "}\n";
+static const char DART_DECOY[] = "class Other {\n"
+                                 "  void save() {}\n"
+                                 "}\n"
+                                 "void unimported() {}\n";
+static const char DART_EXT[] = "import 'package:flutter/material.dart';\n"
+                               "import 'src/base.dart';\n"
+                               "class Ext extends Base {\n"
+                               "  void callsBase() { fromBase(); }\n"
+                               "}\n"
+                               "class W extends StatelessWidget {\n"
+                               "  void callsOutside() { build(); }\n"
+                               "  void callsOwnW() { ownW(); }\n"
+                               "  void ownW() {}\n"
+                               "}\n";
+
+#define DART_FILE "lib/main.dart"
+#define DART_STORE_FILE "lib/src/store.dart"
+#define DART_BASE_FILE "lib/src/base.dart"
+#define DART_CALL(id, method, text, tfile, tsuffix, label, tline, tdecl)                       \
+    SL_CALL_AT(id, DART_FILE, "Counter." method, text, 0, tfile, tsuffix, label, tline, tdecl)
+#define DART_DENY(id, method, text, at) SL_DENY_AT(id, DART_FILE, "Counter." method, text, at)
+#define DART_SAVE(id, method, text)                                                            \
+    DART_CALL(id, method, text, DART_STORE_FILE, "Store.save", "Method", 5, "  void save() {}")
+#define DART_STORE_CLASS(id, method, text)                                                     \
+    DART_CALL(id, method, text, DART_STORE_FILE, "store.Store", "Class", 1, "class Store {")
+
+TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
+    static const RQ_Source sources[] = {
+        {.path = "pubspec.yaml", .text = "name: counter\n"},
+        {.path = DART_FILE, .text = DART_MAIN},
+        {.path = "lib/main_part.dart", .text = DART_PART},
+        {.path = "lib/barrel.dart", .text = DART_BARREL},
+        {.path = DART_STORE_FILE, .text = DART_STORE},
+        {.path = DART_BASE_FILE, .text = DART_BASE},
+        {.path = "lib/decoy.dart", .text = DART_DECOY},
+        {.path = "lib/ext.dart", .text = DART_EXT},
+    };
+    static const RQ_Expected expected[] = {
+        DART_CALL("own-member", "callsOwn", "ownM()", DART_FILE, "Counter.ownM", "Method", 35,
+                  "  void ownM() {}"),
+        DART_CALL("inherited-member-with-no-outside-import", "callsInherited", "fromBase()",
+                  DART_BASE_FILE, "Base.fromBase", "Method", 2, "  void fromBase() {}"),
+        DART_CALL("mixin-member", "callsMixin", "fromMix()", DART_BASE_FILE, "Mix.fromMix",
+                  "Method", 6, "  void fromMix() {}"),
+        DART_CALL("last-mixin-wins", "callsLastMixin", "both()", DART_BASE_FILE, "Later.both",
+                  "Method", 10, "  void both() {}"),
+        DART_CALL("library-function-beats-inherited-member", "callsLibraryFirst", "fromLibrary()",
+                  DART_FILE, "main.fromLibrary", "Function", 38, "void fromLibrary() {}"),
+        DART_SAVE("declared-field-receiver", "callsField", "store.save"),
+        DART_SAVE("field-initialized-by-constructor", "callsInferred", "made.save"),
+        DART_SAVE("declared-parameter-receiver", "callsParam", "p.save"),
+        DART_STORE_CLASS("constructor-call", "callsLocal", "Store()"),
+        DART_SAVE("local-initialized-by-constructor", "callsLocal", "l.save"),
+        DART_STORE_CLASS("named-constructor", "callsTyped", "Store.named"),
+        DART_SAVE("declared-local-receiver", "callsTyped", "t.save"),
+        DART_CALL("static-method-on-class", "callsStatic", "Store.make", DART_STORE_FILE,
+                  "Store.make", "Method", 4, "  static Store make() => Store();"),
+        DART_CALL("library-top-level", "callsTop", "topLocal()", DART_FILE, "main.topLocal",
+                  "Function", 39, "void topLocal() {}"),
+        DART_CALL("through-package-uri-and-export", "callsBarrel", "helper()", DART_STORE_FILE,
+                  "store.helper", "Function", 7, "void helper() {}"),
+        DART_CALL("prefix-with-show", "callsPrefix", "s.helper", DART_STORE_FILE, "store.helper",
+                  "Function", 7, "void helper() {}"),
+        DART_CALL("function-in-a-part", "callsPart", "fromPart()", "lib/main_part.dart",
+                  "main_part.fromPart", "Function", 2, "void fromPart() {}"),
+        DART_STORE_CLASS("new-expression", "callsNew", "new Store()"),
+        SL_CALL_AT("part-sees-its-library", "lib/main_part.dart", "main_part.partCalls",
+                   "topLocal()", 0, DART_FILE, "main.topLocal", "Function", 39,
+                   "void topLocal() {}"),
+        SL_CALL_AT("own-member-under-an-outside-superclass", "lib/ext.dart", "W.callsOwnW",
+                   "ownW()", 0, "lib/ext.dart", "W.ownW", "Method", 9, "  void ownW() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        DART_DENY("parameter-shadows-member", "noShadow", "ownM()", 1),
+        DART_DENY("local-function-shadows-library", "noLocalFn", "topLocal()", 1),
+        DART_DENY("hidden-by-the-export", "noHidden", "hiddenName()", 0),
+        DART_DENY("private-to-its-library", "noPrivate", "_private()", 0),
+        DART_DENY("same-project-but-not-imported", "noUnimported", "unimported()", 0),
+        DART_DENY("dynamic-receiver", "noUnknown", "d.save", 0),
+        DART_DENY("untyped-parameter", "noUntyped", "x.save", 0),
+        DART_DENY("show-list-excludes-it", "noPrefixShow", "s.notShown", 0),
+        DART_DENY("closure-parameter-shadows-member", "noClosureParam", "ownM()", 2),
+        DART_DENY("call-of-a-value", "noValueCall", "store()", 0),
+        SL_DENY_AT("outside-import-can-win-over-inherited", "lib/ext.dart", "Ext.callsBase",
+                   "fromBase()", 0),
+        SL_DENY_AT("superclass-outside-project", "lib/ext.dart", "W.callsOutside", "build()", 0),
+    };
+    ASSERT(sl_check("dart-rules", ".dart", "void filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── Swift ─────────────────────────────────────────────────────────── */
+
+static const char SW_MANIFEST[] = "// swift-tools-version:5.9\n"
+                                  "import PackageDescription\n"
+                                  "let package = Package(name: \"App\", targets: [\n"
+                                  "    .target(name: \"App\", dependencies: [\"Lib\"]),\n"
+                                  "    .target(name: \"Lib\", path: \"Sources/Lib\"),\n"
+                                  "    .testTarget(name: \"AppTests\", dependencies: [\"App\"]),\n"
+                                  "])\n";
+static const char SW_MAIN[] =
+    "import Lib\n"
+    "\n"
+    "func sameFile() {}\n"
+    "private func fileHelper() {}\n"
+    "func byLabel(a: Int) {}\n"
+    "struct Box {\n"
+    "    func put() {}\n"
+    "    static func make() -> Box { Box() }\n"
+    "}\n"
+    "class Base {\n"
+    "    func fromBase() {}\n"
+    "}\n"
+    "protocol Greets {\n"
+    "    func greet()\n"
+    "}\n"
+    "extension Greets {\n"
+    "    func wave() {}\n"
+    "}\n"
+    "class Service: Base, Greets {\n"
+    "    let box: Box\n"
+    "    var maybe: Box?\n"
+    "    override init() { box = Box() }\n"
+    "    func greet() {}\n"
+    "    func ownM() {}\n"
+    "    func callsOwn() { ownM() }\n"
+    "    func callsSelf() { self.ownM() }\n"
+    "    func callsInherited() { fromBase() }\n"
+    "    func callsDefault() { wave() }\n"
+    "    func callsExtension() { inExtension() }\n"
+    "    func callsProperty() { box.put() }\n"
+    "    func callsOptional() { maybe?.put() }\n"
+    "    func callsParam(p: Box) { p.put() }\n"
+    "    func callsLocal() { let l = Box(); l.put() }\n"
+    "    func callsStatic() { Box.make() }\n"
+    "    func callsResult() { Box.make().put() }\n"
+    "    func callsFree() { sameFile() }\n"
+    "    func callsPrivate() { fileHelper() }\n"
+    "    func callsOtherFile() { otherFile() }\n"
+    "    func callsLabelA() { byLabel(a: 1) }\n"
+    "    func callsLabelB() { byLabel(b: 1) }\n"
+    "    func callsImported() { libPublic() }\n"
+    "    func callsQualified() { Lib.libPublic() }\n"
+    "    func callsImportedType() { LibType().run() }\n"
+    "    func noParamShadow(ownM: () -> Void) { ownM() }\n"
+    "    func localShadowsProperty() { let box = Other(); box.put() }\n"
+    "    func noInternalOfImport() { libInternal() }\n"
+    "    func noPrivateElsewhere() { otherPrivate() }\n"
+    "    func noDynamic(x: Any) { x.put() }\n"
+    "    func noGeneric<T>(t: T) { t.put() }\n"
+    "    func noClosureParam() { [1].map { ownM in ownM() } }\n"
+    "    func noValueCall() { box() }\n"
+    "    func noCaseBinding(o: Box?) { switch o { case .some(let box): box.put(); default: break } "
+    "}\n"
+    "}\n"
+    "struct Other { func put() {} }\n"
+    "class Outside: NSObject {\n"
+    "    func own() {}\n"
+    "    func callsOwnMember() { own() }\n"
+    "    func noFreeUnderOpenBase() { sameFile() }\n"
+    "    func noInherited() { inheritedFromOutside() }\n"
+    "}\n";
+static const char SW_SECOND[] = "func otherFile() {}\n"
+                                "func byLabel(b: Int) {}\n"
+                                "private func otherPrivate() {}\n"
+                                "extension Service {\n"
+                                "    func inExtension() {}\n"
+                                "}\n";
+static const char SW_LIB[] = "public func libPublic() {}\n"
+                             "func libInternal() {}\n"
+                             "public class LibType {\n"
+                             "    public init() {}\n"
+                             "    public func run() {}\n"
+                             "}\n";
+static const char SW_TEST[] = "@testable import App\n"
+                              "func testCalls() { sameFile() }\n";
+static const char SW_LOOSE[] = "func looseLocal() {}\n"
+                               "func looseCalls() { looseLocal(); loose2() }\n";
+
+#define SW_FILE "Sources/App/Main.swift"
+#define SW_SECOND_FILE "Sources/App/Second.swift"
+#define SW_LIB_FILE "Sources/Lib/Lib.swift"
+#define SW_CALL(id, method, text, at, tfile, tsuffix, label, tline, tdecl)                     \
+    SL_CALL_AT(id, SW_FILE, "Service." method, text, at, tfile, tsuffix, label, tline, tdecl)
+#define SW_DENY(id, method, text, at) SL_DENY_AT(id, SW_FILE, "Service." method, text, at)
+#define SW_PUT(id, method, text)                                                               \
+    SW_CALL(id, method, text, 0, SW_FILE, "Box.put", "Method", 7, "    func put() {}")
+#define SW_BOX(id, method, at)                                                                 \
+    SW_CALL(id, method, "Box()", at, SW_FILE, "Main.Box", "Struct", 6, "struct Box {")
+
+TEST(resolver_source_swift_modules_lookup_and_receivers) {
+    static const RQ_Source sources[] = {
+        {.path = "Package.swift", .text = SW_MANIFEST},
+        {.path = SW_FILE, .text = SW_MAIN},
+        {.path = SW_SECOND_FILE, .text = SW_SECOND},
+        {.path = SW_LIB_FILE, .text = SW_LIB},
+        {.path = "Tests/AppTests/T.swift", .text = SW_TEST},
+        {.path = "Scripts/loose.swift", .text = SW_LOOSE},
+        {.path = "Scripts/loose2.swift", .text = "func loose2() {}\n"},
+    };
+    static const RQ_Expected expected[] = {
+        SW_CALL("own-member", "callsOwn", "ownM()", 1, SW_FILE, "Service.ownM", "Method", 24,
+                "    func ownM() {}"),
+        SW_CALL("explicit-self", "callsSelf", "self.ownM()", 0, SW_FILE, "Service.ownM", "Method",
+                24, "    func ownM() {}"),
+        SW_CALL("superclass-member", "callsInherited", "fromBase()", 1, SW_FILE, "Base.fromBase",
+                "Method", 11, "    func fromBase() {}"),
+        SW_CALL("protocol-extension-member", "callsDefault", "wave()", 1, SW_FILE, "Greets.wave",
+                "Method", 17, "    func wave() {}"),
+        SW_CALL("extension-in-another-file", "callsExtension", "inExtension()", 0, SW_SECOND_FILE,
+                "Service.inExtension", "Method", 5, "    func inExtension() {}"),
+        SW_PUT("declared-property-receiver", "callsProperty", "box.put()"),
+        SW_PUT("optional-chain-keeps-the-type", "callsOptional", "maybe?.put()"),
+        SW_PUT("declared-parameter-receiver", "callsParam", "p.put()"),
+        SW_BOX("initializer-call", "callsLocal", 2),
+        SW_PUT("local-from-initializer", "callsLocal", "l.put()"),
+        SW_CALL("static-method", "callsStatic", "Box.make()", 0, SW_FILE, "Box.make", "Method", 8,
+                "    static func make() -> Box { Box() }"),
+        SW_CALL("result-of-a-declared-return-type", "callsResult", "Box.make()", 1, SW_FILE,
+                "Box.make", "Method", 8, "    static func make() -> Box { Box() }"),
+        SW_PUT("member-on-a-declared-return-type", "callsResult", "Box.make().put()"),
+        SW_CALL("same-file-function", "callsFree", "sameFile()", 1, SW_FILE, "Main.sameFile",
+                "Function", 3, "func sameFile() {}"),
+        SW_CALL("private-in-its-file", "callsPrivate", "fileHelper()", 1, SW_FILE,
+                "Main.fileHelper", "Function", 4, "private func fileHelper() {}"),
+        SW_CALL("another-file-of-the-target", "callsOtherFile", "otherFile()", 0, SW_SECOND_FILE,
+                "Second.otherFile", "Function", 1, "func otherFile() {}"),
+        SW_CALL("label-selects-this-overload", "callsLabelA", "byLabel(a: 1)", 0, SW_FILE,
+                "Main.byLabel", "Function", 5, "func byLabel(a: Int) {}"),
+        SW_CALL("label-selects-that-overload", "callsLabelB", "byLabel(b: 1)", 0, SW_SECOND_FILE,
+                "Second.byLabel", "Function", 2, "func byLabel(b: Int) {}"),
+        SW_CALL("public-of-an-imported-target", "callsImported", "libPublic()", 0, SW_LIB_FILE,
+                "Lib.libPublic", "Function", 1, "public func libPublic() {}"),
+        SW_CALL("module-qualified", "callsQualified", "Lib.libPublic()", 0, SW_LIB_FILE,
+                "Lib.libPublic", "Function", 1, "public func libPublic() {}"),
+        SW_CALL("imported-type", "callsImportedType", "LibType()", 0, SW_LIB_FILE, "Lib.LibType",
+                "Class", 3, "public class LibType {"),
+        SW_CALL("member-of-imported-type", "callsImportedType", "LibType().run()", 0, SW_LIB_FILE,
+                "LibType.run", "Method", 5, "    public func run() {}"),
+        SW_CALL("local-shadows-property-with-its-own-type", "localShadowsProperty", "box.put()", 1,
+                SW_FILE, "Other.put", "Method", 56, "struct Other { func put() {} }"),
+        SW_CALL("initializer-of-the-shadowing-local", "localShadowsProperty", "Other()", 0, SW_FILE,
+                "Main.Other", "Struct", 56, "struct Other { func put() {} }"),
+        SL_CALL_AT("own-member-under-an-outside-superclass", SW_FILE, "Outside.callsOwnMember",
+                   "own()", 1, SW_FILE, "Outside.own", "Method", 58, "    func own() {}"),
+        SL_CALL_AT("testable-import-reaches-internal", "Tests/AppTests/T.swift", "T.testCalls",
+                   "sameFile()", 0, SW_FILE, "Main.sameFile", "Function", 3, "func sameFile() {}"),
+        SL_CALL_AT("no-target-still-decides-its-own-file", "Scripts/loose.swift",
+                   "loose.looseCalls", "looseLocal()", 1, "Scripts/loose.swift", "loose.looseLocal",
+                   "Function", 1, "func looseLocal() {}"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SW_DENY("parameter-shadows-member", "noParamShadow", "ownM()", 3),
+        SW_DENY("closure-parameter-shadows-member", "noClosureParam", "ownM()", 4),
+        SW_DENY("internal-of-an-import-without-testable", "noInternalOfImport", "libInternal()", 0),
+        SW_DENY("private-to-another-file", "noPrivateElsewhere", "otherPrivate()", 0),
+        SW_DENY("any-has-no-members-here", "noDynamic", "x.put()", 0),
+        SW_DENY("generic-parameter", "noGeneric", "t.put()", 0),
+        SW_DENY("call-of-a-value", "noValueCall", "box()", 0),
+        SW_DENY("case-binding-shadows-property", "noCaseBinding", "box.put()", 2),
+        SL_DENY_AT("free-function-under-an-outside-superclass", SW_FILE,
+                   "Outside.noFreeUnderOpenBase", "sameFile()", 2),
+        SL_DENY_AT("member-of-an-outside-superclass", SW_FILE, "Outside.noInherited",
+                   "inheritedFromOutside()", 0),
+        SL_DENY_AT("no-known-module-across-files", "Scripts/loose.swift", "loose.looseCalls",
+                   "loose2()", 0),
+    };
+    ASSERT(sl_check("swift-rules", ".swift", "func filler() {}\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_elixir_modules_aliases_imports_and_arity);
     RUN_TEST(resolver_source_erlang_module_arity_export_and_import);
     RUN_TEST(resolver_source_zig_containers_imports_and_declared_receivers);
     RUN_TEST(resolver_source_perl_packages_exporter_and_method_resolution);
     RUN_TEST(resolver_source_ruby_ancestor_chain_and_self_rules);
+    RUN_TEST(resolver_source_dart_lexical_scope_libraries_and_receivers);
+    RUN_TEST(resolver_source_swift_modules_lookup_and_receivers);
 }

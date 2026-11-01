@@ -250,10 +250,15 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         return true;
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
     if (prior) {
-        bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
+        bool same_file = !strcmp(prior->file, file);
+        bool same_owner = same_file && !strcmp(prior->label, definition->label);
         /* Clauses of one function are one declaration wherever the QN carries
-         * no arity. The adapter separately refuses a QN shared by two modules. */
-        bool one_name = same_owner && cbm_source_adapter_one_name_one_node(language);
+         * no arity. The adapter separately refuses a QN shared by two modules.
+         * A Swift struct and its extension in one file are one type's node too,
+         * under whichever label the graph kept. */
+        bool one_type = same_file && cbm_label_is_type_like(prior->label) &&
+                        cbm_label_is_type_like(definition->label);
+        bool one_name = (same_owner || one_type) && cbm_source_adapter_one_name_one_node(language);
         prior->ambiguous |=
             !one_name && (!same_owner || prior->start_line != definition->start_line ||
                           prior->end_line != definition->end_line || language == CBM_LANG_PYTHON);
@@ -390,11 +395,13 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         return false;
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
     if (!proof || proof->ambiguous || strcmp(proof->file, node->file_path) ||
-        strcmp(proof->label, node->label) || node->start_line < 0 || node->end_line < 0)
+        node->start_line < 0 || node->end_line < 0)
         return false;
-    /* The upsert keeps one clause's span; every clause already agreed on the file. */
+    /* The upsert keeps one clause's span and label; all agreed on the file. */
     if (proof->one_name)
         return true;
+    if (strcmp(proof->label, node->label))
+        return false;
     return proof->start_line == (uint32_t)node->start_line &&
            proof->end_line == (uint32_t)node->end_line;
 }
@@ -2733,8 +2740,11 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     if (target && (strcmp(relation, "CALL_REFERENCE") == 0 || strcmp(relation, "CALLS") == 0) &&
         !callable_node(target) &&
         !((resolver->file->language == CBM_LANG_PYTHON ||
-           resolver->file->language == CBM_LANG_DART) &&
-          target->label && !strcmp(target->label, "Class") &&
+           resolver->file->language == CBM_LANG_DART ||
+           resolver->file->language == CBM_LANG_SWIFT) &&
+          target->label &&
+          (!strcmp(target->label, "Class") ||
+           (resolver->file->language == CBM_LANG_SWIFT && !strcmp(target->label, "Struct"))) &&
           (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";

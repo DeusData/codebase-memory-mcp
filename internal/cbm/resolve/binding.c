@@ -2385,8 +2385,6 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
     bool component = language == CBM_LANG_VUE || language == CBM_LANG_SVELTE;
     if (language != CBM_LANG_PYTHON && language != CBM_LANG_LUA && language != CBM_LANG_DART &&
         language != CBM_LANG_RUST && !javascript_language(language) && !component) {
-        if (language == CBM_LANG_SWIFT)
-            index->reason = "swift_build_module_membership_required";
         return index;
     }
     if (!result || !source || !result->module_qn || source_len > UINT32_MAX || result->has_error ||

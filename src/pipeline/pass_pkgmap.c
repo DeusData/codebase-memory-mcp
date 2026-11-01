@@ -1101,6 +1101,19 @@ static char *swift_extract_after(const char *start, const char *end, const char 
  * `Sources/<target_name>` (fixed-convention, same approach parse_cargo_toml
  * takes for `src/lib`). `literal_path` is borrowed; caller retains
  * ownership. */
+static void swift_register_membership(const char *target_name, const char *directory,
+                                      cbm_pkg_entries_t *entries) {
+    char key[PKGMAP_PATH_BUF];
+    int written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_SWIFT_DIR_PREFIX, directory);
+    if (written > 0 && (size_t)written < sizeof(key))
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, target_name));
+    written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_SWIFT_TARGET_PREFIX, target_name);
+    if (written > 0 && (size_t)written < sizeof(key))
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, directory));
+}
+
 static void swift_register_target(const char *rel_path, const char *target_name,
                                   const char *literal_path, cbm_pkg_entries_t *entries) {
     if (!target_name || !target_name[0]) {
@@ -1116,7 +1129,57 @@ static void swift_register_target(const char *rel_path, const char *target_name,
     }
     char *entry = build_entry_path(rel_path, suffix);
     if (entry) {
+        swift_register_membership(target_name, entry, entries);
         pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, target_name), entry);
+    }
+}
+
+/* A test or executable target is no importable module of its own for other manifests,
+ * but its files do share a module, which is what the resolver's adapter needs. */
+static void swift_register_membership_only(const char *rel_path, const char *target_name,
+                                           const char *literal_path, const char *convention,
+                                           cbm_pkg_entries_t *entries) {
+    if (!target_name || !target_name[0]) {
+        return;
+    }
+    char suffix_buf[PKGMAP_PATH_BUF];
+    const char *suffix = literal_path;
+    if (!suffix || !suffix[0]) {
+        snprintf(suffix_buf, sizeof(suffix_buf), "%s/%s", convention, target_name);
+        suffix = suffix_buf;
+    }
+    char *entry = build_entry_path(rel_path, suffix);
+    if (entry) {
+        swift_register_membership(target_name, entry, entries);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entry);
+    }
+}
+
+static void swift_scan_membership_only(const char *source, const char *end, const char *rel_path,
+                                       const char *prefix, const char *convention,
+                                       cbm_pkg_entries_t *entries) {
+    const char *cursor = source;
+    while (cursor < end) {
+        const char *hit = swift_find_code_token(cursor, end, prefix);
+        if (!hit) {
+            return;
+        }
+        const char *open = hit + strlen(prefix) - SKIP_ONE;
+        const char *close = swift_match_paren(open, end);
+        if (!close) {
+            return;
+        }
+        char *name = swift_extract_after(open, close, "name:", NULL);
+        if (name) {
+            bool path_present = false;
+            char *literal_path = swift_extract_after(open, close, "path:", &path_present);
+            if (literal_path || !path_present) {
+                swift_register_membership_only(rel_path, name, literal_path, convention, entries);
+            }
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, literal_path);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, name);
+        }
+        cursor = close + SKIP_ONE;
     }
 }
 
@@ -1166,6 +1229,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
                                 cbm_pkg_entries_t *entries) {
     const char *end = source + source_len;
     swift_scan_targets(source, end, rel_path, entries);
+    swift_scan_membership_only(source, end, rel_path, ".testTarget(", "Tests", entries);
+    swift_scan_membership_only(source, end, rel_path, ".executableTarget(", "Sources", entries);
 }
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
@@ -1445,8 +1510,8 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
             }
             char *qn = we->items[i].node_fact || !strcmp(entry_rel, ambiguous_pkgmap_value) ||
                                pkgmap_is_psr4_prefix(we->items[i].pkg_name) ||
-                               !strncmp(we->items[i].pkg_name, CBM_PKGMAP_DART_ROOT_PREFIX,
-                                        strlen(CBM_PKGMAP_DART_ROOT_PREFIX))
+                               !strncmp(we->items[i].pkg_name, CBM_PKGMAP_RAW_PREFIX,
+                                        strlen(CBM_PKGMAP_RAW_PREFIX))
                            ? pkgmap_strndup(entry_rel, strlen(entry_rel))
                            : pkgmap_take_raw(cbm_pipeline_fqn_module(project_name, entry_rel));
             if (!qn) {

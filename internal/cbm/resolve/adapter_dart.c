@@ -138,7 +138,7 @@ static const char *dart_uri_library(cbm_source_walk_t *walk, const char *base_fi
         const char *slash = strchr(rest, '/');
         if (!slash)
             return NULL;
-        char *key = cbm_arena_sprintf(walk->arena, "@cbm:dart:%.*s", (int)(slash - rest), rest);
+        char *key = cbm_arena_sprintf(walk->arena, "@cbm:raw:dart:%.*s", (int)(slash - rest), rest);
         const char *lib = key ? cbm_source_table_package(walk->table, key) : NULL;
         return lib ? dart_path_join(walk, lib, slash + 1) : NULL;
     }
