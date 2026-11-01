@@ -3158,7 +3158,8 @@ static bool rs_expression_macro(const char *name) {
 /* An identifier token in an expression macro argument. A token after `.` is a
  * member of an expression this walk has not typed; `name =` is a named format
  * argument; `name:` a struct field. Neither is a scope name. */
-static void rs_macro_token(rs_walk_t *w, TSNode token, const char *before, const char *after) {
+static void rs_macro_token(rs_walk_t *w, TSNode token, const char *before, const char *after,
+                           bool heads_only) {
     const char *name = rs_text(&w->b, token);
     if (!name)
         return;
@@ -3171,13 +3172,15 @@ static void rs_macro_token(rs_walk_t *w, TSNode token, const char *before, const
         rs_type_name_site(w, token, segs, 1, false);
         return;
     }
+    if (heads_only)
+        return;
     const rs_type_t *local_type = NULL;
     bool is_local = false;
     rs_sel_t sel = rs_value_name(w, name, &local_type, &is_local);
     rs_emit(w, CBM_RUST_SITE_REF, ts_node_start_byte(token), ts_node_end_byte(token), &sel);
 }
 
-static void rs_walk_macro_tokens(rs_walk_t *w, TSNode tree, bool expression) {
+static void rs_walk_macro_tokens(rs_walk_t *w, TSNode tree, bool expression, bool heads_only) {
     if (w->depth > RS_MAX_WALK_DEPTH)
         return;
     w->depth++;
@@ -3189,11 +3192,11 @@ static void rs_walk_macro_tokens(rs_walk_t *w, TSNode tree, bool expression) {
         TSNode child = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(child);
         if (!ts_node_is_null(pending)) {
-            rs_macro_token(w, pending, pending_before, kind);
+            rs_macro_token(w, pending, pending_before, kind, heads_only);
             pending = (TSNode){0};
         }
         if (!strcmp(kind, "token_tree")) {
-            rs_walk_macro_tokens(w, child, expression);
+            rs_walk_macro_tokens(w, child, expression, heads_only);
         } else if (expression && !strcmp(kind, "identifier")) {
             pending = child;
             pending_before = previous;
@@ -3201,7 +3204,7 @@ static void rs_walk_macro_tokens(rs_walk_t *w, TSNode tree, bool expression) {
         previous = kind;
     }
     if (!ts_node_is_null(pending))
-        rs_macro_token(w, pending, pending_before, NULL);
+        rs_macro_token(w, pending, pending_before, NULL, heads_only);
     ts_tree_cursor_delete(&cursor);
     w->depth--;
 }
@@ -3218,6 +3221,16 @@ static TSNode rs_macro_tree(TSNode invocation) {
 /* A project macro of the same name is not the standard one. */
 static bool rs_std_expression_macro(rs_walk_t *w, const char *name) {
     if (!name || !rs_expression_macro(name))
+        return false;
+    rs_ent_t ent = rs_lookup_lexical(&w->q, w->inst, w->blocks, w->nblocks, name, RS_NS_MACRO);
+    return ent.kind != RS_ENT_ITEM;
+}
+
+/* `matches!(x, Kind::One | Kind::Two(_))`: the second argument is a pattern. A path head in
+ * it names a type or module of the caller's scope; a bare name in it is a new binding. */
+static bool rs_std_pattern_macro(rs_walk_t *w, const char *name) {
+    if (!name || (strcmp(name, "matches") != 0 && strcmp(name, "assert_matches") != 0 &&
+                  strcmp(name, "debug_assert_matches") != 0))
         return false;
     rs_ent_t ent = rs_lookup_lexical(&w->q, w->inst, w->blocks, w->nblocks, name, RS_NS_MACRO);
     return ent.kind != RS_ENT_ITEM;
@@ -3301,8 +3314,11 @@ static const rs_type_t *rs_walk_macro(rs_walk_t *w, TSNode node) {
     TSNode tree = rs_macro_tree(node);
     const rs_type_t *element = NULL;
     if (!ts_node_is_null(tree)) {
-        if (!expression || !rs_walk_macro_arguments(w, tree, name, &element))
-            rs_walk_macro_tokens(w, tree, expression);
+        bool pattern = !expression && rs_std_pattern_macro(w, name);
+        if (pattern)
+            rs_walk_macro_tokens(w, tree, true, true);
+        else if (!expression || !rs_walk_macro_arguments(w, tree, name, &element))
+            rs_walk_macro_tokens(w, tree, expression, false);
     }
     rs_sel_t sel = rs_sel_settled("rust_macro_invocation", CBM_RESOLVE_DOMAIN_UNKNOWN);
     rs_emit(w, CBM_RUST_SITE_CALL, ts_node_start_byte(node), ts_node_end_byte(node), &sel);
