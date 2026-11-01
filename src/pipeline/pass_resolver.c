@@ -7,6 +7,7 @@
 #include "lang_specs.h"
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/import_resolve.h"
+#include "pipeline/resolver_ecma.h"
 #include "pipeline/shared_resolver.h"
 #include "resolve/binding.h"
 #include "resolve/lookup.h"
@@ -77,6 +78,14 @@ typedef struct {
     /* Java/Kotlin/C# overloads of one owner share a qualified name, and the
      * graph keeps them as one node. That node faithfully names all of them. */
     bool overload_set;
+    /* TypeScript's separate type space: one graph node carries a value and a
+     * same-named type, so either declaration may be the materialized one. */
+    const char *merged_label;
+    uint32_t merged_start_line, merged_end_line;
+    /* Only overload signatures so far; the implementation takes over. */
+    bool signature_only;
+    /* A same-QN declaration lives in another file, so no span can settle it. */
+    bool cross_file;
 } target_proof_t;
 
 typedef struct {
@@ -130,6 +139,7 @@ struct cbm_shared_resolver {
     python_pending_import_t *python_imports;
     CBMHashTable *python_namespaces;
     bool python_unknown_namespace_escape;
+    cbm_ecma_table_t *ecma;
     CBMHashTable *http_defaults, *http_sites, *http_unsafe;
     CBMHashTable *http_candidates, *http_veto;
     http_candidate_import_t *http_candidate_imports;
@@ -162,11 +172,19 @@ typedef struct {
     uint64_t import_work;
     CBMHashTable *import_names;
     CBMHashTable *python_imports;
+    CBMHashTable *ecma_dependencies;
     semantic_site_t *sites;
     size_t site_count;
     const cbm_gbuf_node_t *file_node;
     bool source_matches;
+    const char *source;
+    size_t source_length;
 } file_resolver_t;
+
+static bool ecma_language(CBMLanguage language) {
+    return language == CBM_LANG_JAVASCRIPT || language == CBM_LANG_TYPESCRIPT ||
+           language == CBM_LANG_TSX || language == CBM_LANG_ARKTS;
+}
 
 static char *load_source(const char *path, size_t *length) {
     *length = 0;
@@ -197,6 +215,10 @@ static char *load_source(const char *path, size_t *length) {
     source[got] = '\0';
     *length = got;
     return source;
+}
+
+char *cbm_shared_resolver_load_source(const char *path, size_t *length) {
+    return load_source(path, length);
 }
 
 static char *file_source(const cbm_resolver_file_t *file, size_t *length) {
@@ -241,15 +263,52 @@ static const CBMFileResult *owner_source_view(const CBMFileResult *result, CBMLa
     return view;
 }
 
+static bool ecma_type_only_label(const char *label) {
+    return !strcmp(label, "Type") || !strcmp(label, "Interface");
+}
+
+/* TypeScript facts about two same-QN declarations of one file. Returns true when
+ * they are one declared entity, which then needs no ambiguity verdict. */
+static bool ecma_merge_target(target_proof_t *prior, const CBMDefinition *definition,
+                              const char *file) {
+    if (strcmp(prior->file, file))
+        return false;
+    bool same_label = !strcmp(prior->label, definition->label);
+    if (same_label && !strcmp(definition->label, "Function")) {
+        /* `function f(a: string): void;` above `function f(a: any) {}` */
+        if (definition->is_abstract)
+            return true;
+        if (prior->signature_only) {
+            prior->signature_only = false;
+            prior->start_line = definition->start_line;
+            prior->end_line = definition->end_line;
+            return true;
+        }
+    }
+    if (!same_label && !prior->merged_label &&
+        ecma_type_only_label(prior->label) != ecma_type_only_label(definition->label)) {
+        prior->merged_label = definition->label;
+        prior->merged_start_line = definition->start_line;
+        prior->merged_end_line = definition->end_line;
+        return true;
+    }
+    return false;
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
                        const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
         return true;
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
     if (prior) {
+        if ((language == CBM_LANG_TYPESCRIPT || language == CBM_LANG_TSX ||
+             language == CBM_LANG_ARKTS) &&
+            ecma_merge_target(prior, definition, file))
+            return true;
         bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
         bool same_span = prior->start_line == definition->start_line &&
                          prior->end_line == definition->end_line;
+        prior->cross_file |= strcmp(prior->file, file) != 0;
         if (same_owner && !same_span && cbm_oo_language(language) &&
             (strcmp(definition->label, "Class") != 0 || language == CBM_LANG_CSHARP))
             prior->overload_set = true;
@@ -272,6 +331,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     entry->start_line = definition->start_line;
     entry->end_line = definition->end_line;
     entry->declarations = 1;
+    entry->signature_only = definition->is_abstract;
     if (!entry->file || !entry->label)
         return false;
     cbm_ht_set(resolver->targets, key, entry);
@@ -390,10 +450,58 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         !node->label)
         return false;
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
-    return proof && !proof->ambiguous && !strcmp(proof->file, node->file_path) &&
-           !strcmp(proof->label, node->label) && node->start_line >= 0 && node->end_line >= 0 &&
-           (proof->overload_set || (proof->start_line == (uint32_t)node->start_line &&
-                                    proof->end_line == (uint32_t)node->end_line));
+    if (!proof || proof->ambiguous || strcmp(proof->file, node->file_path) ||
+        node->start_line < 0 || node->end_line < 0)
+        return false;
+    if (proof->merged_label && !strcmp(proof->merged_label, node->label) &&
+        proof->merged_start_line == (uint32_t)node->start_line &&
+        proof->merged_end_line == (uint32_t)node->end_line)
+        return true;
+    if (strcmp(proof->label, node->label))
+        return false;
+    return proof->overload_set || (proof->start_line == (uint32_t)node->start_line &&
+                                   proof->end_line == (uint32_t)node->end_line);
+}
+
+/* JavaScript nests functions freely and extraction names them flat, so two
+ * `const handle` of one file share a QN and one graph node, showing the last. That
+ * node is still exactly right for an occurrence inside its own span. */
+static bool ecma_source_span_settles(const file_resolver_t *resolver, const cbm_gbuf_node_t *node,
+                                     uint32_t start, const char *source, size_t length) {
+    const target_proof_t *proof =
+        resolver->shared ? cbm_ht_get(resolver->shared->targets, node->qualified_name) : NULL;
+    if (!proof || !proof->ambiguous || proof->cross_file || !source || start > length ||
+        node->start_line <= 0 || !ecma_language(resolver->file->language))
+        return false;
+    int line = 1;
+    for (uint32_t at = 0; at < start; at++)
+        line += source[at] == '\n';
+    return line >= node->start_line && line <= node->end_line;
+}
+
+/* The lexical declaration this occurrence names is the one the node shows. */
+static bool ecma_target_span_settles(const file_resolver_t *resolver, const cbm_gbuf_node_t *node,
+                                     const char *name, uint32_t start, uint32_t end,
+                                     CBMSourceOrigin origin) {
+    const target_proof_t *proof =
+        resolver->shared ? cbm_ht_get(resolver->shared->targets, node->qualified_name) : NULL;
+    uint32_t first = 0, last = 0;
+    return proof && proof->ambiguous && !proof->cross_file && node->start_line > 0 &&
+           ecma_language(resolver->file->language) &&
+           cbm_resolve_binding_js_declaration_lines(resolver->bindings, name, start, end, origin,
+                                                    &first, &last) &&
+           first == (uint32_t)node->start_line && last == (uint32_t)node->end_line;
+}
+
+/* A merged value + type answers a type reference even when the value is the
+ * declaration the single graph node happens to show. */
+static bool target_declares_type(const file_resolver_t *resolver, const cbm_gbuf_node_t *node) {
+    if (cbm_label_is_type_like(node->label))
+        return true;
+    const target_proof_t *proof =
+        resolver->shared ? cbm_ht_get(resolver->shared->targets, node->qualified_name) : NULL;
+    return proof && proof->merged_label &&
+           (cbm_label_is_type_like(proof->merged_label) || cbm_label_is_type_like(proof->label));
 }
 
 typedef struct {
@@ -1049,6 +1157,15 @@ static bool http_file_capture(cbm_shared_resolver_t *resolver, const cbm_pipelin
     return ok;
 }
 
+/* A .js file's own manifest can declare it a module whatever its syntax. */
+static cbm_resolve_binding_index_t *binding_build_for(CBMArena *arena, const CBMFileResult *result,
+                                                      CBMLanguage language, const char *rel_path,
+                                                      const char *source, size_t length) {
+    bool declared = language == CBM_LANG_JAVASCRIPT && cbm_pipeline_node_declared_module(rel_path);
+    return cbm_resolve_binding_build_declared_module(arena, result, language, source, length,
+                                                     declared);
+}
+
 static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
                         const CBMFileResult *result, const cbm_file_info_t *file) {
     if (!export_language(file->language))
@@ -1073,7 +1190,7 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
     TSTree *owner_tree = NULL;
     result = owner_source_view(result, file->language, source, length, &source_view, &owner_tree);
     cbm_resolve_binding_index_t *index =
-        cbm_resolve_binding_build(&arena, result, file->language, source, length);
+        binding_build_for(&arena, result, file->language, file->rel_path, source, length);
     /* Sequential extraction releases raw buffers. Audit the same verified
      * bytes used for exports instead of requiring parallel source retention.
      * The owner summary copies identities and stores spans, never this buffer. */
@@ -1081,6 +1198,18 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
                                                source, length);
     if (ok && file->language == CBM_LANG_PYTHON)
         ok = capture_python_namespace(resolver, result, file->rel_path, index);
+    if (ok && ecma_language(file->language)) {
+        const char *key =
+            cbm_arena_sprintf(&arena, "ecma_module:%zu:%s", strlen(file->rel_path), file->rel_path);
+        const cbm_resolve_proof_t *audit =
+            key ? export_audit(resolver, result, file->rel_path, key, result->module_qn, 0,
+                               cbm_resolve_binding_js_exports_complete(index) ||
+                                   cbm_resolve_binding_js_export_count(index) > 0,
+                               "source_ecma_module_audit", NULL)
+                : NULL;
+        ok = audit && cbm_ecma_table_add(resolver->ecma, ctx, file->rel_path, result->module_qn,
+                                         index, audit);
+    }
     if (ok && (file->language == CBM_LANG_JAVASCRIPT || file->language == CBM_LANG_TYPESCRIPT ||
                file->language == CBM_LANG_TSX || file->language == CBM_LANG_ARKTS))
         ok = http_file_capture(resolver, ctx, &arena, index, result, file->rel_path);
@@ -1763,11 +1892,13 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
                                               (cbm_resolve_solver_limits_t){0});
     resolver->go_types =
         cbm_go_stabilization_new(&resolver->arena, &resolver->proofs, resolver->solver);
+    resolver->ecma = cbm_ecma_table_new(&resolver->arena);
     resolver->complete = true;
     if (!resolver->exports || !resolver->targets || !resolver->namespaces ||
         !resolver->python_queries || !resolver->python_namespaces || !resolver->http_defaults ||
         !resolver->http_sites || !resolver->http_unsafe || !resolver->http_candidates ||
-        !resolver->http_veto || !resolver->project || !resolver->solver || !resolver->go_types) {
+        !resolver->http_veto || !resolver->project || !resolver->solver || !resolver->go_types ||
+        !resolver->ecma) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -1960,6 +2091,7 @@ void cbm_shared_resolver_free(cbm_shared_resolver_t *resolver) {
     cbm_ht_free(resolver->http_candidates);
     cbm_ht_free(resolver->http_veto);
     cbm_go_stabilization_dispose(resolver->go_types);
+    cbm_ecma_table_free(resolver->ecma);
     cbm_arena_destroy(&resolver->arena);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, resolver);
 }
@@ -2514,12 +2646,196 @@ static cbm_resolve_result_t dart_name_result(file_resolver_t *resolver, const ch
     return *cached;
 }
 
+/* The repository file a specifier names, once per specifier per file. */
+static const char *ecma_dependency(file_resolver_t *resolver, const char *source) {
+    if (!resolver->ecma_dependencies) {
+        resolver->ecma_dependencies = cbm_ht_create(16);
+        if (!resolver->ecma_dependencies)
+            return NULL;
+    }
+    static const char none[] = "";
+    const char *known = cbm_ht_get(resolver->ecma_dependencies, source);
+    if (known)
+        return known == none ? NULL : known;
+    const char *file =
+        cbm_ecma_dependency(resolver->file->ctx, resolver->file->rel_path, source, resolver->arena);
+    char *key = cbm_arena_strdup(resolver->arena, source);
+    if (key)
+        cbm_ht_set(resolver->ecma_dependencies, key, (void *)(file ? file : none));
+    return file;
+}
+
+/* The value a module binding holds, by the exporting modules' own surfaces. */
+static cbm_ecma_value_t ecma_import_value(const file_resolver_t *resolver,
+                                          const cbm_resolve_js_import_t *import, const char *file,
+                                          bool type_space, cbm_resolve_lookup_t *query) {
+    const cbm_ecma_table_t *table = resolver->shared->ecma;
+    if (import->is_default)
+        return cbm_ecma_default(table, file, query);
+    if (import->member && type_space)
+        return cbm_ecma_lookup_type(table, file, import->member, query);
+    if (import->member)
+        return cbm_ecma_lookup(table, file, import->member, query);
+    if (import->is_require)
+        return cbm_ecma_whole(table, file, query);
+    return (cbm_ecma_value_t){.status = CBM_ECMA_NAMESPACE, .file = file};
+}
+
+/* Follow `a.b.c` from the imported root: a namespace answers by its exports, a
+ * declaration only by an exact member declared in the same file. */
+static const char *ecma_member_target(file_resolver_t *resolver, const char *owner,
+                                      const char *member) {
+    const char *qn = cbm_arena_sprintf(resolver->arena, "%s.%s", owner, member);
+    const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(resolver->file->graph, qn) : NULL;
+    const cbm_gbuf_node_t *base = cbm_gbuf_find_by_qn(resolver->file->graph, owner);
+    return node && base && node->file_path && base->file_path &&
+                   !strcmp(node->file_path, base->file_path)
+               ? qn
+               : NULL;
+}
+
+static cbm_resolve_result_t ecma_finish(cbm_resolve_lookup_t *query, cbm_resolve_result_t result) {
+    cbm_resolve_result_t symbolic = result;
+    result.proof = cbm_resolve_lookup_finish(query, CBM_PROOF_REGISTRY_LOOKUP, symbolic);
+    if (query->context && !result.proof) {
+        result.analysis = query->context->pool->failure == CBM_RESOLVE_ANALYSIS_LIMITED
+                              ? CBM_RESOLVE_ANALYSIS_LIMITED
+                              : CBM_RESOLVE_ANALYSIS_FAILED;
+        result.facts = 0;
+        result.reason = "ecma_import_proof_unavailable";
+    }
+    return result;
+}
+
+static cbm_resolve_result_t ecma_import_result(file_resolver_t *resolver,
+                                               const cbm_resolve_js_import_t *import,
+                                               const char *name, bool invocation,
+                                               bool type_position) {
+    cbm_resolve_lookup_t query;
+    cbm_resolve_lookup_begin(&query, cbm_resolve_binding_lookup_context(resolver->bindings),
+                             "ecma.import_binding", name, 0, 0, CBM_SOURCE_ORIGIN_RAW);
+    cbm_resolve_result_t result = unresolved("import_target_unresolved");
+    const char *file = import->source && resolver->shared && resolver->shared->complete
+                           ? ecma_dependency(resolver, import->source)
+                           : NULL;
+    (void)cbm_resolve_lookup_observe(
+        &query, "ecma.import_paths", import->source ? import->source : "unknown_specifier", file,
+        file ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        file ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNKNOWN, 0, file != NULL,
+        file ? "ecma_import_path_observed" : "ecma_import_path_open");
+    if (!file)
+        return ecma_finish(&query, result);
+    const char *rest = strchr(name, '.');
+    cbm_ecma_value_t value =
+        ecma_import_value(resolver, import, file, type_position && !rest, &query);
+    const char *target = value.status == CBM_ECMA_DECLARATION ? value.target : NULL;
+    if (target && value.member)
+        target = ecma_member_target(resolver, target, value.member);
+    /* `exports = module.exports = createApp; exports.named = named`: the required value
+     * is one object, so the module's own names answer before createApp's members. */
+    if (target && rest && import->is_require && !import->member) {
+        const char *segment = rest + 1;
+        rest = strchr(segment, '.');
+        const char *member = cbm_arena_strndup(resolver->arena, segment,
+                                               rest ? (size_t)(rest - segment) : strlen(segment));
+        if (!member) {
+            query.failed = true;
+            return ecma_finish(&query, result);
+        }
+        value = cbm_ecma_lookup(resolver->shared->ecma, file, member, &query);
+        target = value.status == CBM_ECMA_DECLARATION ? value.target : NULL;
+        if (target && value.member)
+            target = ecma_member_target(resolver, target, value.member);
+    }
+    while (rest && (value.status == CBM_ECMA_NAMESPACE || target)) {
+        const char *segment = rest + 1;
+        rest = strchr(segment, '.');
+        if (target) {
+            /* A class or namespace declares the rest of the path, or nothing does. */
+            target = ecma_member_target(resolver, target, segment);
+            if (target && rest) {
+                target = ecma_member_target(resolver, target, rest + 1);
+                rest = NULL;
+            }
+            rest = NULL;
+            break;
+        }
+        const char *member = cbm_arena_strndup(resolver->arena, segment,
+                                               rest ? (size_t)(rest - segment) : strlen(segment));
+        if (!member) {
+            query.failed = true;
+            return ecma_finish(&query, result);
+        }
+        value = type_position && !rest
+                    ? cbm_ecma_lookup_type(resolver->shared->ecma, value.file, member, &query)
+                    : cbm_ecma_lookup(resolver->shared->ecma, value.file, member, &query);
+        target = value.status == CBM_ECMA_DECLARATION ? value.target : NULL;
+        if (target && value.member)
+            target = ecma_member_target(resolver, target, value.member);
+    }
+    if (value.status == CBM_ECMA_AMBIGUOUS) {
+        result = (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_AMBIGUOUS,
+                                        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                        .candidate_count = 2,
+                                        .reason = "ecma_export_ambiguous"};
+    } else if (target && !rest) {
+        const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(resolver->file->graph, target);
+        uint32_t facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                         CBM_RESOLVE_FACT_IMPORT_BOUND;
+        if (invocation && node && node->label && !strcmp(node->label, "Class")) {
+            /* `new X()` runs X's own constructor when X declares one. */
+            const char *constructor = ecma_member_target(resolver, target, "constructor");
+            if (constructor)
+                target = constructor;
+            else
+                facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+        }
+        result = (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                        .rule = CBM_RESOLVE_RULE_IMPORT_BINDING,
+                                        .facts = facts,
+                                        .target = target,
+                                        .candidate_count = 1,
+                                        .reason = "ecma_export_binding"};
+    } else if (value.status == CBM_ECMA_DECLARATION || value.status == CBM_ECMA_ABSENT) {
+        result.reason = "import_member_unresolved";
+    } else if (value.status == CBM_ECMA_NAMESPACE) {
+        result.reason = "ecma_namespace_value";
+    } else {
+        result.reason = "ecma_export_unproven";
+    }
+    return ecma_finish(&query, result);
+}
+
 static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char *name,
                                            const char *scope, uint32_t start, uint32_t end,
                                            CBMSourceOrigin origin, bool invocation) {
     const cbm_resolver_file_t *file = resolver->file;
     if (!name || !name[0])
         return unresolved("reference_spelling_missing");
+    if (ecma_language(file->language) || file->language == CBM_LANG_VUE ||
+        file->language == CBM_LANG_SVELTE) {
+        cbm_resolve_result_t local =
+            cbm_resolve_binding_local(resolver->bindings, name, start, end, origin);
+        if (cbm_resolve_admit(&local))
+            return local;
+        const char *path = name;
+        bool type_position = false;
+        const cbm_resolve_js_import_t *import = cbm_resolve_binding_js_import(
+            resolver->bindings, name, start, end, origin, &path, &type_position);
+        cbm_resolve_result_t member =
+            cbm_resolve_binding_js_member(resolver->bindings, name, start, end, origin);
+        if (cbm_resolve_admit(&member))
+            return member;
+        if (import) {
+            cbm_resolve_result_t proof =
+                ecma_import_result(resolver, import, path, invocation, type_position);
+            return proof.target ? cbm_resolve_binding_validate(resolver->bindings, name, start, end,
+                                                               origin, proof)
+                                : proof;
+        }
+    }
     if (file->language == CBM_LANG_DART) {
         cbm_resolve_result_t proof = dart_name_result(resolver, name);
         return cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
@@ -2669,23 +2985,31 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     if (source &&
         (!source->file_path || strcmp(source->file_path, resolver->file->rel_path) ||
          (source != resolver->file_node && (!source->label || strcmp(source->label, "Module")) &&
-          !target_materialized(resolver, source) && !conditional))) {
+          !target_materialized(resolver, source) && !conditional &&
+          !ecma_source_span_settles(resolver, source, start, resolver->source,
+                                    resolver->source_length)))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "source_declaration_identity_conflict";
     }
-    if (target && !target_materialized(resolver, target)) {
+    if (target && !target_materialized(resolver, target) &&
+        !ecma_target_span_settles(resolver, target, name, start, end, origin)) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "target_declaration_identity_conflict";
     }
     if (target && (strcmp(relation, "CALL_REFERENCE") == 0 || strcmp(relation, "CALLS") == 0) &&
         !callable_node(target) &&
-        !((resolver->file->language == CBM_LANG_PYTHON || cbm_oo_language(resolver->file->language)) &&
-          target->label && cbm_label_is_type_like(target->label) &&
+        !((((resolver->file->language == CBM_LANG_PYTHON ||
+             cbm_oo_language(resolver->file->language)) &&
+            target->label && cbm_label_is_type_like(target->label)) ||
+           ((ecma_language(resolver->file->language) ||
+             resolver->file->language == CBM_LANG_VUE ||
+             resolver->file->language == CBM_LANG_SVELTE) &&
+            target->label && !strcmp(target->label, "Class"))) &&
           (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
     }
-    if (target && strcmp(relation, "USES_TYPE") == 0 && !cbm_label_is_type_like(target->label)) {
+    if (target && strcmp(relation, "USES_TYPE") == 0 && !target_declares_type(resolver, target)) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "type_target_not_type";
     }
@@ -2781,6 +3105,17 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
     for (int u = 0; u < result->usages.count; u++) {
         const CBMUsage *usage = &result->usages.items[u];
         const char *relation = usage->kind == CBM_USAGE_CALL_REFERENCE ? "CALL_REFERENCE" : "USAGE";
+        /* USAGE means a value. A type annotation's name is USES_TYPE, from type_refs. */
+        if (usage->kind != CBM_USAGE_CALL_REFERENCE &&
+            cbm_resolve_binding_js_type_occurrence(resolver->bindings, usage->ref_name,
+                                                   usage->site_start_byte, usage->site_end_byte,
+                                                   usage->source_origin)) {
+            if (!record_result(resolver, usage->enclosing_func_qn, usage->ref_name, relation,
+                               usage->site_start_byte, usage->site_end_byte, usage->source_origin,
+                               unresolved("usage_names_a_type"), NULL))
+                return false;
+            continue;
+        }
         const semantic_site_t *site =
             find_semantic(resolver, usage->enclosing_func_qn, usage->site_start_byte,
                           usage->site_end_byte, usage->source_origin, CBM_RESOLVED_CALL_REFERENCE);
@@ -2889,12 +3224,14 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     file_resolver_t resolver = {.shared = shared,
                                 .file = file,
                                 .arena = &arena,
+                                .source = source,
+                                .source_length = length,
                                 .source_matches = cbm_result_source_matches(
                                     file->result, source, length, CBM_SOURCE_ORIGIN_RAW)};
     resolver.file_node =
         cbm_pipeline_file_node(file->graph, file->ctx->project_name, file->rel_path);
     resolver.bindings =
-        cbm_resolve_binding_build(&arena, file->result, file->language, source, length);
+        binding_build_for(&arena, file->result, file->language, file->rel_path, source, length);
     bool begun = cbm_gbuf_resolution_begin(file->output);
     bool ok = begun && resolver.bindings &&
               cbm_resolve_binding_set_identity(resolver.bindings, file->ctx->project_name,
@@ -2906,6 +3243,7 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
         cbm_gbuf_resolution_end(file->output);
     cbm_ht_free(resolver.import_names);
     cbm_ht_free(resolver.python_imports);
+    cbm_ht_free(resolver.ecma_dependencies);
     cbm_free(CBM_MEM_CLASS_EXTRACT, resolver.sites);
     if (owner_tree)
         ts_tree_delete(owner_tree);

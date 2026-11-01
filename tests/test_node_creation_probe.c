@@ -840,13 +840,7 @@ TEST(probe_ts_calls_edge) {
          .target = {.file = "chain.ts",
                     .suffix = "square",
                     .declaration_line = 1,
-                    .declaration_text = "function square(n: number): number { return n * n; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-global-script-scope",
-         .why = "The unchanged TypeScript file is a script with no import/export; global script "
-                "binding completeness is not proved.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "function square(n: number): number { return n * n; }"}},
         {.case_id = "probe_ts_calls_edge-2",
          .site = {.file = "chain.ts", .caller = "run", .needle = "cube(n)", .occurrence_index = 0},
          .relation = "CALLS",
@@ -854,13 +848,7 @@ TEST(probe_ts_calls_edge) {
                     .suffix = "cube",
                     .declaration_line = 3,
                     .declaration_text =
-                        "function cube(n: number): number { return n * square(n); }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-global-script-scope",
-         .why = "The unchanged TypeScript file is a script with no import/export; global script "
-                "binding completeness is not proved.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                        "function cube(n: number): number { return n * square(n); }"}},
         {.case_id = "probe_ts_calls_edge-3",
          .site =
              {.file = "chain.ts", .caller = "run", .needle = "square(n)", .occurrence_index = 1},
@@ -868,13 +856,7 @@ TEST(probe_ts_calls_edge) {
          .target = {.file = "chain.ts",
                     .suffix = "square",
                     .declaration_line = 1,
-                    .declaration_text = "function square(n: number): number { return n * n; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-global-script-scope",
-         .why = "The unchanged TypeScript file is a script with no import/export; global script "
-                "binding completeness is not proved.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "function square(n: number): number { return n * n; }"}}};
     NcpMetrics m =
         ncp_metrics_quality("chain.ts",
                             "function square(n: number): number { return n * n; }\n\n"
@@ -884,7 +866,7 @@ TEST(probe_ts_calls_edge) {
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     ASSERT_TRUE(m.functions >= 3); /* square, cube, run remain extracted. */
     PASS();

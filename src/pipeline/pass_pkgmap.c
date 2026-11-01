@@ -14,6 +14,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/import_resolve.h"
+#include "pipeline/resolver_ecma.h"
 #include "resolve/capabilities.h"
 #include "resolve/policy.h"
 #include "lang_specs.h"
@@ -534,6 +535,21 @@ static void parse_package_json(const char *source, int source_len, const char *r
     }
     const char *name = yyjson_get_str(yyjson_obj_get(root, "name"));
     node_collect(entries, "scope", directory, NULL, node_package_name(name) ? name : "");
+    const char *module_type = yyjson_get_str(yyjson_obj_get(root, "type"));
+    if (module_type && (!strcmp(module_type, "module") || !strcmp(module_type, "commonjs")))
+        node_collect(entries, "type", directory, NULL, module_type);
+    /* A relative directory import reads `main` directly; `exports` only binds a
+     * bare package specifier. */
+    const char *main_entry = yyjson_get_str(yyjson_obj_get(root, "main"));
+    if (main_entry && main_entry[0]) {
+        char main_path[PKGMAP_PATH_BUF];
+        char relative[PKGMAP_PATH_BUF];
+        int written = snprintf(relative, sizeof(relative), "%s%s", main_entry[0] == '.' ? "" : "./",
+                               main_entry);
+        if (written > 0 && (size_t)written < sizeof(relative) &&
+            cbm_repo_rel_join(directory, relative, main_path, sizeof(main_path)))
+            node_collect(entries, "main", directory, NULL, main_path);
+    }
     node_workspace_paths(root, directory, entries);
     node_dependencies(root, directory, entries);
     if (!node_package_name(name))
@@ -3928,6 +3944,23 @@ static bool python_map_put(CBMHashTable *by_local, const char **keys, const char
     return (uintptr_t)cbm_ht_get(by_local, key) == (uintptr_t)*count;
 }
 
+/* What this import names by the exporting module's surface: through a barrel,
+ * an alias or a default export. NULL when the surface has no such answer. */
+static char *ecma_surface_binding(const cbm_pipeline_ctx_t *ctx, const char *file,
+                                  const CBMImport *import) {
+    if (!ctx->ecma_surfaces)
+        return NULL;
+    cbm_ecma_value_t value = import->is_default ? cbm_ecma_default(ctx->ecma_surfaces, file, NULL)
+                             : import->member
+                                 ? cbm_ecma_lookup(ctx->ecma_surfaces, file, import->member, NULL)
+                                 : (cbm_ecma_value_t){.status = CBM_ECMA_UNKNOWN};
+    if (value.status == CBM_ECMA_DECLARATION && value.target && !value.member)
+        return strdup(value.target);
+    if (value.status == CBM_ECMA_NAMESPACE && value.file)
+        return cbm_pipeline_fqn_compute(ctx->project_name, value.file, NULL);
+    return NULL;
+}
+
 int cbm_pipeline_ecma_import_map(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                  const CBMFileResult *result, bool include_type_only,
                                  const char ***out_keys, const char ***out_values, int *out_count) {
@@ -3950,14 +3983,16 @@ int cbm_pipeline_ecma_import_map(const cbm_pipeline_ctx_t *ctx, const char *sour
             continue;
         const cbm_gbuf_node_t *dependency = NULL;
         char *value = NULL;
-        if (!result->parse_unusable && !result->walk_truncated && !import->is_default) {
+        if (!result->parse_unusable && !result->walk_truncated) {
             cbm_resolve_result_t proof = cbm_pipeline_resolve_import_result(
                 ctx, source_rel, NULL, import, NULL, &dependency);
             if (cbm_resolve_admit(&proof) && dependency && dependency->file_path &&
                 dependency->label &&
                 (!strcmp(dependency->label, "File") || !strcmp(dependency->label, "Module"))) {
-                value = cbm_pipeline_fqn_compute(ctx->project_name, dependency->file_path,
-                                                 import->member);
+                value = ecma_surface_binding(ctx, dependency->file_path, import);
+                if (!value && !import->is_default)
+                    value = cbm_pipeline_fqn_compute(ctx->project_name, dependency->file_path,
+                                                     import->member);
             }
         }
         /* An unresolved/default binding still shadows project names. Export
@@ -4128,6 +4163,80 @@ static const cbm_gbuf_node_t *node_package_target(const cbm_pipeline_ctx_t *ctx,
                : NULL;
 }
 
+bool cbm_pipeline_node_declared_module(const char *source_rel) {
+    CBMHashTable *map = cbm_pipeline_get_pkgmap();
+    if (!map || !source_rel)
+        return false;
+    char directory[PKGMAP_PATH_BUF];
+    int size = snprintf(directory, sizeof(directory), "%s", source_rel);
+    if (size < 0 || (size_t)size >= sizeof(directory))
+        return false;
+    for (;;) {
+        char *parent = strrchr(directory, '/');
+        if (parent)
+            *parent = '\0';
+        else
+            directory[0] = '\0';
+        if (node_fact(map, "scope", directory, NULL))
+            return node_fact(map, "type", directory, NULL) != NULL;
+        if (!directory[0])
+            return false;
+    }
+}
+
+/* Node and TypeScript resolve a relative directory through its manifest's main,
+ * then its index file. TypeScript prefers its own source to a compiled sibling. */
+static const cbm_gbuf_node_t *ecma_directory_entry(const cbm_pipeline_ctx_t *ctx,
+                                                   const char *source_rel, const char *module_path,
+                                                   CBMLanguage language) {
+    static const char *const typescript[] = {".ts",  ".tsx", ".js",  ".jsx", ".mts",
+                                             ".mjs", ".cts", ".cjs", NULL};
+    static const char *const javascript[] = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", NULL};
+    char source_dir[PKGMAP_PATH_BUF], directory[PKGMAP_PATH_BUF], candidate[PKGMAP_PATH_BUF];
+    int size = snprintf(source_dir, sizeof(source_dir), "%s", source_rel);
+    if (size < 0 || (size_t)size >= sizeof(source_dir))
+        return NULL;
+    char *slash = strrchr(source_dir, '/');
+    if (slash)
+        *slash = '\0';
+    else
+        source_dir[0] = '\0';
+    if (!cbm_repo_rel_join(source_dir, module_path, directory, sizeof(directory)))
+        return NULL;
+    size_t length = strlen(directory);
+    while (length && directory[length - 1] == '/')
+        directory[--length] = '\0';
+    CBMHashTable *map = cbm_pipeline_get_pkgmap();
+    const char *entry = map ? node_fact(map, "main", directory, NULL) : NULL;
+    if (entry) {
+        const cbm_gbuf_node_t *file = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, entry);
+        if (file && import_language_matches(language, file))
+            return file;
+        /* `main` may omit its extension, exactly like a relative import. */
+        for (const char *const *ext = language == CBM_LANG_JAVASCRIPT ? javascript : typescript;
+             *ext; ext++) {
+            int n = snprintf(candidate, sizeof(candidate), "%s%s", entry, *ext);
+            file = n > 0 && (size_t)n < sizeof(candidate)
+                       ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate)
+                       : NULL;
+            if (file && import_language_matches(language, file))
+                return file;
+        }
+    }
+    for (const char *const *ext = language == CBM_LANG_JAVASCRIPT ? javascript : typescript; *ext;
+         ext++) {
+        int n = snprintf(candidate, sizeof(candidate), "%s%sindex%s", directory,
+                         directory[0] ? "/" : "", *ext);
+        const cbm_gbuf_node_t *file =
+            n > 0 && (size_t)n < sizeof(candidate)
+                ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, candidate)
+                : NULL;
+        if (file && import_language_matches(language, file))
+            return file;
+    }
+    return NULL;
+}
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const CBMImport *imp,
     CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only, bool *ambiguous) {
@@ -4148,6 +4257,13 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
             node_package_target(ctx, source_rel, imp->module_path, src_lang, &covered);
         if (covered)
             return package;
+        if (!strcmp(imp->module_path, ".") || !strcmp(imp->module_path, "..")) {
+            char spelled[PKGMAP_PATH_BUF];
+            int n = snprintf(spelled, sizeof(spelled), "%s/", imp->module_path);
+            return n > 0 && (size_t)n < sizeof(spelled)
+                       ? ecma_directory_entry(ctx, source_rel, spelled, src_lang)
+                       : NULL;
+        }
     }
 
     if (src_lang == CBM_LANG_PYTHON && python_source_import_kind(imp->kind))
@@ -4192,8 +4308,23 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
                 import_targetable_label(target->label))
                 return target;
         }
+        bool ecma = src_lang == CBM_LANG_JAVASCRIPT || src_lang == CBM_LANG_TYPESCRIPT ||
+                    src_lang == CBM_LANG_TSX || src_lang == CBM_LANG_ARKTS;
+        if (slash_relative && ecma)
+            return ecma_directory_entry(ctx, source_rel, imp->module_path, src_lang);
         if (slash_relative)
             return NULL;
+        /* `@/components` names a directory through a configured path alias. */
+        if (ecma && ctx->path_aliases && source_rel) {
+            const cbm_path_alias_map_t *aliases =
+                cbm_path_alias_find_for_file(ctx->path_aliases, source_rel);
+            char *aliased = aliases ? cbm_path_alias_resolve(aliases, imp->module_path) : NULL;
+            const cbm_gbuf_node_t *entry =
+                aliased ? ecma_directory_entry(ctx, "", aliased, src_lang) : NULL;
+            free(aliased);
+            if (entry)
+                return entry;
+        }
     }
     if (src_lang == CBM_LANG_JAVA || src_lang == CBM_LANG_KOTLIN || src_lang == CBM_LANG_CSHARP ||
         src_lang == CBM_LANG_SCALA)

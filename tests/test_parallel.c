@@ -1161,17 +1161,12 @@ TEST(parallel_args_json_no_overflow) {
                    .suffix = "app.sink",
                    .label = "Function",
                    .declaration_line = 1,
-                   .declaration_text = "function sink(...xs: string[]) { return xs; }"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "typescript-rest-parameter-callable-proof",
-        .why = "The rest-parameter callable does not yet have an admissible identity proof.",
-        .tried = "Retained all sixty long literal arguments and the original pipeline path; "
-                 "the occurrence is recorded but its graph edge is withheld."};
+                   .declaration_text = "function sink(...xs: string[]) { return xs; }"}};
     RQ_Report quality = {0};
     ASSERT(parallel_quality_check(gbuf, "argov-test", "wide-call-arguments", &input, 1, &expected,
                                   1, &quality));
     ASSERT_EQ(quality.genuine, 1);
-    ASSERT_EQ(quality.missing, 1);
+    ASSERT_EQ(quality.missing, 0);
     /* The original input's first eight 100-byte values fit. A second source
      * fixture stays within CBM_MAX_CALL_ARGS while making each literal longer
      * so the last JSON argument cannot fit. Neither control needs a speculative
@@ -2745,12 +2740,7 @@ TEST(parallel_tsx_local_component_shadow_has_no_false_call) {
                    .suffix = "main.Card",
                    .label = "Function",
                    .declaration_line = 1,
-                   .declaration_text = "function Card(): JSX.Element { return <div/>; }"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "tsx-jsx-element-callable-identity",
-        .why = "The JSX.Element annotated component lacks an admitted callable identity.",
-        .tried = "Preserved the original component, direct tag, parameter shadow and both "
-                 "pipeline routes; the exact tag carrier is retained without a guessed target."};
+                   .declaration_text = "function Card(): JSX.Element { return <div/>; }"}};
     RQ_Report quality[2] = {0};
     ASSERT(parallel_quality_check(sequential, "cbm_tsx_shadow", "jsx-shadow-sequential", &input, 1,
                                   &expected, 1, &quality[0]));
@@ -2758,8 +2748,8 @@ TEST(parallel_tsx_local_component_shadow_has_no_false_call) {
                                   &expected, 1, &quality[1]));
     ASSERT_EQ(quality[0].genuine, 1);
     ASSERT_EQ(quality[1].genuine, 1);
-    ASSERT_EQ(quality[0].missing, 1);
-    ASSERT_EQ(quality[1].missing, 1);
+    ASSERT_EQ(quality[0].missing, 0);
+    ASSERT_EQ(quality[1].missing, 0);
     free(source);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
@@ -2767,8 +2757,8 @@ TEST(parallel_tsx_local_component_shadow_has_no_false_call) {
     rmdir(tmpdir);
     ASSERT_TRUE(sequential_nodes);
     ASSERT_TRUE(parallel_nodes);
-    ASSERT_FALSE(sequential_good);
-    ASSERT_FALSE(parallel_good);
+    ASSERT_TRUE(sequential_good);
+    ASSERT_TRUE(parallel_good);
     ASSERT_FALSE(sequential_wrong);
     ASSERT_FALSE(parallel_wrong);
     PASS();
@@ -3124,17 +3114,12 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
         {.case_id = "imported-interface-annotation",
          .site =
              {.file = main_rel, .caller = "main.choose", .needle = "Config", .occurrence_index = 1},
-         .relation = "USAGE",
+         .relation = "USES_TYPE",
          .target = {.file = "a/types.ts",
                     .suffix = "a.types.Config",
                     .label = "Interface",
                     .declaration_line = 1,
-                    .declaration_text = "export interface Config { enabled: boolean }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-namespace-file-binding-audit",
-         .why = "The namespace-containing file lacks a complete source binding proof.",
-         .tried = "Preserved the imported interface, local same-name class and second-file decoy; "
-                  "both drivers abstain."},
+                    .declaration_text = "export interface Config { enabled: boolean }"}},
         {.case_id = "namespace-sibling-call",
          .site = {.file = main_rel,
                   .caller = "main.App.Utils.normalise",
@@ -3145,12 +3130,7 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
                     .suffix = "main.App.Utils.clamp",
                     .label = "Function",
                     .declaration_line = 5,
-                    .declaration_text = "    export function clamp(): number { return 1; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-namespace-member-call-proof",
-         .why = "Nested namespace member lookup is not source-certified.",
-         .tried = "Retained the exact namespace structure and both source callers in sequential "
-                  "and parallel runs."},
+                    .declaration_text = "    export function clamp(): number { return 1; }"}},
         {.case_id = "namespace-constructor-call",
          .site = {.file = main_rel,
                   .caller = "main.App.Config.constructor",
@@ -3193,11 +3173,11 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
             graph, project, route ? "ts-namespace-parallel" : "ts-namespace-sequential", sources, 3,
             expected, 3, &observation.quality[route]);
         observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT] =
-            count_edges_between_nodes(graph, choose, selected, "USAGE");
+            count_edges_between_nodes(graph, choose, selected, "USES_TYPE");
         observation.edge_counts[route][TS_EXACT_DECOY_IMPORT] =
-            count_edges_between_nodes(graph, choose, decoy, "USAGE");
+            count_edges_between_nodes(graph, choose, decoy, "USES_TYPE");
         observation.edge_counts[route][TS_EXACT_LOCAL_CLASS] =
-            count_edges_between_nodes(graph, choose, local_class, "USAGE");
+            count_edges_between_nodes(graph, choose, local_class, "USES_TYPE");
         observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL] =
             count_edges_between_nodes(graph, normalise, clamp, "CALLS");
         observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL] =
@@ -3232,11 +3212,11 @@ TEST(parallel_typescript_import_namespace_exact_parity) {
     for (int route = 0; route < 2; route++) {
         ASSERT_TRUE(observation.quality_ok[route]);
         ASSERT_EQ(observation.quality[route].genuine, 3);
-        ASSERT_EQ(observation.quality[route].missing, 3);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 0);
+        ASSERT_EQ(observation.quality[route].missing, 1);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_DECOY_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_LOCAL_CLASS], 0);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 0);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 0);
     }
     PASS();
@@ -3249,11 +3229,11 @@ TEST(parallel_tsx_import_namespace_exact_parity) {
     for (int route = 0; route < 2; route++) {
         ASSERT_TRUE(observation.quality_ok[route]);
         ASSERT_EQ(observation.quality[route].genuine, 3);
-        ASSERT_EQ(observation.quality[route].missing, 3);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 0);
+        ASSERT_EQ(observation.quality[route].missing, 1);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_DECOY_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_LOCAL_CLASS], 0);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 0);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 0);
     }
     PASS();

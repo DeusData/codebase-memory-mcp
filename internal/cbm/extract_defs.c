@@ -711,8 +711,63 @@ static TSNode find_cpp_template_inner_node(TSNode node, CBMLanguage lang) {
 // Try arrow_function name via parent variable_declarator (top-level resolution)
 // or object-literal property (`pair` key) — the latter covers factory functions
 // that return an object of arrow methods (the Zustand actions-slice pattern, #341).
-static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
-    if (strcmp(kind, "arrow_function") != 0) {
+static bool js_node_is_exports_object(TSNode node, const char *source) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "identifier") == 0) {
+        return end - start == 7 && memcmp(source + start, "exports", 7) == 0;
+    }
+    if (strcmp(kind, "member_expression") != 0) {
+        return false;
+    }
+    /* `Owner.prototype.method = function () {}` declares a method just as plainly. */
+    enum { PROTOTYPE_SUFFIX = 10 };
+    if (end - start > PROTOTYPE_SUFFIX &&
+        memcmp(source + end - PROTOTYPE_SUFFIX, ".prototype", PROTOTYPE_SUFFIX) == 0) {
+        return true;
+    }
+    return end - start == 14 && memcmp(source + start, "module.exports", 14) == 0;
+}
+
+/* `exports.helper = function () {}` and `module.exports = { helper: function () {} }`
+ * name their function in the module's export surface. */
+static TSNode resolve_commonjs_function_name(TSNode node, const char *source) {
+    TSNode null_node = {0};
+    TSNode parent = ts_node_parent(node);
+    const char *pk = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    if (strcmp(pk, "assignment_expression") == 0) {
+        TSNode left = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+        if (ts_node_eq(node, ts_node_child_by_field_name(parent, TS_FIELD("right"))) &&
+            !ts_node_is_null(left) && strcmp(ts_node_type(left), "member_expression") == 0 &&
+            js_node_is_exports_object(ts_node_child_by_field_name(left, TS_FIELD("object")),
+                                      source)) {
+            return ts_node_child_by_field_name(left, TS_FIELD("property"));
+        }
+        return null_node;
+    }
+    if (strcmp(pk, "pair") == 0) {
+        TSNode object = ts_node_parent(parent);
+        TSNode assignment = ts_node_is_null(object) ? null_node : ts_node_parent(object);
+        if (!ts_node_is_null(assignment) &&
+            strcmp(ts_node_type(assignment), "assignment_expression") == 0 &&
+            ts_node_eq(object, ts_node_child_by_field_name(assignment, TS_FIELD("right"))) &&
+            js_node_is_exports_object(ts_node_child_by_field_name(assignment, TS_FIELD("left")),
+                                      source)) {
+            return ts_node_child_by_field_name(parent, TS_FIELD("key"));
+        }
+    }
+    return null_node;
+}
+
+static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind, CBMLanguage lang) {
+    bool ecma = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
+    /* An anonymous `const f = function () {}` is named exactly like its arrow. */
+    bool anonymous_function = ecma && strcmp(kind, "function_expression") == 0;
+    if (strcmp(kind, "arrow_function") != 0 && !anonymous_function) {
         TSNode null_node = {0};
         return null_node;
     }
@@ -722,6 +777,10 @@ static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
         return null_node;
     }
     const char *pk = ts_node_type(parent);
+    if (anonymous_function && strcmp(pk, "pair") == 0) {
+        TSNode null_node = {0};
+        return null_node;
+    }
     if (strcmp(pk, "variable_declarator") == 0 || strcmp(pk, "public_field_definition") == 0) {
         /* `const f = () => {}` and the class-field form `f = () => {}` both name
          * the arrow via the parent's `name` child (#new_ts_class_field_arrow):
@@ -765,6 +824,43 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
 
 // Resolve the name node for a function, handling language-specific quirks.
 // Uses a loop to handle template_declaration unwrapping (avoids recursion).
+bool cbm_js_function_inside_class_member(TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    const char *kind = ts_node_type(node);
+    const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    /* The members themselves have nodes: a method, or a field holding a function. */
+    if (strcmp(parent_kind, "class_body") == 0 ||
+        ((strcmp(parent_kind, "public_field_definition") == 0 ||
+          strcmp(parent_kind, "field_definition") == 0) &&
+         strcmp(kind, "decorator") != 0)) {
+        return false;
+    }
+    for (TSNode at = parent; !ts_node_is_null(at); at = ts_node_parent(at)) {
+        const char *ancestor = ts_node_type(at);
+        if (strcmp(ancestor, "class_body") == 0) {
+            return true;
+        }
+        if (strcmp(ancestor, "program") == 0 || strcmp(ancestor, "internal_module") == 0) {
+            return false;
+        }
+    }
+    return false;
+}
+
+/* As cbm_resolve_func_name, for callers holding the source text a CommonJS export
+ * name is recognized by. */
+TSNode cbm_resolve_func_name_in_source(TSNode node, CBMLanguage lang, const char *source) {
+    TSNode name = cbm_resolve_func_name(node, lang);
+    const char *kind = ts_node_type(node);
+    if (ts_node_is_null(name) && source &&
+        (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+         lang == CBM_LANG_ARKTS) &&
+        (strcmp(kind, "function_expression") == 0 || strcmp(kind, "arrow_function") == 0)) {
+        return resolve_commonjs_function_name(node, source);
+    }
+    return name;
+}
+
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
     enum { MAX_TEMPLATE_DEPTH = 2 };
     for (int tmpl_depth = 0; tmpl_depth < MAX_TEMPLATE_DEPTH; tmpl_depth++) {
@@ -1268,7 +1364,7 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         }
 
         {
-            TSNode r = resolve_toplevel_arrow_name(node, kind);
+            TSNode r = resolve_toplevel_arrow_name(node, kind, lang);
             if (!ts_node_is_null(r)) {
                 return r;
             }
@@ -6885,7 +6981,7 @@ static TSNode function_definition_end(const CBMExtractCtx *ctx, TSNode node) {
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
-    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
+    TSNode name_node = cbm_resolve_func_name_in_source(node, ctx->language, ctx->source);
     if (ctx->language == CBM_LANG_C && ctx->test_declarations &&
         ctx->test_declarations_raw_source) {
         TSNode candidate_name, candidate_body;
@@ -7016,8 +7112,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.end_line = ts_node_end_point(function_definition_end(ctx, node)).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
-    if (ctx->language == CBM_LANG_RUST &&
-        strcmp(ts_node_type(node), "function_signature_item") == 0) {
+    if ((ctx->language == CBM_LANG_RUST &&
+         strcmp(ts_node_type(node), "function_signature_item") == 0) ||
+        strcmp(ts_node_type(node), "function_signature") == 0) {
         def.is_abstract = true;
     }
 

@@ -881,9 +881,10 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_resolution_t *res, const char *module_qn,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls, const char *route_mount,
-                                 CBMLanguage lang) {
+                                 CBMLanguage lang, CBMCallEvidence *evidence) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && route_reg_path(call, lang) != NULL) {
+        evidence->route_registered = true;
         return handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
                                          imp_count, route_mount, lang);
     }
@@ -1001,6 +1002,7 @@ static bool calls_emit_route_call(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     evidence->calls_emitted |= handle_route_registration(
         ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count, route_mount, lang);
+    evidence->route_registered = true;
     return true;
 }
 
@@ -1090,7 +1092,7 @@ static bool calls_emit_lsp_target(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     evidence->calls_emitted |=
         emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                             imp_vals, imp_count, false, route_mount, lang);
+                             imp_vals, imp_count, false, route_mount, lang, evidence);
     return true;
 }
 
@@ -1261,6 +1263,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return SKIP_ONE;
     }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        evidence->candidate_qn = cbm_registry_diagnostic_candidate(
+            ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang);
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,
          * `httpx.post`) — the import map skips it (no node) and no project symbol
@@ -1433,7 +1437,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     evidence->candidate_qn = target_node->qualified_name;
     evidence->calls_emitted |=
         emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                             imp_vals, imp_count, drop_plain_call, route_mount, lang);
+                             imp_vals, imp_count, drop_plain_call, route_mount, lang, evidence);
     return SKIP_ONE;
 }
 

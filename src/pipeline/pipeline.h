@@ -354,6 +354,11 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
  * strategy chain is unchanged. Import-map and lsp_* answers are never
  * vetoed; CBM_LANG_COUNT never vetoes. pass_calls.c and pass_parallel.c
  * MUST apply it identically. Pure; unit-tested in test_registry.c. */
+/* What the name chain would guess for a call no binding resolved. Text for whoever
+ * reviews an unresolved site, never a target: no edge may be derived from it. */
+const char *cbm_registry_diagnostic_candidate(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **keys,
+                                              const char **values, int count, CBMLanguage lang);
 bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_lang,
                                     const cbm_resolution_t *res);
 

@@ -21,6 +21,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pass_lsp_cross.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
+#include "pipeline/resolver_ecma.h"
 #include "pipeline/pipeline_internal.h"
 #include "helpers.h" /* cbm_fqn_module */
 #include "pipeline/doc_links.h"
@@ -2247,6 +2248,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
          * the same origin-aware cross pass as a full sequential run. */
         if (rc == 0 && atomic_load(&ctx->test_definition_owners_seen)) {
             rc = cbm_pipeline_pass_lsp_cross(ctx, changed_files, ci, cache);
+            cbm_ecma_surfaces_free(ctx->ecma_surfaces);
+            ctx->ecma_surfaces = NULL;
         }
         if (rc == 0) {
             rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);

@@ -1573,13 +1573,7 @@ TEST(es_usage_crossfile_typescript) {
                     .suffix = "Config",
                     .label = "Interface",
                     .declaration_line = 1,
-                    .declaration_text = "export interface Config {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-parameter-type-projection",
-         .why = "A parameter annotation is a type use; the current TypeScript bridge has no "
-                "USES_TYPE projection.",
-         .tried = "Replaced the aggregate USAGE floor with the exact type occurrence and a "
-                  "required callable control."}};
+                    .declaration_text = "export interface Config {"}}};
     static const RQ_Forbidden forbidden[] = {
         {.case_id = "annotation-is-not-value-usage",
          .site = {.file = "main.ts", .caller = "create", .needle = "Config", .occurrence_index = 1},

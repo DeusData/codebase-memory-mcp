@@ -42,6 +42,7 @@
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_proof.h"
 #include "lsp/ts_lsp.h"
+#include "pipeline/resolver_ecma.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/pipeline_internal.h"
@@ -427,6 +428,13 @@ static const char *pxc_resolve_base_qn(const pxc_base_scope_t *bs, const char *r
         return NULL;
     }
     if (pxc_base_strategy_is_weak(res.strategy)) {
+        return NULL;
+    }
+    /* A method proof walks this chain, so an ECMAScript base must be the import or
+     * same-module declaration its spelling names, never a suffix-aware neighbour. */
+    if ((bs->lang == CBM_LANG_JAVASCRIPT || bs->lang == CBM_LANG_TYPESCRIPT ||
+         bs->lang == CBM_LANG_TSX) &&
+        strcmp(res.strategy, "import_map") != 0 && strcmp(res.strategy, "same_module") != 0) {
         return NULL;
     }
     if (!cbm_label_is_type_like(cbm_registry_label_of(bs->reg, res.qualified_name))) {
@@ -2689,6 +2697,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     }
 
     cbm_log_info("pass.start", "pass", "lsp_cross", "files", itoa_buf(file_count));
+    if (!ctx->ecma_surfaces)
+        ctx->ecma_surfaces = cbm_ecma_surfaces_build(ctx, files, file_count, cache);
 
     /* Build the Rust workspace manifest once (only when the project has at
      * least one Rust file, to avoid an unconditional Cargo.toml read).

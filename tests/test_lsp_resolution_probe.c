@@ -578,28 +578,15 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "and the strict Go bridge does not publish the struct-literal type occurrence.",
      "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
-    {"lrp_ts_usage_type_param", "main.ts", "run", "Config", 1, "types.ts", "Config", "USAGE", 1,
-     "export interface Config { timeout: number; }", false, false,
-     "Source annotation occurrence is not recorded by generic binding audit; Source audit "
-     "exact import "
-     "candidate was rejected with binding_occurrence_missing. The independent source span must "
-     "target Config, not the wrapper : Config.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_ts_usage_type_param", "main.ts", "run", "Config", 1, "types.ts", "Config", "USES_TYPE", 1,
+     "export interface Config { timeout: number; }", true, false, NULL,
+     "A parameter annotation is a type use, so USES_TYPE at the exact name; es_usage_crossfile_typescript forbids USAGE here."},
     {"lrp_ts_usage_import_type_with_decoy", "main.ts", "choose", "Config", 1, "a/types.ts",
-     "Config", "USAGE", 1, "export interface Config { selected: number; }", false, false,
-     "Exact import-type annotation identity is genuine but binding audit omits the type "
-     "occurrence. Must preserve ./a/types namespace identity and reject same-name b/types.ts "
-     "decoy.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Config", "USES_TYPE", 1, "export interface Config { selected: number; }", true, false, NULL,
+     "A parameter annotation is a type use, so USES_TYPE at the exact name; es_usage_crossfile_typescript forbids USAGE here. Keeps ./a/types identity against the same-name b/types.ts decoy."},
     {"lrp_tsx_usage_import_type_with_decoy", "main.tsx", "choose", "Config", 1, "a/types.ts",
-     "Config", "USAGE", 1, "export interface Config { selected: number; }", false, false,
-     "Exact import-type annotation identity is genuine but binding audit omits the type "
-     "occurrence. Must preserve ./a/types namespace identity and reject same-name b/types.ts "
-     "decoy.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Config", "USES_TYPE", 1, "export interface Config { selected: number; }", true, false, NULL,
+     "A parameter annotation is a type use, so USES_TYPE at the exact name; es_usage_crossfile_typescript forbids USAGE here. Keeps ./a/types identity against the same-name b/types.ts decoy."},
     {"lrp_python_usage_instantiation", "main.py", "create", "User(name)", 0, "model.py", "User",
      "CALLS", 1, "class User:", true, false,
      "Existing explicit Python Class-call contract requires exact imported User and CLASS_CALLABLE "
@@ -1006,17 +993,12 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "TS receiver_type supports const identifier initialized by new imported Counter; no "
      "inheritance or competing declaration. Existing direct-method proof tests are positive "
      "controls."},
-    {"lrp_ts_s2_method_dispatch", "main.ts", "run", "new Counter()", 0, "counter.ts", NULL, "CALLS",
-     0, NULL, false, false,
-     "Implicit constructor has no materialized callable declaration/constructor proof. The "
-     "new-expression type fact used by later member calls does not prove constructor invocation.",
-     "TS proof bridge handles member calls and method references, not new-expression publication."},
+    {"lrp_ts_s2_method_dispatch", "main.ts", "run", "new Counter()", 0, "counter.ts", "Counter",
+     "CALLS", 1, "export class Counter {", true, false, NULL,
+     "`new` selects the class; an implicit constructor has no node of its own, so the Class is the materialized callable, as ts.same-file-constructor requires."},
     {"lrp_ts_s3_constructor", "main.ts", "make", "new Widget(name)", 0, "widget.ts",
-     "Widget.constructor", "CALLS", 2, "    constructor(public name: string) {}", false, false,
-     "new_expression has a call carrier but no constructor-target semantic proof.",
-     "Source audit recorded callable/class target rejection; explicit Widget.constructor is "
-     "present and "
-     "cannot be replaced with unrelated Widget.label."},
+     "Widget.constructor", "CALLS", 2, "    constructor(public name: string) {}", true, false,
+     NULL, "`new` runs the constructor the class declares, never the unrelated Widget.label."},
     {"lrp_ts_s4_static_method", "main.ts", "run", "Factory.version()", 0, "factory.ts",
      "Factory.version", "CALLS", 2, "    static version(): string { return '1.0'; }", false, false,
      "Imported class value is not a proven instance receiver; static class-member selection needs "
@@ -1024,14 +1006,11 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "TS receiver_type requires this or a lexical identifier with annotation/new-expression "
      "initializer; the import identifier Factory does not supply that binding."},
     {"lrp_ts_s4_static_method", "factory.ts", "Factory.create", "new Factory()", 0, "factory.ts",
-     NULL, "CALLS", 0, NULL, false, false,
-     "Implicit Factory constructor has no materialized callable declaration or constructor proof.",
-     "The old global floor could be satisfied by this unrelated factory body call after a "
-     "constructor implementation; it must never satisfy run->version."},
-    {"lrp_ts_s5_chained", "main.ts", "run", "new Builder()", 0, "builder.ts", NULL, "CALLS", 0,
-     NULL, false, false,
-     "Implicit Builder constructor is not materialized/proven as a callable declaration.",
-     "TS producer supports declared direct methods only; constructor binding remains separate."},
+     "Factory", "CALLS", 1, "export class Factory {", true, false, NULL,
+     "`new` selects the class; an implicit constructor has no node of its own, so the Class is the materialized callable, as ts.same-file-constructor requires."},
+    {"lrp_ts_s5_chained", "main.ts", "run", "new Builder()", 0, "builder.ts", "Builder", "CALLS", 1,
+     "export class Builder {", true, false, NULL,
+     "`new` selects the class; an implicit constructor has no node of its own, so the Class is the materialized callable, as ts.same-file-constructor requires."},
     {"lrp_ts_s5_chained", "main.ts", "run", "new Builder().add(1)", 0, "builder.ts", "Builder.add",
      "CALLS", 3, "    add(x: number): Builder { this.items.push(x); return this; }", false, false,
      "Chained receiver requires constructor/selected-method return facts; current receiver_type "
@@ -1070,10 +1049,8 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "Reviewed ts_proof.c receiver_type. Constructor and external console.log edges must not "
      "satisfy this occurrence."},
     {"lrp_ts_s8_field_type_hint", "service.ts", "Service.constructor", "new Logger()", 0,
-     "logger.ts", NULL, "CALLS", 0, NULL, false, false,
-     "Implicit Logger constructor is a genuine separate invocation, without materialized callable "
-     "identity/constructor proof.",
-     "Class type existence does not grant CLASS_CALLABLE authority for TypeScript."},
+     "logger.ts", "Logger", "CALLS", 1, "export class Logger {", true, false, NULL,
+     "`new` selects the class; an implicit constructor has no node of its own, so the Class is the materialized callable, as ts.same-file-constructor requires."},
     {"lrp_kotlin_s1_crossfile_call", "Main.kt", "run", "double(n)", 0, "Util.kt", "double", "CALLS",
      1, "fun double(x: Int): Int = x * 2", true, false, NULL,
      "Same-package top-level identity and fixed positional builtin Int applicability are "
@@ -2746,7 +2723,7 @@ static int lrp_ts_imported_type_with_decoy(const char *main_filename) {
                                ? "lrp_tsx_usage_import_type_with_decoy"
                                : "lrp_ts_usage_import_type_with_decoy";
     bool ok = lrp_check_oracle(store, lp.project, files, 3, scenario);
-    int decoy = store ? lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE", "main.choose",
+    int decoy = store ? lrp_exact_edge_by_qn_suffix(store, lp.project, "USES_TYPE", "main.choose",
                                                     "b.types.Config")
                       : -1;
     if (!ok || decoy != 0)

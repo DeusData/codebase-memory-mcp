@@ -63,6 +63,10 @@ const cbm_resolve_import_snapshot_t *cbm_pipeline_import_snapshot(const cbm_gbuf
                                                                   const char *,
                                                                   const CBMFileResult *);
 
+/* True when the nearest package.json of this path declares `"type"`, which makes
+ * its .js files modules whatever their syntax. */
+bool cbm_pipeline_node_declared_module(const char *source_rel);
+
 /* Source-audited Rust use bindings, separate from dependency File targets. */
 int cbm_pipeline_rust_import_map(const cbm_gbuf_t *, const char *, const char *,
                                  const CBMFileResult *, const char ***, const char ***, int *);

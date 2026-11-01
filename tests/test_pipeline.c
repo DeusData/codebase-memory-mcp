@@ -3999,13 +3999,7 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     .suffix = "parity.tsxReferenceTarget",
                     .label = "Function",
                     .declaration_line = 1,
-                    .declaration_text = "function tsxReferenceTarget(): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "callback-tsx-script",
-         .why = "Script/global loading namespace is unconfigured; the lexical auditor supports "
-                "explicit modules.",
-         .tried = "Focused pipeline probe: bare callback absent; explicit ESM counterpart is "
-                  "required separately."},
+                    .declaration_text = "function tsxReferenceTarget(): void {}"}},
         {.case_id = "callback-java-package-access",
          .site = {.file = "JavaParity.java",
                   .caller = "JavaParity.javaReferenceSite",
@@ -4078,13 +4072,7 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     .label = "Function",
                     .declaration_line = 2,
                     .declaration_text =
-                        "function typescriptShadowAccept(callback: () => void): void {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "typescript-script-global-call",
-         .why = "The unchanged script fixture has no configured global namespace or explicit "
-                "module boundary.",
-         .tried = "Source binding audit rejects the complete script domain; the shadowed argument "
-                  "remains a hard negative, and explicit module reference controls are required."},
+                        "function typescriptShadowAccept(callback: () => void): void {}"}},
         {.case_id = "javascriptModule-required-reference",
          .site = {.file = "module_parity.js",
                   .caller = "module_parity.javascriptModuleReferenceSite",
@@ -12027,13 +12015,7 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
                     .suffix = "ToastService.openSuccessUniqueXyz",
                     .label = "Method",
                     .declaration_line = 2,
-                    .declaration_text = "  openSuccessUniqueXyz(msg: string): void {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-INLINE-CONSTRUCTOR-RECEIVER",
-         .why = "The inline constructor result is a genuine receiver, but receiver_type only "
-                "accepts named bindings or this.",
-         .tried = "Preserved the original expression and class declaration; named new-initialized "
-                  "receivers and explicitly typed method calls remain required."},
+                    .declaration_text = "  openSuccessUniqueXyz(msg: string): void {"}},
         {.case_id = "ts.same-name-constructed-method",
          .site = {.file = "app/notify.ts",
                   .caller = "notify.crossSameNameNew",
@@ -12068,13 +12050,7 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
                     .suffix = "ToastService",
                     .label = "Class",
                     .declaration_line = 1,
-                    .declaration_text = "export class ToastService {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-IMPLICIT-CONSTRUCTOR-CALLABLE",
-         .why = "The default constructor belongs to this class, but the shared CALLS policy needs "
-                "a constructor callable-identity proof.",
-         .tried = "Preserved the original expression and class declaration; named new-initialized "
-                  "receivers and explicitly typed method calls remain required."},
+                    .declaration_text = "export class ToastService {"}},
         {.case_id = "ts.cross-local-constructor",
          .site = {.file = "app/variants.ts",
                   .caller = "variants.crossNewLocal",
@@ -12085,13 +12061,7 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
                     .suffix = "ToastService",
                     .label = "Class",
                     .declaration_line = 1,
-                    .declaration_text = "export class ToastService {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-IMPLICIT-CONSTRUCTOR-CALLABLE",
-         .why = "The default constructor belongs to this class, but the shared CALLS policy needs "
-                "a constructor callable-identity proof.",
-         .tried = "Preserved the original expression and class declaration; named new-initialized "
-                  "receivers and explicitly typed method calls remain required."},
+                    .declaration_text = "export class ToastService {"}},
         {.case_id = "ts.cross-chain-constructor",
          .site = {.file = "app/variants.ts",
                   .caller = "variants.crossNewChain",
@@ -12102,13 +12072,7 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
                     .suffix = "ToastService",
                     .label = "Class",
                     .declaration_line = 1,
-                    .declaration_text = "export class ToastService {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-IMPLICIT-CONSTRUCTOR-CALLABLE",
-         .why = "The default constructor belongs to this class, but the shared CALLS policy needs "
-                "a constructor callable-identity proof.",
-         .tried = "Preserved the original expression and class declaration; named new-initialized "
-                  "receivers and explicitly typed method calls remain required."},
+                    .declaration_text = "export class ToastService {"}},
         {.case_id = "ts.same-name-constructor",
          .site = {.file = "app/notify.ts",
                   .caller = "notify.crossSameNameNew",
@@ -12119,13 +12083,7 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
                     .suffix = "NotifierService",
                     .label = "Class",
                     .declaration_line = 1,
-                    .declaration_text = "export class NotifierService {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-IMPLICIT-CONSTRUCTOR-CALLABLE",
-         .why = "The default constructor belongs to this class, but the shared CALLS policy needs "
-                "a constructor callable-identity proof.",
-         .tried = "Preserved the original expression and class declaration; named new-initialized "
-                  "receivers and explicitly typed method calls remain required."},
+                    .declaration_text = "export class NotifierService {"}},
     };
     bool quality =
         pipeline_quality_files(s, project, "ts-constructor-receivers", tmp, files, 4, expected,
@@ -12143,7 +12101,9 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
  * edge, so trace_path(foo, inbound) missed the caller. End to end through the
  * real pipeline: the renamed call, an app-local wrapper that shares the
  * exported name, and a method on a renamed class import all reach the
- * exported member, while the plain named import control keeps lsp_ts_import. */
+ * exported member. Every admitted edge now carries strategy shared_resolver, so
+ * the old per-strategy labels (lsp_ts_import, lsp_import_alias, lsp_ts_method)
+ * became this one; what the test binds is the edge to the exact target. */
 TEST(pipeline_ts_renamed_import_call_issue2297) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ts_2297_XXXXXX");
@@ -12195,9 +12155,9 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     ASSERT_NOT_NULL(s);
 
     bool plain =
-        cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "lsp_ts_import");
+        cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "shared_resolver");
     bool renamed = cross_file_call_has_strategy(s, project, "callsRenamed", "fooUniqueQrs",
-                                                "lsp_import_alias");
+                                                "shared_resolver");
     char wrapper_qn[512];
     char exported_qn[512];
     snprintf(wrapper_qn, sizeof(wrapper_qn), "%s.src.wrapper.buildHealthUniqueQrs", project);
@@ -12213,7 +12173,7 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
         cbm_store_find_edges_by_source_type(s, wrapper_node.id, "CALLS", &edges, &edge_count);
         for (int i = 0; i < edge_count; i++) {
             if (edges[i].target_id == exported_node.id && edges[i].properties_json &&
-                strstr(edges[i].properties_json, "lsp_import_alias"))
+                strstr(edges[i].properties_json, "shared_resolver"))
                 wrapper = true;
             if (edges[i].target_id == wrapper_node.id)
                 recursive = true;
@@ -12223,7 +12183,19 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     cbm_node_free_fields(&wrapper_node);
     cbm_node_free_fields(&exported_node);
     bool renamed_class = cross_file_call_has_strategy(s, project, "viaRenamedClass",
-                                                      "pingUniqueQrs", "lsp_ts_method");
+                                                      "pingUniqueQrs", "shared_resolver");
+    /* An admitted alias call is not an unresolved one. */
+    int alias_rows = 0;
+    static const char *const alias_files[] = {"src/renamed.ts", "src/wrapper.ts"};
+    for (size_t f = 0; f < sizeof(alias_files) / sizeof(alias_files[0]); f++) {
+        cbm_coverage_row_t *rows = NULL;
+        int row_count = 0;
+        ASSERT_EQ(cbm_store_coverage_get_path(s, project, alias_files[f], &rows, &row_count),
+                  CBM_STORE_OK);
+        for (int i = 0; i < row_count; i++)
+            alias_rows += strcmp(rows[i].kind, "unresolved_calls") == 0;
+        cbm_store_free_coverage(rows, row_count);
+    }
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -12234,6 +12206,7 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     ASSERT_TRUE(wrapper);
     ASSERT_FALSE(recursive);
     ASSERT_TRUE(renamed_class);
+    ASSERT_EQ(alias_rows, 0);
     PASS();
 }
 
@@ -12331,14 +12304,7 @@ TEST(pipeline_ts_param_property_injection_issue514) {
                     .label = "Method",
                     .declaration_line = 2,
                     .declaration_text = "export class CatService extends BaseService { findAll(): "
-                                        "string[] { return ['cat']; } }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-INHERITED-RECEIVER-DOMAIN",
-         .why = "Even a direct override on a class with a base is withheld until the complete "
-                "inherited receiver domain is audited.",
-         .tried = "Original annotations, constructors, factory body and extraction occurrence "
-                  "checks remain; the bridge rejects inherited classes and accepts only identifier "
-                  "or this receivers."},
+                                        "string[] { return ['cat']; } }"}},
         {.case_id = "ts.parameter-property.injected-controller",
          .site = {.file = paths[1],
                   .caller = "CatController.findAll",
@@ -12349,14 +12315,7 @@ TEST(pipeline_ts_param_property_injection_issue514) {
                     .label = "Method",
                     .declaration_line = 2,
                     .declaration_text = "export class CatService extends BaseService { findAll(): "
-                                        "string[] { return ['cat']; } }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-CONSTRUCTOR-PARAMETER-FIELD",
-         .why = "Parameter-property initialization and selector receiver identity need explicit "
-                "field-flow proof.",
-         .tried = "Original annotations, constructors, factory body and extraction occurrence "
-                  "checks remain; the bridge rejects inherited classes and accepts only identifier "
-                  "or this receivers."},
+                                        "string[] { return ['cat']; } }"}},
         {.case_id = "ts.parameter-property.injected-reporter",
          .site = {.file = paths[2],
                   .caller = "CatReporter.reportInjected",
@@ -12367,14 +12326,7 @@ TEST(pipeline_ts_param_property_injection_issue514) {
                     .label = "Method",
                     .declaration_line = 2,
                     .declaration_text = "export class CatService extends BaseService { findAll(): "
-                                        "string[] { return ['cat']; } }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-CONSTRUCTOR-PARAMETER-FIELD",
-         .why = "Parameter-property initialization and selector receiver identity need explicit "
-                "field-flow proof.",
-         .tried = "Original annotations, constructors, factory body and extraction occurrence "
-                  "checks remain; the bridge rejects inherited classes and accepts only identifier "
-                  "or this receivers."},
+                                        "string[] { return ['cat']; } }"}},
         {.case_id = "ts.parameter-property.fresh-field",
          .site = {.file = paths[2],
                   .caller = "CatReporter.reportLocal",
@@ -12385,14 +12337,7 @@ TEST(pipeline_ts_param_property_injection_issue514) {
                     .label = "Method",
                     .declaration_line = 2,
                     .declaration_text = "export class CatService extends BaseService { findAll(): "
-                                        "string[] { return ['cat']; } }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-INITIALIZED-FIELD-RECEIVER",
-         .why = "The field initializer determines a genuine receiver but the adapter does not "
-                "prove selector field flow.",
-         .tried = "Original annotations, constructors, factory body and extraction occurrence "
-                  "checks remain; the bridge rejects inherited classes and accepts only identifier "
-                  "or this receivers."},
+                                        "string[] { return ['cat']; } }"}},
         {.case_id = "ts.parameter-property.annotated-field",
          .site = {.file = paths[2],
                   .caller = "CatReporter.reportAnnotated",
@@ -12403,14 +12348,7 @@ TEST(pipeline_ts_param_property_injection_issue514) {
                     .label = "Method",
                     .declaration_line = 1,
                     .declaration_text =
-                        "export class BaseService { findAll(): string[] { return []; } }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "TS-ANNOTATED-FIELD-RECEIVER",
-         .why = "Static declaration selection uses the BaseService annotation, but a field "
-                "selector still needs receiver provenance.",
-         .tried = "Original annotations, constructors, factory body and extraction occurrence "
-                  "checks remain; the bridge rejects inherited classes and accepts only identifier "
-                  "or this receivers."},
+                        "export class BaseService { findAll(): string[] { return []; } }"}},
         {.case_id = "ts.parameter-property.factory-field",
          .site = {.file = paths[2],
                   .caller = "CatReporter.reportFactory",

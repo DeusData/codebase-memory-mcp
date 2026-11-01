@@ -25,6 +25,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/shared_resolver.h"
+#include "pipeline/resolver_ecma.h"
 #include "resolve/policy.h"
 #include "pipeline/pass_ensemble_routing.h"
 #include "pipeline/worker_pool.h"
@@ -1281,13 +1282,14 @@ static bool unresolved_collect_site(unresolved_capture_t *capture, const CBMReso
     CBMCallEvidence published = evidence ? *evidence : (CBMCallEvidence){0};
     if (capture->authoritative) {
         /* Preserve the legacy candidate as diagnostic data, never authority.
-         * Final ownership/sealing may still downgrade the resolver outcome. */
-        published.calls_emitted = false;
+         * Final ownership/sealing may still downgrade the resolver outcome. A
+         * registered route is no guess at a callee: nothing is missing there. */
+        published.calls_emitted = published.route_registered;
         evidence = &published;
     }
-    /* Only the exact admitted occurrence suppresses shared-mode diagnostics.
-     * Legacy insertions can be removed by projection. Other relations and an
-     * unadmitted candidate alone never suppress a missing invocation. */
+    /* In shared mode only the exact admitted occurrence, or a registered route,
+     * suppresses a diagnostic. Legacy insertions can be removed by projection.
+     * Other relations and an unadmitted candidate alone suppress nothing. */
     if (evidence && evidence->calls_emitted) {
         return true;
     }
@@ -3188,6 +3190,8 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     cbm_shared_resolver_free(ctx->shared_resolver);
     ctx->shared_resolver = NULL;
+    cbm_ecma_surfaces_free(ctx->ecma_surfaces);
+    ctx->ecma_surfaces = NULL;
     if (seq_cache) {
         for (int i = 0; i < file_count; i++) {
             if (seq_cache[i]) {
@@ -3331,6 +3335,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_arena_init(&cross_lsp_arena);
     CBM_PROF_START(t_collect_defs);
     if (run_cross_lsp) {
+        ctx->ecma_surfaces = cbm_ecma_surfaces_build(ctx, files, file_count, cache);
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
         all_defs = def_modules ? cbm_pxc_collect_all_defs(ctx, &cross_lsp_arena, cache, files,
@@ -3437,6 +3442,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
     cbm_shared_resolver_free(ctx->shared_resolver);
     ctx->shared_resolver = NULL;
+    cbm_ecma_surfaces_free(ctx->ecma_surfaces);
+    ctx->ecma_surfaces = NULL;
     cbm_doclinks_end(ctx);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
