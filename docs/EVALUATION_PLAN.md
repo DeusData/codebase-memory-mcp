@@ -274,8 +274,7 @@ then its index is **deleted** before the next language — so **only one project
 every index is genuinely cold. The skeleton:
 
 ```bash
-# Start clean: no leftover DBs, fresh results tree
-rm -f ~/.cache/codebase-memory-mcp/*.db
+# Start clean: fresh results tree
 mkdir -p /tmp/eval-results
 
 for lang in $ALL_LANGS; do                      # ALL_LANGS = full 159-name list (§2 / §8)
