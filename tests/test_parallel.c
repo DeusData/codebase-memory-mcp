@@ -4241,7 +4241,7 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
                       parallel_quality_check(gbuf, "cbm_issue56_parallel",
                                              local_decoy ? "rust-manifest-shadow" : "rust-manifest",
                                              sources, 3, expected, 2, &quality) &&
-                      quality.genuine == 2 && quality.found == 1 && quality.missing == 1;
+                      quality.genuine == 2 && quality.found == 2 && quality.missing == 0;
     if (!quality_ok) {
         cbm_gbuf_free(gbuf);
         gbuf = NULL;

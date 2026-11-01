@@ -568,7 +568,7 @@ TEST(probe_rust_struct_impl) {
     ASSERT_TRUE(m.functions + m.methods >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -665,7 +665,7 @@ TEST(probe_rust_type_alias) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
