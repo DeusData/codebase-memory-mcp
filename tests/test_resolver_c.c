@@ -468,7 +468,9 @@ TEST(resolver_cpp_direct_member_requires_source_class_and_visibility) {
     }
     ASSERT_EQ(proven[0], 1);
     ASSERT_EQ(proven[1], 0);
-    ASSERT_EQ(proven[2], 0);
+    /* `struct Engine : Other { void work() {} };`: a class's own member hides whatever
+     * its bases declare, so the unknown base changes nothing about this call. */
+    ASSERT_EQ(proven[2], 1);
     ASSERT_EQ(proven[3], 0);
     PASS();
 }
@@ -1085,6 +1087,7 @@ typedef struct {
     const RQ_Forbidden *forbidden;
     size_t forbidden_count;
     const char *compile_commands; /* %s is the repository root */
+    size_t known_gaps;            /* rows in `expected` marked RQ_KNOWN_GAP */
 } CTUCase;
 
 static bool c_tu_run(const CTUCase *fixture, int driver) {
@@ -1131,8 +1134,9 @@ static bool c_tu_run(const CTUCase *fixture, int driver) {
     if (store)
         cbm_store_close(store);
     th_cleanup(root);
-    ok = ok && report.genuine == fixture->expected_count && report.found == report.genuine &&
-         report.missing + report.wrong + report.metadata_errors == 0;
+    ok = ok && report.genuine == fixture->expected_count && report.required_missing == 0 &&
+         report.recovered_gaps == 0 && report.found + fixture->known_gaps == report.genuine &&
+         report.missing == fixture->known_gaps && report.wrong + report.metadata_errors == 0;
     if (!ok)
         fprintf(stderr, "[C-TU] %s driver=%d genuine=%zu found=%zu missing=%zu wrong=%zu meta=%zu\n",
                 fixture->suite, driver, report.genuine, report.found, report.missing, report.wrong,
@@ -1714,7 +1718,295 @@ TEST(resolver_c_bare_values_and_types_bind_in_the_translation_unit) {
     PASS();
 }
 
+/* C++ as LLVM writes it: namespaces, a class in a header with its members defined in
+ * a source file no caller includes, base classes, implicit members. */
+#define C_TU_CXX_HEADER                                                                         \
+    "#ifndef LLVM_ADT_STRINGREF_H\n"                                                            \
+    "#define LLVM_ADT_STRINGREF_H\n"                                                            \
+    "namespace llvm {\n"                                                                        \
+    "class StringRef {\n"                                                                       \
+    "public:\n"                                                                                 \
+    "  int size() const { return Length; }\n"                                                   \
+    "  bool empty() const;\n"                                                                   \
+    "  int Count;\n"                                                                            \
+    "private:\n"                                                                                \
+    "  int secret() const { return 1; }\n"                                                      \
+    "  int Length;\n"                                                                           \
+    "};\n"                                                                                      \
+    "class Derived : public StringRef {\n"                                                      \
+    "public:\n"                                                                                 \
+    "  int own() { return size(); }\n"                                                          \
+    "};\n"                                                                                      \
+    "int getAsInteger(StringRef S);\n"                                                          \
+    "inline int headerHelper(StringRef S) { return S.empty() ? 0 : 1; }\n"                      \
+    "struct Arrow {\n"                                                                          \
+    "  StringRef *operator->();\n"                                                              \
+    "  int Count;\n"                                                                            \
+    "};\n"                                                                                      \
+    "}\n"                                                                                       \
+    "#endif\n"
+#define C_TU_CXX_IMPL                                                                           \
+    "#include \"llvm/ADT/StringRef.h\"\n"                                                       \
+    "using namespace llvm;\n"                                                                   \
+    "bool StringRef::empty() const { return Length == 0; }\n"                                   \
+    "int llvm::getAsInteger(StringRef S) { return S.size(); }\n"
+#define C_TU_CXX_USE                                                                            \
+    "#include \"llvm/ADT/StringRef.h\"\n"                                                       \
+    "namespace llvm {\n"                                                                        \
+    "int useInline(StringRef S) { return S.size(); }\n"                                         \
+    "int useOutOfLine(StringRef S) { return S.empty() ? 0 : 1; }\n"                             \
+    "int useFree(StringRef S) { return getAsInteger(S); }\n"                                    \
+    "int useHeader(StringRef S) { return headerHelper(S); }\n"                                  \
+    "int usePointer(StringRef *S) { return S->Count; }\n"                                       \
+    "int useBase(Derived D) { return D.size(); }\n"                                             \
+    "int usePrivate(StringRef S) { return S.secret(); }\n"                                      \
+    "int useArrow(Arrow A) { return A->Count; }\n"                                              \
+    "int useDot(Arrow A) { return A.Count; }\n"                                                 \
+    "}\n"                                                                                       \
+    "int outer(llvm::StringRef S) { return llvm::getAsInteger(S); }\n"
+#define C_TU_CXX_ADL                                                                            \
+    "namespace a {\n"                                                                           \
+    "struct W {};\n"                                                                            \
+    "int pick(W w);\n"                                                                          \
+    "}\n"                                                                                       \
+    "namespace b {\n"                                                                           \
+    "using namespace a;\n"                                                                      \
+    "int pick(W w);\n"                                                                          \
+    "int run(W w) { return pick(w); }\n"                                                        \
+    "}\n"
+static const RQ_Source C_TU_CXX[] = {{.path = "llvm/include/llvm/ADT/StringRef.h",
+                                      .text = C_TU_CXX_HEADER},
+                                     {.path = "llvm/lib/Support/StringRef.cpp",
+                                      .text = C_TU_CXX_IMPL},
+                                     {.path = "llvm/lib/Support/Use.cpp", .text = C_TU_CXX_USE},
+                                     {.path = "adl.cpp", .text = C_TU_CXX_ADL}};
+
+TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
+    const char *header = "llvm/include/llvm/ADT/StringRef.h";
+    const char *impl = "llvm/lib/Support/StringRef.cpp";
+    const char *use_file = "llvm/lib/Support/Use.cpp";
+    const char *use = C_TU_CXX_USE;
+    const char *impl_text = C_TU_CXX_IMPL;
+    const RQ_Target size = {.file = header,
+                            .suffix = "llvm.StringRef.size",
+                            .label = "Method",
+                            .declaration_line = 6,
+                            .declaration_text = "  int size() const { return Length; }"};
+    const RQ_Target empty = {.file = impl,
+                             .suffix = "StringRef.StringRef.empty",
+                             .label = "Method",
+                             .declaration_line = 3,
+                             .declaration_text =
+                                 "bool StringRef::empty() const { return Length == 0; }"};
+    const RQ_Target free_function = {.file = impl,
+                                     .suffix = "llvm.getAsInteger",
+                                     .label = "Method",
+                                     .declaration_line = 4,
+                                     .declaration_text =
+                                         "int llvm::getAsInteger(StringRef S) { return S.size(); }"};
+    const RQ_Target inline_function = {
+        .file = header,
+        .suffix = "llvm.headerHelper",
+        .label = "Function",
+        .declaration_line = 18,
+        .declaration_text = "inline int headerHelper(StringRef S) { return S.empty() ? 0 : 1; }"};
+    const RQ_Target count = {.file = header,
+                             .suffix = "llvm.StringRef.Count",
+                             .label = "Field",
+                             .declaration_line = 8,
+                             .declaration_text = "  int Count;"};
+    const RQ_Target arrow_count = {.file = header,
+                                   .suffix = "llvm.Arrow.Count",
+                                   .label = "Field",
+                                   .declaration_line = 21,
+                                   .declaration_text = "  int Count;"};
+    const RQ_Target length = {.file = header,
+                              .suffix = "llvm.StringRef.Length",
+                              .label = "Field",
+                              .declaration_line = 11,
+                              .declaration_text = "  int Length;"};
+    const RQ_Target string_ref = {.file = header,
+                                  .suffix = "llvm.StringRef",
+                                  .label = "Class",
+                                  .declaration_line = 4,
+                                  .declaration_text = "class StringRef {"};
+    const RQ_Target arrow_type = {.file = header,
+                                  .suffix = "llvm.Arrow",
+                                  .label = "Class",
+                                  .declaration_line = 19,
+                                  .declaration_text = "struct Arrow {"};
+    const RQ_Expected expected[] = {
+        {.case_id = "inline-member",
+         .site = {.file = use_file, .caller = "llvm.useInline", .needle = "S.size()"},
+         .relation = "CALLS",
+         .target = size},
+        {.case_id = "out-of-line-member",
+         .site = {.file = use_file, .caller = "llvm.useOutOfLine", .needle = "S.empty()"},
+         .relation = "CALLS",
+         .target = empty},
+        {.case_id = "namespace-function-qualified-definition",
+         .site = {.file = use_file, .caller = "llvm.useFree", .needle = "getAsInteger(S)"},
+         .relation = "CALLS",
+         .target = free_function},
+        {.case_id = "header-inline-function",
+         .site = {.file = use_file, .caller = "llvm.useHeader", .needle = "headerHelper(S)"},
+         .relation = "CALLS",
+         .target = inline_function},
+        {.case_id = "base-class-member",
+         .site = {.file = use_file, .caller = "llvm.useBase", .needle = "D.size()"},
+         .relation = "CALLS",
+         .target = size},
+        {.case_id = "qualified-call",
+         .site = {.file = use_file, .caller = "Use.outer", .needle = "llvm::getAsInteger(S)"},
+         .relation = "CALLS",
+         .target = free_function},
+        {.case_id = "member-call-in-out-of-line-definition",
+         .site = {.file = impl, .caller = "llvm.getAsInteger", .needle = "S.size()"},
+         .relation = "CALLS",
+         .target = size},
+        {.case_id = "pointer-member-type",
+         .site = C_TU_WORD(use_file, use, "llvm.usePointer", "usePointer(", "StringRef"),
+         .relation = "USAGE",
+         .target = string_ref},
+        {.case_id = "pointer-member",
+         .site = C_TU_WORD(use_file, use, "llvm.usePointer", "S->Count", "Count"),
+         .relation = "USAGE",
+         .target = count},
+        {.case_id = "dot-on-a-class-with-arrow-type",
+         .site = C_TU_WORD(use_file, use, "llvm.useDot", "useDot(", "Arrow"),
+         .relation = "USAGE",
+         .target = arrow_type},
+        {.case_id = "dot-on-a-class-with-arrow",
+         .site = C_TU_WORD(use_file, use, "llvm.useDot", "A.Count", "Count"),
+         .relation = "USAGE",
+         .target = arrow_count},
+        {.case_id = "implicit-member-in-out-of-line-definition",
+         .site = C_TU_WORD(impl, impl_text, "StringRef.StringRef.empty", "return Length", "Length"),
+         .relation = "USAGE",
+         .target = length},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "private-member-from-outside",
+         .site = {.file = use_file, .caller = "llvm.usePrivate", .needle = "S.secret()"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "overloaded-arrow-is-not-a-field-of-this-class",
+         .site = C_TU_WORD(use_file, use, "llvm.useArrow", "A->Count", "Count"),
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "argument-dependent-lookup-adds-a-candidate",
+         .site = {.file = "adl.cpp", .caller = "b.run", .needle = "pick(w)"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-cxx",
+                             .sources = C_TU_CXX,
+                             .source_count = sizeof(C_TU_CXX) / sizeof(C_TU_CXX[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* What the C rules leave unbound on real code. Each row is a genuine reference that the
+ * resolver abstains on today; an edge here would be promoted to required, and an edge to
+ * anything else is reported as wrong. */
+#define C_TU_GAPS_HEADER                                                                        \
+    "#ifndef GAPS_H\n"                                                                          \
+    "#define GAPS_H\n"                                                                          \
+    "typedef struct tabpage_S {\n"                                                              \
+    "  struct tabpage_S *tp_next;\n"                                                            \
+    "} tabpage_T;\n"                                                                            \
+    "extern tabpage_T *first_tabpage;\n"                                                        \
+    "#define FOR_ALL_TABS(tp) for (tabpage_T *(tp) = first_tabpage; (tp); (tp) = (tp)->tp_next)\n" \
+    "#define LOG_LINE(s) log_line(s)\n"                                                         \
+    "void log_line(const char *s);\n"                                                           \
+    "static inline int ascii_iswhite(int c) FUNC_ATTR_CONST { return c == 32; }\n"              \
+    "#endif\n"
+#define C_TU_GAPS_SOURCE                                                                        \
+    "#include \"gaps.h\"\n"                                                                     \
+    "tabpage_T *first_tabpage;\n"                                                               \
+    "void log_line(const char *s) { (void)s; }\n"
+#define C_TU_GAPS_USE                                                                           \
+    "#include \"gaps.h\"\n"                                                                     \
+    "int use_loop(void) {\n"                                                                    \
+    "  int n = 0;\n"                                                                            \
+    "  FOR_ALL_TABS(tp) {\n"                                                                    \
+    "    n += tp->tp_next != 0;\n"                                                              \
+    "  }\n"                                                                                     \
+    "  return n;\n"                                                                             \
+    "}\n"                                                                                       \
+    "void use_macro(void) { LOG_LINE(\"x\"); }\n"                                               \
+    "int use_attr(int c) { return ascii_iswhite(c); }\n"
+static const RQ_Source C_TU_GAPS[] = {{.path = "gaps.h", .text = C_TU_GAPS_HEADER},
+                                      {.path = "gaps.c", .text = C_TU_GAPS_SOURCE},
+                                      {.path = "use_gaps.c", .text = C_TU_GAPS_USE}};
+
+TEST(resolver_c_known_gaps_stay_honest) {
+    const char *use = C_TU_GAPS_USE;
+    const RQ_Expected expected[] = {
+        {.case_id = "macro-declared-loop-variable",
+         .site = C_TU_WORD("use_gaps.c", use, "use_gaps.use_loop", "n += tp->", "tp_next"),
+         .relation = "USAGE",
+         .target = {.file = "gaps.h",
+                    .suffix = "gaps.tabpage_S.tp_next",
+                    .label = "Field",
+                    .declaration_line = 4,
+                    .declaration_text = "  struct tabpage_S *tp_next;"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "c-macro-declared-variable",
+         .why = "`FOR_ALL_TABS(tp)` declares tp inside a macro body. The resolver does not "
+                "expand macros, so tp has no declared type and its members stay unknown.",
+         .tried = "Read neovim's FOR_ALL_* loops. Guessing the type from the macro text needs "
+                  "expansion rules this resolver does not have."},
+        {.case_id = "function-like-macro",
+         .site = {.file = "use_gaps.c", .caller = "use_gaps.use_macro", .needle = "LOG_LINE(\"x\")"},
+         .relation = "CALLS",
+         .target = {.file = "gaps.h",
+                    .suffix = "gaps.LOG_LINE#macro",
+                    .label = "Macro",
+                    .declaration_line = 8,
+                    .declaration_text = "#define LOG_LINE(s) log_line(s)"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "c-function-like-macro",
+         .why = "A function-like macro use reads as a call, and the function it reaches is only "
+                "known after expansion. `serverLog`, `assert` and `kv_size` have this form.",
+         .tried = "A macro of the name abstains wherever it is visible, so a same-named function "
+                  "never takes the edge. Binding the Macro node as a call needs a decision on "
+                  "what CALLS means for a macro."},
+        {.case_id = "attribute-macro-in-header",
+         .site = {.file = "use_gaps.c", .caller = "use_gaps.use_attr", .needle = "ascii_iswhite(c)"},
+         .relation = "CALLS",
+         .target = {.file = "gaps.h",
+                    .suffix = "gaps.ascii_iswhite",
+                    .label = "Function",
+                    .declaration_line = 10,
+                    .declaration_text =
+                        "static inline int ascii_iswhite(int c) FUNC_ATTR_CONST { return c == 32; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "c-attribute-macro-definition",
+         .why = "`.h` is parsed with the C++ grammar, which reads `f(int c) ATTR {` as a broken "
+                "definition named ATTR, so the function has no graph node to bind.",
+         .tried = "Traced with a tree dump on neovim's ascii_defs.h. The proof layer emits no "
+                  "rows from the bogus definition; recovering the name belongs in extraction."},
+    };
+    const CTUCase fixture = {.suite = "c-tu-gaps",
+                             .sources = C_TU_GAPS,
+                             .source_count = sizeof(C_TU_GAPS) / sizeof(C_TU_GAPS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .known_gaps = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_known_gaps_stay_honest);
+    RUN_TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit);
     RUN_TEST(resolver_c_header_prototype_binds_external_definition_through_includes);
     RUN_TEST(resolver_c_lookalike_calls_abstain);
     RUN_TEST(resolver_c_copied_library_binds_the_copy_compiled_against_its_header);
