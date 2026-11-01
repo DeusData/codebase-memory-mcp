@@ -1190,7 +1190,7 @@ static const char SC_MAIN[] =
     "  def noUnknownImport(): Unit = notAnywhere()\n"
     "  def localShadows(): Unit = { val box = new Plain(); box.go() }\n"
     "  def mentionsObject(): Any = Util\n"
-    "  def noFieldName(p: Box): Any = p.Util\n"
+    "  def noFieldName(p: Any): Any = p.Util\n"
     "}\n"
     "class Open extends outside.Thing {\n"
     "  def own(): Unit = ()\n"

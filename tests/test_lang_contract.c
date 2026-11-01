@@ -982,7 +982,9 @@ typedef struct {
 
 /* Source-authored invocation sites and full declaration-line anchors. Binding
  * classifications identify an audited missing proof stage, not a claim that
- * extraction has no additional gap. Dart and CUDA are required capabilities. */
+ * extraction has no additional gap. Dart, CUDA and the languages with a source
+ * adapter (Ruby, Swift, Scala, Perl, Zig, Elixir, OCaml, Haskell, Erlang) are
+ * required capabilities. */
 static const CallOracle CALL_ORACLES[] = {
     {"ruby",
      "run",
@@ -992,10 +994,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "def helper",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Top-level def methods and implicit-receiver invocation have no audited Ruby method binding.",
-     "The zero-argument helper() call is preserved; the generic language gate excludes Ruby."},
+     "",
+     ""},
     {"lua",
      "run",
      "helper",
@@ -1018,11 +1020,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "func helper() -> Int {",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Swift file membership in a build module and module-level function visibility are not proved.",
-     "The original free helper() invocation remains; binding_build returns "
-     "swift_build_module_membership_required."},
+     "",
+     ""},
     {"dart",
      "run",
      "helper",
@@ -1043,11 +1044,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "def helper(): Int =",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Scala top-level def visibility and invocation binding have no semantic proof bridge.",
-     "Kept the Scala 3 expression-bodied helper and run definitions; only namespace imports are "
-     "advertised."},
+     "",
+     ""},
     {"bash",
      "run",
      "helper",
@@ -1069,11 +1069,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      5,
      "sub helper {",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Perl package-sub invocation has no admitted semantic proof bridge from its legacy engine.",
-     "Kept use strict/warnings and the direct main-package helper call; capability dispatch "
-     "explicitly withholds that bridge."},
+     "",
+     ""},
     {"r",
      "run",
      "helper",
@@ -1109,11 +1108,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "fn helper() void {}",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Zig container-level function declarations have no audited lexical invocation binding.",
-     "Kept the private fn helper and pub fn run in one file; the generic language gate excludes "
-     "Zig."},
+     "",
+     ""},
     {"gdscript",
      "run",
      "helper",
@@ -1148,11 +1146,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      2,
      "  def helper(x) do",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Elixir local function name/arity lookup within defmodule has no audited module binding.",
-     "Kept Sample.helper/1 and run/0 source declarations; no Elixir semantic proof adapter is "
-     "selected."},
+     "",
+     ""},
     {"ocaml",
      "run",
      "helper",
@@ -1161,11 +1158,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "let helper x = x + 1",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "OCaml let-bound functions and curried application have no audited lexical binding adapter.",
-     "Kept the original helper 41 application inside run; the generic language gate excludes "
-     "OCaml."},
+     "",
+     ""},
     {"gleam",
      "run",
      "helper",
@@ -1200,11 +1196,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      2,
      "helper x = x + 1",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Haskell equation bindings and application identity have no audited lexical proof adapter.",
-     "Kept the separate helper type signature/equation and run value binding; the generic language "
-     "gate excludes Haskell."},
+     "",
+     ""},
     {"fortran",
      "run",
      "helper",
@@ -1407,10 +1402,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      4,
      "helper(X) -> X + 1.",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Erlang module-local function name/arity lookup has no audited semantic binding.",
-     "Kept module a, export run/0 and local helper/1; the generic language gate excludes Erlang."},
+     "",
+     ""},
     {"fennel",
      "run",
      "helper",
@@ -1844,8 +1839,8 @@ TEST(contract_calls_breadth) {
     for (int run = 0; run < RUNS; run++) {
         ASSERT(accepted[run]);
         ASSERT_EQ(reports[run].genuine, SITES);
-        ASSERT_EQ(reports[run].found, 2);    /* independently required Dart and CUDA sites */
-        ASSERT_EQ(reports[run].missing, 53); /* includes both original Fortran references */
+        ASSERT_EQ(reports[run].found, 11);   /* Dart, CUDA and the nine adapter languages */
+        ASSERT_EQ(reports[run].missing, 44); /* includes both original Fortran references */
     }
     ASSERT(equivalent);
     PASS();
