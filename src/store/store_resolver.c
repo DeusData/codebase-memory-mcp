@@ -326,6 +326,16 @@ static bool resolver_count_outcomes(sqlite3 *db, const char *project,
     return sqlite3_finalize(stmt) == SQLITE_OK && step == SQLITE_DONE;
 }
 
+/* The currency check reads every table, so a refused read also fails it. That is an
+ * unreadable generation, which must not be reported as one that was never written. */
+static bool resolver_read_denied(sqlite3 *db) {
+    sqlite3_stmt *statement = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT project FROM main.resolver_occurrences LIMIT 0", -1,
+                                &statement, NULL);
+    sqlite3_finalize(statement);
+    return rc == SQLITE_AUTH;
+}
+
 int cbm_store_resolver_summary(cbm_store_t *store, const char *project,
                                cbm_resolve_counts_t *counts, bool *present) {
     if (!store || !project || !counts || !present)
@@ -336,7 +346,7 @@ int cbm_store_resolver_summary(cbm_store_t *store, const char *project,
     if (sqlite3_exec(db, "SAVEPOINT resolver_summary", NULL, NULL, NULL) != SQLITE_OK)
         return CBM_STORE_ERR;
     bool current = resolver_current(db, project);
-    bool ok = !current || resolver_count_outcomes(db, project, counts);
+    bool ok = current ? resolver_count_outcomes(db, project, counts) : !resolver_read_denied(db);
     ok = sqlite3_exec(db, "RELEASE resolver_summary", NULL, NULL, NULL) == SQLITE_OK && ok;
     if (!ok) {
         memset(counts, 0, sizeof(*counts));
