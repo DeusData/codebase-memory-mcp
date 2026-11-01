@@ -1278,9 +1278,10 @@ TEST(resolver_stabilization_go_literals_new_make_and_conversions_are_typed) {
         "  S(raw).Up(/*convert*/)\n"
         "  (*A)(nil).M(/*convert-pointer*/)\n"
         "}\n"
-        "func G() {\n"
+        /* new(n), since the grammar has no new(1) yet and would skip all of G as a syntax error. */
+        "func G(n int) {\n"
         "  new := func(n int) *B { return nil }\n"
-        "  z := new(1)\n"
+        "  z := new(n)\n"
         "  z.M(/*shadowed-new*/)\n"
         "}\n";
     ASSERT(go_selects(source, "test.api.F", "a.M(/*address*/", "test.api.A.M"));
