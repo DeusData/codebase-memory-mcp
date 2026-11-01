@@ -17329,9 +17329,8 @@ static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
 /* POSIX-only: the unscoped search_code scan as find/sort argv stages feeding the
  * in-process scanner. */
 static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
-                                                 const char *file_pattern,
-                                                 const char *pattern, const char *filelist,
-                                                 const char *root_path,
+                                                 const char *file_pattern, const char *pattern,
+                                                 const char *filelist, const char *root_path,
                                                  char output_path[CBM_SZ_2K], size_t output_limit,
                                                  uint64_t deadline_ms, bool deadline_latched,
                                                  cbm_proc_result_t *result_out);
@@ -18301,9 +18300,10 @@ static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
                                 output_limit_latched);
     if (*cancellation_latched || *deadline_latched || *output_limit_latched) {
         result_out->tree_quiesced = true; /* no child was spawned */
-        return *cancellation_latched ? MCP_SCAN_CANCELLED
-               : *deadline_latched     ? MCP_SCAN_DEADLINE
-                                       : MCP_SCAN_OUTPUT_LIMIT;
+        if (*cancellation_latched) {
+            return MCP_SCAN_CANCELLED;
+        }
+        return *deadline_latched ? MCP_SCAN_DEADLINE : MCP_SCAN_OUTPUT_LIMIT;
     }
     cbm_proc_opts_t options = {
         .bin = bin,
@@ -18369,9 +18369,8 @@ static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
  * find/sort failures fail closed, and an empty list is a successful empty
  * scan. */
 static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
-                                                 const char *file_pattern,
-                                                 const char *pattern, const char *filelist,
-                                                 const char *root_path,
+                                                 const char *file_pattern, const char *pattern,
+                                                 const char *filelist, const char *root_path,
                                                  char output_path[CBM_SZ_2K], size_t output_limit,
                                                  uint64_t deadline_ms, bool deadline_latched,
                                                  cbm_proc_result_t *result_out) {
@@ -18417,8 +18416,8 @@ static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use
     }
     /* The sorted, NUL-separated file list feeds the same in-process scanner an
      * indexed project uses, so matching has one implementation. */
-    mcp_scan_cause_t scan_cause = search_scan_in_process(srv, filelist, pattern, use_regex, out,
-                                                         output_limit, deadline_ms);
+    mcp_scan_cause_t scan_cause =
+        search_scan_in_process(srv, filelist, pattern, use_regex, out, output_limit, deadline_ms);
     if (fclose(out) != 0 && scan_cause == MCP_SCAN_SUCCESS) {
         scan_cause = MCP_SCAN_COMMAND_FAILURE;
     }
