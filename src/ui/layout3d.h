@@ -69,8 +69,11 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
 /* Release a computed layout result and its fields through their matching allocators. */
 void cbm_layout_free(cbm_layout_result_t *result);
 
-/* Serialize layout result to JSON string. Caller must free(). */
+/* Serialize layout result to JSON string. Release with cbm_layout_free_json(). */
 char *cbm_layout_to_json(const cbm_layout_result_t *result);
+
+/* Free the JSON string returned by cbm_layout_to_json. */
+void cbm_layout_free_json(char *json);
 
 /* ── CBM Atlas region level ───────────────────────────────────── */
 

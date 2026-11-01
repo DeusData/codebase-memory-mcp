@@ -1281,10 +1281,18 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
         if (strcmp(cand->label, "Function") != 0 && strcmp(cand->label, "Method") != 0) {
             continue;
         }
-        if (!unique_callable) {
-            unique_callable = cand;
-        } else if (unique_callable->id != cand->id) {
-            callable_ambiguous = true;
+        /* A generated member (a Java record's implicit accessor) is registered
+         * by qualified name only: it joins through its owner's Class.method
+         * tail below, never on its leaf name alone -- `Objects.nonNull(x)` is
+         * no call of some record's nonNull(). Nor does it make a same-named
+         * callable ambiguous: the leaf fallback sees the graph as if it were
+         * not there. */
+        if (!cbm_node_props_generated(cand->properties_json)) {
+            if (!unique_callable) {
+                unique_callable = cand;
+            } else if (unique_callable->id != cand->id) {
+                callable_ambiguous = true;
+            }
         }
         if (!cbm_pipeline_qn_class_method_tail_eq(cand->qualified_name, callee_tail)) {
             continue;
