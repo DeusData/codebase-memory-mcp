@@ -65,6 +65,7 @@ The high-resolution GIFs show CBM Lens Beta on 20 October 2026; the still images
 - **Equip your coding agents**: `install` sets up supported client configuration, durable guidance, skills, Scout/Verify/Auditor profiles, and applicable context hooks. Support varies by client; see the [integration matrix](#multi-agent-support).
 - **Keep context local and reusable**: indexes persist between sessions, eligible active MCP sessions can keep them synchronized, and optional graph artifacts let a team share a baseline.
 - **Run a native tool on your machine**: standard releases include CBM Lens for macOS, Linux, and Windows. The native runtime needs no Docker or language runtime; parser grammars are included.
+- **Keep personal repo memory local**: `manage_memory` stores ADR-style knowledge in a local SQLite store under the user data dir, outside source repos. Branch-aware overlays, no upload, no repo writes.
 
 ## Quick Start
 
@@ -307,6 +308,7 @@ The install script placed beside the binary is **reported, not deleted**: uninst
 ### Graph & analysis
 - **Architecture overview**: `get_architecture` returns a compact summary by default. Request specific `aspects` for routes, hotspots, dependencies, clusters, or cycles. `system_structure` provides the projection used by CBM Lens and must be requested on its own.
 - **Architecture Decision Records**: `manage_adr` persists the project's decision record across sessions; indexing also extracts supported ADR metadata and supersession from documentation files
+- **Personal repo memory**: `manage_memory` stores personal repo memory locally outside source repos, keyed by repo, branch, and document type
 - **Louvain community detection**: Discovers functional modules by clustering call edges
 - **Change impact**: `detect_changes` maps uncommitted changes to affected symbols with risk classification and can report test impact with `scope: "tests"`; `compare_graphs` compares indexed snapshots
 - **Runtime observations**: `ingest_traces` adds observed call relationships from separately collected traces alongside static analysis; static call paths alone do not show what ran
@@ -402,6 +404,7 @@ In this repository, test narrowing is wired to the Linux x86_64 test leg when `T
 
 ### Distribution & operation
 - **Native runtime set, zero infrastructure services**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Personal memory**: Local repo knowledge lives in `manage_memory` under the user data dir; it is never written to the repo unless you explicitly export artifacts
 - **Auto-sync**: Background watcher detects file changes in projects registered by active MCP sessions, including successful explicit `index_repository` targets, and re-indexes them automatically.
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph --project my-project --name-pattern ".*Handler.*"`
@@ -437,6 +440,20 @@ Share a compressed graph snapshot so teammates can reuse an indexed baseline.
 - **Optional**: shared export is opt-in, and Git commits remain your choice. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
 The artifact provides a shared baseline while each developer keeps a local query database.
+
+## Personal Repo Memory
+
+Use `manage_memory` when you want ADR-style knowledge to stay local and private.
+
+- **Storage**: local SQLite `memory.db` under the user data dir, separate from repo files
+- **Override**: set `CBM_MEMORY_DIR=/path/to/private/memory`
+- **No upload**: `manage_memory` never writes `.codebase-memory/` or changes tracked files
+- **Branch aware**: memory is keyed by repo identity, branch, and document type; feature branches can keep overlays while `main` keeps base memory
+- **LLM workflow**: call `manage_memory(mode="get")` at session start, investigate with graph tools if empty/stale, then update with `manage_memory(mode="update", content="...")`
+- **Branch promotion**: after branch work, copy branch memory into base with `manage_memory(mode="promote", branch="feature")`
+- **Maintenance**: list entries with `manage_memory(mode="list")`, remove one branch/doc with `manage_memory(mode="delete", branch="...")`, inspect paths with `manage_memory(mode="settings")`
+
+`manage_adr(scope="personal", ...)` is also accepted as a compatibility path to the same personal store.
 
 ## How It Works
 
@@ -957,6 +974,7 @@ mode. `index_status` keeps describing the published graph and its freshness.
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records (`get` reads, `update` replaces the whole document, `set_sections` rewrites only the named sections and leaves every other byte untouched, `sections` lists headings). Query modes do not wait behind a same-project reindex; writes remain serialized. |
+| `manage_memory` | Local personal repo memory outside source repos. Branch-aware overlays, keyed by repo identity, branch, and document type. |
 | `ingest_traces` | Store observed call paths or caller/callee pairs under a run label. Both endpoints must resolve to indexed symbols; unresolved names are reported. |
 
 `manage_adr(mode='set_sections')` writes one or more sections by name and splices them into the stored document, so text outside the named sections (including a preamble, code fences and section ordering) is preserved byte-for-byte. Any `## Heading` works, not just the conventional PURPOSE / STACK / ARCHITECTURE / PATTERNS / TRADEOFFS / PHILOSOPHY set; names match exactly, including case. Writing the same section twice is a no-op, so a retry after a lost response cannot duplicate content.
@@ -1019,6 +1037,9 @@ codebase-memory-mcp config set watcher_enabled false     # stop the watcher thre
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config get memory_dir                # local personal memory directory
+codebase-memory-mcp config set memory_enabled true       # opt in to local per-repo memory
+codebase-memory-mcp config set memory_dir ~/private/cbm  # override personal memory dir
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
@@ -1026,12 +1047,28 @@ The two `index_max_*` settings default to `off`. Exceeding one fails the complet
 index attempt rather than publishing a partial graph; an existing serving index
 is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
+Default memory config:
+- `memory_enabled=false`: `manage_memory` storage is opt-in. When not configured, existing project ADR/index behavior is unchanged.
+- `memory_dir=<user data dir>`: global user-home memory DB location, override with config or `CBM_MEMORY_DIR`. The path must be absolute and outside the source repo.
+
+### Personal memory privacy and storage boundaries
+
+`manage_memory` is opt-in, local-only personal storage. It is intentionally separate from project indexes and source repos. Enable it with `codebase-memory-mcp config set memory_enabled true` or by passing an external config with `memory_enabled=true`:
+
+- **Where data lives:** one SQLite DB named `memory.db` under `memory_dir`. Defaults are macOS `~/Library/Application Support/codebase-memory-mcp`, Linux `~/.local/share/codebase-memory-mcp`, Windows `%LOCALAPPDATA%/codebase-memory-mcp`. `CBM_MEMORY_DIR` or `config set memory_dir ...` can override this with an absolute path outside the repo.
+- **Repo boundary:** write/read/delete operations are rejected when `memory_dir` is relative or inside the current project root. The tool reports `storage_boundary_error` and does not create `memory.db`.
+- **No external transmission:** `manage_memory` does not upload memory, does not write to git, does not call network APIs, and does not sync to the repo. Responses redact repo identity and storage keys. Paths are redacted unless `reveal_paths=true` is passed to `mode="settings"`.
+- **No sensitive-data logging:** memory content, storage keys, repo IDs, and memory paths are not logged by the memory tool. Content is returned only to the caller for explicit `get`/`sections` requests.
+- **Delete semantics:** `mode="delete"` removes only the selected repo/branch/doc row from `memory.db`. It does not delete other branches, other repos, the DB file, SQLite free pages, filesystem backups, or user copies.
+- **Promote semantics:** `mode="promote"` is a local-only copy from the current branch doc to the base branch doc in the same `memory.db`.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CBM_ALLOWED_ROOT` | *(unset)* | Confine `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused, and the same check now applies to the graph UI's `POST /api/index` route rather than only to the MCP tool. Unset imposes no *containment* restriction; but see the always-on limits below, which apply whether or not this is set. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. One account can use only one canonical cache root at a time; close active CBM sessions/commands before switching it. |
+| `CBM_MEMORY_DIR` | macOS: `~/Library/Application Support/codebase-memory-mcp`; Linux: `~/.local/share/codebase-memory-mcp`; Windows: `%LOCALAPPDATA%/codebase-memory-mcp` | Override local personal memory storage with an absolute path outside the repo. `manage_memory` writes `memory.db` here and does not touch the repo. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable the shared daemon's periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. Exact paths are logged by `diagnostics.start`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none`; or their numeric equivalents `0` to `4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
@@ -1044,6 +1081,9 @@ Environment used by daemon-owned components (such as diagnostics, daemon logging
 ```bash
 # Store indexes in a custom directory
 export CBM_CACHE_DIR=~/my-projects/cbm-data
+
+# Store personal memory in a private directory
+export CBM_MEMORY_DIR=~/private/cbm-memory
 ```
 
 ## Custom File Extensions
@@ -1072,7 +1112,7 @@ Project config overrides global for conflicting extensions. An entry whose langu
 
 ## Persistence
 
-SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
+Project index SQLite databases are stored at `~/.cache/codebase-memory-mcp/`. Personal memory is stored separately in the user data dir or an absolute, repo-external `CBM_MEMORY_DIR`. Both persist across restarts (WAL mode, ACID-safe). To reset indexes: `rm -rf ~/.cache/codebase-memory-mcp/`. To reset personal memory, remove `memory.db` from `manage_memory(mode="settings", reveal_paths=true)` output.
 
 ## Troubleshooting
 

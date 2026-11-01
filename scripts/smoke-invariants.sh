@@ -522,7 +522,7 @@ inv_mcp_initialize() {
 
 # ── Invariant 4: tools/list returns exactly the expected tools ─────────────
 # Cross-check against the canonical registry (TOOLS[] in src/mcp/mcp.c).
-EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_file_outline get_graph_schema compare_graphs get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes manage_adr ingest_traces"
+EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_file_outline get_graph_schema compare_graphs get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes manage_adr manage_memory ingest_traces"
 EXPECTED_TOOL_COUNT="$(printf '%s\n' $EXPECTED_TOOLS | grep -c .)"
 inv_tools_list() {
     if ! mcp_alive; then
