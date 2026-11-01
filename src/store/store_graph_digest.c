@@ -1,5 +1,6 @@
 /* Canonical stored-content digest. This module establishes no provenance. */
 #include "store/store_graph_digest.h"
+#include "store/store_resolver_evidence.h"
 
 #include "foundation/sha256.h"
 
@@ -695,6 +696,11 @@ static bool gd_table_header(gd_context_t *g, int index, bool present) {
         return false;
     }
     if (!gd_text_eq(name, table->name) || !gd_text_eq(type, g->is_view[index] ? "view" : "table")) {
+        return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+    }
+    /* A view is only accepted as the writer's own: a look-alike over other rows
+     * would otherwise be certified as this generation's resolver data. */
+    if (g->is_view[index] && !cbm_store_resolver_view_definition_current((const char *)sql.data)) {
         return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
     }
     if (!gd_value(g, GD_TEXT, sql.data, sql.length)) {

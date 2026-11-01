@@ -898,6 +898,16 @@ TEST(resolver_generation_missing_metadata_rows_are_unavailable) {
     PASS();
 }
 
+/* A view can be swapped for one over other rows with the same columns. */
+TEST(resolver_generation_replaced_view_is_unavailable) {
+    ASSERT(generation_corruption_is_unavailable(
+        "DROP VIEW resolver_occurrence_evidence;"
+        "CREATE VIEW resolver_occurrence_evidence(project,ordinal,content_identity,"
+        "configuration_identity,proof,source_binding_proof) AS SELECT p.project,o.ordinal,'','',"
+        "1,1 FROM resolver_projects p JOIN resolver_occurrence_rows o ON o.pid=p.pid"));
+    PASS();
+}
+
 TEST(resolver_generation_modified_metadata_is_unavailable) {
     ASSERT(generation_corruption_is_unavailable(
         "UPDATE resolver_occurrence_rows SET proof=0 WHERE pid=1"));
@@ -1300,6 +1310,7 @@ SUITE(resolver_generation) {
     RUN_TEST(resolver_generation_missing_metadata_tables_are_unavailable);
     RUN_TEST(resolver_generation_missing_metadata_rows_are_unavailable);
     RUN_TEST(resolver_generation_modified_metadata_is_unavailable);
+    RUN_TEST(resolver_generation_replaced_view_is_unavailable);
     RUN_TEST(resolver_generation_empty_project_has_complete_metadata);
     RUN_TEST(resolver_generation_views_read_back_every_stored_value);
     RUN_TEST(resolver_generation_storage_does_not_repeat_strings);

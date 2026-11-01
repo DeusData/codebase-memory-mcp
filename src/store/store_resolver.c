@@ -131,6 +131,17 @@ static bool resolver_guard(sqlite3 *db, const char *table, int operation, bool i
            sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
 }
 
+static bool resolver_view_definition_current(sqlite3 *db, const char *name) {
+    sqlite3_stmt *statement = NULL;
+    bool ok =
+        sqlite3_prepare_v2(db, "SELECT sql FROM main.sqlite_schema WHERE type='view' AND name=?",
+                           -1, &statement, NULL) == SQLITE_OK &&
+        resolver_bind_text(statement, 1, name) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_ROW &&
+        cbm_store_resolver_view_definition_current((const char *)sqlite3_column_text(statement, 0));
+    return sqlite3_finalize(statement) == SQLITE_OK && ok;
+}
+
 static bool resolver_schema_current(sqlite3 *db, bool install) {
     const resolver_table_t meta = {"store_meta", "k,v"};
     if (!resolver_table_current(db, &meta))
@@ -143,7 +154,8 @@ static bool resolver_schema_current(sqlite3 *db, bool install) {
                 return false;
     }
     for (size_t i = 0; i < sizeof(resolver_views) / sizeof(resolver_views[0]); i++)
-        if (!resolver_object_current(db, &resolver_views[i], "view"))
+        if (!resolver_object_current(db, &resolver_views[i], "view") ||
+            !resolver_view_definition_current(db, resolver_views[i].name))
             return false;
     return true;
 }

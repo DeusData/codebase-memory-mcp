@@ -11,6 +11,9 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
                                  size_t count, const cbm_resolve_file_t *files, size_t file_count,
                                  const cbm_resolve_summary_t *summaries, size_t summary_count,
                                  bool commit_batches);
+/* True when sql, as stored in sqlite_schema, is exactly how the writer defines this
+ * logical view. A view of another name or definition is not this generation's data. */
+bool cbm_store_resolver_view_definition_current(const char *sql);
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 /* Rows between progress lines; 0 restores the production interval. */
 void cbm_store_resolver_test_set_progress_rows(uint64_t rows);

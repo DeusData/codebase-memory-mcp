@@ -143,6 +143,28 @@ static char *schema_sql(void) {
     return out;
 }
 
+bool cbm_store_resolver_view_definition_current(const char *sql) {
+    /* SQLite stores "CREATE VIEW name..." without the IF NOT EXISTS it was given. */
+    static const char prefix[] = "CREATE VIEW ";
+    if (!sql || strncmp(sql, prefix, sizeof(prefix) - 1))
+        return false;
+    char *schema = schema_sql();
+    if (!schema)
+        return false;
+    /* The definition runs to the statement's ';', which sqlite_schema drops. */
+    size_t length = strlen(sql);
+    const char *body = sql + sizeof(prefix) - 1;
+    size_t body_length = length - (sizeof(prefix) - 1);
+    bool found = false;
+    static const char opening[] = "CREATE VIEW IF NOT EXISTS ";
+    for (const char *at = strstr(schema, opening); at && !found; at = strstr(at + 1, opening)) {
+        const char *definition = at + sizeof(opening) - 1;
+        found = !strncmp(definition, body, body_length) && definition[body_length] == ';';
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, schema);
+    return found;
+}
+
 enum {
     DIGEST_BYTES = 32,
     DICT_CACHE_SLOTS = 1 << 16,
