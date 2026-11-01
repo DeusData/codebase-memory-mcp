@@ -157,8 +157,8 @@ is_android() {
 OS=$(detect_os)
 ARCH=$(detect_arch)
 if [ "$OS" = "linux" ] && is_android; then
-  echo "error: Android/Termux is not supported by the Linux portable binary." >&2
-  echo "Build from source with scripts/build.sh in Termux or use a supported Linux host." >&2
+  echo 'error: Android/Termux cannot run the Linux portable binary (static glibc; Android kills it with "Bad system call").' >&2
+  echo "Building from source in Termux may work but is not a supported platform yet - see issue #1202." >&2
   exit 1
 fi
 
