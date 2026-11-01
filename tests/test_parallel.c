@@ -3625,7 +3625,7 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                                  {.path = "app/Main.kt", .text = main_source},
                                  {.path = "quality/Alias.kt", .text = alias_source}};
     const RQ_Expected expected[] = {
-        {.case_id = "original-callable-alias-parse-gap",
+        {.case_id = "original-callable-alias-beside-class-member",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.aliasCaller",
                   .needle = "callback()",
@@ -3637,14 +3637,14 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                     .declaration_line = 8,
                     .declaration_text = "fun projectHandler(): Int = 7"},
          .mode = RQ_KNOWN_GAP,
-         .gap_id = "kotlin_parse_incomplete_callable_identity",
+         .gap_id = "kotlin_callable_alias_beside_class_member",
          .why = "The file parses completely (asserted below), but this alias has no proof once the "
                 "file also declares a class with a member: the same call binds with `class Box` "
                 "gone or empty, as the parse-complete quality/Alias.kt row shows.",
          .tried = "Preserved the original generic/destructuring/loop fixture and raw carriers. "
                   "Varied the file: a loop or destructuring does not block the alias, a class "
                   "with one member function does. The call is left unbound in both drivers."},
-        {.case_id = "original-callable-reference-parse-gap",
+        {.case_id = "original-callable-reference",
          .site = {.file = "app/Main.kt",
                   .caller = "app.Main.aliasCaller",
                   .needle = "projectHandler",
@@ -4618,12 +4618,7 @@ static const RQ_Expected PAR_JVM_EXPECTED[] = {
                 .label = "Method",
                 .declaration_line = 4,
                 .declaration_text = "    fun ping(javaService: JavaService): String {"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "jvm-reference-argument-proof",
-     .why = "Java applicability proves primitives only; this constructor argument needs exact JVM "
-            "reference compatibility.",
-     .tried = "Original Java/Kotlin fixture retained; source argument bridge rejects object "
-              "creation rather than trusting confidence."},
+     .mode = RQ_REQUIRED},
     {.case_id = "kotlin-java-package-access",
      .site = {.file = "src/main/kotlin/com/example/KotlinService.kt",
               .caller = "src.main.kotlin.com.example.KotlinService.KotlinService.ping",
@@ -4635,28 +4630,20 @@ static const RQ_Expected PAR_JVM_EXPECTED[] = {
                 .label = "Method",
                 .declaration_line = 10,
                 .declaration_text = "    String pong() {"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "jvm-package-access-proof",
-     .why = "Kotlin strict lookup does not yet prove same-package access to Java package-private "
-            "declarations.",
-     .tried = "Original com.example package and package-private service retained; public-only "
-              "proof lookup abstains."},
+     .mode = RQ_REQUIRED},
     {.case_id = "java-implicit-constructor",
      .site = {.file = "src/main/java/com/example/Example.java",
               .caller = "src.main.java.com.example.JavaCaller.call",
               .needle = "new JavaService()"},
      .relation = "CALLS",
+     /* No constructor is declared, so the class stands for the implicit one, as it
+      * does for every Java and C# `new` (test_resolver_oo.c). */
      .target = {.file = "src/main/java/com/example/Example.java",
-                .suffix = NULL,
-                .label = "Method",
+                .suffix = "src.main.java.com.example.JavaService",
+                .label = "Class",
                 .declaration_line = 9,
                 .declaration_text = "class JavaService {"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "java_implicit_constructor_identity_unmaterialized",
-     .why = "The implicit default constructor has no independently materialized callable identity; "
-            "the Class is not a CALLS target.",
-     .tried = "Counted the nested new JavaService() occurrence and anchored it to the declaring "
-              "class. A NULL target identity rejects every guessed node, including the Class."},
+     .mode = RQ_REQUIRED},
     {.case_id = "required-cross-file-scalar-control",
      .site = {.file = "src/main/kotlin/quality/Control.kt",
               .caller = "src.main.kotlin.quality.Control.direct",
@@ -4737,8 +4724,8 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     ASSERT(parallel_quality_check(gbuf, "com", "jvm-cross-file", PAR_JVM_SOURCES, 4,
                                   PAR_JVM_EXPECTED, 4, &quality));
     ASSERT_EQ(quality.genuine, 4);
-    ASSERT_EQ(quality.found, 1);
-    ASSERT_EQ(quality.missing, 3);
+    ASSERT_EQ(quality.found, 4);
+    ASSERT_EQ(quality.missing, 0);
     ASSERT_EQ(quality.required_missing + quality.wrong, 0);
 
     cbm_gbuf_free(gbuf);
@@ -5396,8 +5383,8 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
         ASSERT(parallel_quality_check(gbuf, "com", names[s], PAR_JVM_SOURCES, 4, PAR_JVM_EXPECTED,
                                       4, &quality));
         ASSERT_EQ(quality.genuine, 4);
-        ASSERT_EQ(quality.found, 1);
-        ASSERT_EQ(quality.missing, 3);
+        ASSERT_EQ(quality.found, 4);
+        ASSERT_EQ(quality.missing, 0);
         ASSERT_EQ(quality.required_missing + quality.wrong, 0);
 
         cbm_gbuf_free(gbuf);
