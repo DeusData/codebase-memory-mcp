@@ -600,6 +600,8 @@ typedef struct {
     uint32_t count;
     uint32_t cap;
     uint32_t source_len;
+    const char *source;
+    const char **defined; /* -D names the caller configured: those keep their meaning */
     bool failed;
 } CBMAttrWords;
 
@@ -622,6 +624,14 @@ static void cbm_attr_range_add(CBMAttrWords *words, TSRange range) {
 }
 
 static void cbm_attr_word_add(CBMAttrWords *words, TSNode word) {
+    uint32_t word_start = ts_node_start_byte(word);
+    size_t word_len = ts_node_end_byte(word) - word_start;
+    for (const char **define = words->defined; define && *define; define++) {
+        size_t name_len = strcspn(*define, "=");
+        if (name_len == word_len && !strncmp(*define, words->source + word_start, word_len)) {
+            return;
+        }
+    }
     cbm_attr_range_add(words, (TSRange){ts_node_start_point(word), ts_node_end_point(word),
                                         ts_node_start_byte(word), ts_node_end_byte(word)});
 }
@@ -927,10 +937,10 @@ static bool cbm_attr_exclude_words(TSParser *parser, CBMAttrWords *words) {
     return set;
 }
 
-TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
-                           TSParseOptions opts) {
+static TSTree *cbm_parse_c_source_defined(TSParser *parser, const char *source, uint32_t source_len,
+                                          TSParseOptions opts, const char **defined) {
     TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
-    CBMAttrWords words = {.source_len = source_len};
+    CBMAttrWords words = {.source_len = source_len, .source = source, .defined = defined};
     for (int round = 0; tree && round < CBM_ATTR_MAX_ROUNDS; round++) {
         uint32_t before = words.count;
         cbm_attr_collect(ts_tree_root_node(tree), source, &words, 0);
@@ -948,6 +958,11 @@ TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, words.items);
     return tree;
+}
+
+TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
+                           TSParseOptions opts) {
+    return cbm_parse_c_source_defined(parser, source, source_len, opts, NULL);
 }
 
 // --- Parse timeout callback ---
@@ -4239,7 +4254,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     bool c_family = language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
-    TSTree *tree = c_family ? cbm_parse_c_source(parser, source, (uint32_t)source_len, opts)
+    TSTree *tree = c_family ? cbm_parse_c_source_defined(parser, source, (uint32_t)source_len, opts,
+                                                         extra_defines)
                             : cbm_parse_source(parser, source, (uint32_t)source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);

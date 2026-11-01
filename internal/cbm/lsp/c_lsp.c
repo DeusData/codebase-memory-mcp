@@ -7545,66 +7545,11 @@ static void c_resolve_calls_in_node(CLSPContext *ctx, TSNode node) {
     ctx->walk_depth--;
 }
 
-static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
-    if (ts_node_is_null(node))
-        return;
-    const char *kind = ts_node_type(node);
-
-    if (ctx->test_definition_owners && ctx->test_definition_owners->has_test_definition_owners &&
-        ctx->test_definition_owners->test_owner_language == CBM_LANG_C) {
-        if (c_process_configured_test_body(ctx, node))
-            return;
-        /* Nested native functions are independent owners even when they occur
-         * inside the raw body of a configured C definition. */
-        if (strcmp(kind, "function_definition") == 0) {
-            c_process_function(ctx, node);
-            return;
-        }
-    }
-
-    /* Declarations establish scope before their initializer. Assignments
-     * take effect after their operands, never before a nested RHS write. */
-    bool assignment = !strcmp(kind, "assignment_expression");
-    if (!assignment)
-        c_process_statement(ctx, node);
-    int initializer_fp = -1;
-    const cbm_resolve_proof_t *initializer_origin = NULL;
-    if (!strcmp(kind, "init_declarator")) {
-        TSNode name =
-            c_fp_declarator_name(ctx, ts_node_child_by_field_name(node, "declarator", 10), NULL);
-        if (!ts_node_is_null(name))
-            initializer_fp = c_find_fp_binding_index(ctx, c_node_text(ctx, name));
-        if (initializer_fp >= 0)
-            initializer_origin = ctx->fp_target_proofs[initializer_fp];
-    }
-
-    // --- Initializers: hand the initialized type down to the list ---
-    if (strcmp(kind, "initializer_list") == 0) {
-        c_walk_initializer_list(ctx, node);
-        return;
-    }
-    if (strcmp(kind, "init_declarator") == 0) {
-        c_hint_declared_initializer(ctx, node);
-    } else if (strcmp(kind, "compound_literal_expression") == 0) {
-        TSNode literal_type = ts_node_child_by_field_name(node, "type", 4);
-        if (!ts_node_is_null(literal_type))
-            c_hint_initializer_list(ctx, ts_node_child_by_field_name(node, "value", 5),
-                                    c_parse_type_node(ctx, literal_type));
-    }
-
-    /* Taking a callable variable's address exposes its storage to writes
-     * that this local assignment tracker cannot see. */
-    if (!strcmp(kind, "pointer_expression") || !strcmp(kind, "unary_expression")) {
-        TSNode operand =
-            c_fp_unwrap_parentheses(ctx, ts_node_child_by_field_name(node, "argument", 8));
-        TSNode operator= ts_node_child_by_field_name(node, "operator", 8);
-        const char *op = ts_node_is_null(operator) ? NULL : c_node_text(ctx, operator);
-        if (op && !strcmp(op, "&") && !ts_node_is_null(operand) &&
-            !strcmp(ts_node_type(operand), "identifier"))
-            c_escape_fp_storage(ctx, c_node_text(ctx, operand));
-    }
-
-    c_resolve_callable_value_reference(ctx, node);
+/* What this one node does, apart from walking its children. Kept out of the recursive
+ * function: its locals would otherwise be in every frame of the walk, and
+ * C_LSP_MAX_WALK_DEPTH nested frames have to fit the stack. */
+__attribute__((noinline)) static void c_resolve_node_operations(CLSPContext *ctx, TSNode node,
+                                                                const char *kind) {
     if (!strcmp(kind, "identifier"))
         c_emit_value_reference(ctx, node);
     else if (!strcmp(kind, "type_identifier"))
@@ -7647,7 +7592,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     }
                     if (hit.target || hit.open ||
                         c_proof_field_declarer(ctx, ctx->proof_method_class, written, at, 0, NULL))
-                        goto recurse;
+                        return;
                     ctx->proof_class_scope_checked = true;
                 }
             }
@@ -7660,7 +7605,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     "qualified-or-bound-callable-or-no-associated-argument-types", NULL);
                 c_emit_proven(ctx, &proof, c_node_text(ctx, func_node), CBM_RESOLVED_INVOCATION,
                               node);
-                goto recurse;
+                return;
             }
 
             if (c_cxx_rules(ctx) && !ctx->in_template && !strcmp(fk, "qualified_identifier")) {
@@ -7668,7 +7613,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                 if (cbm_resolve_admit(&scoped)) {
                     c_emit_proven(ctx, &scoped, c_node_text(ctx, func_node),
                                   CBM_RESOLVED_INVOCATION, node);
-                    goto recurse;
+                    return;
                 }
             }
 
@@ -7678,7 +7623,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                 if (cbm_resolve_admit(&method)) {
                     c_emit_proven(ctx, &method, c_node_text(ctx, func_node),
                                   CBM_RESOLVED_INVOCATION, node);
-                    goto recurse;
+                    return;
                 }
                 if (c_cxx_rules(ctx) && !ctx->in_template) {
                     const cbm_resolve_proof_t *receiver_proof = NULL;
@@ -7702,7 +7647,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             cbm_resolve_result_t member = c_proof_member_lookup(
                                 ctx, spelling, func_node, hit.target, receiver_proof);
                             c_emit_proven(ctx, &member, spelling, CBM_RESOLVED_INVOCATION, node);
-                            goto recurse;
+                            return;
                         }
                     }
                 }
@@ -7775,7 +7720,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                                     strategy = "lsp_smart_ptr_dispatch";
                                 c_emit_resolved_call_at(ctx, method->qualified_name, strategy,
                                                         0.95f, node);
-                                goto recurse;
+                                return;
                             }
                         }
 
@@ -7803,7 +7748,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         }
                     }
                 }
-                goto recurse;
+                return;
             }
 
             // qualified_identifier: ns::func() or Class::static_method()
@@ -7854,7 +7799,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         f = cbm_registry_lookup_func(ctx->registry, qn);
                     if (f) {
                         c_emit_resolved_call_at(ctx, f->qualified_name, "lsp_scoped", 0.95f, node);
-                        goto recurse;
+                        return;
                     }
                     // Try as method (Class::method) with type-aware overload resolution
                     const char *dot = strrchr(qn, '.');
@@ -7875,7 +7820,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         if (m) {
                             c_emit_resolved_call_at(ctx, m->qualified_name, "lsp_scoped", 0.95f,
                                                     node);
-                            goto recurse;
+                            return;
                         }
                     }
                     // Namespace fallback: extract_defs may omit namespace from QN.
@@ -7892,7 +7837,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         if (nf) {
                             c_emit_resolved_call_at(ctx, nf->qualified_name, "lsp_scoped", 0.90f,
                                                     node);
-                            goto recurse;
+                            return;
                         }
                     }
                     // Class::method of a class declared in another file (#1153).
@@ -7910,12 +7855,12 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         if (sm) {
                             c_emit_resolved_call_at(ctx, sm->qualified_name, "lsp_scoped", 0.95f,
                                                     node);
-                            goto recurse;
+                            return;
                         }
                     }
                     c_emit_unresolved_call(ctx, qn, "scoped_not_in_registry");
                 }
-                goto recurse;
+                return;
             }
 
             // template_function: func<T>(args) or ns::func<T>(args)
@@ -7975,7 +7920,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         }
                     }
                 }
-                goto recurse;
+                return;
             }
 
             // Direct identifier call: func()
@@ -7995,7 +7940,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         c_emit_resolved_call_orig_at(ctx, fp_target, name,
                                                      is_dll ? "lsp_dll_resolve" : "lsp_func_ptr",
                                                      is_dll ? 0.80f : 0.85f, node);
-                        goto recurse;
+                        return;
                     }
 
                     // Check if it's a variable with callable type
@@ -8003,7 +7948,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                     if (!cbm_type_is_unknown(var_type)) {
                         if (var_type->kind == CBM_TYPE_FUNC) {
                             // Function type variable without tracked target — can't resolve
-                            goto recurse;
+                            return;
                         }
                         // Functor call: variable with operator()
                         const CBMType *base = c_simplify_type(ctx, var_type, false);
@@ -8014,7 +7959,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             if (op) {
                                 c_emit_resolved_call_at(ctx, op->qualified_name, "lsp_operator",
                                                         0.90f, node);
-                                goto recurse;
+                                return;
                             }
                         }
                     }
@@ -8030,7 +7975,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                             const char *ctor_qn =
                                 cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn_str, name);
                             c_emit_resolved_call_at(ctx, ctor_qn, "lsp_constructor", 0.95f, node);
-                            goto recurse;
+                            return;
                         }
                     }
 
@@ -8068,7 +8013,7 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
                         }
                     }
                 }
-                goto recurse;
+                return;
             }
         }
     }
@@ -8460,8 +8405,70 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
         // being initialized This is primarily for completeness — no CALLS edge
         // needed for field designators
     }
+}
 
-recurse:;
+static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
+    if (ts_node_is_null(node))
+        return;
+    const char *kind = ts_node_type(node);
+
+    if (ctx->test_definition_owners && ctx->test_definition_owners->has_test_definition_owners &&
+        ctx->test_definition_owners->test_owner_language == CBM_LANG_C) {
+        if (c_process_configured_test_body(ctx, node))
+            return;
+        /* Nested native functions are independent owners even when they occur
+         * inside the raw body of a configured C definition. */
+        if (strcmp(kind, "function_definition") == 0) {
+            c_process_function(ctx, node);
+            return;
+        }
+    }
+
+    /* Declarations establish scope before their initializer. Assignments
+     * take effect after their operands, never before a nested RHS write. */
+    bool assignment = !strcmp(kind, "assignment_expression");
+    if (!assignment)
+        c_process_statement(ctx, node);
+    int initializer_fp = -1;
+    const cbm_resolve_proof_t *initializer_origin = NULL;
+    if (!strcmp(kind, "init_declarator")) {
+        TSNode name =
+            c_fp_declarator_name(ctx, ts_node_child_by_field_name(node, "declarator", 10), NULL);
+        if (!ts_node_is_null(name))
+            initializer_fp = c_find_fp_binding_index(ctx, c_node_text(ctx, name));
+        if (initializer_fp >= 0)
+            initializer_origin = ctx->fp_target_proofs[initializer_fp];
+    }
+
+    // --- Initializers: hand the initialized type down to the list ---
+    if (strcmp(kind, "initializer_list") == 0) {
+        c_walk_initializer_list(ctx, node);
+        return;
+    }
+    if (strcmp(kind, "init_declarator") == 0) {
+        c_hint_declared_initializer(ctx, node);
+    } else if (strcmp(kind, "compound_literal_expression") == 0) {
+        TSNode literal_type = ts_node_child_by_field_name(node, "type", 4);
+        if (!ts_node_is_null(literal_type))
+            c_hint_initializer_list(ctx, ts_node_child_by_field_name(node, "value", 5),
+                                    c_parse_type_node(ctx, literal_type));
+    }
+
+    /* Taking a callable variable's address exposes its storage to writes
+     * that this local assignment tracker cannot see. */
+    if (!strcmp(kind, "pointer_expression") || !strcmp(kind, "unary_expression")) {
+        TSNode operand =
+            c_fp_unwrap_parentheses(ctx, ts_node_child_by_field_name(node, "argument", 8));
+        TSNode operator= ts_node_child_by_field_name(node, "operator", 8);
+        const char *op = ts_node_is_null(operator) ? NULL : c_node_text(ctx, operator);
+        if (op && !strcmp(op, "&") && !ts_node_is_null(operand) &&
+            !strcmp(ts_node_type(operand), "identifier"))
+            c_escape_fp_storage(ctx, c_node_text(ctx, operand));
+    }
+
+    c_resolve_callable_value_reference(ctx, node);
+    c_resolve_node_operations(ctx, node, kind);
+
     // Push scope for blocks and control structures
     bool push_scope =
         (strcmp(kind, "compound_statement") == 0 || strcmp(kind, "if_statement") == 0 ||
