@@ -661,10 +661,14 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
 }
 
 /* Other top-level declarations of the type `t` names: same simple name, same
- * declared namespace, different entry. Registration order; at most `cap`. */
+ * declared namespace, different entry. Registration order; at most `cap`.
+ * A type in the global namespace ("") has no twins: without a namespace the
+ * same name across a repository is a different type per assembly (every test
+ * project's own `Program`), so pooling them would bind a member of one to an
+ * unrelated other, ahead of the type's own base classes. */
 static int cs_namespace_twins(CSLSPContext *ctx, const CBMRegisteredType *t,
                               const CBMRegisteredType **out, int cap) {
-    if (!ctx->registry || !t || !t->namespace_qn || !t->short_name)
+    if (!ctx->registry || !t || !t->namespace_qn || !t->namespace_qn[0] || !t->short_name)
         return 0;
     int n = 0;
     CBMTypeShortIter it;

@@ -1298,6 +1298,102 @@ TEST(cslsp_decl_namespace_global_needs_clean_parse) {
     PASS();
 }
 
+static bool has_resolved_row(const CBMResolvedCallArray *out, const char *caller_qn,
+                             const char *callee_qn) {
+    for (int i = 0; i < out->count; i++) {
+        const CBMResolvedCall *rc = &out->items[i];
+        if (rc->caller_qn && rc->callee_qn && strcmp(rc->caller_qn, caller_qn) == 0 &&
+            strcmp(rc->callee_qn, callee_qn) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* `partial` pieces of one namespaced type are separate registry entries, so
+ * a member declared on another piece still binds (#2120). Types declared in
+ * the GLOBAL namespace carry the empty namespace, and the same simple name
+ * there is a different type per assembly across a repository (each test
+ * project's own `Helper`). They must never pool as twins: the twin probe runs
+ * before the base-class walk, so pooling bound `h.Stop()` on ToolA's Helper
+ * to the unrelated ToolB Helper instead of ToolA's own base ToolABase. Runs
+ * the production Tier-2 C# registry builder over cross-file defs. */
+TEST(cslsp_global_namespace_types_are_not_partial_twins) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[] = {
+        {.qualified_name = "p.ToolA.Helper.Helper",
+         .short_name = "Helper",
+         .label = "Class",
+         .def_module_qn = "p.ToolA.Helper",
+         .embedded_types = "p.ToolA.Base.ToolABase",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolA.Helper.Helper.Start",
+         .short_name = "Start",
+         .label = "Method",
+         .receiver_type = "p.ToolA.Helper.Helper",
+         .def_module_qn = "p.ToolA.Helper",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolA.Base.ToolABase",
+         .short_name = "ToolABase",
+         .label = "Class",
+         .def_module_qn = "p.ToolA.Base",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolA.Base.ToolABase.Stop",
+         .short_name = "Stop",
+         .label = "Method",
+         .receiver_type = "p.ToolA.Base.ToolABase",
+         .def_module_qn = "p.ToolA.Base",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolB.Helper.Helper",
+         .short_name = "Helper",
+         .label = "Class",
+         .def_module_qn = "p.ToolB.Helper",
+         .lang = CBM_LANG_CSHARP},
+        {.qualified_name = "p.ToolB.Helper.Helper.Stop",
+         .short_name = "Stop",
+         .label = "Method",
+         .receiver_type = "p.ToolB.Helper.Helper",
+         .def_module_qn = "p.ToolB.Helper",
+         .lang = CBM_LANG_CSHARP},
+    };
+    CBMTypeRegistry *reg =
+        cbm_cs_build_cross_registry(&arena, defs, (int)(sizeof(defs) / sizeof(defs[0])));
+    ASSERT_NOT_NULL(reg);
+    /* No namespace anywhere: both Helpers and the base live in the global
+     * namespace. The caller sits in ToolA's Helper file, so `new Helper()`
+     * binds ToolA's Helper through the same-module step, independent of
+     * registration order. */
+    const char *src = "public class Helper : ToolABase { public void Start() { } }\n"
+                      "public class Caller {\n"
+                      "    public void Go() {\n"
+                      "        var h = new Helper();\n"
+                      "        h.Start();\n"
+                      "        h.Stop();\n"
+                      "    }\n"
+                      "}\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_cs_lsp_cross_with_registry(&arena, src, (int)strlen(src), "p.ToolA.Helper", reg, NULL,
+                                       0, NULL, &out);
+    const char *caller = "p.ToolA.Helper.Caller.Go";
+    bool start_own = has_resolved_row(&out, caller, "p.ToolA.Helper.Helper.Start");
+    bool stop_base = has_resolved_row(&out, caller, "p.ToolA.Base.ToolABase.Stop");
+    bool stop_twin = has_resolved_row(&out, caller, "p.ToolB.Helper.Helper.Stop");
+    if (!start_own || !stop_base || stop_twin) {
+        printf("  start_own=%d stop_base=%d stop_unrelated_global_twin=%d\n", start_own, stop_base,
+               stop_twin);
+        for (int i = 0; i < out.count; i++) {
+            printf("    %s -> %s [%s]\n", out.items[i].caller_qn ? out.items[i].caller_qn : "?",
+                   out.items[i].callee_qn ? out.items[i].callee_qn : "?",
+                   out.items[i].strategy ? out.items[i].strategy : "?");
+        }
+    }
+    cbm_arena_destroy(&arena);
+    ASSERT_TRUE(start_own);
+    ASSERT_TRUE(stop_base);
+    ASSERT_FALSE(stop_twin);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────── */
 
 SUITE(cs_lsp) {
@@ -1363,5 +1459,6 @@ SUITE(cs_lsp) {
     RUN_TEST(cslsp_httpclient_chain);
     RUN_TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(cslsp_cyclic_alias_qualifier_terminates);
+    RUN_TEST(cslsp_global_namespace_types_are_not_partial_twins);
     RUN_TEST(cslsp_decl_namespace_global_needs_clean_parse);
 }
