@@ -1226,6 +1226,34 @@ TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site) {
     PASS();
 }
 
+/* A qualified type name resolves its qualifier as a TYPE when no namespace
+ * binds it (nested types, #2120). A using alias whose target is qualified by
+ * the alias itself (`using Loop = Loop.Inner;`) or by a mutual alias re-enters
+ * that walk through the alias step forever: each `Loop` resolves the target
+ * `Loop.Inner`, whose qualifier is `Loop` again. The walk is depth-bounded;
+ * the file must still finish and resolve its ordinary calls. */
+TEST(cslsp_cyclic_alias_qualifier_terminates) {
+    const char *src = "using Loop = Loop.Inner;\n"
+                      "using Ping = Pong.Inner;\n"
+                      "using Pong = Ping.Inner;\n"
+                      "namespace App {\n"
+                      "    public class Svc { public void Go() { } }\n"
+                      "    public class Runner {\n"
+                      "        public void Run(Loop a, Ping b) {\n"
+                      "            var x = new Loop();\n"
+                      "            var y = new Ping.Leaf();\n"
+                      "            var s = new Svc();\n"
+                      "            s.Go();\n"
+                      "        }\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_cs(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "Runner.Run", "Svc.Go") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────── */
 
 SUITE(cs_lsp) {
@@ -1290,4 +1318,5 @@ SUITE(cs_lsp) {
     RUN_TEST(cslsp_stringbuilder_chain);
     RUN_TEST(cslsp_httpclient_chain);
     RUN_TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site);
+    RUN_TEST(cslsp_cyclic_alias_qualifier_terminates);
 }

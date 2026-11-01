@@ -51,6 +51,10 @@
 #define CS_USING_INITIAL_CAP 16
 #define CS_NAMESPACE_INITIAL_CAP 8
 #define CS_LSP_PARENT_WALK_MAX 32
+/* Nested-type qualifier walk depth: one level per type nesting step of `A.B.C`
+ * (a namespace-qualified top-level type binds without recursing), so 8 covers
+ * real nesting while a cyclic alias such as `using A = A.B;` stops after 8. */
+#define CS_QUALIFIER_MAX_DEPTH 8
 
 extern const TSLanguage *tree_sitter_c_sharp(void);
 
@@ -431,9 +435,13 @@ static const char *cs_resolve_by_declared_namespace(CSLSPContext *ctx, const cha
      * member type of it. Nested QNs are the parent QN plus the simple name,
      * which step 8b's namespace scan can never produce because nested types
      * carry no namespace_qn (#2120 residual: `new Command.Result(...)`,
-     * `new Grain.Handler(dep).Handle(...)`). */
-    if (!best && qualifier) {
+     * `new Grain.Handler(dep).Handle(...)`). The walk is depth-bounded: an
+     * alias whose target names the alias itself (`using A = A.B;`, or a
+     * mutual pair) re-enters this path through step 8 with no end. */
+    if (!best && qualifier && ctx->qualifier_depth < CS_QUALIFIER_MAX_DEPTH) {
+        ctx->qualifier_depth++;
         const char *qtype = cs_resolve_type_name(ctx, qualifier);
+        ctx->qualifier_depth--;
         if (qtype) {
             const char *nested = cbm_arena_sprintf(ctx->arena, "%s.%s", qtype, simple);
             if (cs_lookup_type_qn(ctx, nested))

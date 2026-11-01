@@ -111,6 +111,11 @@ typedef struct {
     /* Recursion guard for cs_eval_expr_type. */
     int eval_depth;
 
+    /* Recursion guard for the nested-type qualifier walk of
+     * cs_resolve_type_name: resolving `A.B` resolves the qualifier `A` as a
+     * type first, and a `using A = A.B;` alias cycles back into it. */
+    int qualifier_depth;
+
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 } CSLSPContext;
