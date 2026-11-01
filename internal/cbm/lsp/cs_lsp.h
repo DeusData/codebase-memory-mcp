@@ -61,6 +61,11 @@ typedef struct {
     const char *local_name; /* alias name; "" for non-alias */
     const char *target_qn;  /* dotted target QN */
     bool is_global;         /* `global using` */
+    /* Declared inside a namespace body rather than at compilation-unit level.
+     * C# consults a namespace declaration's usings right after that
+     * namespace's own members, but compilation-unit usings only after the
+     * global namespace's members, so the two rank on opposite sides of it. */
+    bool in_namespace;
 } CBMCSUsing;
 
 /* CSLSPContext — per-file type-evaluation state. */

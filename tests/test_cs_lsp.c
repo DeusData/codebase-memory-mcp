@@ -1254,6 +1254,50 @@ TEST(cslsp_cyclic_alias_qualifier_terminates) {
     PASS();
 }
 
+static const CBMDefinition *find_def_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, name) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+/* A top-level C# type records its declared namespace; "" means the global
+ * namespace and is claimed only on a clean parse. The vendored grammar does
+ * not parse a `ref partial struct` with members, and error recovery dissolves
+ * the enclosing namespace, so the types after it surface with no namespace
+ * ancestor. Those must not read as global (they would hide every imported
+ * type of the same name); unknown (NULL) keeps them out of namespace binding
+ * exactly as before global-namespace binding existed. */
+TEST(cslsp_decl_namespace_global_needs_clean_parse) {
+    CBMFileResult *clean = extract_cs("public class Loose { }\n"
+                                      "namespace Acme.Lib { public class Kept { } }\n");
+    ASSERT(clean);
+    const CBMDefinition *loose = find_def_named(clean, "Loose");
+    const CBMDefinition *kept = find_def_named(clean, "Kept");
+    ASSERT(loose && kept);
+    ASSERT(loose->decl_namespace && strcmp(loose->decl_namespace, "") == 0);
+    ASSERT(kept->decl_namespace && strcmp(kept->decl_namespace, "Acme.Lib") == 0);
+    cbm_free_result(clean);
+
+    CBMFileResult *damaged = extract_cs("namespace Acme.Lib\n"
+                                        "{\n"
+                                        "    public ref partial struct Handler\n"
+                                        "    {\n"
+                                        "        public void Append(string value) { }\n"
+                                        "    }\n"
+                                        "    public static partial class Gadget { }\n"
+                                        "}\n");
+    ASSERT(damaged);
+    const CBMDefinition *gadget = find_def_named(damaged, "Gadget");
+    ASSERT(gadget);
+    if (gadget->decl_namespace && !gadget->decl_namespace[0])
+        printf("  Gadget after a parse error claims the global namespace\n");
+    ASSERT(!gadget->decl_namespace || gadget->decl_namespace[0]);
+    cbm_free_result(damaged);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────── */
 
 SUITE(cs_lsp) {
@@ -1319,4 +1363,5 @@ SUITE(cs_lsp) {
     RUN_TEST(cslsp_httpclient_chain);
     RUN_TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(cslsp_cyclic_alias_qualifier_terminates);
+    RUN_TEST(cslsp_decl_namespace_global_needs_clean_parse);
 }

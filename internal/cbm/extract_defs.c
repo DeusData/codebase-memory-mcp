@@ -8340,9 +8340,15 @@ static const char *cs_namespace_decl_name(CBMArena *a, TSNode ns, const char *so
 /* Declared namespace of a C# type declaration: every enclosing namespace
  * block (outer to inner) under an optional file-scoped namespace, which the
  * grammar may attach either as an ancestor or as a preceding sibling of the
- * compilation unit's members. NULL = global namespace. The file-level
- * namespace_name keeps only the FIRST namespace of a file, which mislabels
- * every type of a multi-namespace file (#2120). */
+ * compilation unit's members. "" = the global namespace, NULL = unknown. The
+ * file-level namespace_name keeps only the FIRST namespace of a file, which
+ * mislabels every type of a multi-namespace file (#2120).
+ *
+ * "No namespace found" proves the global namespace only for a clean parse:
+ * error recovery can dissolve a namespace declaration around a construct the
+ * grammar does not know (a `ref partial struct` with members does it), leaving
+ * the types after it parented straight under the compilation unit. Calling
+ * those global would let them hide every imported type of the same name. */
 static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *source) {
     const char *acc = NULL;
     bool file_scoped = false;
@@ -8376,7 +8382,10 @@ static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *
             }
         }
     }
-    return acc;
+    if (acc) {
+        return acc;
+    }
+    return ts_node_has_error(top) ? NULL : "";
 }
 
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {

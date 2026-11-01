@@ -261,11 +261,15 @@ void cs_lsp_init(CSLSPContext *ctx, CBMArena *arena, const char *source, int sou
 
 /* ── using management ───────────────────────────────────────────── */
 
-void cs_lsp_add_using(CSLSPContext *ctx, CBMCSUsingKind kind, const char *local_name,
-                      const char *target_qn, bool is_global) {
+/* Append a using directive; `in_namespace` marks one declared inside a
+ * namespace body (CBMCSUsing.in_namespace). */
+static void cs_add_using_scoped(CSLSPContext *ctx, CBMCSUsingKind kind, const char *local_name,
+                                const char *target_qn, bool is_global, bool in_namespace) {
     if (!target_qn)
         return;
-    /* Dedupe by (kind, local_name, target). */
+    /* Dedupe by (kind, local_name, target). The cross-file entry pre-loads
+     * the pipeline's import list without placement; the AST walk then finds
+     * the same directive and is the authority on where it was declared. */
     for (int i = 0; i < ctx->using_count; i++) {
         CBMCSUsing *u = &ctx->usings[i];
         if (u->kind != kind)
@@ -276,6 +280,7 @@ void cs_lsp_add_using(CSLSPContext *ctx, CBMCSUsingKind kind, const char *local_
         const char *b = u->local_name ? u->local_name : "";
         if (strcmp(a, b) != 0)
             continue;
+        u->in_namespace = u->in_namespace || in_namespace;
         return;
     }
     if (ctx->using_count >= ctx->using_cap) {
@@ -293,6 +298,12 @@ void cs_lsp_add_using(CSLSPContext *ctx, CBMCSUsingKind kind, const char *local_
     slot->local_name = local_name ? cbm_arena_strdup(ctx->arena, local_name) : "";
     slot->target_qn = cbm_arena_strdup(ctx->arena, target_qn);
     slot->is_global = is_global;
+    slot->in_namespace = in_namespace;
+}
+
+void cs_lsp_add_using(CSLSPContext *ctx, CBMCSUsingKind kind, const char *local_name,
+                      const char *target_qn, bool is_global) {
+    cs_add_using_scoped(ctx, kind, local_name, target_qn, is_global, false);
 }
 
 /* ── namespace stack ────────────────────────────────────────────── */
@@ -362,12 +373,29 @@ static const char *cs_try_type_qn(CSLSPContext *ctx, const char *qn) {
     return NULL;
 }
 
+/* Append the file's using-namespace targets declared inside (`in_namespace`)
+ * or outside a namespace body. */
+static int cs_append_using_namespaces(const CSLSPContext *ctx, bool in_namespace, const char **out,
+                                      int n, int cap) {
+    for (int i = 0; i < ctx->using_count && n < cap; i++) {
+        const CBMCSUsing *u = &ctx->usings[i];
+        if (u->kind == CBM_CS_USING_NAMESPACE && u->in_namespace == in_namespace && u->target_qn &&
+            u->target_qn[0])
+            out[n++] = u->target_qn;
+    }
+    return n;
+}
+
 /* Namespaces through which `qualifier` (the part of a type reference before
  * its simple name, NULL for a simple name) can reach a top-level type, in C#
  * lookup order: each enclosing namespace innermost outward, then the global
- * namespace (qualified references only) or the file's `using` namespaces
- * (simple names only -- a using-namespace directive does not import nested
- * namespaces). Returns the count written to `out` (at most `cap`). */
+ * namespace (qualified references only) or, for a simple name, the usings
+ * of the enclosing namespace bodies, the global namespace "" and last the
+ * compilation-unit usings (a using-namespace directive does not import nested
+ * namespaces). C# consults the members of the global namespace BEFORE the
+ * compilation unit's usings: a top-level type declared without a namespace
+ * hides an imported type of the same name. Returns the count written to
+ * `out` (at most `cap`). */
 static int cs_visible_namespaces(CSLSPContext *ctx, const char *qualifier, const char **out,
                                  int cap) {
     int n = 0;
@@ -382,17 +410,13 @@ static int cs_visible_namespaces(CSLSPContext *ctx, const char *qualifier, const
             out[n++] = qualifier;
         return n;
     }
-    for (int i = 0; i < ctx->using_count && n < cap; i++) {
-        const CBMCSUsing *u = &ctx->usings[i];
-        if (u->kind == CBM_CS_USING_NAMESPACE && u->target_qn && u->target_qn[0])
-            out[n++] = u->target_qn;
-    }
-    /* The global namespace is checked last: an unqualified name binds to a
-     * top-level type declared without a namespace whatever the file imports
-     * (#2120 residual — such types used to be invisible to step 8b). */
+    n = cs_append_using_namespaces(ctx, true, out, n, cap);
+    /* The global namespace (#2120 residual: such types used to be invisible
+     * to step 8b) ranks after every enclosing namespace and namespace-body
+     * using, and before the compilation-unit usings. */
     if (n < cap)
         out[n++] = "";
-    return n;
+    return cs_append_using_namespaces(ctx, false, out, n, cap);
 }
 
 /* Bind a (possibly namespace-qualified) type reference to the project type
@@ -2824,12 +2848,19 @@ static void cs_process_type_decl(CSLSPContext *ctx, TSNode node) {
 
 static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
     /* Walk the entire tree once at top — using directives can appear at file
-     * scope or inside namespace blocks. */
-    TSNode stack[256];
+     * scope or inside namespace blocks. `in_ns` records per stacked node
+     * whether it sits inside a namespace declaration: a block namespace's
+     * body, or the compilation-unit siblings after a file-scoped namespace
+     * (the grammar may attach those either way). */
+    enum { CS_IMPORT_WALK_MAX = 256 };
+    TSNode stack[CS_IMPORT_WALK_MAX];
+    bool in_ns[CS_IMPORT_WALK_MAX];
     int top = 0;
+    in_ns[top] = false;
     stack[top++] = root;
     while (top > 0) {
         TSNode n = stack[--top];
+        bool n_in_ns = in_ns[top];
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
@@ -2913,20 +2944,23 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
             }
             if (target) {
                 if (is_alias) {
-                    cs_lsp_add_using(ctx, CBM_CS_USING_ALIAS, alias_name ? alias_name : "", target,
-                                     is_global);
+                    cs_add_using_scoped(ctx, CBM_CS_USING_ALIAS, alias_name ? alias_name : "",
+                                        target, is_global, n_in_ns);
                 } else if (is_static) {
-                    cs_lsp_add_using(ctx, CBM_CS_USING_STATIC, "", target, is_global);
+                    cs_add_using_scoped(ctx, CBM_CS_USING_STATIC, "", target, is_global, n_in_ns);
                 } else {
-                    cs_lsp_add_using(ctx, CBM_CS_USING_NAMESPACE, "", target, is_global);
+                    cs_add_using_scoped(ctx, CBM_CS_USING_NAMESPACE, "", target, is_global,
+                                        n_in_ns);
                 }
             }
         }
         /* Push children for traversal. We don't recurse into method bodies
          * (using directives can't appear there), but namespace bodies may
          * contain more usings. */
+        bool child_in_ns = n_in_ns || strcmp(k, "namespace_declaration") == 0 ||
+                           strcmp(k, "file_scoped_namespace_declaration") == 0;
         uint32_t cnc = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnc && top < 256; i++) {
+        for (uint32_t i = 0; i < cnc && top < CS_IMPORT_WALK_MAX; i++) {
             TSNode c = ts_node_child(n, i);
             if (ts_node_is_null(c))
                 continue;
@@ -2935,7 +2969,11 @@ static void cs_collect_imports(CSLSPContext *ctx, TSNode root) {
                 strcmp(ck, "constructor_declaration") == 0 || strcmp(ck, "block") == 0) {
                 continue;
             }
+            in_ns[top] = child_in_ns;
             stack[top++] = c;
+            /* A file-scoped namespace covers the siblings that follow it. */
+            if (strcmp(ck, "file_scoped_namespace_declaration") == 0)
+                child_in_ns = true;
         }
     }
 }
@@ -3782,10 +3820,11 @@ static const char *cs_top_level_namespace(const char *type_qn, const char *short
     if (strncmp(type_qn, module_qn, mlen) != 0 || type_qn[mlen] != '.' ||
         strcmp(type_qn + mlen + 1, short_name) != 0)
         return NULL;
-    /* Top-level C# type: its declared namespace, "" when it declares none
-     * (global namespace) so step 8b can bind it — NULL stays reserved for
-     * nested types, which no namespace can reach by simple name. */
-    return (namespace_name && namespace_name[0]) ? namespace_name : "";
+    /* Top-level C# type: its declared namespace, "" for the global namespace
+     * so step 8b can bind it, NULL when extraction could not tell (a parse
+     * error dissolved the namespace; see cs_type_decl_namespace). NULL stays
+     * invisible to step 8b, as do nested types. */
+    return namespace_name;
 }
 
 /* Register one batch of CBMLSPDef[] into a registry. Shared by the
