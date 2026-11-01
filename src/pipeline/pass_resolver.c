@@ -349,22 +349,26 @@ static bool note_conditional_owners(cbm_shared_resolver_t *resolver, const CBMFi
     TSNode root = ts_tree_root_node(result->cached_tree);
     if (!owner_kind(root, "module") || ts_node_has_error(root))
         return true;
-    uint32_t count = ts_node_named_child_count(root);
-    for (uint32_t i = 0; i < count; i++) {
-        TSNode group = ts_node_named_child(root, i);
-        if (!owner_kind(group, "if_statement"))
-            continue;
-        TSNode first = owner_field(group, "consequence");
-        TSNode alternative = owner_field(group, "alternative");
-        TSNode second = owner_field(alternative, "body");
-        if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
-            !owner_kind(second, "block"))
-            continue;
-        if (!note_owner_branch(resolver, result, file, source, length, group, first, 1) ||
-            !note_owner_branch(resolver, result, file, source, length, group, second, 2))
-            return false;
+    /* A cursor, not an index loop: a fetch by index walks from the first child. */
+    bool ok = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode group = ts_tree_cursor_current_node(&cursor);
+            if (!owner_kind(group, "if_statement"))
+                continue;
+            TSNode first = owner_field(group, "consequence");
+            TSNode alternative = owner_field(group, "alternative");
+            TSNode second = owner_field(alternative, "body");
+            if (!owner_kind(first, "block") || !owner_kind(alternative, "else_clause") ||
+                !owner_kind(second, "block"))
+                continue;
+            ok = note_owner_branch(resolver, result, file, source, length, group, first, 1) &&
+                 note_owner_branch(resolver, result, file, source, length, group, second, 2);
+        } while (ok && ts_tree_cursor_goto_next_sibling(&cursor));
     }
-    return true;
+    ts_tree_cursor_delete(&cursor);
+    return ok;
 }
 
 static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_node_t *node) {
