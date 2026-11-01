@@ -240,19 +240,10 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
     {"lrp_java_s2_method_dispatch", "Runner.java", "Runner.run", "c.inc()", 0, "Counter.java",
-     "Counter.inc", "CALLS", 5, "    public void inc() { n++; }", false, false,
-     "Typed local Counter receiver exists in source, but package-private Counter fails the "
-     "public-only owner audit in java_proof_member; same-package visibility needs explicit "
-     "support.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Counter.inc", "CALLS", 5, "    public void inc() { n++; }", true, false, NULL, NULL},
     {"lrp_java_s2_method_dispatch", "Runner.java", "Runner.run", "c.value()", 0, "Counter.java",
-     "Counter.value", "CALLS", 6, "    public int value() { return n; }", false, false,
-     "Typed local Counter receiver exists in source, but package-private Counter fails the "
-     "public-only owner audit in java_proof_member; same-package visibility needs explicit "
-     "support.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Counter.value", "CALLS", 6, "    public int value() { return n; }", true, false, NULL,
+     NULL},
     {"lrp_java_s3_constructor", "Factory.java", "Factory.make", "new Widget(name)", 0,
      "Widget.java", "Widget.Widget", "CALLS", 5,
      "    public Widget(String name) { this.name = name; }", false, false,
@@ -270,28 +261,13 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
     {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder().add(1)", 0, "Builder.java",
      "Builder.add", "CALLS", 8, "    public Builder add(int x) { items.add(x); return this; }",
-     false, false,
-     "Fluent construction/return type is not represented by the strict map; java_proof_member "
-     "accepts only identifier receivers. Nonempty add arguments and package-private owner need "
-     "separate proof.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     true, false, NULL, NULL},
     {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder().add(1).add(2)", 0,
      "Builder.java", "Builder.add", "CALLS", 8,
-     "    public Builder add(int x) { items.add(x); return this; }", false, false,
-     "Fluent construction/return type is not represented by the strict map; java_proof_member "
-     "accepts only identifier receivers. Nonempty add arguments and package-private owner need "
-     "separate proof.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "    public Builder add(int x) { items.add(x); return this; }", true, false, NULL, NULL},
     {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder().add(1).add(2).build()", 0,
      "Builder.java", "Builder.build", "CALLS", 9,
-     "    public List<Integer> build() { return items; }", false, false,
-     "Fluent construction/return type is not represented by the strict map; java_proof_member "
-     "accepts only identifier receivers. Nonempty add arguments and package-private owner need "
-     "separate proof.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "    public List<Integer> build() { return items; }", true, false, NULL, NULL},
     {"lrp_java_s6_inherited_method", "Dog.java", "Dog.run", "describe()", 0, "Animal.java",
      "Animal.describe", "CALLS", 4, "    public String describe() { return \"animal\"; }", false,
      false,
@@ -307,11 +283,7 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
     {"lrp_java_s8_field_type_hint", "Service.java", "Service.run", "logger.log(msg)", 0,
      "Logger.java", "Logger.log", "CALLS", 4,
-     "    public void log(String msg) { System.out.println(msg); }", false, false,
-     "The strict map lacks class-field receiver provenance; Logger is package-private and nonempty "
-     "String argument applicability is unsupported.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "    public void log(String msg) { System.out.println(msg); }", true, false, NULL, NULL},
     {"lrp_csharp_s1_crossfile_call", "Main.cs", "Main.Run", "Util.Square(n)", 0, "Util.cs",
      "Util.Square", "CALLS", 3, "        public static int Square(int x) { return x * x; }", false,
      false,
@@ -320,17 +292,10 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
     {"lrp_csharp_s2_method_dispatch", "Runner.cs", "Runner.Run", "c.Inc()", 0, "Counter.cs",
-     "Counter.Inc", "CALLS", 4, "        public void Inc() { n++; }", false, false,
-     "new Counter() receiver provenance is not added to the strict map; object_creation_expression "
-     "fails csp_audit and internal Counter/fields also fail the restricted class domain.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Counter.Inc", "CALLS", 4, "        public void Inc() { n++; }", true, false, NULL, NULL},
     {"lrp_csharp_s2_method_dispatch", "Runner.cs", "Runner.Run", "c.Value()", 0, "Counter.cs",
-     "Counter.Value", "CALLS", 5, "        public int Value() { return n; }", false, false,
-     "new Counter() receiver provenance is not added to the strict map; object_creation_expression "
-     "fails csp_audit and internal Counter/fields also fail the restricted class domain.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Counter.Value", "CALLS", 5, "        public int Value() { return n; }", true, false, NULL,
+     NULL},
     {"lrp_csharp_s3_constructor", "Factory.cs", "Factory.Make", "new Widget(name)", 0, "Widget.cs",
      "Widget.Widget", "CALLS", 4, "        public Widget(string name) { Name = name; }", false,
      false,
@@ -347,25 +312,13 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
     {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder().Add(1)", 0, "Builder.cs",
      "Builder.Add", "CALLS", 5, "        public Builder Add(int x) { items.Add(x); return this; }",
-     false, false,
-     "Constructor/return type propagation and non-identifier fluent receivers are unsupported; "
-     "object_creation_expression fails body audit and Add has a nonempty argument list.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     true, false, NULL, NULL},
     {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder().Add(1).Add(2)", 0, "Builder.cs",
      "Builder.Add", "CALLS", 5, "        public Builder Add(int x) { items.Add(x); return this; }",
-     false, false,
-     "Constructor/return type propagation and non-identifier fluent receivers are unsupported; "
-     "object_creation_expression fails body audit and Add has a nonempty argument list.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     true, false, NULL, NULL},
     {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder().Add(1).Add(2).Build()", 0,
      "Builder.cs", "Builder.Build", "CALLS", 6,
-     "        public List<int> Build() { return items; }", false, false,
-     "Constructor/return type propagation and non-identifier fluent receivers are unsupported; "
-     "object_creation_expression fails body audit and Add has a nonempty argument list.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "        public List<int> Build() { return items; }", true, false, NULL, NULL},
     {"lrp_csharp_s6_inherited_method", "Child.cs", "Child.Run", "Describe()", 0, "Base.cs",
      "Base.Describe", "CALLS", 3, "        public virtual string Describe() { return \"base\"; }",
      false, false,
@@ -380,11 +333,8 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
     {"lrp_csharp_s8_field_type_hint", "Service.cs", "Service.Run", "logger.Log(msg)", 0,
-     "Logger.cs", "Logger.Log", "CALLS", 3, "        public void Log(string msg) { }", false, false,
-     "Field receiver provenance is missing; csp_function only establishes annotated parameter "
-     "facts and the nonempty argument needs applicability proof.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     "Logger.cs", "Logger.Log", "CALLS", 3, "        public void Log(string msg) { }", true, false,
+     NULL, NULL},
     {"lrp_php_s1_crossfile_call", "main.php", "run", "triple($n)", 0, "util.php", "triple", "CALLS",
      2, "function triple($x) { return $x * 3; }", false, false,
      "Literal require IMPORTS is proved, but php_proof_calls never resolves "
@@ -572,12 +522,17 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "declaration must not be replaced by a name-only target.",
      "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
      "cited source proof guard. Legacy confidence/name matches were not accepted."},
+    {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 0, "types.go", "Config", "USAGE",
+     3, "type Config struct{ Port int }", true, false, NULL, NULL},
     {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 1, "types.go", "Config", "USAGE",
-     3, "type Config struct{ Port int }", false, false,
-     "Composite literal type usage is genuine, but generic Go binding validation is unsupported "
-     "and the strict Go bridge does not publish the struct-literal type occurrence.",
-     "Prior exact fixture audit: expected target absent; read-only trace of exact fixture and the "
-     "cited source proof guard. Legacy confidence/name matches were not accepted."},
+     3, "type Config struct{ Port int }", true, false, NULL, NULL},
+    /* A key of a struct literal must name a field of that struct (Go spec, composite literals). */
+    {"lrp_go_usage_struct_literal", "main.go", "Make", "Port", 0, "types.go", "Config.Port", "USAGE",
+     3, "type Config struct{ Port int }", true, false, NULL, NULL},
+    {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 0, "types.go", "Config",
+     "USES_TYPE", 3, "type Config struct{ Port int }", true, false, NULL, NULL},
+    {"lrp_go_usage_struct_literal", "main.go", "Make", "Config", 1, "types.go", "Config",
+     "USES_TYPE", 3, "type Config struct{ Port int }", true, false, NULL, NULL},
     {"lrp_ts_usage_type_param", "main.ts", "run", "Config", 1, "types.ts", "Config", "USES_TYPE", 1,
      "export interface Config { timeout: number; }", true, false, NULL,
      "A parameter annotation is a type use, so USES_TYPE at the exact name; es_usage_crossfile_typescript forbids USAGE here."},
@@ -596,46 +551,17 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "The relative-import source proof guard must retain this exact "
      "constructor/Class-call regression required."},
     {"lrp_java_s2_method_dispatch", "Runner.java", "Runner.run", "new Counter()", 0, "Counter.java",
-     NULL, "CALLS", 0, NULL, false, false,
-     "Java supplies a default constructor, but no source constructor declaration exists and "
-     "projection must not redirect its call to the Class.",
-     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
-     "this semantic invocation from the denominator. A stable implicit declaration identity is "
-     "needed before an exact graph suffix can be asserted."},
-    {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder()", 0, "Builder.java", NULL,
-     "CALLS", 0, NULL, false, false,
-     "Java default Builder constructor has no materialized source declaration; this missing "
-     "constructor identity must remain visible independently of the fluent method misses.",
-     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
-     "this semantic invocation from the denominator. A stable implicit declaration identity is "
-     "needed before an exact graph suffix can be asserted."},
-    {"lrp_java_s8_field_type_hint", "Service.java", NULL, "new Logger()", 0, "Logger.java", NULL,
-     "CALLS", 0, NULL, false, false,
-     "Implicit constructor invocation occurs in a field initializer, with neither source-declared "
-     "constructor target nor source-declared initializer callable owner. Needs stable semantic "
-     "identities for both; do not attach to Service.run.",
-     "Inspected exact source initializer and absent constructor declaration; no fabricated scope "
-     "or Class target."},
+     "Counter", "CALLS", 3, "class Counter {", true, false, NULL, NULL},
+    {"lrp_java_s5_chained", "Main.java", "Main.run", "new Builder()", 0, "Builder.java", "Builder",
+     "CALLS", 6, "class Builder {", true, false, NULL, NULL},
+    {"lrp_java_s8_field_type_hint", "Service.java", "Service.java.__file__", "new Logger()", 0,
+     "Logger.java", "Logger", "CALLS", 3, "class Logger {", true, false, NULL, NULL},
     {"lrp_csharp_s2_method_dispatch", "Runner.cs", "Runner.Run", "new Counter()", 0, "Counter.cs",
-     NULL, "CALLS", 0, NULL, false, false,
-     "C# default constructor has no source declaration; needs materialized implicit target "
-     "identity before an exact CALLS target can exist.",
-     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
-     "this semantic invocation from the denominator. A stable implicit declaration identity is "
-     "needed before an exact graph suffix can be asserted."},
-    {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder()", 0, "Builder.cs", NULL,
-     "CALLS", 0, NULL, false, false,
-     "C# default Builder constructor lacks an explicit source declaration and stable synthetic "
-     "graph identity.",
-     "Source fixture has no constructor declaration; do not invent a Class target or silently omit "
-     "this semantic invocation from the denominator. A stable implicit declaration identity is "
-     "needed before an exact graph suffix can be asserted."},
-    {"lrp_csharp_s8_field_type_hint", "Service.cs", NULL, "new Logger()", 0, "Logger.cs", NULL,
-     "CALLS", 0, NULL, false, false,
-     "Implicit constructor call appears in a field initializer. Both initializer owner and default "
-     "constructor target need stable semantic identities; it must not be attributed to "
-     "Service.Run.",
-     "Source fixture inspection, no guessed owner/target."},
+     "Counter", "CALLS", 2, "    class Counter {", true, false, NULL, NULL},
+    {"lrp_csharp_s5_chained", "Main.cs", "Main.Run", "new Builder()", 0, "Builder.cs", "Builder",
+     "CALLS", 3, "    class Builder {", true, false, NULL, NULL},
+    {"lrp_csharp_s8_field_type_hint", "Service.cs", "Service", "new Logger()", 0, "Logger.cs",
+     "Logger", "CALLS", 2, "    class Logger {", true, false, NULL, NULL},
     {"lrp_python_s1_crossfile_call", "main.py", "run", "triple(n)", 0, "util.py", "triple", "CALLS",
      1, "def triple(x):", true, false, NULL, NULL},
     {"lrp_python_s2_method_dispatch", "main.py", "run", "Counter()", 0, "counter.py", "Counter",
@@ -1037,45 +963,25 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "declaration as an incomplete direct member domain; typed receiver alone is insufficient.",
      "Reviewed kt_proof_class_fact and direct parameter-type call path; zero-argument method-only "
      "classes have positive controls, but this property-bearing fixture does not."},
-    {"lrp_kotlin_s3_constructor", "Main.kt", "make", "Widget(name)", 0, "Widget.kt", NULL, "CALLS",
-     0, NULL, false, false,
-     "The primary constructor is the class header; no independent callable graph identity or "
-     "Kotlin class-call contract is established. Constructor syntax cannot be promoted by class "
-     "name alone.",
-     "kt_proof_function_identity rejects names with type declarations; kt_proof_class_fact also "
-     "leaves primary-constructor classes incomplete."},
-    {"lrp_kotlin_s4_companion_static", "App.kt", "run", "Config.default()", 0, "Config.kt", NULL,
-     "CALLS", 0, NULL, false, false,
-     "Anonymous companion ownership/materialization and class-to-companion dispatch lack proof.",
-     "kt_proof_call navigation requires a typed lexical receiver; kt_proof_walk does not walk "
-     "companion-object declarations. No exact graph QN is invented."},
+    {"lrp_kotlin_s3_constructor", "Main.kt", "make", "Widget(name)", 0, "Widget.kt", "Widget", "CALLS",
+     1, "class Widget(val name: String) {", true, false, NULL, NULL},
+    {"lrp_kotlin_s4_companion_static", "App.kt", "run", "Config.default()", 0, "Config.kt",
+     "Config.Companion.default", "CALLS", 3, "        fun default(): Config = Config(false)",
+     true, false, NULL, NULL},
     {"lrp_kotlin_s4_companion_static", "Config.kt", "Config.Companion.default", "Config(false)", 0,
-     "Config.kt", NULL, "CALLS", 0, NULL, false, false,
-     "Primary constructor call within the companion is a separate genuine site; no callable "
-     "materialization/constructor contract.",
-     "No Kotlin class-call rule; absence of companion graph scope must remain counted."},
-    {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder()", 0, "Builder.kt", NULL, "CALLS", 0,
-     NULL, false, false, "Implicit primary constructor is not materialized/proven as a callable.",
-     "Bare function resolution rejects class names; there is no separate constructor producer."},
+     "Config.kt", "Config", "CALLS", 1, "class Config(val debug: Boolean) {", true, false, NULL,
+     NULL},
+    {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder()", 0, "Builder.kt", "Builder", "CALLS", 1,
+     "class Builder {", true, false, NULL, NULL},
     {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder().add(1)", 0, "Builder.kt", "Builder.add",
-     "CALLS", 3, "    fun add(x: Int): Builder { items.add(x); return this }", false, false,
-     "Requires chained constructor/return-type provenance. Navigation proof accepts a simple "
-     "lexical receiver only; Builder property items also makes class domain incomplete.",
-     "Reviewed kt_proof_call receiver shape and kt_proof_class_fact. Each add occurrence remains a "
-     "separate denominator item."},
+     "CALLS", 3, "    fun add(x: Int): Builder { items.add(x); return this }", true, false, NULL,
+     NULL},
     {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder().add(1).add(2)", 0, "Builder.kt",
-     "Builder.add", "CALLS", 3, "    fun add(x: Int): Builder { items.add(x); return this }", false,
-     false,
-     "Requires chained constructor/return-type provenance. Navigation proof accepts a simple "
-     "lexical receiver only; Builder property items also makes class domain incomplete.",
-     "Reviewed kt_proof_call receiver shape and kt_proof_class_fact. Each add occurrence remains a "
-     "separate denominator item."},
+     "Builder.add", "CALLS", 3, "    fun add(x: Int): Builder { items.add(x); return this }", true,
+     false, NULL, NULL},
     {"lrp_kotlin_s5_chained", "Main.kt", "run", "Builder().add(1).add(2).build()", 0, "Builder.kt",
-     "Builder.build", "CALLS", 4, "    fun build(): List<Int> = items.toList()", false, false,
-     "Requires chained constructor/return-type provenance. Navigation proof accepts a simple "
-     "lexical receiver only; Builder property items also makes class domain incomplete.",
-     "Reviewed kt_proof_call receiver shape and kt_proof_class_fact. Each add occurrence remains a "
-     "separate denominator item."},
+     "Builder.build", "CALLS", 4, "    fun build(): List<Int> = items.toList()", true, false, NULL,
+     NULL},
     {"lrp_kotlin_s6_inherited_method", "Child.kt", "Child.run", "describe()", 0, "Base.kt",
      "Base.describe", "CALLS", 2, "    open fun describe(): String = \"base\"", false, false,
      "Implicit-this inherited member lookup lacks proof; class-context bare calls are disabled and "
@@ -1095,18 +1001,9 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "bridge. Unique short name is not authority."},
     {"lrp_kotlin_s8_field_type_hint", "Service.kt", "Service.run", "logger.log(msg)", 0,
      "Logger.kt", "Logger.log", "CALLS", 2, "    fun log(msg: String): Unit { println(msg) }",
-     false, false,
-     "Property initializer Logger() does not donate a proven receiver identity to member body; "
-     "current type map populates declared parameters and callable vals, not class field "
-     "constructor inference.",
-     "Reviewed kt_proof_function parameter map and kt_proof_call navigation; constructor and "
-     "println calls cannot satisfy this method occurrence."},
-    {"lrp_kotlin_s8_field_type_hint", "Service.kt", "Service", "Logger()", 0, "Logger.kt", NULL,
-     "CALLS", 0, NULL, false, false,
-     "Property-initializer constructor invocation lacks callable materialization and initializer "
-     "scope contract.",
-     "kt_proof_walk does not publish constructor calls from class property initializers; no Kotlin "
-     "class-call authority."},
+     true, false, NULL, NULL},
+    {"lrp_kotlin_s8_field_type_hint", "Service.kt", "Service", "Logger()", 0, "Logger.kt", "Logger",
+     "CALLS", 1, "class Logger {", true, false, NULL, NULL},
     {"lrp_python_s6b_constructor", "child.py", "run", "Child()", 0, "child.py", "Child", "CALLS", 4,
      "class Child(Base):", true, false, NULL,
      "Exact imported Class-call identity with CLASS_CALLABLE and occurrence evidence is supported; "
@@ -1314,6 +1211,13 @@ static bool lrp_same_site(const LRP_Check *check, size_t i, uint32_t start, uint
            check->pp_starts[i] == start && check->pp_ends[i] == end;
 }
 
+/* File and file-level Module nodes identify the whole source, so their persisted
+ * range is 0/0 (the same convention as rq_target). The row's caller still has to name
+ * that exact node; any other scope must enclose the occurrence. */
+static bool lrp_scope_encloses(int first, int last, int line) {
+    return (first == 0 && last == 0) || (first <= line && last >= line);
+}
+
 /* Do not prefilter by the expected span, scope or role: a shifted/rebound
  * occurrence must fail rather than become a tolerated missing edge. */
 static bool lrp_match_occurrence(LRP_Check *check, sqlite3_stmt *stmt) {
@@ -1340,8 +1244,8 @@ static bool lrp_match_occurrence(LRP_Check *check, sqlite3_stmt *stmt) {
             continue;
         bool identity = source_file && !strcmp(source_file, g->file) &&
                         lrp_qn_has_declaration(scope, g->caller) &&
-                        sqlite3_column_int(stmt, 11) <= check->lines[i] &&
-                        sqlite3_column_int(stmt, 12) >= check->lines[i] &&
+                        lrp_scope_encloses(sqlite3_column_int(stmt, 11),
+                                           sqlite3_column_int(stmt, 12), check->lines[i]) &&
                         lrp_target_matches(g, target_file, target, sqlite3_column_int(stmt, 8),
                                            sqlite3_column_int(stmt, 9));
         if (identity && g->forbidden) {

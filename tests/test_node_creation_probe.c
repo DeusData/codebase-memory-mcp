@@ -1051,7 +1051,7 @@ TEST(probe_kotlin_data_class) {
     ASSERT_TRUE(m.functions + m.methods >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1158,7 +1158,7 @@ TEST(probe_cs_class_methods) {
     ASSERT_TRUE(m.methods >= 2); /* Add, Double */
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }

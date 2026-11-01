@@ -133,9 +133,9 @@ static void mkc_cleanup(MKC_Proj *lp, cbm_store_t *store) {
 
 /* Each obligation below is authored from its fixture, independently of emitted
  * rows. Missing edges remain quality debt; invented targets fail the oracle.
- * Unsupported implicit constructors retain a real source declaration anchor
- * with no fabricated callable identity. The explicit C# operator also retains
- * its unmapped callable identity as debt. Unknown receiver sites are forbidden. */
+ * A class stands for a constructor that has no node of its own: a primary constructor
+ * in the class header, a synthesized apply, or a Swift init. The evidence marks it as a
+ * class call. Unknown receiver sites are forbidden. */
 typedef struct {
     const char *test, *caller, *needle, *target, *declaration, *label;
     int line;
@@ -143,14 +143,14 @@ typedef struct {
     bool required;
 } MKC_Golden;
 static const MKC_Golden mkc_goldens[] = {
-    {"mkc_c1_scala_constructor_new", "make", "new Widget(n)", NULL,
-     "class Widget(val name: String) {", "Method", 1, 0, false},
-    {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0)", NULL,
-     "case class Point(x: Double, y: Double) {", "Method", 1, 0, false},
+    {"mkc_c1_scala_constructor_new", "make", "new Widget(n)", "Widget",
+     "class Widget(val name: String) {", "Class", 1, 0, true},
+    {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0)", "Point",
+     "case class Point(x: Double, y: Double) {", "Class", 1, 0, true},
     {"mkc_c1_scala_case_class_apply", "origin", "Point(0.0, 0.0).dist()", "dist",
      "  def dist(): Double = math.sqrt(x*x + y*y)", "Method", 2, 0, true},
-    {"mkc_c1_swift_initializer", "make", "Widget(name: n)", "init",
-     "    init(name: String) { self.name = name }", "Method", 3, 0, false},
+    {"mkc_c1_swift_initializer", "make", "Widget(name: n)", "Widget", "class Widget {", "Class", 1, 0,
+     true},
     {"mkc_c1_ruby_type_new", "make", "Widget.new(name)", "initialize", "  def initialize(name)",
      "Method", 2, 0, true},
     {"mkc_c1_rust_new_samefile", "run", "Point::new(3.0, 4.0)", "new",
@@ -177,12 +177,18 @@ static const MKC_Golden mkc_goldens[] = {
      "Method", 8, 0, false},
     {"mkc_c2_kotlin_operator_plus", "run", "a + b", "plus",
      "    operator fun plus(other: Vec2): Vec2 =", "Method", 2, 0, true},
-    {"mkc_c2_csharp_operator_plus", "Run", "a + b", NULL,
+    {"mkc_c2_csharp_operator_plus", "Run", "a + b", "operator+",
      "        public static Vec2 operator+(Vec2 a, Vec2 b) {", "Method", 5, 0, false},
     {"mkc_c2_csharp_operator_plus", "Run", "(a + b).Dot(b)", "Dot",
      "        public float Dot(Vec2 o) { return X*o.X + Y*o.Y; }", "Method", 8, 0, false},
     {"mkc_c2_csharp_operator_plus", "operator+", "new Vec2(a.X + b.X, a.Y + b.Y)", "Vec2",
-     "        public Vec2(float x, float y) { X = x; Y = y; }", "Method", 4, 0, false},
+     "        public Vec2(float x, float y) { X = x; Y = y; }", "Method", 4, 0, true},
+    {"mkc_c2_csharp_operator_overloads", "operator+", "new Vec2(a.X + b.X)", "Vec2",
+     "        public Vec2(float x) { X = x; }", "Method", 4, 0, true},
+    {"mkc_c2_csharp_operator_overloads", "operator+", "new Vec2(a.X + b)", "Vec2",
+     "        public Vec2(float x) { X = x; }", "Method", 4, 0, true},
+    {"mkc_c2_csharp_operator_overloads", "operator-", "new Vec2(a.X - b.X)", "Vec2",
+     "        public Vec2(float x) { X = x; }", "Method", 4, 0, true},
     {"mkc_c2_scala_symbolic_method", "run", "a + b", "+",
      "  def +(other: Vec2): Vec2 = Vec2(x + other.x, y + other.y)", "Method", 2, 0, false},
     {"mkc_c2_scala_symbolic_method", "run", "(a + b).dot(b)", "dot",
@@ -258,8 +264,8 @@ static const MKC_Golden mkc_goldens[] = {
      "    make(name: string): Widget { return new Widget(name); }", "Method", 7, 0, true},
     {"mkc_c8_typescript_constructor_samefile", "run", "this.make(name).label()", "label",
      "    label(): string { return this.name; }", "Method", 3, 0, false},
-    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget(name)", NULL,
-     "class Widget(val name: String) {", "Method", 1, 0, false},
+    {"mkc_c8_kotlin_constructor_samefile", "make", "Widget(name)", "Widget",
+     "class Widget(val name: String) {", "Class", 1, 0, true},
     {"mkc_c8_kotlin_constructor_samefile", "run", "make(name)", "make",
      "fun make(name: String): Widget = Widget(name)", "Function", 5, 0, true},
     {"mkc_c8_kotlin_constructor_samefile", "run", "make(name).label()", "label",
@@ -327,9 +333,7 @@ static bool mkc_quality(const MKC_File *original, int count, const char *test) {
             .why = g->target
                        ? "This source-authored call requires a complete language binding and "
                          "receiver/overload proof to its exact callable declaration."
-                       : "The genuine call has no faithful callable graph identity. A class "
-                         "anchor for an implicit constructor, or an explicit operator anchor, "
-                         "records debt without accepting a Class as a callable target.",
+                       : "The genuine call has no faithful callable graph identity.",
             .tried = "The original v69 production harness failed its aggregate call floor. "
                      "Preserved fixture bytes and replaced that floor with exact source "
                      "occurrences/declarations. Direct make calls remain required source "
@@ -653,6 +657,23 @@ TEST(mkc_c2_csharp_operator_plus) {
                                   "    }\n"
                                   "}\n"}};
     /* Exact source obligations and unsupported-binding gaps are tracked above. */
+    ASSERT_TRUE(mkc_quality(f, 1, __func__));
+    PASS();
+}
+
+/* A C# operator's body has its own node, also when the operator is overloaded. A call in it
+ * belongs to that operator, never to the file. */
+TEST(mkc_c2_csharp_operator_overloads) {
+    static const MKC_File f[] = {
+        {"Vec.cs", "namespace App {\n"
+                   "    struct Vec2 {\n"
+                   "        public float X;\n"
+                   "        public Vec2(float x) { X = x; }\n"
+                   "        public static Vec2 operator+(Vec2 a, Vec2 b) { return new Vec2(a.X + b.X); }\n"
+                   "        public static Vec2 operator+(Vec2 a, float b) { return new Vec2(a.X + b); }\n"
+                   "        public static Vec2 operator -(Vec2 a, Vec2 b) { return new Vec2(a.X - b.X); }\n"
+                   "    }\n"
+                   "}\n"}};
     ASSERT_TRUE(mkc_quality(f, 1, __func__));
     PASS();
 }
@@ -1309,6 +1330,7 @@ SUITE(matrix_known_classes) {
     RUN_TEST(mkc_c2_kotlin_operator_plus);
     /* C2-G: C# operator+ — red=bug */
     RUN_TEST(mkc_c2_csharp_operator_plus);
+    RUN_TEST(mkc_c2_csharp_operator_overloads);
     /* C2-H: Scala symbolic method — uncertain/red=bug */
     RUN_TEST(mkc_c2_scala_symbolic_method);
     /* C2-I: Ruby def + — uncertain/red=bug */
