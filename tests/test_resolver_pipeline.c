@@ -713,7 +713,191 @@ TEST(resolver_pipeline_infra_adapter_pool_has_no_proof_work_budget) {
     PASS();
 }
 
+static int python_file_emitted_calls(size_t name_bytes, int functions) {
+    enum { LINE_BYTES = 64 };
+    char *project = malloc(name_bytes + 1);
+    char *source = malloc((size_t)functions * LINE_BYTES + 64);
+    int emitted = -1;
+    if (!project || !source) {
+        free(project);
+        free(source);
+        return emitted;
+    }
+    memset(project, 'p', name_bytes);
+    project[name_bytes] = '\0';
+    size_t used = (size_t)snprintf(source, 64, "def base():\n    return 1\n");
+    for (int i = 0; i < functions; i++)
+        used += (size_t)snprintf(source + used, LINE_BYTES, "def f%d():\n    return base()\n", i);
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)used, CBM_LANG_PYTHON, project, "module.py", 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    if (result && graph && registry) {
+        result->source = source;
+        result->source_len = (int)used;
+        const char *target = NULL;
+        for (int d = 0; d < result->defs.count; d++) {
+            const CBMDefinition *def = &result->defs.items[d];
+            if (!def->qualified_name || !def->name || !def->label)
+                continue;
+            cbm_gbuf_upsert_node(graph, def->label, def->name, def->qualified_name, "module.py",
+                                 def->start_line, def->end_line, "{}");
+            cbm_registry_add(registry, def->name, def->qualified_name, def->label);
+            if (!strcmp(def->name, "base"))
+                target = def->qualified_name;
+        }
+        cbm_file_info_t file = {
+            .path = "/tmp/module.py", .rel_path = "module.py", .language = CBM_LANG_PYTHON};
+        cbm_pipeline_ctx_t ctx = {
+            .project_name = project, .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+        cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+        cbm_resolver_file_t input = {.ctx = &ctx,
+                                     .registry = registry,
+                                     .graph = graph,
+                                     .output = graph,
+                                     .result = result,
+                                     .rel_path = "module.py",
+                                     .module_qn = result->module_qn,
+                                     .language = CBM_LANG_PYTHON};
+        if (shared && target && cbm_shared_resolver_file(shared, &input))
+            emitted = emitted_target(graph, "CALLS", target);
+        cbm_shared_resolver_free(shared);
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    if (result)
+        cbm_free_result(result);
+    free(source);
+    free(project);
+    return emitted;
+}
+
+/* A file's own lookup proofs have the same shape as a project's: one per occurrence, each
+ * linear in its text. A fixed budget stopped resolving partway through any large enough
+ * file, leaving every later occurrence as registry_lookup_proof_unavailable, and how soon
+ * depended on the length of the checkout path because every proof hashes the project name.
+ * The short name is the control: only the hashed text differs between these two files. */
+TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget) {
+    enum { FUNCTIONS = 400 };
+    ASSERT_EQ(python_file_emitted_calls(4, FUNCTIONS), FUNCTIONS);
+    ASSERT_EQ(python_file_emitted_calls(4000, FUNCTIONS), FUNCTIONS);
+    PASS();
+}
+
+static int reason_rows(const cbm_gbuf_t *graph, const char *reason) {
+    size_t count = 0;
+    const cbm_resolve_record_t *records = cbm_gbuf_resolutions(graph, &count);
+    int matched = 0;
+    for (size_t r = 0; r < count; r++)
+        matched += records[r].result.reason && !strcmp(records[r].result.reason, reason);
+    return matched;
+}
+
+/* Emitted CALLS to target_name, or with reason set, the rows carrying that reason. */
+static int rust_source_count(const char *source, const char *target_name, const char *reason) {
+    CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUST, "proj",
+                                             "lib.rs", 0, NULL, NULL);
+    cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    int emitted = -1;
+    if (result && graph && registry && add_result(graph, registry, result, "lib.rs", source)) {
+        char target[128];
+        snprintf(target, sizeof(target), "%s.%s", result->module_qn, target_name);
+        cbm_file_info_t file = {
+            .path = "/tmp/lib.rs", .rel_path = "lib.rs", .language = CBM_LANG_RUST};
+        cbm_pipeline_ctx_t ctx = {
+            .project_name = "proj", .repo_path = "/tmp", .gbuf = graph, .registry = registry};
+        cbm_shared_resolver_t *shared = cbm_shared_resolver_build(&ctx, &file, 1, &result);
+        cbm_resolver_file_t input = {.ctx = &ctx,
+                                     .registry = registry,
+                                     .graph = graph,
+                                     .output = graph,
+                                     .result = result,
+                                     .rel_path = "lib.rs",
+                                     .module_qn = result->module_qn,
+                                     .language = CBM_LANG_RUST};
+        if (shared && cbm_shared_resolver_file(shared, &input))
+            emitted = reason ? reason_rows(graph, reason) : emitted_target(graph, "CALLS", target);
+        cbm_shared_resolver_free(shared);
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(graph);
+    if (result)
+        cbm_free_result(result);
+    return emitted;
+}
+static int rust_source_emits(const char *source, const char *target_name) {
+    return rust_source_count(source, target_name, NULL);
+}
+
+/* Two `impl From<_> for Error` both declare Error.from: one QN, so one graph node, whose edges
+ * are the union of every variant's body. meilisearch alone has hundreds of these, and every
+ * call inside them was void as source_declaration_identity_conflict. The Rust adapter decides
+ * these sites itself, so this pins the identity. Emission through it is pinned for Java in
+ * resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not. */
+TEST(resolver_pipeline_same_kind_declarations_sharing_a_qn_are_one_source) {
+    const char *source = "struct Error;\nstruct A;\nstruct B;\n"
+                         "fn helper() -> i32 { 1 }\n"
+                         "impl From<A> for Error {\n"
+                         "    fn from(a: A) -> Error { helper(); Error }\n"
+                         "}\n"
+                         "impl From<B> for Error {\n"
+                         "    fn from(b: B) -> Error { helper(); Error }\n"
+                         "}\n";
+    ASSERT_EQ(rust_source_count(source, "helper", "source_declaration_identity_conflict"), 0);
+    PASS();
+}
+
+/* A struct and a function sharing a QN are different things: the node can stand for only one
+ * of them, so the function's body cannot speak for it. */
+TEST(resolver_pipeline_different_kinds_sharing_a_qn_stay_a_conflict) {
+    const char *source = "struct Twin { x: i32 }\n"
+                         "fn Twin() -> i32 { helper() }\n"
+                         "fn helper() -> i32 { 1 }\n";
+    ASSERT_EQ(rust_source_emits(source, "helper"), 0);
+    PASS();
+}
+
+/* USES_TYPE scopes were file + bare function name, which no node carries for a method's class
+ * or a Go package, so every signature type in those reported source_not_materialized. */
+TEST(resolver_pipeline_signature_type_refs_name_the_declaring_scope) {
+    const char *go = "package lib\n\ntype Thing struct{}\n\n"
+                     "func Make(t Thing) Thing { return t }\n\n"
+                     "func (t Thing) Same(o Thing) Thing { return o }\n";
+    CBMFileResult *result = cbm_extract_file(go, (int)strlen(go), CBM_LANG_GO, "proj", "lib/lib.go",
+                                             0, NULL, NULL);
+    ASSERT_NOT_NULL(result);
+    int make = 0, same = 0, wrong = 0;
+    for (int i = 0; i < result->type_refs.count; i++) {
+        const char *scope = result->type_refs.items[i].enclosing_func_qn;
+        make += scope && !strcmp(scope, "proj.lib.Make");
+        same += scope && !strcmp(scope, "proj.lib.Thing.Same");
+        wrong += scope && strstr(scope, "lib.lib") != NULL;
+    }
+    cbm_free_result(result);
+    ASSERT_GT(make, 0);
+    ASSERT_GT(same, 0);
+    ASSERT_EQ(wrong, 0);
+    const char *ts = "interface Thing { x: number }\n"
+                     "class Service {\n  run(t: Thing): Thing { return t; }\n}\n";
+    result = cbm_extract_file(ts, (int)strlen(ts), CBM_LANG_TYPESCRIPT, "proj", "app.ts", 0, NULL,
+                              NULL);
+    ASSERT_NOT_NULL(result);
+    int method = 0;
+    for (int i = 0; i < result->type_refs.count; i++) {
+        const char *scope = result->type_refs.items[i].enclosing_func_qn;
+        method += scope && !strcmp(scope, "proj.app.Service.run");
+    }
+    cbm_free_result(result);
+    ASSERT_GT(method, 0);
+    PASS();
+}
+
 SUITE(resolver_pipeline) {
+    RUN_TEST(resolver_pipeline_same_kind_declarations_sharing_a_qn_are_one_source);
+    RUN_TEST(resolver_pipeline_different_kinds_sharing_a_qn_stay_a_conflict);
+    RUN_TEST(resolver_pipeline_signature_type_refs_name_the_declaring_scope);
+    RUN_TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget);
     RUN_TEST(resolver_pipeline_shared_build_has_no_proof_work_budget);
     RUN_TEST(resolver_pipeline_graph_pool_has_no_proof_work_budget);
     RUN_TEST(resolver_pipeline_infra_adapter_pool_has_no_proof_work_budget);

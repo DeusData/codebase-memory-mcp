@@ -6,9 +6,6 @@
 #include <string.h>
 
 #define PROOF_MAX_DEPTH 256u
-#define PROOF_DEFAULT_NODES 65536u
-#define PROOF_DEFAULT_PREMISES 65536u
-#define PROOF_DEFAULT_WORK UINT64_C(4194304)
 
 struct cbm_resolve_proof_entry {
     cbm_resolve_proof_t node;
@@ -55,13 +52,13 @@ void cbm_resolve_proof_pool_init(cbm_resolve_proof_pool_t *pool, CBMArena *arena
         return;
     *pool = (cbm_resolve_proof_pool_t){
         .arena = arena,
-        .node_limit = node_limit ? node_limit : PROOF_DEFAULT_NODES,
-        .premise_limit = premise_limit ? premise_limit : PROOF_DEFAULT_PREMISES,
-        .work_limit = work_limit ? work_limit : PROOF_DEFAULT_WORK,
+        .node_limit = node_limit ? node_limit : SIZE_MAX,
+        .premise_limit = premise_limit ? premise_limit : SIZE_MAX,
+        .work_limit = work_limit ? work_limit : UINT64_MAX,
         .failure = arena ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_FAILED};
 }
 void cbm_resolve_proof_pool_init_project(cbm_resolve_proof_pool_t *pool, CBMArena *arena) {
-    cbm_resolve_proof_pool_init(pool, arena, SIZE_MAX, SIZE_MAX, UINT64_MAX);
+    cbm_resolve_proof_pool_init(pool, arena, 0, 0, 0);
 }
 const cbm_resolve_proof_view_t *cbm_resolve_proof_view(const cbm_resolve_proof_t *proof) {
     return proof ? &proof->value : NULL;
@@ -520,7 +517,7 @@ bool cbm_resolve_proof_visit(const cbm_resolve_proof_t *root, size_t node_limit,
     if (!root || !visit)
         return false;
     proof_walk_t walk = {
-        .visit = visit, .context = context, .limit = node_limit ? node_limit : PROOF_DEFAULT_NODES};
+        .visit = visit, .context = context, .limit = node_limit ? node_limit : SIZE_MAX};
     bool ok = walk_node(&walk, root, 1) != NULL;
     cbm_free(CBM_MEM_CLASS_EXTRACT, walk.slots);
     return ok;
@@ -539,7 +536,7 @@ bool cbm_resolve_proof_visit_roots(const cbm_resolve_proof_t *const *roots, size
     memcpy(sorted, roots, root_count * sizeof(*sorted));
     qsort(sorted, root_count, sizeof(*sorted), compare_premises);
     proof_walk_t walk = {
-        .visit = visit, .context = context, .limit = node_limit ? node_limit : PROOF_DEFAULT_NODES};
+        .visit = visit, .context = context, .limit = node_limit ? node_limit : SIZE_MAX};
     bool ok = true;
     for (size_t i = 0; i < root_count; i++) {
         if (!walk_node(&walk, sorted[i], 1)) {

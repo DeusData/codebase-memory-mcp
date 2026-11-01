@@ -13506,7 +13506,7 @@ static void write_go_init_lsp_fixture(const char *tmp, int pad_files) {
 
 /* Each init's LSP-resolved edges start at that init's own node. */
 static int assert_go_init_lsp_edges(cbm_store_t *s, const char *project) {
-    const char *lsp = "\"strategy\":\"lsp_";
+    const char *lsp = "\"strategy\":\"shared_resolver\"";
     ASSERT_GTE(go_calls_between(s, project, ".reg.init#a.go:1", ".reg.Codec.register", lsp), 1);
     ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:1", ".reg.Store.register", lsp), 1);
     ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:2", ".reg.Store.warm", lsp), 1);
@@ -14216,13 +14216,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .label = "Method",
                     .declaration_line = 11,
                     .declaration_text = "func (e *Encoder) EncodeTuple() int { return e.n }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.return-flow.UseNamed.factory",
          .site = {.file = "app/app.go", .caller = "UseNamed", .needle = "enc.NewNamed()"},
          .relation = "CALLS",
@@ -14240,13 +14234,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .label = "Method",
                     .declaration_line = 13,
                     .declaration_text = "func (e *Encoder) EncodeNamed() int { return e.n }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.return-flow.UseField.factory",
          .site = {.file = "app/app.go", .caller = "UseField", .needle = "newHead()"},
          .relation = "CALLS",
@@ -14267,13 +14255,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .label = "Method",
                     .declaration_line = 5,
                     .declaration_text = "func (i *isolation) LowWatermarkField() int { return 0 }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.return-flow.UseSlice.factory",
          .site = {.file = "app/app.go", .caller = "UseSlice", .needle = "diag.Run()"},
          .relation = "CALLS",
@@ -14292,13 +14274,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .declaration_line = 7,
                     .declaration_text =
                         "func (d Diagnostics) HasErrorsSlice() bool { return len(d) > 0 }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.return-flow.UseGrouped.factory",
          .site = {.file = "app/app.go", .caller = "UseGrouped", .needle = "enc.NewPair()"},
          .relation = "CALLS",
@@ -14317,13 +14293,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .label = "Method",
                     .declaration_line = 15,
                     .declaration_text = "func (e *Encoder) EncodeGrouped() int { return e.n }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.return-flow.UseIndex.factory",
          .site = {.file = "app/app.go", .caller = "UseIndex", .needle = "samples.Generate()"},
          .relation = "CALLS",
@@ -14341,13 +14311,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .label = "Method",
                     .declaration_line = 3,
                     .declaration_text = "type Sample interface{ TS() int64 }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.return-flow.UseTupleSlice.factory",
          .site = {.file = "app/app.go", .caller = "UseTupleSlice", .needle = "samples.List()"},
          .relation = "CALLS",
@@ -14366,13 +14330,7 @@ static bool go_multi_return_quality(cbm_store_t *store, const char *project, con
                     .label = "Method",
                     .declaration_line = 3,
                     .declaration_text = "type Sample interface{ TS() int64 }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-RETURN-COMPONENT-RECEIVER-FLOW",
-         .why = "Tuple/named/slice return components and subsequent field/index receivers lack a "
-                "joined exact type-flow proof.",
-         .tried = "The original factories and receiver expressions remain; direct factory "
-                  "invocation is required independently. Interface calls target their static "
-                  "interface declaration, never a guessed implementation."},
+         .mode = RQ_REQUIRED},
     };
     return pipeline_quality_files(store, project, "go-return-flow", root, files, 5, expected,
                                   sizeof(expected) / sizeof(expected[0]), NULL, 0);
@@ -14455,11 +14413,7 @@ static bool go_global_write_quality(cbm_store_t *store, const char *project, con
                    .label = "Variable",
                    .declaration_line = 3,
                    .declaration_text = "var Counter int"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "GO-PACKAGE-VARIABLE-WRITE",
-        .why = "Go package-variable writes have no admitted source binding and write-role bridge.",
-        .tried = "Both files declare the same configured package and no local shadows Counter; the "
-                 "legacy short-name writer has no sealed occurrence evidence."};
+        .mode = RQ_REQUIRED};
     return pipeline_quality_files(store, project, "go-package-write", root, files, 2, &expected, 1,
                                   NULL, 0);
 }
@@ -15351,11 +15305,7 @@ static bool go_selector_roles_quality(cbm_store_t *store, const char *project, c
                     .label = "Field",
                     .declaration_line = 4,
                     .declaration_text = "\terr error"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-FIELD-WRITE-PROOF",
-         .why = "Go field writes have no admitted owner/declaration/write-role proof bridge.",
-         .tried = "The explicit Tracker receiver and unique declared field establish the fixture "
-                  "target; generic reference extraction does not carry that owner proof."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.typed-field-value-use",
          .site = {.file = "state/reset.go", .caller = "Reset"},
          .relation = "USAGE",
@@ -15364,11 +15314,7 @@ static bool go_selector_roles_quality(cbm_store_t *store, const char *project, c
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "\tn   int"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "GO-FIELD-VALUE-PROOF",
-         .why = "Go field value uses have no admitted owner/declaration proof bridge.",
-         .tried = "The return selector uses Tracker.n; a name-only value reference cannot prove "
-                  "the owner."},
+         .mode = RQ_REQUIRED},
         {.case_id = "go.typed-field-read",
          .site = {.file = "state/reset.go", .caller = "Reset"},
          .relation = "READS",
@@ -15381,7 +15327,16 @@ static bool go_selector_roles_quality(cbm_store_t *store, const char *project, c
          .gap_id = "GO-FIELD-READ-PROOF",
          .why = "Go field reads have no admitted owner/declaration/read-role proof bridge.",
          .tried = "The return expression reads Tracker.n; neither spelling nor the write guard "
-                  "supplies exact read evidence."}};
+                  "supplies exact read evidence."},
+        {.case_id = "go.receiver-type-reference",
+         .site = {.file = "state/reset.go", .caller = "Reset", .needle = "Tracker"},
+         .relation = "USAGE",
+         .target = {.file = "state/state.go",
+                    .suffix = "Tracker",
+                    .label = "Struct",
+                    .declaration_line = 3,
+                    .declaration_text = "type Tracker struct {"},
+         .mode = RQ_REQUIRED}};
     /* Anchor the n leaf of the literal return selector without relying on a
      * substring count through function keywords or identifiers. */
     char *source = pipeline_quality_source(root, "state/reset.go");
@@ -15398,7 +15353,7 @@ static bool go_selector_roles_quality(cbm_store_t *store, const char *project, c
         expected[i].site.end_byte = at + 1;
     }
     free(source);
-    return pipeline_quality_files(store, project, "go-selector-roles", root, files, 2, expected, 3,
+    return pipeline_quality_files(store, project, "go-selector-roles", root, files, 2, expected, 4,
                                   NULL, 0);
 }
 

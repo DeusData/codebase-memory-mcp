@@ -68,12 +68,19 @@ typedef struct {
     bool invalid;
 } conditional_owner_t;
 
+typedef struct target_file {
+    const char *file;
+    struct target_file *next;
+} target_file_t;
+
 typedef struct {
     const char *file;
     const char *label;
     uint32_t start_line, end_line, second_start_line, second_end_line;
     unsigned declarations;
     conditional_owner_t *conditional;
+    /* Other files declaring this QN (Go build-tag twins, C declaration headers). */
+    target_file_t *other_files;
     bool ambiguous;
     /* Java/Kotlin/C# overloads of one owner share a qualified name, and the
      * graph keeps them as one node. That node faithfully names all of them. */
@@ -86,6 +93,8 @@ typedef struct {
     bool signature_only;
     /* A same-QN declaration lives in another file, so no span can settle it. */
     bool cross_file;
+    /* A different kind sharing the QN (C: struct and function) is no variant. */
+    bool mixed_kinds, rebound;
 } target_proof_t;
 
 typedef struct {
@@ -295,6 +304,37 @@ static bool ecma_merge_target(target_proof_t *prior, const CBMDefinition *defini
     return false;
 }
 
+static bool target_declared_in(const target_proof_t *target, const char *file) {
+    if (!strcmp(target->file, file))
+        return true;
+    for (const target_file_t *other = target->other_files; other; other = other->next)
+        if (!strcmp(other->file, file))
+            return true;
+    return false;
+}
+
+/* Overloads, trait impls and build-tag twins all stay live, so one node is exact for any of them.
+ * Elsewhere a later declaration of a name rebinds it, as a second Python def does, and the bodies
+ * are not equivalent: selecting that node would claim edges from a body nothing may reach. */
+static bool declarations_coexist(CBMLanguage language) {
+    switch (language) {
+    case CBM_LANG_GO:
+    case CBM_LANG_RUST:
+    case CBM_LANG_JAVA:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_CPP:
+    case CBM_LANG_C:
+    case CBM_LANG_SWIFT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
                        const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
@@ -314,6 +354,16 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
             prior->overload_set = true;
         else
             prior->ambiguous |= !same_owner || !same_span || language == CBM_LANG_PYTHON;
+        prior->mixed_kinds |= strcmp(prior->label, definition->label) != 0;
+        prior->rebound |= !declarations_coexist(language);
+        if (!target_declared_in(prior, file)) {
+            target_file_t *other = cbm_arena_calloc(&resolver->arena, sizeof(*other));
+            const char *copy = cbm_arena_strdup(&resolver->arena, file);
+            if (!other || !copy)
+                return false;
+            *other = (target_file_t){.file = copy, .next = prior->other_files};
+            prior->other_files = other;
+        }
         if (prior->declarations == 1 && same_owner) {
             prior->second_start_line = definition->start_line;
             prior->second_end_line = definition->end_line;
@@ -332,6 +382,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     entry->end_line = definition->end_line;
     entry->declarations = 1;
     entry->signature_only = definition->is_abstract;
+    entry->rebound = !declarations_coexist(language);
     if (!entry->file || !entry->label)
         return false;
     cbm_ht_set(resolver->targets, key, entry);
@@ -450,8 +501,18 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         !node->label)
         return false;
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
-    if (!proof || proof->ambiguous || strcmp(proof->file, node->file_path) ||
-        node->start_line < 0 || node->end_line < 0)
+    if (!proof)
+        return false;
+    /* Several declarations of one kind sharing a QN are one identity in this graph: one
+     * node whose `variants` keep every span and whose edges are the union of every body
+     * (graph_buffer.c, "Definition variants"). Rust `impl From<A> for E` beside
+     * `impl From<B> for E`, overloads and build-tag twins all land here, and any member
+     * reaches the same node, so selecting that node is exact whichever member a site
+     * means. The node must still be one the census recorded. */
+    if (proof->ambiguous)
+        return !proof->mixed_kinds && !proof->rebound && !strcmp(proof->label, node->label) &&
+               target_declared_in(proof, node->file_path);
+    if (strcmp(proof->file, node->file_path) || node->start_line < 0 || node->end_line < 0)
         return false;
     if (proof->merged_label && !strcmp(proof->merged_label, node->label) &&
         proof->merged_start_line == (uint32_t)node->start_line &&
@@ -502,6 +563,27 @@ static bool target_declares_type(const file_resolver_t *resolver, const cbm_gbuf
         resolver->shared ? cbm_ht_get(resolver->shared->targets, node->qualified_name) : NULL;
     return proof && proof->merged_label &&
            (cbm_label_is_type_like(proof->merged_label) || cbm_label_is_type_like(proof->label));
+}
+
+/* The occurrence's enclosing declaration must be the source node, and that declaration
+ * must live in this file. For a variant set the winning span may be another member's, even
+ * in another file (Go build tags), so ownership is the census' list of declaring files. */
+static bool source_identity_holds(const file_resolver_t *resolver, const cbm_gbuf_node_t *source,
+                                  bool conditional) {
+    const char *file = resolver->file->rel_path;
+    if (!source->file_path)
+        return false;
+    const target_proof_t *proof =
+        resolver->shared && resolver->shared->complete && source->qualified_name
+            ? cbm_ht_get(resolver->shared->targets, source->qualified_name)
+            : NULL;
+    if (proof && proof->ambiguous && !proof->mixed_kinds && !proof->rebound &&
+        source != resolver->file_node)
+        return target_materialized(resolver, source) && target_declared_in(proof, file);
+    if (strcmp(source->file_path, file))
+        return false;
+    return source == resolver->file_node || (source->label && !strcmp(source->label, "Module")) ||
+           target_materialized(resolver, source) || conditional;
 }
 
 typedef struct {
@@ -1808,6 +1890,34 @@ static bool prepare_python_queries(cbm_shared_resolver_t *resolver, const cbm_pi
     return true;
 }
 
+/* Imports bind by declared package name, which every importer needs before any file's
+ * imports are collected. An unreadable file simply declares nothing here. */
+static bool note_go_packages(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
+                             const cbm_file_info_t *files, int file_count) {
+    for (int f = 0; f < file_count; f++) {
+        if (files[f].language != CBM_LANG_GO)
+            continue;
+        size_t length = 0;
+        char *source = load_source(files[f].path, &length);
+        if (!source)
+            continue;
+        CBMArena arena;
+        cbm_arena_init(&arena);
+        char *path = cbm_arena_strdup(&arena, files[f].rel_path);
+        if (path)
+            cbm_normalize_path_sep(path);
+        const char *module =
+            path ? cbm_fqn_module_source_lang(&arena, ctx->project_name, path, CBM_LANG_GO) : NULL;
+        bool ok =
+            module && cbm_go_stabilization_note_package(resolver->go_types, module, source, length);
+        cbm_arena_destroy(&arena);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
 static bool collect_go_types(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
                              const CBMFileResult *result, const cbm_file_info_t *file) {
     if (file->language != CBM_LANG_GO)
@@ -1902,6 +2012,10 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
+    if (!note_go_packages(resolver, ctx, files, file_count)) {
+        cbm_shared_resolver_free(resolver);
+        return NULL;
+    }
     for (int f = 0; f < file_count; f++) {
         /* Embedded ECMAScript surfaces need their own complete use audit.
          * Their absence from this adapter cannot certify non-mutation. */
@@ -1967,7 +2081,7 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     }
     for (size_t i = 0; i < cbm_resolve_solver_count(resolver->solver); i++) {
         const cbm_resolve_solver_result_t *binding = cbm_resolve_solver_at(resolver->solver, i);
-        if (strncmp(binding->key, "go/", 3))
+        if (!cbm_go_stabilization_summary_key(binding->key))
             continue;
         const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(binding->proof);
         char *payload = solver_summary_payload(binding);
@@ -2872,9 +2986,11 @@ static const cbm_gbuf_node_t *source_node(const file_resolver_t *resolver, const
     if (!scope || !scope[0])
         return resolver->file_node;
     const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(resolver->file->graph, scope);
-    /* A class-level occurrence in a directory-module language carries the
-     * package's QN. That node is every file of the package; this is one (#787). */
-    return cbm_pipeline_node_is_dir_container(node) ? resolver->file_node : node;
+    /* A package-level reference in a directory-module language carries the DIRECTORY
+     * module QN, which is the Folder shared by every file of the package. An anonymous
+     * callable's scope names no node at all. Either way the occurrence is in this file, the
+     * attribution every ordinary resolver uses (#787). */
+    return !node || cbm_pipeline_node_is_dir_container(node) ? resolver->file_node : node;
 }
 
 static bool callable_node(const cbm_gbuf_node_t *node) {
@@ -2926,6 +3042,44 @@ static const cbm_resolve_proof_t *local_occurrence_proof(const file_resolver_t *
         local, cbm_resolve_proof_leaf(context->pool, CBM_PROOF_SOURCE_FACT, &source, &key, &role)};
     return cbm_resolve_proof_derive(context->pool, CBM_PROOF_NAMED_JOIN, &source, &key, result,
                                     premises, 2, true);
+}
+
+/* The extraction carrier read this token in this role. A Go reference's proof attests the
+ * declaration, shared by every site that selects it. A package-level occurrence's proof
+ * names the module scope, which in a directory-module language is the shared Folder, while
+ * the edge starts at this file's node. Either way this ties that proof to the exact site. */
+static bool carrier_needs_site_proof(const file_resolver_t *resolver, const cbm_gbuf_node_t *source,
+                                     const char *scope, const cbm_resolve_result_t *result) {
+    if (!result->proof || !cbm_resolve_admit(result))
+        return false;
+    if (source == resolver->file_node && scope && scope[0] && strcmp(scope, source->qualified_name))
+        return true;
+    return resolver->file->language == CBM_LANG_GO &&
+           cbm_resolve_proof_view(result->proof)->key.start_byte == 0;
+}
+
+static const cbm_resolve_proof_t *carrier_occurrence_proof(const file_resolver_t *resolver,
+                                                           const char *source_qn, const char *name,
+                                                           const char *relation, uint32_t start,
+                                                           uint32_t end, CBMSourceOrigin origin,
+                                                           const cbm_resolve_result_t *result) {
+    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(resolver->bindings);
+    if (!context || !source_qn || !name)
+        return NULL;
+    cbm_resolve_proof_source_t source =
+        cbm_result_proof_source(resolver->file->result, origin, source_qn);
+    source.file = resolver->file->rel_path;
+    cbm_resolve_proof_key_t key = {.lookup_domain = source_qn,
+                                   .lookup_key = name,
+                                   .binding_identity = result->target,
+                                   .start_byte = start,
+                                   .end_byte = end,
+                                   .origin = (uint32_t)origin,
+                                   .detail = relation};
+    cbm_resolve_result_t site = *result;
+    site.proof = NULL;
+    site.reason = "extraction_carrier_occurrence";
+    return cbm_resolve_proof_leaf(context->pool, CBM_PROOF_SOURCE_FACT, &source, &key, &site);
 }
 
 /* Projection retains the complete source spelling and argument metadata.
@@ -2982,14 +3136,13 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     }
     const owner_variant_t *conditional =
         conditional_source_owner(resolver, source, start, end, origin);
-    if (source &&
-        (!source->file_path || strcmp(source->file_path, resolver->file->rel_path) ||
-         (source != resolver->file_node && (!source->label || strcmp(source->label, "Module")) &&
-          !target_materialized(resolver, source) && !conditional &&
-          !ecma_source_span_settles(resolver, source, start, resolver->source,
-                                    resolver->source_length)))) {
+    if (source && !source_identity_holds(resolver, source, conditional != NULL) &&
+        !(source->file_path && !strcmp(source->file_path, resolver->file->rel_path) &&
+          ecma_source_span_settles(resolver, source, start, resolver->source,
+                                   resolver->source_length))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
-        result.reason = "source_declaration_identity_conflict";
+        if (result.binding == CBM_RESOLVE_BINDING_UNIQUE)
+            result.reason = "source_declaration_identity_conflict";
     }
     if (target && !target_materialized(resolver, target) &&
         !ecma_target_span_settles(resolver, target, name, start, end, origin)) {
@@ -3021,6 +3174,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     const cbm_resolve_proof_t *binding =
         local_occurrence_proof(resolver, source ? source->qualified_name : scope, name, relation,
                                start, end, origin, &result);
+    if (!binding && source && carrier_needs_site_proof(resolver, source, scope, &result))
+        binding = carrier_occurrence_proof(resolver, source->qualified_name, name, relation, start,
+                                           end, origin, &result);
     if (conditional && result.proof && cbm_resolve_admit(&result)) {
         /* Extend local authority rather than cloning shared export ancestors
          * into every worker. An export summary cannot attest a local site. */
@@ -3069,34 +3225,64 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
 
 static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
     const CBMFileResult *result = resolver->file->result;
+    bool go = resolver->file->language == CBM_LANG_GO;
     for (int c = 0; c < result->calls.count; c++) {
         const CBMCall *call = &result->calls.items[c];
-        const semantic_site_t *site =
-            find_semantic(resolver, call->enclosing_func_qn, call->site_start_byte,
-                          call->site_end_byte, call->source_origin, CBM_RESOLVED_INVOCATION);
-        /* Exact simple JSX tags can obtain an independent lexical proof. An
-         * existing semantic result, including ambiguity, remains authoritative. */
-        bool lexical_jsx = call->requires_lsp_resolution &&
-                           cbm_resolve_binding_jsx_occurrence(
-                               resolver->bindings, call->callee_name, call->site_start_byte,
-                               call->site_end_byte, call->source_origin);
-        cbm_resolve_result_t outcome =
-            site ? semantic_result(resolver, site, arena)
-            : call->requires_lsp_resolution && !lexical_jsx
-                ? unresolved("semantic_resolution_required")
-                : generic_result(resolver, call->callee_name, call->enclosing_func_qn,
-                                 call->site_start_byte, call->site_end_byte, call->source_origin,
-                                 true);
-        if (resolver->file->language == CBM_LANG_GO && resolver->source_matches &&
-            call->source_origin == CBM_SOURCE_ORIGIN_RAW)
-            (void)cbm_go_stabilization_call(resolver->shared->go_types, resolver->file->rel_path,
-                                            call->enclosing_func_qn, call->site_start_byte,
-                                            call->site_end_byte, &outcome);
+        /* The shared fixed point decides a Go site it can answer, including ambiguity. A site
+         * it leaves unknown keeps whatever the hybrid engine proved on its own: an unknown
+         * operand here is missing knowledge, not a contradiction of that proof. Go's lookup
+         * goes through neither the registry nor a lexical adapter, so nothing else can answer. */
+        cbm_resolve_result_t stabilized = unresolved("go_callee_unresolved");
+        bool go_site =
+            go && resolver->source_matches && call->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+            cbm_go_stabilization_call(resolver->shared->go_types, resolver->file->rel_path,
+                                      call->enclosing_func_qn, call->site_start_byte,
+                                      call->site_end_byte, &stabilized);
+        cbm_resolve_result_t outcome;
+        if (go_site && stabilized.binding != CBM_RESOLVE_BINDING_UNRESOLVED) {
+            outcome = stabilized;
+        } else {
+            const semantic_site_t *site =
+                find_semantic(resolver, call->enclosing_func_qn, call->site_start_byte,
+                              call->site_end_byte, call->source_origin, CBM_RESOLVED_INVOCATION);
+            if (go) {
+                outcome = site ? semantic_result(resolver, site, arena) : stabilized;
+                if (!cbm_resolve_admit(&outcome))
+                    outcome = stabilized;
+            } else {
+                /* Exact simple JSX tags can obtain an independent lexical proof. An
+                 * existing semantic result, including ambiguity, remains authoritative. */
+                bool lexical_jsx = call->requires_lsp_resolution &&
+                                   cbm_resolve_binding_jsx_occurrence(
+                                       resolver->bindings, call->callee_name, call->site_start_byte,
+                                       call->site_end_byte, call->source_origin);
+                outcome = site ? semantic_result(resolver, site, arena)
+                          : call->requires_lsp_resolution && !lexical_jsx
+                              ? unresolved("semantic_resolution_required")
+                              : generic_result(resolver, call->callee_name, call->enclosing_func_qn,
+                                               call->site_start_byte, call->site_end_byte,
+                                               call->source_origin, true);
+            }
+        }
         if (!record_result(resolver, call->enclosing_func_qn, call->callee_name, "CALLS",
                            call->site_start_byte, call->site_end_byte, call->source_origin, outcome,
                            call))
             return false;
     }
+    return true;
+}
+
+/* Go's lexical and selector rules decide a reference token the fixed point analysed. Go
+ * has no other authority, so an unanalysed token skips the registry's lookup and its proof. */
+static bool go_reference(const file_resolver_t *resolver, uint32_t start, uint32_t end,
+                         CBMSourceOrigin origin, bool member, cbm_resolve_result_t *out) {
+    if (resolver->file->language != CBM_LANG_GO)
+        return false;
+    if (resolver->source_matches && origin == CBM_SOURCE_ORIGIN_RAW &&
+        cbm_go_stabilization_reference(resolver->shared->go_types, resolver->file->rel_path, start,
+                                       end, out))
+        return true;
+    *out = unresolved(member ? "receiver_type_required" : "go_reference_unresolved");
     return true;
 }
 
@@ -3136,13 +3322,16 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
             site = find_semantic(resolver, usage->enclosing_func_qn, usage->site_start_byte,
                                  usage->site_end_byte, usage->source_origin,
                                  CBM_RESOLVED_FIELD_REFERENCE);
-        cbm_resolve_result_t outcome =
-            site ? semantic_result(resolver, site, arena)
-            : usage->is_member_access
-                ? unresolved("receiver_type_required")
-                : generic_result(resolver, usage->ref_name, usage->enclosing_func_qn,
-                                 usage->site_start_byte, usage->site_end_byte, usage->source_origin,
-                                 false);
+        cbm_resolve_result_t outcome;
+        if (site)
+            outcome = semantic_result(resolver, site, arena);
+        else if (!go_reference(resolver, usage->site_start_byte, usage->site_end_byte,
+                               usage->source_origin, usage->is_member_access, &outcome))
+            outcome = usage->is_member_access
+                          ? unresolved("receiver_type_required")
+                          : generic_result(resolver, usage->ref_name, usage->enclosing_func_qn,
+                                           usage->site_start_byte, usage->site_end_byte,
+                                           usage->source_origin, false);
         /* Source binding can establish a direct callable argument without a
          * hybrid row. Composite expressions remain USAGE: the extraction
          * carrier deliberately leaves may_be_call_reference false for them. */
@@ -3164,12 +3353,16 @@ static bool resolve_writes(file_resolver_t *resolver, CBMArena *arena) {
         const semantic_site_t *site =
             find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte, rw->site_end_byte,
                           rw->source_origin, CBM_RESOLVED_FIELD_REFERENCE);
-        cbm_resolve_result_t outcome =
-            site ? semantic_result(resolver, site, arena)
-            : rw->is_member_access
-                ? unresolved("receiver_type_required")
-                : generic_result(resolver, rw->var_name, rw->enclosing_func_qn, rw->site_start_byte,
-                                 rw->site_end_byte, rw->source_origin, false);
+        cbm_resolve_result_t outcome;
+        if (site)
+            outcome = semantic_result(resolver, site, arena);
+        else if (!go_reference(resolver, rw->site_start_byte, rw->site_end_byte, rw->source_origin,
+                               rw->is_member_access, &outcome))
+            outcome = rw->is_member_access
+                          ? unresolved("receiver_type_required")
+                          : generic_result(resolver, rw->var_name, rw->enclosing_func_qn,
+                                           rw->site_start_byte, rw->site_end_byte,
+                                           rw->source_origin, false);
         if (!record_result(resolver, rw->enclosing_func_qn, rw->var_name,
                            rw->is_write ? "WRITES" : "READS", rw->site_start_byte,
                            rw->site_end_byte, rw->source_origin, outcome, NULL))
@@ -3187,13 +3380,16 @@ static bool resolve_types(file_resolver_t *resolver) {
                                                 type->site_start_byte, type->site_end_byte,
                                                 type->source_origin, CBM_RESOLVED_TYPE_REFERENCE)
                                 : NULL;
-        cbm_resolve_result_t outcome =
-            site ? semantic_result(resolver, site, resolver->arena)
-            : !type->site_is_exact
-                ? unresolved("type_occurrence_identity_missing")
-                : generic_result(resolver, type->type_name, type->enclosing_func_qn,
-                                 type->site_start_byte, type->site_end_byte, type->source_origin,
-                                 false);
+        cbm_resolve_result_t outcome;
+        if (site)
+            outcome = semantic_result(resolver, site, resolver->arena);
+        else if (!type->site_is_exact)
+            outcome = unresolved("type_occurrence_identity_missing");
+        else if (!go_reference(resolver, type->site_start_byte, type->site_end_byte,
+                               type->source_origin, false, &outcome))
+            outcome = generic_result(resolver, type->type_name, type->enclosing_func_qn,
+                                     type->site_start_byte, type->site_end_byte,
+                                     type->source_origin, false);
         if (!record_result(resolver, type->enclosing_func_qn, type->type_name, "USES_TYPE",
                            type->site_start_byte, type->site_end_byte, type->source_origin, outcome,
                            NULL))

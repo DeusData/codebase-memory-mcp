@@ -159,6 +159,24 @@ static void add_ts_annotation_refs(CBMExtractCtx *ctx, TSNode node, const char *
     }
 }
 
+/* Go spells wrappers around a name (`[]*v1.Pod`, `map[string]T`, `Box[T]`). Each named type
+ * inside is its own exact occurrence, where the wrapped text would match no site. */
+static void add_go_type_refs(CBMExtractCtx *ctx, TSNode node, const char *func_qn, unsigned depth) {
+    enum { MAX_GO_TYPE_DEPTH = 32 };
+    if (ts_node_is_null(node) || depth >= MAX_GO_TYPE_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "qualified_type") == 0) {
+        add_type_ref(ctx, cbm_node_text(ctx->arena, node, ctx->source), func_qn, node);
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        add_go_type_refs(ctx, ts_node_named_child(node, i), func_qn, depth + 1);
+    }
+}
+
 // Extract parameter types from a parameters/formal_parameters node.
 static void extract_param_type_refs(CBMExtractCtx *ctx, TSNode params, const char *func_qn) {
     uint32_t count = ts_node_child_count(params);
@@ -168,6 +186,8 @@ static void extract_param_type_refs(CBMExtractCtx *ctx, TSNode params, const cha
         if (!ts_node_is_null(type_node)) {
             if (ts_family(ctx->language)) {
                 add_ts_annotation_refs(ctx, type_node, func_qn, 0);
+            } else if (ctx->language == CBM_LANG_GO) {
+                add_go_type_refs(ctx, type_node, func_qn, 0);
                 continue;
             }
             const char *tname = extract_type_text(ctx->arena, type_node, ctx->source);
@@ -186,6 +206,10 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
             break;
         }
         if (!ts_node_is_null(rt)) {
+            if (ctx->language == CBM_LANG_GO) {
+                add_go_type_refs(ctx, rt, func_qn, 0);
+                break;
+            }
             const char *tname = extract_type_text(ctx->arena, rt, ctx->source);
             add_type_ref(ctx, tname, func_qn, rt);
             break;
@@ -199,6 +223,10 @@ static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *
     if (!ts_node_is_null(type_node) && ts_family(ctx->language)) {
         add_ts_annotation_refs(ctx, type_node, func_qn, 0);
     } else if (!ts_node_is_null(type_node)) {
+        if (ctx->language == CBM_LANG_GO) {
+            add_go_type_refs(ctx, type_node, func_qn, 0);
+            return;
+        }
         add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn,
                      type_node);
     }
@@ -387,10 +415,10 @@ static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkSta
         return;
     }
 
-    const char *func_qn;
-    if (state->enclosing_class_qn) {
-        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, func_name);
-    } else {
+    /* The scope a call in this body would get. file + bare name misses a Go package's
+     * directory-based module and a Go receiver, leaving a scope no graph node carries. */
+    const char *func_qn = cbm_declaration_scope_qn(ctx, node, cbm_lang_spec(ctx->language), state);
+    if (!func_qn) {
         func_qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, func_name);
     }
 
