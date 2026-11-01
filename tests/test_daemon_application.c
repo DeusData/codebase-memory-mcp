@@ -1662,6 +1662,7 @@ typedef struct {
      * itself instead, which is the edge a reader on another thread needs. */
     atomic_bool args_captured[APP_FAKE_MAX_ATTEMPTS];
     size_t memory_budgets[APP_FAKE_MAX_ATTEMPTS];
+    bool background_requests[APP_FAKE_MAX_ATTEMPTS];
 } app_fake_worker_context_t;
 
 typedef struct {
@@ -1729,6 +1730,8 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
                        args_json ? args_json : "");
         atomic_store(&context->args_captured[worker->attempt], true);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
+        context->background_requests[worker->attempt] =
+            cbm_mcp_get_bool_arg(args_json, "_cbm_background");
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
                            marker_file);
@@ -2546,6 +2549,7 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_TRUE(first_initialized);
     ASSERT_TRUE(first_owned);
     ASSERT_TRUE(auto_policy_propagated);
+    ASSERT_TRUE(fake.background_requests[0]);
     ASSERT_TRUE(second_initialized);
     ASSERT_TRUE(coalesced);
     ASSERT_TRUE(restricted_disconnect_kept_job);
@@ -2643,8 +2647,9 @@ TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls)
                            app_wait_for_active_jobs(application, 0);
 
     char grant_error[APP_TEST_PATH_CAP];
-    bool approved = ordinary_reaped && cbm_workspace_grant_add(cache, sensitive, sensitive, true,
-                                                               grant_error, sizeof(grant_error));
+    bool approved =
+        ordinary_reaped && cbm_workspace_grant_add(cache, sensitive, sensitive, true, false,
+                                                   grant_error, sizeof(grant_error));
     bool approved_initialized =
         approved && app_test_initialize_profile(&callbacks, approved_session, sensitive,
                                                 CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
@@ -2769,8 +2774,9 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
     bool ordinary_released = ordinary_watched && cbm_watcher_watch_count(watcher) == 0;
 
     char grant_error[APP_TEST_PATH_CAP];
-    bool approved = ordinary_released && cbm_workspace_grant_add(cache, sensitive, sensitive, true,
-                                                                 grant_error, sizeof(grant_error));
+    bool approved =
+        ordinary_released && cbm_workspace_grant_add(cache, sensitive, sensitive, true, false,
+                                                     grant_error, sizeof(grant_error));
     bool approved_initialized =
         approved && app_test_initialize_profile(&callbacks, approved_session, sensitive,
                                                 CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
@@ -2814,6 +2820,122 @@ TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
     ASSERT_TRUE(approved);
     ASSERT_TRUE(approved_watched);
     ASSERT_TRUE(watches_released);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(home_restored);
+    PASS();
+}
+
+/* Under `daemon start` a session that ENDS leaves its watch to the daemon, but
+ * a workspace-policy release is not a disconnect: once the session's root is
+ * no longer allowed (here its approval is revoked), the next request's
+ * refresh must still end the watch in a permanent generation too. */
+TEST(daemon_application_permanent_workspace_release_still_ends_watch) {
+    app_env_backup_t cache_environment;
+    app_env_backup_t home_environment;
+    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
+                              app_env_backup_capture(&home_environment, "HOME");
+    char sensitive_raw[APP_TEST_PATH_CAP];
+    char cache_raw[APP_TEST_PATH_CAP];
+    (void)snprintf(sensitive_raw, sizeof(sensitive_raw),
+                   "%s/cbm-app-permanent-release-home-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache_raw, sizeof(cache_raw), "%s/cbm-app-permanent-release-cache-XXXXXX",
+                   cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(sensitive_raw) != NULL && cbm_mkdtemp(cache_raw) != NULL;
+    char sensitive[APP_TEST_PATH_CAP] = {0};
+    char cache[APP_TEST_PATH_CAP] = {0};
+    bool canonical = dirs_ok && cbm_canonical_path(sensitive_raw, sensitive, sizeof(sensitive)) &&
+                     cbm_canonical_path(cache_raw, cache, sizeof(cache));
+    bool environments_set = environments_saved && canonical &&
+                            cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                            cbm_setenv("HOME", sensitive, 1) == 0;
+    cbm_config_t *stored_config = environments_set ? cbm_config_open(cache) : NULL;
+    bool config_ready = stored_config &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "false") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "true") == 0;
+    char *project = canonical ? cbm_project_name_from_path(sensitive) : NULL;
+    char db_path[APP_TEST_PATH_CAP] = {0};
+    if (project) {
+        (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    }
+    bool db_ready = config_ready && project && app_test_create_empty_file(db_path);
+    /* The root is $HOME, so only an explicit sensitive approval allows it. */
+    char grant_error[APP_TEST_PATH_CAP];
+    bool approved = db_ready && cbm_workspace_grant_add(cache, sensitive, sensitive, true, false,
+                                                        grant_error, sizeof(grant_error));
+    char grant_path[APP_TEST_PATH_CAP] = {0};
+    bool grant_path_ok =
+        approved && cbm_workspace_grant_path(cache, grant_path, sizeof(grant_path));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    cbm_daemon_application_config_t config = {
+        .watcher = watcher,
+        .config = stored_config,
+    };
+    cbm_daemon_application_t *application =
+        grant_path_ok && watcher ? cbm_daemon_application_new(&config) : NULL;
+    if (application) {
+        cbm_daemon_application_set_permanent(application, true);
+    }
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 4036) : NULL;
+
+    bool initialized = app_test_initialize_profile(&callbacks, session, sensitive,
+                                                   CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    int watch_while_approved = watcher ? cbm_watcher_watch_count(watcher) : -1;
+
+    /* Revoke the approval. Every request ends with a synchronous watch
+     * refresh, so one ping is the point where the policy is re-read. */
+    bool revoked = initialized && cbm_unlink(grant_path) == 0;
+    uint8_t *ping = NULL;
+    uint32_t ping_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool pinged = revoked &&
+                  app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
+                                        "{\"jsonrpc\":\"2.0\",\"id\":4136,\"method\":\"ping\"}",
+                                        &ping, &ping_length) &&
+                  app_test_request(&callbacks, session, ping, ping_length, &response,
+                                   &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(response);
+    free(ping);
+    int watch_after_revoke = watcher ? cbm_watcher_watch_count(watcher) : -1;
+
+    if (session) {
+        callbacks.session_cancel(callbacks.context, session);
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(store);
+    cbm_config_close(stored_config);
+    free(project);
+    (void)th_rmtree(sensitive);
+    (void)th_rmtree(cache);
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool home_restored = app_env_backup_restore(&home_environment);
+
+    ASSERT_TRUE(environments_saved);
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(environments_set);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(db_ready);
+    ASSERT_TRUE(approved);
+    ASSERT_TRUE(grant_path_ok);
+    ASSERT_TRUE(initialized);
+    ASSERT_EQ(watch_while_approved, 1);
+    ASSERT_TRUE(revoked);
+    ASSERT_TRUE(pinged);
+    /* A policy release, not a disconnect: the permanent watch ends as well. */
+    ASSERT_EQ(watch_after_revoke, 0);
     ASSERT_TRUE(stopped);
     ASSERT_TRUE(cache_restored);
     ASSERT_TRUE(home_restored);
@@ -4169,6 +4291,7 @@ TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(subscribed);
     ASSERT_TRUE(worker_started);
+    ASSERT_FALSE(fixture.fake.background_requests[0]);
     ASSERT_TRUE(request_returned);
     ASSERT_TRUE(thread_joined);
     ASSERT_EQ(request.status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
@@ -4466,6 +4589,7 @@ TEST(daemon_application_final_cancel_drains_admitted_watcher_job) {
     ASSERT_TRUE(fixture_ready);
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(worker_started);
+    ASSERT_TRUE(fixture.fake.background_requests[0]);
     ASSERT_TRUE(job_active);
     ASSERT_EQ(watches_after_cancel, 0);
     ASSERT_TRUE(thread_joined);
@@ -4582,6 +4706,252 @@ TEST(daemon_application_watcher_job_follows_exact_live_watch_owners) {
     ASSERT_TRUE(thread_joined);
     ASSERT_EQ(request.result, 1);
     ASSERT_EQ(atomic_load(&fixture.fake.destroys), 1);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+
+TEST(daemon_application_permanent_watch_survives_disconnect_and_indexes_without_session) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 47);
+
+    if (fixture_ready) {
+        cbm_daemon_application_set_permanent(fixture.application, true);
+    }
+
+    int watch_before_disconnect =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    if (fixture.session) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+    }
+
+    int watch_after_cancel =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    if (fixture.session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+        fixture.session = NULL;
+    }
+
+    int watch_after_close =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    /*
+     * No client session remains at this point. A permanent daemon-owned
+     * physical watch must nevertheless be allowed to launch its background
+     * indexing job.
+     */
+    app_watcher_index_thread_t request = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .pause_before_subscribe = false,
+        .result = -1,
+    };
+    atomic_init(&request.ready, false);
+    atomic_init(&request.proceed, true);
+    atomic_init(&request.done, false);
+
+    cbm_thread_t thread;
+    bool thread_started =
+        fixture_ready &&
+        watch_after_close == 1 &&
+        cbm_thread_create(&thread, 0, app_watcher_index_thread, &request) == 0;
+
+    bool worker_started =
+        thread_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+
+    int watch_during_job =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    /*
+     * The fake worker deliberately waits until the test releases it.
+     * Let the daemon-owned watcher job finish normally.
+     */
+    if (worker_started) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+
+    bool request_done =
+        thread_started && app_wait_for_atomic_bool(&request.done, true);
+
+    bool thread_joined =
+        request_done && cbm_thread_join(&thread) == 0;
+
+    int watch_after_job =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    int destroys_before_cleanup =
+        fixture_ready ? atomic_load(&fixture.fake.destroys) : -1;
+
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(watch_before_disconnect, 1);
+
+    /* Permanent mode: disconnect must not unwatch the project. */
+    ASSERT_EQ(watch_after_cancel, 1);
+    ASSERT_EQ(watch_after_close, 1);
+
+    /* No session exists, yet the watcher still owns background indexing. */
+    ASSERT_TRUE(thread_started);
+    ASSERT_TRUE(worker_started);
+    ASSERT_EQ(watch_during_job, 1);
+
+    ASSERT_TRUE(request_done);
+    ASSERT_TRUE(thread_joined);
+    ASSERT_EQ(request.result, 0);
+    ASSERT_EQ(destroys_before_cleanup, 1);
+
+    /* Completing the background job must not consume the persistent watch. */
+    ASSERT_EQ(watch_after_job, 1);
+
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+/* A permanent daemon keeps a project watched after its last session closes.
+ * delete_project from another session or the CLI removes the project's DB but
+ * owns no watch, so the watch itself must notice: a later change must end the
+ * orphaned watch, never re-create the deleted index. */
+TEST(daemon_application_permanent_watch_ends_when_project_db_is_deleted) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 48);
+    if (fixture_ready) {
+        cbm_daemon_application_set_permanent(fixture.application, true);
+        /* Should a job be admitted, it completes at once: the verdict is
+         * read from the start counter, never from a timeout. */
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    if (fixture.session) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+        fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+        fixture.session = NULL;
+    }
+    int watch_after_close = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool db_removed = fixture_ready && cbm_unlink(fixture.db_path) == 0;
+    int result = db_removed ? cbm_daemon_application_watcher_index(fixture.project, fixture.root,
+                                                                   fixture.application)
+                            : -2;
+    int starts = fixture_ready ? atomic_load(&fixture.fake.starts) : -1;
+    int watch_after_index = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(watch_after_close, 1);
+    ASSERT_TRUE(db_removed);
+    /* A harmless skip: nothing admitted, the deleted index stays deleted. */
+    ASSERT_EQ(result, 1);
+    ASSERT_EQ(starts, 0);
+    /* The orphaned physical watch is torn down. */
+    ASSERT_EQ(watch_after_index, 0);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+/* The second watcher callback either joins the running job (its retained
+ * ownership is the job's second subscriber) or returns. Both states latch, so
+ * whichever happens decides the wait; the deadline only catches "neither". */
+static bool app_wait_for_watcher_join_or_return(cbm_daemon_application_t *application,
+                                                const char *project, atomic_bool *returned) {
+    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    while (cbm_now_ms() < deadline) {
+        if (cbm_daemon_application_job_subscribers(application, project) == 2 ||
+            atomic_load(returned)) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return false;
+}
+
+/* A full reindex unlinks the project's DB while it rebuilds it, so a missing
+ * DB alone does not mean the project was deleted. While the permanent watch's
+ * own job runs, a second change in its root must join that job and keep the
+ * watch; once the job ends, both callbacks hand their ownership back. */
+TEST(daemon_application_permanent_watch_kept_while_its_reindex_runs) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 49);
+    if (fixture_ready) {
+        cbm_daemon_application_set_permanent(fixture.application, true);
+    }
+    if (fixture.session) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+        fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+        fixture.session = NULL;
+    }
+    int watch_after_close = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    app_watcher_index_thread_t first = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .pause_before_subscribe = false,
+        .result = -1,
+    };
+    atomic_init(&first.ready, false);
+    atomic_init(&first.proceed, true);
+    atomic_init(&first.done, false);
+    app_watcher_index_thread_t second = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .pause_before_subscribe = false,
+        .result = -1,
+    };
+    atomic_init(&second.ready, false);
+    atomic_init(&second.proceed, true);
+    atomic_init(&second.done, false);
+
+    /* The fake worker keeps the first job running until allow_completion. */
+    cbm_thread_t first_thread;
+    bool first_started = fixture_ready && watch_after_close == 1 &&
+                         cbm_thread_create(&first_thread, 0, app_watcher_index_thread, &first) == 0;
+    bool job_running = first_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    bool db_removed = job_running && cbm_unlink(fixture.db_path) == 0;
+    cbm_thread_t second_thread;
+    bool second_started =
+        db_removed && cbm_thread_create(&second_thread, 0, app_watcher_index_thread, &second) == 0;
+    bool settled = second_started && app_wait_for_watcher_join_or_return(
+                                         fixture.application, fixture.project, &second.done);
+    size_t subscribers_while_running =
+        fixture_ready ? cbm_daemon_application_job_subscribers(fixture.application, fixture.project)
+                      : 0;
+    bool second_returned_while_running = atomic_load(&second.done);
+    int watch_while_running = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    if (fixture_ready) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    bool first_joined = first_started && app_wait_for_atomic_bool(&first.done, true) &&
+                        cbm_thread_join(&first_thread) == 0;
+    bool second_joined = second_started && app_wait_for_atomic_bool(&second.done, true) &&
+                         cbm_thread_join(&second_thread) == 0;
+    int starts = fixture_ready ? atomic_load(&fixture.fake.starts) : -1;
+    size_t subscribers_after =
+        fixture_ready ? cbm_daemon_application_job_subscribers(fixture.application, fixture.project)
+                      : SIZE_MAX;
+    int watch_after = fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(watch_after_close, 1);
+    ASSERT_TRUE(job_running);
+    ASSERT_TRUE(db_removed);
+    ASSERT_TRUE(settled);
+    /* The second change joined the running job instead of ending the watch. */
+    ASSERT_EQ(subscribers_while_running, 2);
+    ASSERT_FALSE(second_returned_while_running);
+    ASSERT_EQ(watch_while_running, 1);
+    ASSERT_TRUE(first_joined);
+    ASSERT_TRUE(second_joined);
+    ASSERT_EQ(first.result, 0);
+    ASSERT_EQ(second.result, 0);
+    ASSERT_EQ(starts, 1);
+    /* Each callback released the ownership it retained at admission. */
+    ASSERT_EQ(subscribers_after, 0);
+    ASSERT_EQ(watch_after, 1);
     ASSERT_TRUE(cleaned);
     PASS();
 }
@@ -6928,8 +7298,9 @@ typedef struct {
     uint32_t context_length;
 } app_async_fixture_t;
 
-static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *label,
-                                   bool permanent) {
+/* stored_config is optional; a test that needs auto_index passes its own. */
+static bool app_async_fixture_init_with_config(app_async_fixture_t *fixture, const char *label,
+                                               bool permanent, cbm_config_t *stored_config) {
     memset(fixture, 0, sizeof(*fixture));
     app_fake_worker_context_init(&fixture->fake);
     fixture->ops = (cbm_daemon_application_worker_ops_t){
@@ -6940,7 +7311,8 @@ static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *lab
         .log_path = app_fake_worker_log_path,
         .destroy = app_fake_worker_destroy,
     };
-    cbm_daemon_application_config_t config = {.worker_ops = &fixture->ops};
+    cbm_daemon_application_config_t config = {.config = stored_config,
+                                              .worker_ops = &fixture->ops};
     fixture->application = cbm_daemon_application_new(&config);
     if (!fixture->application) {
         return false;
@@ -6959,6 +7331,11 @@ static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *lab
     return fixture->project &&
            app_test_context_request(fixture->root, fixture->root, &fixture->context,
                                     &fixture->context_length);
+}
+
+static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *label,
+                                   bool permanent) {
+    return app_async_fixture_init_with_config(fixture, label, permanent, NULL);
 }
 
 static cbm_daemon_runtime_application_session_t *app_async_session(app_async_fixture_t *fixture,
@@ -7338,6 +7715,78 @@ TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call) {
  * the daemon's only live session is refused async (the daemon would stop and
  * cancel the job as soon as the command exits), while status stays allowed and
  * a long-lived MCP session on the same temporary daemon remains a valid host. */
+/* Automatic indexing (session auto-index, watcher re-index) marks its job
+ * _cbm_background so the worker leaves CPU headroom. The marker picks the
+ * worker count, never what is indexed, so an explicit index_repository for the
+ * same root still JOINS the automatic job already running for it, the contract
+ * the repo_path fold above restored, instead of being refused as an options
+ * conflict. The worker is held, so the join is observed while the job runs. */
+TEST(daemon_application_explicit_index_joins_running_auto_index_job) {
+    app_env_backup_t cache_environment;
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-auto-join-cache-XXXXXX", cbm_tmpdir());
+    bool cache_ready =
+        cache_saved && cbm_mkdtemp(cache) != NULL && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+    cbm_config_t *stored_config = cache_ready ? cbm_config_open(cache) : NULL;
+    bool config_ready = stored_config &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    app_async_fixture_t fixture;
+    bool setup = config_ready &&
+                 app_async_fixture_init_with_config(&fixture, "auto-join", true, stored_config);
+
+    cbm_daemon_runtime_application_session_t *automatic =
+        setup ? app_test_open(&fixture.callbacks, 7801) : NULL;
+    bool auto_started = automatic &&
+                        app_test_initialize_profile(&fixture.callbacks, automatic, fixture.root,
+                                                    CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL) &&
+                        app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    /* args_json is published by the args_captured release store; the
+     * background_requests slot is written after it, so read the args. */
+    bool auto_marked = auto_started &&
+                       app_wait_for_atomic_bool(&fixture.fake.args_captured[0], true) &&
+                       cbm_mcp_get_bool_arg(fixture.fake.args_json[0], "_cbm_background");
+
+    cbm_daemon_runtime_application_session_t *explicit_session =
+        auto_marked ? app_async_session(&fixture, 7802) : NULL;
+    char *joined =
+        explicit_session ? app_async_call_now(&fixture, explicit_session, ",\"async\":true") : NULL;
+    int starts_while_running = atomic_load(&fixture.fake.starts);
+    size_t active_while_running =
+        setup ? cbm_daemon_application_active_jobs(fixture.application) : 0;
+
+    if (explicit_session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, explicit_session);
+    }
+    if (automatic) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, automatic);
+        fixture.callbacks.session_close(fixture.callbacks.context, automatic);
+    }
+    bool stopped = !setup || app_async_fixture_finish(&fixture);
+    cbm_config_close(stored_config);
+    bool cleaned = !cache_ready || th_rmtree(cache) == 0;
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(auto_started);
+    ASSERT_TRUE(auto_marked);
+    ASSERT_NOT_NULL(explicit_session);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_FALSE(app_async_contains(joined, "different options"));
+    ASSERT_FALSE(app_async_contains(joined, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(joined, "\"joined\":true"));
+    ASSERT_EQ(starts_while_running, 1);
+    ASSERT_EQ(active_while_running, 1);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cleaned);
+    ASSERT_TRUE(cache_restored);
+    free(joined);
+    PASS();
+}
+
 TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon) {
     app_async_fixture_t fixture;
     bool setup = app_async_fixture_init(&fixture, "async-refuse", false);
@@ -7658,6 +8107,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_permanent_workspace_release_still_ends_watch);
     RUN_TEST(daemon_application_ui_index_accepts_non_ascii_directory);
     RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
     RUN_TEST(daemon_application_async_index_returns_before_completion_and_status_polls);
@@ -7666,6 +8116,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_async_and_status_validation_errors);
     RUN_TEST(daemon_application_cancelled_sync_index_reply_offers_async);
     RUN_TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call);
+    RUN_TEST(daemon_application_explicit_index_joins_running_auto_index_job);
     RUN_TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon);
     RUN_TEST(daemon_application_unnamed_status_finds_async_job_of_root_owner_issue2134);
     RUN_TEST(daemon_application_unnamed_status_keeps_path_derived_key_issue2134);
@@ -7691,6 +8142,9 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_stale_watcher_callback_is_rejected_at_job_admission);
     RUN_TEST(daemon_application_final_cancel_drains_admitted_watcher_job);
     RUN_TEST(daemon_application_watcher_job_follows_exact_live_watch_owners);
+    RUN_TEST(daemon_application_permanent_watch_survives_disconnect_and_indexes_without_session);
+    RUN_TEST(daemon_application_permanent_watch_ends_when_project_db_is_deleted);
+    RUN_TEST(daemon_application_permanent_watch_kept_while_its_reindex_runs);
     RUN_TEST(daemon_application_late_watcher_session_owns_active_watcher_job);
     RUN_TEST(daemon_application_watch_roots_match_windows_separators_only);
     RUN_TEST(daemon_application_async_completion_disables_all_watches);
