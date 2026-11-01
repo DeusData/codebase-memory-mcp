@@ -1178,6 +1178,22 @@ static void scala_visit(scala_ctx_t *ctx, TSNode node, unsigned depth) {
         scala_visit_children(ctx, node, depth);
         return;
     }
+    if (!strcmp(kind, "instance_expression")) {
+        /* `new Foo(...)` constructs the class, whatever the term namespace holds. */
+        const char *type =
+            scala_type_text(ctx->walk, ts_node_named_child(node, 0), ctx->type_params);
+        if (type) {
+            scala_ref_t ref =
+                strchr(type, '.') ? scala_resolve_path(ctx, type) : scala_name(ctx, type, -1);
+            if (ref.kind == SCALA_TEMPLATE && ref.decl)
+                ref.kind = SCALA_CLASS;
+            if (ref.kind != SCALA_CLASS)
+                ref = (scala_ref_t){.reason = "scala_class_not_in_project"};
+            scala_emit(ctx, node, &ref, -1);
+        }
+        scala_visit_children(ctx, node, depth);
+        return;
+    }
     if (!strcmp(kind, "lambda_expression")) {
         scala_local_t *saved = ctx->locals;
         TSNode parameters = cbm_source_field(node, "parameters");

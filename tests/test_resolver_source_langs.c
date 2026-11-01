@@ -630,13 +630,35 @@ static const char RB_BASE[] = "module Sinatra\n"
                               "  1\n"
                               "end\n";
 
+static const char RB_BARE[] = "class Bare\n"
+                              "  def helper\n"
+                              "    1\n"
+                              "  end\n"
+                              "  def calls\n"
+                              "    helper\n"
+                              "  end\n"
+                              "  def shadowed\n"
+                              "    helper = 2\n"
+                              "    helper\n"
+                              "  end\n"
+                              "  def rebound\n"
+                              "    helper = 1\n"
+                              "    helper = helper + 1\n"
+                              "  end\n"
+                              "  def param(helper)\n"
+                              "    helper\n"
+                              "  end\n"
+                              "end\n";
+
 #define RB_FILE "lib/sinatra/base.rb"
+#define RB_BARE_FILE "lib/sinatra/bare.rb"
 #define RB_CALL(id, caller_name, text, tsuffix, tline, tdecl)                                  \
     SL_CALL_AT(id, RB_FILE, caller_name, text, 0, RB_FILE, tsuffix, "Method", tline, tdecl)
 #define RB_OWN "    def own"
 
 TEST(resolver_source_ruby_ancestor_chain_and_self_rules) {
-    static const RQ_Source sources[] = {{.path = RB_FILE, .text = RB_BASE}};
+    static const RQ_Source sources[] = {{.path = RB_FILE, .text = RB_BASE},
+                                        {.path = RB_BARE_FILE, .text = RB_BARE}};
     static const RQ_Expected expected[] = {
         RB_CALL("singleton-method-from-class-self", "Base.get", "route('GET', path)", "Base.route",
                 16, "      def route(verb, path)"),
@@ -656,6 +678,8 @@ TEST(resolver_source_ruby_ancestor_chain_and_self_rules) {
                    RB_FILE, "Base.own", "Method", 29, RB_OWN),
         SL_CALL_AT("superclass-method", RB_FILE, "Child.call_inherited", "own()", 5, RB_FILE,
                    "Base.own", "Method", 29, RB_OWN),
+        SL_CALL_AT("bare-name-no-assignment-precedes", RB_BARE_FILE, "Bare.calls", "helper", 1,
+                   RB_BARE_FILE, "Bare.helper", "Method", 2, "  def helper"),
     };
     static const RQ_Forbidden forbidden[] = {
         SL_DENY_AT("receiver-of-unknown-class", RB_FILE, "Base.no_unknown_receiver", "thing.own()",
@@ -665,6 +689,11 @@ TEST(resolver_source_ruby_ancestor_chain_and_self_rules) {
         SL_DENY_AT("local-assigned-twice", RB_FILE, "Base.no_reassigned", "made.other_m()", 1),
         SL_DENY_AT("constant-outside-the-project", RB_FILE, "Base.no_outside", "Outside.settings",
                    0),
+        SL_DENY_AT("bare-name-after-its-assignment-is-the-local", RB_BARE_FILE, "Bare.shadowed",
+                   "helper", 3),
+        SL_DENY_AT("right-of-a-second-assignment-is-the-local", RB_BARE_FILE, "Bare.rebound",
+                   "helper", 6),
+        SL_DENY_AT("parameter-is-the-local", RB_BARE_FILE, "Bare.param", "helper", 8),
     };
     ASSERT(sl_check("ruby-rules", ".rb", "def filler\n  1\nend\n", sources,
                     sizeof(sources) / sizeof(sources[0]), expected,
@@ -713,7 +742,13 @@ static const char DART_MAIN[] =
     "  void ownM() {}\n"
     "}\n"
     "void fromLibrary() {}\n"
-    "void topLocal() {}\n";
+    "void topLocal() {}\n"
+    "class Chains {\n"
+    "  final Extra extra = Extra();\n"
+    "  Extra give() => extra;\n"
+    "  void callsDeep() { give().deep(); }\n"
+    "  void callsCascade() { extra..casc(); }\n"
+    "}\n";
 static const char DART_PART[] = "part of 'main.dart';\n"
                                 "void fromPart() {}\n"
                                 "void partCalls() { topLocal(); }\n";
@@ -728,7 +763,11 @@ static const char DART_STORE[] = "class Store {\n"
                                  "void helper() {}\n"
                                  "void notShown() {}\n"
                                  "void _private() {}\n"
-                                 "void hiddenName() {}\n";
+                                 "void hiddenName() {}\n"
+                                 "class Extra {\n"
+                                 "  void deep() {}\n"
+                                 "  void casc() {}\n"
+                                 "}\n";
 static const char DART_BASE[] = "abstract class Base {\n"
                                 "  void fromBase() {}\n"
                                 "  void fromLibrary() {}\n"
@@ -809,6 +848,12 @@ TEST(resolver_source_dart_lexical_scope_libraries_and_receivers) {
         SL_CALL_AT("part-sees-its-library", "lib/main_part.dart", "main_part.partCalls",
                    "topLocal()", 0, DART_FILE, "main.topLocal", "Function", 39,
                    "void topLocal() {}"),
+        SL_CALL_AT("function-with-a-declared-return-type", DART_FILE, "Chains.callsDeep", "give()",
+                   0, DART_FILE, "Chains.give", "Method", 42, "  Extra give() => extra;"),
+        SL_CALL_AT("member-deep-in-a-selector-chain", DART_FILE, "Chains.callsDeep", ".deep()", 0,
+                   DART_STORE_FILE, "Extra.deep", "Method", 12, "  void deep() {}"),
+        SL_CALL_AT("cascade-selects-on-its-receiver", DART_FILE, "Chains.callsCascade", "..casc()",
+                   0, DART_STORE_FILE, "Extra.casc", "Method", 13, "  void casc() {}"),
         SL_CALL_AT("own-member-under-an-outside-superclass", "lib/ext.dart", "W.callsOwnW",
                    "ownW()", 0, "lib/ext.dart", "W.ownW", "Method", 9, "  void ownW() {}"),
     };
@@ -1134,6 +1179,8 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
         SC_PUT("plain-class-parameter", "callsPrivateParam", "other.put()"),
         SC_PUT("field-from-new", "callsField", "made.put()"),
         SC_PUT("declared-parameter", "callsParam", "p.put()"),
+        SC_CALL("new-constructs-the-class", "callsLocal", "new Box(3)", 0, SC_FILE, "Main.Box",
+                "Class", 20, "object Box {"),
         SC_PUT("local-from-new", "callsLocal", "l.put()"),
         SC_MAKE("companion-method", "callsTyped", 0),
         SC_PUT("declared-local", "callsTyped", "t.put()"),
@@ -1143,6 +1190,8 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
         SC_CALL("case-class-apply-constructs", "callsCaseApply", "Box(4)", 0, SC_FILE, "Main.Box",
                 "Class", 20, "object Box {"),
         SC_PUT("member-of-a-constructed-case-class", "callsCaseApply", "Box(4).put()"),
+        SC_CALL("new-of-a-class-with-no-companion", "callsPlainNew", "new Plain()", 0, SC_FILE,
+                "Main.Plain", "Class", 23, "class Plain {"),
         SC_CALL("member-after-new", "callsPlainNew", "new Plain().go()", 0, SC_FILE, "Plain.go",
                 "Method", 24, "  def go(): Unit = ()"),
         SC_CALL("another-file-of-the-package", "callsPackageFn", "sameOther()", 0,
@@ -1154,6 +1203,8 @@ TEST(resolver_source_scala_packages_precedence_and_receivers) {
                 "src/lib/Util.scala", "Wild.fromWild", "Method", 7, "  def fromWild(): Unit = ()"),
         SC_CALL("renamed-import", "callsRenamed", "R.renamed()", 0, "src/lib/Util.scala",
                 "Renames.renamed", "Method", 10, "  def renamed(): Unit = ()"),
+        SC_CALL("new-beside-a-shadowing-local", "localShadows", "new Plain()", 1, SC_FILE,
+                "Main.Plain", "Class", 23, "class Plain {"),
         SC_CALL("local-shadows-parameter-with-its-own-type", "localShadows", "box.go()", 0, SC_FILE,
                 "Plain.go", "Method", 24, "  def go(): Unit = ()"),
         SL_CALL_AT("own-member-under-an-outside-parent", SC_FILE, "Open.callsOwnOpen", "own()", 1,

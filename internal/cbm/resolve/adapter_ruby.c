@@ -809,7 +809,8 @@ static void ruby_visit(ruby_visit_t *visit, TSNode node, unsigned depth) {
     if (!strcmp(syntax, "block_parameters") || !strcmp(syntax, "lambda_parameters") ||
         !strcmp(syntax, "method_parameters") || !strcmp(syntax, "left_assignment_list") ||
         !strcmp(syntax, "exception_variable") || !strcmp(syntax, "alias") ||
-        !strcmp(syntax, "undef") || strstr(syntax, "pattern"))
+        !strcmp(syntax, "undef") || strstr(syntax, "pattern") ||
+        (!strcmp(syntax, "unary") && cbm_source_token(node, "defined?")))
         return;
     if (!strcmp(syntax, "assignment") || !strcmp(syntax, "operator_assignment")) {
         TSNode left = cbm_source_field(node, "left");
