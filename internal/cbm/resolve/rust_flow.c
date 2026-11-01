@@ -1448,6 +1448,25 @@ static int rs_closure_params_for(rs_walk_t *w, const rs_type_t *receiver, const 
     return 0;
 }
 
+#define RS_MAP_ENTRY "std::collections::hash_map::Entry"
+#define RS_MAP_OCCUPIED "std::collections::hash_map::OccupiedEntry"
+#define RS_MAP_VACANT "std::collections::hash_map::VacantEntry"
+
+static const rs_type_t *rs_pair_of(CBMArena *arena, const rs_type_t *a, const rs_type_t *b) {
+    rs_type_t *pair = rs_type_new(arena, RT_TUPLE);
+    if (!pair)
+        return &RS_UNKNOWN_TYPE;
+    pair->args = cbm_arena_alloc(arena, 2 * sizeof(*pair->args));
+    if (pair->args) {
+        pair->args[0] = a;
+        pair->args[1] = b;
+        pair->nargs = 2;
+    }
+    return pair;
+}
+
+static const rs_type_t *rs_element_of(rs_walk_t *w, const rs_type_t *iterable);
+
 static const rs_type_t *rs_iter_method(rs_walk_t *w, const rs_type_t *type, const char *name,
                                        const rs_type_t *closure_ret) {
     CBMArena *arena = w->arena;
@@ -1457,8 +1476,9 @@ static const rs_type_t *rs_iter_method(rs_walk_t *w, const rs_type_t *type, cons
                                        "step_by",  "by_ref",     "into_iter",  "iter",    NULL};
     if (rs_name_in(name, same))
         return type;
-    static const char *const option_element[] = {"next", "last",      "nth",  "min", "max",
-                                                 "find", "next_back", "peek", NULL};
+    static const char *const option_element[] = {
+        "next",  "last",       "nth",        "min",    "max",    "find",   "next_back", "peek",
+        "rfind", "min_by_key", "max_by_key", "min_by", "max_by", "reduce", NULL};
     if (rs_name_in(name, option_element))
         return rs_option_of(arena, element);
     if (!strcmp(name, "map"))
@@ -1476,18 +1496,10 @@ static const rs_type_t *rs_iter_method(rs_walk_t *w, const rs_type_t *type, cons
                               : &RS_UNKNOWN_TYPE);
     if (!strcmp(name, "cloned") || !strcmp(name, "copied"))
         return rs_iter_of(arena, rs_peel(element));
-    if (!strcmp(name, "enumerate")) {
-        rs_type_t *pair = rs_type_new(arena, RT_TUPLE);
-        if (!pair)
-            return &RS_UNKNOWN_TYPE;
-        pair->args = cbm_arena_alloc(arena, 2 * sizeof(*pair->args));
-        if (pair->args) {
-            pair->args[0] = &RS_UNKNOWN_TYPE;
-            pair->args[1] = element;
-            pair->nargs = 2;
-        }
-        return rs_iter_of(arena, pair);
-    }
+    if (!strcmp(name, "enumerate"))
+        return rs_iter_of(arena, rs_pair_of(arena, &RS_UNKNOWN_TYPE, element));
+    if (!strcmp(name, "flatten"))
+        return rs_iter_of(arena, rs_element_of(w, element));
     return &RS_UNKNOWN_TYPE;
 }
 
@@ -1522,6 +1534,14 @@ static const rs_type_t *rs_option_method(rs_walk_t *w, const rs_type_t *type, co
     if (!strcmp(name, "get_or_insert_with") || !strcmp(name, "insert") ||
         !strcmp(name, "get_or_insert"))
         return rs_ref_of(arena, inner);
+    if (!strcmp(name, "flatten"))
+        return rs_ext_is(rs_peel(inner), "std::option::Option") ? rs_peel(inner) : &RS_UNKNOWN_TYPE;
+    /* Option<Result<T, E>> becomes Result<Option<T>, E>. */
+    if (!strcmp(name, "transpose") && rs_ext_is_result(rs_peel(inner)))
+        return rs_result_of(arena, rs_option_of(arena, rs_arg(rs_peel(inner), 0)),
+                            rs_arg(rs_peel(inner), 1));
+    if ((!strcmp(name, "map_or") || !strcmp(name, "map_or_else")) && closure_ret)
+        return closure_ret;
     return &RS_UNKNOWN_TYPE;
 }
 
@@ -1549,6 +1569,11 @@ static const rs_type_t *rs_result_method(rs_walk_t *w, const rs_type_t *type, co
         return closure_ret ? closure_ret : &RS_UNKNOWN_TYPE;
     if (!strcmp(name, "clone"))
         return type;
+    /* Result<Option<T>, E> becomes Option<Result<T, E>>. */
+    if (!strcmp(name, "transpose") && rs_ext_is(rs_peel(ok), "std::option::Option"))
+        return rs_option_of(arena, rs_result_of(arena, rs_arg(rs_peel(ok), 0), err));
+    if ((!strcmp(name, "map_or") || !strcmp(name, "map_or_else")) && closure_ret)
+        return closure_ret;
     return &RS_UNKNOWN_TYPE;
 }
 
@@ -1569,14 +1594,20 @@ static const rs_type_t *rs_seq_method(rs_walk_t *w, const rs_type_t *type, const
         return rs_option_of(arena, element);
     if (!strcmp(name, "remove") || !strcmp(name, "swap_remove"))
         return element;
-    if (!strcmp(name, "clone") || !strcmp(name, "to_vec"))
+    if (!strcmp(name, "clone") || !strcmp(name, "to_vec") || !strcmp(name, "to_owned"))
         return type->kind == RT_ARRAY ? rs_ext_type(arena, "std::vec::Vec", element, NULL) : type;
-    if (!strcmp(name, "as_slice") || !strcmp(name, "as_mut_slice")) {
+    if (!strcmp(name, "split_off"))
+        return type;
+    static const char *const slices[] = {"as_slice", "as_mut_slice", NULL};
+    static const char *const slice_runs[] = {
+        "windows", "chunks", "chunks_exact", "chunks_mut", "rchunks", "split", NULL};
+    if (rs_name_in(name, slices) || rs_name_in(name, slice_runs)) {
         rs_type_t *slice = rs_type_new(arena, RT_ARRAY);
         if (!slice)
             return &RS_UNKNOWN_TYPE;
         slice->inner = element;
-        return rs_ref_of(arena, slice);
+        const rs_type_t *reference = rs_ref_of(arena, slice);
+        return rs_name_in(name, slices) ? reference : rs_iter_of(arena, reference);
     }
     return &RS_UNKNOWN_TYPE;
 }
@@ -1598,20 +1629,41 @@ static const rs_type_t *rs_map_method(rs_walk_t *w, const rs_type_t *type, const
         return rs_iter_of(arena, key);
     if (!strcmp(name, "clone"))
         return type;
-    if (!strcmp(name, "iter") || !strcmp(name, "iter_mut") || !strcmp(name, "into_iter")) {
-        bool owned = !strcmp(name, "into_iter");
-        rs_type_t *pair = rs_type_new(arena, RT_TUPLE);
-        if (!pair)
-            return &RS_UNKNOWN_TYPE;
-        pair->args = cbm_arena_alloc(arena, 2 * sizeof(*pair->args));
-        if (pair->args) {
-            pair->args[0] = owned ? key : rs_ref_of(arena, key);
-            pair->args[1] = owned ? value : rs_ref_of(arena, value);
-            pair->nargs = 2;
-        }
-        return rs_iter_of(arena, pair);
-    }
+    const rs_type_t *ref_pair = rs_pair_of(arena, rs_ref_of(arena, key), rs_ref_of(arena, value));
+    if (!strcmp(name, "iter") || !strcmp(name, "iter_mut"))
+        return rs_iter_of(arena, ref_pair);
+    if (!strcmp(name, "into_iter") || !strcmp(name, "drain"))
+        return rs_iter_of(arena, rs_pair_of(arena, key, value));
+    if (!strcmp(name, "entry"))
+        return rs_ext_type(arena, RS_MAP_ENTRY, key, value);
+    static const char *const ref_pairs[] = {"first_key_value", "last_key_value", "get_key_value",
+                                            NULL};
+    if (rs_name_in(name, ref_pairs))
+        return rs_option_of(arena, ref_pair);
+    static const char *const owned_pairs[] = {"pop_first", "pop_last", "remove_entry", NULL};
+    if (rs_name_in(name, owned_pairs))
+        return rs_option_of(arena, rs_pair_of(arena, key, value));
     return &RS_UNKNOWN_TYPE;
+}
+
+/* The map entry API, whichever map handed it out. */
+static const rs_type_t *rs_entry_method(CBMArena *arena, const rs_type_t *type, const char *name) {
+    const rs_type_t *key = rs_arg(type, 0), *value = rs_arg(type, 1);
+    if (!strcmp(name, "key"))
+        return rs_ref_of(arena, key);
+    if (rs_ext_is(type, RS_MAP_ENTRY)) {
+        static const char *const inserting[] = {"or_default", "or_insert", "or_insert_with",
+                                                "or_insert_with_key", NULL};
+        if (rs_name_in(name, inserting))
+            return rs_ref_of(arena, value);
+        return !strcmp(name, "and_modify") ? type : &RS_UNKNOWN_TYPE;
+    }
+    if (rs_ext_is(type, RS_MAP_VACANT))
+        return !strcmp(name, "insert") ? rs_ref_of(arena, value) : &RS_UNKNOWN_TYPE;
+    static const char *const borrowing[] = {"get", "get_mut", "into_mut", NULL};
+    if (rs_name_in(name, borrowing))
+        return rs_ref_of(arena, value);
+    return !strcmp(name, "insert") || !strcmp(name, "remove") ? value : &RS_UNKNOWN_TYPE;
 }
 
 static bool rs_anyhow_context_in_scope(rs_walk_t *w) {
@@ -1644,6 +1696,9 @@ static const rs_type_t *rs_ext_method_ret(rs_walk_t *w, const rs_type_t *receive
             return rs_seq_method(w, type, name);
         if (rs_is_map(type))
             return rs_map_method(w, type, name);
+        if (rs_ext_is(type, RS_MAP_ENTRY) || rs_ext_is(type, RS_MAP_OCCUPIED) ||
+            rs_ext_is(type, RS_MAP_VACANT))
+            return rs_entry_method(arena, type, name);
         if (rs_is_set(type)) {
             if (!strcmp(name, "iter"))
                 return rs_iter_of(arena, rs_ref_of(arena, rs_arg(type, 0)));
@@ -1651,6 +1706,12 @@ static const rs_type_t *rs_ext_method_ret(rs_walk_t *w, const rs_type_t *receive
                 return rs_iter_of(arena, rs_arg(type, 0));
             if (!strcmp(name, "clone"))
                 return type;
+            static const char *const borrowed[] = {"get", "first", "last", NULL};
+            if (rs_name_in(name, borrowed))
+                return rs_option_of(arena, rs_ref_of(arena, rs_arg(type, 0)));
+            static const char *const owned[] = {"take", "pop_first", "pop_last", NULL};
+            if (rs_name_in(name, owned))
+                return rs_option_of(arena, rs_arg(type, 0));
             return &RS_UNKNOWN_TYPE;
         }
         if (rs_ext_is(type, "std::cell::RefCell")) {
@@ -2134,6 +2195,17 @@ static const rs_type_t *rs_payload_type(rs_walk_t *w, const rs_sel_t *sel,
             return rs_arg(peeled, 0);
         if (!strcmp(path, "std::result::Result::Err") && rs_ext_is_result(peeled))
             return rs_arg(peeled, 1);
+        /* `Entry::Occupied(e)`, under whichever path this map's Entry is named. */
+        if (rs_ext_is(peeled, RS_MAP_ENTRY)) {
+            size_t length = strlen(path);
+            static const char occupied[] = "Entry::Occupied", vacant[] = "Entry::Vacant";
+            if (length >= sizeof(occupied) - 1 &&
+                !strcmp(path + length - (sizeof(occupied) - 1), occupied))
+                return rs_ext_type(w->arena, RS_MAP_OCCUPIED, rs_arg(peeled, 0), rs_arg(peeled, 1));
+            if (length >= sizeof(vacant) - 1 &&
+                !strcmp(path + length - (sizeof(vacant) - 1), vacant))
+                return rs_ext_type(w->arena, RS_MAP_VACANT, rs_arg(peeled, 0), rs_arg(peeled, 1));
+        }
         return &RS_UNKNOWN_TYPE;
     }
     const rs_item_t *owner = sel->variant_enum ? sel->variant_enum : sel->ctor;
@@ -2167,8 +2239,13 @@ static void rs_bind_tuple_struct(rs_walk_t *w, TSNode node, const rs_type_t *typ
         rs_emit(w, CBM_RUST_SITE_REF, ts_node_start_byte(head), ts_node_end_byte(head), &sel);
     int position = 0;
     bool typed = true;
-    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-        TSNode child = ts_node_named_child(node, i);
+    for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
+        TSNode child = ts_node_child(node, i);
+        /* `_` is an anonymous token and it holds a position: `Foo(_, v)`. */
+        if (!ts_node_is_named(child)) {
+            position += rs_is(child, "_") ? 1 : 0;
+            continue;
+        }
         if (ts_node_eq(child, head))
             continue;
         if (rs_is(child, "remaining_field_pattern")) {
@@ -2315,8 +2392,13 @@ static void rs_bind_pattern(rs_walk_t *w, TSNode node, const rs_type_t *type) {
         const rs_type_t *peeled = rs_peel(type);
         int position = 0;
         bool typed = peeled->kind == RT_TUPLE;
-        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
-            TSNode child = ts_node_named_child(node, i);
+        for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
+            TSNode child = ts_node_child(node, i);
+            /* `_` is an anonymous token and it holds a position: `(_, v)`. */
+            if (!ts_node_is_named(child)) {
+                position += rs_is(child, "_") ? 1 : 0;
+                continue;
+            }
             if (rs_is(child, "remaining_field_pattern")) {
                 typed = false;
                 continue;
@@ -2682,8 +2764,6 @@ static const rs_type_t *rs_walk_path_call(rs_walk_t *w, TSNode call, TSNode call
     return rs_ctor_result(w, &sel);
 }
 
-static const rs_type_t *rs_element_of(rs_walk_t *w, const rs_type_t *iterable);
-
 static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode callee,
                                             TSNode arguments) {
     TSNode access = callee;
@@ -2747,6 +2827,16 @@ static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode ca
         w->collected = rs_element_of(w, receiver);
         w->collected_end = ts_node_end_byte(call);
         w->collected_delta = w->site_delta;
+    }
+    /* zip pairs this element with the argument's. */
+    if (!strcmp(name, "zip") && args.first) {
+        const rs_type_t *peeled = rs_peel(receiver);
+        if (peeled->kind == RT_ITER)
+            return rs_iter_of(w->arena,
+                              rs_pair_of(w->arena, peeled->inner, rs_element_of(w, args.first)));
+        if (rs_ext_is(peeled, "std::option::Option"))
+            return rs_option_of(
+                w->arena, rs_pair_of(w->arena, rs_arg(peeled, 0), rs_arg(rs_peel(args.first), 0)));
     }
     return rs_ext_method_ret(w, receiver, name, args.closure_ret);
 }
@@ -2897,7 +2987,7 @@ static const rs_type_t *rs_element_of(rs_walk_t *w, const rs_type_t *iterable) {
         return rs_peel(rs_arg(type, 0))->inner;
     if (rs_is_seq(type))
         element = rs_seq_element(type);
-    else if (rs_is_set(type) || rs_ext_is(type, "std::option::Option"))
+    else if (rs_is_set(type) || rs_ext_is(type, "std::option::Option") || rs_ext_is_result(type))
         element = rs_arg(type, 0);
     else if (rs_is_map(type)) {
         const rs_type_t *pair = rs_iter_of(arena, NULL);
@@ -3005,8 +3095,13 @@ static const rs_type_t *rs_walk_closure(rs_walk_t *w, TSNode node) {
     rs_scope_push(w, &scope, false);
     TSNode list = rs_field(node, "parameters");
     int position = 0;
-    for (uint32_t i = 0; !ts_node_is_null(list) && i < ts_node_named_child_count(list); i++) {
-        TSNode param = ts_node_named_child(list, i);
+    for (uint32_t i = 0; !ts_node_is_null(list) && i < ts_node_child_count(list); i++) {
+        TSNode param = ts_node_child(list, i);
+        /* `_` is an anonymous token and it holds a position: `|_, v|`. */
+        if (!ts_node_is_named(param)) {
+            position += rs_is(param, "_") ? 1 : 0;
+            continue;
+        }
         const rs_type_t *fallback =
             position < given && position < 2 ? params[position] : &RS_UNKNOWN_TYPE;
         if (rs_is(param, "parameter")) {
