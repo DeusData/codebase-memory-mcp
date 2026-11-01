@@ -7570,14 +7570,15 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Pi",
         "Sourcegraph Cody",
         "Oh My Pi (omp)",
+        "ZCode",
     };
-    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 45U);
+    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 46U);
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
-    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "46 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("README must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("README must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -7590,9 +7591,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("pkg/npm/README.md");
     if (!data)
         FAIL("could not read npm README for supported-agent contract");
-    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "46 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("npm README must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("npm README must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -7605,9 +7606,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/index.html");
     if (!data)
         FAIL("could not read docs/index.html for supported-agent contract");
-    if (!strstr(data, "configures 45 automatic/conditional client surfaces")) {
+    if (!strstr(data, "configures 46 automatic/conditional client surfaces")) {
         free(data);
-        FAIL("landing page must describe all 45 automatic/conditional client surfaces accurately");
+        FAIL("landing page must describe all 46 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -7626,7 +7627,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
             FAIL("CLI help must list every automatic/conditional client surface");
         }
     }
-    if (!strstr(data, "Supported automatic/conditional client surfaces (45)")) {
+    if (!strstr(data, "Supported automatic/conditional client surfaces (46)")) {
         free(data);
         FAIL("CLI help must not describe all conditional surfaces as auto-detected");
     }
@@ -7635,10 +7636,10 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/llms.txt");
     if (!data)
         FAIL("could not read docs/llms.txt for supported-agent contract");
-    if (!strstr(data, "45 automatic/conditional client surfaces") ||
-        !strstr(data, "39 automatically detected") || !strstr(data, "6 conditional/explicit")) {
+    if (!strstr(data, "46 automatic/conditional client surfaces") ||
+        !strstr(data, "40 automatically detected") || !strstr(data, "6 conditional/explicit")) {
         free(data);
-        FAIL("llms.txt must describe the 45-surface 39+6 support matrix accurately");
+        FAIL("llms.txt must describe the 46-surface 40+6 support matrix accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
