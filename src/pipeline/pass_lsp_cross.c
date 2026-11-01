@@ -1948,7 +1948,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         return;
 
     cbm_resolve_proof_pool_t proof_pool;
-    cbm_resolve_proof_pool_init(&proof_pool, dst_arena, 0, 0, 0);
+    cbm_resolve_proof_pool_init_project(&proof_pool, dst_arena);
     cbm_resolve_proof_clone_session_t proofs;
     (void)cbm_resolve_proof_clone_begin(&proofs, &proof_pool);
     /* The complete source batch remains alive until clone_end. A shared
@@ -2395,6 +2395,55 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                                        rust_shared_ctx, bindings, NULL);
 }
 
+struct cbm_oo_index *cbm_pxc_build_oo_index(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                            CBMFileResult **cache, const cbm_file_info_t *files,
+                                            int file_count) {
+    bool any = false;
+    for (int i = 0; i < file_count && !any; i++)
+        any = cbm_oo_language(files[i].language);
+    if (!any)
+        return NULL;
+    cbm_oo_index_t *index = cbm_oo_index_new(arena);
+    if (!index)
+        return NULL;
+    for (int i = 0; i < file_count; i++) {
+        if (!cbm_oo_language(files[i].language))
+            continue;
+        bool loaded = false;
+        CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+        if (!result)
+            continue;
+        int source_len = result->source_len;
+        const char *source = result->source;
+        char *owned = NULL;
+        if (!source || source_len <= 0) {
+            owned = pxc_read_file(files[i].path, &source_len);
+            source = owned;
+        }
+        if (source && source_len > 0)
+            (void)cbm_oo_index_add_file(index, files[i].language, files[i].rel_path, result, source,
+                                        source_len);
+        cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
+        cbm_pipeline_result_release(result, loaded);
+    }
+    cbm_oo_index_seal(index);
+    return index;
+}
+
+/* Strict static selection for this file; rows join by exact occurrence. */
+static void pxc_run_oo(CBMLanguage lang, CBMFileResult *result, const char *source, int source_len,
+                       const char *rel, const cbm_oo_index_t *index) {
+    CBMArena scratch;
+    pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
+    CBMResolvedCallArray out = {0};
+    char *file_qn = cbm_pipeline_fqn_compute(result->source_project, rel, "__file__");
+    cbm_oo_resolve_file(index, &scratch, lang, rel, file_qn, source, source_len, result->cached_tree,
+                        result, &out);
+    pxc_append_results(&result->arena, &result->resolved_calls, &out);
+    free(file_qn);
+    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
+}
+
 void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result, const char *source,
                                         int source_len, const char *rel, const char *def_module,
                                         const CBMCrossLspRegistries *cross_registries,
@@ -2413,6 +2462,8 @@ void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result,
     if (!result) {
         return;
     }
+    if (cross_registries && cross_registries->oo && cbm_oo_language(lang))
+        pxc_run_oo(lang, result, source, source_len, rel, cross_registries->oo);
     /* Source occurrence identities use the extractor's file module, while
      * Java's candidate registry separately indexes the declared package. */
     if (lang == CBM_LANG_JAVA && result->module_qn)
@@ -2749,6 +2800,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
+        cross_registries.oo = cbm_pxc_build_oo_index(ctx, xa, cache, files, file_count);
     }
 
     int processed = 0;
@@ -2840,6 +2892,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     }
 
     cbm_pxc_free_module_def_index(module_def_index);
+    cbm_oo_index_free(cross_registries.oo);
     free(all_defs);
     /* The module-QN strings are borrowed by the shared cross registries in
      * ctx->seq_cross_arena, which deliberately outlive this pass so that

@@ -937,6 +937,39 @@ static const char *py_nearest_scope_qn(const WalkState *state) {
 }
 
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
+/* Is this function a member of an anonymous class body? Kotlin's grammar sometimes
+ * reads `object : T() { members }` as a call of the literal with a trailing lambda. */
+static bool jvm_anonymous_member(CBMLanguage language, TSNode function) {
+    if (language != CBM_LANG_JAVA && language != CBM_LANG_KOTLIN) {
+        return false;
+    }
+    TSNode body = ts_node_parent(function);
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    TSNode owner = ts_node_parent(body);
+    if (ts_node_is_null(owner)) {
+        return false;
+    }
+    const char *owner_kind = ts_node_type(owner);
+    if (strcmp(ts_node_type(body), "class_body") == 0) {
+        return strcmp(owner_kind, "object_creation_expression") == 0 ||
+               strcmp(owner_kind, "object_literal") == 0;
+    }
+    if (language != CBM_LANG_KOTLIN || strcmp(ts_node_type(body), "statements") != 0 ||
+        strcmp(owner_kind, "lambda_literal") != 0) {
+        return false;
+    }
+    TSNode annotated = ts_node_parent(owner);
+    TSNode suffix = ts_node_is_null(annotated) ? annotated : ts_node_parent(annotated);
+    TSNode call = ts_node_is_null(suffix) ? suffix : ts_node_parent(suffix);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0 ||
+        ts_node_named_child_count(call) == 0) {
+        return false;
+    }
+    return strcmp(ts_node_type(ts_node_named_child(call, 0)), "object_literal") == 0;
+}
+
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
     /* Raw configured definitions already own the canonical QN, including
@@ -944,6 +977,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     const char *configured_qn = cbm_test_definition_qn(ctx, node);
     if (configured_qn) {
         return configured_qn;
+    }
+
+    /* A member of an anonymous class has no node of its own. Like a lambda's body,
+     * its body belongs to the enclosing declaration; a QN of its own named a source
+     * no node carries, and every call in it was dropped. */
+    if (jvm_anonymous_member(ctx->language, node) && state->enclosing_func_qn) {
+        return state->enclosing_func_qn;
     }
 
     (void)spec;
@@ -1194,6 +1234,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
+        /* `companion object { }` is named Companion by the language. */
+        if (ts_node_is_null(name_node) && state && state->enclosing_class_qn &&
+            strcmp(ts_node_type(node), "companion_object") == 0) {
+            return cbm_arena_sprintf(ctx->arena, "%s.Companion", state->enclosing_class_qn);
+        }
     }
     /* Objective-C: class_interface / class_implementation have no `name` field;
      * the class name is a plain `identifier` child. Without this the walk pushes

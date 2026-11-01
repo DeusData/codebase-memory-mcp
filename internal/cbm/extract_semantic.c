@@ -221,6 +221,14 @@ static TSNode resolve_write_lhs_node(CBMLanguage language, TSNode node) {
         return left;
     }
     const char *nk = ts_node_type(node);
+    /* Kotlin `a.b = c` writes b and reads a: the last navigation names the target. */
+    if (language == CBM_LANG_KOTLIN && strcmp(nk, "directly_assignable_expression") == 0) {
+        uint32_t parts = ts_node_named_child_count(node);
+        TSNode last = parts ? ts_node_named_child(node, parts - 1) : (TSNode){0};
+        if (!ts_node_is_null(last) && strcmp(ts_node_type(last), "navigation_suffix") == 0) {
+            return cbm_find_child_by_kind(last, "simple_identifier");
+        }
+    }
     if (strcmp(nk, "postfix_unary_expression") == 0 || strcmp(nk, "prefix_unary_expression") == 0 ||
         strcmp(nk, "update_expression") == 0) {
         // Only ++/-- mutate their operand. Other unary postfix/prefix forms
@@ -271,6 +279,11 @@ static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const cha
     bool is_member = false;
     TSNode site = {0};
     char *name = resolve_lhs_write_name(ctx, left, &is_member, &site);
+    if (ctx->language == CBM_LANG_KOTLIN && !ts_node_is_null(site)) {
+        TSNode parent = ts_node_parent(site);
+        is_member = is_member || (!ts_node_is_null(parent) &&
+                                  strcmp(ts_node_type(parent), "navigation_suffix") == 0);
+    }
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
         CBMReadWrite rw = {0};
         rw.var_name = name;

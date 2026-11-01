@@ -2777,16 +2777,10 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
                   .end_byte = write_start + 10},
          .relation = "WRITES",
          .target = {.file = "src/demo/Starter.java",
-                    .suffix = "Starter.executable",
+                    .suffix = "Starter.executable#field",
                     .label = "Field",
                     .declaration_line = 4,
-                    .declaration_text = "    private String executable;"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "JAVA-SELF-FIELD-ROLE",
-         .why = "The private field and this receiver are explicit, but no Java field-role proof "
-                "reaches the shared gate.",
-         .tried = "Preserved the two same-name declarations and the wrong-Method WRITES negative; "
-                  "method lookup is not field proof."},
+                    .declaration_text = "    private String executable;"}},
         {.case_id = "java.field-namesake.read",
          .site = {.file = "src/demo/Starter.java",
                   .caller = "Starter.show",
@@ -2794,16 +2788,21 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
                   .end_byte = read_start + 10},
          .relation = "USAGE",
          .target = {.file = "src/demo/Starter.java",
-                    .suffix = "Starter.executable",
+                    .suffix = "Starter.executable#field",
                     .label = "Field",
                     .declaration_line = 4,
-                    .declaration_text = "    private String executable;"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "JAVA-IMPLICIT-SELF-FIELD",
-         .why = "The unqualified read selects this field, but the lexical adapter does not prove "
-                "implicit Java receiver fields.",
-         .tried = "Preserved the field declaration and wrong-Method USAGE negative; neither a "
-                  "same-name method nor a global leaf match qualifies."},
+                    .declaration_text = "    private String executable;"}},
+        /* No constructor is declared, so `new` binds the class. */
+        {.case_id = "java.implicit-constructor",
+         .site = {.file = "src/demo/Starter.java",
+                  .caller = "Starter.run",
+                  .needle = "new Starter()"},
+         .relation = "CALLS",
+         .target = {.file = "src/demo/Starter.java",
+                    .suffix = "Starter",
+                    .label = "Class",
+                    .declaration_line = 3,
+                    .declaration_text = "public class Starter {"}},
         {.case_id = "java.field-namesake.call",
          .site = {.file = "src/demo/Starter.java",
                   .caller = "Starter.run",
@@ -2813,13 +2812,7 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
                     .suffix = "Starter.executable",
                     .label = "Method",
                     .declaration_line = 6,
-                    .declaration_text = "    public Starter executable(String path) {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "JAVA-CONSTRUCTED-CHAIN-RECEIVER",
-         .why = "The new expression selects Starter, but constructor-result and argument "
-                "applicability evidence is outside the typed-parameter method subset.",
-         .tried = "The original constructed receiver and String argument remain; no leaf-name "
-                  "fallback is allowed to stand in for their proof."},
+                    .declaration_text = "    public Starter executable(String path) {"}},
         {.case_id = "java.fluent-call-return",
          .site = {.file = "src/demo/Starter.java",
                   .caller = "Starter.run",
@@ -2829,18 +2822,12 @@ TEST(pipeline_field_named_like_method_keeps_its_reads_and_writes) {
                     .suffix = "Starter.show",
                     .label = "Method",
                     .declaration_line = 11,
-                    .declaration_text = "    public String show() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "JAVA-CONSTRUCTED-CHAIN-RECEIVER",
-         .why = "The declared Starter return supplies a genuine chained receiver; the shared type "
-                "map has no proven return flow for this expression yet.",
-         .tried = "Included the second genuine call omitted by the former non-vacuity assertion; "
-                  "the exact method declaration remains independently anchored."},
+                    .declaration_text = "    public String show() {"}},
     };
     RQ_Report report;
-    ASSERT(rq_check(store, project, "java-field-namesakes", &source, 1, expected, 4, NULL, 0,
+    ASSERT(rq_check(store, project, "java-field-namesakes", &source, 1, expected, 5, NULL, 0,
                     &report, stderr));
-    ASSERT_EQ(report.genuine, 4);
+    ASSERT_EQ(report.genuine, 5);
     cbm_store_close(store);
     cbm_pipeline_free(p);
     th_cleanup(tmp);
@@ -3984,13 +3971,7 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     .suffix = "Parity.CSharpParity.csharpReferenceTarget",
                     .label = "Method",
                     .declaration_line = 3,
-                    .declaration_text = "  static void csharpReferenceTarget() {}"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "callback-csharp-same-owner",
-         .why =
-             "Same-owner method-group accessibility and lexical target proof are not implemented.",
-         .tried = "Focused pipeline probe: exact callback absent; legacy emitter has no evidence; "
-                  "public member invocation control is separately required."},
+                    .declaration_text = "  static void csharpReferenceTarget() {}"}},
         {.case_id = "callback-javascript-script",
          .site = {.file = "parity.js",
                   .caller = "parity.javascriptReferenceSite",
@@ -14041,6 +14022,10 @@ TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
                     "            var store = Services.Resolve();\n"
                     "            store.Put(2);\n"
                     "        }\n"
+                    "        private Repo.Store _store = null;\n"
+                    "        public void KeepField() {\n"
+                    "            _store.Put(3);\n"
+                    "        }\n"
                     "    }\n"
                     "}\n");
     for (int i = 0; i < 52; i++) {
@@ -14069,9 +14054,13 @@ TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
      * arbitrary project Write at PP_FIELD_HINT_CONF. No owner segment is "W",
      * so the fixed hint must not fire at all. */
     ASSERT_FALSE(cross_file_call_has_strategy(s, project, "Log", "Write", "field_type_hint"));
-    /* (2) The intended hint case binds the owner it names, never FileStore. */
-    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", "field_type_hint"), 1);
+    /* (2) A variable's name proves nothing: Services is undeclared, so `store` has
+     * no known type and the hint's old answer was a guess that binds nothing now. */
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", NULL), 0);
     ASSERT_EQ(count_calls_with(s, project, ".Keep", ".FileStore.Put", NULL), 0);
+    /* (3) A declared field's type is a fact: the owner it declares, never FileStore. */
+    ASSERT_EQ(count_calls_with(s, project, ".KeepField", ".Store.Put", NULL), 1);
+    ASSERT_EQ(count_calls_with(s, project, ".KeepField", ".FileStore.Put", NULL), 0);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);

@@ -1993,11 +1993,9 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     free(rels);
     /* This coordinator owns the context while it is built, including spilled
      * source results. Workers only consume the completed binding snapshots. */
-    if (namespace_map &&
-        !cbm_pipeline_import_context_build(ctx, files, file_count, result_cache, namespace_map)) {
-        cbm_pipeline_namespace_map_free(namespace_map);
-        namespace_map = NULL;
-    }
+    if (namespace_map)
+        (void)cbm_pipeline_import_context_build(ctx, files, file_count, result_cache,
+                                                namespace_map);
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {

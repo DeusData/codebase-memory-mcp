@@ -81,6 +81,7 @@ static char *pkgmap_read_file(const char *path, int *out_len) {
 /* ── Constants ─────────────────────────────────────────────────── */
 
 static const char ambiguous_pkgmap_value[] = "@cbm:ambiguous-package-root";
+static const char import_context_failed[] = "@cbm:import-context:failed";
 
 enum {
     PKGMAP_INIT_CAP = 16,
@@ -2851,8 +2852,8 @@ static bool rust_cargo_roots(rust_import_context_t *context, CBMFileResult **cac
     return success;
 }
 
-bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                       int count, CBMFileResult **cache, CBMHashTable *map) {
+static bool import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                 int count, CBMFileResult **cache, CBMHashTable *map) {
     if (!ctx || !map || !build_compile_import_context(ctx, map))
         return false;
     rust_import_context_t context = {.ctx = ctx, .map = map};
@@ -2899,6 +2900,19 @@ bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_
     ts_parser_delete(context.parser);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, context.files);
     return success;
+}
+
+/* The context holds Rust and compile-database facts only. Its failure withholds
+ * them from those languages (create_import_edges), and says nothing about any
+ * other language's namespaces: one crate without a src/main.rs must not void
+ * every Java import of the project. */
+bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                       int count, CBMFileResult **cache, CBMHashTable *map) {
+    if (import_context_build(ctx, files, count, cache, map))
+        return true;
+    if (map)
+        (void)import_fact_put(map, import_context_failed, "1");
+    return false;
 }
 
 static bool rust_visible_from(const char *visibility, const char *path, const char *source_module) {
@@ -5235,6 +5249,10 @@ int cbm_pipeline_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResul
     /* Extraction disambiguates shared extensions such as Objective-C .m.
      * Re-deriving the language from the filename loses that source fact. */
     CBMLanguage lang = result->cached_lang;
+    if (namespace_map && cbm_ht_get(namespace_map, import_context_failed) &&
+        (lang == CBM_LANG_RUST || lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
+         lang == CBM_LANG_CUDA || lang == CBM_LANG_OBJC))
+        namespace_map = NULL;
     for (int i = 0; i < result->imports.count; i++)
         materialize_namespace_import(ctx, &result->imports.items[i], lang, namespace_map);
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");

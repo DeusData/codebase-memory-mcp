@@ -3453,6 +3453,14 @@ static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const 
         if (ts_node_named_child_count(node) < 1 || kotlin_index_is_write_lhs(node))
             return;
         op_method = "get";
+    } else if (strcmp(kind, "infix_expression") == 0) {
+        /* `a f b` calls f: left operand, the function's identifier, right operand. */
+        if (ts_node_named_child_count(node) != 3)
+            return;
+        TSNode function = ts_node_named_child(node, 1);
+        if (strcmp(ts_node_type(function), "simple_identifier") != 0)
+            return;
+        op_method = cbm_node_text(ctx->arena, function, ctx->source);
     } else {
         return;
     }

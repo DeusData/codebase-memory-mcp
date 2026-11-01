@@ -305,19 +305,15 @@ static const RQ_Expected CS_PRIMITIVE_EXPECTED[] = {
                 .label = "Method",
                 .declaration_line = 2,
                 .declaration_text = " private int Keep(int x) { return x; }"}},
+    /* C# picks the int overload; both are one graph node, carrying the last line. */
     {.case_id = "overload-selection",
      .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Util.Over(y)"},
      .relation = "CALLS",
      .target = {.file = "Util.cs",
                 .suffix = "Util.Over",
                 .label = "Method",
-                .declaration_line = 7,
-                .declaration_text = " public static int Over(int x) { return x; }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "csharp-overload-selection",
-     .why = "the complete name domain retains both source overloads",
-     .tried = "int-to-int selects the int declaration in C#; argument checks intentionally do not "
-              "rank overloads"},
+                .declaration_line = 8,
+                .declaration_text = " public static long Over(long x) { return x; }"}},
     {.case_id = "constant-narrowing",
      .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Util.Narrow(1)"},
      .relation = "CALLS",
@@ -325,12 +321,7 @@ static const RQ_Expected CS_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Util.Narrow",
                 .label = "Method",
                 .declaration_line = 6,
-                .declaration_text = " public static byte Narrow(byte value) { return value; }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "csharp-constant-narrowing",
-     .why = "constant-expression narrowing has no proof rule yet",
-     .tried = "the literal 1 fits byte, but the current primitive rules admit only identity and "
-              "widening"},
+                .declaration_text = " public static byte Narrow(byte value) { return value; }"}},
     {.case_id = "internal-assembly-visibility",
      .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Internal.Square(y)"},
      .relation = "CALLS",
@@ -338,12 +329,7 @@ static const RQ_Expected CS_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Internal.Square",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " public static int Square(int x) { return x * x; }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "csharp-internal-assembly-visibility",
-     .why = "cross-file internal accessibility requires an explicit compilation/assembly domain",
-     .tried = "the fixture is one C# compilation; equal namespace and repository membership are "
-              "insufficient production evidence"},
+                .declaration_text = " public static int Square(int x) { return x * x; }"}},
     {.case_id = "generic-inference",
      .site = {.file = "main.cs", .caller = "Calc.Gaps", .needle = "Util.Generic(y)"},
      .relation = "CALLS",
@@ -351,12 +337,7 @@ static const RQ_Expected CS_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Util.Generic",
                 .label = "Method",
                 .declaration_line = 9,
-                .declaration_text = " public static T Generic<T>(T value) { return value; }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "csharp-generic-inference",
-     .why = "generic inference and substitutions are not implemented by this proof bridge",
-     .tried = "the compiler infers T=int; primitive fixed-signature evidence cannot prove that "
-              "substitution"},
+                .declaration_text = " public static T Generic<T>(T value) { return value; }"}},
     {.case_id = "local-primitive-flow",
      .site = {.file = "main.cs", .caller = "Calc.Local", .needle = "Util.Square(value)"},
      .relation = "CALLS",
@@ -364,12 +345,7 @@ static const RQ_Expected CS_PRIMITIVE_EXPECTED[] = {
                 .suffix = "Util.Square",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " public static int Square(int x) { return x * x; }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "csharp-local-primitive-flow",
-     .why = "local declaration and assignment flow remain conservative in this adapter",
-     .tried = "the explicit int local is genuine; only immutable parameter facts and source "
-              "literals are currently admitted"},
+                .declaration_text = " public static int Square(int x) { return x * x; }"}},
 };
 
 static const RQ_Forbidden CS_PRIMITIVE_FORBIDDEN[] = {
@@ -459,8 +435,8 @@ TEST(resolver_cs_primitive_arguments_and_lexical_members_require_proofs) {
         th_cleanup(root);
         ASSERT(ok);
         ASSERT_EQ(report.genuine, 12);
-        ASSERT_EQ(report.found, 7);
-        ASSERT_EQ(report.missing, 5);
+        ASSERT_EQ(report.found, 12);
+        ASSERT_EQ(report.missing, 0);
         ASSERT_EQ(report.required_missing + report.wrong, 0);
     }
     PASS();

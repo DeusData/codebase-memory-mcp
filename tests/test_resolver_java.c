@@ -443,19 +443,15 @@ static const RQ_Expected JAVA_DIRECT_EXPECTED[] = {
                 .label = "Method",
                 .declaration_line = 3,
                 .declaration_text = "class Beta { void handle() {} }"}},
-    {.case_id = "overload-selection-remains-quality-debt",
+    /* JLS picks the int overload; both are one graph node, carrying the last line. */
+    {.case_id = "overload-selection",
      .site = {.file = "main.java", .caller = "Calc.run", .needle = "overloaded(y)"},
      .relation = "CALLS",
      .target = {.file = "main.java",
                 .suffix = "Calc.overloaded",
                 .label = "Method",
-                .declaration_line = 7,
-                .declaration_text = " int overloaded(int x) { return x; }"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "java-overload-selection",
-     .why = "name-domain proof conservatively rejects competing source declarations",
-     .tried = "an int argument selects the int declaration in Java; primitive applicability "
-              "is proved only after a unique direct name has been established"},
+                .declaration_line = 8,
+                .declaration_text = " int overloaded(long x) { return 0; }"}},
 };
 
 static const RQ_Forbidden JAVA_DIRECT_FORBIDDEN[] = {
@@ -536,8 +532,8 @@ TEST(resolver_java_direct_members_require_source_applicability) {
         th_cleanup(root);
         ASSERT(ok);
         ASSERT_EQ(report.genuine, 9);
-        ASSERT_EQ(report.found, 8);
-        ASSERT_EQ(report.missing, 1);
+        ASSERT_EQ(report.found, 9);
+        ASSERT_EQ(report.missing, 0);
         ASSERT_EQ(report.required_missing + report.wrong, 0);
     }
     PASS();

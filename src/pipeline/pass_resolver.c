@@ -14,6 +14,7 @@
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
 #include "lsp/go_stabilize.h"
+#include "lsp/oo_strict.h"
 #include "result_spill.h"
 #include "service_patterns.h"
 
@@ -73,6 +74,9 @@ typedef struct {
     unsigned declarations;
     conditional_owner_t *conditional;
     bool ambiguous;
+    /* Java/Kotlin/C# overloads of one owner share a qualified name, and the
+     * graph keeps them as one node. That node faithfully names all of them. */
+    bool overload_set;
 } target_proof_t;
 
 typedef struct {
@@ -244,8 +248,13 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
     if (prior) {
         bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
-        prior->ambiguous |= !same_owner || prior->start_line != definition->start_line ||
-                            prior->end_line != definition->end_line || language == CBM_LANG_PYTHON;
+        bool same_span = prior->start_line == definition->start_line &&
+                         prior->end_line == definition->end_line;
+        if (same_owner && !same_span && cbm_oo_language(language) &&
+            (strcmp(definition->label, "Class") != 0 || language == CBM_LANG_CSHARP))
+            prior->overload_set = true;
+        else
+            prior->ambiguous |= !same_owner || !same_span || language == CBM_LANG_PYTHON;
         if (prior->declarations == 1 && same_owner) {
             prior->second_start_line = definition->start_line;
             prior->second_end_line = definition->end_line;
@@ -383,8 +392,8 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
     return proof && !proof->ambiguous && !strcmp(proof->file, node->file_path) &&
            !strcmp(proof->label, node->label) && node->start_line >= 0 && node->end_line >= 0 &&
-           proof->start_line == (uint32_t)node->start_line &&
-           proof->end_line == (uint32_t)node->end_line;
+           (proof->overload_set || (proof->start_line == (uint32_t)node->start_line &&
+                                    proof->end_line == (uint32_t)node->end_line));
 }
 
 typedef struct {
@@ -2547,7 +2556,9 @@ static const cbm_gbuf_node_t *source_node(const file_resolver_t *resolver, const
     if (!scope || !scope[0])
         return resolver->file_node;
     const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(resolver->file->graph, scope);
-    return node && !cbm_pipeline_node_is_dir_container(node) ? node : NULL;
+    /* A class-level occurrence in a directory-module language carries the
+     * package's QN. That node is every file of the package; this is one (#787). */
+    return cbm_pipeline_node_is_dir_container(node) ? resolver->file_node : node;
 }
 
 static bool callable_node(const cbm_gbuf_node_t *node) {
@@ -2668,8 +2679,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     }
     if (target && (strcmp(relation, "CALL_REFERENCE") == 0 || strcmp(relation, "CALLS") == 0) &&
         !callable_node(target) &&
-        !(resolver->file->language == CBM_LANG_PYTHON && target->label &&
-          !strcmp(target->label, "Class") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
+        !((resolver->file->language == CBM_LANG_PYTHON || cbm_oo_language(resolver->file->language)) &&
+          target->label && cbm_label_is_type_like(target->label) &&
+          (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
     }

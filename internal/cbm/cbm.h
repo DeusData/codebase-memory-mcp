@@ -1275,6 +1275,11 @@ void cbm_result_compact_release_thread(void);
 TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
                          TSParseOptions opts);
 
+/* cbm_parse_source, then for a C# file the grammar could not read, a parse of a
+ * same-length view of it. Offsets and lines are the source's own. */
+TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
+                                   uint32_t source_len, TSParseOptions opts);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the

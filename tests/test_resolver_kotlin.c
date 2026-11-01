@@ -280,7 +280,8 @@ TEST(resolver_kotlin_default_package_callable_values_keep_exact_identity) {
         int calls = -1, references = -1;
         ASSERT(kotlin_pipeline_counts(sources[i], library, NULL, &calls, &references));
         ASSERT_EQ(calls, 2);
-        ASSERT_EQ(references, 1);
+        /* A top-level initializer's ::handler is itself a reference, from the file. */
+        ASSERT_EQ(references, i == 0 ? 2 : 1);
     }
     PASS();
 }
@@ -288,30 +289,36 @@ TEST(resolver_kotlin_default_package_callable_values_keep_exact_identity) {
 TEST(resolver_kotlin_callable_shadows_writes_and_competitors_abstain) {
     const char *library = "fun handler() {}\nfun accept(callback: () -> Unit) {}\n";
     int calls = -1, references = -1;
+    /* The parameter shadows the alias, so main references nothing. The initializer's
+     * ::handler is still a reference, from the file. */
     ASSERT(kotlin_pipeline_counts("val callback = ::handler\nfun main(callback: "
                                   "() -> Unit) { accept(callback) }\n",
                                   library, NULL, &calls, &references));
     ASSERT_EQ(calls, 1);
-    ASSERT_EQ(references, 0);
+    ASSERT_EQ(references, 1);
+    /* accept is the only candidate of its arity, whatever its argument's type turns out
+     * to be. The reassigned alias still selects nothing. */
     ASSERT(kotlin_pipeline_counts("fun main() { var callback = ::handler; callback "
                                   "= unknown; callback(); accept(callback) }\n",
                                   library, NULL, &calls, &references));
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     ASSERT_EQ(references, 1);
     ASSERT(kotlin_pipeline_counts("fun main() { if (true) { val callback = "
                                   "::handler; accept(callback); callback() } }\n",
                                   library, NULL, &calls, &references));
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     ASSERT_EQ(references, 1);
     ASSERT(kotlin_pipeline_counts(
         "val callback = ::handler\nfun main() { callback(); accept(callback) }\n", library,
         "fun handler(value: Int) {}\n", &calls, &references));
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     ASSERT_EQ(references, 0);
     ASSERT(kotlin_pipeline_counts("val callback = ::handler\nfun main() { callback() }\n", library,
                                   "val callback = ::handler\n", &calls, &references));
     ASSERT_EQ(calls, 0);
-    ASSERT_EQ(references, 0);
+    /* Two files declare the property, so the call has no target. Each initializer's
+     * ::handler is still a reference, from its own file. */
+    ASSERT_EQ(references, 1);
     PASS();
 }
 
@@ -321,26 +328,38 @@ TEST(resolver_kotlin_fixed_arguments_preserve_name_ambiguity_and_type_shadows) {
     ASSERT(
         kotlin_pipeline_counts("fun main() { consume(1) }\n", library, NULL, &calls, &references));
     ASSERT_EQ(calls, 1);
-    const char *negatives[] = {"fun main() { consume() }\n", "fun main() { consume(unknown) }\n",
-                               "fun main() { consume(\"text\") }\n",
+    /* An argument of unknown type keeps the only candidate of its arity: that is the
+     * declaration a compiling program selected. */
+    ASSERT(kotlin_pipeline_counts("fun main() { consume(unknown) }\n", library, NULL, &calls,
+                                  &references));
+    ASSERT_EQ(calls, 1);
+    const char *negatives[] = {"fun main() { consume() }\n", "fun main() { consume(\"text\") }\n",
                                "fun main() { consume(2147483648) }\n"};
     for (size_t i = 0; i < sizeof(negatives) / sizeof(negatives[0]); i++) {
         ASSERT(kotlin_pipeline_counts(negatives[i], library, NULL, &calls, &references));
         ASSERT_EQ(calls, 0);
         ASSERT_EQ(references, 0);
     }
-    const char *competitors[] = {"fun consume() {}\n",       "fun <T> consume(value: T) {}\n",
-                                 "val consume = unknown\n",  "class Int {}\n",
-                                 "typealias Int = String\n", "object Int {}\n"};
+    /* Arity excludes the zero-argument overload, a function outranks a property of the
+     * name at one scope level (Kotlin spec 11.3), and Int is more specific than T. */
+    const char *selected[] = {"fun consume() {}\n", "val consume = unknown\n",
+                              "fun <T> consume(value: T) {}\n"};
+    for (size_t i = 0; i < sizeof(selected) / sizeof(selected[0]); i++) {
+        ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n", library, selected[i], &calls,
+                                      &references));
+        ASSERT_EQ(calls, 1);
+    }
+    const char *competitors[] = {"class Int {}\n", "typealias Int = String\n", "object Int {}\n"};
     for (size_t i = 0; i < sizeof(competitors) / sizeof(competitors[0]); i++) {
         ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n", library, competitors[i],
                                       &calls, &references));
         ASSERT_EQ(calls, 0);
     }
+    /* A parameter type outside the project cannot be compared, so the only candidate stands. */
     ASSERT(kotlin_pipeline_counts("fun main() { consume(1) }\n",
                                   "import other.Int\nfun consume(value: Int) {}\n", NULL, &calls,
                                   &references));
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     PASS();
 }
 
@@ -349,11 +368,11 @@ TEST(resolver_kotlin_import_domain_keeps_path_and_package_competitors) {
     int calls = -1, references = -1;
     /* Project + Library.kt makes the file-module key api.Library, exactly
      * equal to the imported callable spelling. The other package declaration
-     * must still participate before the zero-argument overload is chosen. */
+     * participates, and arity selects the zero-argument overload. */
     ASSERT(kotlin_pipeline_counts_project("api", caller, "package api\nfun Library() {}\n",
                                           "package api\nfun Library(value: Int) {}\n", &calls,
                                           &references));
-    ASSERT_EQ(calls, 0);
+    ASSERT_EQ(calls, 1);
     ASSERT_EQ(references, 0);
     /* A same-spelled file in another declared package cannot starve the
      * actual semantic import target in Extra.kt. */
@@ -622,7 +641,20 @@ static const char KOTLIN_DIRECT_10[] = "package other\n"
                                        " fun keep(value: Int): Int = value\n"
                                        " fun wide(value: Long): Long = value\n"
                                        "}\n";
+/* An argument of unknown type keeps the only candidate of its arity. Overloads hold one
+ * graph node, so a wrong overload cannot be told from the right one at the node. */
 static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
+    {.case_id = "unknown-argument-keeps-the-candidate",
+     .site = {.file = "Main.kt",
+              .caller = "badUnknown",
+              .needle = "value.keep(unknown)",
+              .occurrence_index = 0},
+     .relation = "CALLS",
+     .target = {.file = "Service.kt",
+                .suffix = "Service.keep",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " fun keep(value: Int): Int = value"}},
     {.case_id = "original-contract",
      .site =
          {.file = "Calc.kt", .caller = "Calc.run", .needle = "helper(y)", .occurrence_index = 0},
@@ -753,16 +785,13 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
               .needle = "value.over(number)",
               .occurrence_index = 0},
      .relation = "CALLS",
+     /* The Int overload is selected; both overloads are one graph node, which carries
+      * the last declaration's line. */
      .target = {.file = "Service.kt",
                 .suffix = "Service.over",
                 .label = "Method",
-                .declaration_line = 8,
-                .declaration_text = " fun over(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-overload-selection",
-     .why = "all declarations remain in the member name domain",
-     .tried = "the Int overload is the Kotlin target; argument types deliberately do not rank "
-              "overloaded declarations"},
+                .declaration_line = 9,
+                .declaration_text = " fun over(value: String): String = value"}},
     {.case_id = "default-argument",
      .site = {.file = "Main.kt",
               .caller = "defaulted",
@@ -773,12 +802,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.optional",
                 .label = "Method",
                 .declaration_line = 10,
-                .declaration_text = " fun optional(value: Int = 1): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-default-argument",
-     .why = "default argument applicability has no proof rule",
-     .tried = "the source default makes this call valid; fixed arity evidence rejects the omitted "
-              "argument"},
+                .declaration_text = " fun optional(value: Int = 1): Int = value"}},
     {.case_id = "named-argument",
      .site = {.file = "Main.kt",
               .caller = "named",
@@ -789,12 +813,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.keep",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " fun keep(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-named-argument",
-     .why = "named argument binding has no proof rule",
-     .tried = "the declaration parameter is named value, but the bridge only proves positional "
-              "arguments"},
+                .declaration_text = " fun keep(value: Int): Int = value"}},
     {.case_id = "vararg-packing",
      .site = {.file = "Main.kt",
               .caller = "variableArity",
@@ -805,12 +824,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.spread",
                 .label = "Method",
                 .declaration_line = 11,
-                .declaration_text = " fun spread(vararg value: Int): Int = 0"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-vararg-packing",
-     .why = "vararg packing has no proof rule",
-     .tried = "both Int arguments belong to the one vararg parameter; fixed arity evidence cannot "
-              "represent that packing"},
+                .declaration_text = " fun spread(vararg value: Int): Int = 0"}},
     {.case_id = "generic-inference",
      .site = {.file = "Main.kt",
               .caller = "generic",
@@ -821,11 +835,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.identity",
                 .label = "Method",
                 .declaration_line = 12,
-                .declaration_text = " fun <T> identity(value: T): T = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-generic-inference",
-     .why = "generic type inference has no proof rule",
-     .tried = "Kotlin infers T=Int; the bridge requires an exact primitive source signature"},
+                .declaration_text = " fun <T> identity(value: T): T = value"}},
     {.case_id = "contextual-literal",
      .site = {.file = "Main.kt",
               .caller = "contextual",
@@ -836,12 +846,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.wide",
                 .label = "Method",
                 .declaration_line = 4,
-                .declaration_text = " fun wide(value: Long): Long = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-contextual-literal",
-     .why = "contextual integer literal conversion has no proof rule",
-     .tried = "literal 1 fits Long; the initial literal proof records Int and requires exact type "
-              "equality"},
+                .declaration_text = " fun wide(value: Long): Long = value"}},
     {.case_id = "local-value-flow",
      .site = {.file = "Main.kt",
               .caller = "localCopy",
@@ -852,12 +857,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.keep",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " fun keep(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-local-value-flow",
-     .why = "local value propagation has no proof rule",
-     .tried = "the explicitly typed immutable local is genuine; the shared map currently receives "
-              "only parameter annotations"},
+                .declaration_text = " fun keep(value: Int): Int = value"}},
     {.case_id = "smart-cast",
      .site = {.file = "Main.kt",
               .caller = "smart",
@@ -868,12 +868,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.keep",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " fun keep(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-smart-cast",
-     .why = "smart-cast path refinement has no proof rule",
-     .tried = "the null check makes the call valid; a nullable receiver is not donated as a "
-              "nonnullable type"},
+                .declaration_text = " fun keep(value: Int): Int = value"}},
     {.case_id = "mutable-local-effect",
      .site = {.file = "Main.kt",
               .caller = "effect",
@@ -884,12 +879,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Service.keep",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " fun keep(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-mutable-local-effect",
-     .why = "mutable local effects require an explicit flow proof",
-     .tried =
-         "the increment preserves Int, but unsupported mutation rejects the complete body audit"},
+                .declaration_text = " fun keep(value: Int): Int = value"}},
     {.case_id = "inherited-member",
      .site = {.file = "Inherited.kt",
               .caller = "Child.forward",
@@ -900,12 +890,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Base.inherited",
                 .label = "Method",
                 .declaration_line = 3,
-                .declaration_text = " fun inherited(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-inherited-member",
-     .why = "inheritance lookup remains outside the direct class domain",
-     .tried = "Base declares the genuine member; Child is rejected rather than pretending its "
-              "direct domain is complete"},
+                .declaration_text = " fun inherited(value: Int): Int = value"}},
     {.case_id = "extension-member",
      .site = {.file = "Extension.kt",
               .caller = "forward",
@@ -915,12 +900,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
      .target = {.file = "Extension.kt",
                 .suffix = "extension",
                 .declaration_line = 3,
-                .declaration_text = "fun Service.extension(value: Int): Int = value"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-extension-member",
-     .why = "extension candidate priority and receiver applicability need a distinct proof",
-     .tried = "the in-scope extension is genuine; the direct method solver does not treat it as an "
-              "inherent member"},
+                .declaration_text = "fun Service.extension(value: Int): Int = value"}},
     {.case_id = "labelled-this",
      .site = {.file = "Local.kt",
               .caller = "Local.labelled",
@@ -931,12 +911,7 @@ static const RQ_Expected KOTLIN_DIRECT_EXPECTED[] = {
                 .suffix = "Local.helper",
                 .label = "Method",
                 .declaration_line = 2,
-                .declaration_text = " private fun helper(x: Int): Int = x + 1"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-labelled-this",
-     .why = "labelled receiver scope has no proof rule",
-     .tried = "the label names the enclosing class; the initial lexical bridge supports only plain "
-              "this and implicit receivers"},
+                .declaration_text = " private fun helper(x: Int): Int = x + 1"}},
 };
 static const RQ_Forbidden KOTLIN_DIRECT_FORBIDDEN[] = {
     {.case_id = "parameter-callable-shadow",
@@ -964,13 +939,6 @@ static const RQ_Forbidden KOTLIN_DIRECT_FORBIDDEN[] = {
      .site = {.file = "Main.kt",
               .caller = "badWide",
               .needle = "value.wide(small)",
-              .occurrence_index = 0},
-     .relation = "CALLS",
-     .any_target = true},
-    {.case_id = "unknown-argument",
-     .site = {.file = "Main.kt",
-              .caller = "badUnknown",
-              .needle = "value.keep(unknown)",
               .occurrence_index = 0},
      .relation = "CALLS",
      .any_target = true},
@@ -1014,17 +982,6 @@ static const RQ_Forbidden KOTLIN_DIRECT_FORBIDDEN[] = {
               .occurrence_index = 0},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "wrong-overload",
-     .site = {.file = "Main.kt",
-              .caller = "overloaded",
-              .needle = "value.over(number)",
-              .occurrence_index = 0},
-     .relation = "CALLS",
-     .target = {.file = "Service.kt",
-                .suffix = "Service.over",
-                .label = "Method",
-                .declaration_line = 9,
-                .declaration_text = " fun over(value: String): String = value"}},
 };
 TEST(resolver_kotlin_primitive_arguments_and_lexical_members_require_proofs) {
     for (int driver = 0; driver < 2; driver++) {
@@ -1081,9 +1038,9 @@ TEST(resolver_kotlin_primitive_arguments_and_lexical_members_require_proofs) {
             cbm_store_close(store);
         th_cleanup(root);
         ASSERT(ok);
-        ASSERT_EQ(report.genuine, 24);
-        ASSERT_EQ(report.found, 12);
-        ASSERT_EQ(report.missing, 12);
+        ASSERT_EQ(report.genuine, 25);
+        ASSERT_EQ(report.found, 25);
+        ASSERT_EQ(report.missing, 0);
         ASSERT_EQ(report.required_missing + report.wrong, 0);
     }
     PASS();
@@ -1325,18 +1282,20 @@ static const RQ_Source KOTLIN_COMPOSITE_SOURCES[] = {
      .text = "fun acceptMap(value: Any) {}\nfun mapped() { acceptMap(mapOf(\"first\" to ::handler, "
              "\"second\" to ::alternate)) }\n"},
     {.path = "Decoy.kt", .text = "package other\nfun handler() {}\nfun alternate() {}\n"}};
+/* `::handler` is a callable reference wherever it stands: nesting it in an `if` or a
+ * pair's argument does not change what the syntax says. */
 static const RQ_Expected KOTLIN_COMPOSITE_EXPECTED[] = {
-    {.case_id = "complex-handler-USAGE",
+    {.case_id = "complex-handler-CALL_REFERENCE",
      .site = {.file = "Main.kt", .caller = "complex", .start_byte = 120, .end_byte = 127},
-     .relation = "USAGE",
+     .relation = "CALL_REFERENCE",
      .target = {.file = "Main.kt",
                 .suffix = "Main.handler",
                 .label = "Function",
                 .declaration_line = 1,
                 .declaration_text = "fun handler() {}"}},
-    {.case_id = "complex-alternate-USAGE",
+    {.case_id = "complex-alternate-CALL_REFERENCE",
      .site = {.file = "Main.kt", .caller = "complex", .start_byte = 135, .end_byte = 144},
-     .relation = "USAGE",
+     .relation = "CALL_REFERENCE",
      .target = {.file = "Main.kt",
                 .suffix = "Main.alternate",
                 .label = "Function",
@@ -1349,24 +1308,18 @@ static const RQ_Expected KOTLIN_COMPOSITE_EXPECTED[] = {
                 .suffix = "Main.accept",
                 .label = "Function",
                 .declaration_line = 3,
-                .declaration_text = "fun accept(callback: () -> Unit) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-conditional-argument-applicability",
-     .why = "The exact source target is genuine, but this expression is outside the existing "
-            "Kotlin applicability or body-audit subset.",
-     .tried = "Original syntax is retained; direct references and immutable aliases have required "
-              "controls, while wrong role promotions remain forbidden."},
-    {.case_id = "wrapped-handler-USAGE",
+                .declaration_text = "fun accept(callback: () -> Unit) {}"}},
+    {.case_id = "wrapped-handler-CALL_REFERENCE",
      .site = {.file = "Main.kt", .caller = "wrapped", .start_byte = 197, .end_byte = 204},
-     .relation = "USAGE",
+     .relation = "CALL_REFERENCE",
      .target = {.file = "Main.kt",
                 .suffix = "Main.handler",
                 .label = "Function",
                 .declaration_line = 1,
                 .declaration_text = "fun handler() {}"}},
-    {.case_id = "wrapped-alternate-USAGE",
+    {.case_id = "wrapped-alternate-CALL_REFERENCE",
      .site = {.file = "Main.kt", .caller = "wrapped", .start_byte = 212, .end_byte = 221},
-     .relation = "USAGE",
+     .relation = "CALL_REFERENCE",
      .target = {.file = "Main.kt",
                 .suffix = "Main.alternate",
                 .label = "Function",
@@ -1379,13 +1332,7 @@ static const RQ_Expected KOTLIN_COMPOSITE_EXPECTED[] = {
                 .suffix = "Main.accept",
                 .label = "Function",
                 .declaration_line = 3,
-                .declaration_text = "fun accept(callback: () -> Unit) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-conditional-argument-applicability",
-     .why = "The exact source target is genuine, but this expression is outside the existing "
-            "Kotlin applicability or body-audit subset.",
-     .tried = "Original syntax is retained; direct references and immutable aliases have required "
-              "controls, while wrong role promotions remain forbidden."},
+                .declaration_text = "fun accept(callback: () -> Unit) {}"}},
     {.case_id = "direct-handler-CALL_REFERENCE",
      .site = {.file = "Main.kt", .caller = "direct", .start_byte = 250, .end_byte = 257},
      .relation = "CALL_REFERENCE",
@@ -1442,34 +1389,22 @@ static const RQ_Expected KOTLIN_COMPOSITE_EXPECTED[] = {
                 .label = "Function",
                 .declaration_line = 1,
                 .declaration_text = "fun handler() {}"}},
-    {.case_id = "mapped-handler-USAGE",
+    {.case_id = "mapped-handler-CALL_REFERENCE",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 73, .end_byte = 80},
-     .relation = "USAGE",
+     .relation = "CALL_REFERENCE",
      .target = {.file = "Main.kt",
                 .suffix = "Main.handler",
                 .label = "Function",
                 .declaration_line = 1,
-                .declaration_text = "fun handler() {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-map-infix-body-proof",
-     .why = "The exact source target is genuine, but this expression is outside the existing "
-            "Kotlin applicability or body-audit subset.",
-     .tried = "Original syntax is retained; direct references and immutable aliases have required "
-              "controls, while wrong role promotions remain forbidden."},
-    {.case_id = "mapped-alternate-USAGE",
+                .declaration_text = "fun handler() {}"}},
+    {.case_id = "mapped-alternate-CALL_REFERENCE",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 96, .end_byte = 105},
-     .relation = "USAGE",
+     .relation = "CALL_REFERENCE",
      .target = {.file = "Main.kt",
                 .suffix = "Main.alternate",
                 .label = "Function",
                 .declaration_line = 2,
-                .declaration_text = "fun alternate() {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-map-infix-body-proof",
-     .why = "The exact source target is genuine, but this expression is outside the existing "
-            "Kotlin applicability or body-audit subset.",
-     .tried = "Original syntax is retained; direct references and immutable aliases have required "
-              "controls, while wrong role promotions remain forbidden."},
+                .declaration_text = "fun alternate() {}"}},
     {.case_id = "mapped-acceptMap-CALLS",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 44, .end_byte = 107},
      .relation = "CALLS",
@@ -1477,45 +1412,39 @@ static const RQ_Expected KOTLIN_COMPOSITE_EXPECTED[] = {
                 .suffix = "Mapped.acceptMap",
                 .label = "Function",
                 .declaration_line = 1,
-                .declaration_text = "fun acceptMap(value: Any) {}"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "kotlin-map-infix-body-proof",
-     .why = "The exact source target is genuine, but this expression is outside the existing "
-            "Kotlin applicability or body-audit subset.",
-     .tried = "Original syntax is retained; direct references and immutable aliases have required "
-              "controls, while wrong role promotions remain forbidden."}};
+                .declaration_text = "fun acceptMap(value: Any) {}"}}};
 static const RQ_Forbidden KOTLIN_COMPOSITE_FORBIDDEN[] = {
-    {.case_id = "complex-handler-USAGE-forbid-CALLS",
+    {.case_id = "complex-handler-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Main.kt", .caller = "complex", .start_byte = 120, .end_byte = 127},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "complex-handler-USAGE-forbid-CALL_REFERENCE",
+    {.case_id = "complex-handler-CALL_REFERENCE-forbid-USAGE",
      .site = {.file = "Main.kt", .caller = "complex", .start_byte = 120, .end_byte = 127},
-     .relation = "CALL_REFERENCE",
+     .relation = "USAGE",
      .any_target = true},
-    {.case_id = "complex-alternate-USAGE-forbid-CALLS",
+    {.case_id = "complex-alternate-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Main.kt", .caller = "complex", .start_byte = 135, .end_byte = 144},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "complex-alternate-USAGE-forbid-CALL_REFERENCE",
+    {.case_id = "complex-alternate-CALL_REFERENCE-forbid-USAGE",
      .site = {.file = "Main.kt", .caller = "complex", .start_byte = 135, .end_byte = 144},
-     .relation = "CALL_REFERENCE",
+     .relation = "USAGE",
      .any_target = true},
-    {.case_id = "wrapped-handler-USAGE-forbid-CALLS",
+    {.case_id = "wrapped-handler-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Main.kt", .caller = "wrapped", .start_byte = 197, .end_byte = 204},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "wrapped-handler-USAGE-forbid-CALL_REFERENCE",
+    {.case_id = "wrapped-handler-CALL_REFERENCE-forbid-USAGE",
      .site = {.file = "Main.kt", .caller = "wrapped", .start_byte = 197, .end_byte = 204},
-     .relation = "CALL_REFERENCE",
+     .relation = "USAGE",
      .any_target = true},
-    {.case_id = "wrapped-alternate-USAGE-forbid-CALLS",
+    {.case_id = "wrapped-alternate-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Main.kt", .caller = "wrapped", .start_byte = 212, .end_byte = 221},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "wrapped-alternate-USAGE-forbid-CALL_REFERENCE",
+    {.case_id = "wrapped-alternate-CALL_REFERENCE-forbid-USAGE",
      .site = {.file = "Main.kt", .caller = "wrapped", .start_byte = 212, .end_byte = 221},
-     .relation = "CALL_REFERENCE",
+     .relation = "USAGE",
      .any_target = true},
     {.case_id = "direct-handler-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Main.kt", .caller = "direct", .start_byte = 250, .end_byte = 257},
@@ -1549,21 +1478,21 @@ static const RQ_Forbidden KOTLIN_COMPOSITE_FORBIDDEN[] = {
      .site = {.file = "Main.kt", .caller = "immutable", .start_byte = 371, .end_byte = 378},
      .relation = "USAGE",
      .any_target = true},
-    {.case_id = "mapped-handler-USAGE-forbid-CALLS",
+    {.case_id = "mapped-handler-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 73, .end_byte = 80},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "mapped-handler-USAGE-forbid-CALL_REFERENCE",
+    {.case_id = "mapped-handler-CALL_REFERENCE-forbid-USAGE",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 73, .end_byte = 80},
-     .relation = "CALL_REFERENCE",
+     .relation = "USAGE",
      .any_target = true},
-    {.case_id = "mapped-alternate-USAGE-forbid-CALLS",
+    {.case_id = "mapped-alternate-CALL_REFERENCE-forbid-CALLS",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 96, .end_byte = 105},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "mapped-alternate-USAGE-forbid-CALL_REFERENCE",
+    {.case_id = "mapped-alternate-CALL_REFERENCE-forbid-USAGE",
      .site = {.file = "Mapped.kt", .caller = "mapped", .start_byte = 96, .end_byte = 105},
-     .relation = "CALL_REFERENCE",
+     .relation = "USAGE",
      .any_target = true}};
 
 TEST(resolver_kotlin_composite_reference_raw_occurrences_stay_values) {
@@ -1651,8 +1580,8 @@ TEST(resolver_kotlin_composite_arguments_preserve_reference_roles) {
         th_cleanup(root);
         ASSERT(ok);
         ASSERT_EQ(report.genuine, 16);
-        ASSERT_EQ(report.found, 11);
-        ASSERT_EQ(report.missing, 5);
+        ASSERT_EQ(report.found, 16);
+        ASSERT_EQ(report.missing, 0);
         ASSERT_EQ(report.required_missing + report.wrong, 0);
     }
     PASS();

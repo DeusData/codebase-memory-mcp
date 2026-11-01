@@ -8691,6 +8691,11 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
     if (ts_node_is_null(name_node)) {
+        /* `companion object { }` is named Companion by the language, and its members
+         * are reached through the class. Dropping it dropped every member. */
+        if (ctx->language == CBM_LANG_KOTLIN && strcmp(kind, "companion_object") == 0) {
+            emit_class_def(ctx, node, spec, kind, cbm_arena_strdup(a, "Companion"));
+        }
         return;
     }
 
@@ -12831,11 +12836,17 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
         name_node = cbm_find_child_by_kind(node, "identifier");
     }
-    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_SWIFT) {
+    if (ts_node_is_null(name_node) &&
+        (ctx->language == CBM_LANG_SWIFT || ctx->language == CBM_LANG_KOTLIN)) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
     }
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
         name_node = cbm_find_child_by_kind(node, "class_name");
+    }
+    /* `companion object { }` is named Companion by the language. */
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN && saved_enclosing &&
+        strcmp(ts_node_type(node), "companion_object") == 0) {
+        return cbm_arena_sprintf(ctx->arena, "%s.Companion", saved_enclosing);
     }
     if (!ts_node_is_null(name_node)) {
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);

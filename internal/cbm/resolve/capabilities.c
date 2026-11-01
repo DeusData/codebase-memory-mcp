@@ -13,6 +13,8 @@ static bool syntax(const char *const *kinds) {
 #define C_EDGES (EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE) | EDGE(READS) | EDGE(WRITES))
 #define SOURCE_EDGES (EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE))
 #define TYPED_EDGES (EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USES_TYPE))
+#define OO_EDGES \
+    (EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE) | EDGE(READS) | EDGE(WRITES) | EDGE(USES_TYPE))
 typedef struct {
     CBMLanguage language;
     unsigned supported;
@@ -47,11 +49,11 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_PYTHON, SOURCE_EDGES | EDGE(USES_TYPE),
      "Static project imports and bounded reexports; dynamic imports and unknown package roots "
      "abstain."},
-    {CBM_LANG_JAVA, EDGE(IMPORTS) | CALLABLE_EDGES,
+    {CBM_LANG_JAVA, OO_EDGES,
      "Exact declared package members; incomplete or competing namespace candidates abstain."},
-    {CBM_LANG_KOTLIN, TYPED_EDGES | EDGE(CALL_REFERENCE) | EDGE(USAGE),
+    {CBM_LANG_KOTLIN, OO_EDGES,
      "Exact declared packages and aliases; incomplete or competing namespace candidates abstain."},
-    {CBM_LANG_CSHARP, TYPED_EDGES,
+    {CBM_LANG_CSHARP, OO_EDGES,
      "Exact declared namespace members; unproved aliases and competing candidates abstain."},
     {CBM_LANG_PHP, TYPED_EDGES,
      "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
@@ -93,6 +95,7 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_KUSTOMIZE, EDGE(IMPORTS),
      "Literal relative resource paths only; transformed or generated resources are unsupported."},
 };
+#undef OO_EDGES
 #undef TYPED_EDGES
 #undef SOURCE_EDGES
 #undef C_EDGES
@@ -263,11 +266,24 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
     case CBM_LANG_CSHARP:
-    case CBM_LANG_PHP:
         out->adapter = language == CBM_LANG_JAVA     ? "java"
                        : language == CBM_LANG_KOTLIN ? "kotlin"
-                       : language == CBM_LANG_CSHARP ? "csharp"
-                                                     : "php";
+                                                     : "csharp";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
+                             CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
+        out->limitation =
+            "The declaration static rules select: lexical scopes, import precedence, inherited "
+            "members over resolved supertypes, arity, known argument types and exact overload "
+            "matches. Competing overloads on different nodes, lambdas with an unreadable "
+            "receiver, members hidden by an unindexed supertype and unmodelled inference abstain. "
+            "A type-shaped name is assumed not to be a field of an unindexed supertype. Implicit "
+            "iterator and componentN calls share one span and are not emitted. A bare call inside "
+            "an extension on an external type abstains, because that type's members are unlisted. "
+            "A C# file the grammar cannot read is read without its later conditional branches.";
+        break;
+    case CBM_LANG_PHP:
+        out->adapter = "php";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW;
