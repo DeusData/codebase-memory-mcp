@@ -1588,6 +1588,10 @@ TEST(resolver_c_member_access_follows_written_declarations) {
          .site = C_TU_WORD("src/use.c", use, "use.bump_flags", "c->flags++", "flags"),
          .relation = "WRITES",
          .target = flags},
+        {.case_id = "increment-parameter-type",
+         .site = C_TU_WORD("src/use.c", use, "use.bump_flags", "bump_flags(client", "client"),
+         .relation = "USAGE",
+         .target = client_type},
         {.case_id = "increment-also-reads",
          .site = C_TU_WORD("src/use.c", use, "use.bump_flags", "c->flags++", "flags"),
          .relation = "USAGE",
@@ -2284,8 +2288,8 @@ TEST(resolver_cpp_reference_prototypes_and_scoped_members) {
 /* Inside a member function the class's own names come first, also the ones with no graph
  * node to bind: a pure virtual hides a free function of that name. */
 #define C_TU_HIDING_HEADER                                                                      \
-    "#ifndef PRINTER_H\n"                                                                       \
-    "#define PRINTER_H\n"                                                                       \
+    "#pragma once\n"                                                                            \
+    "// No macro here: the rows below all come from the file as written.\n"                     \
     "int print(int x);\n"                                                                       \
     "int render(int x);\n"                                                                      \
     "int hidden(int x);\n"                                                                      \
@@ -2311,8 +2315,7 @@ TEST(resolver_cpp_reference_prototypes_and_scoped_members) {
     "  using hidden = int;\n"                                                                   \
     "public:\n"                                                                                 \
     "  int go3() { return hidden(3); }\n"                                                       \
-    "};\n"                                                                                      \
-    "#endif\n"
+    "};\n"
 #define C_TU_HIDING_IMPL                                                                        \
     "#include \"printer.h\"\n"                                                                  \
     "int print(int x) { return x; }\n"                                                          \
@@ -2719,6 +2722,7 @@ static const RQ_Source C_TU_ACCESS[] = {{.path = "access.h", .text = C_TU_ACCESS
                                         {.path = "access.cpp", .text = C_TU_ACCESS_IMPL}};
 
 TEST(resolver_cpp_nested_aliases_and_protected_members) {
+    const char *header = C_TU_ACCESS_HEADER;
     const RQ_Expected expected[] = {
         {.case_id = "alias-inside-another-class-does-not-compete",
          .site = {.file = "access.cpp", .caller = "access.Inner.outer", .needle = "inner()"},
@@ -2729,7 +2733,7 @@ TEST(resolver_cpp_nested_aliases_and_protected_members) {
                     .declaration_line = 9,
                     .declaration_text = "  int inner() const { return 1; }"}},
         {.case_id = "protected-member-from-a-derived-class",
-         .site = {.file = "access.h", .caller = "access.llvm.ArmParser.run", .needle = "parse()"},
+         .site = C_TU_WORD("access.h", header, "access.llvm.ArmParser.run", "return parse", "parse()"),
          .relation = "CALLS",
          .target = {.file = "access.h",
                     .suffix = "access.llvm.Parser.parse",
@@ -2739,7 +2743,7 @@ TEST(resolver_cpp_nested_aliases_and_protected_members) {
     };
     const RQ_Forbidden forbidden[] = {
         {.case_id = "private-member-of-a-base",
-         .site = {.file = "access.h", .caller = "access.llvm.ArmParser.peek", .needle = "secret()"},
+         .site = C_TU_WORD("access.h", header, "access.llvm.ArmParser.peek", "return secret", "secret()"),
          .relation = "CALLS",
          .any_target = true},
         {.case_id = "protected-member-from-outside",
