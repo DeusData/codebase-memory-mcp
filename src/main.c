@@ -2735,10 +2735,11 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     cbm_ui_config_t ui_config;
     cbm_ui_config_load(&ui_config);
     /* A bare start inherits the saved choice, just like automatic startup.
-     * Only an explicit UI request may re-enable a deliberately disabled UI. */
-    bool ui_requested = ui_config.ui_enabled || requested_port > 0 || open_browser;
+     * Only an explicit UI request may re-enable a deliberately disabled UI
+     * (cbm_ui_config_daemon_start_ui; the ui suite pins the rule). */
+    bool ui_requested =
+        cbm_ui_config_daemon_start_ui(&ui_config, requested_port, open_browser, &ui_port);
     if (CBM_EMBEDDED_FILE_COUNT > 0 && ui_requested) {
-        ui_port = requested_port > 0 ? requested_port : ui_config.ui_port;
         uint8_t update_mask = 0x03U; /* enabled + port */
         bool context_set =
             main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,

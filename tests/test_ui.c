@@ -267,6 +267,52 @@ TEST(config_missing_fields) {
     PASS();
 }
 
+/* #2114: a cold `daemon start` used to configure (and so re-enable) the UI on
+ * every start, overwriting a saved ui_enabled=false. The rule now: a bare start
+ * honours the saved choice; only an explicit --port=N or --open requests the UI
+ * (and the caller persists that choice). The real-process guard
+ * tests/test_daemon_open_readiness.py covers the same contract end to end, but
+ * no CI leg runs it, so this pure rule is what CI checks. */
+TEST(config_daemon_start_honours_saved_ui_choice) {
+    const cbm_ui_config_t disabled = {.ui_enabled = false, .ui_port = 9749};
+    const cbm_ui_config_t enabled = {.ui_enabled = true, .ui_port = 9749};
+    int port = -1;
+
+    /* Bare start, saved disabled: no UI and nothing to persist (#2114). */
+    ASSERT_FALSE(cbm_ui_config_daemon_start_ui(&disabled, 0, false, &port));
+    ASSERT_EQ(port, 0);
+
+    /* Bare start, saved enabled: the UI on the saved port. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&enabled, 0, false, &port));
+    ASSERT_EQ(port, 9749);
+
+    /* --port=N re-enables a disabled UI on N. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&disabled, 9800, false, &port));
+    ASSERT_EQ(port, 9800);
+
+    /* --open re-enables a disabled UI on the saved port. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&disabled, 0, true, &port));
+    ASSERT_EQ(port, 9749);
+
+    /* An explicit --port=N wins over the saved port. */
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&enabled, 9800, false, &port));
+    ASSERT_EQ(port, 9800);
+    port = -1;
+    ASSERT_TRUE(cbm_ui_config_daemon_start_ui(&disabled, 9800, true, &port));
+    ASSERT_EQ(port, 9800);
+
+    /* No saved configuration requests nothing. */
+    port = -1;
+    ASSERT_FALSE(cbm_ui_config_daemon_start_ui(NULL, 9800, true, &port));
+    ASSERT_EQ(port, 0);
+
+    PASS();
+}
+
 /* ── Embedded asset tests ─────────────────────────────────────── */
 
 TEST(embedded_lookup_not_found) {
@@ -2734,6 +2780,7 @@ SUITE(ui) {
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);
+    RUN_TEST(config_daemon_start_honours_saved_ui_choice);
 
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);
