@@ -362,6 +362,8 @@ static void kh_parameters(const kh_t *h, oo_callable_t *callable, TSNode paramet
             if (refs)
                 refs[total] = kt_typeref(&h->text, type);
             total++;
+            if (pending_vararg && !vararg)
+                callable->vararg_position = total;
             vararg |= pending_vararg;
             pending_vararg = false;
             /* A class parameter keeps its default inside its own node. */
@@ -797,6 +799,41 @@ static bool kt_explicit_external(oo_walk_t *w, const oo_scope_t *scope, const ch
     return false;
 }
 
+/* The standard library's collection and text subtyping, for extension receivers. */
+static bool kt_external_conforms(const char *actual, const char *declared) {
+    static const struct {
+        const char *actual, *supertypes;
+    } TABLE[] = {
+        {"List", " Collection Iterable "},
+        {"Set", " Collection Iterable "},
+        {"Collection", " Iterable "},
+        {"MutableList", " List Collection MutableCollection Iterable MutableIterable "},
+        {"MutableSet", " Set Collection MutableCollection Iterable MutableIterable "},
+        {"MutableCollection", " Collection Iterable MutableIterable "},
+        {"ArrayList", " MutableList List Collection MutableCollection Iterable "},
+        {"LinkedHashSet", " MutableSet Set Collection MutableCollection Iterable "},
+        {"HashSet", " MutableSet Set Collection MutableCollection Iterable "},
+        {"MutableMap", " Map "},
+        {"HashMap", " MutableMap Map "},
+        {"LinkedHashMap", " MutableMap Map HashMap "},
+        {"String", " CharSequence Comparable "},
+        {"Int", " Number Comparable "},
+        {"Long", " Number Comparable "},
+        {"Double", " Number Comparable "},
+        {"Float", " Number Comparable "},
+        {"Short", " Number Comparable "},
+        {"Byte", " Number Comparable "},
+    };
+    char word[64];
+    int written = snprintf(word, sizeof(word), " %s ", declared);
+    if (written <= 0 || (size_t)written >= sizeof(word))
+        return false;
+    for (size_t i = 0; i < sizeof(TABLE) / sizeof(TABLE[0]); i++)
+        if (!strcmp(TABLE[i].actual, actual))
+            return strstr(TABLE[i].supertypes, word) != NULL;
+    return false;
+}
+
 /* Does an extension's declared receiver accept the value? */
 static bool kt_ref_accepts(oo_walk_t *w, const oo_typeref_t *ref, oo_scope_t scope,
                            const oo_value_t *value) {
@@ -823,11 +860,15 @@ static bool kt_ref_accepts(oo_walk_t *w, const oo_typeref_t *ref, oo_scope_t sco
         declared = declared ? declared + 1 : receiver.external;
         if (!strcmp(declared, "Any"))
             return value->type || value->external;
-        if (!value->external)
-            return false;
+        /* A project collection reaches Iterable through its declared supertypes. */
+        if (!value->external) {
+            oo_value_t element =
+                !strcmp(declared, "Iterable") ? oo_element_of(w, value) : oo_value_unknown();
+            return oo_value_known(&element);
+        }
         const char *actual = strrchr(value->external, '.');
         actual = actual ? actual + 1 : value->external;
-        return !strcmp(declared, actual);
+        return !strcmp(declared, actual) || kt_external_conforms(actual, declared);
     }
     return false;
 }

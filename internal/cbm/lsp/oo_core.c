@@ -1176,6 +1176,10 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
             return true;
         if (callable->max_args < 0 && index == callable->param_count - 1)
             continue; /* Variadic element versus array conversion is not modelled. */
+        /* Past a vararg, position no longer says which parameter an argument lands on. */
+        if (callable->vararg_position && i >= callable->vararg_position - 1 &&
+            !args[i].function_literal)
+            continue;
         if (oo_ref_is_tparam(callable, callable->params[index]))
             continue;
         oo_value_t parameter = oo_value_from_ref(w, callable->params[index], &scope, subst);
@@ -1189,6 +1193,10 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
                 return true;
             continue;
         }
+        /* Array is final: a project class is never one. */
+        if (parameter.external && !strcmp(oo_leaf(parameter.external), "Array") && argument->type &&
+            oo_hierarchy_complete(w->ix, argument->type))
+            return true;
         if (parameter.fn_ref) {
             /* A value whose whole hierarchy is known is not a function. */
             if (argument->type && oo_hierarchy_complete(w->ix, argument->type))

@@ -320,6 +320,12 @@ static const OOFile KOTLIN_FILES[] = {
      "private fun fileOnly(): Int = 5\n"
      "val topProperty: Store = Store()\n"
      "val Store.extProp: Store get() = this\n"
+     "fun <T> Iterable<T>.onIterable(): Int = 1\n"
+     "fun Collection<Int>.onCollection(): Int = 1\n"
+     "class Rows : Iterable<Store> {\n"
+     "    override fun iterator(): Iterator<Store> = TODO()\n"
+     "}\n"
+     "fun <T> middleVararg(first: Int, vararg rest: Store, block: () -> Unit): Int = 1\n"
      "fun String.shout(): String = this\n"
      "fun Int.onlyInt(): Int = this\n"},
     {"core/Tx.kt",
@@ -378,6 +384,12 @@ static const OOFile KOTLIN_FILES[] = {
      "    fun externalExtension() { text?.shout() }\n"
      "    fun externalWrongReceiver() { text?.onlyInt() }\n"
      "    fun extensionProperty(s: Store) { s.extProp.get() }\n"
+     "    fun listIsIterable(l: List<Int>) { l.onIterable() }\n"
+     "    fun projectIsIterable(r: Rows) { r.onIterable() }\n"
+     "    fun setIsCollection(v: Set<Int>) { v.onCollection() }\n"
+     "    fun stringIsNoCollection(t: String) { t.onCollection() }\n"
+     "    fun storeIsNoIterable(s: Store) { s.onIterable() }\n"
+     "    fun varargInTheMiddle(s: Store) { middleVararg<Int>(1, s, s) { } }\n"
      "    fun wrongExtensionProperty(s: Store) { s.otherProp }\n"
      "    fun objectValue() { val t = object : Store() { fun own() = 1 }; t.get(); t.ext() }\n"
      "    fun objectOwnMember() {\n"
@@ -495,6 +507,14 @@ static int oo_kotlin_check(bool parallel) {
     /* An extension on a value whose type lies outside the project. */
     OO_EXPECT("CALLS", "Main.externalExtension", "Store.shout", 1);
     OO_EXPECT("CALLS", "Main.externalWrongReceiver", "Store.onlyInt", 0);
+    /* An extension's receiver takes the standard library's subtypes, and only those. */
+    OO_EXPECT("CALLS", "Main.listIsIterable", "Store.onIterable", 1);
+    OO_EXPECT("CALLS", "Main.projectIsIterable", "Store.onIterable", 1);
+    OO_EXPECT("CALLS", "Main.setIsCollection", "Store.onCollection", 1);
+    OO_EXPECT("CALLS", "Main.stringIsNoCollection", "Store.onCollection", 0);
+    OO_EXPECT("CALLS", "Main.storeIsNoIterable", "Store.onIterable", 0);
+    /* Past a vararg, position does not say which parameter an argument lands on. */
+    OO_EXPECT("CALLS", "Main.varargInTheMiddle", "Store.middleVararg", 1);
     /* Extension properties: only the receiver they are declared on. */
     OO_EXPECT("USAGE", "Main.extensionProperty", "Store.extProp", 1);
     OO_EXPECT("CALLS", "Main.extensionProperty", "Store.Store.get", 1);

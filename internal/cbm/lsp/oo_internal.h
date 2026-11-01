@@ -94,6 +94,7 @@ typedef struct oo_callable {
     const oo_file_t *file;
     uint32_t flags;
     int min_args, max_args; /* max_args -1: variadic. */
+    int vararg_position;    /* Kotlin: 1 + the vararg's index; it need not be last. */
     const oo_typeref_t **params;
     int param_count;
     const oo_typeref_t *ret;
