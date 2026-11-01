@@ -212,25 +212,25 @@ static const cv_golden_t cv_goldens[] = {
     {"cv_c_preprocessor", "cv_c_preprocessor-2", "pick.c", "pick", "beta()", 0, "pick.c", "beta", 2,
      "void beta(void) {}"},
     {"cv_c_preprocessor", "cv_c_preprocessor-3", "pick.c", "caller", "pick()", 0, "pick.c", "pick",
-     4, "void pick(void) { alpha(); }"},
+     6, "void pick(void) { beta(); }"},
     {"cv_cpp_elif", "cv_cpp_elif-1", "pick.cpp", "pick", "alpha()", 1, "pick.cpp", "alpha", 1,
      "void alpha() {}"},
     {"cv_cpp_elif", "cv_cpp_elif-2", "pick.cpp", "pick", "beta()", 1, "pick.cpp", "beta", 2,
      "void beta() {}"},
-    {"cv_cpp_elif", "cv_cpp_elif-3", "pick.cpp", "caller", "pick()", 2, "pick.cpp", "pick", 4,
-     "void pick() { alpha(); }"},
+    {"cv_cpp_elif", "cv_cpp_elif-3", "pick.cpp", "caller", "pick()", 2, "pick.cpp", "pick", 6,
+     "void pick() { beta(); }"},
     {"cv_cpp_class_members", "cv_cpp_class_members-1", "pick.cpp", "pick", "alpha()", 1, "pick.cpp",
      "alpha", 2, "  void alpha() {}"},
     {"cv_cpp_class_members", "cv_cpp_class_members-2", "pick.cpp", "pick", "beta()", 1, "pick.cpp",
      "beta", 3, "  void beta() {}"},
     {"cv_cpp_class_members", "cv_cpp_class_members-3", "pick.cpp", "caller", "pick()", 2,
-     "pick.cpp", "pick", 5, "  void pick() { alpha(); }"},
+     "pick.cpp", "pick", 7, "  void pick() { beta(); }"},
     {"cv_cuda", "cv_cuda-1", "pick.cu", "pick", "alpha()", 1, "pick.cu", "alpha", 1,
      "__device__ void alpha() {}"},
     {"cv_cuda", "cv_cuda-2", "pick.cu", "pick", "beta()", 1, "pick.cu", "beta", 2,
      "__device__ void beta() {}"},
-    {"cv_cuda", "cv_cuda-3", "pick.cu", "caller", "pick()", 2, "pick.cu", "pick", 4,
-     "__device__ void pick() { alpha(); }"},
+    {"cv_cuda", "cv_cuda-3", "pick.cu", "caller", "pick()", 2, "pick.cu", "pick", 6,
+     "__device__ void pick() { beta(); }"},
     {"cv_csharp_class_members", "cv_csharp_class_members-1", "Picker.cs", "Pick", "Alpha()", 1,
      "Picker.cs", "Alpha", 2, "  static void Alpha() {}"},
     {"cv_csharp_class_members", "cv_csharp_class_members-2", "Picker.cs", "Pick", "Beta()", 1,
@@ -359,6 +359,20 @@ static const cv_recovered_t cv_recovered[] = {
     {"cv_python_if-1", 5, 6, "    def pick():"}, {"cv_python_if-2", 8, 9, "    def pick():"},
     {"cv_c_platform_files-1", 0, 0, NULL},       {"cv_c_platform_files-2", 0, 0, NULL},
     {"cv_c_platform_directories-1", 0, 0, NULL}, {"cv_c_platform_directories-2", 0, 0, NULL},
+    /* The translation-unit rules bind a function's body in either branch, and a caller to the
+     * one node both branches share. That node's stored span is the last branch. */
+    {"cv_c_preprocessor-1", 4, 4, "void pick(void) { alpha(); }"},
+    {"cv_c_preprocessor-2", 6, 6, "void pick(void) { beta(); }"},
+    {"cv_c_preprocessor-3", 0, 0, NULL},
+    {"cv_cpp_elif-1", 4, 4, "void pick() { alpha(); }"},
+    {"cv_cpp_elif-2", 6, 6, "void pick() { beta(); }"},
+    {"cv_cpp_elif-3", 0, 0, NULL},
+    {"cv_cpp_class_members-1", 5, 5, "  void pick() { alpha(); }"},
+    {"cv_cpp_class_members-2", 7, 7, "  void pick() { beta(); }"},
+    {"cv_cpp_class_members-3", 0, 0, NULL},
+    {"cv_cuda-1", 4, 4, "__device__ void pick() { alpha(); }"},
+    {"cv_cuda-2", 6, 6, "__device__ void pick() { beta(); }"},
+    {"cv_cuda-3", 0, 0, NULL},
 };
 
 static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, int count) {
@@ -424,7 +438,9 @@ static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, i
             .relation = "CALLS",
             .target = {.file = g->target_file,
                        .suffix = g->target,
-                       .label = recovered ? "Function" : NULL,
+                       .label = !recovered                             ? NULL
+                                : !strcmp(test, "cv_cpp_class_members") ? "Method"
+                                                                        : "Function",
                        .declaration_line = g->declaration_line,
                        .declaration_text = g->declaration},
             .mode = recovered ? RQ_REQUIRED : RQ_KNOWN_GAP,
@@ -434,7 +450,7 @@ static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, i
             .why =
                 recovered
                     ? "This source-authored body call is recovered and must retain its exact "
-                      "callable target; merged Python callers also require their authored variant."
+                      "callable target; merged callers also require their authored variant."
                 : g->target
                     ? "The strict resolver has no admitted binding for these conditional or "
                       "build-selected declarations; each source relationship remains recall debt."
