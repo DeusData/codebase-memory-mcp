@@ -1230,11 +1230,22 @@ TEST(index_supervisor_quiet_timeout_remains_hang_with_duration_enabled) {
     const char *saved_timeout = getenv("CBM_INDEX_WORKER_TIMEOUT_S");
     char *saved_timeout_copy = saved_timeout ? cbm_strdup(saved_timeout) : NULL;
     (void)cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "1", 1);
-    cbm_index_supervisor_reset_resource_hooks_for_testing();
-    cbm_index_resource_policy_t policy = index_supervisor_test_worker_policy(0, 60000);
+    /* The duration watchdog stays armed, but its clock is pinned at the request
+     * origin, so the quiet timeout (the subprocess's own clock) is the only way
+     * this hung worker can end, however slowly the host runs. With the real
+     * clock a starved run could cross the duration limit first and turn the
+     * HANG into a resource kill. The limit equals the quiet timeout on purpose:
+     * more real time than the limit always passes, and it still cannot fire. */
+    index_supervisor_resource_fake_t fake = {
+        .now_ms = 100,
+        .rss_status = CBM_PROC_TREE_RSS_EMPTY,
+    };
+    cbm_index_supervisor_set_resource_hooks_for_testing(index_supervisor_fake_clock,
+                                                        index_supervisor_fake_charged_rss, &fake);
+    cbm_index_resource_policy_t policy = index_supervisor_test_worker_policy(0, 1000);
     cbm_index_worker_handle_t *handle = NULL;
     int start_rc = cbm_index_worker_start_with_policy("{\"__cbm_test_worker\":\"hang-tree\"}", 0,
-                                                      &policy, false, NULL, NULL, 0, &handle);
+                                                      &policy, false, NULL, NULL, 100, &handle);
     const cbm_index_worker_result_t *result = NULL;
     bool terminal = handle && index_supervisor_test_poll_terminal(
                                   handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
@@ -1246,11 +1257,15 @@ TEST(index_supervisor_quiet_timeout_remains_hang_with_duration_enabled) {
     } else {
         index_supervisor_test_cleanup_handle(handle);
     }
+    cbm_index_supervisor_reset_resource_hooks_for_testing();
     index_supervisor_test_restore_env("CBM_INDEX_WORKER_TIMEOUT_S", saved_timeout_copy);
 
     ASSERT_EQ(start_rc, 0);
     ASSERT_TRUE(terminal);
     ASSERT_TRUE(remained_hang);
+    /* The duration check really ran while polling (it read the pinned clock),
+     * so HANG won against a live watchdog, not against a disabled one. */
+    ASSERT_TRUE(fake.clock_calls > 0);
     PASS();
 }
 
