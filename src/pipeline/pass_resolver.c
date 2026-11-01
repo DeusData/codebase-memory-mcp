@@ -11,6 +11,7 @@
 #include "resolve/binding.h"
 #include "resolve/lookup.h"
 #include "resolve/policy.h"
+#include "resolve/rust_names.h"
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
 #include "lsp/go_stabilize.h"
@@ -73,6 +74,9 @@ typedef struct {
     unsigned declarations;
     conditional_owner_t *conditional;
     bool ambiguous;
+    /* cfg twins and one type's repeated impl methods are one graph identity;
+     * the Rust adapter separately rejects a QN two scopes of a file claim. */
+    bool rust;
 } target_proof_t;
 
 typedef struct {
@@ -162,6 +166,10 @@ typedef struct {
     size_t site_count;
     const cbm_gbuf_node_t *file_node;
     bool source_matches;
+    const cbm_rust_file_analysis_t *rust;
+    /* One node per distinct site fact, so its size is the file's own: only the
+     * memory core can refuse it, never a cap that would drop edges from a big file. */
+    cbm_resolve_proof_pool_t rust_proofs;
 } file_resolver_t;
 
 static char *load_source(const char *path, size_t *length) {
@@ -242,6 +250,10 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     if (!definition->qualified_name || !definition->label || !file)
         return true;
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
+    if (prior && prior->rust && language == CBM_LANG_RUST) {
+        prior->ambiguous |= strcmp(prior->file, file) != 0;
+        return true;
+    }
     if (prior) {
         bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
         prior->ambiguous |= !same_owner || prior->start_line != definition->start_line ||
@@ -263,6 +275,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     entry->start_line = definition->start_line;
     entry->end_line = definition->end_line;
     entry->declarations = 1;
+    entry->rust = language == CBM_LANG_RUST;
     if (!entry->file || !entry->label)
         return false;
     cbm_ht_set(resolver->targets, key, entry);
@@ -377,6 +390,8 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         !node->label)
         return false;
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
+    if (proof && proof->rust)
+        return !proof->ambiguous && !strcmp(proof->file, node->file_path);
     return proof && !proof->ambiguous && !strcmp(proof->file, node->file_path) &&
            !strcmp(proof->label, node->label) && node->start_line >= 0 && node->end_line >= 0 &&
            proof->start_line == (uint32_t)node->start_line &&
@@ -2536,6 +2551,73 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
                                         candidate.proof);
 }
 
+/* One site fact from the Rust adapter, sealed with the proof of this occurrence:
+ * its enclosing scope, spelling, span and relation. */
+static cbm_resolve_result_t rust_result(file_resolver_t *resolver, cbm_rust_site_kind_t kind,
+                                        const char *name, const char *scope, uint32_t start,
+                                        uint32_t end, CBMSourceOrigin origin,
+                                        const char *relation) {
+    const cbm_rust_site_t *site = origin == CBM_SOURCE_ORIGIN_RAW
+                                      ? cbm_rust_site_find(resolver->rust, kind, start, end)
+                                      : NULL;
+    if (!site)
+        return unresolved(resolver->rust ? "rust_no_resolved_site" : "rust_project_model_missing");
+    cbm_resolve_result_t result = {.binding = site->binding,
+                                   .domain = site->domain,
+                                   .analysis = site->analysis,
+                                   .rule = site->rule,
+                                   .facts = site->facts,
+                                   .target = site->target,
+                                   .candidate_count =
+                                       site->binding == CBM_RESOLVE_BINDING_UNIQUE      ? 1
+                                       : site->binding == CBM_RESOLVE_BINDING_AMBIGUOUS ? 2
+                                                                                        : 0,
+                                   .reason = site->reason};
+    if (!cbm_resolve_admit(&result))
+        return result;
+    /* A graph node of another kind under this QN is not the declaration selected:
+     * a field sharing its name with a method keeps only the method's node. */
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(resolver->file->graph, site->target);
+    if (node && site->label && node->label && strcmp(node->label, site->label)) {
+        result.facts = 0;
+        result.binding = CBM_RESOLVE_BINDING_UNRESOLVED;
+        result.candidate_count = 0;
+        result.target = NULL;
+        result.reason = "rust_target_label_conflict";
+        return result;
+    }
+    /* A tuple struct's name is its constructor. */
+    if (kind == CBM_RUST_SITE_CALL && site->label && !strcmp(site->label, "Struct"))
+        result.facts |= CBM_RESOLVE_FACT_CLASS_CALLABLE;
+    cbm_resolve_lookup_context_t *shared = cbm_resolve_binding_lookup_context(resolver->bindings);
+    if (!shared)
+        return unresolved("rust_proof_context_missing");
+    cbm_resolve_proof_source_t source = shared->source;
+    source.scope = scope;
+    cbm_resolve_lookup_context_t context;
+    cbm_resolve_lookup_t query;
+    if (!cbm_resolve_lookup_context_init(&context, &resolver->rust_proofs, source)) {
+        result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+        result.facts = 0;
+        result.reason = "rust_proof_unavailable";
+        return result;
+    }
+    cbm_resolve_lookup_begin(&query, &context, "rust.name_resolution", name, start, end,
+                             CBM_SOURCE_ORIGIN_RAW);
+    (void)cbm_resolve_lookup_observe(&query, "rust.name_resolution", name, site->target,
+                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                     result.facts, true, site->reason);
+    query.key.binding_identity = site->target;
+    query.key.detail = relation;
+    result.proof = cbm_resolve_lookup_finish(&query, CBM_PROOF_REGISTRY_LOOKUP, result);
+    if (!result.proof) {
+        result.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
+        result.facts = 0;
+        result.reason = "rust_proof_unavailable";
+    }
+    return result;
+}
+
 static const cbm_gbuf_node_t *source_node(const file_resolver_t *resolver, const char *scope) {
     if (!scope || !scope[0])
         return resolver->file_node;
@@ -2662,7 +2744,9 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     if (target && (strcmp(relation, "CALL_REFERENCE") == 0 || strcmp(relation, "CALLS") == 0) &&
         !callable_node(target) &&
         !(resolver->file->language == CBM_LANG_PYTHON && target->label &&
-          !strcmp(target->label, "Class") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
+          !strcmp(target->label, "Class") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE)) &&
+        !(resolver->file->language == CBM_LANG_RUST && target->label &&
+          !strcmp(target->label, "Struct") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
     }
@@ -2739,6 +2823,10 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
                                call->site_end_byte, call->source_origin);
         cbm_resolve_result_t outcome =
             site ? semantic_result(resolver, site, arena)
+            : resolver->file->language == CBM_LANG_RUST
+                ? rust_result(resolver, CBM_RUST_SITE_CALL, call->callee_name,
+                              call->enclosing_func_qn, call->site_start_byte, call->site_end_byte,
+                              call->source_origin, "CALLS")
             : call->requires_lsp_resolution && !lexical_jsx
                 ? unresolved("semantic_resolution_required")
                 : generic_result(resolver, call->callee_name, call->enclosing_func_qn,
@@ -2782,8 +2870,21 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
             site = find_semantic(resolver, usage->enclosing_func_qn, usage->site_start_byte,
                                  usage->site_end_byte, usage->source_origin,
                                  CBM_RESOLVED_FIELD_REFERENCE);
+        /* A direct callable argument is a call reference, decided before the
+         * occurrence proof records its relation. */
+        if (!site && resolver->file->language == CBM_LANG_RUST && usage->may_be_call_reference) {
+            const cbm_rust_site_t *fact = cbm_rust_site_find(
+                resolver->rust, CBM_RUST_SITE_REF, usage->site_start_byte, usage->site_end_byte);
+            if (fact && fact->target &&
+                callable_node(cbm_gbuf_find_by_qn(resolver->file->graph, fact->target)))
+                relation = "CALL_REFERENCE";
+        }
         cbm_resolve_result_t outcome =
             site ? semantic_result(resolver, site, arena)
+            : resolver->file->language == CBM_LANG_RUST
+                ? rust_result(resolver, CBM_RUST_SITE_REF, usage->ref_name,
+                              usage->enclosing_func_qn, usage->site_start_byte,
+                              usage->site_end_byte, usage->source_origin, relation)
             : usage->is_member_access
                 ? unresolved("receiver_type_required")
                 : generic_result(resolver, usage->ref_name, usage->enclosing_func_qn,
@@ -2812,6 +2913,10 @@ static bool resolve_writes(file_resolver_t *resolver, CBMArena *arena) {
                           rw->source_origin, CBM_RESOLVED_FIELD_REFERENCE);
         cbm_resolve_result_t outcome =
             site ? semantic_result(resolver, site, arena)
+            : resolver->file->language == CBM_LANG_RUST
+                ? rust_result(resolver, CBM_RUST_SITE_REF, rw->var_name, rw->enclosing_func_qn,
+                              rw->site_start_byte, rw->site_end_byte, rw->source_origin,
+                              rw->is_write ? "WRITES" : "READS")
             : rw->is_member_access
                 ? unresolved("receiver_type_required")
                 : generic_result(resolver, rw->var_name, rw->enclosing_func_qn, rw->site_start_byte,
@@ -2834,9 +2939,12 @@ static bool resolve_types(file_resolver_t *resolver) {
                                                 type->source_origin, CBM_RESOLVED_TYPE_REFERENCE)
                                 : NULL;
         cbm_resolve_result_t outcome =
-            site ? semantic_result(resolver, site, resolver->arena)
-            : !type->site_is_exact
-                ? unresolved("type_occurrence_identity_missing")
+            site                   ? semantic_result(resolver, site, resolver->arena)
+            : !type->site_is_exact ? unresolved("type_occurrence_identity_missing")
+            : resolver->file->language == CBM_LANG_RUST
+                ? rust_result(resolver, CBM_RUST_SITE_REF, type->type_name, type->enclosing_func_qn,
+                              type->site_start_byte, type->site_end_byte, type->source_origin,
+                              "USES_TYPE")
                 : generic_result(resolver, type->type_name, type->enclosing_func_qn,
                                  type->site_start_byte, type->site_end_byte, type->source_origin,
                                  false);
@@ -2876,8 +2984,29 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
         cbm_pipeline_file_node(file->graph, file->ctx->project_name, file->rel_path);
     resolver.bindings =
         cbm_resolve_binding_build(&arena, file->result, file->language, source, length);
+    TSTree *rust_tree = NULL;
+    bool rust_ok = true;
+    if (file->language == CBM_LANG_RUST && file->ctx->rust_project && source &&
+        resolver.source_matches && length <= UINT32_MAX) {
+        const TSTree *tree = file->result->cached_tree;
+        if (!tree) {
+            TSParser *parser = ts_parser_new();
+            if (parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST)))
+                rust_tree = cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
+            if (parser)
+                ts_parser_delete(parser);
+            tree = rust_tree;
+        }
+        /* A partial parse leaves no faithful scopes: every site stays unresolved. */
+        if (tree && !ts_node_has_error(ts_tree_root_node(tree))) {
+            resolver.rust = cbm_rust_analyze_file(file->ctx->rust_project, &arena, file->rel_path,
+                                                  source, length, ts_tree_root_node(tree));
+            rust_ok = resolver.rust != NULL;
+            cbm_resolve_proof_pool_init_project(&resolver.rust_proofs, &arena);
+        }
+    }
     bool begun = cbm_gbuf_resolution_begin(file->output);
-    bool ok = begun && resolver.bindings &&
+    bool ok = rust_ok && begun && resolver.bindings &&
               cbm_resolve_binding_set_identity(resolver.bindings, file->ctx->project_name,
                                                file->rel_path) &&
               prepare_source_imports(&resolver) && index_semantics(&resolver) &&
@@ -2890,6 +3019,8 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     cbm_free(CBM_MEM_CLASS_EXTRACT, resolver.sites);
     if (owner_tree)
         ts_tree_delete(owner_tree);
+    if (rust_tree)
+        ts_tree_delete(rust_tree);
     cbm_arena_destroy(&arena);
     cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
     return ok;

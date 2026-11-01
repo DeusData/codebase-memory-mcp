@@ -453,6 +453,8 @@ typedef struct {
     CBMFileResult **result_cache;
     /* Immutable export proofs shared by all resolution workers. */
     cbm_shared_resolver_t *shared_resolver;
+    /* Immutable Rust name model, sealed before import edges are projected. */
+    struct cbm_rust_project *rust_project;
     cbm_resolve_stats_t *resolver_stats; /* run-owned; workers borrow until join */
     _Atomic bool resolver_failed;
 
@@ -946,7 +948,7 @@ void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 /* Enrich the map with source-audited Rust module trees and configured C/C++
  * include roots. A false result leaves a partial map which the caller must
  * discard; it must never become a completed lookup domain. */
-bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+bool cbm_pipeline_import_context_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                        int count, CBMFileResult **cache, CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
