@@ -455,6 +455,8 @@ static bool shadow_case_controlled_with_allowed_target(const char *source, const
     cbm_arena_destroy(&f.arena);
     return ok;
 }
+static bool go_selects(const char *source, const char *scope, const char *anchor,
+                       const char *expected);
 static bool shadow_case_controlled_and_unknown(const char *source, const char *scope,
                                                const char *spelling) {
     return shadow_case_controlled_with_allowed_target(source, scope, spelling, NULL);
@@ -543,7 +545,8 @@ TEST(resolver_stabilization_grouped_var_callable_shadows_package_callable) {
                          "func F(){\n"
                          "var (\nMake=func() B{return B{}}\n)\n"
                          "x:=Make(); x.M()\n}\n";
-    ASSERT(shadow_case_controlled_and_unknown(source, "test.api.F", "x.M"));
+    /* The local closure returns B. The package's Make returning A must not be consulted. */
+    ASSERT(go_selects(source, "test.api.F", "x.M", "test.api.B.M"));
     PASS();
 }
 TEST(resolver_stabilization_nonlocal_assignment_does_not_invent_local_authority) {
@@ -1285,7 +1288,8 @@ TEST(resolver_stabilization_go_literals_new_make_and_conversions_are_typed) {
     ASSERT(go_selects(source, "test.api.F", "c[0].M(/*make*/", "test.api.A.M"));
     ASSERT(go_selects(source, "test.api.F", "S(raw).Up(/*convert*/", "test.api.S.Up"));
     ASSERT(go_selects(source, "test.api.F", "(*A)(nil).M(/*convert-pointer*/", "test.api.A.M"));
-    ASSERT(go_selects(source, "test.api.G", "z.M(/*shadowed-new*/", NULL));
+    /* A local new is an ordinary closure returning *B, never the builtin. */
+    ASSERT(go_selects(source, "test.api.G", "z.M(/*shadowed-new*/", "test.api.B.M"));
     PASS();
 }
 
