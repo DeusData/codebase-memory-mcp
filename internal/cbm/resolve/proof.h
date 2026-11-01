@@ -128,6 +128,20 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
                                                     const cbm_resolve_proof_t *const *premises,
                                                     size_t premise_count, bool predecessors_closed);
 
+/* The node cbm_resolve_proof_derive would intern, built on the caller's storage
+ * and touching no pool, for a writer that needs a fact's identity but will never
+ * look it up again. premises must already be interned in one pool; the array is
+ * sorted and deduplicated in place and *out borrows it, like every string it holds.
+ * False when the depth limit is reached, as derive would fail. */
+bool cbm_resolve_proof_compose(cbm_resolve_proof_view_t *out, cbm_resolve_proof_kind_t kind,
+                               const cbm_resolve_proof_source_t *source,
+                               const cbm_resolve_proof_key_t *key,
+                               const cbm_resolve_result_t *outcome,
+                               const cbm_resolve_proof_t **premises, size_t count, bool closed);
+/* The ordering of cbm_resolve_proof_compare, for a view that has no node yet. */
+int cbm_resolve_proof_view_compare(const cbm_resolve_proof_view_t *a,
+                                   const cbm_resolve_proof_view_t *b);
+
 /* Deep clone + full-key interning. Shared predecessors are visited once.
  * Use a destination pool in CBMFileResult's arena before hybrid teardown. */
 const cbm_resolve_proof_t *cbm_resolve_proof_clone(cbm_resolve_proof_pool_t *destination,

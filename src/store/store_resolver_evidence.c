@@ -1,6 +1,7 @@
 #include "resolve/stats.h"
 #include "store_resolver_evidence.h"
 #include "arena.h"
+#include "foundation/compat.h"
 #include "foundation/json_writer.h"
 #include "foundation/log.h"
 #include "foundation/mem_core.h"
@@ -189,6 +190,7 @@ typedef struct {
     dict_slot_t *dict;
     size_t dict_capacity, dict_count;
     dict_cache_t *cache;
+    sqlite3_int64 *row_facts;
     verified_source_t verified[VERIFIED_SOURCE_SLOTS];
     CBMArena owned;
     type_digest_t *types;
@@ -205,8 +207,16 @@ static const char *text(const char *value) {
 static bool bind_text(sqlite3_stmt *s, int col, const char *value) {
     return sqlite3_bind_text(s, col, text(value), -1, SQLITE_STATIC) == SQLITE_OK;
 }
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+static uint64_t progress_rows = PROGRESS_ROWS;
+void cbm_store_resolver_test_set_progress_rows(uint64_t rows) {
+    progress_rows = rows ? rows : PROGRESS_ROWS;
+}
+#else
+enum { progress_rows = PROGRESS_ROWS };
+#endif
 static void note_rows(evidence_write_t *w, const char *stage) {
-    if (++w->rows % PROGRESS_ROWS)
+    if (++w->rows % progress_rows)
         return;
     char rows[32];
     (void)snprintf(rows, sizeof(rows), "%llu", (unsigned long long)w->rows);
@@ -610,8 +620,9 @@ static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, si
            bind_fact_text(w, s, 30, v->outcome.reason) &&
            sqlite3_bind_int(s, 31, v->predecessors_closed ? 1 : 0) == SQLITE_OK;
 }
-static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_t *node) {
-    const cbm_resolve_proof_view_t *v = cbm_resolve_proof_view(node);
+/* node is NULL for a composed fact, which only its row will ever cite. */
+static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v,
+                       const cbm_resolve_proof_t *node, size_t *written) {
     if (!v || !source_matches(w, &v->source) || !grow_ids(w))
         return false;
     bool plain = fact_plain_text(&w->fact_text, v);
@@ -645,8 +656,10 @@ static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_t *node) {
     ok = ok && note_type_digest(w, v, digest) &&
          finish_row(w, w->fact, bind_fact(w, v, entry.id, digest), "facts");
     if (ok) {
-        *id_slot(w, node) = entry;
+        if (node)
+            *id_slot(w, node) = entry;
         w->count++;
+        *written = entry.id;
     }
     return ok;
 }
@@ -666,19 +679,117 @@ static bool write_facts_from(evidence_write_t *w, const cbm_resolve_proof_t *nod
     for (size_t i = 0; i < v->premise_count; i++)
         if (!write_facts_from(w, v->premises[i]))
             return false;
-    return write_fact(w, node);
+    size_t written = 0;
+    return write_fact(w, v, node, &written);
+}
+
+/* Roots are sorted structurally, so fact ids do not depend on occurrence order. A
+ * root is a node, or a row whose occurrence fact has not been composed yet: low bit
+ * set. Equal fingerprints are rare, and only they compose a view to compare. */
+typedef struct {
+    uint64_t fingerprint;
+    uintptr_t ref;
+} fact_root_t;
+typedef struct {
+    cbm_resolve_proof_view_t view;
+    const cbm_resolve_proof_t *premises[2];
+} composed_fact_t;
+
+static CBM_TLS const char *fact_root_project;
+
+static bool root_is_row(const fact_root_t *root) {
+    return root->ref & 1;
+}
+static const cbm_resolve_record_t *root_row(const fact_root_t *root) {
+    return (const cbm_resolve_record_t *)(root->ref & ~(uintptr_t)1);
+}
+static bool compose_fact(composed_fact_t *fact, const cbm_resolve_record_t *row,
+                         const char *project) {
+    cbm_resolve_proof_source_t source;
+    cbm_resolve_proof_key_t key;
+    cbm_resolve_result_t outcome;
+    size_t count = 0;
+    cbm_resolve_record_envelope(row, project, &source, &key, &outcome, fact->premises, &count);
+    return cbm_resolve_proof_compose(&fact->view, CBM_PROOF_OCCURRENCE_BINDING, &source, &key,
+                                     &outcome, fact->premises, count, true);
+}
+/* Composition of these rows already succeeded when their fingerprints were taken. */
+static const cbm_resolve_proof_view_t *root_view(const fact_root_t *root, composed_fact_t *fact) {
+    if (!root_is_row(root))
+        return cbm_resolve_proof_view((const cbm_resolve_proof_t *)root->ref);
+    return compose_fact(fact, root_row(root), fact_root_project) ? &fact->view : NULL;
 }
 static int compare_roots(const void *left, const void *right) {
-    return cbm_resolve_proof_compare(*(const cbm_resolve_proof_t *const *)left,
-                                     *(const cbm_resolve_proof_t *const *)right);
+    const fact_root_t *a = left, *b = right;
+    if (a->fingerprint != b->fingerprint)
+        return a->fingerprint < b->fingerprint ? -1 : 1;
+    if (a->ref == b->ref)
+        return 0;
+    composed_fact_t first, second;
+    const cbm_resolve_proof_view_t *x = root_view(a, &first), *y = root_view(b, &second);
+    if (!x || !y)
+        return x ? 1 : (y ? -1 : 0);
+    return cbm_resolve_proof_view_compare(x, y);
 }
-/* Roots are sorted structurally, so fact ids do not depend on occurrence order. */
-static bool write_facts(evidence_write_t *w, const cbm_resolve_proof_t **roots, size_t count) {
+/* Roots that compare equal are one fact, as interning would have made them: the
+ * first writes it and the others take its id. */
+static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_root_t *previous,
+                       const cbm_resolve_record_t *rows, size_t *last_id) {
+    bool same = previous && !compare_roots(previous, root);
+    if (!root_is_row(root)) {
+        const cbm_resolve_proof_t *node = (const cbm_resolve_proof_t *)root->ref;
+        if (same && !find_id(w, node)) {
+            if (!grow_ids(w))
+                return false;
+            *id_slot(w, node) = (evidence_id_t){.node = node, .id = *last_id};
+            return true;
+        }
+        if (!write_facts_from(w, node))
+            return false;
+        *last_id = find_id(w, node)->id;
+        return true;
+    }
+    const cbm_resolve_record_t *row = root_row(root);
+    if (!same) {
+        composed_fact_t fact;
+        if (!compose_fact(&fact, row, w->project))
+            return false;
+        for (size_t i = 0; i < fact.view.premise_count; i++)
+            if (!write_facts_from(w, fact.view.premises[i]))
+                return false;
+        if (!write_fact(w, &fact.view, NULL, last_id))
+            return false;
+    }
+    w->row_facts[row - rows] = (sqlite3_int64)*last_id;
+    return true;
+}
+static bool write_facts(evidence_write_t *w, fact_root_t *roots, size_t count,
+                        const cbm_resolve_record_t *rows) {
+    fact_root_project = w->project;
     if (count > 1)
         qsort(roots, count, sizeof(*roots), compare_roots);
+    size_t last_id = 0;
     for (size_t i = 0; i < count; i++)
-        if (!write_facts_from(w, roots[i]))
+        if (!write_root(w, &roots[i], i ? &roots[i - 1] : NULL, rows, &last_id))
             return false;
+    return true;
+}
+/* A row's occurrence fact, or the node it already has. */
+static bool collect_row_roots(evidence_write_t *w, const cbm_resolve_record_t *row,
+                              fact_root_t *roots, size_t *count) {
+    if (row->envelope_pending) {
+        composed_fact_t fact;
+        if (!row->result.proof || !compose_fact(&fact, row, w->project))
+            return false;
+        roots[(*count)++] = (fact_root_t){.fingerprint = fact.view.fingerprint,
+                                          .ref = (uintptr_t)row | (uintptr_t)1};
+    } else if (row->result.proof) {
+        roots[(*count)++] = (fact_root_t){.fingerprint = row->result.proof->value.fingerprint,
+                                          .ref = (uintptr_t)row->result.proof};
+    }
+    if (row->binding_proof)
+        roots[(*count)++] = (fact_root_t){.fingerprint = row->binding_proof->value.fingerprint,
+                                          .ref = (uintptr_t)row->binding_proof};
     return true;
 }
 
@@ -753,7 +864,7 @@ static sqlite3_int64 properties_id(evidence_write_t *w, const cbm_resolve_record
     return id;
 }
 static bool bind_occurrence(evidence_write_t *w, const cbm_resolve_record_t *row, size_t ordinal,
-                            const evidence_id_t *proof, const evidence_id_t *binding) {
+                            sqlite3_int64 proof, const evidence_id_t *binding) {
     sqlite3_stmt *s = w->occurrence;
     const cbm_resolve_result_t *r = &row->result;
     int32_t line = -1;
@@ -776,12 +887,15 @@ static bool bind_occurrence(evidence_write_t *w, const cbm_resolve_record_t *row
            sqlite3_bind_int64(s, 20, line) == SQLITE_OK &&
            bind_id(w, s, 21, row->content_identity) &&
            bind_id(w, s, 22, row->configuration_identity) &&
-           sqlite3_bind_int64(s, 23, proof ? (sqlite3_int64)proof->id : 0) == SQLITE_OK &&
+           sqlite3_bind_int64(s, 23, proof) == SQLITE_OK &&
            sqlite3_bind_int64(s, 24, binding ? (sqlite3_int64)binding->id : 0) == SQLITE_OK;
 }
 static bool write_occurrences(evidence_write_t *w, const cbm_resolve_record_t *rows, size_t count) {
     for (size_t i = 0; i < count; i++) {
-        evidence_id_t *proof = find_id(w, rows[i].result.proof);
+        evidence_id_t *node = rows[i].envelope_pending ? NULL : find_id(w, rows[i].result.proof);
+        sqlite3_int64 proof = rows[i].envelope_pending ? w->row_facts[i]
+                              : node                   ? (sqlite3_int64)node->id
+                                                       : 0;
         evidence_id_t *binding = find_id(w, rows[i].binding_proof);
         cbm_resolve_proof_source_t source = {.project = w->project,
                                              .file = rows[i].file_path,
@@ -943,9 +1057,9 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
         file_count > SIZE_MAX / sizeof(void *) || summary_count > SIZE_MAX / sizeof(void *))
         return false;
     size_t root_capacity = count * 2 + summary_count;
-    if (root_capacity > SIZE_MAX / sizeof(void *))
+    if (root_capacity > SIZE_MAX / sizeof(fact_root_t))
         return false;
-    const cbm_resolve_proof_t **roots =
+    fact_root_t *roots =
         root_capacity ? cbm_alloc(CBM_MEM_CLASS_STORE, root_capacity * sizeof(*roots)) : NULL;
     const cbm_resolve_file_t **ordered_files =
         file_count ? cbm_alloc(CBM_MEM_CLASS_STORE, file_count * sizeof(*ordered_files)) : NULL;
@@ -956,16 +1070,12 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     bool ok = (!root_capacity || roots) && (!file_count || ordered_files) &&
               (!summary_count || ordered_summaries) && cache;
     size_t root_count = 0;
-    for (size_t i = 0; ok && i < count; i++) {
-        if (rows[i].result.proof)
-            roots[root_count++] = rows[i].result.proof;
-        if (rows[i].binding_proof)
-            roots[root_count++] = rows[i].binding_proof;
-    }
     for (size_t i = 0; ok && i < summary_count; i++) {
         ordered_summaries[i] = &summaries[i];
         if (summaries[i].result.proof)
-            roots[root_count++] = summaries[i].result.proof;
+            roots[root_count++] =
+                (fact_root_t){.fingerprint = summaries[i].result.proof->value.fingerprint,
+                              .ref = (uintptr_t)summaries[i].result.proof};
     }
     for (size_t i = 0; ok && i < file_count; i++)
         ordered_files[i] = &files[i];
@@ -988,8 +1098,12 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     w->file_count = file_count;
     w->cache = cache;
     cbm_arena_init(&w->owned);
+    w->row_facts = count ? cbm_calloc(CBM_MEM_CLASS_STORE, count * sizeof(*w->row_facts)) : NULL;
+    ok = ok && (!count || w->row_facts);
+    for (size_t i = 0; ok && i < count; i++)
+        ok = collect_row_roots(w, &rows[i], roots, &root_count);
     ok = ok && reset_tables(db, project, &w->pid) && prepare_writer(w) &&
-         write_facts(w, roots, root_count);
+         write_facts(w, roots, root_count, rows);
     cbm_free(CBM_MEM_CLASS_STORE, roots);
     ok = ok && write_occurrences(w, rows, count) &&
          write_summaries(w, ordered_summaries, summary_count) &&
@@ -1003,6 +1117,7 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     cbm_free(CBM_MEM_CLASS_STORE, w->dict);
     cbm_free(CBM_MEM_CLASS_STORE, w->types);
     cbm_free(CBM_MEM_CLASS_STORE, w->fact_text.bytes);
+    cbm_free(CBM_MEM_CLASS_STORE, w->row_facts);
     cbm_free(CBM_MEM_CLASS_STORE, cache);
     cbm_arena_destroy(&w->owned);
     cbm_free(CBM_MEM_CLASS_STORE, writer);

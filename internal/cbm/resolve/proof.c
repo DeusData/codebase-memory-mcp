@@ -113,6 +113,7 @@ static uint64_t hash_number(uint64_t hash, uint64_t value) {
     }
     return hash;
 }
+/* A NULL pool charges nothing, for a view that will never enter one. */
 static bool proof_hash(cbm_resolve_proof_pool_t *pool, cbm_resolve_proof_view_t *v) {
     uint64_t hash = UINT64_C(14695981039346656037), numbers[16];
     const char *strings[16];
@@ -123,7 +124,7 @@ static bool proof_hash(cbm_resolve_proof_pool_t *pool, cbm_resolve_proof_view_t 
     for (size_t i = 0; i < count; i++) {
         const char *s = text_or_empty(strings[i]);
         size_t length = strlen(s);
-        if (!proof_step(pool, length + 1))
+        if (pool && !proof_step(pool, length + 1))
             return false;
         hash = hash_number(hash, length);
         for (size_t j = 0; j < length; j++) {
@@ -153,17 +154,21 @@ static int compare_payload(const cbm_resolve_proof_view_t *a, const cbm_resolve_
     }
     return 0;
 }
+int cbm_resolve_proof_view_compare(const cbm_resolve_proof_view_t *a,
+                                   const cbm_resolve_proof_view_t *b) {
+    if (a->fingerprint != b->fingerprint)
+        return a->fingerprint < b->fingerprint ? -1 : 1;
+    int order = compare_payload(a, b);
+    for (size_t i = 0; !order && i < a->premise_count; i++)
+        order = cbm_resolve_proof_compare(a->premises[i], b->premises[i]);
+    return order;
+}
 int cbm_resolve_proof_compare(const cbm_resolve_proof_t *a, const cbm_resolve_proof_t *b) {
     if (a == b)
         return 0;
     if (!a || !b)
         return a ? 1 : -1;
-    if (a->value.fingerprint != b->value.fingerprint)
-        return a->value.fingerprint < b->value.fingerprint ? -1 : 1;
-    int order = compare_payload(&a->value, &b->value);
-    for (size_t i = 0; !order && i < a->value.premise_count; i++)
-        order = cbm_resolve_proof_compare(a->value.premises[i], b->value.premises[i]);
-    return order;
+    return cbm_resolve_proof_view_compare(&a->value, &b->value);
 }
 static int compare_premises(const void *left, const void *right) {
     return cbm_resolve_proof_compare(*(const cbm_resolve_proof_t *const *)left,
@@ -563,6 +568,60 @@ static unsigned state_rank(cbm_resolve_analysis_t state) {
     }
     return 5;
 }
+/* The steps every derived node takes, shared with a composed one so they cannot
+ * disagree about a fact's identity. */
+static cbm_resolve_proof_view_t derived_begin(cbm_resolve_proof_kind_t kind,
+                                              const cbm_resolve_proof_source_t *source,
+                                              const cbm_resolve_proof_key_t *key,
+                                              const cbm_resolve_result_t *outcome, bool closed) {
+    cbm_resolve_proof_view_t value = {
+        .kind = kind, .key = *key, .outcome = *outcome, .predecessors_closed = closed, .depth = 1};
+    if (source)
+        value.source = *source;
+    if (!closed && state_rank(value.outcome.analysis) < state_rank(CBM_RESOLVE_ANALYSIS_PENDING))
+        value.outcome.analysis = CBM_RESOLVE_ANALYSIS_PENDING;
+    return value;
+}
+static bool derived_premise(cbm_resolve_proof_view_t *value, const cbm_resolve_proof_view_t *p) {
+    if (state_rank(p->outcome.analysis) > state_rank(value->outcome.analysis))
+        value->outcome.analysis = p->outcome.analysis;
+    if (p->depth >= PROOF_MAX_DEPTH)
+        return false;
+    if (value->depth <= p->depth)
+        value->depth = p->depth + 1;
+    return true;
+}
+static void derived_finish(cbm_resolve_proof_view_t *value, const cbm_resolve_proof_t **premises,
+                           size_t count) {
+    qsort(premises, count, sizeof(*premises), compare_premises);
+    size_t unique = 0;
+    for (size_t i = 0; i < count; i++)
+        if (!unique || premises[i] != premises[unique - 1])
+            premises[unique++] = premises[i];
+    value->premises = premises;
+    value->premise_count = unique;
+    if (value->outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE) {
+        value->outcome.binding = CBM_RESOLVE_BINDING_UNRESOLVED;
+        value->outcome.facts = 0;
+        value->outcome.target = NULL;
+        value->outcome.candidate_count = 0;
+    }
+}
+bool cbm_resolve_proof_compose(cbm_resolve_proof_view_t *out, cbm_resolve_proof_kind_t kind,
+                               const cbm_resolve_proof_source_t *source,
+                               const cbm_resolve_proof_key_t *key,
+                               const cbm_resolve_result_t *outcome,
+                               const cbm_resolve_proof_t **premises, size_t count, bool closed) {
+    if (!out || !key || !outcome || !premises || !count)
+        return false;
+    *out = derived_begin(kind, source, key, outcome, closed);
+    for (size_t i = 0; i < count; i++)
+        if (!premises[i] || !derived_premise(out, &premises[i]->value))
+            return false;
+    derived_finish(out, premises, count);
+    out->outcome.proof = NULL;
+    return proof_hash(NULL, out);
+}
 const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *pool,
                                                     cbm_resolve_proof_kind_t kind,
                                                     const cbm_resolve_proof_source_t *source,
@@ -588,12 +647,7 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
         proof_fail(pool, CBM_RESOLVE_ANALYSIS_FAILED);
         return NULL;
     }
-    cbm_resolve_proof_view_t value = {
-        .kind = kind, .key = *key, .outcome = *outcome, .predecessors_closed = closed, .depth = 1};
-    if (source)
-        value.source = *source;
-    if (!closed && state_rank(value.outcome.analysis) < state_rank(CBM_RESOLVE_ANALYSIS_PENDING))
-        value.outcome.analysis = CBM_RESOLVE_ANALYSIS_PENDING;
+    cbm_resolve_proof_view_t value = derived_begin(kind, source, key, outcome, closed);
     proof_walk_t walk = {.pool = pool, .limit = pool->node_limit};
     bool ok = true;
     for (size_t i = 0; i < count; i++) {
@@ -606,16 +660,11 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
             ok = false;
             break;
         }
-        const cbm_resolve_proof_view_t *p = &premises[i]->value;
-        if (state_rank(p->outcome.analysis) > state_rank(value.outcome.analysis))
-            value.outcome.analysis = p->outcome.analysis;
-        if (p->depth >= PROOF_MAX_DEPTH) {
+        if (!derived_premise(&value, &premises[i]->value)) {
             proof_fail(pool, CBM_RESOLVE_ANALYSIS_LIMITED);
             ok = false;
             break;
         }
-        if (value.depth <= p->depth)
-            value.depth = p->depth + 1;
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, walk.slots);
     if (!ok && pool->failure == CBM_RESOLVE_ANALYSIS_COMPLETE)
@@ -624,19 +673,7 @@ const cbm_resolve_proof_t *cbm_resolve_proof_derive(cbm_resolve_proof_pool_t *po
                              : CBM_RESOLVE_ANALYSIS_FAILED);
     const cbm_resolve_proof_t *result = NULL;
     if (ok) {
-        qsort(premises, count, sizeof(*premises), compare_premises);
-        size_t unique = 0;
-        for (size_t i = 0; i < count; i++)
-            if (!unique || premises[i] != premises[unique - 1])
-                premises[unique++] = premises[i];
-        value.premises = premises;
-        value.premise_count = unique;
-        if (value.outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE) {
-            value.outcome.binding = CBM_RESOLVE_BINDING_UNRESOLVED;
-            value.outcome.facts = 0;
-            value.outcome.target = NULL;
-            value.outcome.candidate_count = 0;
-        }
+        derived_finish(&value, premises, count);
         result = intern(pool, value, false);
     }
     cbm_free(CBM_MEM_CLASS_EXTRACT, premises);

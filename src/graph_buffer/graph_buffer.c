@@ -535,29 +535,26 @@ bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
      * one constant-size join with its local source binding validation. */
     for (size_t i = 0; ok && i < gb->resolution_count; i++) {
         cbm_resolve_record_t *row = &gb->resolutions[i];
-        if (!row->result.proof)
+        if (!row->result.proof || row->envelope_pending)
             continue;
         /* Replaying the coordinator does not add another envelope or change
          * an already owned, admitted occurrence in this project. */
         if (cbm_resolve_record_admit(row) && row->result.proof->value.source.project &&
             !strcmp(row->result.proof->value.source.project, gb->project))
             continue;
-        const cbm_resolve_proof_t *premises[] = {row->result.proof, row->binding_proof};
-        cbm_resolve_proof_source_t source = {.project = gb->project,
-                                             .file = row->file_path,
-                                             .scope = row->scope,
-                                             .content_identity = row->content_identity,
-                                             .configuration_identity = row->configuration_identity,
-                                             .source_origin = row->source_origin};
-        cbm_resolve_proof_key_t key = {.lookup_domain = row->scope,
-                                       .lookup_key = row->spelling,
-                                       .start_byte = row->start_byte,
-                                       .end_byte = row->end_byte,
-                                       .origin = row->source_origin,
-                                       .binding_identity = row->result.target,
-                                       .detail = row->relation};
-        cbm_resolve_result_t outcome = row->result;
-        outcome.proof = NULL;
+        /* Nothing reads an abstained row's occurrence fact before it is stored, so
+         * the writer composes it there. See cbm_resolve_record_t.envelope_pending. */
+        if (!row->emitted) {
+            row->envelope_pending = true;
+            continue;
+        }
+        const cbm_resolve_proof_t *premises[2];
+        size_t premise_count = 0;
+        cbm_resolve_proof_source_t source;
+        cbm_resolve_proof_key_t key;
+        cbm_resolve_result_t outcome;
+        cbm_resolve_record_envelope(row, gb->project, &source, &key, &outcome, premises,
+                                    &premise_count);
         uint32_t supported = premises[0]->value.outcome.facts;
         if (row->binding_proof)
             supported |= row->binding_proof->value.outcome.facts;
@@ -591,7 +588,7 @@ bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb) {
         }
         row->result.proof =
             cbm_resolve_proof_derive(&gb->proof_pool, CBM_PROOF_OCCURRENCE_BINDING, &source, &key,
-                                     &outcome, premises, row->binding_proof ? 2 : 1, true);
+                                     &outcome, premises, premise_count, true);
         ok = row->result.proof != NULL;
         if (ok && row->emitted && !cbm_resolve_record_admit(row)) {
             row->result.analysis = row->result.proof->value.outcome.analysis;

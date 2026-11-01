@@ -30,6 +30,10 @@ typedef struct {
      * once by the coordinator before their shared arena is destroyed. */
     bool proof_borrowed;
     bool emitted;
+    /* A sealed row that produced no edge: its occurrence fact is composed from
+     * these columns when stored. No edge will ever read it back, and holding a
+     * node per abstention was the largest part of a large index's peak memory. */
+    bool envelope_pending;
 } cbm_resolve_record_t;
 
 /* Captured extraction summary, independent of derived lookup outcomes. */

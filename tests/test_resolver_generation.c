@@ -4,6 +4,8 @@
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
 #include "store/store_resolver.h"
+#include "store/store_resolver_evidence.h"
+#include "foundation/log.h"
 #include <sqlite3.h>
 #include <stdio.h>
 #include <string.h>
@@ -1107,6 +1109,40 @@ TEST(resolver_generation_storage_does_not_repeat_strings) {
     PASS();
 }
 
+/* A worker that logs nothing for 15 minutes is killed as hung, and a write that
+ * stores hundreds of millions of rows must not look like one. */
+static int generation_progress_lines;
+static void generation_progress_sink(const char *line) {
+    if (strstr(line, "msg=resolver.evidence.progress") && strstr(line, "rows="))
+        generation_progress_lines++;
+}
+
+TEST(resolver_generation_long_write_reports_progress) {
+    enum { ROWS = 64, EVERY = 8 };
+    cbm_resolve_record_t rows[ROWS];
+    memset(rows, 0, sizeof(rows));
+    for (int i = 0; i < ROWS; i++) {
+        rows[i].file_path = "src/module.c";
+        rows[i].scope = "project.src.module.owner";
+        rows[i].relation = "USAGE";
+        rows[i].spelling = "name";
+        rows[i].start_byte = (uint32_t)i;
+        rows[i].end_byte = (uint32_t)i + 1;
+    }
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    generation_progress_lines = 0;
+    cbm_store_resolver_test_set_progress_rows(EVERY);
+    cbm_log_set_sink_ex(generation_progress_sink, CBM_LOG_SINK_REPLACE);
+    int rc = cbm_store_resolver_replace(store, "proj", rows, ROWS);
+    cbm_log_set_sink(NULL);
+    cbm_store_resolver_test_set_progress_rows(0);
+    cbm_store_close(store);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(generation_progress_lines, ROWS / EVERY);
+    PASS();
+}
+
 TEST(resolver_generation_empty_project_has_complete_metadata) {
     cbm_store_t *store = cbm_store_open_memory();
     ASSERT_NOT_NULL(store);
@@ -1167,6 +1203,7 @@ SUITE(resolver_generation) {
     RUN_TEST(resolver_generation_empty_project_has_complete_metadata);
     RUN_TEST(resolver_generation_views_read_back_every_stored_value);
     RUN_TEST(resolver_generation_storage_does_not_repeat_strings);
+    RUN_TEST(resolver_generation_long_write_reports_progress);
     RUN_TEST(resolver_generation_persists_independent_facts_and_all_join_supports);
     RUN_TEST(resolver_generation_ids_ignore_occurrence_insertion_order);
     RUN_TEST(resolver_generation_source_mismatch_rolls_back_every_metadata_table);

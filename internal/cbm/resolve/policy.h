@@ -2,6 +2,7 @@
 #define CBM_RESOLVE_POLICY_H
 
 #include "record.h"
+#include "proof.h"
 #include <stdbool.h>
 
 /* Pure common admission, used after the adapter has validated the occurrence,
@@ -30,6 +31,13 @@ bool cbm_resolve_record_admit(const cbm_resolve_record_t *record);
  * anyway forces the whole form, so the split always reverses exactly. The caller
  * frees the result with cbm_free(CBM_MEM_CLASS_RESOLVE, ...). */
 char *cbm_resolve_properties_tail(const cbm_resolve_record_t *record, int32_t *line);
+
+/* The inputs of a row's occurrence fact: premises[0] is the row's proof, and a
+ * binding proof when there is one follows it. */
+void cbm_resolve_record_envelope(const cbm_resolve_record_t *record, const char *project,
+                                 cbm_resolve_proof_source_t *source, cbm_resolve_proof_key_t *key,
+                                 cbm_resolve_result_t *outcome,
+                                 const cbm_resolve_proof_t *premises[2], size_t *premise_count);
 
 /* Zero denotes an unsupported rule. Exported for diagnostics and adapters;
  * setting these bits without performing the lookup is not valid evidence. */

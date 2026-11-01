@@ -51,6 +51,30 @@ char *cbm_resolve_properties_tail(const cbm_resolve_record_t *record, int32_t *l
     return out;
 }
 
+void cbm_resolve_record_envelope(const cbm_resolve_record_t *record, const char *project,
+                                 cbm_resolve_proof_source_t *source, cbm_resolve_proof_key_t *key,
+                                 cbm_resolve_result_t *outcome,
+                                 const cbm_resolve_proof_t *premises[2], size_t *premise_count) {
+    premises[0] = record->result.proof;
+    premises[1] = record->binding_proof;
+    *premise_count = record->binding_proof ? 2 : 1;
+    *source = (cbm_resolve_proof_source_t){.project = project,
+                                           .file = record->file_path,
+                                           .scope = record->scope,
+                                           .content_identity = record->content_identity,
+                                           .configuration_identity = record->configuration_identity,
+                                           .source_origin = record->source_origin};
+    *key = (cbm_resolve_proof_key_t){.lookup_domain = record->scope,
+                                     .lookup_key = record->spelling,
+                                     .start_byte = record->start_byte,
+                                     .end_byte = record->end_byte,
+                                     .origin = record->source_origin,
+                                     .binding_identity = record->result.target,
+                                     .detail = record->relation};
+    *outcome = record->result;
+    outcome->proof = NULL;
+}
+
 uint32_t cbm_resolve_rule_required_facts(cbm_resolve_rule_t rule) {
     const uint32_t common = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE;
     switch (rule) {
