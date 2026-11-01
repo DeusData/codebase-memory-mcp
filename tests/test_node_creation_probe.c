@@ -515,7 +515,7 @@ TEST(probe_rust_struct_impl) {
                     .suffix = "new",
                     .declaration_line = 4,
                     .declaration_text = "    fn new() -> Self { Stack { items: Vec::new() } }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "rust-generic-mutating-receiver",
          .why = "Generic Stack<T>, owned construction and &mut self methods exceed the audited "
                 "nongeneric inherent &self receiver subset.",
@@ -530,7 +530,7 @@ TEST(probe_rust_struct_impl) {
                     .declaration_line = 5,
                     .declaration_text =
                         "    fn push(&mut self, item: T) { self.items.push(item); }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "rust-generic-mutating-receiver",
          .why = "Generic Stack<T>, owned construction and &mut self methods exceed the audited "
                 "nongeneric inherent &self receiver subset.",
@@ -543,7 +543,7 @@ TEST(probe_rust_struct_impl) {
                     .suffix = "pop",
                     .declaration_line = 6,
                     .declaration_text = "    fn pop(&mut self) -> Option<T> { self.items.pop() }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "rust-generic-mutating-receiver",
          .why = "Generic Stack<T>, owned construction and &mut self methods exceed the audited "
                 "nongeneric inherent &self receiver subset.",
@@ -568,7 +568,7 @@ TEST(probe_rust_struct_impl) {
     ASSERT_TRUE(m.functions + m.methods >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -648,7 +648,7 @@ TEST(probe_rust_type_alias) {
                     .declaration_line = 4,
                     .declaration_text =
                         "fn speed(dist: Meters, time: Seconds) -> f64 { dist / time }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "rust-type-alias-binding-domain",
          .why = "The type_item declarations make the Rust binding audit incomplete; exact free "
                 "calls through alias-bearing files remain genuine missing edges.",
@@ -665,7 +665,7 @@ TEST(probe_rust_type_alias) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }

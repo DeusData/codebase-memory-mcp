@@ -6,6 +6,7 @@
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "lsp/type_registry.h"
+#include "resolve/rust_names.h"
 
 /* Semantic import bindings survive edits to the rendered graph. A source or
  * configuration change, on the other hand, invalidates the captured evidence. */
@@ -87,13 +88,16 @@ static authority_result_t authority_fixture(bool rust) {
     cbm_gbuf_t *graph = root ? cbm_gbuf_new("p", root) : NULL;
     CBMHashTable *map = NULL;
     char *expected = NULL, *file_qn = NULL, *tampered = NULL;
+    char *paths[3] = {0};
     bool ok = graph != NULL;
     for (int i = 0; ok && i < 3; i++) {
         ok = th_write_file(TH_PATH(root, rels[i]), sources[i]) == 0;
+        paths[i] = strdup(TH_PATH(root, rels[i]));
         results[i] = ok ? cbm_extract_file(sources[i], (int)strlen(sources[i]), language, "p",
                                            rels[i], 0, NULL, NULL)
                         : NULL;
         files[i].rel_path = (char *)rels[i];
+        files[i].path = paths[i];
         files[i].language = language;
         ok = results[i] && authority_seed(graph, rels[i], results[i]);
     }
@@ -148,10 +152,13 @@ static authority_result_t authority_fixture(bool rust) {
     free(tampered);
     free(file_qn);
     free(expected);
+    cbm_rust_project_free(context.rust_project);
     cbm_pipeline_namespace_map_free(map);
     cbm_gbuf_free(graph);
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 3; i++) {
         cbm_free_result(results[i]);
+        free(paths[i]);
+    }
     if (root)
         th_cleanup(root);
     return out;

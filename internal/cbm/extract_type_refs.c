@@ -177,22 +177,55 @@ static void add_go_type_refs(CBMExtractCtx *ctx, TSNode node, const char *func_q
     }
 }
 
+// Rust: one reference per named type in an annotation, each on its own exact token.
+// `index: &Index` uses Index; `-> Result<Option<Foo>>` uses Result, Option and Foo.
+static void add_rust_type_refs(CBMExtractCtx *ctx, TSNode node, const char *func_qn, int depth) {
+    enum { MAX_TYPE_DEPTH = 32 };
+    if (ts_node_is_null(node) || depth > MAX_TYPE_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "scoped_type_identifier") == 0) {
+        const char *text = cbm_node_text(ctx->arena, node, ctx->source);
+        // `Vec<_>` asks the compiler to infer; the placeholder names no type.
+        if (text && strcmp(text, "_") != 0) {
+            add_type_ref(ctx, text, func_qn, node);
+        }
+        return;
+    }
+    if (strcmp(kind, "type_binding") == 0) {
+        // `Item = T`: Item names a member of the bound trait, not a type in scope.
+        add_rust_type_refs(ctx, ts_node_child_by_field_name(node, TS_FIELD("type")), func_qn,
+                           depth + 1);
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        add_rust_type_refs(ctx, ts_node_named_child(node, i), func_qn, depth + 1);
+    }
+}
+
 // Extract parameter types from a parameters/formal_parameters node.
 static void extract_param_type_refs(CBMExtractCtx *ctx, TSNode params, const char *func_qn) {
     uint32_t count = ts_node_child_count(params);
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(params, i);
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        if (!ts_node_is_null(type_node)) {
-            if (ts_family(ctx->language)) {
-                add_ts_annotation_refs(ctx, type_node, func_qn, 0);
-            } else if (ctx->language == CBM_LANG_GO) {
-                add_go_type_refs(ctx, type_node, func_qn, 0);
-                continue;
-            }
-            const char *tname = extract_type_text(ctx->arena, type_node, ctx->source);
-            add_type_ref(ctx, tname, func_qn, type_node);
+        if (ts_node_is_null(type_node)) {
+            continue;
         }
+        if (ts_family(ctx->language)) {
+            add_ts_annotation_refs(ctx, type_node, func_qn, 0);
+        } else if (ctx->language == CBM_LANG_GO) {
+            add_go_type_refs(ctx, type_node, func_qn, 0);
+            continue;
+        }
+        if (ctx->language == CBM_LANG_RUST) {
+            add_rust_type_refs(ctx, type_node, func_qn, 0);
+            continue;
+        }
+        const char *tname = extract_type_text(ctx->arena, type_node, ctx->source);
+        add_type_ref(ctx, tname, func_qn, type_node);
     }
 }
 
@@ -203,6 +236,10 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt) && ts_family(ctx->language)) {
             add_ts_annotation_refs(ctx, rt, func_qn, 0);
+            break;
+        }
+        if (!ts_node_is_null(rt) && ctx->language == CBM_LANG_RUST) {
+            add_rust_type_refs(ctx, rt, func_qn, 0);
             break;
         }
         if (!ts_node_is_null(rt)) {
@@ -222,6 +259,8 @@ static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *
     TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
     if (!ts_node_is_null(type_node) && ts_family(ctx->language)) {
         add_ts_annotation_refs(ctx, type_node, func_qn, 0);
+    } else if (!ts_node_is_null(type_node) && ctx->language == CBM_LANG_RUST) {
+        add_rust_type_refs(ctx, type_node, func_qn, 0);
     } else if (!ts_node_is_null(type_node)) {
         if (ctx->language == CBM_LANG_GO) {
             add_go_type_refs(ctx, type_node, func_qn, 0);

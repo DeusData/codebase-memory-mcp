@@ -24,6 +24,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #include "pipeline/lsp_surface.h"
 #include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "resolve/rust_names.h"
 #include "pipeline/shared_resolver.h"
 #include "pipeline/resolver_ecma.h"
 #include "resolve/policy.h"
@@ -3192,6 +3193,8 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     ctx->shared_resolver = NULL;
     cbm_ecma_surfaces_free(ctx->ecma_surfaces);
     ctx->ecma_surfaces = NULL;
+    cbm_rust_project_free(ctx->rust_project);
+    ctx->rust_project = NULL;
     if (seq_cache) {
         for (int i = 0; i < file_count; i++) {
             if (seq_cache[i]) {
@@ -3444,6 +3447,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     ctx->shared_resolver = NULL;
     cbm_ecma_surfaces_free(ctx->ecma_surfaces);
     ctx->ecma_surfaces = NULL;
+    cbm_rust_project_free(ctx->rust_project);
+    ctx->rust_project = NULL;
     cbm_doclinks_end(ctx);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));

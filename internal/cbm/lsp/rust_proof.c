@@ -695,7 +695,8 @@ static void rsp_audit(rsp_context_t *context, TSNode node, unsigned depth) {
 }
 static void rsp_expression(rsp_context_t *context, TSNode node, const char *caller, CBMScope *scope,
                            unsigned depth) {
-    if (!rsp_budget(&context->source, depth))
+    /* `let x;` has no value to walk. */
+    if (ts_node_is_null(node) || !rsp_budget(&context->source, depth))
         return;
     if (rsp_is(node, "call_expression")) {
         TSNode callee = rsp_field(node, "function");

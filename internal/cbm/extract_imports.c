@@ -1952,17 +1952,83 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 // --- Rust imports ---
 // use_declaration -> use_list or scoped_use_list
 
-static void parse_rust_imports(CBMExtractCtx *ctx) {
+// One import per leaf of a use tree: `use a::{b, c as d, e::{self, f}, g::*};`
+// binds b, d, e, f and a glob, each with its complete path and exact token span.
+static void rust_use_leaf(CBMExtractCtx *ctx, TSNode site, const char *prefix, size_t prefix_len,
+                          const char *tail, const char *alias) {
     CBMArena *a = ctx->arena;
-
-    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    if (!ts_tree_cursor_goto_first_child(&cursor)) {
-        ts_tree_cursor_delete(&cursor);
+    const char *path;
+    if (prefix_len && tail) {
+        path = cbm_arena_sprintf(a, "%.*s::%s", (int)prefix_len, prefix, tail);
+    } else if (prefix_len) {
+        path = cbm_arena_strndup(a, prefix, prefix_len);
+    } else {
+        path = tail;
+    }
+    if (!path || !path[0]) {
         return;
     }
-    do {
+    CBMImport imp = {.local_name = alias ? alias : path_last(a, path), .module_path = path};
+    push_import_at(ctx, site, imp);
+}
+
+static void rust_use_tree(CBMExtractCtx *ctx, TSNode node, const char *prefix, size_t prefix_len) {
+    CBMArena *a = ctx->arena;
+    if (ts_node_is_null(node)) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "use_list") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode leaf = ts_node_named_child(node, i);
+            const char *leaf_kind = ts_node_type(leaf);
+            if (strcmp(leaf_kind, "line_comment") != 0 && strcmp(leaf_kind, "block_comment") != 0) {
+                rust_use_tree(ctx, leaf, prefix, prefix_len);
+            }
+        }
+    } else if (strcmp(kind, "scoped_use_list") == 0) {
+        TSNode path = ts_node_child_by_field_name(node, TS_FIELD("path"));
+        const char *head = ts_node_is_null(path) ? NULL : cbm_node_text(a, path, ctx->source);
+        const char *joined = head && prefix_len
+                                 ? cbm_arena_sprintf(a, "%.*s::%s", (int)prefix_len, prefix, head)
+                             : head ? head
+                                    : cbm_arena_strndup(a, prefix ? prefix : "", prefix_len);
+        if (joined) {
+            rust_use_tree(ctx, ts_node_child_by_field_name(node, TS_FIELD("list")), joined,
+                          strlen(joined));
+        }
+    } else if (strcmp(kind, "use_as_clause") == 0) {
+        TSNode path = ts_node_child_by_field_name(node, TS_FIELD("path"));
+        const char *alias =
+            cbm_node_text(a, ts_node_child_by_field_name(node, TS_FIELD("alias")), ctx->source);
+        const char *tail = cbm_node_text(a, path, ctx->source);
+        bool self_leaf = tail && strcmp(tail, "self") == 0 && prefix_len;
+        rust_use_leaf(ctx, node, prefix, prefix_len, self_leaf ? NULL : tail, alias);
+    } else if (strcmp(kind, "self") == 0 && prefix_len) {
+        rust_use_leaf(ctx, node, prefix, prefix_len, NULL, NULL);
+    } else {
+        // identifier, scoped_identifier, crate, self, super, use_wildcard
+        rust_use_leaf(ctx, node, prefix, prefix_len, cbm_node_text(a, node, ctx->source), NULL);
+    }
+}
+
+// Every `use` and `mod name;` in the file: an inline `mod tests { use super::*; }`
+// or a `use` in a function body is as much a dependency of this file as a
+// top-level one. The binding's own scope comes from its exact span.
+static void parse_rust_imports(CBMExtractCtx *ctx) {
+    CBMArena *a = ctx->arena;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    bool walking = true;
+    while (walking) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (strcmp(ts_node_type(node), "mod_item") == 0) {
+        const char *kind = ts_node_type(node);
+        bool descend = ts_node_is_named(node) && strcmp(kind, "token_tree") != 0 &&
+                       strcmp(kind, "macro_definition") != 0;
+        if (strcmp(kind, "use_declaration") == 0) {
+            rust_use_tree(ctx, ts_node_child_by_field_name(node, TS_FIELD("argument")), NULL, 0);
+            descend = false;
+        } else if (strcmp(kind, "mod_item") == 0) {
             TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
             TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
             if (ts_node_is_null(body) && !ts_node_is_null(name)) {
@@ -1972,34 +2038,16 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
                                  .kind = CBM_IMPORT_KIND_MODULE_DECLARATION};
                 push_import_at(ctx, name, imp);
             }
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor))
             continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                walking = false;
+                break;
+            }
         }
-        if (strcmp(ts_node_type(node), "use_declaration") != 0) {
-            continue;
-        }
-
-        TSNode argument = ts_node_child_by_field_name(node, TS_FIELD("argument"));
-        char *full = cbm_node_text(a, ts_node_is_null(argument) ? node : argument, ctx->source);
-        if (!full) {
-            continue;
-        }
-        // An argument field excludes visibility (`pub use`) and its semicolon.
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
-
-        TSNode alias = ts_node_child_by_field_name(argument, TS_FIELD("alias"));
-        const char *local =
-            !ts_node_is_null(alias) && strcmp(ts_node_type(argument), "use_as_clause") == 0
-                ? cbm_node_text(a, alias, ctx->source)
-                : path_last(a, full);
-        CBMImport imp = {.local_name = local, .module_path = full};
-        push_import_at(ctx, argument, imp);
-    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
     ts_tree_cursor_delete(&cursor);
 }
 

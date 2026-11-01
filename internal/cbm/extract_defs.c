@@ -11697,6 +11697,30 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
         return;
     }
 
+    /* Rust: a constant in an inline module (`pub mod main_key { pub const X }`) is
+     * as much a declaration as one at file level. Function bodies stay out. */
+    if (ctx->language == CBM_LANG_RUST) {
+        TSNodeStack stack;
+        ts_nstack_init(&stack, ctx, CBM_SZ_32);
+        ts_nstack_push(&stack, root);
+        while (stack.count > 0) {
+            TSNode scope = ts_nstack_pop(&stack);
+            uint32_t count = ts_node_named_child_count(scope);
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode child = ts_node_named_child(scope, i);
+                const char *kind = ts_node_type(child);
+                if (strcmp(kind, "const_item") == 0 || strcmp(kind, "static_item") == 0) {
+                    extract_vars_mainstream(ctx, child, ctx->arena, kind);
+                } else if (strcmp(kind, "mod_item") == 0) {
+                    TSNode body = ts_node_child_by_field_name(child, TS_FIELD("body"));
+                    if (!ts_node_is_null(body))
+                        ts_nstack_push(&stack, body);
+                }
+            }
+        }
+        return;
+    }
+
     /* HCL: a file's own assignments -- a .tfvars file, Terragrunt's `inputs`
      * -- sit in the top-level body, one level below the root the generic loop
      * scans, so none was extracted. Attributes inside blocks belong to their

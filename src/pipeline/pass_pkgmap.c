@@ -17,6 +17,7 @@
 #include "pipeline/resolver_ecma.h"
 #include "resolve/capabilities.h"
 #include "resolve/policy.h"
+#include "resolve/rust_names.h"
 #include "lang_specs.h"
 #include "helpers.h"
 #include "discover/discover.h"
@@ -2571,358 +2572,87 @@ static bool build_compile_import_context(const cbm_pipeline_ctx_t *ctx, CBMHashT
     return complete;
 }
 
-typedef struct {
-    const char *rel;
-    int cache_index;
-    CBMFileResult *result;
-    bool loaded;
-    const char *source;
-    char *owned_source;
-    TSTree *tree;
-    bool owned_tree;
-} rust_import_file_t;
-
-typedef struct {
-    const cbm_pipeline_ctx_t *ctx;
-    CBMHashTable *map;
-    rust_import_file_t *files;
-    int count;
-    TSParser *parser;
-} rust_import_context_t;
-
-static int rust_file_compare(const void *left, const void *right) {
-    return strcmp(((const rust_import_file_t *)left)->rel,
-                  ((const rust_import_file_t *)right)->rel);
+/* One Rust project model for the whole index: crates and dependency names from
+ * every Cargo.toml, module trees from each crate root, and each file's items and
+ * use trees. Built before any dependency or binding is projected. */
+static bool rust_project_add_file(cbm_rust_project_t *project, const cbm_pipeline_ctx_t *ctx,
+                                  CBMFileResult **cache, const cbm_file_info_t *file, int index,
+                                  TSParser *parser) {
+    bool loaded = false;
+    CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, index, NULL, &loaded);
+    if (!result)
+        return true;
+    if (result->parse_unusable || result->walk_truncated) {
+        cbm_pipeline_result_release(result, loaded);
+        return true; /* A file with no usable tree contributes no declarations. */
+    }
+    int length = result->source ? result->source_len : 0;
+    char *owned = result->source ? NULL : pkgmap_read_file(file->path, &length);
+    const char *source = result->source ? result->source : owned;
+    TSTree *owned_tree = NULL;
+    const TSTree *tree = result->cached_tree;
+    if (!tree && source && length >= 0) {
+        owned_tree = cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
+        tree = owned_tree;
+    }
+    bool ok = true;
+    if (tree && source)
+        ok = cbm_rust_project_add_file(project, file->rel_path, result, source, (size_t)length,
+                                       ts_tree_root_node(tree));
+    if (owned_tree)
+        ts_tree_delete(owned_tree);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
+    cbm_pipeline_result_release(result, loaded);
+    return ok;
 }
 
-static rust_import_file_t *rust_import_file(rust_import_context_t *context, const char *rel) {
-    rust_import_file_t key = {.rel = rel};
-    return bsearch(&key, context->files, (size_t)context->count, sizeof(context->files[0]),
-                   rust_file_compare);
-}
-
-static bool rust_node_text(TSNode node, const char *source, char *out, size_t capacity) {
-    if (ts_node_is_null(node))
+static bool rust_project_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int count,
+                               CBMFileResult **cache) {
+    cbm_rust_project_free(ctx->rust_project);
+    ctx->rust_project = NULL;
+    bool any = false;
+    for (int i = 0; !any && i < count; i++)
+        any = files[i].language == CBM_LANG_RUST;
+    if (!any)
+        return true;
+    cbm_rust_project_t *project = cbm_rust_project_new();
+    TSParser *parser = ts_parser_new();
+    bool ok = project && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RUST));
+    for (int i = 0; ok && i < count; i++) {
+        if (strcmp(path_leaf(files[i].rel_path), "Cargo.toml") == 0) {
+            int length = 0;
+            char *text = pkgmap_read_file(files[i].path, &length);
+            if (text)
+                ok =
+                    cbm_rust_project_add_manifest(project, files[i].rel_path, text, (size_t)length);
+            cbm_free(CBM_MEM_CLASS_EXTRACT, text);
+        } else if (files[i].language == CBM_LANG_RUST) {
+            ok = rust_project_add_file(project, ctx, cache, &files[i], i, parser);
+        }
+    }
+    ok = ok && cbm_rust_project_seal(project);
+    if (parser)
+        ts_parser_delete(parser);
+    if (!ok) {
+        cbm_rust_project_free(project);
         return false;
-    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
-    if (end < start || end - start >= capacity)
-        return false;
-    memcpy(out, source + start, end - start);
-    out[end - start] = '\0';
+    }
+    ctx->rust_project = project;
     return true;
 }
 
-static bool rust_context_fact(rust_import_context_t *context, const char *kind, const char *root,
-                              const char *path, const char *value) {
-    char key[PKGMAP_PATH_BUF];
-    int size = snprintf(key, sizeof(key), "@cbm:rust:%s:%s:%s", kind, root, path);
-    return size > 0 && (size_t)size < sizeof(key) && import_fact_put(context->map, key, value);
-}
-
-static const char *rust_import_fact(CBMHashTable *map, const char *kind, const char *root,
-                                    const char *path) {
-    char key[PKGMAP_PATH_BUF];
-    int size = snprintf(key, sizeof(key), "@cbm:rust:%s:%s:%s", kind, root, path);
-    return map && size > 0 && (size_t)size < sizeof(key) ? cbm_ht_get(map, key) : NULL;
-}
-
-static bool rust_source_tree(rust_import_context_t *context, rust_import_file_t *file,
-                             CBMFileResult **cache) {
-    if (file->tree)
-        return true;
-    file->result =
-        cbm_pipeline_result_acquire(context->ctx, cache, file->cache_index, NULL, &file->loaded);
-    if (!file->result || file->result->parse_unusable || file->result->walk_truncated)
-        return false;
-    file->source = file->result->source;
-    int length = file->result->source_len;
-    if (!file->source) {
-        char absolute[PKGMAP_PATH_BUF];
-        if (!import_absolute_path(context->ctx->repo_path, file->rel, absolute, sizeof(absolute)))
-            return false;
-        file->owned_source = pkgmap_read_file(absolute, &length);
-        file->source = file->owned_source;
-    }
-    if (!file->source || length < 0)
-        return false;
-    file->tree = file->result->cached_tree;
-    if (!file->tree) {
-        file->tree =
-            cbm_parse_source(context->parser, file->source, (uint32_t)length, (TSParseOptions){0});
-        file->owned_tree = file->tree != NULL;
-    }
-    return file->tree && !ts_node_has_error(ts_tree_root_node(file->tree));
-}
-
-/* Only the active module ancestry may retain a spilled extraction result.
- * Module facts own their strings, so completed siblings need no parse/source
- * lifetime after their declaration walk. Unspilled cache entries stay owned
- * by the pipeline; this helper releases only the copies acquired here. */
-static void rust_release_source(rust_import_file_t *file) {
-    if (file->owned_tree)
-        ts_tree_delete(file->tree);
-    cbm_free(CBM_MEM_CLASS_EXTRACT, file->owned_source);
-    cbm_pipeline_result_release(file->result, file->loaded);
-    file->result = NULL;
-    file->loaded = false;
-    file->source = NULL;
-    file->owned_source = NULL;
-    file->tree = NULL;
-    file->owned_tree = false;
-}
-
-/* Private module/items are visible to their parent module and its descendants.
- * pub(crate) is crate-wide; restricted pub(in ...) needs a richer scope fact.
- */
-static char rust_item_visibility(TSNode node, const char *source) {
-    char visibility = 'L';
-    TSTreeCursor cursor = ts_tree_cursor_new(node);
-    if (ts_tree_cursor_goto_first_child(&cursor)) {
-        do {
-            TSNode child = ts_tree_cursor_current_node(&cursor);
-            if (strcmp(ts_node_type(child), "visibility_modifier") != 0)
-                continue;
-            char text[CBM_SZ_256];
-            visibility = rust_node_text(child, source, text, sizeof(text)) &&
-                                 (strcmp(text, "pub") == 0 || strcmp(text, "pub(crate)") == 0)
-                             ? 'P'
-                             : '?';
-            break;
-        } while (ts_tree_cursor_goto_next_sibling(&cursor));
-    }
-    ts_tree_cursor_delete(&cursor);
-    return visibility;
-}
-
-static bool rust_walk_module(rust_import_context_t *context, CBMFileResult **cache,
-                             rust_import_file_t *file, TSNode body, const char *root,
-                             const char *logical, const char *directory, unsigned depth) {
-    if (depth > PKGMAP_WALK_MAX_DEPTH)
-        return false;
-    if (!rust_context_fact(context, "module", root, logical, file->rel))
-        return false;
-    TSTreeCursor cursor = ts_tree_cursor_new(body);
-    if (!ts_tree_cursor_goto_first_child(&cursor)) {
-        ts_tree_cursor_delete(&cursor);
-        return true;
-    }
-    do {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (!ts_node_is_named(node))
-            continue;
-        const char *kind = ts_node_type(node);
-        /* Macro expansion and attributes can replace or introduce names.
-         * Until their configured expansion is available this module tree is
-         * not a complete import domain, even if one spelling looks unique. */
-        if (strcmp(kind, "attribute_item") == 0 || strcmp(kind, "inner_attribute_item") == 0 ||
-            strcmp(kind, "macro_invocation") == 0 || strcmp(kind, "macro_definition") == 0 ||
-            strcmp(kind, "expression_statement") == 0)
-            goto failed;
-        if (strcmp(kind, "line_comment") == 0 || strcmp(kind, "block_comment") == 0)
-            continue;
-        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
-        char name[CBM_SZ_256], path[PKGMAP_PATH_BUF];
-        bool eligible = rust_node_text(name_node, file->source, name, sizeof(name));
-        bool is_module = strcmp(kind, "mod_item") == 0;
-        if (!eligible)
-            continue;
-        int size = snprintf(path, sizeof(path), "%s%s%s", logical, logical[0] ? "::" : "", name);
-        if (size <= 0 || (size_t)size >= sizeof(path))
-            goto failed;
-        char visibility[2] = {rust_item_visibility(node, file->source), '\0'};
-        if (!rust_context_fact(context, is_module ? "visibility" : "item", root, path, visibility))
-            goto failed;
-        if (!is_module)
-            continue;
-        TSNode inline_body = ts_node_child_by_field_name(node, "body", 4);
-        char child_dir[PKGMAP_PATH_BUF];
-        if (!cbm_repo_rel_join(directory, name, child_dir, sizeof(child_dir)))
-            goto failed;
-        if (!ts_node_is_null(inline_body)) {
-            /* Extracted imports currently omit their lexical module scope.
-             * A nested self/super import could otherwise bind in this file's
-             * outer module. Withhold the domain until scoped occurrences are
-             * available, even when its target spelling looks exact. */
-            goto failed;
-        }
-        char flat[PKGMAP_PATH_BUF], nested[PKGMAP_PATH_BUF];
-        int flat_size = snprintf(flat, sizeof(flat), "%s.rs", child_dir);
-        int nested_size = snprintf(nested, sizeof(nested), "%s/mod.rs", child_dir);
-        if (flat_size <= 0 || (size_t)flat_size >= sizeof(flat) || nested_size <= 0 ||
-            (size_t)nested_size >= sizeof(nested))
-            goto failed;
-        rust_import_file_t *first = rust_import_file(context, flat);
-        rust_import_file_t *second = rust_import_file(context, nested);
-        if (first && second) {
-            if (!rust_context_fact(context, "module", root, path, ambiguous_pkgmap_value))
-                goto failed;
-            continue;
-        }
-        rust_import_file_t *child = first ? first : second;
-        if (!child)
-            continue;
-        if (!rust_source_tree(context, child, cache)) {
-            rust_release_source(child);
-            continue;
-        }
-        char membership[PKGMAP_PATH_BUF], key[PKGMAP_PATH_BUF];
-        size = snprintf(membership, sizeof(membership), "%s\n%s", root, path);
-        int key_size = snprintf(key, sizeof(key), "@cbm:rust:file:%s", child->rel);
-        bool complete = size > 0 && (size_t)size < sizeof(membership) && key_size > 0 &&
-                        (size_t)key_size < sizeof(key) &&
-                        import_fact_put(context->map, key, membership) &&
-                        rust_walk_module(context, cache, child, ts_tree_root_node(child->tree),
-                                         root, path, child_dir, depth + 1);
-        rust_release_source(child);
-        if (!complete)
-            goto failed;
-    } while (ts_tree_cursor_goto_next_sibling(&cursor));
-    ts_tree_cursor_delete(&cursor);
-    return true;
-
-failed:
-    ts_tree_cursor_delete(&cursor);
-    return false;
-}
-
-static bool rust_add_root(rust_import_context_t *context, CBMFileResult **cache, const char *rel) {
-    rust_import_file_t *file = rust_import_file(context, rel);
-    if (!file)
-        return true;
-    if (!rust_source_tree(context, file, cache)) {
-        rust_release_source(file);
-        return true; /* No ready marker: a parse failure never supplies complete
-                        evidence. */
-    }
-    char key[PKGMAP_PATH_BUF], membership[PKGMAP_PATH_BUF];
-    int size = snprintf(key, sizeof(key), "@cbm:rust:file:%s", rel);
-    int value_size = snprintf(membership, sizeof(membership), "%s\n", rel);
-    char *directory = path_dirname(rel);
-    bool complete = size > 0 && (size_t)size < sizeof(key) && value_size > 0 &&
-                    (size_t)value_size < sizeof(membership) && directory &&
-                    import_fact_put(context->map, key, membership) &&
-                    rust_walk_module(context, cache, file, ts_tree_root_node(file->tree), rel, "",
-                                     directory, 0);
-    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
-    rust_release_source(file);
-    if (!complete)
-        return false;
-    return rust_context_fact(context, "ready", rel, "", "1");
-}
-
-/* Cargo target paths are facts separate from module filenames. Custom lib/bin
- * roots use the same declaration walk as the default targets. */
-static bool rust_cargo_roots(rust_import_context_t *context, CBMFileResult **cache,
-                             const char *manifest) {
-    char absolute[PKGMAP_PATH_BUF];
-    if (!import_absolute_path(context->ctx->repo_path, manifest, absolute, sizeof(absolute)))
-        return false;
-    int length = 0;
-    char *source = pkgmap_read_file(absolute, &length);
-    if (!source)
-        return true;
-    char *directory = path_dirname(manifest);
-    if (!directory) {
-        cbm_free(CBM_MEM_CLASS_EXTRACT, source);
-        return false;
-    }
-    bool package = false, custom_lib = false, success = true;
-    enum { CARGO_OTHER, CARGO_PACKAGE, CARGO_LIB, CARGO_BIN } section = CARGO_OTHER;
-    for (char *line = source; line && line[0];) {
-        char *next = strchr(line, '\n');
-        if (next)
-            *next++ = '\0';
-        while (isspace((unsigned char)*line))
-            line++;
-        if (*line == '[') {
-            section = strncmp(line, "[package]", 9) == 0 ? CARGO_PACKAGE
-                      : strncmp(line, "[lib]", 5) == 0   ? CARGO_LIB
-                      : strncmp(line, "[[bin]]", 7) == 0 ? CARGO_BIN
-                                                         : CARGO_OTHER;
-            package = package || section == CARGO_PACKAGE;
-        } else if ((section == CARGO_LIB || section == CARGO_BIN) &&
-                   strncmp(line, "path", 4) == 0 &&
-                   (isspace((unsigned char)line[4]) || line[4] == '=')) {
-            char *value = extract_quoted(line + 4, line + strlen(line));
-            char path[PKGMAP_PATH_BUF];
-            if (!value || !cbm_repo_rel_join(directory, value, path, sizeof(path)))
-                success = false;
-            else
-                success = rust_add_root(context, cache, path) && success;
-            custom_lib = custom_lib || section == CARGO_LIB;
-            cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
-        }
-        line = next;
-    }
-    if (package) {
-        const char *defaults[] = {"src/lib.rs", "src/main.rs"};
-        for (int i = custom_lib ? 1 : 0; i < 2; i++) {
-            char path[PKGMAP_PATH_BUF];
-            if (!cbm_repo_rel_join(directory, defaults[i], path, sizeof(path)) ||
-                !rust_add_root(context, cache, path))
-                success = false;
-        }
-    }
-    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
-    cbm_free(CBM_MEM_CLASS_EXTRACT, source);
-    return success;
-}
-
-static bool import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                 int count, CBMFileResult **cache, CBMHashTable *map) {
+static bool import_context_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int count,
+                                 CBMFileResult **cache, CBMHashTable *map) {
     if (!ctx || !map || !build_compile_import_context(ctx, map))
         return false;
-    rust_import_context_t context = {.ctx = ctx, .map = map};
-    for (int i = 0; i < count; i++)
-        if (files[i].language == CBM_LANG_RUST)
-            context.count++;
-    if (!context.count)
-        return true;
-    if ((size_t)context.count > SIZE_MAX / sizeof(context.files[0]))
-        return false;
-    context.files =
-        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)context.count * sizeof(context.files[0]));
-    context.parser = ts_parser_new();
-    if (!context.files || !context.parser ||
-        !ts_parser_set_language(context.parser, cbm_ts_language(CBM_LANG_RUST))) {
-        cbm_free(CBM_MEM_CLASS_SEMANTIC, context.files);
-        ts_parser_delete(context.parser);
-        return false;
-    }
-    int index = 0;
-    for (int i = 0; i < count; i++)
-        if (files[i].language == CBM_LANG_RUST)
-            context.files[index++] =
-                (rust_import_file_t){.rel = files[i].rel_path, .cache_index = i};
-    qsort(context.files, (size_t)context.count, sizeof(context.files[0]), rust_file_compare);
-    bool success = true, cargo_found = false;
-    for (int i = 0; i < count; i++) {
-        if (strcmp(path_leaf(files[i].rel_path), "Cargo.toml") == 0) {
-            cargo_found = true;
-            success = rust_cargo_roots(&context, cache, files[i].rel_path) && success;
-        }
-    }
-    /* A standalone Rust entry file is an explicit rustc root. Its siblings
-     * become members only through actual mod declarations below that root. */
-    if (!cargo_found)
-        for (int i = 0; i < context.count; i++) {
-            const char *leaf = path_leaf(context.files[i].rel);
-            if (strcmp(leaf, "main.rs") == 0 || strcmp(leaf, "lib.rs") == 0)
-                success = rust_add_root(&context, cache, context.files[i].rel) && success;
-        }
-    for (int i = 0; i < context.count; i++) {
-        rust_release_source(&context.files[i]);
-    }
-    ts_parser_delete(context.parser);
-    cbm_free(CBM_MEM_CLASS_SEMANTIC, context.files);
-    return success;
+    return rust_project_build(ctx, files, count, cache);
 }
 
 /* The context holds Rust and compile-database facts only. Its failure withholds
  * them from those languages (create_import_edges), and says nothing about any
  * other language's namespaces: one crate without a src/main.rs must not void
  * every Java import of the project. */
-bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+bool cbm_pipeline_import_context_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                        int count, CBMFileResult **cache, CBMHashTable *map) {
     if (import_context_build(ctx, files, count, cache, map))
         return true;
@@ -2931,182 +2661,27 @@ bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_
     return false;
 }
 
-static bool rust_visible_from(const char *visibility, const char *path, const char *source_module) {
-    if (!visibility || (visibility[0] != 'P' && visibility[0] != 'L'))
-        return false;
-    if (visibility[0] == 'P')
-        return true;
-    const char *last = NULL;
-    for (const char *p = path; (p = strstr(p, "::")) != NULL; p += 2)
-        last = p;
-    size_t parent = last ? (size_t)(last - path) : 0;
-    return parent == 0 || (strncmp(source_module, path, parent) == 0 &&
-                           (source_module[parent] == '\0' || source_module[parent] == ':'));
-}
-
-/* Only a physical file's own module maps its direct declarations to the
- * file symbol scope. Inline modules need their nested declaration identity;
- * a same-file top-level namesake is never a substitute. */
-static bool rust_physical_module_matches(CBMHashTable *map, const char *root, const char *file,
-                                         const char *logical) {
-    char key[PKGMAP_PATH_BUF];
-    int length = snprintf(key, sizeof(key), "@cbm:rust:file:%s", file);
-    const char *membership =
-        map && length > 0 && (size_t)length < sizeof(key) ? cbm_ht_get(map, key) : NULL;
-    size_t root_length = strlen(root);
-    return membership && !strncmp(membership, root, root_length) &&
-           membership[root_length] == '\n' && !strcmp(membership + root_length + 1, logical);
-}
-
-static const cbm_gbuf_node_t *rust_use_target(const cbm_pipeline_ctx_t *ctx, CBMHashTable *map,
-                                              const char *root, const char *source_module,
-                                              char *path, bool *ambiguous,
-                                              const cbm_gbuf_node_t **binding) {
-    if (binding)
-        *binding = NULL;
-    char prefix[PKGMAP_PATH_BUF] = "";
-    char *cursor = path;
-    const char *file = rust_import_fact(map, "module", root, "");
-    while (cursor && cursor[0]) {
-        char *next = strstr(cursor, "::");
-        if (next)
-            *next = '\0';
-        if (strcmp(cursor, "*") == 0 && !next)
-            break;
-        char full[PKGMAP_PATH_BUF];
-        int size = snprintf(full, sizeof(full), "%s%s%s", prefix, prefix[0] ? "::" : "", cursor);
-        if (size <= 0 || (size_t)size >= sizeof(full))
-            return NULL;
-        const char *module = rust_import_fact(map, "module", root, full);
-        if (module) {
-            if (strcmp(module, ambiguous_pkgmap_value) == 0) {
-                *ambiguous = true;
-                return NULL;
-            }
-            if (!rust_visible_from(rust_import_fact(map, "visibility", root, full), full,
-                                   source_module))
-                return NULL;
-            file = module;
-            snprintf(prefix, sizeof(prefix), "%s", full);
-        } else {
-            if (next ||
-                !rust_visible_from(rust_import_fact(map, "item", root, full), full, source_module))
-                return NULL;
-            if (binding && file && rust_physical_module_matches(map, root, file, prefix)) {
-                char *qn = cbm_pipeline_fqn_compute(ctx->project_name, file, cursor);
-                const cbm_gbuf_node_t *member = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
-                if (member && member->file_path && !strcmp(member->file_path, file) &&
-                    member->label && strcmp(member->label, "File") &&
-                    strcmp(member->label, "Module"))
-                    *binding = member;
-                free(qn);
-            }
-        }
-        cursor = next ? next + 2 : NULL;
-    }
-    return file ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, file) : NULL;
-}
-
+/* The dependency is the file of the deepest module the path names; the binding
+ * is the declaration its leaf reaches, through re-exports. */
 static const cbm_gbuf_node_t *resolve_rust_import(const cbm_pipeline_ctx_t *ctx,
                                                   const char *source_rel, const CBMImport *imp,
-                                                  CBMHashTable *map, bool *ambiguous,
-                                                  const cbm_gbuf_node_t **binding) {
+                                                  bool *ambiguous, const cbm_gbuf_node_t **binding,
+                                                  const char **reason) {
     if (binding)
         *binding = NULL;
-    char key[PKGMAP_PATH_BUF], membership[PKGMAP_PATH_BUF];
-    int size = snprintf(key, sizeof(key), "@cbm:rust:file:%s", source_rel);
-    const char *context =
-        map && size > 0 && (size_t)size < sizeof(key) ? cbm_ht_get(map, key) : NULL;
-    if (!context || strcmp(context, ambiguous_pkgmap_value) == 0 ||
-        strlen(context) >= sizeof(membership))
+    cbm_rust_import_t fact = cbm_rust_project_import(ctx->rust_project, source_rel, imp);
+    if (reason)
+        *reason = fact.reason;
+    *ambiguous = fact.ambiguous;
+    if (!fact.dependency_file)
         return NULL;
-    snprintf(membership, sizeof(membership), "%s", context);
-    char *source_module = strchr(membership, '\n');
-    if (!source_module)
-        return NULL;
-    *source_module++ = '\0';
-    const char *root = membership;
-    if (!rust_import_fact(map, "ready", root, ""))
-        return NULL;
-    const char *raw = imp->module_path;
-    char base[PKGMAP_PATH_BUF] = "";
-    if (imp->kind == CBM_IMPORT_KIND_MODULE_DECLARATION) {
-        char module[PKGMAP_PATH_BUF];
-        size = snprintf(module, sizeof(module), "%s%s%s", source_module,
-                        source_module[0] ? "::" : "", raw);
-        if (size <= 0 || (size_t)size >= sizeof(module))
-            return NULL;
-        const char *file = rust_import_fact(map, "module", root, module);
-        if (file && strcmp(file, ambiguous_pkgmap_value) == 0) {
-            *ambiguous = true;
-            return NULL;
-        }
-        return file ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, file) : NULL;
+    if (binding && fact.member_qn) {
+        const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, fact.member_qn);
+        if (member && member->label && strcmp(member->label, "File") &&
+            strcmp(member->label, "Module"))
+            *binding = member;
     }
-    if (strncmp(raw, "crate::", 7) == 0)
-        raw += 7;
-    else if (strncmp(raw, "self::", 6) == 0) {
-        raw += 6;
-        snprintf(base, sizeof(base), "%s", source_module);
-    } else if (strncmp(raw, "super::", 7) == 0) {
-        snprintf(base, sizeof(base), "%s", source_module);
-        while (strncmp(raw, "super::", 7) == 0) {
-            if (!base[0])
-                return NULL;
-            char *last = NULL;
-            for (char *p = base; (p = strstr(p, "::")) != NULL; p += 2)
-                last = p;
-            if (last)
-                *last = '\0';
-            else
-                base[0] = '\0';
-            raw += 7;
-        }
-    } else {
-        /* Unqualified paths can name extern crates or lexical use aliases. */
-        return NULL;
-    }
-    char path[PKGMAP_PATH_BUF];
-    size = snprintf(path, sizeof(path), "%s%s%s", base, base[0] ? "::" : "", raw);
-    if (size <= 0 || (size_t)size >= sizeof(path))
-        return NULL;
-    char *group = strchr(path, '{');
-    if (!group) {
-        char *alias = strstr(path, " as ");
-        if (alias)
-            *alias = '\0';
-        return rust_use_target(ctx, map, root, source_module, path, ambiguous, binding);
-    }
-    char *end = strchr(group, '}');
-    if (!end || end[1] || strchr(group + 1, '{'))
-        return NULL;
-    *group++ = '\0';
-    *end = '\0';
-    const cbm_gbuf_node_t *target = NULL;
-    for (char *part = group; part;) {
-        char *next = strchr(part, ',');
-        if (next)
-            *next++ = '\0';
-        while (isspace((unsigned char)*part))
-            part++;
-        size_t length = strlen(part);
-        while (length && isspace((unsigned char)part[length - 1]))
-            part[--length] = '\0';
-        char *alias = strstr(part, " as ");
-        if (alias)
-            *alias = '\0';
-        char member[PKGMAP_PATH_BUF];
-        size = snprintf(member, sizeof(member), "%s%s", path, part);
-        if (size <= 0 || (size_t)size >= sizeof(member))
-            return NULL;
-        const cbm_gbuf_node_t *hit =
-            rust_use_target(ctx, map, root, source_module, member, ambiguous, NULL);
-        if (!hit || (target && target->id != hit->id))
-            return NULL;
-        target = hit;
-        part = next;
-    }
-    return target;
+    return cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, fact.dependency_file);
 }
 
 /* These adapters accept only audited literal carriers. Their conventions
@@ -4532,8 +4107,7 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
         return resolve_configured_include(ctx, source_rel, imp, namespace_map);
     }
     if (lang == CBM_LANG_RUST) {
-        *reason = "declared_rust_module_path";
-        return resolve_rust_import(ctx, source_rel, imp, namespace_map, ambiguous, NULL);
+        return resolve_rust_import(ctx, source_rel, imp, ambiguous, NULL, reason);
     }
     if (lang == CBM_LANG_PHP) {
         if (imp->kind == CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN) {
@@ -4651,6 +4225,11 @@ static cbm_resolve_result_t resolve_import_observed(
                                   : CBM_RESOLVE_ANALYSIS_FAILED;
             result.facts = 0;
         }
+    }
+    /* A path proved to leave the project is external, not an unresolved edge. */
+    if (language == CBM_LANG_RUST && !target && !strcmp(reason, "rust_external_crate_import")) {
+        result.domain = CBM_RESOLVE_DOMAIN_EXTERNAL;
+        result.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
     }
     if (out)
         *out = cbm_resolve_admit(&result) ? target : NULL;
@@ -5440,7 +5019,7 @@ static cbm_resolve_result_t source_import_binding(const cbm_pipeline_ctx_t *ctx,
             target = namespace;
         } else if (!c_family && import->module_path) {
             const cbm_gbuf_node_t *observed =
-                resolve_rust_import(ctx, rel, import, namespace_map, &ambiguous, &member);
+                resolve_rust_import(ctx, rel, import, &ambiguous, &member, NULL);
             if (observed == dependency && member && !ambiguous)
                 target = member->qualified_name;
         }

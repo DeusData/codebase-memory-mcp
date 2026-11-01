@@ -738,7 +738,7 @@ TEST(es_calls_crossfile_rust) {
                     .label = "Function",
                     .declaration_line = 1,
                     .declaration_text = "pub fn square(x: i32) -> i32 {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "rust-library-module-root-context",
          .why = "A lib.rs crate root used as a declared submodule needs explicit crate membership.",
          .tried = "Preserved the original main/lib source and added a required ordinary module "

@@ -503,15 +503,9 @@ TEST(javascript_import_table) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Rust — parse_rust_imports (text-based: strips "use "/";" from whole node).
- *
- * EXPECTED: basic and namespaced forms GREEN; grouped/braced forms may be RED
- * because the whole `use std::io::{self, Write};` text becomes the module_path,
- * so has_import("std::io") would still match as a substring — likely GREEN even
- * for grouped. The alias form `use X as Y;` leaves "std::collections::HashMap as H"
- * as module_path — has_import("std::collections::HashMap") would still match.
- * So most forms should be GREEN at extraction.  Graph-level zero edges are
- * downstream.
+ * Rust — parse_rust_imports: one import per use-tree leaf, each with its whole
+ * path. `use std::io::{self, Write};` is "std::io" and "std::io::Write", and an
+ * alias changes the local name, never the path.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static const import_case_t rust_cases[] = {

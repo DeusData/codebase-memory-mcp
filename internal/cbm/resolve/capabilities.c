@@ -62,7 +62,8 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_PHP, TYPED_EDGES,
      "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
-     "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
+     "Cargo crates, module trees, use trees, re-exports and globs; macro-generated items and "
+     "unmodeled receiver types abstain."},
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
      "Direct URI imports with prefix and show/hide bindings; parts and reexports are unsupported."},
     {CBM_LANG_LUA, EDGE(CALLS), NULL},
@@ -305,8 +306,12 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW;
         out->limitation =
-            "Declared modules and exact free functions; direct inherent &self methods on &T; "
-            "macros, attributes, traits and richer receiver search abstain.";
+            "Cargo crates and module trees, use trees, re-exports, globs, same-module items, "
+            "inherent "
+            "and in-scope trait methods with autoderef, and declared receiver types. Items a macro "
+            "generates, variants as call targets, fields sharing a method's name and external "
+            "return "
+            "types abstain.";
         break;
     case CBM_LANG_DART:
         out->adapter = "dart_source";

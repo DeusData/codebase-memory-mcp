@@ -248,13 +248,13 @@ static const cv_golden_t cv_goldens[] = {
     {"cv_rust_cfg_free_functions", "cv_rust_cfg_free_functions-2", "src/lib.rs", "pick", "beta()",
      1, "src/lib.rs", "beta", 2, "fn beta() {}"},
     {"cv_rust_cfg_free_functions", "cv_rust_cfg_free_functions-3", "src/lib.rs", "caller", "pick()",
-     2, "src/lib.rs", "pick", 4, "fn pick() { alpha(); }"},
+     2, "src/lib.rs", "pick", 6, "fn pick() { beta(); }"},
     {"cv_rust_cfg_methods", "cv_rust_cfg_methods-1", "src/lib.rs", "pick", "alpha()", 1,
      "src/lib.rs", "alpha", 2, "fn alpha() {}"},
     {"cv_rust_cfg_methods", "cv_rust_cfg_methods-2", "src/lib.rs", "pick", "beta()", 1,
      "src/lib.rs", "beta", 3, "fn beta() {}"},
     {"cv_rust_cfg_methods", "cv_rust_cfg_methods-3", "src/lib.rs", "caller", "self.pick()", 0,
-     "src/lib.rs", "pick", 6, "    fn pick(&self) { alpha(); }"},
+     "src/lib.rs", "pick", 8, "    fn pick(&self) { beta(); }"},
     {"cv_go_build_tag_files", "cv_go_build_tag_files-1", "pick/pick_windows.go", "Pick", "alpha()",
      0, "pick/common.go", "alpha", 3, "func alpha() {}"},
     {"cv_go_build_tag_files", "cv_go_build_tag_files-2", "pick/pick_posix.go", "Pick", "beta()", 0,
@@ -354,11 +354,22 @@ typedef struct {
     const char *case_id;
     unsigned caller_start, caller_end;
     const char *caller_declaration;
+    const char *target_label; /* NULL: Function */
 } cv_recovered_t;
 static const cv_recovered_t cv_recovered[] = {
-    {"cv_python_if-1", 5, 6, "    def pick():"}, {"cv_python_if-2", 8, 9, "    def pick():"},
-    {"cv_c_platform_files-1", 0, 0, NULL},       {"cv_c_platform_files-2", 0, 0, NULL},
-    {"cv_c_platform_directories-1", 0, 0, NULL}, {"cv_c_platform_directories-2", 0, 0, NULL},
+    {"cv_python_if-1", 5, 6, "    def pick():", NULL},
+    {"cv_python_if-2", 8, 9, "    def pick():", NULL},
+    {"cv_c_platform_files-1", 0, 0, NULL, NULL},
+    {"cv_c_platform_files-2", 0, 0, NULL, NULL},
+    {"cv_c_platform_directories-1", 0, 0, NULL, NULL},
+    {"cv_c_platform_directories-2", 0, 0, NULL, NULL},
+    /* Rust cfg twins are one node, whose canonical range is the last twin. */
+    {"cv_rust_cfg_free_functions-1", 4, 4, "fn pick() { alpha(); }", NULL},
+    {"cv_rust_cfg_free_functions-2", 6, 6, "fn pick() { beta(); }", NULL},
+    {"cv_rust_cfg_free_functions-3", 0, 0, NULL, NULL},
+    {"cv_rust_cfg_methods-1", 6, 6, "    fn pick(&self) { alpha(); }", NULL},
+    {"cv_rust_cfg_methods-2", 8, 8, "    fn pick(&self) { beta(); }", NULL},
+    {"cv_rust_cfg_methods-3", 0, 0, NULL, "Method"},
 };
 
 static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, int count) {
@@ -424,7 +435,9 @@ static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, i
             .relation = "CALLS",
             .target = {.file = g->target_file,
                        .suffix = g->target,
-                       .label = recovered ? "Function" : NULL,
+                       .label = !recovered                ? NULL
+                                : recovered->target_label ? recovered->target_label
+                                                          : "Function",
                        .declaration_line = g->declaration_line,
                        .declaration_text = g->declaration},
             .mode = recovered ? RQ_REQUIRED : RQ_KNOWN_GAP,
@@ -434,7 +447,8 @@ static bool cv_quality(cv_proj_t *p, const char *test, const cv_file_t *files, i
             .why =
                 recovered
                     ? "This source-authored body call is recovered and must retain its exact "
-                      "callable target; merged Python callers also require their authored variant."
+                      "callable target; merged Python and Rust callers also require their "
+                      "authored variant."
                 : g->target
                     ? "The strict resolver has no admitted binding for these conditional or "
                       "build-selected declarations; each source relationship remains recall debt."

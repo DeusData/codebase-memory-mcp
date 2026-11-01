@@ -14616,7 +14616,7 @@ static bool rust_constructed_quality(cbm_store_t *store, const char *project, co
                     .suffix = "store.Store.new",
                     .declaration_line = 6,
                     .declaration_text = "    pub fn new() -> Store {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-ASSOCIATED-FUNCTION-PROOF",
          .why = "Associated function selection is outside the admitted Rust free-function and "
                 "direct borrowed-receiver subsets.",
@@ -14633,7 +14633,7 @@ static bool rust_constructed_quality(cbm_store_t *store, const char *project, co
                     .suffix = "store.Store.get",
                     .declaration_line = 10,
                     .declaration_text = "    pub fn get(&self, k: u32) -> u32 {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-CONSTRUCTED-RECEIVER-PROOF",
          .why = "Constructor-return receiver flow and methods with arguments have no admitted Rust "
                 "receiver proof.",
@@ -14742,7 +14742,7 @@ static bool rust_associated_quality(cbm_store_t *store, const char *project, con
                     .suffix = "fsx.Opts.write",
                     .declaration_line = 6,
                     .declaration_text = "    pub fn write(w: bool) -> Opts {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-ASSOCIATED-FUNCTION-PROOF",
          .why = "An imported type does not establish an associated-function lookup proof.",
          .tried =
@@ -14769,7 +14769,7 @@ static bool rust_associated_quality(cbm_store_t *store, const char *project, con
                     .suffix = "cache.write",
                     .declaration_line = 1,
                     .declaration_text = "pub fn write(p: &str) -> usize {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-DECLARED-MODULE-CALLABLE-BINDING",
          .why = "The source declares mod cache, but the lexical auditor blocks module declarations "
                 "rather than proving their member namespace.",
@@ -14858,7 +14858,7 @@ static bool rust_generic_quality(cbm_store_t *store, const char *project, const 
                     .suffix = "helper_a",
                     .declaration_line = 12,
                     .declaration_text = "pub fn helper_a() -> u32 { 1 }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-GENERIC-IMPL-CALLER-PROOF",
          .why = "Generic impl/lifetime caller domains and their Self/receiver bindings are not "
                 "completed by the current Rust source auditor.",
@@ -14875,7 +14875,7 @@ static bool rust_generic_quality(cbm_store_t *store, const char *project, const 
                     .suffix = "Gen.other_g",
                     .declaration_line = 4,
                     .declaration_text = "    pub fn other_g(&self) -> u32 { 3 }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-GENERIC-IMPL-CALLER-PROOF",
          .why = "Generic impl/lifetime caller domains and their Self/receiver bindings are not "
                 "completed by the current Rust source auditor.",
@@ -14892,7 +14892,7 @@ static bool rust_generic_quality(cbm_store_t *store, const char *project, const 
                     .suffix = "Gen.assoc_g",
                     .declaration_line = 5,
                     .declaration_text = "    pub fn assoc_g() -> u32 { 4 }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-GENERIC-IMPL-CALLER-PROOF",
          .why = "Generic impl/lifetime caller domains and their Self/receiver bindings are not "
                 "completed by the current Rust source auditor.",
@@ -14909,7 +14909,7 @@ static bool rust_generic_quality(cbm_store_t *store, const char *project, const 
                     .suffix = "helper_b",
                     .declaration_line = 13,
                     .declaration_text = "pub fn helper_b() -> u32 { 2 }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-GENERIC-IMPL-CALLER-PROOF",
          .why = "Generic impl/lifetime caller domains and their Self/receiver bindings are not "
                 "completed by the current Rust source auditor.",
@@ -14926,7 +14926,7 @@ static bool rust_generic_quality(cbm_store_t *store, const char *project, const 
                     .suffix = "Life.other_l",
                     .declaration_line = 10,
                     .declaration_text = "    pub fn other_l(&self) -> u32 { 5 }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-GENERIC-IMPL-CALLER-PROOF",
          .why = "Generic impl/lifetime caller domains and their Self/receiver bindings are not "
                 "completed by the current Rust source auditor.",
@@ -15145,7 +15145,7 @@ static bool rust_std_receiver_quality(cbm_store_t *store, const char *project, c
                     .declaration_line = 6,
                     .declaration_text =
                         "    pub fn join(&self, other: &EvidenceTier) -> EvidenceTier {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-INLINE-CONSTRUCTOR-RECEIVER",
          .why = "A tuple-struct value has a known method, but the proof bridge requires a named "
                 "receiver and a zero-argument method call.",
@@ -15185,7 +15185,7 @@ static bool rust_std_receiver_quality(cbm_store_t *store, const char *project, c
                     .suffix = "lib.Gauge.recalibrate_gauge",
                     .declaration_line = 13,
                     .declaration_text = "    pub fn recalibrate_gauge(&self) -> u8 {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-ITERATOR-CLOSURE-ELEMENT-TYPE",
          .why = "The Gauge slice determines the iterator element, but closure parameter and "
                 "iterator return transfer are unsupported.",
@@ -18854,7 +18854,7 @@ static bool rust_macro_quality(cbm_store_t *store, const char *project, const ch
                     .suffix = "lib.render",
                     .declaration_line = 1,
                     .declaration_text = "pub fn render() -> &'static str { \"ok\" }"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "RUST-BUILTIN-MACRO-RAW-CARRIER",
          .why = "A built-in macro token tree requires an audited raw-to-expanded call mapping; "
                 "macro syntax is outside the admitted Rust binding subset.",
