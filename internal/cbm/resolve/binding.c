@@ -66,6 +66,8 @@ typedef struct {
     /* The direct-argument carrier spells `a.b` as b over the attribute's span.
      * The spelling is a member name here, never a lexical read of b. */
     bool attribute_terminal;
+    /* Inside a comprehension written directly in a class body. */
+    bool class_comprehension;
 } binding_site_t;
 
 typedef struct {
@@ -371,6 +373,21 @@ static const char *python_chain(cbm_resolve_binding_index_t *index, TSNode node,
                       : cbm_arena_sprintf(index->arena, "%s(%s)", callee, first);
 }
 
+static bool python_in_class_comprehension(const cbm_resolve_binding_index_t *index, TSNode node) {
+    if (!index->current_scope || !index->scopes[index->current_scope].class_scope)
+        return false;
+    for (unsigned depth = 0; !ts_node_is_null(node) && depth < 64; depth++) {
+        if (kind_is(node, "list_comprehension") || kind_is(node, "set_comprehension") ||
+            kind_is(node, "dictionary_comprehension") || kind_is(node, "generator_expression"))
+            return true;
+        if (kind_is(node, "class_definition") || kind_is(node, "function_definition") ||
+            kind_is(node, "lambda"))
+            return false;
+        node = ts_node_parent(node);
+    }
+    return false;
+}
+
 static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNode node) {
     if (!name || !*name) {
         return;
@@ -399,6 +416,9 @@ static void add_site(cbm_resolve_binding_index_t *index, const char *name, TSNod
     if (index->language == CBM_LANG_PYTHON && (kind_is(node, "call") || kind_is(node, "attribute")))
         index->sites[index->site_count - 1].chain =
             python_chain(index, kind_is(node, "call") ? field(node, "function") : node, 0);
+    if (index->language == CBM_LANG_PYTHON)
+        index->sites[index->site_count - 1].class_comprehension =
+            python_in_class_comprehension(index, node);
 }
 
 /* The same carrier over a parenthesized direct argument, `f((a.b))`. */
@@ -1046,6 +1066,34 @@ static bool python_own_module_entry(cbm_resolve_binding_index_t *index, TSNode s
 
 /* The class annotation names, for the supported annotation forms: a dotted
  * name, its string spelling, and Optional[...] around one of those. */
+static const char *python_import_canonical(const cbm_resolve_binding_index_t *index,
+                                           const char *chain);
+static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, TSNode node,
+                                           unsigned depth);
+
+/* typing.Optional however it was imported. A project class of that name says nothing
+ * about its argument. */
+static bool python_is_typing_optional(cbm_resolve_binding_index_t *index, TSNode outer) {
+    const char *spelled = python_chain(index, outer, 0);
+    const char *canonical = spelled ? python_import_canonical(index, spelled) : NULL;
+    return canonical && !strcmp(canonical, "typing.Optional");
+}
+
+static bool python_annotation_is_none(TSNode node) {
+    while (kind_is(node, "type") && ts_node_named_child_count(node) == 1)
+        node = ts_node_named_child(node, 0);
+    return kind_is(node, "none");
+}
+
+/* `X | None` says X. Two classes say neither. */
+static const char *python_union_chain(cbm_resolve_binding_index_t *index, TSNode left, TSNode right,
+                                      unsigned depth) {
+    bool left_none = python_annotation_is_none(left), right_none = python_annotation_is_none(right);
+    if (left_none == right_none)
+        return NULL;
+    return python_annotation_chain(index, left_none ? right : left, depth + 1);
+}
+
 static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, TSNode node,
                                            unsigned depth) {
     if (ts_node_is_null(node) || depth > 8)
@@ -1066,12 +1114,25 @@ static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, T
         return cbm_arena_strndup(index->arena, text + 1, length - 2);
     }
     if (kind_is(node, "generic_type") && ts_node_named_child_count(node) == 2) {
-        const char *outer = node_text(index, ts_node_named_child(node, 0));
         TSNode arguments = ts_node_named_child(node, 1);
-        if (!outer || (strcmp(outer, "Optional") && strcmp(outer, "typing.Optional")) ||
+        if (!python_is_typing_optional(index, ts_node_named_child(node, 0)) ||
             ts_node_named_child_count(arguments) != 1)
             return NULL;
         return python_annotation_chain(index, ts_node_named_child(arguments, 0), depth + 1);
+    }
+    /* The grammar reads a dotted generic, typing.Optional[X], as a subscript. */
+    if (kind_is(node, "subscript") && ts_node_named_child_count(node) == 2)
+        return python_is_typing_optional(index, field(node, "value"))
+                   ? python_annotation_chain(index, field(node, "subscript"), depth + 1)
+                   : NULL;
+    if (kind_is(node, "union_type") && ts_node_named_child_count(node) == 2)
+        return python_union_chain(index, ts_node_named_child(node, 0), ts_node_named_child(node, 1),
+                                  depth);
+    if (kind_is(node, "binary_operator")) {
+        const char *operator= node_text(index, field(node, "operator"));
+        return operator&& !strcmp(operator, "|")
+                   ? python_union_chain(index, field(node, "left"), field(node, "right"), depth)
+                   : NULL;
     }
     return NULL;
 }
@@ -1728,16 +1789,25 @@ static void python_note_class(cbm_resolve_binding_index_t *index, TSNode node, u
     }
     for (uint32_t i = 0; i < count; i++) {
         TSNode base = ts_node_named_child(bases, i);
-        if (kind_is(base, "comment") || kind_is(base, "keyword_argument"))
+        if (kind_is(base, "keyword_argument")) {
+            const char *keyword = node_text(index, field(base, "name"));
+            entry->metaclass |= keyword && !strcmp(keyword, "metaclass");
+            continue;
+        }
+        if (kind_is(base, "comment"))
             continue;
         /* Generic[T] and Base[int] inherit the subscripted class. */
-        if (kind_is(base, "subscript"))
+        bool subscripted = kind_is(base, "subscript");
+        if (subscripted)
             base = field(base, "value");
         const char *chain = python_chain(index, base, 0);
-        if (!chain)
+        if (!chain || (subscripted && entry->base_count >= 64)) {
             entry->unknown_base = true;
-        else
-            entry->bases[entry->base_count++] = chain;
+            continue;
+        }
+        if (subscripted)
+            entry->subscripted |= UINT64_C(1) << entry->base_count;
+        entry->bases[entry->base_count++] = chain;
     }
 }
 
@@ -3486,6 +3556,24 @@ static const char *javascript_symbol_scope(cbm_resolve_binding_index_t *index) {
 static void audit_http_default(cbm_resolve_binding_index_t *index, TSNode root);
 static void audit_http_escapes(cbm_resolve_binding_index_t *index);
 
+static const binding_name_t *find_scoped_name(const cbm_resolve_binding_index_t *index,
+                                              const char *name, size_t length, uint32_t scope,
+                                              bool *present);
+
+/* A comprehension body does not see the class it is written in, and has no scope of its
+ * own here. So a name the class binds could be the comprehension's or the enclosing
+ * scope's, and it abstains. Any other name reads on through the class as usual. */
+static void python_refuse_class_comprehension_reads(cbm_resolve_binding_index_t *index) {
+    for (size_t i = 0; i < index->site_count; i++) {
+        binding_site_t *site = &index->sites[i];
+        if (!site->class_comprehension)
+            continue;
+        bool present = false;
+        (void)find_scoped_name(index, site->name, strcspn(site->name, ".("), site->scope, &present);
+        site->attribute_terminal |= present;
+    }
+}
+
 cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
                                                        CBMLanguage language, const char *source,
                                                        size_t source_len) {
@@ -3609,6 +3697,8 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
         apply_export_markers(index);
         if (javascript_language(language))
             audit_javascript_values(index);
+        if (language == CBM_LANG_PYTHON)
+            python_refuse_class_comprehension_reads(index);
     }
     /* An explicit replacement of annotation storage can invoke user code
      * even when the annotation itself is a bare name. Do not infer the

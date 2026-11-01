@@ -80,6 +80,7 @@ typedef struct {
     py_member_kind_t kind;
     py_ref_t value;    /* return type, property type, or class attribute value */
     bool none_default; /* `x = None` in the class body: instances store the real value */
+    bool annotated;    /* its value comes from an annotation */
 } py_member_t;
 
 typedef struct {
@@ -92,7 +93,8 @@ struct py_class {
     const char *qualified_name;
     py_ref_t *bases;
     uint32_t base_count;
-    bool unknown_base;
+    uint64_t subscripted; /* bit per base: written Base[...] */
+    bool unknown_base, metaclass;
     py_member_t *members; /* sorted by name */
     uint32_t member_count;
     py_attribute_t *attributes; /* sorted by name */
@@ -103,6 +105,7 @@ struct py_class {
     uint32_t mro_count, reliable;
     const struct py_class **direct; /* resolved written bases, opaque ones included */
     uint32_t direct_count;
+    const struct py_class *first; /* the first written base, when it resolved */
     bool opaque, duplicate, visiting, sealed, intercepts, custom_new;
     /* A base here or in the ancestry is unknown and could reorder what follows. */
     bool uncertain;
@@ -173,7 +176,13 @@ static py_ref_t py_ref_of_chain(const cbm_resolve_binding_index_t *index, CBMAre
         return none;
     size_t length = strcspn(chain, ".(");
     const char *rest = chain + length;
-    if (length == 5 && !strncmp(chain, "super", 5) && rest[0] == '(') {
+    /* super and type are the builtins only while nothing in scope binds the name. */
+    bool builtin = rest[0] == '(' &&
+                   ((length == 5 && !strncmp(chain, "super", 5)) ||
+                    (length == 4 && !strncmp(chain, "type", 4))) &&
+                   cbm_resolve_binding_python_root(index, chain, length, scope, at).kind ==
+                       CBM_PY_ROOT_UNBOUND;
+    if (builtin && length == 5) {
         if (rest[1] == ')') {
             const char *owner = cbm_resolve_binding_python_method_owner(index, scope);
             return owner ? (py_ref_t){PY_REF_SUPER, owner, rest + 2, NULL} : none;
@@ -187,7 +196,7 @@ static py_ref_t py_ref_of_chain(const cbm_resolve_binding_index_t *index, CBMAre
                                                rest + 1, close + 1);
         return py_ref_of_chain(index, arena, imports, joined, scope, at, depth + 1, steps);
     }
-    if (length == 4 && !strncmp(chain, "type", 4) && rest[0] == '(' && rest[1] != ')') {
+    if (builtin && rest[1] != ')') {
         const char *close = strchr(rest, ')');
         if (!close)
             return none;
@@ -494,6 +503,8 @@ bool cbm_py_members_add_file(cbm_py_members_t *members, const cbm_resolve_bindin
         }
         entry->qualified_name = key;
         entry->unknown_base = source->unknown_base;
+        entry->subscripted = source->subscripted;
+        entry->metaclass = source->metaclass;
         entry->base_count = source->base_count;
         entry->bases =
             source->base_count
@@ -545,6 +556,7 @@ bool cbm_py_members_add_file(cbm_py_members_t *members, const cbm_resolve_bindin
         slot->target = py_keep(members, member->target);
         slot->kind = py_member_kind(index, member);
         slot->none_default = member->kind == CBM_PY_MEMBER_VALUE && member->none_value;
+        slot->annotated = member->type_chain != NULL;
         slot->value = member->kind == CBM_PY_MEMBER_FUNCTION
                           ? py_capture_type(members, index, &scratch, imports, member->return_chain,
                                             member->chain_scope)
@@ -765,6 +777,20 @@ static bool py_instance_attribute(const py_eval_t *eval, const py_class_t *cls, 
     return present;
 }
 
+/* A metaclass or __init_subclass__ can replace what a class body assigned: a Django field
+ * reads as its column value, an Enum member as the enum. A base we cannot read can bring
+ * either of them along. */
+static bool py_class_body_rewritable(const py_class_t *cls) {
+    if (cls->uncertain)
+        return true;
+    for (uint32_t i = 0; i < cls->mro_count; i++) {
+        const py_class_t *entry = cls->mro[i];
+        if (entry->opaque || entry->metaclass || py_own_member(entry, "__init_subclass__"))
+            return true;
+    }
+    return false;
+}
+
 static py_value_t py_read_member(const py_eval_t *eval, const py_value_t *value, const char *name,
                                  unsigned depth) {
     py_value_t unknown = {.kind = PY_VALUE_UNKNOWN};
@@ -805,8 +831,13 @@ static py_value_t py_read_member(const py_eval_t *eval, const py_value_t *value,
         read.owner = owner->qualified_name;
         return read;
     }
-    case PY_MEMBER_VALUE:
-        return py_eval_ref(eval, &member->value, depth + 1);
+    case PY_MEMBER_VALUE: {
+        py_value_t read = py_eval_ref(eval, &member->value, depth + 1);
+        /* An annotation states what a read yields, whatever the machinery does. */
+        return read.kind == PY_VALUE_INSTANCE && !member->annotated && py_class_body_rewritable(cls)
+                   ? unknown
+                   : read;
+    }
     case PY_MEMBER_DECORATED:
     case PY_MEMBER_OPAQUE:
         return unknown;
@@ -1252,20 +1283,29 @@ static void py_seal_fallback(py_class_t *cls, CBMArena *arena) {
     cls->sealed = mro != NULL;
 }
 
-/* When an ancestor's bases are unknown, its ancestry can reorder the rest. Only
- * a single-inheritance prefix keeps its place regardless. */
+/* When an ancestor's bases are unknown, its ancestry can reorder the rest. A
+ * single-inheritance prefix keeps its place regardless, and so does the first written
+ * base behind it: C3 puts that directly after its class, or refuses the class. What
+ * follows a first base of several can be overtaken, by a subclass of its parent. */
 static uint32_t py_single_chain(const py_class_t *cls, const py_class_t **mro, uint32_t count) {
     uint32_t reliable = 1;
     const py_class_t *current = cls;
-    while (reliable < count && !current->opaque && current->base_count == 1 &&
-           !current->unknown_base) {
-        const py_class_t *next = mro[reliable];
-        if (next->opaque)
+    while (reliable < count && !current->opaque && !current->unknown_base && current->first &&
+           mro[reliable] == current->first && !mro[reliable]->opaque) {
+        uint32_t written = current->base_count;
+        current = mro[reliable++];
+        if (written != 1)
             break;
-        reliable++;
-        current = next;
     }
     return reliable;
+}
+
+/* Base[int] asks the class, and a __class_getitem__ can answer with anything. */
+static bool py_answers_subscript(const py_class_t *cls) {
+    for (uint32_t i = 0; i < cls->mro_count; i++)
+        if (py_own_member(cls->mro[i], "__class_getitem__"))
+            return true;
+    return false;
 }
 
 static void py_seal_class(const py_eval_t *eval, cbm_py_members_t *members, py_class_t *cls,
@@ -1299,11 +1339,14 @@ static void py_seal_class(const py_eval_t *eval, cbm_py_members_t *members, py_c
             continue;
         }
         py_seal_class(eval, members, (py_class_t *)base, depth + 1);
-        if (!base->sealed) {
+        if (!base->sealed ||
+            (b < 64 && ((cls->subscripted >> b) & 1) && py_answers_subscript(base))) {
             unsealed = true;
             continue;
         }
         inherited |= base->uncertain;
+        if (b == 0)
+            cls->first = base;
         lists[list_count] = base->mro;
         counts[list_count] = base->mro_count;
         list_count++;
@@ -1330,7 +1373,7 @@ static void py_seal_class(const py_eval_t *eval, cbm_py_members_t *members, py_c
         reliable++;
     cls->uncertain = unsealed || inherited;
     if (cls->uncertain)
-        reliable = unsealed && direct_count != written ? 1 : py_single_chain(cls, mro, mro_count);
+        reliable = py_single_chain(cls, mro, mro_count);
     cls->reliable = reliable;
     for (uint32_t i = 0; i < reliable; i++) {
         cls->intercepts |= py_own_member(mro[i], "__getattribute__") != NULL;

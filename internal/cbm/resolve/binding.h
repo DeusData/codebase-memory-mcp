@@ -89,7 +89,9 @@ typedef struct {
     uint32_t scope, header_scope;
     const char **bases; /* access paths, source order */
     uint32_t base_count;
-    bool unknown_base; /* a base expression that has no access path */
+    uint64_t subscripted; /* bit per base: written Base[...] */
+    bool metaclass;       /* written metaclass=... */
+    bool unknown_base;    /* a base expression that has no access path */
 } cbm_resolve_python_class_t;
 
 /* `from module_path import *` at module level; at is the statement's end. */
