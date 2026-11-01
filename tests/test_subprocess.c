@@ -813,6 +813,17 @@ TEST(subprocess_spawn_returns_while_child_is_running) {
  * Waits below have no deadline: they end when the descendant is ready or the
  * tree stops running, so the outcome, not a timer, decides the verdict. */
 
+#ifdef _WIN32
+#define RSS_TREE_FAULT_GONE ERROR_INVALID_PARAMETER /* no process with that id any more */
+#define RSS_TREE_FAULT_LIVE ERROR_ACCESS_DENIED     /* a member we may not open */
+#elif defined(__APPLE__)
+#define RSS_TREE_FAULT_GONE ESRCH
+#define RSS_TREE_FAULT_LIVE EPERM
+#else
+#define RSS_TREE_FAULT_GONE ENOENT
+#define RSS_TREE_FAULT_LIVE EACCES
+#endif
+
 #define RSS_TREE_MIB UINT64_C(1048576)
 
 typedef struct {
@@ -866,8 +877,9 @@ static bool rss_tree_finish(cbm_subprocess_t *process, rss_tree_sample_t *sample
     return result.tree_quiesced;
 }
 
-/* Measure one tree whose descendant holds `mib` MiB. */
-static rss_tree_sample_t rss_tree_sample(int mib) {
+/* Measure one tree whose descendant holds `mib` MiB, with every non-root
+ * member's measurement failing with `member_fault` (0 = real calls). */
+static rss_tree_sample_t rss_tree_sample(int mib, int member_fault) {
     rss_tree_sample_t sample = {.status = CBM_PROC_TREE_RSS_ERROR,
                                 .final_status = CBM_PROC_TREE_RSS_ERROR,
                                 .final_rss = UINT64_MAX};
@@ -891,7 +903,9 @@ static rss_tree_sample_t rss_tree_sample(int mib) {
     if (sample.spawned) {
         sample.ready = rss_tree_wait_ready(ready_path, process);
         if (sample.ready) {
+            cbm_subprocess_tree_rss_fault_members_for_testing(member_fault);
             sample.status = cbm_subprocess_tree_rss_bytes(process, &sample.rss);
+            cbm_subprocess_tree_rss_fault_members_for_testing(0);
         }
         sample.quiesced = rss_tree_finish(process, &sample);
     }
@@ -904,8 +918,8 @@ static rss_tree_sample_t rss_tree_sample(int mib) {
  * the root. 128 MiB touched against a 96 MiB floor leaves room for allocator
  * and page-rounding noise and none for a root-only total. */
 TEST(subprocess_tree_rss_measures_contained_descendants) {
-    rss_tree_sample_t idle = rss_tree_sample(0);
-    rss_tree_sample_t loaded = rss_tree_sample(128);
+    rss_tree_sample_t idle = rss_tree_sample(0, 0);
+    rss_tree_sample_t loaded = rss_tree_sample(128, 0);
     if (loaded.status == CBM_PROC_TREE_RSS_OK && idle.status == CBM_PROC_TREE_RSS_OK) {
         printf("    tree rss: idle=%llu MiB loaded=%llu MiB\n",
                (unsigned long long)(idle.rss / RSS_TREE_MIB),
@@ -923,6 +937,29 @@ TEST(subprocess_tree_rss_measures_contained_descendants) {
     ASSERT_TRUE(loaded.quiesced);
     ASSERT_EQ(loaded.final_status, CBM_PROC_TREE_RSS_EMPTY);
     ASSERT_EQ(loaded.final_rss, 0);
+    PASS();
+}
+
+/* A live member the platform will not let us measure must fail the probe: a
+ * total without it would under-report the tree. */
+TEST(subprocess_tree_rss_fails_when_a_live_member_cannot_be_measured) {
+    rss_tree_sample_t sample = rss_tree_sample(0, RSS_TREE_FAULT_LIVE);
+    ASSERT_TRUE(sample.spawned);
+    ASSERT_TRUE(sample.ready);
+    ASSERT_EQ(sample.status, CBM_PROC_TREE_RSS_ERROR);
+    ASSERT_TRUE(sample.quiesced);
+    PASS();
+}
+
+/* A member that exited between the listing and its measurement holds nothing:
+ * it is skipped and the rest of the tree (here the root) is still measured. */
+TEST(subprocess_tree_rss_skips_a_member_that_exited_mid_probe) {
+    rss_tree_sample_t sample = rss_tree_sample(0, RSS_TREE_FAULT_GONE);
+    ASSERT_TRUE(sample.spawned);
+    ASSERT_TRUE(sample.ready);
+    ASSERT_EQ(sample.status, CBM_PROC_TREE_RSS_OK);
+    ASSERT_TRUE(sample.rss > 0);
+    ASSERT_TRUE(sample.quiesced);
     PASS();
 }
 
@@ -2775,6 +2812,8 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_null_bin_rejected);
     RUN_TEST(subprocess_spawn_returns_while_child_is_running);
     RUN_TEST(subprocess_tree_rss_measures_contained_descendants);
+    RUN_TEST(subprocess_tree_rss_fails_when_a_live_member_cannot_be_measured);
+    RUN_TEST(subprocess_tree_rss_skips_a_member_that_exited_mid_probe);
     RUN_TEST(subprocess_natural_completion_is_cached_across_polls);
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);

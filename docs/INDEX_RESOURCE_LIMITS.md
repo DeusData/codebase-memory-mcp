@@ -60,7 +60,11 @@ quarantine a source file.
 
 If RSS is enabled and three consecutive probes cannot obtain any trustworthy
 tree measurement while the root worker is still running, CBM fails closed with
-`code=resource_probe_failed`.
+`code=resource_probe_failed`. A probe is untrustworthy as soon as one member of
+the tree cannot be measured: only a process that exits between the listing and
+its measurement is skipped, because a total without a live member would
+under-report. On Linux the probe reads every `/proc/<pid>/stat` to find the
+tree's members, so a `/proc` mounted with `hidepid=1` makes it fail closed.
 
 ## Counting and failure semantics
 

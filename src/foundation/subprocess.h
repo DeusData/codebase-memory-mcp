@@ -159,8 +159,9 @@ cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t
  * On macOS this is phys_footprint (what the OS holds against the process);
  * elsewhere it is RSS. OK returns an overflow-safe byte total, EMPTY means
  * the owned tree currently has no observable members, and ERROR means no
- * trustworthy measurement could be obtained. Individual processes that exit
- * during enumeration are ignored. */
+ * trustworthy measurement could be obtained. A member that exits between the
+ * listing and its measurement is ignored (the platform reports it gone); any
+ * other member that cannot be measured is ERROR, never a smaller total. */
 cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_bytes(cbm_subprocess_t *process,
                                                          uint64_t *rss_bytes);
 bool cbm_subprocess_root_running(const cbm_subprocess_t *process);
@@ -243,6 +244,10 @@ void cbm_subprocess_hold_parent_until_child_exits_for_testing(int spawns);
  * waitid does not report it yet. Test builds only. */
 void cbm_subprocess_observe_exiting_child_for_testing(int spawns);
 uint64_t cbm_subprocess_rss_sum_for_testing(const uint64_t *values, size_t count);
+/* Make the tree probe's measurement of every NON-root member fail with
+ * platform_error (errno on POSIX, GetLastError() on Windows), as a live or an
+ * exiting member would; 0 restores the real calls. Test builds only. */
+void cbm_subprocess_tree_rss_fault_members_for_testing(int platform_error);
 #endif
 
 /* How the POSIX fork+exec child closed its inherited descriptors (#1484). */

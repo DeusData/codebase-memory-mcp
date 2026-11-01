@@ -476,9 +476,53 @@ uint64_t cbm_subprocess_rss_sum_for_testing(const uint64_t *values, size_t count
     }
     return total;
 }
+
+static atomic_int g_tree_rss_member_fault;
+
+void cbm_subprocess_tree_rss_fault_members_for_testing(int platform_error) {
+    atomic_store_explicit(&g_tree_rss_member_fault, platform_error, memory_order_release);
+}
+
+/* Test builds can make every NON-root member's measurement fail with one
+ * platform error (errno on POSIX, GetLastError() on Windows); 0 = real call.
+ * Production builds compile the check out entirely. */
+static int cbm_tree_rss_member_fault(bool root) {
+    return root ? 0 : atomic_load_explicit(&g_tree_rss_member_fault, memory_order_acquire);
+}
 #endif
 
+/* A member that cannot be measured is skipped only when the platform says it
+ * no longer exists (it exited between the listing and the measurement, and
+ * holds nothing). Any other failure is a live member whose memory a total
+ * would silently leave out, so the probe fails instead -- a watchdog that
+ * under-reports is one that quietly stopped watching. The root is strict
+ * either way. */
 #ifdef _WIN32
+static HANDLE cbm_tree_rss_open_member(DWORD pid, bool root, DWORD *error_out) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int fault = cbm_tree_rss_member_fault(root);
+    if (fault != 0) {
+        *error_out = (DWORD)fault;
+        return NULL;
+    }
+#else
+    (void)root;
+#endif
+    /* GetProcessMemoryInfo documents PROCESS_QUERY_INFORMATION |
+     * PROCESS_VM_READ. PROCESS_QUERY_LIMITED_INFORMATION is a lesser
+     * alternative on newer Windows; the Job Object membership list
+     * already closes most of the pid-reuse window between listing and
+     * opening. */
+    HANDLE member = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    *error_out = member ? ERROR_SUCCESS : GetLastError();
+    return member;
+}
+
+static bool cbm_tree_rss_member_exited(HANDLE member) {
+    DWORD exit_code = 0;
+    return GetExitCodeProcess(member, &exit_code) && exit_code != STILL_ACTIVE;
+}
+
 static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
                                                                    uint64_t *rss_bytes) {
     DWORD capacity = 32;
@@ -510,18 +554,15 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
 
     uint64_t total = 0;
     DWORD measured = 0;
-    bool root_failed = false;
-    for (DWORD index = 0; index < processes->NumberOfProcessIdsInList; index++) {
+    bool failed = false;
+    for (DWORD index = 0; index < processes->NumberOfProcessIdsInList && !failed; index++) {
         DWORD pid = (DWORD)processes->ProcessIdList[index];
-        /* GetProcessMemoryInfo documents PROCESS_QUERY_INFORMATION |
-         * PROCESS_VM_READ. PROCESS_QUERY_LIMITED_INFORMATION is a lesser
-         * alternative on newer Windows; the Job Object membership list
-         * already closes most of the pid-reuse window between listing and
-         * opening. A member we cannot open is a probe failure when it is
-         * the root. */
-        HANDLE member = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        bool root = pid == process->process_id;
+        DWORD open_error = ERROR_SUCCESS;
+        HANDLE member = cbm_tree_rss_open_member(pid, root, &open_error);
         if (!member) {
-            root_failed = root_failed || pid == process->process_id;
+            /* ERROR_INVALID_PARAMETER: no process has this id any more. */
+            failed = root || open_error != ERROR_INVALID_PARAMETER;
             continue;
         }
         PROCESS_MEMORY_COUNTERS memory;
@@ -529,14 +570,14 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
         if (GetProcessMemoryInfo(member, &memory, sizeof(memory))) {
             cbm_rss_add_saturated(&total, (uint64_t)memory.WorkingSetSize);
             measured++;
-        } else if (pid == process->process_id) {
-            root_failed = true;
+        } else {
+            failed = root || !cbm_tree_rss_member_exited(member);
         }
         CloseHandle(member);
     }
     DWORD listed = processes->NumberOfProcessIdsInList;
     cbm_free(CBM_MEM_CLASS_OTHER, processes);
-    if (root_failed || (measured == 0 && listed > 0)) {
+    if (failed || (measured == 0 && listed > 0)) {
         return CBM_PROC_TREE_RSS_ERROR;
     }
     if (measured == 0) {
@@ -546,56 +587,73 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
     return CBM_PROC_TREE_RSS_OK;
 }
 #elif defined(__APPLE__)
-static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
-                                                                   uint64_t *rss_bytes) {
-    int capacity = proc_listallpids(NULL, 0);
-    if (capacity <= 0 || capacity > INT_MAX / (int)sizeof(pid_t) - 64) {
-        return CBM_PROC_TREE_RSS_ERROR;
-    }
-    capacity += 64;
+/* The members of the contained process group, as the kernel lists them. An
+ * all-process scan cannot decide membership: proc_pidinfo answers EPERM for
+ * every process of another user, so "not in our group" and "in our group but
+ * unreadable" would look the same. Returns the member count, or -1. */
+static int cbm_tree_rss_list_group(pid_t pgid, pid_t **pids_out) {
+    int capacity = 64;
     pid_t *pids = NULL;
-    int count = 0;
     for (;;) {
         pid_t *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, pids, (size_t)capacity * sizeof(*pids));
         if (!grown) {
             cbm_free(CBM_MEM_CLASS_OTHER, pids);
-            return CBM_PROC_TREE_RSS_ERROR;
+            return -1;
         }
         pids = grown;
-        count = proc_listallpids(pids, capacity * (int)sizeof(*pids));
-        if (count <= 0) {
+        errno = 0;
+        int bytes =
+            proc_listpids(PROC_PGRP_ONLY, (uint32_t)pgid, pids, capacity * (int)sizeof(*pids));
+        if (bytes < 0 || (bytes == 0 && errno != 0)) {
             cbm_free(CBM_MEM_CLASS_OTHER, pids);
-            return CBM_PROC_TREE_RSS_ERROR;
+            return -1;
         }
+        int count = bytes / (int)sizeof(*pids);
         if (count < capacity) {
-            break;
+            *pids_out = pids;
+            return count;
         }
         if (capacity > INT_MAX / (int)sizeof(*pids) / 2) {
             cbm_free(CBM_MEM_CLASS_OTHER, pids);
-            return CBM_PROC_TREE_RSS_ERROR;
+            return -1;
         }
         capacity *= 2;
+    }
+}
+
+static int cbm_tree_rss_member_rusage(pid_t pid, bool root, struct rusage_info_v2 *usage) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int fault = cbm_tree_rss_member_fault(root);
+    if (fault != 0) {
+        errno = fault;
+        return -1;
+    }
+#else
+    (void)root;
+#endif
+    return proc_pid_rusage(pid, RUSAGE_INFO_V2, (rusage_info_t *)usage);
+}
+
+static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
+                                                                   uint64_t *rss_bytes) {
+    pid_t *pids = NULL;
+    int count = cbm_tree_rss_list_group(process->pgid, &pids);
+    if (count < 0) {
+        return CBM_PROC_TREE_RSS_ERROR;
     }
 
     uint64_t total = 0;
     int measured = 0;
-    bool root_failed = false;
-    for (int index = 0; index < count; index++) {
-        struct proc_bsdinfo info;
+    bool failed = false;
+    for (int index = 0; index < count && !failed; index++) {
         if (pids[index] <= 0) {
             continue;
         }
-        if (proc_pidinfo(pids[index], PROC_PIDTBSDINFO, 0, &info, sizeof(info)) !=
-            (int)sizeof(info)) {
-            root_failed = root_failed || pids[index] == process->pid;
-            continue;
-        }
-        if ((pid_t)info.pbi_pgid != process->pgid) {
-            continue;
-        }
+        bool root = pids[index] == process->pid;
         struct rusage_info_v2 usage;
-        if (proc_pid_rusage(pids[index], RUSAGE_INFO_V2, (rusage_info_t *)&usage) != 0) {
-            root_failed = root_failed || pids[index] == process->pid;
+        if (cbm_tree_rss_member_rusage(pids[index], root, &usage) != 0) {
+            /* ESRCH: the member exited after the listing. */
+            failed = root || errno != ESRCH;
             continue;
         }
         /* phys_footprint is what the OS charges, matching cbm_mem_charged().
@@ -606,7 +664,7 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
         measured++;
     }
     cbm_free(CBM_MEM_CLASS_OTHER, pids);
-    if (root_failed) {
+    if (failed) {
         return CBM_PROC_TREE_RSS_ERROR;
     }
     if (measured == 0) {
@@ -628,22 +686,61 @@ static bool cbm_proc_pid_name(const char *name) {
     return true;
 }
 
-static bool cbm_linux_proc_stat(const char *pid_name, pid_t *group, int64_t *rss_pages) {
+typedef enum {
+    CBM_LINUX_STAT_OK = 0,
+    CBM_LINUX_STAT_GONE,       /* the process exited after the /proc listing */
+    CBM_LINUX_STAT_UNREADABLE, /* a process whose stat could not be read or parsed */
+} cbm_linux_stat_t;
+
+/* /proc/<pid>/stat is world-readable, so on a default /proc mount the only
+ * expected failure is the exit race: ENOENT at open, ESRCH at read. Anything
+ * else (EACCES under hidepid=1, a parse failure) leaves the process's group
+ * unknown, and the probe fails closed rather than guess it is not ours. */
+static cbm_linux_stat_t cbm_linux_stat_failure(int error) {
+    return error == ENOENT || error == ESRCH ? CBM_LINUX_STAT_GONE : CBM_LINUX_STAT_UNREADABLE;
+}
+
+static cbm_linux_stat_t cbm_linux_proc_stat_line(const char *pid_name, bool root, char *line,
+                                                 size_t line_size) {
     char path[64];
     int length = snprintf(path, sizeof(path), "/proc/%s/stat", pid_name);
     if (length <= 0 || length >= (int)sizeof(path)) {
-        return false;
+        return CBM_LINUX_STAT_UNREADABLE;
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    int fault = cbm_tree_rss_member_fault(root);
+    if (fault != 0) {
+        return cbm_linux_stat_failure(fault);
+    }
+#else
+    (void)root;
+#endif
+    errno = 0;
     FILE *stat_file = cbm_fopen(path, "rb");
     if (!stat_file) {
-        return false;
+        return cbm_linux_stat_failure(errno);
     }
-    char stat_line[4096];
-    bool read = fgets(stat_line, sizeof(stat_line), stat_file) != NULL;
+    errno = 0;
+    bool read = fgets(line, (int)line_size, stat_file) != NULL;
+    int read_error = errno;
     (void)fclose(stat_file);
-    char *command_end = read ? strrchr(stat_line, ')') : NULL;
+    if (!read) {
+        return read_error == ESRCH ? CBM_LINUX_STAT_GONE : CBM_LINUX_STAT_UNREADABLE;
+    }
+    return CBM_LINUX_STAT_OK;
+}
+
+static cbm_linux_stat_t cbm_linux_proc_stat(const char *pid_name, bool root, pid_t *group,
+                                            int64_t *rss_pages) {
+    char stat_line[4096];
+    cbm_linux_stat_t status =
+        cbm_linux_proc_stat_line(pid_name, root, stat_line, sizeof(stat_line));
+    if (status != CBM_LINUX_STAT_OK) {
+        return status;
+    }
+    char *command_end = strrchr(stat_line, ')');
     if (!command_end || command_end[1] != ' ') {
-        return false;
+        return CBM_LINUX_STAT_UNREADABLE;
     }
 
     char *save = NULL;
@@ -656,7 +753,7 @@ static bool cbm_linux_proc_stat(const char *pid_name, pid_t *group, int64_t *rss
             char *end = NULL;
             long long value = strtoll(token, &end, 10);
             if (!end || *end != '\0') {
-                return false;
+                return CBM_LINUX_STAT_UNREADABLE;
             }
             if (field == 5) {
                 *group = (pid_t)value;
@@ -670,7 +767,7 @@ static bool cbm_linux_proc_stat(const char *pid_name, pid_t *group, int64_t *rss
         token = strtok_r(NULL, " ", &save);
         field++;
     }
-    return have_group && have_rss;
+    return have_group && have_rss ? CBM_LINUX_STAT_OK : CBM_LINUX_STAT_UNREADABLE;
 }
 
 static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subprocess_t *process,
@@ -687,17 +784,18 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
 
     uint64_t total = 0;
     int measured = 0;
-    bool root_failed = false;
+    bool failed = false;
     struct dirent *entry;
-    while ((entry = readdir(proc)) != NULL) {
+    while (!failed && (entry = readdir(proc)) != NULL) {
         if (!cbm_proc_pid_name(entry->d_name)) {
             continue;
         }
         pid_t group = 0;
         int64_t pages = 0;
         bool root_entry = strtol(entry->d_name, NULL, 10) == (long)process->pid;
-        if (!cbm_linux_proc_stat(entry->d_name, &group, &pages)) {
-            root_failed = root_failed || root_entry;
+        cbm_linux_stat_t status = cbm_linux_proc_stat(entry->d_name, root_entry, &group, &pages);
+        if (status != CBM_LINUX_STAT_OK) {
+            failed = root_entry || status != CBM_LINUX_STAT_GONE;
             continue;
         }
         if (group != process->pgid || pages < 0) {
@@ -711,7 +809,7 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
         measured++;
     }
     (void)closedir(proc);
-    if (root_failed) {
+    if (failed) {
         return CBM_PROC_TREE_RSS_ERROR;
     }
     if (measured == 0) {
