@@ -17326,10 +17326,11 @@ static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
     bool *cancellation_latched, bool *deadline_latched, bool *output_limit_latched,
     cbm_proc_result_t *result_out);
 
-/* POSIX-only: the unscoped search_code scan as find/sort/grep argv stages. */
+/* POSIX-only: the unscoped search_code scan as find/sort argv stages feeding the
+ * in-process scanner. */
 static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
                                                  const char *file_pattern,
-                                                 const char *pattern_file, const char *filelist,
+                                                 const char *pattern, const char *filelist,
                                                  const char *root_path,
                                                  char output_path[CBM_SZ_2K], size_t output_limit,
                                                  uint64_t deadline_ms, bool deadline_latched,
@@ -17741,7 +17742,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                  * shell parses search scopes or file patterns anymore (#2634).
                  * The command override keeps the shell runner for tests. */
                 scan_cause = mcp_run_search_scan_argv(
-                    srv, use_regex, file_pattern, tmpfile, filelist, root_path, output_path,
+                    srv, use_regex, file_pattern, pattern, filelist, root_path, output_path,
                     scan_output_limit, scan_deadline_ms, scan_deadline_latched, &scan_result);
             } else
 #endif
@@ -18360,20 +18361,16 @@ static mcp_scan_cause_t mcp_run_argv_stage_cancellable_bounded(
                                                  : MCP_SCAN_CONTAINED_COMMAND_FAILURE;
 }
 
-/* Number of file operands per grep spawn. Bounded so argv stays far below
- * ARG_MAX even with long paths, like the xargs batching it replaces. */
-#define MCP_ARGV_SCAN_GREP_CHUNK 256
-
-/* The unscoped (unindexed or not-fully-indexed root) search_code scan as three
- * argv stages, with no shell anywhere: find writes the NUL-delimited candidate
- * list, LC_ALL=C sort orders it in place, and grep scans it in chunks. Search
- * scopes, file patterns and the pattern file now reach the tools as plain
- * arguments instead of shell-string interpolations (#2634). Exit codes keep
- * the old pipeline's contract: find/sort failures fail closed, grep's exit 1
- * is an ordinary no-match, and an empty list is a successful empty scan. */
+/* The unscoped (unindexed or not-fully-indexed root) search_code scan with no
+ * shell anywhere: find writes the NUL-delimited candidate list and LC_ALL=C
+ * sort orders it in place, both as argv stages, then the list feeds the
+ * in-process scanner (search_scan_in_process). Search scopes and file patterns
+ * reach find as plain arguments instead of shell-string interpolations (#2634).
+ * find/sort failures fail closed, and an empty list is a successful empty
+ * scan. */
 static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use_regex,
                                                  const char *file_pattern,
-                                                 const char *pattern_file, const char *filelist,
+                                                 const char *pattern, const char *filelist,
                                                  const char *root_path,
                                                  char output_path[CBM_SZ_2K], size_t output_limit,
                                                  uint64_t deadline_ms, bool deadline_latched,
@@ -18418,140 +18415,18 @@ static mcp_scan_cause_t mcp_run_search_scan_argv(cbm_mcp_server_t *srv, bool use
         output_path[0] = '\0';
         return MCP_SCAN_COMMAND_FAILURE;
     }
-    FILE *list = cbm_fopen(filelist, "rb");
-    if (!list) {
-        (void)fclose(out);
-        (void)cbm_unlink(output_path);
-        output_path[0] = '\0';
-        return MCP_SCAN_COMMAND_FAILURE;
+    /* The sorted, NUL-separated file list feeds the same in-process scanner an
+     * indexed project uses, so matching has one implementation. */
+    mcp_scan_cause_t scan_cause = search_scan_in_process(srv, filelist, pattern, use_regex, out,
+                                                         output_limit, deadline_ms);
+    if (fclose(out) != 0 && scan_cause == MCP_SCAN_SUCCESS) {
+        scan_cause = MCP_SCAN_COMMAND_FAILURE;
     }
-
-    const char *grep_flag = use_regex ? "-E" : "-F";
-    const char **chunk_argv =
-        malloc(((size_t)MCP_ARGV_SCAN_GREP_CHUNK + 7) * sizeof(*chunk_argv));
-    char **chunk_paths = malloc((size_t)MCP_ARGV_SCAN_GREP_CHUNK * sizeof(*chunk_paths));
-    char *pathbuf = malloc(CBM_SZ_4K);
-    if (!chunk_argv || !chunk_paths || !pathbuf) {
-        free(chunk_argv);
-        free(chunk_paths);
-        free(pathbuf);
-        (void)fclose(list);
-        (void)fclose(out);
-        (void)cbm_unlink(output_path);
-        output_path[0] = '\0';
-        return MCP_SCAN_COMMAND_FAILURE;
-    }
-    size_t pathcap = CBM_SZ_4K;
-    size_t pathlen = 0;
-    uint64_t output_bytes = 0;
-    size_t seq = 0;
-    cause = MCP_SCAN_SUCCESS;
-    bool io_error = false;
-    while (cause == MCP_SCAN_SUCCESS) {
-        size_t n = 0;
-        while (n < MCP_ARGV_SCAN_GREP_CHUNK) {
-            int c = fgetc(list);
-            if (c == EOF) {
-                if (ferror(list)) {
-                    io_error = true;
-                }
-                break;
-            }
-            if (c == '\0') {
-                if (pathlen > 0) {
-                    pathbuf[pathlen] = '\0';
-                    chunk_paths[n] = cbm_strdup(pathbuf);
-                    if (!chunk_paths[n]) {
-                        io_error = true;
-                        break;
-                    }
-                    n++;
-                    pathlen = 0;
-                }
-                continue;
-            }
-            if (pathlen + 1 >= pathcap) {
-                size_t newcap = pathcap * 2;
-                char *grown = realloc(pathbuf, newcap);
-                if (!grown) {
-                    io_error = true;
-                    break;
-                }
-                pathbuf = grown;
-                pathcap = newcap;
-            }
-            pathbuf[pathlen++] = (char)c;
-        }
-        if (io_error || n == 0) {
-            for (size_t i = 0; i < n; i++) {
-                free(chunk_paths[i]);
-            }
-            break;
-        }
-
-        char chunk_path[CBM_SZ_2K];
-        int written = snprintf(chunk_path, sizeof(chunk_path), "%s.grep%zu", output_path, seq++);
-        if (written <= 0 || (size_t)written >= sizeof(chunk_path)) {
-            io_error = true;
-        } else {
-            chunk_argv[0] = "grep";
-            chunk_argv[1] = "-Hn";
-            chunk_argv[2] = grep_flag;
-            chunk_argv[3] = "-f";
-            chunk_argv[4] = pattern_file;
-            chunk_argv[5] = "--";
-            for (size_t i = 0; i < n; i++) {
-                chunk_argv[6 + i] = chunk_paths[i];
-            }
-            chunk_argv[6 + n] = NULL;
-            cause = mcp_run_argv_stage_cancellable_bounded(
-                srv, "grep", chunk_argv, NULL, chunk_path, output_bytes, output_limit,
-                deadline_ms, true, true, &cancellation_latched, &deadline_latched,
-                &output_limit_latched, result_out);
-            if (cause == MCP_SCAN_SUCCESS) {
-                FILE *chunk = cbm_fopen(chunk_path, "rb");
-                if (!chunk) {
-                    cause = MCP_SCAN_COMMAND_FAILURE;
-                } else {
-                    char copybuf[CBM_SZ_16K];
-                    size_t got;
-                    while ((got = fread(copybuf, 1, sizeof(copybuf), chunk)) > 0) {
-                        if (fwrite(copybuf, 1, got, out) != got) {
-                            cause = MCP_SCAN_COMMAND_FAILURE;
-                            break;
-                        }
-                        output_bytes += got;
-                    }
-                    if (ferror(chunk) && cause == MCP_SCAN_SUCCESS) {
-                        cause = MCP_SCAN_COMMAND_FAILURE;
-                    }
-                    (void)fclose(chunk);
-                }
-            }
-            (void)cbm_unlink(chunk_path);
-        }
-        for (size_t i = 0; i < n; i++) {
-            free(chunk_paths[i]);
-        }
-    }
-    free(chunk_argv);
-    free(chunk_paths);
-    free(pathbuf);
-    (void)fclose(list);
-    if (fclose(out) != 0 && cause == MCP_SCAN_SUCCESS) {
-        cause = MCP_SCAN_COMMAND_FAILURE;
-    }
-    if (io_error && cause == MCP_SCAN_SUCCESS) {
-        cause = MCP_SCAN_COMMAND_FAILURE;
-    }
-    if (cause == MCP_SCAN_SUCCESS && output_limit > 0 && output_bytes > output_limit) {
-        cause = MCP_SCAN_OUTPUT_LIMIT;
-    }
-    if (cause != MCP_SCAN_SUCCESS) {
+    if (scan_cause != MCP_SCAN_SUCCESS) {
         (void)cbm_unlink(output_path);
         output_path[0] = '\0';
     }
-    return cause;
+    return scan_cause;
 }
 #endif
 
