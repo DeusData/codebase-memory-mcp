@@ -5,6 +5,7 @@
 #include "resolve/snapshot.h"
 #include "store/store_resolver.h"
 #include "store/store_resolver_evidence.h"
+#include "foundation/compat.h"
 #include "foundation/log.h"
 #include <sqlite3.h>
 #include <stdio.h>
