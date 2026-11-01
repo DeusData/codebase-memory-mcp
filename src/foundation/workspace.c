@@ -392,8 +392,18 @@ enum { WS_LINE_MAX = 4096 };
 /* A line may carry a leading '!' meaning "a person explicitly approved this
  * sensitive root". The marker is stored rather than inferred so re-classifying
  * later (a new credential name is added to the list, say) cannot silently
- * upgrade an ordinary grant into a sensitive one. */
+ * upgrade an ordinary grant into a sensitive one. A leading '^' is the same
+ * kind of record for a root refused as too broad (allow-root --approve-broad).
+ * Neither character can begin a canonical absolute path, so a marked line can
+ * never be misread as an ordinary grant. */
 static const char WS_SENSITIVE_MARK = '!';
+static const char WS_BROAD_MARK = '^';
+
+typedef enum {
+    WS_GRANT_ORDINARY = 0,
+    WS_GRANT_SENSITIVE, /* explicit approval of a CBM_WS_DENY_SENSITIVE root */
+    WS_GRANT_BROAD,     /* explicit approval of a CBM_WS_DENY_TOO_SHALLOW root */
+} ws_grant_kind_t;
 
 bool cbm_workspace_grant_path(const char *cache_dir, char *out, size_t out_sz) {
     if (!cache_dir || !cache_dir[0] || !out || out_sz == 0) {
@@ -406,7 +416,8 @@ bool cbm_workspace_grant_path(const char *cache_dir, char *out, size_t out_sz) {
 /* Walk the grant file, invoking visit for each entry. visit returns true to stop.
  * Returns the number of entries seen. */
 static int ws_grant_walk(const char *cache_dir,
-                         bool (*visit)(const char *root, bool sensitive, void *ctx), void *ctx) {
+                         bool (*visit)(const char *root, ws_grant_kind_t kind, void *ctx),
+                         void *ctx) {
     char store[WS_LINE_MAX];
     if (!cbm_workspace_grant_path(cache_dir, store, sizeof(store))) {
         return 0;
@@ -425,13 +436,18 @@ static int ws_grant_walk(const char *cache_dir,
         if (len == 0 || line[0] == '#') {
             continue;
         }
-        bool sensitive = line[0] == WS_SENSITIVE_MARK;
-        const char *root = sensitive ? line + 1 : line;
+        ws_grant_kind_t kind = WS_GRANT_ORDINARY;
+        if (line[0] == WS_SENSITIVE_MARK) {
+            kind = WS_GRANT_SENSITIVE;
+        } else if (line[0] == WS_BROAD_MARK) {
+            kind = WS_GRANT_BROAD;
+        }
+        const char *root = kind == WS_GRANT_ORDINARY ? line : line + 1;
         if (!root[0]) {
             continue;
         }
         seen++;
-        if (visit && visit(root, sensitive, ctx)) {
+        if (visit && visit(root, kind, ctx)) {
             break;
         }
     }
@@ -443,14 +459,21 @@ typedef struct {
     const char *candidate;
     bool contained;       /* candidate is at or below some granted root */
     bool exact_sensitive; /* candidate is itself a grant marked sensitive */
+    bool exact_broad;     /* candidate is itself a grant marked broad */
 } ws_match_t;
 
-static bool ws_match_visit(const char *root, bool sensitive, void *ctx) {
+static bool ws_match_visit(const char *root, ws_grant_kind_t kind, void *ctx) {
     ws_match_t *m = ctx;
     if (cbm_path_within_root(root, m->candidate)) {
         m->contained = true;
-        if (sensitive && ws_paths_equal(root, m->candidate)) {
-            m->exact_sensitive = true;
+        /* Exact equality, never a prefix: an approval names one root, and must
+         * not quietly cover every root below it. */
+        if (kind != WS_GRANT_ORDINARY && ws_paths_equal(root, m->candidate)) {
+            if (kind == WS_GRANT_SENSITIVE) {
+                m->exact_sensitive = true;
+            } else {
+                m->exact_broad = true;
+            }
         }
     }
     return false; /* visit every entry: a later one may be the exact match */
@@ -462,10 +485,15 @@ typedef struct {
     size_t used;
 } ws_list_t;
 
-static bool ws_list_visit(const char *root, bool sensitive, void *ctx) {
+static bool ws_list_visit(const char *root, ws_grant_kind_t kind, void *ctx) {
     ws_list_t *l = ctx;
-    int n = snprintf(l->out + l->used, l->out_sz - l->used, "%s%s\n",
-                     sensitive ? "(approved) " : "", root);
+    const char *label = "";
+    if (kind == WS_GRANT_SENSITIVE) {
+        label = "(approved) ";
+    } else if (kind == WS_GRANT_BROAD) {
+        label = "(approved broad) ";
+    }
+    int n = snprintf(l->out + l->used, l->out_sz - l->used, "%s%s\n", label, root);
     if (n > 0 && (size_t)n < l->out_sz - l->used) {
         l->used += (size_t)n;
     }
@@ -481,9 +509,49 @@ bool cbm_workspace_grant_list(const char *cache_dir, char *out, size_t out_sz) {
     return ws_grant_walk(cache_dir, ws_list_visit, &l) > 0;
 }
 
+/* The allow-root flag that records an explicit approval for a refused verdict,
+ * or NULL when nothing can lift it (absolute denials). */
+static const char *ws_verdict_approval_flag(cbm_ws_verdict_t verdict) {
+    if (verdict == CBM_WS_DENY_TOO_SHALLOW) {
+        return "--approve-broad";
+    }
+    if (cbm_workspace_verdict_is_overridable(verdict)) {
+        return "--approve-sensitive";
+    }
+    return NULL;
+}
+
+/* True when a refused verdict carries the explicit approval that lifts it. Each
+ * flag lifts only its own verdict: --approve-sensitive never widens breadth and
+ * --approve-broad never widens sensitivity; absolute denials lift for neither.
+ * Refuses by default and names the flag, rather than asking a question whose
+ * answer we cannot authenticate. */
+static bool ws_grant_verdict_approved(cbm_ws_verdict_t verdict, bool approve_sensitive,
+                                      bool approve_broad, char *err, size_t err_sz) {
+    bool approved = false;
+    if (verdict == CBM_WS_DENY_TOO_SHALLOW) {
+        approved = approve_broad;
+    } else if (cbm_workspace_verdict_is_overridable(verdict)) {
+        approved = approve_sensitive;
+    }
+    if (approved) {
+        return true;
+    }
+    if (err) {
+        const char *flag = ws_verdict_approval_flag(verdict);
+        if (flag) {
+            snprintf(err, err_sz, "%s; re-run with %s if that is intended",
+                     cbm_workspace_verdict_reason(verdict), flag);
+        } else {
+            snprintf(err, err_sz, "%s", cbm_workspace_verdict_reason(verdict));
+        }
+    }
+    return false;
+}
+
 bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
-                             const char *canonical_path, bool approve_sensitive, char *err,
-                             size_t err_sz) {
+                             const char *canonical_path, bool approve_sensitive, bool approve_broad,
+                             char *err, size_t err_sz) {
     if (err && err_sz) {
         err[0] = '\0';
     }
@@ -495,33 +563,22 @@ bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
     }
 
     cbm_ws_verdict_t verdict = cbm_workspace_classify_root(canonical_path, home_dir, cache_dir);
-    if (verdict != CBM_WS_ALLOW) {
-        if (!cbm_workspace_verdict_is_overridable(verdict)) {
-            if (err) {
-                snprintf(err, err_sz, "%s", cbm_workspace_verdict_reason(verdict));
-            }
-            return false;
-        }
-        if (!approve_sensitive) {
-            /* Refuse by default and name the flag, rather than asking a question
-             * whose answer we cannot authenticate. */
-            if (err) {
-                snprintf(err, err_sz, "%s; re-run with --approve-sensitive if that is intended",
-                         cbm_workspace_verdict_reason(verdict));
-            }
-            return false;
-        }
+    if (verdict != CBM_WS_ALLOW &&
+        !ws_grant_verdict_approved(verdict, approve_sensitive, approve_broad, err, err_sz)) {
+        return false;
     }
 
     bool sensitive = verdict == CBM_WS_DENY_SENSITIVE;
+    bool broad = verdict == CBM_WS_DENY_TOO_SHALLOW;
 
-    /* Already present is success, not a duplicate error. A sensitive approval
+    /* Already present is success, not a duplicate error. An explicit approval
      * is narrower: an old ordinary grant (or an ordinary ancestor) establishes
      * containment, but does not record the exact human-approved exception that
      * cbm_workspace_root_allowed requires. Append that exact marked entry once. */
-    ws_match_t existing = {canonical_path, false, false};
+    ws_match_t existing = {canonical_path, false, false, false};
     (void)ws_grant_walk(cache_dir, ws_match_visit, &existing);
-    if (existing.contained && (!sensitive || existing.exact_sensitive)) {
+    if (existing.contained && (!sensitive || existing.exact_sensitive) &&
+        (!broad || existing.exact_broad)) {
         return true;
     }
 
@@ -539,7 +596,13 @@ bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
         }
         return false;
     }
-    (void)fprintf(f, "%s%s\n", sensitive ? "!" : "", canonical_path);
+    char mark[2] = {'\0', '\0'};
+    if (sensitive) {
+        mark[0] = WS_SENSITIVE_MARK;
+    } else if (broad) {
+        mark[0] = WS_BROAD_MARK;
+    }
+    (void)fprintf(f, "%s%s\n", mark, canonical_path);
     bool ok = fclose(f) == 0;
     if (!ok && err) {
         snprintf(err, err_sz, "cannot write %s", store);
@@ -560,7 +623,7 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
         return false;
     }
 
-    ws_match_t match = {canonical_path, false, false};
+    ws_match_t match = {canonical_path, false, false, false};
     int grants = ws_grant_walk(cache_dir, ws_match_visit, &match);
 
     /* A configured root behaves as an additional grant so existing
@@ -605,17 +668,23 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
         return true;
     }
     /* An explicit human approval recorded for exactly this path is the only thing
-     * that lifts a sensitive refusal. Absolute and shallow refusals cannot be
-     * lifted at all. */
+     * that lifts a sensitive or a too-broad refusal, each by its own marker: a
+     * broad approval says "index this whole tree on purpose", which is not a
+     * statement about credentials, and the reverse. Exact match, never a prefix,
+     * so one broad approval cannot cover every root below it — the "/Users"-style
+     * breadth the depth rule exists to catch. Absolute refusals cannot be lifted. */
     if (verdict == CBM_WS_DENY_SENSITIVE && match.exact_sensitive) {
         return true;
     }
+    if (verdict == CBM_WS_DENY_TOO_SHALLOW && match.exact_broad) {
+        return true;
+    }
     if (err) {
-        if (cbm_workspace_verdict_is_overridable(verdict)) {
+        const char *flag = ws_verdict_approval_flag(verdict);
+        if (flag) {
             snprintf(err, err_sz,
-                     "%s: %s. To index it anyway, run: codebase-memory-mcp allow-root "
-                     "--approve-sensitive %s",
-                     canonical_path, cbm_workspace_verdict_reason(verdict), canonical_path);
+                     "%s: %s. To index it anyway, run: codebase-memory-mcp allow-root %s %s",
+                     canonical_path, cbm_workspace_verdict_reason(verdict), flag, canonical_path);
         } else {
             snprintf(err, err_sz, "%s: %s", canonical_path, cbm_workspace_verdict_reason(verdict));
         }

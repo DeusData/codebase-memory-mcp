@@ -33,6 +33,14 @@ typedef struct {
     const char **import_module_qns;
     int import_count;
 
+    // Renamed named imports (`import { foo as bar }`): local binding -> the name
+    // the module exports. Parallel arrays of length import_alias_count; a
+    // binding absent here is exported under its local name.
+    const char **import_alias_locals;
+    const char **import_alias_exports;
+    int import_alias_count;
+    size_t import_alias_capacity;
+
     // File / surrounding context.
     const char *module_qn;          // QN of this file's module
     const char *enclosing_func_qn;  // current function being walked, NULL at module scope
@@ -72,6 +80,11 @@ typedef struct {
 // for the calling thread, valid after a cbm_run_ts_lsp on the same thread.
 long cbm_ts_lsp_test_budget_remaining(void);
 bool cbm_ts_lsp_test_budget_warned(void);
+// Registry entries/probes visited by the two AST signature passes in the last run.
+unsigned long cbm_ts_lsp_test_signature_lookup_work(void);
+// Inspect signature-index selection and checked walker addition without huge ASTs.
+int cbm_ts_lsp_test_signature_func_index(CBMTypeRegistry *reg, const char *qn);
+int cbm_ts_lsp_test_walk_pending_count(int top, uint32_t count);
 // Maximum recursive calls in one member/method lookup during the last TS LSP run,
 // including attempts rejected by the depth or visited-type guard.
 int cbm_ts_lsp_test_max_member_lookup_steps(void);

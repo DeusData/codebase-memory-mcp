@@ -275,6 +275,31 @@ if proc.returncode != 0 or got != ["internal/cbm/grammar_go.c",
                                    "vendored/sqlite3/sqlite3.c"]:
     failures.append(f"codeql (c): the retrace helper must list the translation units for "
                     f"changed vendored code and wrappers, got {got} (exit {proc.returncode})")
+# Native Windows Python emits CRLF even when the change list uses LF. Pin
+# that producer/consumer boundary on every platform, including direct wrapper
+# paths that must survive verbatim rather than being mapped to a family name.
+crlf_root = work / "crlf-selector"
+crlf_scripts = crlf_root / "scripts" / "ci"
+crlf_scripts.mkdir(parents=True)
+(crlf_scripts / retrace.name).write_bytes(retrace.read_bytes())
+expected_retrace = ["internal/cbm/grammar_go.c", "internal/cbm/grammar_json.c",
+                    "internal/cbm/ts_runtime.c", "vendored/sqlite3/sqlite3.c"]
+for path in expected_retrace:
+    fixture = crlf_root / path
+    fixture.parent.mkdir(parents=True, exist_ok=True)
+    fixture.touch()
+(crlf_scripts / "select-lanes.sh").write_bytes(
+    b"#!/usr/bin/env bash\nprintf '%s\\r\\n' "
+    b"internal/cbm/vendored/grammars/go/parser.c internal/cbm/grammar_json.c "
+    b"internal/cbm/ts_runtime.c vendored/sqlite3/sqlite3.c\n")
+proc = subprocess.run([bash, str(crlf_scripts / retrace.name),
+                       "--changed", str(changed), str(listed)],
+                      capture_output=True, text=True, env=env)
+got = listed.read_bytes() if listed.exists() else None
+if proc.returncode != 0 or got != ("\n".join(expected_retrace) + "\n").encode("utf-8"):
+    failures.append(f"codeql CRLF: the retrace helper must preserve every changed "
+                    f"wrapper and write LF entrypoints, got {got!r} (exit {proc.returncode})")
+
 for label, args in (("an unreadable change list", ["--changed", str(work / "missing.txt")]),
                     ("no pull request", [])):
     listed.write_text("stale\n", encoding="utf-8")
