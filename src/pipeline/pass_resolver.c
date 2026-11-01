@@ -330,8 +330,8 @@ static bool ecma_type_only_label(const char *label) {
 
 /* TypeScript facts about two same-QN declarations of one file. Returns true when
  * they are one declared entity, which then needs no ambiguity verdict. */
-static bool ecma_merge_target(target_proof_t *prior, const CBMDefinition *definition,
-                              const char *file) {
+static bool ecma_merge_target(CBMArena *arena, target_proof_t *prior,
+                              const CBMDefinition *definition, const char *file) {
     if (strcmp(prior->file, file))
         return false;
     bool same_label = !strcmp(prior->label, definition->label);
@@ -348,7 +348,7 @@ static bool ecma_merge_target(target_proof_t *prior, const CBMDefinition *defini
     }
     if (!same_label && !prior->merged_label &&
         ecma_type_only_label(prior->label) != ecma_type_only_label(definition->label)) {
-        prior->merged_label = definition->label;
+        prior->merged_label = cbm_arena_strdup(arena, definition->label);
         prior->merged_start_line = definition->start_line;
         prior->merged_end_line = definition->end_line;
         return true;
@@ -399,7 +399,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     if (prior) {
         if ((language == CBM_LANG_TYPESCRIPT || language == CBM_LANG_TSX ||
              language == CBM_LANG_ARKTS) &&
-            ecma_merge_target(prior, definition, file))
+            ecma_merge_target(&resolver->arena, prior, definition, file))
             return true;
         bool same_file = !strcmp(prior->file, file);
         bool same_owner = same_file && !strcmp(prior->label, definition->label);

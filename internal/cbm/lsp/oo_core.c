@@ -211,22 +211,38 @@ static char oo_def_class(const char *label) {
     return cbm_label_is_type_like(label) ? 'T' : 'F';
 }
 
+/* A spilled result goes back to the store as soon as its file is harvested, so a qualified
+ * name the index keeps is copied into the index. A definition found here is valid only
+ * during the harvest. */
 bool oo_defs_init(oo_defs_t *defs, CBMArena *arena, const CBMFileResult *file) {
-    defs->arena = arena;
+    cbm_arena_init(&defs->scratch);
     defs->by_line = cbm_ht_create((uint32_t)file->defs.count + 8);
-    if (!defs->by_line)
+    if (!defs->by_line) {
+        oo_defs_free(defs);
         return false;
+    }
     for (int i = 0; i < file->defs.count; i++) {
         const CBMDefinition *def = &file->defs.items[i];
         if (!def->name || !def->qualified_name)
             continue;
-        const char *key = cbm_arena_sprintf(arena, "%c%u:%s", oo_def_class(def->label),
+        const char *key = cbm_arena_sprintf(&defs->scratch, "%c%u:%s", oo_def_class(def->label),
                                             def->start_line, def->name);
-        if (!key)
+        if (!key) {
+            oo_defs_free(defs);
             return false;
+        }
         /* First writer wins: overloads on one line share a qualified name. */
-        if (!cbm_ht_get(defs->by_line, key))
-            cbm_ht_set(defs->by_line, key, (void *)def);
+        if (cbm_ht_get(defs->by_line, key))
+            continue;
+        CBMDefinition *copy = cbm_arena_alloc(&defs->scratch, sizeof(*copy));
+        const char *qualified_name = cbm_arena_strdup(arena, def->qualified_name);
+        if (!copy || !qualified_name) {
+            oo_defs_free(defs);
+            return false;
+        }
+        *copy = *def;
+        copy->qualified_name = qualified_name;
+        cbm_ht_set(defs->by_line, key, copy);
     }
     return true;
 }
@@ -234,6 +250,7 @@ bool oo_defs_init(oo_defs_t *defs, CBMArena *arena, const CBMFileResult *file) {
 void oo_defs_free(oo_defs_t *defs) {
     cbm_ht_free(defs->by_line);
     defs->by_line = NULL;
+    cbm_arena_destroy(&defs->scratch);
 }
 
 const CBMDefinition *oo_defs_find(const oo_defs_t *defs, char kind, uint32_t line,

@@ -297,7 +297,7 @@ const oo_callable_t *oo_lookup_ext_static(const cbm_oo_index_t *ix, const char *
 /* Per-file definition lookup while harvesting: extraction's exact node names. */
 typedef struct {
     CBMHashTable *by_line;
-    CBMArena *arena;
+    CBMArena scratch; /* the table's keys and definition copies, gone with the harvest */
 } oo_defs_t;
 bool oo_defs_init(oo_defs_t *defs, CBMArena *arena, const CBMFileResult *file);
 void oo_defs_free(oo_defs_t *defs);

@@ -10,6 +10,7 @@
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 #include "sqlite3.h"
+#include "resolver_quality.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -893,7 +894,70 @@ TEST(resolver_oo_rust_context_failure_keeps_java_imports) {
     PASS();
 }
 
+/* Over the memory budget every result is parked on disk and read back only for a moment.
+ * The declaration index outlives each read, so it must own the names it keeps: it held
+ * pointers into the freed result, and a resolve worker read them. */
+TEST(resolver_oo_declaration_index_outlives_a_spilled_result) {
+    char root[256];
+    snprintf(root, sizeof(root), "/tmp/cbm_oo_spill_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char repo[512], database[512];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    bool ok = cbm_mkdir_p(repo, 0755) == true;
+    static const RQ_Source sources[] = {
+        {.path = "app/Store.java",
+         .text = "package app;\nclass Store {\n  static int count;\n  int read() { return count; }\n}\n"},
+        {.path = "app/Use.java",
+         .text = "package app;\nclass Use {\n  int run(Store store) { return store.read(); }\n}\n"}};
+    for (size_t i = 0; ok && i < sizeof(sources) / sizeof(sources[0]); i++)
+        ok = th_write_file(TH_PATH(repo, sources[i].path), sources[i].text) == 0;
+    for (int i = 0; ok && i < 55; i++) {
+        char path[40];
+        snprintf(path, sizeof(path), "SpillPadding%02d.java", i);
+        ok = th_write_file(TH_PATH(repo, path), "// unrelated source file\n") == 0;
+    }
+    static const RQ_Expected expected[] = {
+        {.case_id = "spilled-member-call",
+         .site = {.file = "app/Use.java", .caller = "app.Use.run", .needle = "store.read()"},
+         .relation = "CALLS",
+         .target = {.file = "app/Store.java",
+                    .suffix = "app.Store.read",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "  int read() { return count; }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "spilled-static-field",
+         .site = {.file = "app/Store.java", .caller = "app.Store.read", .needle = "count", .occurrence_index = 1},
+         .relation = "USAGE",
+         .target = {.file = "app/Store.java",
+                    .suffix = "app.Store.count",
+                    .label = "Field",
+                    .declaration_line = 3,
+                    .declaration_text = "  static int count;"},
+         .mode = RQ_REQUIRED}};
+    cbm_setenv("CBM_MEM_SPILL", "1", 1);
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(repo, database, CBM_MODE_FULL) : NULL;
+    ok = pipeline && cbm_pipeline_set_project_name(pipeline, "oo-spill") &&
+         cbm_pipeline_run(pipeline) == 0;
+    cbm_pipeline_free(pipeline);
+    cbm_unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_MEM_SPILL");
+    cbm_store_t *store = ok ? cbm_store_open_path_existing(database) : NULL;
+    RQ_Report report = {0};
+    ok = store && rq_check(store, "oo-spill", "oo-spill", sources, 2, expected, 2, NULL, 0, &report,
+                           stderr);
+    if (store)
+        cbm_store_close(store);
+    th_cleanup(root);
+    ASSERT(ok);
+    ASSERT_EQ(report.found, 2);
+    PASS();
+}
+
 SUITE(resolver_oo) {
+    RUN_TEST(resolver_oo_declaration_index_outlives_a_spilled_result);
     RUN_TEST(resolver_oo_java_static_selection);
     RUN_TEST(resolver_oo_java_static_selection_parallel);
     RUN_TEST(resolver_oo_kotlin_static_selection);
