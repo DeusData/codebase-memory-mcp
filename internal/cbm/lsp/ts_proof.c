@@ -439,7 +439,8 @@ static const char *declared_field_type(TSLSPContext *ctx, TSNode owner, const ch
             if (found)
                 return NULL;
             found = annotated_type_name(ctx, member);
-            if (!found) {
+            /* An annotation wins even when it names no class: `x: unknown = new A()`. */
+            if (!found && ts_node_is_null(field(member, "type"))) {
                 TSNode value = field(member, "value");
                 TSNode constructor = field(value, "constructor");
                 if (kind(value, "new_expression") && kind(constructor, "identifier"))
