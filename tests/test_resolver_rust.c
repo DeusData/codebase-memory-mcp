@@ -1532,6 +1532,33 @@ TEST(resolver_rust_anyhow_context_keeps_the_success_type) {
     PASS();
 }
 
+/* `index: &Index` used to record one span around `&Index`, which proved nothing and was
+ * withheld, and `Option<Foo>` recorded only Option. Each named type is its own use. */
+TEST(resolver_rust_every_named_type_in_a_signature_is_a_use) {
+    static const rust_proof_file_t files[] = {
+        {"src/main.rs",
+         "pub struct A;\npub struct B;\npub struct C;\npub struct D;\n"
+         "fn wrapped(a: &A, b: Option<B>) -> Result<Vec<C>, String> { todo!() }\n"
+         "fn local() { let held: Vec<D> = Vec::new(); drop(held); }\n"
+         "fn bound(it: impl Iterator<Item = A>) { drop(it); }\n"
+         "fn generic<B>(value: B) { drop(value); }\n"
+         "fn main() {}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.A"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.B"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.wrapped", "src.main.C"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.local", "src.main.D"), 1);
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.bound", "src.main.A"), 1);
+        /* `Item` names a member of the trait; it is no use of a type in scope. */
+        ASSERT_EQ(rust_occurrences_like(store, "USES_TYPE", "Item"), 0);
+        /* The parameter hides the struct of the same name. */
+        ASSERT_EQ(rust_edge(store, "USES_TYPE", "src.main.generic", "src.main.B"), 0);
+        ASSERT_EQ(rust_occurrences_like(store, "USES_TYPE", "%&%"), 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
     RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
@@ -1559,6 +1586,7 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator);
     RUN_TEST(resolver_rust_deferred_let_takes_its_type_from_the_assignment);
     RUN_TEST(resolver_rust_anyhow_context_keeps_the_success_type);
+    RUN_TEST(resolver_rust_every_named_type_in_a_signature_is_a_use);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
