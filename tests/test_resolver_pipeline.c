@@ -784,7 +784,17 @@ TEST(resolver_pipeline_file_lookup_proofs_have_no_work_budget) {
     PASS();
 }
 
-static int rust_source_emits(const char *source, const char *target_name) {
+static int reason_rows(const cbm_gbuf_t *graph, const char *reason) {
+    size_t count = 0;
+    const cbm_resolve_record_t *records = cbm_gbuf_resolutions(graph, &count);
+    int matched = 0;
+    for (size_t r = 0; r < count; r++)
+        matched += records[r].result.reason && !strcmp(records[r].result.reason, reason);
+    return matched;
+}
+
+/* Emitted CALLS to target_name, or with reason set, the rows carrying that reason. */
+static int rust_source_count(const char *source, const char *target_name, const char *reason) {
     CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_RUST, "proj",
                                              "lib.rs", 0, NULL, NULL);
     cbm_gbuf_t *graph = cbm_gbuf_new("proj", "/tmp");
@@ -807,7 +817,7 @@ static int rust_source_emits(const char *source, const char *target_name) {
                                      .module_qn = result->module_qn,
                                      .language = CBM_LANG_RUST};
         if (shared && cbm_shared_resolver_file(shared, &input))
-            emitted = emitted_target(graph, "CALLS", target);
+            emitted = reason ? reason_rows(graph, reason) : emitted_target(graph, "CALLS", target);
         cbm_shared_resolver_free(shared);
     }
     cbm_registry_free(registry);
@@ -816,10 +826,15 @@ static int rust_source_emits(const char *source, const char *target_name) {
         cbm_free_result(result);
     return emitted;
 }
+static int rust_source_emits(const char *source, const char *target_name) {
+    return rust_source_count(source, target_name, NULL);
+}
 
 /* Two `impl From<_> for Error` both declare Error.from: one QN, so one graph node, whose edges
  * are the union of every variant's body. meilisearch alone has hundreds of these, and every
- * call inside them was void as source_declaration_identity_conflict. */
+ * call inside them was void as source_declaration_identity_conflict. The Rust adapter decides
+ * these sites itself, so this pins the identity. Emission through it is pinned for Java in
+ * resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not. */
 TEST(resolver_pipeline_same_kind_declarations_sharing_a_qn_are_one_source) {
     const char *source = "struct Error;\nstruct A;\nstruct B;\n"
                          "fn helper() -> i32 { 1 }\n"
@@ -829,7 +844,7 @@ TEST(resolver_pipeline_same_kind_declarations_sharing_a_qn_are_one_source) {
                          "impl From<B> for Error {\n"
                          "    fn from(b: B) -> Error { helper(); Error }\n"
                          "}\n";
-    ASSERT_EQ(rust_source_emits(source, "helper"), 2);
+    ASSERT_EQ(rust_source_count(source, "helper", "source_declaration_identity_conflict"), 0);
     PASS();
 }
 
@@ -846,8 +861,9 @@ TEST(resolver_pipeline_different_kinds_sharing_a_qn_stay_a_conflict) {
 /* USES_TYPE scopes were file + bare function name, which no node carries for a method's class
  * or a Go package, so every signature type in those reported source_not_materialized. */
 TEST(resolver_pipeline_signature_type_refs_name_the_declaring_scope) {
-    const char *go = "package lib\n\ntype T struct{}\n\n"
-                     "func Make(t T) T { return t }\n\nfunc (t T) Same(o T) T { return o }\n";
+    const char *go = "package lib\n\ntype Thing struct{}\n\n"
+                     "func Make(t Thing) Thing { return t }\n\n"
+                     "func (t Thing) Same(o Thing) Thing { return o }\n";
     CBMFileResult *result = cbm_extract_file(go, (int)strlen(go), CBM_LANG_GO, "proj", "lib/lib.go",
                                              0, NULL, NULL);
     ASSERT_NOT_NULL(result);
@@ -855,15 +871,15 @@ TEST(resolver_pipeline_signature_type_refs_name_the_declaring_scope) {
     for (int i = 0; i < result->type_refs.count; i++) {
         const char *scope = result->type_refs.items[i].enclosing_func_qn;
         make += scope && !strcmp(scope, "proj.lib.Make");
-        same += scope && !strcmp(scope, "proj.lib.T.Same");
+        same += scope && !strcmp(scope, "proj.lib.Thing.Same");
         wrong += scope && strstr(scope, "lib.lib") != NULL;
     }
     cbm_free_result(result);
     ASSERT_GT(make, 0);
     ASSERT_GT(same, 0);
     ASSERT_EQ(wrong, 0);
-    const char *ts = "interface T { x: number }\n"
-                     "class Service {\n  run(t: T): T { return t; }\n}\n";
+    const char *ts = "interface Thing { x: number }\n"
+                     "class Service {\n  run(t: Thing): Thing { return t; }\n}\n";
     result = cbm_extract_file(ts, (int)strlen(ts), CBM_LANG_TYPESCRIPT, "proj", "app.ts", 0, NULL,
                               NULL);
     ASSERT_NOT_NULL(result);

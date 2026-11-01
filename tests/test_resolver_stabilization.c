@@ -1016,6 +1016,43 @@ TEST(resolver_stabilization_go_bare_result_types_declare_no_local) {
     PASS();
 }
 
+/* kubectl: o.Builder().WithScheme(). The static type of calling a function value is its declared
+ * result, whether the value is a field, a parameter or a closure. Several results have no single
+ * type, and what comes out of a container or a dereference stays unknown. */
+TEST(resolver_stabilization_go_function_values_yield_their_declared_result) {
+    const char *source = GO_TWO_TYPES
+        "type Opts struct {\n"
+        "  Make func() *A\n  Named func() (out B)\n  Many func() (A, error)\n  Plain func()\n"
+        "}\n"
+        "type Holder struct{ Opts }\n"
+        "var pointer *func() *A\n"
+        "func F(o Opts, h Holder, fn func() *A, many func() (A, error), fs []func() *A) {\n"
+        "  o.Make().M(/*field*/)\n"
+        "  o.Named().M(/*named-result*/)\n"
+        "  o.Many().M(/*several*/)\n"
+        "  h.Make().M(/*promoted*/)\n"
+        "  fn().M(/*parameter*/)\n"
+        "  x := fn()\n"
+        "  x.M(/*stored*/)\n"
+        "  many().M(/*several-parameter*/)\n"
+        "  l := func() B { return B{} }\n"
+        "  l().M(/*closure*/)\n"
+        "  fs[0]().M(/*from-slice*/)\n"
+        "  (*pointer)().M(/*dereference*/)\n"
+        "}\n";
+    ASSERT(go_selects(source, "test.api.F", "o.Make().M(/*field*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "o.Named().M(/*named-result*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "o.Many().M(/*several*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "h.Make().M(/*promoted*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "fn().M(/*parameter*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "x.M(/*stored*/", "test.api.A.M"));
+    ASSERT(go_selects(source, "test.api.F", "many().M(/*several-parameter*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "l().M(/*closure*/", "test.api.B.M"));
+    ASSERT(go_selects(source, "test.api.F", "fs[0]().M(/*from-slice*/", NULL));
+    ASSERT(go_selects(source, "test.api.F", "(*pointer)().M(/*dereference*/", NULL));
+    PASS();
+}
+
 TEST(resolver_stabilization_go_tuple_results_bind_by_position) {
     const char *source = GO_TWO_TYPES
         "func Pair() (*A, *B) { return nil, nil }\n"
@@ -1700,6 +1737,10 @@ static int go_references_case(bool parallel) {
                             "\t_ = Getter\n"
                             "\treturn nil\n"
                             "}\n\n"
+                            "type Opts struct {\n\tMake func() *lib.Impl\n}\n\n"
+                            "func Fields(o Opts) string {\n"
+                            "\treturn o.Make().Name\n"
+                            "}\n\n"
                             "func Declared() {\n"
                             "\tmount.New().Run()\n"
                             "}\n"),
@@ -1738,6 +1779,9 @@ static int go_references_case(bool parallel) {
     ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Result", "test.lib.Getter"), 1);
     ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Result", "test.app.Getter"), 1);
     ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.ResultParam", "test.app.Getter"), 0);
+    /* o.Make() selects the field, which gives the chain its type but is no callable. */
+    ASSERT_EQ(count_edge_between(db, "USAGE", "test.app.Fields", "test.lib.Impl.Name"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Fields", "test.app.Opts.Make"), 0);
     /* The import binds mount, the package's declared name, though the path says mount-utils. */
     ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Declared", "test.mount-utils.New"), 1);
     ASSERT_EQ(count_edge_between(db, "CALLS", "test.app.Declared", "test.mount-utils.Mounter.Run"),
@@ -1745,6 +1789,53 @@ static int go_references_case(bool parallel) {
     cbm_store_close(store);
     th_rmtree(root);
     PASS();
+}
+/* Overloads stay live, so one node is exact for any of them. A second Python def rebinds the
+ * name, so the bodies are not equivalent and that node selects nothing. */
+static int declarations_case(bool parallel) {
+    const char *root = th_mktempdir("cbm_declarations");
+    ASSERT_NOT_NULL(root);
+    char repo[1024], database[1024];
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(repo, 0755));
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "A.java"),
+                            "class A {\n"
+                            "    static void helper() {}\n"
+                            "    void f(int x) { helper(); }\n"
+                            "    void f(String y) { helper(); }\n"
+                            "}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "rebind.py"),
+                            "def alpha():\n    pass\n\n"
+                            "def beta():\n    pass\n\n"
+                            "def pick():\n    alpha()\n\n"
+                            "def pick():\n    beta()\n\n"
+                            "def caller():\n    pick()\n"),
+              0);
+    for (int i = 0; parallel && i < 52; i++) {
+        char name[64], source[96];
+        snprintf(name, sizeof(name), "padding_%02d.py", i);
+        snprintf(source, sizeof(source), "def padding_%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(TH_PATH(repo, name), source), 0);
+    }
+    ASSERT_EQ(index_fixture(repo, database, parallel), 0);
+    cbm_store_t *store = cbm_store_open_path_existing(database);
+    ASSERT_NOT_NULL(store);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.A.f", "test.A.helper"), 1);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.rebind.pick", "test.rebind.alpha"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.rebind.pick", "test.rebind.beta"), 0);
+    ASSERT_EQ(count_edge_between(db, "CALLS", "test.rebind.caller", "test.rebind.pick"), 0);
+    cbm_store_close(store);
+    th_rmtree(root);
+    PASS();
+}
+TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_sequential) {
+    return declarations_case(false);
+}
+TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_parallel) {
+    return declarations_case(true);
 }
 TEST(resolver_stabilization_go_pipeline_references_sequential) {
     return go_references_case(false);
@@ -1835,6 +1926,7 @@ SUITE(resolver_stabilization) {
     RUN_TEST(resolver_stabilization_go_calls_in_every_statement_form_are_visited);
     RUN_TEST(resolver_stabilization_go_block_frames_shadow_exactly);
     RUN_TEST(resolver_stabilization_go_bare_result_types_declare_no_local);
+    RUN_TEST(resolver_stabilization_go_function_values_yield_their_declared_result);
     RUN_TEST(resolver_stabilization_go_tuple_results_bind_by_position);
     RUN_TEST(resolver_stabilization_go_field_chains_follow_declared_field_types);
     RUN_TEST(resolver_stabilization_go_interface_methods_are_their_own_declarations);
@@ -1853,6 +1945,8 @@ SUITE(resolver_stabilization) {
     RUN_TEST(resolver_stabilization_go_syntax_error_costs_only_its_own_declaration);
     RUN_TEST(resolver_stabilization_go_replace_directive_proves_a_sibling_module);
     RUN_TEST(resolver_stabilization_go_workspace_use_proves_a_listed_module);
+    RUN_TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_sequential);
+    RUN_TEST(resolver_stabilization_overloads_share_an_identity_and_rebinding_does_not_parallel);
     RUN_TEST(resolver_stabilization_go_pipeline_references_sequential);
     RUN_TEST(resolver_stabilization_go_pipeline_references_parallel);
     RUN_TEST(resolver_stabilization_go_pipeline_twins_and_package_level_sequential);
