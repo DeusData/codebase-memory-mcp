@@ -1398,9 +1398,62 @@ static int js_project_members_case(int padding) {
                        "moved = other();\n"
                        "export function movedCaller() { return moved.go(); }\n"
                        "function other(): any { return null; }\n"},
+        /* Hazards an adversarial read of the rule found. `Held` is the module's in every
+         * positive; each decoy spells a member the module-level owner really has. */
+        {"lib/hazard.js",
+         "const Held = { keep() { return 1; } };\n"
+         "function heldCaller() { return Held.keep(); }\n"
+         "function shadowedOwner(Held) {\n"
+         "  Held.local = function localThis() { return this.keep(); };\n"
+         "}\n"
+         "function nestedOwner() {\n"
+         "  const Held = { inner() { return this.keep(); } };\n"
+         "  return Held;\n"
+         "}\n"
+         "function getterValue() { return 1; }\n"
+         "const Getter = {\n"
+         "  get prop() { return getterValue; },\n"
+         "  readProp() { return this.prop(); },\n"
+         "};\n"
+         "const Defined = { swapped() { return 1; }, useSwapped() { return this.swapped(); } };\n"
+         "Object.defineProperty(Defined, 'swapped', { value: getterValue });\n"
+         "const Mixed = { blended() { return 1; }, useBlended() { return this.blended(); } };\n"
+         "Object.assign(Mixed, { blended: getterValue });\n"
+         "const SelfMixed = { own() { return 1; }, init() { Object.assign(this, {}); return this.own(); } };\n"
+         "const Gone = { removed() { return 1; }, useRemoved() { delete Gone.removed; return this.removed(); } };\n"
+         "function Proto() {}\n"
+         "Proto.prototype.onProto = function onProto() { return 1; };\n"
+         "Proto.prototype.useProto = function useProto() { return this.onProto(); };\n"
+         "mixin(Proto.prototype, {});\n"
+         "const Map2 = { held() { return 1; }, useHeld() { return this.held(); } };\n"
+         "const seen = new Map();\n"
+         "seen.set(Map2, 1);\n"
+         "const Outer = { outerTarget() { return 1; }, make() {\n"
+         "  class Made { field = this.outerTarget(); }\n"
+         "  return new Made();\n"
+         "} };\n"
+         "function mixin() {}\n"
+         "module.exports = { heldCaller, shadowedOwner, nestedOwner, Getter, Defined, Mixed, "
+         "SelfMixed, Gone, Proto, Map2, Outer };\n"},
     };
     js_project_t project = {0};
     ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "heldCaller", "lib.hazard.keep"), 1);
+    /* The owner is matched by name, so a parameter or nested `Held` must not reach it. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "localThis", "lib.hazard.keep"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "inner", "lib.hazard.keep"), 0);
+    /* A getter runs on the read; the call invokes what it returned. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "readProp", "lib.hazard.prop"), 0);
+    /* Writes no assignment spells. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useSwapped", "lib.hazard.swapped"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useBlended", "lib.hazard.blended"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "init", "lib.hazard.own"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useRemoved", "lib.hazard.removed"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useProto", "lib.hazard.onProto"), 0);
+    /* `seen.set(Map2, 1)` writes to `seen`; Map2's members are untouched. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "useHeld", "lib.hazard.held"), 1);
+    /* A field initializer's `this` is the class instance, not the literal around it. */
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "make", "lib.hazard.outerTarget"), 0);
     /* Both names of `res.set = res.header = function header`. */
     ASSERT_EQ(js_project_edges(&project, "CALLS", "send", "lib.res.header"), 1);
     /* An assignment in a function can replace it; nothing assigns `missing`. */

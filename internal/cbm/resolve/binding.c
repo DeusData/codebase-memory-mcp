@@ -1317,7 +1317,10 @@ static void note_javascript_object_members(cbm_resolve_binding_index_t *index, c
             }
             member = node_text(index, key);
             row = js_member_row(index, owner, member, prototype);
-            if (row)
+            /* `get m()` runs on the read; what a call then invokes is its return value. */
+            if (row && (child_token(item, "get") || child_token(item, "set")))
+                row->conflict = true;
+            else if (row)
                 js_member_value(index, row, kind_is(item, "pair") ? field(item, "value") : item,
                                 member);
         }
@@ -1332,14 +1335,16 @@ static void javascript_this_owner(cbm_resolve_binding_index_t *index, TSNode nod
         return;
     state->js_this_owner = NULL;
     state->js_this_prototype = false;
+    /* Owners are later matched by name at module level, so a nested or parameter
+     * `Owner` must not reach them. */
+    if (state->scope != 0)
+        return;
     TSNode parent = ts_node_parent(node);
     TSNode object = (TSNode){0};
     if (kind_is(node, "function_declaration")) {
         /* A constructor function's `this` is its instance. */
-        if (state->scope == 0) {
-            state->js_this_owner = node_text(index, field(node, "name"));
-            state->js_this_prototype = true;
-        }
+        state->js_this_owner = node_text(index, field(node, "name"));
+        state->js_this_prototype = true;
         return;
     }
     while (kind_is(parent, "assignment_expression")) {
@@ -1386,26 +1391,82 @@ static void javascript_this_owner(cbm_resolve_binding_index_t *index, TSNode nod
     }
 }
 
+/* `owner`, `owner.prototype` or `this` as the object whose members are named. */
+static const char *js_member_owner(cbm_resolve_binding_index_t *index, TSNode object,
+                                   const binding_walk_t *state, bool *prototype) {
+    *prototype = false;
+    if (kind_is(object, "this")) {
+        *prototype = state->js_this_prototype;
+        return state->js_this_owner;
+    }
+    if (kind_is(object, "identifier"))
+        return node_text(index, object);
+    if (kind_is(object, "member_expression") && kind_is(field(object, "object"), "identifier") &&
+        kind_is(field(object, "property"), "property_identifier")) {
+        const char *middle = node_text(index, field(object, "property"));
+        if (middle && !strcmp(middle, "prototype")) {
+            *prototype = true;
+            return node_text(index, field(object, "object"));
+        }
+    }
+    return NULL;
+}
+
 /* `owner[key] = v` and `owner.prototype[key] = v` can replace any member. */
 static void note_javascript_computed_write(cbm_resolve_binding_index_t *index, TSNode left,
                                            const binding_walk_t *state) {
-    TSNode object = field(left, "object");
-    const char *owner = NULL;
     bool prototype = false;
-    if (kind_is(object, "this")) {
-        owner = state->js_this_owner;
-        prototype = state->js_this_prototype;
-    } else if (kind_is(object, "identifier")) {
-        owner = node_text(index, object);
-    } else if (kind_is(object, "member_expression") &&
-               kind_is(field(object, "object"), "identifier") &&
-               kind_is(field(object, "property"), "property_identifier")) {
-        const char *middle = node_text(index, field(object, "property"));
-        if (middle && !strcmp(middle, "prototype")) {
-            owner = node_text(index, field(object, "object"));
-            prototype = true;
-        }
+    const char *owner = js_member_owner(index, field(left, "object"), state, &prototype);
+    if (owner)
+        (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+}
+
+/* A call that names its first argument the object it copies members into. */
+static bool js_mutator_name(const char *name) {
+    static const char *const names[] = {"assign",
+                                        "defineProperty",
+                                        "defineProperties",
+                                        "deleteProperty",
+                                        "extend",
+                                        "merge",
+                                        "mixin",
+                                        "set"};
+    for (size_t i = 0; name && i < sizeof(names) / sizeof(names[0]); i++) {
+        if (!strcmp(name, names[i]))
+            return true;
     }
+    return false;
+}
+
+/* `Object.assign(owner, ...)`, `mixin(owner.prototype, ...)` and `delete owner.m` can
+ * replace members no assignment names. `Reflect.set` is the one receiver-sensitive
+ * name: a plain `map.set(owner, v)` mutates `map`, so `set` needs that receiver. */
+static void note_javascript_member_mutation(cbm_resolve_binding_index_t *index, TSNode node,
+                                            const binding_walk_t *state) {
+    TSNode object = (TSNode){0};
+    if (kind_is(node, "unary_expression") && child_token(node, "delete")) {
+        TSNode target = field(node, "argument");
+        if (kind_is(target, "member_expression") || kind_is(target, "subscript_expression"))
+            object = field(target, "object");
+    } else if (kind_is(node, "call_expression")) {
+        TSNode callee = field(node, "function");
+        bool member = kind_is(callee, "member_expression");
+        const char *name = member
+                               ? node_text(index, field(callee, "property"))
+                               : (kind_is(callee, "identifier") ? node_text(index, callee) : NULL);
+        if (!js_mutator_name(name))
+            return;
+        const char *receiver = member ? node_text(index, field(callee, "object")) : NULL;
+        if (!strcmp(name, "set") && (!receiver || strcmp(receiver, "Reflect")))
+            return;
+        TSNode arguments = field(node, "arguments");
+        if (kind_is(arguments, "arguments") && ts_node_named_child_count(arguments) > 0)
+            object = ts_node_named_child(arguments, 0);
+    }
+    if (ts_node_is_null(object))
+        return;
+    bool prototype = false;
+    const char *owner = js_member_owner(index, object, state, &prototype);
     if (owner)
         (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
 }
@@ -1430,19 +1491,8 @@ static void note_javascript_member_write(cbm_resolve_binding_index_t *index, TSN
         }
         return;
     }
-    const char *owner = NULL;
     bool prototype = false;
-    if (kind_is(object, "identifier")) {
-        owner = node_text(index, object);
-    } else if (kind_is(object, "member_expression") &&
-               kind_is(field(object, "object"), "identifier") &&
-               kind_is(field(object, "property"), "property_identifier")) {
-        const char *middle = node_text(index, field(object, "property"));
-        if (middle && !strcmp(middle, "prototype")) {
-            owner = node_text(index, field(object, "object"));
-            prototype = true;
-        }
-    }
+    const char *owner = js_member_owner(index, object, state, &prototype);
     /* `Owner.prototype = {...}` itself. Any other value replaces every member. */
     if (owner && !prototype && !strcmp(member, "prototype")) {
         TSNode value = js_unwrap_value(right);
@@ -1897,6 +1947,7 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
     }
     note_http_dependency(index, node);
     note_javascript_commonjs(index, node, &state);
+    note_javascript_member_mutation(index, node, &state);
     if (kind_is(node, "export_statement")) {
         index->javascript_module |= depth == 1;
         bool namespace_level = index->scopes[state.scope].namespace_scope && parent_kind &&
@@ -2018,6 +2069,11 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         index->current_scope = state.scope;
     } else if (kind_is(node, "class_body")) {
         state.named_export = false;
+        /* Field initializers and static blocks have the class's own `this`. */
+        state.js_this_owner = NULL;
+        state.js_this_prototype = false;
+        index->current_this_owner = NULL;
+        index->current_this_prototype = false;
     }
 
     bool declaration_name =
