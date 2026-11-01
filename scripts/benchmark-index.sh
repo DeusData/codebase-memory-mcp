@@ -33,11 +33,21 @@ cbm_test_runtime_init
 # including its removal — passes to the caller. A failed run cleans up
 # regardless: there is no index worth keeping, and nothing must leak. Never on
 # by default, or an unattended run accumulates one root per language.
+#
+# The handoff promises a stopped daemon, so it is written only once
+# `daemon stop` succeeded. A refused stop (a client still committed to the
+# daemon, or no answer) fails the run with the product's explanation, writes
+# no handoff, and keeps the root without cleaning it up: the daemon may still
+# be using it, and the operator decides what happens to it.
 bench_finish() {
-  local rc=$?
+  local rc=$? stop_out=""
   [ -z "${BENCH_TMP:-}" ] || rm -rf -- "$BENCH_TMP" || true
   if [ "$rc" -eq 0 ] && [ -n "${CBM_BENCH_KEEP_RUNTIME:-}" ] && [ -d "${OUT:-}" ]; then
-    "$BINARY" daemon stop >/dev/null 2>&1 || true
+    if ! stop_out=$("$BINARY" daemon stop 2>&1); then
+      echo "  $LANG: private daemon did not stop; runtime kept at $CBM_TEST_RUNTIME_ROOT, no handoff written" >&2
+      [ -z "$stop_out" ] || printf '%s\n' "$stop_out" >&2
+      exit 1
+    fi
     printf 'CBM_BENCH_RUNTIME_ROOT=%q\nCBM_RUNTIME_DIR=%q\nCBM_CACHE_DIR=%q\n' \
       "$CBM_TEST_RUNTIME_ROOT" "$CBM_RUNTIME_DIR" "$CBM_CACHE_DIR" > "$OUT/runtime-root.txt"
     echo "  $LANG: runtime kept at $CBM_TEST_RUNTIME_ROOT; paths in $OUT/runtime-root.txt" >&2

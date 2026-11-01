@@ -299,9 +299,13 @@ for lang in $ALL_LANGS; do                      # ALL_LANGS = full 159-name list
 
   # --- step 8: delete THIS language's index so the next is cold, then mark done ---
   # The graph session (steps 4-7) may still have a daemon running under the kept
-  # CBM_RUNTIME_DIR (exported above); stop it before its root goes away.
-  ~/.local/bin/codebase-memory-mcp daemon stop || true
-  rm -rf -- "$CBM_BENCH_RUNTIME_ROOT"
+  # CBM_RUNTIME_DIR (exported above); stop it before its root goes away. A refused
+  # stop (a session still attached) means the root is still in use: keep it.
+  if ~/.local/bin/codebase-memory-mcp daemon stop; then
+    rm -rf -- "$CBM_BENCH_RUNTIME_ROOT"
+  else
+    echo "$lang: daemon under $CBM_RUNTIME_DIR did not stop; keeping $CBM_BENCH_RUNTIME_ROOT" >&2
+  fi
   manifest_mark_done "$lang" "$index_ms"
 done
 ```
