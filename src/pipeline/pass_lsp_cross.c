@@ -715,6 +715,9 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         }
     }
     dst->lang = lang;
+    dst->alias_target = (lang == CBM_LANG_GO && src->alias_target)
+                            ? cbm_arena_strdup(arena, src->alias_target)
+                            : NULL;
     dst->decorators = NULL;
     if (src->decorators) {
         int n = 0;
@@ -2079,14 +2082,15 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
                      const char **imp_qns, int imp_count) {
-    cbm_pxc_run_one_with_php_bindings(lang, r, source, source_len, module_qn, defs, def_count,
+    cbm_pxc_run_one_with_php_bindings(lang, r, source, source_len, module_qn, NULL, defs, def_count,
                                       imp_names, imp_qns, imp_count, NULL);
 }
 
 void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const char *source,
-                                       int source_len, const char *module_qn, CBMLSPDef *defs,
-                                       int def_count, const char **imp_names, const char **imp_qns,
-                                       int imp_count, const CBMPHPImportBindings *bindings) {
+                                       int source_len, const char *module_qn, const char *rel_path,
+                                       CBMLSPDef *defs, int def_count, const char **imp_names,
+                                       const char **imp_qns, int imp_count,
+                                       const CBMPHPImportBindings *bindings) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -2098,8 +2102,8 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
 
     switch (lang) {
     case CBM_LANG_GO:
-        cbm_run_go_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                             imp_qns, imp_count, tree, &out);
+        cbm_run_go_lsp_cross(&scratch, source, source_len, module_qn, rel_path, defs, def_count,
+                             imp_names, imp_qns, imp_count, tree, &out);
         break;
     case CBM_LANG_C:
     case CBM_LANG_CPP:
@@ -2293,9 +2297,9 @@ void cbm_pxc_dispatch_file_with_php_bindings(
              * lsp_unresolved entries -- no parse, no AST walk -- then the
              * AST walk against the overlay (chained to the sealed base). */
             cbm_go_fast_resolve_qualified_calls(result, prebuilt, imp_keys, imp_vals, imp_count);
-            cbm_run_go_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
-                                               imp_keys, imp_vals, imp_count, result->cached_tree,
-                                               &out);
+            cbm_run_go_lsp_cross_with_registry(&scratch, source, source_len, def_module, rel,
+                                               &overlay, imp_keys, imp_vals, imp_count,
+                                               result->cached_tree, &out);
             used_prebuilt = true;
             break;
         case CBM_LANG_PYTHON: {
@@ -2429,7 +2433,7 @@ void cbm_pxc_dispatch_file_with_php_bindings(
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
             pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
         } else {
-            cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module,
+            cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module, rel,
                                               file_defs, file_def_count, imp_keys, imp_vals,
                                               imp_count, bindings);
         }
@@ -2441,8 +2445,9 @@ void cbm_pxc_dispatch_file_with_php_bindings(
         cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module, file_defs,
-                                          file_def_count, imp_keys, imp_vals, imp_count, bindings);
+        cbm_pxc_run_one_with_php_bindings(lang, result, source, source_len, def_module, rel,
+                                          file_defs, file_def_count, imp_keys, imp_vals, imp_count,
+                                          bindings);
     }
     free(filtered);
 }
