@@ -906,7 +906,7 @@ Tools requiring arguments accept JSON piped on stdin. Tools with only optional a
 |------|-------------|
 | `index_repository` | Index a repository into the graph. A successful call from an active MCP session registers the target for auto-sync while that session remains connected (under `daemon start`, also after it disconnects), subject to the global `auto_watch` setting; CLI calls do not register watches. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List indexed projects with paging; use `detail: "stats"` for node/edge counts and database sizes. |
-| `delete_project` | Remove a project and all its graph data. |
+| `delete_project` | Remove a project and all its graph data, including its ADR sidecar (`<db>.adr.db`). |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
 

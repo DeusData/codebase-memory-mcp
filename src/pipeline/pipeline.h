@@ -71,6 +71,23 @@ bool cbm_pipeline_doc_candidates_enabled(const cbm_pipeline_t *p);
 /* Copy the exact discovery violation from the most recent run. */
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
+/* Mark work that runs without a waiting user. Background pipelines reserve
+ * CPU headroom; foreground pipelines retain the initial-index all-core policy. */
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background);
+
+/* Resolve the worker policy for this pipeline, including environment and
+ * crash-recovery overrides. */
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p);
+
+/* Background width from the foreground width and the headroom width: the
+ * headroom, floored at two whenever the foreground width is two or more so an
+ * automatic refresh keeps the parallel route. */
+int cbm_pipeline_background_worker_width(int foreground, int headroom);
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_worker_count_test_reset(void);
+int cbm_pipeline_worker_count_test_last(void);
+#endif
 
 /* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
  * when the run succeeded / did not reach post-publish export. Used to
@@ -458,6 +475,16 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
  * fields carry declared types, so the hint is receiver-aware there. */
 bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
                                        double confidence);
+
+/* A bare Go `init` (a call or reference that is not the member half of a
+ * selector) is always a local name: Go forbids referring to a package init
+ * function, and a method or field needs a selector. True when such a name
+ * resolved onto a Function (every Go Function named init is a package init;
+ * any registry strategy) or onto a Method or Field found by a weak short-name
+ * strategy. lsp_* answers are kept. Go only. Pure; unit-tested in
+ * test_registry.c; wired in pass_calls.c, pass_usages.c and pass_parallel.c. */
+bool cbm_go_suppress_bare_init_bind(bool is_go, bool is_member, const char *name,
+                                    const char *strategy, const char *target_label);
 
 /* Import-binding counterpart (#2127). True when the callee's root identifier
  * is bound by an import of this file whose module chain contradicts the
