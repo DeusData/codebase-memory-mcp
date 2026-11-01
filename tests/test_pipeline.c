@@ -12153,7 +12153,9 @@ TEST(pipeline_ts_crossfile_new_instance_method_call_issue1354) {
  * edge, so trace_path(foo, inbound) missed the caller. End to end through the
  * real pipeline: the renamed call, an app-local wrapper that shares the
  * exported name, and a method on a renamed class import all reach the
- * exported member, while the plain named import control keeps lsp_ts_import. */
+ * exported member. Every admitted edge now carries strategy shared_resolver, so
+ * the old per-strategy labels (lsp_ts_import, lsp_import_alias, lsp_ts_method)
+ * became this one; what the test binds is the edge to the exact target. */
 TEST(pipeline_ts_renamed_import_call_issue2297) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_ts_2297_XXXXXX");
@@ -12205,9 +12207,9 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     ASSERT_NOT_NULL(s);
 
     bool plain =
-        cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "lsp_ts_import");
+        cross_file_call_has_strategy(s, project, "callsPlain", "fooUniqueQrs", "shared_resolver");
     bool renamed = cross_file_call_has_strategy(s, project, "callsRenamed", "fooUniqueQrs",
-                                                "lsp_import_alias");
+                                                "shared_resolver");
     char wrapper_qn[512];
     char exported_qn[512];
     snprintf(wrapper_qn, sizeof(wrapper_qn), "%s.src.wrapper.buildHealthUniqueQrs", project);
@@ -12223,7 +12225,7 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
         cbm_store_find_edges_by_source_type(s, wrapper_node.id, "CALLS", &edges, &edge_count);
         for (int i = 0; i < edge_count; i++) {
             if (edges[i].target_id == exported_node.id && edges[i].properties_json &&
-                strstr(edges[i].properties_json, "lsp_import_alias"))
+                strstr(edges[i].properties_json, "shared_resolver"))
                 wrapper = true;
             if (edges[i].target_id == wrapper_node.id)
                 recursive = true;
@@ -12233,7 +12235,7 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     cbm_node_free_fields(&wrapper_node);
     cbm_node_free_fields(&exported_node);
     bool renamed_class = cross_file_call_has_strategy(s, project, "viaRenamedClass",
-                                                      "pingUniqueQrs", "lsp_ts_method");
+                                                      "pingUniqueQrs", "shared_resolver");
 
     cbm_store_close(s);
     cbm_pipeline_free(p);

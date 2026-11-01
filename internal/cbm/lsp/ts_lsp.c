@@ -3123,6 +3123,9 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
     }
 }
 
+static const char *ts_nested_function_qn(TSLSPContext *ctx, TSNode node);
+static void process_class_field(TSLSPContext *ctx, TSNode field, const char *class_qn);
+
 // Process an arrow_function or function_expression as a callback whose param types are
 // contextually typed by the enclosing call (e.g. `arr.map(x => x.length)` — `x` should
 // be bound to `arr`'s element type via Array<T>.map's `(x: T) => U` signature). The
@@ -3783,10 +3786,15 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "method_definition") == 0 ||
         strcmp(kind, "function_expression") == 0 || strcmp(kind, "arrow_function") == 0 ||
         strcmp(kind, "method_signature") == 0) {
-        // Nested functions just get a fresh scope; top-level / class-method walks own
-        // their enclosing_func_qn via process_function_body.
+        // Nested functions get a fresh scope. A named one is the caller of what its
+        // body calls, under the identity extraction gave it; top-level and class-method
+        // walks own their enclosing_func_qn via process_function_body.
         CBMScope *saved = ctx->current_scope;
+        const char *saved_func = ctx->enclosing_func_qn;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        const char *nested_qn = ts_nested_function_qn(ctx, node);
+        if (nested_qn)
+            ctx->enclosing_func_qn = nested_qn;
         TSNode params =
             ts_node_child_by_field_name(node, "parameters", TS_LSP_FIELD_LEN("parameters"));
         if (!ts_node_is_null(params)) {
@@ -3802,6 +3810,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             process_node(ctx, body);
         }
         ctx->current_scope = saved;
+        ctx->enclosing_func_qn = saved_func;
         return;
     }
 
@@ -3827,7 +3836,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
 
     // Class / interface declarations are walked by the registry pass; here we just dive
     // into method_definition bodies for inner call resolution.
-    if (strcmp(kind, "class_declaration") == 0) {
+    if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "abstract_class_declaration") == 0) {
         // Find the class name to set enclosing_class_qn for methods.
         TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
         const char *class_qn = NULL;
@@ -3841,6 +3850,10 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             uint32_t nc = ts_node_named_child_count(body);
             for (uint32_t i = 0; i < nc; i++) {
                 TSNode m = ts_node_named_child(body, i);
+                if (node_kind_is(m, "public_field_definition")) {
+                    process_class_field(ctx, m, class_qn);
+                    continue;
+                }
                 if (!node_kind_is(m, "method_definition"))
                     continue;
                 TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
@@ -3869,6 +3882,54 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         }
         ts_tree_cursor_delete(&cursor);
     }
+}
+
+/* The QN extraction minted for this nested function: flat under the module, or
+ * under the enclosing class. The caller of an occurrence must name that same node. */
+static const char *ts_nested_function_qn(TSLSPContext *ctx, TSNode node) {
+    if (cbm_js_function_inside_class_member(node))
+        return NULL;
+    TSNode name = cbm_resolve_func_name_in_source(node, CBM_LANG_TYPESCRIPT, ctx->source);
+    char *text = ts_node_is_null(name) ? NULL : node_text(ctx, name);
+    if (!text || !text[0])
+        return NULL;
+    const char *owner = ctx->enclosing_class_qn ? ctx->enclosing_class_qn : ctx->module_qn;
+    return owner ? cbm_arena_sprintf(ctx->arena, "%s.%s", owner, text) : NULL;
+}
+
+static void process_function_body(TSLSPContext *ctx, TSNode func_node, const char *func_qn,
+                                  const char *class_qn);
+
+/* A class field's initializer runs with `this` as the new instance. Its calls have
+ * the field's own arrow as caller, or else the enclosing declaration's. */
+static void process_class_field(TSLSPContext *ctx, TSNode field, const char *class_qn) {
+    TSNode value = ts_node_child_by_field_name(field, "value", TS_LSP_FIELD_LEN("value"));
+    if (ts_node_is_null(value))
+        return;
+    uint32_t count = ts_node_child_count(field);
+    for (uint32_t i = 0; i < count; i++)
+        if (node_kind_is(ts_node_child(field, i), "static"))
+            return;
+    const char *saved_class = ctx->enclosing_class_qn;
+    ctx->enclosing_class_qn = class_qn;
+    if (node_kind_is(value, "arrow_function") || node_kind_is(value, "function_expression")) {
+        const char *qn = ts_nested_function_qn(ctx, value);
+        if (qn) {
+            process_function_body(ctx, value, qn, class_qn);
+            ctx->enclosing_class_qn = saved_class;
+            return;
+        }
+    }
+    CBMScope *saved = ctx->current_scope;
+    const char *saved_func = ctx->enclosing_func_qn;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+    if (!ctx->enclosing_func_qn)
+        ctx->enclosing_func_qn = ctx->module_qn;
+    cbm_scope_bind(ctx->current_scope, "this", cbm_type_named(ctx->arena, class_qn));
+    process_node(ctx, value);
+    ctx->current_scope = saved;
+    ctx->enclosing_func_qn = saved_func;
+    ctx->enclosing_class_qn = saved_class;
 }
 
 static void process_function_body(TSLSPContext *ctx, TSNode func_node, const char *func_qn,
@@ -4002,17 +4063,25 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                 continue;
             const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
             process_function_body(ctx, child, fqn, NULL);
-        } else if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "internal_module") == 0) {
+        } else if (strcmp(kind, "class_declaration") == 0 ||
+                   strcmp(kind, "abstract_class_declaration") == 0 ||
+                   strcmp(kind, "internal_module") == 0) {
             process_node(ctx, child);
         } else if (strcmp(kind, "expression_statement") == 0) {
             /* tree-sitter-typescript wraps a namespace declaration in an
-             * expression_statement. Unwrap only that declaration shape;
-             * ordinary top-level expressions are not owned by a function. */
+             * expression_statement. Anything else belongs to the module, and that
+             * is where a test file's `describe(() => ...)` bodies live. */
             uint32_t count = ts_node_named_child_count(child);
             for (uint32_t j = 0; j < count; j++) {
                 TSNode inner = ts_node_named_child(child, j);
-                if (node_kind_is(inner, "internal_module"))
+                if (node_kind_is(inner, "internal_module")) {
                     process_node(ctx, inner);
+                } else {
+                    const char *saved_func = ctx->enclosing_func_qn;
+                    ctx->enclosing_func_qn = ctx->module_qn;
+                    process_node(ctx, inner);
+                    ctx->enclosing_func_qn = saved_func;
+                }
             }
         } else if (strcmp(kind, "export_statement") == 0) {
             // Walk the wrapped declaration.
@@ -4036,6 +4105,7 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                            strcmp(ik, "variable_declaration") == 0) {
                     process_top_level_variable_arrows(ctx, inner);
                 } else if (strcmp(ik, "class_declaration") == 0 ||
+                           strcmp(ik, "abstract_class_declaration") == 0 ||
                            strcmp(ik, "internal_module") == 0) {
                     process_node(ctx, inner);
                 }

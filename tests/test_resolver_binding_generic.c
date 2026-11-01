@@ -533,19 +533,24 @@ TEST(resolver_binding_ecmascript_parameters_have_exact_lexical_owners) {
         {"export function caller() { accept(handler); }\n"
          "const unrelated = handler => 0;\n",
          true, false},
+        /* These three were pinned as a module-wide veto. Scopes are real now: a default
+         * value only reads the import, and a destructured or rest parameter binds in
+         * `unrelated` alone, so `caller` still names the import. */
         {"export function caller() { accept(handler); }\n"
          "function unrelated(value = handler) { return 0; }\n",
-         false, false},
+         true, false},
         {"export function caller(handler = other) { accept(handler); }\n", false, false},
         {"export function caller() { accept(handler); }\n"
          "function unrelated(value = (handler = other)) { return 0; }\n",
          false, false},
         {"export function caller() { accept(handler); }\n"
          "function unrelated({handler}) { return 0; }\n",
-         false, false},
+         true, false},
         {"export function caller() { accept(handler); }\n"
          "function unrelated(...handler) { return 0; }\n",
-         false, false},
+         true, false},
+        {"export function caller({handler}) { accept(handler); }\n", false, false},
+        {"export function caller(...handler) { accept(handler); }\n", false, false},
         {"export function caller() { accept(handler); var handler = other; }\n", false, false},
         {"export function caller() { accept(handler); let handler = other; }\n", false, false},
         {"export function caller() { accept(handler); }\n"
@@ -594,11 +599,15 @@ TEST(resolver_binding_ecmascript_parameters_have_exact_lexical_owners) {
                                              CBM_SOURCE_ORIGIN_RAW, candidate);
             bool exact = cbm_resolve_admit(&proof) && proof.proof && proof.target &&
                          !strcmp(proof.target, candidate.target);
+            /* A TypeScript script cannot redeclare a global implementation (a compile
+             * error), so its own declaration is what the name means. JavaScript's can. */
+            bool admitted = cases[i].admitted ||
+                            (cases[i].script && languages[language] != CBM_LANG_JAVASCRIPT);
             cbm_resolve_result_t shifted =
                 cbm_resolve_binding_validate(index, "handler", start + 1, start + strlen("handler"),
                                              CBM_SOURCE_ORIGIN_RAW, candidate);
             bool forged = cbm_resolve_admit(&shifted);
-            if (exact != cases[i].admitted || forged)
+            if (exact != admitted || forged)
                 fprintf(stderr,
                         "ECMAScript parameter scope language=%zu case=%zu "
                         "status=%s reason=%s exact=%d forged=%d\n",
@@ -606,7 +615,7 @@ TEST(resolver_binding_ecmascript_parameters_have_exact_lexical_owners) {
                         forged);
             cbm_arena_destroy(&arena);
             cbm_free_result(file);
-            ASSERT_EQ(exact, cases[i].admitted);
+            ASSERT_EQ(exact, admitted);
             ASSERT(!forged);
         }
     }

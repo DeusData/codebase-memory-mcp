@@ -1810,18 +1810,61 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
      * grammar wraps `const foo = require(..)` as
      *   lexical_declaration → variable_declarator { name: identifier, value: call } */
     const char *local_name = NULL;
+    const char *member = NULL;
     TSNode parent = ts_node_parent(call);
+    /* `const foo = require("m").foo` binds that one member. */
+    if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "member_expression") == 0 &&
+        ts_node_eq(call, ts_node_child_by_field_name(parent, TS_FIELD("object")))) {
+        TSNode property = ts_node_child_by_field_name(parent, TS_FIELD("property"));
+        if (!ts_node_is_null(property) &&
+            strcmp(ts_node_type(property), "property_identifier") == 0) {
+            member = cbm_node_text(a, property, ctx->source);
+            parent = ts_node_parent(parent);
+        }
+    }
     if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
         TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
         if (!ts_node_is_null(name_node) && strcmp(ts_node_type(name_node), "identifier") == 0) {
             local_name = cbm_node_text(a, name_node, ctx->source);
+        } else if (!ts_node_is_null(name_node) && !member &&
+                   strcmp(ts_node_type(name_node), "object_pattern") == 0) {
+            /* `const { a, b: c } = require("m")` binds one local per property,
+             * exactly as `import { a, b as c } from "m"` does. */
+            bool bound = false;
+            uint32_t count = ts_node_named_child_count(name_node);
+            for (uint32_t i = 0; i < count; i++) {
+                TSNode item = ts_node_named_child(name_node, i);
+                const char *item_kind = ts_node_type(item);
+                TSNode key = item;
+                TSNode value = item;
+                if (strcmp(item_kind, "pair_pattern") == 0) {
+                    key = ts_node_child_by_field_name(item, TS_FIELD("key"));
+                    value = ts_node_child_by_field_name(item, TS_FIELD("value"));
+                    if (ts_node_is_null(key) || ts_node_is_null(value) ||
+                        strcmp(ts_node_type(key), "property_identifier") != 0 ||
+                        strcmp(ts_node_type(value), "identifier") != 0) {
+                        continue;
+                    }
+                } else if (strcmp(item_kind, "shorthand_property_identifier_pattern") != 0) {
+                    continue;
+                }
+                CBMImport bound_import = {.local_name = cbm_node_text(a, value, ctx->source),
+                                          .module_path = path,
+                                          .member = cbm_node_text(a, key, ctx->source)};
+                push_import_at(ctx, item, bound_import);
+                bound = true;
+            }
+            if (bound) {
+                return true;
+            }
         }
     }
     if (!local_name) {
         local_name = path_last(a, path);
+        member = NULL;
     }
 
-    CBMImport imp = {.local_name = local_name, .module_path = path};
+    CBMImport imp = {.local_name = local_name, .module_path = path, .member = member};
     push_import_at(ctx, call, imp);
     return true;
 }

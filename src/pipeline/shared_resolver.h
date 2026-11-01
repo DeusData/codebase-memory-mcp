@@ -73,6 +73,9 @@ typedef struct {
 /* Records every extracted in-scope occurrence, including failures and
  * unsupported syntax, and emits only admitted exact targets. False means an
  * allocation/record/edge-write failed; the generation must not be published. */
+/* Raw bytes of one source file; the caller releases with CBM_MEM_CLASS_EXTRACT. */
+char *cbm_shared_resolver_load_source(const char *path, size_t *length);
+
 bool cbm_shared_resolver_file(const cbm_shared_resolver_t *resolver,
                               const cbm_resolver_file_t *file);
 

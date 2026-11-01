@@ -185,6 +185,10 @@ bool cbm_elixir_def_head_is(TSNode signature, TSNode node);
 // naming — drift between private copies caused the Module-mis-attribution of
 // gap #3 (and #438 for the C-declarator case).
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
+TSNode cbm_resolve_func_name_in_source(TSNode node, CBMLanguage lang, const char *source);
+/* An ECMAScript function nested inside a class member. Extraction mints no node for
+ * it, so what it calls belongs to the member it runs in. */
+bool cbm_js_function_inside_class_member(TSNode node);
 
 // C++/CUDA out-of-line method definition (`void Foo::bar() {...}`): return the
 // immediate enclosing class name ("Foo") from the qualified declarator, or NULL

@@ -7,18 +7,76 @@
 
 typedef struct cbm_resolve_binding_index cbm_resolve_binding_index_t;
 
+/* One ECMAScript module binding, from `import` or a `require("literal")`
+ * initializer. A NULL member names the whole module (or its default when
+ * is_default). A NULL source means the specifier is not a plain literal. */
+typedef struct {
+    const char *local;
+    const char *source;
+    const char *member;
+    bool is_default;
+    bool is_require;
+    bool type_only;
+} cbm_resolve_js_import_t;
+
+/* One exported name of an ECMAScript module, in source terms:
+ *   target set:  the name is this module's own declaration
+ *   source set:  it is re-exported from that module (member NULL: its namespace)
+ *   name NULL:   `export * from source`
+ *   whole:       `module.exports = value` / `export = value`; a whole export
+ *                with is_object is the module's named exports themselves
+ *   !known:      the name is exported, but its value is not a proved declaration */
+typedef struct {
+    const char *name;
+    const char *target;
+    const char *source;
+    const char *member;
+    unsigned kind;
+    bool known;
+    bool whole;
+    bool is_object;
+    bool default_import;
+} cbm_resolve_js_export_t;
+
 /* Build once per source file. Borrows result/source until the arena is freed.
  * Supported syntax is deliberately explicit: Python module functions and
- * direct imports, Lua local functions, and explicit JavaScript/TypeScript
- * module function declarations/imports, plus one inline Vue/Svelte script with
- * an audited inert host. Script globals remain unsupported. All
- * potential local/reassigned names block that name across the file; this
- * over-abstention is a quality gap. Unknown syntax, dynamic namespace effects
- * and partial parses fail closed. The source must be the raw buffer used to
- * produce result->cached_tree. */
+ * direct imports, Lua local functions, JavaScript/TypeScript modules, plus one
+ * inline Vue/Svelte script with an audited inert host. An ECMAScript file is a
+ * module when it has import/export, CommonJS syntax or a module extension, or
+ * is TypeScript (a duplicate script-global implementation is a compile error).
+ * A classic browser script has no such signal; another script can replace its
+ * globals, so it remains unsupported. Lexical scopes are real, so a local name
+ * blocks only the scope it is visible in. Unknown syntax, dynamic namespace
+ * effects and partial parses fail closed. The source must be the raw buffer
+ * used to produce result->cached_tree. */
 cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
                                                        CBMLanguage language, const char *source,
                                                        size_t source_len);
+/* As above, for a .js file its package manifest declares a module (`"type"`). */
+cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
+    CBMArena *arena, const CBMFileResult *result, CBMLanguage language, const char *source,
+    size_t source_len, bool declared_module);
+
+/* The module binding visible at this exact occurrence, by the lexical scope of
+ * its root identifier. NULL when the root is anything but such a binding. *path
+ * receives the whole `a.b.c` spelling that binds, when name is only `c`, and
+ * *type_position whether the occurrence names a type. */
+const cbm_resolve_js_import_t *cbm_resolve_binding_js_import(const cbm_resolve_binding_index_t *,
+                                                             const char *name, uint32_t start,
+                                                             uint32_t end, CBMSourceOrigin origin,
+                                                             const char **path,
+                                                             bool *type_position);
+/* The exact source lines of the declaration this occurrence lexically names. */
+bool cbm_resolve_binding_js_declaration_lines(const cbm_resolve_binding_index_t *, const char *name,
+                                              uint32_t start, uint32_t end, CBMSourceOrigin origin,
+                                              uint32_t *start_line, uint32_t *end_line);
+/* False when the export list cannot be trusted as this file's complete surface. */
+bool cbm_resolve_binding_js_exports_complete(const cbm_resolve_binding_index_t *);
+/* True when CommonJS syntax makes `require()` of this file yield module.exports. */
+bool cbm_resolve_binding_js_commonjs(const cbm_resolve_binding_index_t *);
+size_t cbm_resolve_binding_js_export_count(const cbm_resolve_binding_index_t *);
+const cbm_resolve_js_export_t *cbm_resolve_binding_js_export_at(const cbm_resolve_binding_index_t *,
+                                                                size_t);
 
 /* Set exact caller identity without re-reading or hashing source. Captured
  * content/configuration IDs already came from result at build. */

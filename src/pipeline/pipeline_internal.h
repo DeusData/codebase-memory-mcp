@@ -453,6 +453,8 @@ typedef struct {
     CBMFileResult **result_cache;
     /* Immutable export proofs shared by all resolution workers. */
     cbm_shared_resolver_t *shared_resolver;
+    /* ECMAScript export surfaces, ready before the cross-file type pass. */
+    struct cbm_ecma_table *ecma_surfaces;
     cbm_resolve_stats_t *resolver_stats; /* run-owned; workers borrow until join */
     _Atomic bool resolver_failed;
 
@@ -1903,6 +1905,9 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 typedef struct {
     const char *candidate_qn;
     bool calls_emitted;
+    /* This occurrence is a route registration: its Route node and handler edge
+     * represent it in the graph whether or not any CALLS edge survives. */
+    bool route_registered;
 } CBMCallEvidence;
 void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
                                           const CBMFileResult *result,
