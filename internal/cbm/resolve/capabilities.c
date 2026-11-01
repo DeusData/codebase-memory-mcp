@@ -65,13 +65,35 @@ static const edge_row_t edge_rows[] = {
      "Exact declared packages and aliases; incomplete or competing namespace candidates abstain."},
     {CBM_LANG_CSHARP, OO_EDGES,
      "Exact declared namespace members; unproved aliases and competing candidates abstain."},
-    {CBM_LANG_PHP, TYPED_EDGES,
+    {CBM_LANG_PHP, TYPED_EDGES | EDGE(USAGE),
      "Declared namespaces, Composer PSR-4 and literal includes; dynamic paths abstain."},
+    {CBM_LANG_ELIXIR, EDGE(IMPORTS) | EDGE(CALLS),
+     "alias, import, require and use of a module declared once in the project; a module declared "
+     "twice or outside the project abstains."},
+    {CBM_LANG_ERLANG, EDGE(IMPORTS) | EDGE(CALLS),
+     "-import and -behaviour of the module whose file bears its name, and -include next to the "
+     "source; a name borne by two files, -include_lib and macro paths abstain."},
+    {CBM_LANG_ZIG, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
+     "@import of a literal .zig path relative to the importing file; names mapped by the build "
+     "abstain."},
+    {CBM_LANG_PERL, EDGE(IMPORTS) | EDGE(CALLS),
+     "use of a module found under the lib directory of an ancestor of the importing file; other "
+     "@INC entries are not known and abstain."},
+    {CBM_LANG_HASKELL, EDGE(CALLS) | EDGE(USAGE), NULL},
+    {CBM_LANG_OCAML, EDGE(CALLS) | EDGE(USAGE), NULL},
+    {CBM_LANG_RUBY, EDGE(IMPORTS) | EDGE(CALLS),
+     "require_relative of a literal path, and require of a path under the lib directory of an "
+     "ancestor of the importing file; other load paths and interpolation abstain."},
     {CBM_LANG_RUST, TYPED_EDGES,
      "Cargo crates, module trees, use trees, re-exports and globs; macro-generated items and "
      "unmodeled receiver types abstain."},
-    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
-     "Direct URI imports with prefix and show/hide bindings; parts and reexports are unsupported."},
+    {CBM_LANG_SWIFT, EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
+     "Modules from SwiftPM targets; lexical scope, extensions, inheritance and argument labels; "
+     "declared and constructed receiver types. Xcode module membership abstains."},
+    {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
+     "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the pubspec "
+     "name; declared and constructed receiver types along class, mixin and superclass chains. "
+     "Collection element types, conditional imports and part-of by library name abstain."},
     {CBM_LANG_LUA, EDGE(CALLS), NULL},
     {CBM_LANG_CSS, EDGE(IMPORTS),
      "Top-level quoted literal imports before style rules, relative to the source stylesheet; "
@@ -94,8 +116,9 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_MESON, EDGE(IMPORTS),
      "Complete literal subdir calls in an unconditional initial statement prefix; parent "
      "traversal, keyword arguments, conditions and prior unknown effects abstain."},
-    {CBM_LANG_SCALA, EDGE(IMPORTS),
-     "Exact declared namespace members only; no semantic binding proof bridge advertised."},
+    {CBM_LANG_SCALA, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE) | EDGE(USES_TYPE),
+     "Packages, imports by precedence, templates and their linearized parents; declared receiver "
+     "types and `new`. Inferred return types, infix calls and Java classes abstain."},
     {CBM_LANG_HCL, EDGE(IMPORTS) | EDGE(USAGE),
      "Terraform/OpenTofu literal local module sources and Terragrunt literal paths with audited "
      "parent-directory evaluation; remote, dynamic and ambiguous inputs abstain."},
@@ -178,6 +201,10 @@ static void edge_capabilities(cbm_resolve_capabilities_t *out) {
             "require exact source spans and a captured environment input; unsupported images "
             "abstain.";
     }
+    if (out->language == CBM_LANG_PHP)
+        out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
+            "Class-like names through use aliases and the current namespace, at the exact name "
+            "token; imported and absent names outside the project abstain.";
     if (out->language == CBM_LANG_K8S)
         out->edges[CBM_RESOLVE_EDGE_USAGE].limitation =
             "Kubernetes raw literal image repositories and core Secret, ConfigMap, ServiceAccount "
@@ -280,6 +307,70 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
             "Untyped receivers, computed bases, class-body values a metaclass can replace and "
             "unproven decorators abstain.";
         break;
+    case CBM_LANG_PHP:
+        out->adapter = "php_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
+                             CBM_RESOLVE_CAP_TYPE_FLOW;
+        out->limitation =
+            "Namespace, use and global-fallback name resolution; class chains through declared "
+            "parameter, property and return types and consistent local assignment. A chain "
+            "leaving the project, magic members, PHPDoc types and reference effects abstain.";
+        break;
+    case CBM_LANG_ELIXIR:
+        out->adapter = "elixir_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation =
+            "Module functions by name and arity through defmodule, alias and import; quote, "
+            "protocols, computed modules and a graph node shared by two modules abstain.";
+        break;
+    case CBM_LANG_ERLANG:
+        out->adapter = "erlang_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "Functions by name and arity, -import and exported m:f and ?MODULE:f; a "
+                          "variable module or function and macros abstain.";
+        break;
+    case CBM_LANG_ZIG:
+        out->adapter = "zig_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
+                             CBM_RESOLVE_CAP_TYPE_FLOW;
+        out->limitation =
+            "Container declarations, relative @import and members through declared types and "
+            "return types; build-mapped imports, comptime types, captures and a graph node shared "
+            "by two structs of a file abstain.";
+        break;
+    case CBM_LANG_PERL:
+        out->adapter = "perl_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_MEMBER;
+        out->limitation =
+            "Package subs, qualified subs, Exporter imports and Class->m or $self->m through @ISA; "
+            "builtins, computed names and a graph node shared by two packages abstain. A glob "
+            "assigned through a computed name is unbounded and is not modelled.";
+        break;
+    case CBM_LANG_RUBY:
+        out->adapter = "ruby_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation =
+            "Implicit self, self and Const receivers on the lexical class's ancestor chain; blocks "
+            "that can rebind self, metaprogrammed names, unknown ancestors and reopened duplicates "
+            "abstain. Constants inherited from an ancestor are not modelled.";
+        break;
+    case CBM_LANG_HASKELL:
+        out->adapter = "haskell_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation =
+            "Local bindings, top-level declarations, import lists and qualified imports against "
+            "the export list; re-exports, type-class dispatch and two providers abstain.";
+        break;
+    case CBM_LANG_OCAML:
+        out->adapter = "ocaml_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation =
+            "Sequential let scope, local shadowing, module aliases and compilation units in the "
+            "same directory; an open or include of an unknown module and functors abstain.";
+        break;
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
     case CBM_LANG_CSHARP:
@@ -299,14 +390,6 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
             "an extension on an external type abstains, because that type's members are unlisted. "
             "A C# file the grammar cannot read is read without its later conditional branches.";
         break;
-    case CBM_LANG_PHP:
-        out->adapter = "php";
-        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
-                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
-                             CBM_RESOLVE_CAP_TYPE_FLOW;
-        out->limitation = "Source-audited namespaces and direct declared members; unsupported "
-                          "inheritance, extensions, overloads and effects abstain.";
-        break;
     case CBM_LANG_RUST:
         out->adapter = "rust";
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
@@ -322,9 +405,11 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         break;
     case CBM_LANG_DART:
         out->adapter = "dart_source";
-        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
-        out->limitation = "Direct public source bindings with URI, prefix and show/hide rules; "
-                          "parts, reexports and type propagation unimplemented.";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation = "Lexical scope, parts, exports and prefixes; declared and constructed "
+                          "receiver types; collection element types and conditional imports "
+                          "abstain.";
         break;
     case CBM_LANG_LUA:
         out->adapter = "lua_source";
@@ -338,12 +423,20 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->limitation = "Supported source bindings only; no typed cross-file dispatch for the "
                           "containing language.";
         break;
-    case CBM_LANG_SWIFT:
-        out->limitation = "Swift build-module membership and binding proofs unimplemented.";
+    case CBM_LANG_SCALA:
+        out->adapter = "scala_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation = "Packages, imports by precedence, linearized parents; declared receiver "
+                          "types; inferred return types and infix calls abstain.";
         break;
-    case CBM_LANG_PERL:
-        out->limitation =
-            "Single-file legacy engine has no admitted cross-file semantic proof bridge.";
+    case CBM_LANG_SWIFT:
+        out->adapter = "swift_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation = "Modules from SwiftPM targets; outside those, a file decides only for "
+                          "itself. Implicit member expressions and collection element types "
+                          "abstain.";
         break;
     default:
         break;

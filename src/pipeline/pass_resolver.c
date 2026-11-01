@@ -16,6 +16,7 @@
 #include "resolve/rust_names.h"
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
+#include "resolve/source_adapter.h"
 #include "lsp/go_stabilize.h"
 #include "lsp/oo_strict.h"
 #include "result_spill.h"
@@ -104,6 +105,7 @@ typedef struct {
      * node for them, with each branch's span as a variant, so an edge to or from
      * that node is true of the configurations it was found in. */
     bool c_variants;
+    bool one_name;
 } target_proof_t;
 
 typedef struct {
@@ -197,6 +199,7 @@ struct cbm_shared_resolver {
     cbm_resolve_proof_pool_t proofs;
     cbm_resolve_solver_t *solver;
     cbm_go_stabilization_t *go_types;
+    cbm_source_table_t *source_table;
     cbm_shared_resolver_export_summary_t *summary;
     size_t summary_count;
     const char *project;
@@ -233,6 +236,10 @@ typedef struct {
     /* One node per distinct site fact, so its size is the file's own: only the
      * memory core can refuse it, never a cap that would drop edges from a big file. */
     cbm_resolve_proof_pool_t rust_proofs;
+    const cbm_source_unit_t *source_unit;
+    /* Set when the language also has older binding rules: the adapter's sites are
+     * attested here, so they need not claim that older index is complete. */
+    cbm_resolve_binding_index_t *source_bindings;
 } file_resolver_t;
 
 static bool ecma_language(CBMLanguage language) {
@@ -394,20 +401,30 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
              language == CBM_LANG_ARKTS) &&
             ecma_merge_target(prior, definition, file))
             return true;
-        bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
+        bool same_file = !strcmp(prior->file, file);
+        bool same_owner = same_file && !strcmp(prior->label, definition->label);
         bool same_span = prior->start_line == definition->start_line &&
                          prior->end_line == definition->end_line;
-        prior->cross_file |= strcmp(prior->file, file) != 0;
+        prior->cross_file |= !same_file;
         if (same_owner &&
             (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA)) {
             prior->c_variants = true;
             return true;
         }
+        /* Clauses of one function are one declaration wherever the QN carries
+         * no arity. The adapter separately refuses a QN shared by two modules.
+         * A Swift struct and its extension in one file are one type's node too,
+         * under whichever label the graph kept. */
+        bool one_type = same_file && cbm_label_is_type_like(prior->label) &&
+                        cbm_label_is_type_like(definition->label);
+        bool one_name = (same_owner || one_type) && cbm_source_adapter_one_name_one_node(language);
         if (same_owner && !same_span && cbm_oo_language(language) &&
             (strcmp(definition->label, "Class") != 0 || language == CBM_LANG_CSHARP))
             prior->overload_set = true;
         else
-            prior->ambiguous |= !same_owner || !same_span || language == CBM_LANG_PYTHON;
+            prior->ambiguous |=
+                !one_name && (!same_owner || !same_span || language == CBM_LANG_PYTHON);
+        prior->one_name |= one_name;
         prior->mixed_kinds |= strcmp(prior->label, definition->label) != 0;
         prior->rebound |= !declarations_coexist(language);
         if (!target_declared_in(prior, file)) {
@@ -567,10 +584,14 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
      * reaches the same node, so selecting that node is exact whichever member a site
      * means. The node must still be one the census recorded. */
     if (proof->ambiguous)
-        return !proof->mixed_kinds && !proof->rebound && !strcmp(proof->label, node->label) &&
+        return !cbm_source_adapter_supported(resolver->file->language) && !proof->mixed_kinds &&
+               !proof->rebound && !strcmp(proof->label, node->label) &&
                target_declared_in(proof, node->file_path);
     if (strcmp(proof->file, node->file_path) || node->start_line < 0 || node->end_line < 0)
         return false;
+    /* The upsert keeps one clause's span and label; all agreed on the file. */
+    if (proof->one_name)
+        return true;
     if (proof->merged_label && !strcmp(proof->merged_label, node->label) &&
         proof->merged_start_line == (uint32_t)node->start_line &&
         proof->merged_end_line == (uint32_t)node->end_line)
@@ -1553,6 +1574,20 @@ static const char *python_member_star_key(void *context, CBMArena *arena, const 
     const char *key = cbm_arena_sprintf(
         arena, "%.*s.%s", (int)cbm_fqn_symbol_scope_len(lookup->module), lookup->module, name);
     return key && cbm_ht_get(lookup->star_provided, key) ? export_solver_key(arena, key) : NULL;
+}
+
+static bool collect_source_adapter(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
+                                   const cbm_file_info_t *file) {
+    if (!cbm_source_adapter_supported(file->language))
+        return true;
+    size_t length = result->source_len > 0 ? (size_t)result->source_len : 0;
+    char *owned = result->source ? NULL : load_source(file->path, &length);
+    const char *source = result->source ? result->source : owned;
+    bool matches = cbm_result_source_matches(result, source, length, CBM_SOURCE_ORIGIN_RAW);
+    bool ok = cbm_source_collect(resolver->source_table, result, file->language, file->rel_path,
+                                 matches ? source : NULL, length);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
+    return ok;
 }
 
 static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
@@ -2681,13 +2716,16 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->go_types =
         cbm_go_stabilization_new(&resolver->arena, &resolver->proofs, resolver->solver);
     resolver->ecma = cbm_ecma_table_new(&resolver->arena);
+    resolver->source_table = cbm_source_table_new();
+    cbm_source_table_set_packages(resolver->source_table, cbm_pipeline_get_pkgmap());
     resolver->complete = true;
     if (!resolver->exports || !resolver->targets || !resolver->namespaces ||
         !resolver->python_queries || !resolver->python_namespaces ||
         !resolver->python_star_provided || !resolver->python_nested || !resolver->python_members ||
         !resolver->http_defaults || !resolver->http_sites || !resolver->http_unsafe ||
         !resolver->http_candidates || !resolver->http_veto || !resolver->project ||
-        !resolver->solver || !resolver->go_types || !resolver->ecma) {
+        !resolver->solver || !resolver->go_types || !resolver->ecma ||
+        !resolver->source_table) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -2724,6 +2762,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
             ok = export_file(resolver, ctx, result, &files[f]);
         if (ok)
             ok = collect_go_types(resolver, ctx, result, &files[f]);
+        if (ok)
+            ok = collect_source_adapter(resolver, result, &files[f]);
         cbm_pipeline_result_release(result, loaded);
         if (!ok) {
             cbm_log_error("resolver.build.error", "file", files[f].rel_path, "reason",
@@ -2898,6 +2938,7 @@ void cbm_shared_resolver_free(cbm_shared_resolver_t *resolver) {
     cbm_ht_free(resolver->http_veto);
     cbm_go_stabilization_dispose(resolver->go_types);
     cbm_ecma_table_free(resolver->ecma);
+    cbm_source_table_free(resolver->source_table);
     cbm_arena_destroy(&resolver->arena);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, resolver);
 }
@@ -3677,6 +3718,25 @@ static bool python_target_is_variable(const file_resolver_t *resolver, const cha
     return target && target->label && !strcmp(target->label, "Variable");
 }
 
+static bool callable_node(const cbm_gbuf_node_t *node);
+
+/* An adapter's decision for this exact occurrence, never its spelling. */
+static cbm_resolve_result_t source_adapter_result(file_resolver_t *resolver, const char *name,
+                                                  uint32_t start, uint32_t end,
+                                                  CBMSourceOrigin origin, bool invocation) {
+    CBMLanguage language = resolver->file->language;
+    if (!invocation && !cbm_source_adapter_decides_references(language))
+        return unresolved("source_adapter_reference_unsupported");
+    cbm_source_outcome_t outcome;
+    cbm_source_unit_site(resolver->source_unit, start, end,
+                         invocation ? CBM_SOURCE_SITE_CALL : CBM_SOURCE_SITE_REFERENCE, &outcome);
+    if (!outcome.target)
+        return unresolved(outcome.reason);
+    return cbm_resolve_binding_source_site(
+        resolver->source_bindings ? resolver->source_bindings : resolver->bindings, name, start,
+        end, origin, outcome.domain, outcome.target, outcome.rule, outcome.facts, outcome.reason);
+}
+
 static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char *name,
                                            const char *scope, uint32_t start, uint32_t end,
                                            CBMSourceOrigin origin, bool invocation) {
@@ -3710,9 +3770,26 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
     if (file->language == CBM_LANG_C || file->language == CBM_LANG_CPP ||
         file->language == CBM_LANG_CUDA)
         return unresolved("c_translation_unit_binding_unproven");
+    if (cbm_source_adapter_supported(file->language) &&
+        !cbm_source_adapter_has_binding_rules(file->language))
+        return source_adapter_result(resolver, name, start, end, origin, invocation);
     if (file->language == CBM_LANG_DART) {
         cbm_resolve_result_t proof = dart_name_result(resolver, name);
-        return cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
+        proof = cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
+        /* The older rules keep what they prove, unless that is a class they cannot
+         * call, which is the adapter's constructor rule to decide. */
+        const cbm_gbuf_node_t *selected =
+            proof.target ? cbm_gbuf_find_by_qn(file->graph, proof.target) : NULL;
+        if (cbm_resolve_admit(&proof) && (!invocation || callable_node(selected)))
+            return proof;
+        cbm_resolve_result_t decided =
+            source_adapter_result(resolver, name, start, end, origin, invocation);
+        if (decided.target)
+            return decided;
+        /* Both abstained: the occurrence's own reason says more than the file's. */
+        if (invocation)
+            proof.reason = decided.reason;
+        return proof;
     }
     if (file->language == CBM_LANG_PYTHON) {
         cbm_resolve_result_t proof =
@@ -3853,10 +3930,17 @@ static const cbm_resolve_proof_t *local_occurrence_proof(const file_resolver_t *
                                                          const char *relation, uint32_t start,
                                                          uint32_t end, CBMSourceOrigin origin,
                                                          const cbm_resolve_result_t *result) {
+    const cbm_resolve_binding_index_t *authority = resolver->bindings;
     const cbm_resolve_proof_t *local =
-        cbm_resolve_binding_site_proof(resolver->bindings, name, start, end, origin);
+        resolver->source_bindings
+            ? cbm_resolve_binding_site_proof(resolver->source_bindings, name, start, end, origin)
+            : NULL;
+    if (local)
+        authority = resolver->source_bindings;
+    else
+        local = cbm_resolve_binding_site_proof(resolver->bindings, name, start, end, origin);
     const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(local);
-    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(resolver->bindings);
+    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(authority);
     if (!view || !context || !scope || !scope[0])
         return local;
     /* Incomplete or contradictory local authority must reach the sealer as
@@ -4002,7 +4086,13 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
            ((ecma_language(resolver->file->language) ||
              resolver->file->language == CBM_LANG_VUE ||
              resolver->file->language == CBM_LANG_SVELTE) &&
-            target->label && !strcmp(target->label, "Class"))) &&
+            target->label && !strcmp(target->label, "Class")) ||
+           ((resolver->file->language == CBM_LANG_DART ||
+             resolver->file->language == CBM_LANG_SWIFT ||
+             resolver->file->language == CBM_LANG_SCALA) &&
+            target->label &&
+            (!strcmp(target->label, "Class") ||
+             (resolver->file->language == CBM_LANG_SWIFT && !strcmp(target->label, "Struct"))))) &&
           (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
@@ -4116,6 +4206,18 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
         if (!record_result(resolver, call->enclosing_func_qn, call->callee_name, "CALLS",
                            call->site_start_byte, call->site_end_byte, call->source_origin, outcome,
                            call))
+            return false;
+    }
+    size_t extra_count = 0;
+    const cbm_source_extra_call_t *extras =
+        cbm_source_unit_extra_calls(resolver->source_unit, &extra_count);
+    for (size_t e = 0; e < extra_count; e++) {
+        const cbm_source_extra_call_t *extra = &extras[e];
+        cbm_resolve_result_t outcome =
+            source_adapter_result(resolver, extra->name, extra->start, extra->end,
+                                  CBM_SOURCE_ORIGIN_RAW, true);
+        if (!record_result(resolver, extra->scope, extra->name, "CALLS", extra->start, extra->end,
+                           CBM_SOURCE_ORIGIN_RAW, outcome, NULL))
             return false;
     }
     return true;
@@ -4338,10 +4440,33 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
             cbm_resolve_proof_pool_init_project(&resolver.rust_proofs, &arena);
         }
     }
+    /* A standalone caller's project is this one file. */
+    cbm_source_table_t *standalone = NULL;
+    if (cbm_source_adapter_supported(file->language)) {
+        const cbm_source_table_t *table = shared ? shared->source_table : NULL;
+        bool matches =
+            source && cbm_result_source_matches(file->result, source, length, CBM_SOURCE_ORIGIN_RAW);
+        if (!table) {
+            standalone = cbm_source_table_new();
+            if (standalone)
+                (void)cbm_source_collect(standalone, file->result, file->language, file->rel_path,
+                                         matches ? source : NULL, length);
+            table = standalone;
+        }
+        resolver.source_unit =
+            cbm_source_unit_build(&arena, table, file->result, file->language, file->rel_path,
+                                  matches ? source : NULL, length);
+        if (cbm_source_adapter_has_binding_rules(file->language))
+            resolver.source_bindings = cbm_resolve_binding_source_index(
+                &arena, file->result, file->language, source, length);
+    }
     bool begun = cbm_gbuf_resolution_begin(file->output);
     bool ok = rust_ok && begun && resolver.bindings &&
               cbm_resolve_binding_set_identity(resolver.bindings, file->ctx->project_name,
                                                file->rel_path) &&
+              (!resolver.source_bindings ||
+               cbm_resolve_binding_set_identity(resolver.source_bindings, file->ctx->project_name,
+                                                file->rel_path)) &&
               prepare_source_imports(&resolver) && index_semantics(&resolver) &&
               resolve_calls(&resolver, &arena) && resolve_usages(&resolver, &arena) &&
               resolve_writes(&resolver, &arena) && resolve_types(&resolver);
@@ -4351,6 +4476,7 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
     cbm_ht_free(resolver.python_imports);
     cbm_ht_free(resolver.ecma_dependencies);
     cbm_free(CBM_MEM_CLASS_EXTRACT, resolver.sites);
+    cbm_source_table_free(standalone);
     if (owner_tree)
         ts_tree_delete(owner_tree);
     if (rust_tree)

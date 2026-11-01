@@ -763,6 +763,12 @@ static void parse_pubspec_yaml(const char *source, int source_len, const char *r
         snprintf(entry, sizeof(entry), "%s%slib", dir[0] ? dir : "", dir[0] ? "/" : "");
         pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
                          cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+        /* A package: URI names a file under lib, which a dotted QN cannot express. */
+        char key[PKGMAP_PATH_BUF];
+        int written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_DART_ROOT_PREFIX, name);
+        if (written > 0 && (size_t)written < sizeof(key))
+            pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                             cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
         cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     }
     cbm_yaml_free(root);
@@ -1113,6 +1119,19 @@ static char *swift_extract_after(const char *start, const char *end, const char 
  * `Sources/<target_name>` (fixed-convention, same approach parse_cargo_toml
  * takes for `src/lib`). `literal_path` is borrowed; caller retains
  * ownership. */
+static void swift_register_membership(const char *target_name, const char *directory,
+                                      cbm_pkg_entries_t *entries) {
+    char key[PKGMAP_PATH_BUF];
+    int written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_SWIFT_DIR_PREFIX, directory);
+    if (written > 0 && (size_t)written < sizeof(key))
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, target_name));
+    written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_SWIFT_TARGET_PREFIX, target_name);
+    if (written > 0 && (size_t)written < sizeof(key))
+        pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                         cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, directory));
+}
+
 static void swift_register_target(const char *rel_path, const char *target_name,
                                   const char *literal_path, cbm_pkg_entries_t *entries) {
     if (!target_name || !target_name[0]) {
@@ -1128,7 +1147,57 @@ static void swift_register_target(const char *rel_path, const char *target_name,
     }
     char *entry = build_entry_path(rel_path, suffix);
     if (entry) {
+        swift_register_membership(target_name, entry, entries);
         pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, target_name), entry);
+    }
+}
+
+/* A test or executable target is no importable module of its own for other manifests,
+ * but its files do share a module, which is what the resolver's adapter needs. */
+static void swift_register_membership_only(const char *rel_path, const char *target_name,
+                                           const char *literal_path, const char *convention,
+                                           cbm_pkg_entries_t *entries) {
+    if (!target_name || !target_name[0]) {
+        return;
+    }
+    char suffix_buf[PKGMAP_PATH_BUF];
+    const char *suffix = literal_path;
+    if (!suffix || !suffix[0]) {
+        snprintf(suffix_buf, sizeof(suffix_buf), "%s/%s", convention, target_name);
+        suffix = suffix_buf;
+    }
+    char *entry = build_entry_path(rel_path, suffix);
+    if (entry) {
+        swift_register_membership(target_name, entry, entries);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, entry);
+    }
+}
+
+static void swift_scan_membership_only(const char *source, const char *end, const char *rel_path,
+                                       const char *prefix, const char *convention,
+                                       cbm_pkg_entries_t *entries) {
+    const char *cursor = source;
+    while (cursor < end) {
+        const char *hit = swift_find_code_token(cursor, end, prefix);
+        if (!hit) {
+            return;
+        }
+        const char *open = hit + strlen(prefix) - SKIP_ONE;
+        const char *close = swift_match_paren(open, end);
+        if (!close) {
+            return;
+        }
+        char *name = swift_extract_after(open, close, "name:", NULL);
+        if (name) {
+            bool path_present = false;
+            char *literal_path = swift_extract_after(open, close, "path:", &path_present);
+            if (literal_path || !path_present) {
+                swift_register_membership_only(rel_path, name, literal_path, convention, entries);
+            }
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, literal_path);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, name);
+        }
+        cursor = close + SKIP_ONE;
     }
 }
 
@@ -1178,6 +1247,8 @@ static void parse_package_swift(const char *source, int source_len, const char *
                                 cbm_pkg_entries_t *entries) {
     const char *end = source + source_len;
     swift_scan_targets(source, end, rel_path, entries);
+    swift_scan_membership_only(source, end, rel_path, ".testTarget(", "Tests", entries);
+    swift_scan_membership_only(source, end, rel_path, ".executableTarget(", "Sources", entries);
 }
 
 /* ── Public: manifest detection + parsing ──────────────────────── */
@@ -1456,7 +1527,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                 return NULL;
             }
             char *qn = we->items[i].node_fact || !strcmp(entry_rel, ambiguous_pkgmap_value) ||
-                               pkgmap_is_psr4_prefix(we->items[i].pkg_name)
+                               pkgmap_is_psr4_prefix(we->items[i].pkg_name) ||
+                               !strncmp(we->items[i].pkg_name, CBM_PKGMAP_RAW_PREFIX,
+                                        strlen(CBM_PKGMAP_RAW_PREFIX))
                            ? pkgmap_strndup(entry_rel, strlen(entry_rel))
                            : pkgmap_take_raw(cbm_pipeline_fqn_module(project_name, entry_rel));
             if (!qn) {
@@ -2884,10 +2957,75 @@ static bool build_include_path_context(const cbm_file_info_t *files, int count, 
     return true;
 }
 
+/* The compiler requires an Erlang module's name to equal its file's. Elixir names
+ * a module wherever it is declared, nested ones below their parent. */
+static bool source_module_put(CBMHashTable *map, const char *kind, const char *module,
+                              const char *rel) {
+    char key[PKGMAP_PATH_BUF];
+    int length = snprintf(key, sizeof(key), "%s\x1f%s", kind, module);
+    return length > 0 && (size_t)length < sizeof(key) && import_fact_put(map, key, rel);
+}
+
+static const char *elixir_full_module(const CBMFileResult *result, int index, char *out,
+                                      size_t capacity) {
+    const CBMDefinition *def = &result->defs.items[index];
+    int parent = -1;
+    uint32_t best = UINT32_MAX;
+    for (int d = 0; d < result->defs.count; d++) {
+        const CBMDefinition *other = &result->defs.items[d];
+        if (d == index || !other->label || strcmp(other->label, "Class") ||
+            other->start_line > def->start_line || other->end_line < def->end_line)
+            continue;
+        uint32_t span = other->end_line - other->start_line;
+        if (span < best) {
+            best = span;
+            parent = d;
+        }
+    }
+    if (parent < 0) {
+        int length = snprintf(out, capacity, "%s", def->name);
+        return length > 0 && (size_t)length < capacity ? out : NULL;
+    }
+    char prefix[PKGMAP_PATH_BUF];
+    if (!elixir_full_module(result, parent, prefix, sizeof(prefix)))
+        return NULL;
+    int length = snprintf(out, capacity, "%s.%s", prefix, def->name);
+    return length > 0 && (size_t)length < capacity ? out : NULL;
+}
+
+static bool source_module_facts(const cbm_file_info_t *files, int count, CBMFileResult **cache,
+                                CBMHashTable *map) {
+    for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_ERLANG) {
+            char module[PKGMAP_PATH_BUF];
+            const char *leaf = path_leaf(files[i].rel_path);
+            const char *dot = strrchr(leaf, '.');
+            int length = snprintf(module, sizeof(module), "%.*s",
+                                  dot ? (int)(dot - leaf) : (int)strlen(leaf), leaf);
+            if (length <= 0 || (size_t)length >= sizeof(module) ||
+                !source_module_put(map, "erlang_module", module, files[i].rel_path))
+                return false;
+        } else if (files[i].language == CBM_LANG_ELIXIR && cache && cache[i]) {
+            const CBMFileResult *result = cache[i];
+            for (int d = 0; d < result->defs.count; d++) {
+                const CBMDefinition *def = &result->defs.items[d];
+                char module[PKGMAP_PATH_BUF];
+                if (!def->label || strcmp(def->label, "Class") || !def->name)
+                    continue;
+                if (elixir_full_module(result, d, module, sizeof(module)) &&
+                    !source_module_put(map, "elixir_module", module, files[i].rel_path))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool import_context_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int count,
                                  CBMFileResult **cache, CBMHashTable *map) {
     if (!ctx || !map || !build_compile_import_context(ctx, map) ||
-        !build_include_path_context(files, count, map))
+        !build_include_path_context(files, count, map) ||
+        !source_module_facts(files, count, cache, map))
         return false;
     return rust_project_build(ctx, files, count, cache);
 }
@@ -4264,6 +4402,138 @@ static php_use_shape_t php_use_shape(const char *source_rel, const CBMImport *im
     return qualified ? PHP_USE_NAMESPACED : PHP_USE_GLOBAL;
 }
 
+/* A path joined under an ancestor's lib directory: `require 'a/b'` and `use A::B`
+ * search the load path, and a gem or distribution puts its own lib on it. The
+ * nearest ancestor holding the file is the distribution that owns the import. */
+static const cbm_gbuf_node_t *resolve_ancestor_lib_file(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *source_rel,
+                                                        const char *relative) {
+    char *directory = path_dirname(source_rel ? source_rel : "");
+    const cbm_gbuf_node_t *found = NULL;
+    char current[PKGMAP_PATH_BUF];
+    int length = directory ? snprintf(current, sizeof(current), "%s", directory) : -1;
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+    if (length < 0 || (size_t)length >= sizeof(current))
+        return NULL;
+    for (;;) {
+        char path[PKGMAP_PATH_BUF];
+        int written = current[0] && strcmp(current, ".")
+                          ? snprintf(path, sizeof(path), "%s/lib/%s", current, relative)
+                          : snprintf(path, sizeof(path), "lib/%s", relative);
+        if (written > 0 && (size_t)written < sizeof(path)) {
+            found = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+            if (found)
+                return found;
+        }
+        if (!current[0] || !strcmp(current, "."))
+            return NULL;
+        char *slash = strrchr(current, '/');
+        if (slash)
+            *slash = '\0';
+        else
+            current[0] = '\0';
+    }
+}
+
+static const cbm_gbuf_node_t *resolve_source_module(const cbm_pipeline_ctx_t *ctx,
+                                                    CBMHashTable *namespace_map, const char *kind,
+                                                    const char *module, bool *ambiguous) {
+    char key[PKGMAP_PATH_BUF];
+    int length = snprintf(key, sizeof(key), "%s\x1f%s", kind, module);
+    const char *rel = namespace_map && length > 0 && (size_t)length < sizeof(key)
+                          ? cbm_ht_get(namespace_map, key)
+                          : NULL;
+    if (!rel)
+        return NULL;
+    if (!strcmp(rel, ambiguous_pkgmap_value)) {
+        *ambiguous = true;
+        return NULL;
+    }
+    return cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, rel);
+}
+
+/* Import rules of the languages whose adapters live in internal/cbm/resolve. */
+static bool resolve_source_language_import(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                                           const CBMImport *imp, CBMHashTable *namespace_map,
+                                           CBMLanguage lang, bool *ambiguous, const char **reason,
+                                           const cbm_gbuf_node_t **out) {
+    const char *path = imp->module_path;
+    size_t size = strlen(path);
+    char joined[PKGMAP_PATH_BUF];
+    char *directory = NULL;
+    *out = NULL;
+    switch (lang) {
+    case CBM_LANG_ZIG:
+        /* A bare name such as "std" is mapped by the build, not by a path. */
+        *reason = "zig_import_mapped_by_build";
+        if (size < 5 || strcmp(path + size - 4, ".zig") || path[0] == '/' || strchr(path, '\\'))
+            return true;
+        directory = path_dirname(source_rel);
+        *reason = "zig_relative_import";
+        if (directory && cbm_repo_rel_join(directory, path, joined, sizeof(joined)))
+            *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+        return true;
+    case CBM_LANG_RUBY: {
+        char file[PKGMAP_PATH_BUF];
+        bool has_extension = size > 3 && !strcmp(path + size - 3, ".rb");
+        int length = snprintf(file, sizeof(file), "%s%s", path, has_extension ? "" : ".rb");
+        if (length <= 0 || (size_t)length >= sizeof(file) || strstr(path, "#{")) {
+            *reason = "ruby_require_path_not_literal";
+            return true;
+        }
+        if (imp->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH) {
+            directory = path_dirname(source_rel);
+            *reason = "ruby_require_relative";
+            if (directory && cbm_repo_rel_join(directory, file, joined, sizeof(joined)))
+                *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+            return true;
+        }
+        *reason = "ruby_require_gem_lib";
+        *out = resolve_ancestor_lib_file(ctx, source_rel, file);
+        return true;
+    }
+    case CBM_LANG_PERL: {
+        /* `use A::B` loads A/B.pm from @INC; a distribution's lib is on it. */
+        char file[PKGMAP_PATH_BUF];
+        int length = snprintf(file, sizeof(file), "%s.pm", path);
+        if (length <= 0 || (size_t)length >= sizeof(file) || !strstr(path, "::")) {
+            /* A single word is most often a pragma; only a real file binds it. */
+            if (length <= 0 || (size_t)length >= sizeof(file)) {
+                *reason = "perl_module_name_too_long";
+                return true;
+            }
+        }
+        for (char *p = file; (p = strstr(p, "::"));) {
+            *p = '/';
+            memmove(p + 1, p + 2, strlen(p + 2) + 1);
+        }
+        *reason = "perl_use_distribution_lib";
+        *out = resolve_ancestor_lib_file(ctx, source_rel, file);
+        return true;
+    }
+    case CBM_LANG_ERLANG:
+        if (imp->kind == CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH) {
+            directory = path_dirname(source_rel);
+            *reason = "erlang_include_next_to_source";
+            if (directory && cbm_repo_rel_join(directory, path, joined, sizeof(joined)))
+                *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+            return true;
+        }
+        *reason = "erlang_module_is_its_file";
+        *out = resolve_source_module(ctx, namespace_map, "erlang_module", path, ambiguous);
+        return true;
+    case CBM_LANG_ELIXIR:
+        *reason = "elixir_declared_module";
+        *out = resolve_source_module(ctx, namespace_map, "elixir_module", path, ambiguous);
+        return true;
+    default:
+        return false;
+    }
+}
+
 static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ctx,
                                                     const char *source_rel,
                                                     const char *source_file_qn,
@@ -4283,6 +4553,10 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
         *reason = "unsupported_import_language";
         return NULL;
     }
+    const cbm_gbuf_node_t *source_language_target = NULL;
+    if (resolve_source_language_import(ctx, source_rel, imp, namespace_map, lang, ambiguous, reason,
+                                       &source_language_target))
+        return source_language_target;
     /* ECMAScript carriers retain raw StringLiteral spelling. Until escape
      * decoding is proved, a backslash must not become a filesystem separator
      * during File-QN lookup. This shared negative gate also protects callable
@@ -4308,6 +4582,25 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
     }
     if (lang == CBM_LANG_DART) {
         *reason = "dart_import_uri_unproven";
+        if (imp->kind == CBM_IMPORT_KIND_DART_PACKAGE_URI) {
+            /* A pubspec's name maps package:name/x.dart to its lib/x.dart. */
+            const char *rest = imp->module_path + strlen("package:");
+            const char *slash = strchr(rest, '/');
+            CBMHashTable *packages = cbm_pipeline_get_pkgmap();
+            char name[PKGMAP_PATH_BUF], path[PKGMAP_PATH_BUF];
+            int length = slash ? snprintf(name, sizeof(name), "%s%.*s", CBM_PKGMAP_DART_ROOT_PREFIX,
+                                          (int)(slash - rest), rest)
+                               : 0;
+            if (!packages || length <= 0 || (size_t)length >= sizeof(name))
+                return NULL;
+            const char *lib = cbm_ht_get(packages, name);
+            *reason = "dart_package_not_in_project";
+            if (!lib || !cbm_repo_rel_join(lib, slash + 1, path, sizeof(path)))
+                return NULL;
+            *reason = "dart_package_uri_through_pubspec";
+            const cbm_gbuf_node_t *target = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+            return target && import_language_matches(CBM_LANG_DART, target) ? target : NULL;
+        }
         if (imp->kind != CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH)
             return NULL;
         char *directory = path_dirname(source_rel);
@@ -5561,14 +5854,21 @@ int cbm_pipeline_php_import_map(const cbm_gbuf_t *graph, const char *project,
     const char *const *targets = bindings.targets ? bindings.targets : bindings.proven_targets;
     int count = 0;
     bool ok = keys && values && by_local;
-    for (int i = 0; ok && i < capacity; i++) {
-        const CBMImport *import = &result->imports.items[i];
-        if (!import->local_name || !import->local_name[0])
-            continue;
-        char *value = targets ? php_bound_class(graph, project, import, targets[i]) : NULL;
-        if (!value)
-            value = strdup("");
-        ok = python_map_put(by_local, keys, values, &count, import->local_name, value);
+    /* This map answers for class names. `use` and `use function` of one local name
+     * bind in separate tables, so a function or constant import speaks here only for
+     * a name no class import holds, which keeps it a veto of a guessed class. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; ok && i < capacity; i++) {
+            const CBMImport *import = &result->imports.items[i];
+            if (!import->local_name || !import->local_name[0] ||
+                (import->kind == CBM_IMPORT_KIND_DEFAULT) != (pass == 0) ||
+                (pass == 1 && cbm_ht_has(by_local, import->local_name)))
+                continue;
+            char *value = targets ? php_bound_class(graph, project, import, targets[i]) : NULL;
+            if (!value)
+                value = strdup("");
+            ok = python_map_put(by_local, keys, values, &count, import->local_name, value);
+        }
     }
     cbm_pipeline_php_vendor_names_free(&bindings);
     cbm_ht_free(by_local);

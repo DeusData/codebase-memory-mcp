@@ -381,7 +381,9 @@ static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, con
             strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0 ||
             /* PureScript: exp_apply's function head is an `exp_name` whose
              * text is the (possibly qualified) function name. */
-            strcmp(ck, "exp_name") == 0) {
+            strcmp(ck, "exp_name") == 0 ||
+            /* Haskell `Cfg.load x`: the qualified name is the call's head. */
+            strcmp(ck, "qualified") == 0) {
             return cbm_node_text(a, callee, source);
         }
         if (!fp_is_apply_kind(ck)) {
@@ -4397,13 +4399,18 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     return selection;
 }
 
-static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
+static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx, TSNode site,
                                            const CBMPrimaryCalleeSelection *callee) {
     if (!callee->name || !callee->name[0]) {
         return false;
     }
     if (!cbm_is_keyword(callee->name, ctx->language) ||
         cbm_is_resolvable_builtin(callee->name, ctx->language)) {
+        return true;
+    }
+    /* `Foo->new` names a method in a grammar-proven role. A generic keyword list
+     * must not erase the most common method call in Perl. */
+    if (ctx->language == CBM_LANG_PERL && !strcmp(ts_node_type(site), "method_call_expression")) {
         return true;
     }
     /* Contextual words such as get/set are legal ECMAScript identifiers in
@@ -4527,7 +4534,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         CBMPrimaryCalleeSelection callee = select_primary_callee(ctx, node, state);
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
-        if (primary_callee_name_is_allowed(ctx, &callee)) {
+        if (primary_callee_name_is_allowed(ctx, node, &callee)) {
             CBMCall call = {0};
             call.callee_name = callee.name;
             call.enclosing_func_qn = state->enclosing_func_qn;

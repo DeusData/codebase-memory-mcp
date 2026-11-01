@@ -229,9 +229,11 @@ TEST(resolver_binding_generic_unmodeled_library_context_is_not_complete) {
         cbm_resolve_binding_build(&arena, result, CBM_LANG_DART, dart, strlen(dart));
     ASSERT(!cbm_resolve_binding_namespace_complete(index));
     ASSERT_STR_EQ(cbm_resolve_binding_status(index), "dart_library_namespace_expansion_required");
+    /* Swift's module membership is now read from SwiftPM targets by its adapter,
+     * which decides per occurrence; this index only attests those sites. */
     cbm_resolve_binding_index_t *swift =
         cbm_resolve_binding_build(&arena, NULL, CBM_LANG_SWIFT, "", 0);
-    ASSERT_STR_EQ(cbm_resolve_binding_status(swift), "swift_build_module_membership_required");
+    ASSERT_STR_EQ(cbm_resolve_binding_status(swift), "source_adapter_binding");
     cbm_arena_destroy(&arena);
     cbm_free_result(result);
     PASS();
@@ -444,8 +446,11 @@ TEST(resolver_binding_dart_cross_file_conflicts_and_missing_namespace) {
     const dart_golden_t fixtures[] = {
         {"import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
          "int target() => 2;\n", GENERIC_PROJECT ".lib.target", false},
+        /* This pinned an abstention. Two imports providing one name are an error at its
+         * use, so in code that compiles missing.dart, likely generated, cannot provide
+         * target, and lib.dart's is the one selected. */
         {"import 'lib.dart';\nimport 'missing.dart';\nvoid caller() { target(); }\n", NULL,
-         GENERIC_PROJECT ".lib.target", false},
+         GENERIC_PROJECT ".lib.target", true},
         {"import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
          "var target = 2;\n", GENERIC_PROJECT ".lib.target", false},
         {"import 'lib.dart';\nvoid caller() { _target(); }\n", NULL, GENERIC_PROJECT ".lib._target",
@@ -2382,9 +2387,9 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
              report.genuine == 3 && report.found == 1 && report.missing == 2 &&
              !report.required_missing && !report.wrong && ok;
         if (store) {
-            /* The required direct IMPORTS control has legacy 0/0 coordinates.
-             * Check exact physical endpoints and row/edge agreement without
-             * claiming that those coordinates identify an exact raw site. */
+            /* The required direct IMPORTS control now carries the URI literal's exact
+             * bytes, which this pins along with the physical endpoints and agreement
+             * between the row and the edge. It used to carry 0/0 legacy coordinates. */
             ok = generic_count(store,
                                "SELECT count(*) FROM resolver_occurrences r JOIN nodes s ON "
                                "s.project=r.project AND s.qualified_name=r.scope JOIN nodes t "
@@ -2394,7 +2399,7 @@ TEST(resolver_binding_dart_import_requires_complete_direct_uri) {
                                "e.source_id=s.id AND e.target_id=t.id AND e.type=r.relation "
                                "WHERE r.project='dart-uri' AND r.relation='IMPORTS' AND "
                                "r.emitted=1 "
-                               "AND r.start_byte=0 AND r.end_byte=0 AND "
+                               "AND r.start_byte=7 AND r.end_byte=20 AND "
                                "s.file_path='direct.dart' "
                                "AND s.label='File' AND t.file_path='stub.dart' AND "
                                "t.label='File'") == 1 &&

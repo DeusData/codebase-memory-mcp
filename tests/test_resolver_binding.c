@@ -252,7 +252,7 @@ TEST(resolver_binding_unsupported_language_is_explicit) {
     cbm_arena_init(&arena);
     CBMFileResult result = {.module_qn = "test.file"};
     cbm_resolve_binding_index_t *index =
-        cbm_resolve_binding_build(&arena, &result, CBM_LANG_RUBY, "helper()", 8);
+        cbm_resolve_binding_build(&arena, &result, CBM_LANG_JULIA, "helper()", 8);
     ASSERT_STR_EQ(cbm_resolve_binding_status(index), "unsupported_binding_language");
     cbm_resolve_result_t candidate = local_candidate(&arena, &result, "helper");
     cbm_resolve_result_t unresolved =

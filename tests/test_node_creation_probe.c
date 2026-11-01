@@ -1272,13 +1272,7 @@ TEST(probe_ruby_class_calls) {
          .target = {.file = "greeter.rb",
                     .suffix = "format_greeting",
                     .declaration_line = 12,
-                    .declaration_text = "  def format_greeting(n)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-ruby-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "  def format_greeting(n)"}}};
     NcpMetrics m = ncp_metrics_quality("greeter.rb",
                                        "class Greeter\n"
                                        "  def initialize(name)\n"
@@ -1301,7 +1295,7 @@ TEST(probe_ruby_class_calls) {
     ASSERT_TRUE(m.functions >= 1);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1334,26 +1328,14 @@ TEST(probe_ruby_toplevel_functions) {
          .target = {.file = "calc.rb",
                     .suffix = "add",
                     .declaration_line = 1,
-                    .declaration_text = "def add(a, b)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-ruby-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "def add(a, b)"}},
         {.case_id = "probe_ruby_toplevel_functions-2",
          .site = {.file = "calc.rb", .caller = "run", .needle = "mul(2, 3)", .occurrence_index = 0},
          .relation = "CALLS",
          .target = {.file = "calc.rb",
                     .suffix = "mul",
                     .declaration_line = 5,
-                    .declaration_text = "def mul(a, b)"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-ruby-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "def mul(a, b)"}}};
     NcpMetrics m = ncp_metrics_quality("calc.rb",
                                        "def add(a, b)\n  a + b\nend\n\n"
                                        "def mul(a, b)\n  a * b\nend\n\n"
@@ -1363,7 +1345,7 @@ TEST(probe_ruby_toplevel_functions) {
     ASSERT_TRUE(m.functions >= 3); /* add, mul, run */
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1383,13 +1365,7 @@ TEST(probe_swift_struct_calls) {
          .target = {.file = "geo.swift",
                     .suffix = "origin",
                     .declaration_line = 12,
-                    .declaration_text = "func origin() -> Point { return Point(x: 0, y: 0) }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-swift-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "func origin() -> Point { return Point(x: 0, y: 0) }"}},
         {.case_id = "probe_swift_struct_calls-2",
          .site = {.file = "geo.swift",
                   .caller = "run",
@@ -1399,13 +1375,7 @@ TEST(probe_swift_struct_calls) {
          .target = {.file = "geo.swift",
                     .suffix = "distanceTo",
                     .declaration_line = 5,
-                    .declaration_text = "    func distanceTo(_ other: Point) -> Double {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-swift-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "    func distanceTo(_ other: Point) -> Double {"}},
         {.case_id = "probe_swift_struct_calls-3",
          .site = {.file = "geo.swift",
                   .caller = "run",
@@ -1415,13 +1385,7 @@ TEST(probe_swift_struct_calls) {
          .target = {.file = "geo.swift",
                     .suffix = "Point",
                     .declaration_line = 1,
-                    .declaration_text = "struct Point {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-swift-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "struct Point {"}}};
     NcpMetrics m = ncp_metrics_quality("geo.swift",
                                        "struct Point {\n"
                                        "    var x: Double\n"
@@ -1443,7 +1407,7 @@ TEST(probe_swift_struct_calls) {
     ASSERT_TRUE(m.functions >= 1);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1506,13 +1470,7 @@ TEST(probe_scala_class_object) {
          .target = {.file = "calc.scala",
                     .suffix = "mul",
                     .declaration_line = 3,
-                    .declaration_text = "    def mul(x: Int): Int = base * x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-scala-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "    def mul(x: Int): Int = base * x"}},
         {.case_id = "probe_scala_class_object-2",
          .site = {.file = "calc.scala",
                   .caller = "addThenMul",
@@ -1522,13 +1480,7 @@ TEST(probe_scala_class_object) {
          .target = {.file = "calc.scala",
                     .suffix = "add",
                     .declaration_line = 2,
-                    .declaration_text = "    def add(x: Int): Int = base + x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-scala-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "    def add(x: Int): Int = base + x"}}};
     NcpMetrics m = ncp_metrics_quality("calc.scala",
                                        "class Calc(base: Int) {\n"
                                        "    def add(x: Int): Int = base + x\n"
@@ -1547,7 +1499,7 @@ TEST(probe_scala_class_object) {
     ASSERT_TRUE(m.functions + m.methods >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1831,13 +1783,7 @@ TEST(probe_elixir_module_calls) {
          .target = {.file = "calc.ex",
                     .suffix = "add",
                     .declaration_line = 2,
-                    .declaration_text = "  def add(a, b), do: a + b"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-elixir-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "  def add(a, b), do: a + b"}},
         {.case_id = "probe_elixir_module_calls-2",
          .site = {.file = "calc.ex",
                   .caller = "add_then_mul",
@@ -1847,13 +1793,7 @@ TEST(probe_elixir_module_calls) {
          .target = {.file = "calc.ex",
                     .suffix = "mul",
                     .declaration_line = 4,
-                    .declaration_text = "  def mul(a, b), do: a * b"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-elixir-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "  def mul(a, b), do: a * b"}}};
     NcpMetrics m = ncp_metrics_quality("calc.ex",
                                        "defmodule Calc do\n"
                                        "  def add(a, b), do: a + b\n\n"
@@ -1868,7 +1808,7 @@ TEST(probe_elixir_module_calls) {
     ASSERT_TRUE(m.types >= 1 || m.functions >= 1); /* module as Class or Function */
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1901,39 +1841,21 @@ TEST(probe_haskell_functions_calls) {
          .target = {.file = "math.hs",
                     .suffix = "square",
                     .declaration_line = 4,
-                    .declaration_text = "square x = x * x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-haskell-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "square x = x * x"}},
         {.case_id = "probe_haskell_functions_calls-2",
          .site = {.file = "math.hs", .caller = "run", .needle = "cube n", .occurrence_index = 0},
          .relation = "CALLS",
          .target = {.file = "math.hs",
                     .suffix = "cube",
                     .declaration_line = 7,
-                    .declaration_text = "cube x = x * square x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-haskell-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "cube x = x * square x"}},
         {.case_id = "probe_haskell_functions_calls-3",
          .site = {.file = "math.hs", .caller = "run", .needle = "square n", .occurrence_index = 0},
          .relation = "CALLS",
          .target = {.file = "math.hs",
                     .suffix = "square",
                     .declaration_line = 4,
-                    .declaration_text = "square x = x * x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-haskell-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "square x = x * x"}}};
     NcpMetrics m = ncp_metrics_quality("math.hs",
                                        "module Math where\n\n"
                                        "square :: Int -> Int\n"
@@ -1947,7 +1869,7 @@ TEST(probe_haskell_functions_calls) {
     ASSERT_TRUE(m.functions >= 1); /* at least one of square/cube/run */
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1987,13 +1909,7 @@ TEST(probe_zig_functions_calls) {
          .target = {.file = "math.zig",
                     .suffix = "square",
                     .declaration_line = 3,
-                    .declaration_text = "fn square(x: i32) i32 {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-zig-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "fn square(x: i32) i32 {"}},
         {.case_id = "probe_zig_functions_calls-2",
          .site = {.file = "math.zig",
                   .caller = "sumSquares",
@@ -2003,13 +1919,7 @@ TEST(probe_zig_functions_calls) {
          .target = {.file = "math.zig",
                     .suffix = "square",
                     .declaration_line = 3,
-                    .declaration_text = "fn square(x: i32) i32 {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-zig-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "fn square(x: i32) i32 {"}},
         {.case_id = "probe_zig_functions_calls-3",
          .site = {.file = "math.zig",
                   .caller = "main",
@@ -2019,13 +1929,7 @@ TEST(probe_zig_functions_calls) {
          .target = {.file = "math.zig",
                     .suffix = "sumSquares",
                     .declaration_line = 7,
-                    .declaration_text = "pub fn sumSquares(a: i32, b: i32) i32 {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-zig-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "pub fn sumSquares(a: i32, b: i32) i32 {"}}};
     NcpMetrics m = ncp_metrics_quality("math.zig",
                                        "const std = @import(\"std\");\n\n"
                                        "fn square(x: i32) i32 {\n"
@@ -2043,7 +1947,7 @@ TEST(probe_zig_functions_calls) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -2086,13 +1990,7 @@ TEST(probe_ocaml_functions_calls) {
          .target = {.file = "math.ml",
                     .suffix = "square",
                     .declaration_line = 1,
-                    .declaration_text = "let square x = x * x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-ocaml-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "let square x = x * x"}},
         {.case_id = "probe_ocaml_functions_calls-2",
          .site = {.file = "math.ml",
                   .caller = "sum_squares",
@@ -2102,13 +2000,7 @@ TEST(probe_ocaml_functions_calls) {
          .target = {.file = "math.ml",
                     .suffix = "square",
                     .declaration_line = 1,
-                    .declaration_text = "let square x = x * x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-ocaml-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "let square x = x * x"}},
         {.case_id = "probe_ocaml_functions_calls-3",
          .site = {.file = "math.ml",
                   .caller = "sum_squares",
@@ -2118,13 +2010,7 @@ TEST(probe_ocaml_functions_calls) {
          .target = {.file = "math.ml",
                     .suffix = "square",
                     .declaration_line = 1,
-                    .declaration_text = "let square x = x * x"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-ocaml-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "let square x = x * x"}}};
     NcpMetrics m = ncp_metrics_quality("math.ml",
                                        "let square x = x * x\n\n"
                                        "let cube x = x * square x\n\n"
@@ -2138,7 +2024,7 @@ TEST(probe_ocaml_functions_calls) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -2160,13 +2046,7 @@ TEST(probe_erlang_functions_calls) {
          .target = {.file = "math.erl",
                     .suffix = "square",
                     .declaration_line = 4,
-                    .declaration_text = "square(X) -> X * X."},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-erlang-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "square(X) -> X * X."}},
         {.case_id = "probe_erlang_functions_calls-2",
          .site = {.file = "math.erl",
                   .caller = "sum_squares",
@@ -2176,13 +2056,7 @@ TEST(probe_erlang_functions_calls) {
          .target = {.file = "math.erl",
                     .suffix = "square",
                     .declaration_line = 4,
-                    .declaration_text = "square(X) -> X * X."},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-erlang-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "square(X) -> X * X."}},
         {.case_id = "probe_erlang_functions_calls-3",
          .site = {.file = "math.erl",
                   .caller = "run",
@@ -2192,13 +2066,7 @@ TEST(probe_erlang_functions_calls) {
          .target = {.file = "math.erl",
                     .suffix = "sum_squares",
                     .declaration_line = 6,
-                    .declaration_text = "sum_squares(A, B) -> square(A) + square(B)."},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-erlang-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "sum_squares(A, B) -> square(A) + square(B)."}}};
     NcpMetrics m = ncp_metrics_quality("math.erl",
                                        "-module(math).\n"
                                        "-export([run/0, sum_squares/2]).\n\n"
@@ -2211,7 +2079,7 @@ TEST(probe_erlang_functions_calls) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -2333,13 +2201,7 @@ TEST(probe_perl_functions_calls) {
          .target = {.file = "math.pl",
                     .suffix = "square",
                     .declaration_line = 5,
-                    .declaration_text = "sub square {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-perl-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "sub square {"}},
         {.case_id = "probe_perl_functions_calls-2",
          .site = {.file = "math.pl",
                   .caller = "sum_squares",
@@ -2349,13 +2211,7 @@ TEST(probe_perl_functions_calls) {
          .target = {.file = "math.pl",
                     .suffix = "square",
                     .declaration_line = 5,
-                    .declaration_text = "sub square {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-perl-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+                    .declaration_text = "sub square {"}},
         {.case_id = "probe_perl_functions_calls-3",
          .site = {.file = "math.pl",
                   .caller = "run",
@@ -2365,13 +2221,7 @@ TEST(probe_perl_functions_calls) {
          .target = {.file = "math.pl",
                     .suffix = "sum_squares",
                     .declaration_line = 10,
-                    .declaration_text = "sub sum_squares {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-perl-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+                    .declaration_text = "sub sum_squares {"}}};
     NcpMetrics m = ncp_metrics_quality("math.pl",
                                        "#!/usr/bin/perl\n"
                                        "use strict;\n"
@@ -2393,7 +2243,7 @@ TEST(probe_perl_functions_calls) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }

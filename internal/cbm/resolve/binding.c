@@ -1,4 +1,5 @@
 #include "binding.h"
+#include "source_adapter.h"
 #include "../helpers.h"
 #include "../lang_specs.h"
 #include <stdlib.h>
@@ -4838,9 +4839,10 @@ static bool javascript_module_by_source(const CBMFileResult *result, CBMLanguage
            (!strcmp(extension, ".mjs") || !strcmp(extension, ".cjs") || !strcmp(extension, ".jsx"));
 }
 
-cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
-    CBMArena *arena, const CBMFileResult *result, CBMLanguage language, const char *source,
-    size_t source_len, bool declared_module) {
+static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFileResult *result,
+                                                  CBMLanguage language, const char *source,
+                                                  size_t source_len, bool declared_module,
+                                                  bool adapter_sites_only) {
     cbm_resolve_binding_index_t *index = arena ? cbm_arena_calloc(arena, sizeof(*index)) : NULL;
     if (!index) {
         return NULL;
@@ -4872,11 +4874,17 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
         index->reason = "binding_source_snapshot_mismatch";
         return index;
     }
+    /* These languages state their rules per occurrence in adapter_<lang>.c.
+     * This index only attests the exact site through cbm_resolve_binding_source_site. */
+    if (adapter_sites_only ||
+        (cbm_source_adapter_supported(language) && !cbm_source_adapter_has_binding_rules(language))) {
+        index->analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
+        index->reason = "source_adapter_binding";
+        return index;
+    }
     bool component = language == CBM_LANG_VUE || language == CBM_LANG_SVELTE;
     if (language != CBM_LANG_PYTHON && language != CBM_LANG_LUA && language != CBM_LANG_DART &&
         language != CBM_LANG_RUST && !javascript_language(language) && !component) {
-        if (language == CBM_LANG_SWIFT)
-            index->reason = "swift_build_module_membership_required";
         return index;
     }
     if (!result || !source || !result->module_qn || source_len > UINT32_MAX || result->has_error ||
@@ -4989,11 +4997,24 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
     return index;
 }
 
+cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(
+    CBMArena *arena, const CBMFileResult *result, CBMLanguage language, const char *source,
+    size_t source_len, bool declared_module) {
+    return binding_build(arena, result, language, source, source_len, declared_module, false);
+}
+
 cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
                                                        CBMLanguage language, const char *source,
                                                        size_t source_len) {
-    return cbm_resolve_binding_build_declared_module(arena, result, language, source, source_len,
-                                                     false);
+    return binding_build(arena, result, language, source, source_len, false, false);
+}
+
+cbm_resolve_binding_index_t *cbm_resolve_binding_source_index(CBMArena *arena,
+                                                              const CBMFileResult *result,
+                                                              CBMLanguage language,
+                                                              const char *source,
+                                                              size_t source_len) {
+    return binding_build(arena, result, language, source, source_len, false, true);
 }
 
 static const binding_name_t *find_scoped_name(const cbm_resolve_binding_index_t *index,
@@ -5600,6 +5621,50 @@ cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_ind
         .target = row->target,
         .candidate_count = 1,
         .reason = "js_member_declaration"};
+    return binding_query_finish(index, &query, result);
+}
+
+static uint32_t source_rule_fact(cbm_resolve_rule_t rule) {
+    switch (rule) {
+    case CBM_RESOLVE_RULE_SCOPE_BINDING:
+        return CBM_RESOLVE_FACT_SCOPE_BOUND;
+    case CBM_RESOLVE_RULE_IMPORT_BINDING:
+        return CBM_RESOLVE_FACT_IMPORT_BOUND;
+    case CBM_RESOLVE_RULE_TYPE_MEMBER:
+        return CBM_RESOLVE_FACT_RECEIVER_TYPED;
+    case CBM_RESOLVE_RULE_LANGUAGE_BINDING:
+        return CBM_RESOLVE_FACT_LANGUAGE_BOUND;
+    default:
+        return 0;
+    }
+}
+
+cbm_resolve_result_t cbm_resolve_binding_source_site(const cbm_resolve_binding_index_t *index,
+                                                     const char *name, uint32_t start, uint32_t end,
+                                                     CBMSourceOrigin origin, const char *domain,
+                                                     const char *target, cbm_resolve_rule_t rule,
+                                                     uint32_t facts, const char *decision) {
+    cbm_resolve_lookup_t query;
+    binding_query_begin(index, &query, name, start, end, origin);
+    uint32_t fact = source_rule_fact(rule);
+    cbm_resolve_result_t result = {.reason = decision};
+    if (!index || index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name || !*name ||
+        origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !target || !*target || !fact)
+        return binding_query_finish(index, &query, result);
+    (void)cbm_resolve_lookup_observe(&query, "source_occurrences", name, name,
+                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0,
+                                     true, "exact_occurrence_observed");
+    (void)cbm_resolve_lookup_observe(&query, domain ? domain : "source_adapter", name, target,
+                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0,
+                                     true, decision);
+    result.binding = CBM_RESOLVE_BINDING_UNIQUE;
+    result.domain = CBM_RESOLVE_DOMAIN_PROJECT;
+    result.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
+    result.rule = rule;
+    result.facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                   CBM_RESOLVE_FACT_OCCURRENCE_EXACT | fact | facts;
+    result.target = target;
+    result.candidate_count = 1;
     return binding_query_finish(index, &query, result);
 }
 

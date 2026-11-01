@@ -442,18 +442,18 @@ TEST(resolver_diagnostics_capabilities_are_explicit_and_opt_in) {
     yyjson_val *python = yyjson_arr_get(rows, CBM_LANG_PYTHON);
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(python, "adapter")), "python");
     ASSERT(yyjson_arr_size(yyjson_obj_get(python, "supported_proof_subsets")) > 0);
-    yyjson_val *swift = yyjson_arr_get(rows, CBM_LANG_SWIFT);
-    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(swift, "supported_proof_subsets")), 0);
-    ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(swift, "limitation")));
+    yyjson_val *julia = yyjson_arr_get(rows, CBM_LANG_JULIA);
+    ASSERT_EQ(yyjson_arr_size(yyjson_obj_get(julia, "supported_proof_subsets")), 0);
+    ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(julia, "limitation")));
     yyjson_val *python_edges = yyjson_obj_get(python, "edge_capabilities");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(python_edges, 1), "availability")),
                   "supported_subset");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(python_edges, 4), "availability")),
                   "unsupported");
-    yyjson_val *swift_edges = yyjson_obj_get(swift, "edge_capabilities");
+    yyjson_val *julia_edges = yyjson_obj_get(julia, "edge_capabilities");
     for (size_t relation = 0; relation < 7; relation++)
         ASSERT_STR_EQ(
-            yyjson_get_str(yyjson_obj_get(yyjson_arr_get(swift_edges, relation), "availability")),
+            yyjson_get_str(yyjson_obj_get(yyjson_arr_get(julia_edges, relation), "availability")),
             "unsupported");
     ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(resolver_report(doc), "status")), "unavailable");
     yyjson_doc_free(doc);

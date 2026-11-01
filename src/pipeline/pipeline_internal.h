@@ -737,6 +737,14 @@ void cbm_pipeline_diagram_parent_edge(cbm_pipeline_ctx_t *ctx, const CBMDefiniti
 void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result);
 
 /* Get the current pipeline's package map (NULL if none). */
+/* Package-map keys under this prefix hold a raw value, not a dotted QN.
+ *   dart: a Dart package's name -> its repo-relative lib directory
+ *   swift-dir: a SwiftPM target's directory -> the target's name
+ *   swift-target: a SwiftPM target's name -> its directory */
+#define CBM_PKGMAP_RAW_PREFIX "@cbm:raw:"
+#define CBM_PKGMAP_DART_ROOT_PREFIX "@cbm:raw:dart:"
+#define CBM_PKGMAP_SWIFT_DIR_PREFIX "@cbm:raw:swift-dir:"
+#define CBM_PKGMAP_SWIFT_TARGET_PREFIX "@cbm:raw:swift-target:"
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 

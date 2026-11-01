@@ -207,6 +207,22 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
 bool cbm_resolve_binding_jsx_occurrence(const cbm_resolve_binding_index_t *index, const char *name,
                                         uint32_t start, uint32_t end, CBMSourceOrigin origin);
 
+/* Attests one exact occurrence for a decision a source adapter already made
+ * under its language's rule. Adds no authority of its own: the rule, its domain
+ * and the selected declaration are the adapter's, and each is recorded. */
+/* An index that only attests adapter sites, for a language that also has its own
+ * binding index whose completeness must not be claimed by those sites. */
+cbm_resolve_binding_index_t *cbm_resolve_binding_source_index(CBMArena *arena,
+                                                              const CBMFileResult *result,
+                                                              CBMLanguage language,
+                                                              const char *source,
+                                                              size_t source_len);
+cbm_resolve_result_t cbm_resolve_binding_source_site(const cbm_resolve_binding_index_t *index,
+                                                     const char *name, uint32_t start, uint32_t end,
+                                                     CBMSourceOrigin origin, const char *domain,
+                                                     const char *target, cbm_resolve_rule_t rule,
+                                                     uint32_t facts, const char *decision);
+
 /* A fixed diagnostic capability/reason string, never an inferred success. */
 const char *cbm_resolve_binding_status(const cbm_resolve_binding_index_t *index);
 
