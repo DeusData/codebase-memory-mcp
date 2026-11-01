@@ -10,18 +10,23 @@
  * document says (the field tests' rule for bare file names).
  *
  * Into the file: a line range picks the innermost code definition that holds
- * the WHOLE range; a member (`path::Name`, `path::Owner::name`) picks the one
- * definition of that name in the file. Otherwise the edge goes to the file,
- * and the range stays on it ("target_lines"). Every edge is exact: the
- * document wrote the path.
+ * the WHOLE range; a member (`path::Name`, `path::Owner::name`; a call form
+ * `path::name()` reads as `path::name`) picks the one definition of that name
+ * in the file. Otherwise the edge goes to the file, and the range stays on it
+ * ("target_lines"); so does a member the code file writes without a
+ * definition the graph binds (a macro, a prototype, an enum member, a class
+ * attribute). Every edge is exact: the document wrote the path.
  *
  * Unresolved:
  *   missing    the path is not in the graph, but its directory is, or a
  *              directory above it that the reference wrote is: the document
  *              names something that is not there (doc rot; a moved or
- *              renamed directory)
+ *              renamed directory); or a member whose name the code file
+ *              does not write at all
  *   ambiguous  a file name alone that is not next to the document but exists
- *              elsewhere in the repository: the document does not say which
+ *              elsewhere in the repository: the document does not say which;
+ *              or a member name the file defines more than once, with no
+ *              owner to pick one
  * Not a reference to this repository at all (LOCAL: no edge, no row): a link
  * back into the same document; a path that is neither indexed nor of a type
  * the indexer reads (an image, an archive, an extensionless page); a path
@@ -35,11 +40,14 @@
 #include "discover/discover.h" /* cbm_language_for_filename */
 #include "doclink.h"
 #include "foundation/arena.h"
+#include "foundation/compat_fs.h" /* cbm_fopen */
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
+#include "foundation/limits.h" /* cbm_max_file_bytes */
 #include "foundation/mem_core.h"
 #include "graph_buffer/graph_buffer.h"
 
+#include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +98,7 @@ typedef struct {
 typedef struct {
     const char *project;
     size_t project_len;
+    const char *repo;       /* the repository root (NULL: unknown; no file is read) */
     const char **run_paths; /* run_file -> rel_path (NULL: not a Markdown file of this run) */
     int run_count;
     /* base name -> number of File nodes with it (a file name alone that is
@@ -287,6 +296,7 @@ static void *mdr_build(const cbm_doclink_build_in_t *in) {
     cbm_arena_init(&x->arena);
     x->project = in->ctx ? in->ctx->project_name : NULL;
     x->project_len = x->project ? strlen(x->project) : 0;
+    x->repo = in->ctx ? in->ctx->repo_path : NULL;
     x->run_count = in->run_file_count;
     x->run_paths = in->run_file_count > 0
                        ? (const char **)cbm_calloc(CBM_MEM_CLASS_OTHER,
@@ -438,14 +448,31 @@ static bool mdr_code_label(const char *label) {
     return false;
 }
 
+/* The length of the member text as a name: a call form (`name()`,
+ * `Owner.name(a, b)`) ends before its first '('. */
+static size_t mdr_member_len(const char *member) {
+    size_t n = strlen(member);
+    if (n > 0 && member[n - SKIP_ONE] == ')') {
+        const char *open = memchr(member, '(', n);
+        if (open) {
+            return (size_t)(open - member);
+        }
+    }
+    return n;
+}
+
 /* The member text's last segment (after "::" or "."), and the one before it. */
 static void mdr_member_names(const char *member, const char **name, size_t *name_len,
                              const char **owner, size_t *owner_len) {
     const char *segs[PAIR_LEN] = {NULL, NULL};
     size_t lens[PAIR_LEN] = {0, 0};
     const char *s = member;
-    while (*s) {
+    const char *end = member + mdr_member_len(member);
+    while (s < end) {
         size_t n = strcspn(s, ":.");
+        if (n > (size_t)(end - s)) {
+            n = (size_t)(end - s);
+        }
         if (n > 0) {
             segs[0] = segs[SKIP_ONE];
             lens[0] = lens[SKIP_ONE];
@@ -453,7 +480,7 @@ static void mdr_member_names(const char *member, const char **name, size_t *name
             lens[SKIP_ONE] = n;
         }
         s += n;
-        while (*s == ':' || *s == '.') {
+        while (s < end && (*s == ':' || *s == '.')) {
             s++;
         }
     }
@@ -499,12 +526,24 @@ static void mdr_file_defs(const mdr_index_t *x, const char *path, int *lo, int *
     *hi = e;
 }
 
+/* How a member lookup ended: found, or why not. */
+typedef enum {
+    MDR_MEMBER_FOUND = 0,
+    MDR_MEMBER_MISSING,   /* no definition of that name in the file */
+    MDR_MEMBER_AMBIGUOUS, /* several, and the owner does not pick one */
+} mdr_member_t;
+
 /* The code definition of file `path` that the range or the member names, or
  * NULL. Read from the index's definitions by file, never from DEFINES edges:
  * an incremental run's graph holds the edges of the files it re-extracts
- * only, while every node is there. */
+ * only, while every node is there. *member_result (when not NULL) says how a
+ * member lookup ended. */
 static const cbm_gbuf_node_t *mdr_segment(const mdr_index_t *x, const char *path, uint32_t first,
-                                          uint32_t last, const char *member) {
+                                          uint32_t last, const char *member,
+                                          mdr_member_t *member_result) {
+    if (member_result) {
+        *member_result = MDR_MEMBER_FOUND;
+    }
     int lo = 0;
     int hi = 0;
     mdr_file_defs(x, path, &lo, &hi);
@@ -537,6 +576,9 @@ static const cbm_gbuf_node_t *mdr_segment(const mdr_index_t *x, const char *path
     size_t owner_len;
     mdr_member_names(member, &name, &name_len, &owner, &owner_len);
     if (!name) {
+        if (member_result) {
+            *member_result = MDR_MEMBER_MISSING;
+        }
         return NULL;
     }
     const cbm_gbuf_node_t *hit = NULL;
@@ -558,7 +600,70 @@ static const cbm_gbuf_node_t *mdr_segment(const mdr_index_t *x, const char *path
     if (owned_hits == SKIP_ONE) {
         return owned;
     }
-    return owned_hits == 0 && hits == SKIP_ONE ? hit : NULL;
+    if (owned_hits == 0 && hits == SKIP_ONE) {
+        return hit;
+    }
+    if (member_result) {
+        *member_result = hits == 0 ? MDR_MEMBER_MISSING : MDR_MEMBER_AMBIGUOUS;
+    }
+    return NULL;
+}
+
+/* A byte of an identifier: a letter, a digit, '_', and every byte of a
+ * multi-byte character (pipeline_incremental.c doc_row_ident_byte). */
+static bool mdr_ident_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c >= CBM_SZ_128;
+}
+
+/* Does text[0, n) hold name[0, len) as a whole identifier (case-sensitive)? */
+static bool mdr_writes_ident(const char *text, size_t n, const char *name, size_t len) {
+    for (size_t i = 0; len > 0 && i + len <= n;) {
+        const char *hit = memchr(text + i, name[0], n - len - i + SKIP_ONE);
+        if (!hit) {
+            return false;
+        }
+        size_t at = (size_t)(hit - text);
+        if (memcmp(hit, name, len) == 0 && (at == 0 || !mdr_ident_byte((unsigned char)hit[-1])) &&
+            (at + len == n || !mdr_ident_byte((unsigned char)hit[len]))) {
+            return true;
+        }
+        i = at + SKIP_ONE;
+    }
+    return false;
+}
+
+/* Does the code file `path` write the member's name at all? A name the graph
+ * holds no definition for (a macro, a prototype, an enum member, a class
+ * attribute) is still there when the file writes it. Read from the file,
+ * never cached (resolvers run on worker threads). True -- no claim -- when
+ * the file cannot be read whole: a member is missing only when the file was
+ * read and does not write its name. */
+static bool mdr_file_writes(const mdr_index_t *x, const char *path, const char *member) {
+    const char *name;
+    const char *owner;
+    size_t name_len;
+    size_t owner_len;
+    mdr_member_names(member, &name, &name_len, &owner, &owner_len);
+    char abs_path[CBM_PATH_MAX];
+    int w = name && x->repo ? snprintf(abs_path, sizeof(abs_path), "%s/%s", x->repo, path) : 0;
+    if (w <= 0 || (size_t)w >= sizeof(abs_path)) {
+        return true;
+    }
+    FILE *f = cbm_fopen(abs_path, "rb");
+    if (!f) {
+        return true;
+    }
+    long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : CBM_NOT_FOUND;
+    char *text = size >= 0 && size <= cbm_max_file_bytes() && fseek(f, 0, SEEK_SET) == 0
+                     ? (char *)cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + SKIP_ONE)
+                     : NULL;
+    bool writes = true;
+    if (text && fread(text, SKIP_ONE, (size_t)size, f) == (size_t)size) {
+        writes = mdr_writes_ident(text, (size_t)size, name, name_len);
+    }
+    (void)fclose(f);
+    cbm_free(CBM_MEM_CLASS_OTHER, text);
+    return writes;
 }
 
 /* Is `path` of a file type the indexer reads? */
@@ -1183,9 +1288,24 @@ static void mdr_resolve_path(const mdr_index_t *x, const cbm_gbuf_t *graph, cons
                 out->kind = CBM_DOCLINK_LOCAL; /* a link into the same document */
                 return;
             }
-            const cbm_gbuf_node_t *seg = (r->first > 0 || r->member)
-                                             ? mdr_segment(x, t, r->first, r->last, r->member)
-                                             : NULL;
+            mdr_member_t member_result = MDR_MEMBER_FOUND;
+            const cbm_gbuf_node_t *seg =
+                (r->first > 0 || r->member)
+                    ? mdr_segment(x, t, r->first, r->last, r->member, &member_result)
+                    : NULL;
+            /* A named member that a code file does not define is no coarser
+             * link to the file: it is a stale or unclear reference. One the
+             * file writes without a definition the graph binds (a macro, a
+             * prototype, an enum member) is there, and keeps the file edge.
+             * A document's own headings are not definitions, so members of
+             * other files keep the file edge too. */
+            if (!seg && r->member && member_result != MDR_MEMBER_FOUND && mdr_code_file(t) &&
+                (member_result == MDR_MEMBER_AMBIGUOUS || !mdr_file_writes(x, t, r->member))) {
+                out->kind = CBM_DOCLINK_UNRESOLVED;
+                out->reason = member_result == MDR_MEMBER_AMBIGUOUS ? CBM_DOCLINK_REASON_AMBIGUOUS
+                                                                    : CBM_DOCLINK_REASON_MISSING;
+                return;
+            }
             mdr_edge(out, seg ? seg : file, r->first, r->last);
             return;
         }
@@ -1425,7 +1545,8 @@ static void mdr_resolve(const void *index, void *state, int run_file, const CBMD
 
 const cbm_gbuf_node_t *cbm_doclink_md_segment(const void *md_index, const char *path,
                                               uint32_t first, uint32_t last, const char *member) {
-    return md_index ? mdr_segment((const mdr_index_t *)md_index, path, first, last, member) : NULL;
+    return md_index ? mdr_segment((const mdr_index_t *)md_index, path, first, last, member, NULL)
+                    : NULL;
 }
 
 /* ── A region of a file's text (the field test's H8 bind_range) ─────── */
