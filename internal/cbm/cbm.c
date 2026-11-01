@@ -674,6 +674,113 @@ static bool cbm_timeout_cb(TSParseState *state) {
 // We keep one parser per thread, and just switch language as needed.
 // This avoids ~70K ts_parser_new()/ts_parser_delete() cycles on large repos.
 
+/* The bytes of a tree's ERROR nodes: how much of the file the grammar could not read. */
+static uint64_t parse_error_bytes(TSTree *tree) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ts_tree_root_node(tree));
+    uint64_t bytes = 0;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool broken = ts_node_is_error(node);
+        if (broken)
+            bytes += ts_node_end_byte(node) - ts_node_start_byte(node);
+        if (!broken && ts_node_has_error(node) && ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        bool done = false;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+        if (done)
+            break;
+    }
+    ts_tree_cursor_delete(&cursor);
+    return bytes;
+}
+
+/* C#: the grammar reads `#if` only where a whole statement or member can stand, and
+ * does not know `ref partial struct`. Either can turn a whole file into one ERROR,
+ * taking every type it declares with it. This view has the same length and the same
+ * lines: conditional directives and the branches after a file's first one are blank,
+ * and so is that `ref`. Only a file the grammar could not otherwise read uses it. */
+static char *csharp_parse_view(const char *source, uint32_t length) {
+    enum { MAX_DEPTH = 64 };
+    char *view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)length + 1);
+    if (!view)
+        return NULL;
+    memcpy(view, source, length);
+    view[length] = '\0';
+    bool inactive[MAX_DEPTH] = {false};
+    int depth = 0;
+    for (uint32_t at = 0; at < length;) {
+        uint32_t end = at;
+        while (end < length && source[end] != '\n')
+            end++;
+        uint32_t word = at;
+        while (word < end && (source[word] == ' ' || source[word] == '\t'))
+            word++;
+        const char *line = source + word;
+        size_t room = end - word;
+        bool opens = room >= 3 && !strncmp(line, "#if", 3);
+        bool switches = (room >= 5 && (!strncmp(line, "#else", 5) || !strncmp(line, "#elif", 5)));
+        bool closes = room >= 6 && !strncmp(line, "#endif", 6);
+        bool directive = opens || switches || closes;
+        if (opens && depth < MAX_DEPTH)
+            inactive[depth++] = false;
+        else if (switches && depth > 0)
+            inactive[depth - 1] = true;
+        else if (closes && depth > 0)
+            depth--;
+        bool hidden = false;
+        for (int i = 0; i < depth && !hidden; i++)
+            hidden = inactive[i];
+        if (directive || hidden)
+            for (uint32_t i = at; i < end; i++)
+                if (view[i] != '\r')
+                    view[i] = ' ';
+        at = end + 1;
+    }
+    /* `ref partial struct`: the struct's members are what name lookup needs. */
+    for (char *ref = view; (ref = strstr(ref, "ref")) != NULL; ref += 3) {
+        bool starts = ref == view || !(isalnum((unsigned char)ref[-1]) || ref[-1] == '_');
+        char *next = ref + 3;
+        if (!starts || (*next != ' ' && *next != '\t'))
+            continue;
+        while (*next == ' ' || *next == '\t')
+            next++;
+        if (strncmp(next, "partial", 7) != 0)
+            continue;
+        next += 7;
+        while (*next == ' ' || *next == '\t')
+            next++;
+        if (!strncmp(next, "struct", 6))
+            memset(ref, ' ', 3);
+    }
+    return view;
+}
+
+TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
+                                   uint32_t source_len, TSParseOptions opts) {
+    TSTree *tree = cbm_parse_source(parser, source, source_len, opts);
+    if (!tree || language != CBM_LANG_CSHARP || !ts_node_has_error(ts_tree_root_node(tree)))
+        return tree;
+    char *view = csharp_parse_view(source, source_len);
+    if (!view)
+        return tree;
+    ts_parser_reset(parser);
+    TSTree *repaired = cbm_parse_source(parser, view, source_len, opts);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, view);
+    if (!repaired)
+        return tree;
+    if (parse_error_bytes(repaired) < parse_error_bytes(tree)) {
+        ts_tree_delete(tree);
+        return repaired;
+    }
+    ts_tree_delete(repaired);
+    return tree;
+}
+
 static CBM_TLS TSParser *tl_parser = NULL;
 static CBM_TLS CBMLanguage tl_parser_lang = CBM_LANG_COUNT; // invalid sentinel
 
@@ -3866,7 +3973,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     bool sql_ranged = language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) &&
                       cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
                       ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
-    TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
+    TSTree *tree = cbm_parse_source_repairing(parser, language, source, (uint32_t)source_len, opts);
     if (sql_ranged) {
         (void)ts_parser_set_included_ranges(parser, NULL, 0);
     }

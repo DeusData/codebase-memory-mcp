@@ -597,6 +597,7 @@ typedef struct {
     cs_text_t text;
     int depth;
     bool static_method;
+    bool in_nameof;
 } cw_t;
 
 static oo_value_t cw_expr(cw_t *c, TSNode node);
@@ -961,7 +962,14 @@ static oo_value_t cw_invocation(cw_t *c, TSNode node) {
     int argc = 0;
     if (cs_is(function, "identifier") || cs_is(function, "generic_name")) {
         const char *name = cw_generic_or_name(c, function);
+        /* nameof yields a string; a method it names is mentioned, not taken. */
+        bool saved_nameof = c->in_nameof;
+        c->in_nameof = saved_nameof || (name && !strcmp(name, "nameof"));
         const oo_value_t *args = cw_arguments(c, arguments, &argc);
+        bool was_nameof = c->in_nameof && !saved_nameof;
+        c->in_nameof = saved_nameof;
+        if (was_nameof)
+            return oo_value_external("string");
         return name ? cw_bare_call(c, node, name, argc, args) : oo_value_unknown();
     }
     if (cs_is(function, "member_access_expression")) {
@@ -1029,7 +1037,9 @@ static oo_value_t cw_identifier(cw_t *c, TSNode node) {
         if (oo_has_method_named(w, &r->value, name)) {
             oo_select_t selected = oo_select_method(w, &r->value, name, -1, NULL, false);
             if (selected.status == OO_SEL_UNIQUE && selected.callable->graph_qn)
-                oo_emit_usage(w, node, selected.callable->graph_qn, CBM_RESOLVED_CALL_REFERENCE,
+                oo_emit_usage(w, node, selected.callable->graph_qn,
+                              c->in_nameof ? CBM_RESOLVED_VALUE_REFERENCE
+                                           : CBM_RESOLVED_CALL_REFERENCE,
                               CBM_RESOLVE_RULE_TYPE_MEMBER, "csharp-method-group");
             return oo_value_unknown();
         }

@@ -1237,6 +1237,40 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
     return false;
 }
 
+static bool oo_same_external(const oo_value_t *a, const oo_value_t *b) {
+    if (!a->external || !b->external || strcmp(oo_leaf(a->external), oo_leaf(b->external)) ||
+        a->dims != b->dims || a->arg_count != b->arg_count)
+        return false;
+    for (int i = 0; i < a->arg_count; i++) {
+        const oo_value_t *x = &a->args[i], *y = &b->args[i];
+        bool same = x->type ? x->type == y->type && x->dims == y->dims : oo_same_external(x, y);
+        if (!same)
+            return false;
+    }
+    return true;
+}
+
+/* Every argument's type is known and identical to its parameter's. Identity is the best
+ * conversion in Java (15.12.2.5), C# (12.6.4.5) and Kotlin (11.6) alike. */
+static bool oo_arguments_exact(oo_walk_t *w, const oo_callable_t *callable, const oo_subst_t *subst,
+                               const oo_value_t *args, int argc) {
+    if (argc > callable->param_count || callable->max_args < 0 || !callable->params)
+        return false;
+    oo_scope_t scope = oo_scope_of_callable(callable);
+    for (int i = 0; i < argc; i++) {
+        const oo_value_t *argument = &args[i];
+        if (!callable->params[i] || oo_ref_is_tparam(callable, callable->params[i]))
+            return false;
+        oo_value_t parameter = oo_value_from_ref(w, callable->params[i], &scope, subst);
+        bool same = argument->type
+                        ? argument->type == parameter.type && argument->dims == parameter.dims
+                        : oo_same_external(argument, &parameter);
+        if (!same)
+            return false;
+    }
+    return true;
+}
+
 typedef struct {
     const oo_callable_t *callable;
     oo_subst_t *subst;
@@ -1269,6 +1303,20 @@ static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, in
                 out.status = OO_SEL_AMBIGUOUS;
                 break;
             }
+        }
+    }
+    if (out.status == OO_SEL_AMBIGUOUS && args && argc > 0) {
+        int exact = -1, matches = 0;
+        for (int i = 0; i < count; i++) {
+            if (oo_arguments_exact(w, candidates[i].callable, candidates[i].subst, args, argc)) {
+                exact = i;
+                matches++;
+            }
+        }
+        if (matches == 1) {
+            candidates[0] = candidates[exact];
+            count = 1;
+            out.status = OO_SEL_UNIQUE;
         }
     }
     if (out.status == OO_SEL_UNIQUE) {
@@ -1785,7 +1833,8 @@ static TSTree *oo_parse(CBMLanguage language, const char *source, int source_len
         return NULL;
     TSTree *tree = NULL;
     if (ts_parser_set_language(parser, oo_ts_language(language)))
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_source_repairing(parser, language, source, (uint32_t)source_len,
+                                          (TSParseOptions){0});
     ts_parser_delete(parser);
     return tree;
 }
