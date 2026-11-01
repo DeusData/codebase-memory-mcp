@@ -169,7 +169,6 @@ row instead.
 | graphql | 13 | bkegley/tree-sitter-graphql | `5e66e961eee4` | VERIFIED-BOTH | ✅ |
 | groovy | 15 | murtaza64/tree-sitter-groovy | `781d9cd1b482` | VERIFIED-BOTH | ✅ |
 | hare | 15 | tree-sitter-grammars/tree-sitter-hare | `eed7ddf6a66b` | VERIFIED-NVIM | ✅ |
-| haskell | 15 | **self-maintained fork** of tree-sitter/tree-sitter-haskell @ `7fa19f195803` (v0.23.1, the previously vendored pin, VERIFIED-HELIX) + the escaped-char-literal patch (#2547); grammar source in `tools/tree-sitter-haskell/` | MIT, (c) 2014 Max Brunsfeld — byte-identical to upstream; patch (c) 2026 DeusData, see grammar.js + THIRD_PARTY.md |
 | hcl | 15 | tree-sitter-grammars/tree-sitter-hcl | `64ad62785d44` | MISMATCH | ✅ |
 | hlsl | 14 | tree-sitter-grammars/tree-sitter-hlsl | `bab9111922d5` | VERIFIED-NVIM | ✅ |
 | html | 14 | tree-sitter/tree-sitter-html | `73a3947324f6` | VERIFIED-BOTH | ✅ |
