@@ -747,6 +747,103 @@ TEST(resolver_oo_large_file_binds_its_last_site) {
     PASS();
 }
 
+/* The grammar cannot read `ref partial struct`, or an `#if` that splits a construct.
+ * Whole files came back as one error, and with them every type they declared. */
+static const OOFile REPAIR_FILES[] = {
+    {"Repair/Reader.cs",
+     "namespace Acme.Repair {\n"
+     "    public ref partial struct Reader {\n"
+     "        public int Next() { return Peek(); }\n"
+     "        private int Peek() { return 1; }\n"
+     "    }\n"
+     "}\n"},
+    {"Repair/Split.cs",
+     "namespace Acme.Repair {\n"
+     "    public class Base { public int Inherited() { return 1; } }\n"
+     "    public class Split : Base {\n"
+     "        public int First() { return Second(); }\n"
+     "        public int Second() {\n"
+     "#if DEBUG\n"
+     "            if (First() > 0) {\n"
+     "#else\n"
+     "            if (First() > 1) {\n"
+     "#endif\n"
+     "                return Inherited();\n"
+     "            }\n"
+     "            return 0;\n"
+     "        }\n"
+     "    }\n"
+     "}\n"},
+    {"Repair/Overloads.Int.cs",
+     "namespace Acme.Repair {\n"
+     "    public partial class Writer {\n"
+     "        void Put(int value) { Put(value, 1); }\n"
+     "        void Put(int value, int width) { }\n"
+     "        void Wide(long value) { }\n"
+     "        void Twin(int value) { }\n"
+     "    }\n"
+     "}\n"},
+    {"Repair/Overloads.Text.cs",
+     "namespace Acme.Repair {\n"
+     "    public partial class Writer {\n"
+     "        void Put(string value) { }\n"
+     "        void PutInt(int n) { Put(n); }\n"
+     "        void PutText(string t) { Put(t); }\n"
+     "        void PutUnknown(Outside o) { Put(o); }\n"
+     "        void Wide(int value) { }\n"
+     "        void Twin(long value) { }\n"
+     "        void UsesWide(int n) { Wide(n); }\n"
+     "        void UsesTwin(long n) { Twin(n); }\n"
+     "        void UsesLiteral() { Wide(1L); }\n"
+     "        void Named() { var s = nameof(PutInt); }\n"
+     "    }\n"
+     "}\n"},
+};
+
+static int oo_repair_check(bool parallel) {
+    OOIndex index;
+    int failed = 0;
+    if (!oo_open(&index, REPAIR_FILES, (int)(sizeof(REPAIR_FILES) / sizeof(REPAIR_FILES[0])),
+                 parallel, "cs")) {
+        oo_close(&index);
+        return 1;
+    }
+    OO_EXPECT("CALLS", "Reader.Next", "Reader.Peek", 1);
+    OO_EXPECT("CALLS", "Split.First", "Split.Second", 1);
+    OO_EXPECT("CALLS", "Split.Second", "Split.First", 1);
+    OO_EXPECT("CALLS", "Split.Second", "Base.Inherited", 1);
+    /* Overloads in two files of one partial class are two nodes. An exact match of
+     * every argument is the best conversion in all three languages. */
+    OO_EXPECT("CALLS", "Writer.PutInt", "Overloads.Int.Writer.Put", 1);
+    OO_EXPECT("CALLS", "Writer.PutInt", "Overloads.Text.Writer.Put", 0);
+    OO_EXPECT("CALLS", "Writer.PutText", "Overloads.Text.Writer.Put", 1);
+    OO_EXPECT("CALLS", "Writer.PutText", "Overloads.Int.Writer.Put", 0);
+    OO_EXPECT("CALLS", "Writer.UsesWide", "Overloads.Text.Writer.Wide", 1);
+    OO_EXPECT("CALLS", "Writer.UsesWide", "Overloads.Int.Writer.Wide", 0);
+    OO_EXPECT("CALLS", "Writer.UsesTwin", "Overloads.Text.Writer.Twin", 1);
+    OO_EXPECT("CALLS", "Writer.UsesTwin", "Overloads.Int.Writer.Twin", 0);
+    OO_EXPECT("CALLS", "Writer.UsesLiteral", "Overloads.Int.Writer.Wide", 1);
+    OO_EXPECT("CALLS", "Writer.UsesLiteral", "Overloads.Text.Writer.Wide", 0);
+    /* An argument of unknown type leaves them competing. */
+    OO_EXPECT("CALLS", "Writer.PutUnknown", "Overloads.Int.Writer.Put", 0);
+    OO_EXPECT("CALLS", "Writer.PutUnknown", "Overloads.Text.Writer.Put", 0);
+    /* nameof names a symbol. It neither calls it nor takes it as a callable. */
+    OO_EXPECT("CALL_REFERENCE", "Writer.Named", "Overloads.Text.Writer.PutInt", 0);
+    OO_EXPECT("CALLS", "Writer.Named", "Overloads.Text.Writer.PutInt", 0);
+    oo_close(&index);
+    return failed;
+}
+
+TEST(resolver_oo_csharp_repaired_parse_and_exact_overloads) {
+    ASSERT_EQ(oo_repair_check(false), 0);
+    PASS();
+}
+
+TEST(resolver_oo_csharp_repaired_parse_and_exact_overloads_parallel) {
+    ASSERT_EQ(oo_repair_check(true), 0);
+    PASS();
+}
+
 static const OOFile MIXED_FILES[] = {
     {"native/Cargo.toml", "[package]\nname = \"native\"\nversion = \"0.1.0\"\n"},
     {"native/src/lib.rs", "pub fn f() -> i32 { 1 }\n"},
@@ -775,4 +872,6 @@ SUITE(resolver_oo) {
     RUN_TEST(resolver_oo_csharp_static_selection_parallel);
     RUN_TEST(resolver_oo_rust_context_failure_keeps_java_imports);
     RUN_TEST(resolver_oo_large_file_binds_its_last_site);
+    RUN_TEST(resolver_oo_csharp_repaired_parse_and_exact_overloads);
+    RUN_TEST(resolver_oo_csharp_repaired_parse_and_exact_overloads_parallel);
 }
