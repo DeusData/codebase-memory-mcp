@@ -233,21 +233,22 @@ typedef struct {
     const char *test, *caller, *needle, *target, *declaration, *label;
     int line;
     unsigned occurrence;
+    bool required; /* the strict resolver admits this binding: losing it is a failure */
 } MN_Golden;
 static const MN_Golden mn_goldens[] = {
     {"mn_type_alias_rust", "run", "parse(\"42\")", "parse", "fn parse(s: &str) -> Res<i32> {",
-     "Function", 3, 0},
+     "Function", 3, 0, true},
     {"mn_multiple_trait_bounds_rust", "run", "print_both(42)", "print_both",
-     "fn print_both<T: Debug + Display>(val: T) {", "Function", 3, 0},
+     "fn print_both<T: Debug + Display>(val: T) {", "Function", 3, 0, true},
     {"mn_multiple_trait_bounds_rust", "run", "print_both(\"hello\")", "print_both",
-     "fn print_both<T: Debug + Display>(val: T) {", "Function", 3, 0},
+     "fn print_both<T: Debug + Display>(val: T) {", "Function", 3, 0, true},
     {"mn_extension_rust_impl", "demo", "Queue::new()", "new",
      "    pub fn new() -> Self { Queue { buf: std::collections::VecDeque::new() } }", "Method", 6,
-     0},
+     0, true},
     {"mn_extension_rust_impl", "demo", "q.enqueue(1)", "enqueue",
-     "    pub fn enqueue(&mut self, item: T) { self.buf.push_back(item); }", "Method", 7, 0},
+     "    pub fn enqueue(&mut self, item: T) { self.buf.push_back(item); }", "Method", 7, 0, true},
     {"mn_extension_rust_impl", "demo", "q.dequeue()", "dequeue",
-     "    pub fn dequeue(&mut self) -> Option<T> { self.buf.pop_front() }", "Method", 8, 0},
+     "    pub fn dequeue(&mut self) -> Option<T> { self.buf.pop_front() }", "Method", 8, 0, true},
     {"mn_record_kotlin_data_class", "anon", "User(\"anon\", 0)", NULL,
      "data class User(val name: String, val age: Int) {", "Method", 1, 0},
     {"mn_record_kotlin_data_class", "run", "User.anon()", "anon",
@@ -255,32 +256,32 @@ static const MN_Golden mn_goldens[] = {
     {"mn_record_kotlin_data_class", "run", "User.anon().greet()", "greet",
      "    fun greet(): String = \"Hi, $name\"", "Method", 3, 0},
     {"mn_record_rust_derive", "origin", "Self::new(0.0, 0.0)", "new",
-     "    fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 8, 0},
+     "    fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 8, 0, true},
     {"mn_record_rust_derive", "run", "Point::new(3.0, 0.0)", "new",
-     "    fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 8, 0},
+     "    fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 8, 0, true},
     {"mn_record_rust_derive", "run", "Point::origin()", "origin",
-     "    fn origin() -> Self { Self::new(0.0, 0.0) }", "Method", 12, 0},
+     "    fn origin() -> Self { Self::new(0.0, 0.0) }", "Method", 12, 0, true},
     {"mn_record_rust_derive", "run", "a.distance(&Point::origin())", "distance",
-     "    fn distance(&self, other: &Self) -> f64 {", "Method", 9, 0},
+     "    fn distance(&self, other: &Self) -> f64 {", "Method", 9, 0, true},
     {"mn_default_params_python", "farewell", "greet(name, prefix=msg)", "greet",
      "def greet(name, prefix='Hello', suffix='!'):", "Function", 1, 0},
     {"mn_default_params_python", "run", "farewell('World')", "farewell",
      "def farewell(name, msg='Goodbye'):", "Function", 5, 0},
     {"mn_default_params_rust", "default_connect", "connect(host, None)", "connect",
-     "fn connect(host: &str, port: Option<u16>) -> String {", "Function", 1, 0},
+     "fn connect(host: &str, port: Option<u16>) -> String {", "Function", 1, 0, true},
     {"mn_default_params_rust", "run", "default_connect(\"localhost\")", "default_connect",
-     "fn default_connect(host: &str) -> String {", "Function", 6, 0},
+     "fn default_connect(host: &str) -> String {", "Function", 6, 0, true},
     {"mn_default_params_ts", "warn", "log(msg, 'warn')", "log",
      "function log(msg: string, level: string = 'info', ts: number = Date.now()): string {",
      "Function", 1, 0},
     {"mn_default_params_ts", "run", "warn('something wrong')", "warn",
      "function warn(msg: string): string { return log(msg, 'warn'); }", "Function", 5, 0},
     {"mn_pattern_match_rust", "process", "format_ok(v)", "format_ok",
-     "fn format_ok(v: i32) -> String { format!(\"ok:{}\", v) }", "Function", 1, 0},
+     "fn format_ok(v: i32) -> String { format!(\"ok:{}\", v) }", "Function", 1, 0, true},
     {"mn_pattern_match_rust", "process", "format_err(e)", "format_err",
-     "fn format_err(e: &str) -> String { format!(\"err:{}\", e) }", "Function", 2, 0},
+     "fn format_err(e: &str) -> String { format!(\"err:{}\", e) }", "Function", 2, 0, true},
     {"mn_pattern_match_rust", "run", "process(Ok(42))", "process",
-     "fn process(res: Result<i32, &str>) -> String {", "Function", 4, 0},
+     "fn process(res: Result<i32, &str>) -> String {", "Function", 4, 0, true},
     {"mn_pattern_match_python", "dispatch", "handle_quit()", "handle_quit",
      "def handle_quit():", "Function", 1, 1},
     {"mn_pattern_match_python", "dispatch", "handle_go(direction)", "handle_go",
@@ -306,9 +307,9 @@ static const MN_Golden mn_goldens[] = {
     {"mn_pattern_match_ts", "run", "dispatch('ok', 42)", "dispatch",
      "function dispatch(tag: string, payload?: unknown): string {", "Function", 5, 0},
     {"mn_nested_function_rust", "run", "make_adder(10)", "make_adder",
-     "fn make_adder(base: i32) -> impl Fn(i32) -> i32 {", "Function", 3, 0},
+     "fn make_adder(base: i32) -> impl Fn(i32) -> i32 {", "Function", 3, 0, true},
     {"mn_nested_function_rust", "run", "double(5)", "double", "fn double(x: i32) -> i32 { x * 2 }",
-     "Function", 1, 0},
+     "Function", 1, 0, true},
     {"mn_nested_function_rust", "run", "add10(double(5))", NULL, "    move |x| double(x) + base",
      "Function", 4, 0},
     {"mn_nested_function_ts", "run", "makeTransformer(10)", "makeTransformer",
@@ -360,7 +361,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                                             .declaration_text = "def exact_target():"},
                                  .mode = RQ_REQUIRED}};
     char ids[12][100];
-    size_t n = 1;
+    size_t n = 1, required = 1;
     for (size_t i = 0; i < sizeof(mn_goldens) / sizeof(mn_goldens[0]); i++) {
         const MN_Golden *g = mn_goldens + i;
         if (strcmp(test, g->test))
@@ -380,7 +381,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                        .label = g->label,
                        .declaration_line = g->line,
                        .declaration_text = g->declaration},
-            .mode = RQ_KNOWN_GAP,
+            .mode = g->required ? RQ_REQUIRED : RQ_KNOWN_GAP,
             .gap_id = g->target ? "construct-binding-proof-missing"
                                 : "callable-identity-not-materialized",
             .why =
@@ -394,6 +395,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
                      "source bytes and structural assertions remain intact; each covered caller "
                      "now enumerates its project call sites and a required control checks the "
                      "same publication path."};
+        required += g->required;
         n++;
     }
     if (n == 1)
@@ -404,7 +406,7 @@ static bool mn_quality(const char *test, const char *filename, const char *conte
     bool ok = store && rq_check_project_declarations(store, lp.project, test, sources, 2, expected,
                                                      n, NULL, 0, &report, stderr);
     mn_cleanup(&lp, store);
-    return ok && report.genuine == n && report.found == 1 && report.missing == n - 1;
+    return ok && report.genuine == n && report.found == required && report.missing == n - required;
 }
 static MN_Metrics mn_quality_metrics(const char *filename, const char *content, const char *test,
                                      bool *quality) {

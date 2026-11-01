@@ -3933,7 +3933,8 @@ static bool et_write_quality(const EtFile *original, int count, const EtFile *de
         bool ok = rq_check_project_declarations(store, lp.project, suite, sources, (size_t)count,
                                                 expected, 2, &forbidden, 1, &report, stderr);
         et_cleanup(&lp, store);
-        if (!ok || report.genuine != 2 || report.found != 1 || report.missing != 1)
+        size_t found = gap->mode == RQ_REQUIRED ? 2 : 1;
+        if (!ok || report.genuine != 2 || report.found != found || report.missing != 2 - found)
             return false;
     }
     return true;
@@ -4040,11 +4041,11 @@ TEST(writes_rust) {
                    .label = "Field",
                    .declaration_line = 2,
                    .declaration_text = "    pub total: i64,"},
-        .mode = RQ_KNOWN_GAP,
+        .mode = RQ_REQUIRED,
         .gap_id = "rust-declared-self-field-write",
         .why =
             "clear assigns the field of its explicit &mut self receiver in impl Accumulator. The "
-            "unrelated Other field is not its owner. Rust field-write proofs are not yet admitted.",
+            "unrelated Other field is not its owner. The receiver type names the owner.",
         .tried = "The original source is unchanged. This exact assignment is measured in both "
                  "pipeline paths alongside a required supported call and a forbidden foreign "
                  "target; no edge-count substitute can satisfy it."};
