@@ -356,6 +356,193 @@ TEST(pylsp_constructor_call_returns_instance) {
     PASS();
 }
 
+/* Issue #1642: Embedder(...) must resolve to Embedder.__init__, and the
+ * textual callee leaf "Embedder" must still join that row. */
+TEST(pylsp_constructor_call_targets_init) {
+    const char *source = "class Embedder:\n"
+                         "    def __init__(self, model=\"x\"):\n"
+                         "        self.model = model\n"
+                         "def build():\n"
+                         "    return Embedder(model=\"y\")\n";
+    CBMFileResult *r = extract_py(source);
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "build", "Embedder.__init__");
+    ASSERT_GTE(idx, 0);
+    if (idx >= 0) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[idx];
+        ASSERT_STR_EQ(rc->strategy, "lsp_constructor_init");
+        ASSERT_STR_EQ(rc->reason, "Embedder");
+        ASSERT(strncmp(rc->callee_qn, "builtins.", 9) != 0);
+    }
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !strstr(rc->caller_qn, "build"))
+            continue;
+        /* One site, one target: the class node no longer receives the call. */
+        ASSERT(strstr(rc->callee_qn, ".__init__") != NULL);
+        ASSERT(strncmp(rc->callee_qn, "builtins.", 9) != 0);
+    }
+
+    const CBMCall *carrier = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "Embedder") == 0 &&
+            call->enclosing_func_qn && strstr(call->enclosing_func_qn, "build")) {
+            carrier = call;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(carrier);
+    const CBMResolvedCall *joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, carrier, false);
+    ASSERT_NOT_NULL(joined);
+    ASSERT(strstr(joined->callee_qn, "Embedder.__init__") != NULL);
+    ASSERT_STR_EQ(joined->strategy, "lsp_constructor_init");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same-file subclasses: only an __init__ the class declares itself is a
+ * construction target. B(A) inherits A.__init__ but declares none, so B()
+ * stays on the class B (never A.__init__). C(A) declares its own __init__,
+ * so C() resolves to C.__init__ (never the inherited A.__init__). */
+static int count_build_rows(const CBMFileResult *r, const char *caller_leaf,
+                            const char *callee_qn, const char *strategy) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !rc->strategy)
+            continue;
+        const char *dot = strrchr(rc->caller_qn, '.');
+        const char *leaf = dot ? dot + 1 : rc->caller_qn;
+        if (strcmp(leaf, caller_leaf) == 0 && strcmp(rc->callee_qn, callee_qn) == 0 &&
+            strcmp(rc->strategy, strategy) == 0)
+            n++;
+    }
+    return n;
+}
+
+TEST(pylsp_constructor_same_file_subclass_own_init_only) {
+    CBMFileResult *r = extract_py("class A:\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = True\n"
+                                  "class B(A):\n"
+                                  "    def go(self):\n"
+                                  "        return 1\n"
+                                  "class C(A):\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = False\n"
+                                  "def build_b():\n"
+                                  "    return B()\n"
+                                  "def build_c():\n"
+                                  "    return C()\n");
+    ASSERT_NOT_NULL(r);
+    /* B() keeps the class target; the inherited A.__init__ gets no row. */
+    ASSERT_EQ(count_build_rows(r, "build_b", "test.main.B", "lsp_constructor"), 1);
+    ASSERT_EQ(find_resolved(r, "build_b", "__init__"), -1);
+    /* C() binds to the __init__ C declares itself. */
+    int idx = require_resolved(r, "build_c", "test.main.C.__init__");
+    ASSERT_GTE(idx, 0);
+    if (idx >= 0) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[idx];
+        ASSERT_STR_EQ(rc->strategy, "lsp_constructor_init");
+        ASSERT_STR_EQ(rc->reason, "C");
+    }
+    ASSERT_EQ(find_resolved(r, "build_c", "test.main.A.__init__"), -1);
+    ASSERT_EQ(count_build_rows(r, "build_c", "test.main.C", "lsp_constructor"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* No user __init__ (and no inherited one): the call stays on the class. */
+TEST(pylsp_constructor_without_init_stays_on_class) {
+    CBMFileResult *r = extract_py("class Bare:\n"
+                                  "    def method(self):\n"
+                                  "        return 1\n"
+                                  "def build():\n"
+                                  "    return Bare()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "build", "__init__"), -1);
+    int idx = -1;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind == CBM_RESOLVED_INVOCATION && rc->caller_qn &&
+            strstr(rc->caller_qn, "build") && rc->callee_qn && strstr(rc->callee_qn, "Bare") &&
+            !strstr(rc->callee_qn, "__init__")) {
+            idx = i;
+            break;
+        }
+    }
+    ASSERT_GTE(idx, 0);
+    if (idx >= 0)
+        ASSERT_STR_EQ(r->resolved_calls.items[idx].strategy, "lsp_constructor");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* f = Foo(); f() is a callable instance, not a constructor. It must not
+ * gain an edge to Foo.__init__. Foo() itself still does. */
+TEST(pylsp_callable_instance_call_skips_init) {
+    CBMFileResult *r = extract_py("class Foo:\n"
+                                  "    def __init__(self):\n"
+                                  "        pass\n"
+                                  "    def __call__(self):\n"
+                                  "        return 1\n"
+                                  "def use():\n"
+                                  "    f = Foo()\n"
+                                  "    return f()\n");
+    ASSERT_NOT_NULL(r);
+    int init_rows = 0;
+    int class_rows = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !strstr(rc->caller_qn, "use"))
+            continue;
+        if (strstr(rc->callee_qn, "__init__")) {
+            init_rows++;
+            ASSERT_STR_EQ(rc->strategy, "lsp_constructor_init");
+            ASSERT_STR_EQ(rc->reason, "Foo");
+            ASSERT(strncmp(rc->callee_qn, "builtins.", 9) != 0);
+        } else if (strstr(rc->callee_qn, "Foo")) {
+            class_rows++;
+            ASSERT_STR_EQ(rc->strategy, "lsp_constructor");
+            ASSERT_NULL(rc->reason);
+        }
+    }
+    ASSERT_EQ(init_rows, 1);
+    ASSERT_EQ(class_rows, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* builtins.object.__init__ is in the stdlib registry. Construction must not
+ * record a resolution to it. */
+TEST(pylsp_constructor_skips_builtin_init) {
+    CBMFileResult *r = extract_py("from builtins import object\n"
+                                  "def build():\n"
+                                  "    return object()\n");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (!rc->callee_qn)
+            continue;
+        ASSERT(strncmp(rc->callee_qn, "builtins.", 9) != 0 ||
+               strstr(rc->callee_qn, ".__init__") == NULL);
+    }
+    int idx = find_resolved(r, "build", "builtins.object");
+    ASSERT_GTE(idx, 0);
+    if (idx >= 0) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[idx];
+        ASSERT_STR_EQ(rc->strategy, "lsp_constructor");
+        ASSERT(strstr(rc->callee_qn, "__init__") == NULL);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(pylsp_method_via_inheritance) {
     CBMFileResult *r = extract_py(
         "class Base:\n"
@@ -920,6 +1107,104 @@ TEST(pylsp_crossfile_inheritance) {
                          imp_qns, 1, NULL, &out, NULL);
 
     ASSERT_GTE(find_resolved_arr(&out, "go", "shared"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Imported ClassName() resolves to that class's __init__. Bare names are
+ * module-qualified during per-file registration, so the imported class has
+ * to come from the cross-file registry. */
+TEST(pylsp_crossfile_constructor_targets_init) {
+    const char *source = "from models import Embedder\n"
+                         "def build():\n"
+                         "    return Embedder(model=\"y\")\n";
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "models.Embedder";
+    defs[0].short_name = "Embedder";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "models";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "models.Embedder.__init__";
+    defs[1].short_name = "__init__";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "models.Embedder";
+    defs[1].def_module_qn = "models";
+    defs[1].lang = CBM_LANG_PYTHON;
+
+    const char *imp_names[] = {"Embedder"};
+    const char *imp_qns[] = {"models.Embedder"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.main", reg,
+                                       imp_names, imp_qns, 1, NULL, &out, NULL);
+
+    int idx = find_resolved_arr(&out, "build", "models.Embedder.__init__");
+    ASSERT_GTE(idx, 0);
+    if (idx >= 0) {
+        ASSERT_STR_EQ(out.items[idx].strategy, "lsp_constructor_init");
+        ASSERT_STR_EQ(out.items[idx].reason, "Embedder");
+        ASSERT(strncmp(out.items[idx].callee_qn, "builtins.", 9) != 0);
+    }
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* class B(A) where A's __init__ lives in another module and B declares no
+ * __init__ of its own. Construction binds only to an __init__ the class
+ * declares itself, so B() stays on the class B and the inherited
+ * base_mod.A.__init__ gets no row. */
+TEST(pylsp_crossfile_inherited_init_stays_on_class) {
+    const char *source = "from base_mod import A\n"
+                         "class B(A):\n"
+                         "    def go(self):\n"
+                         "        return 1\n"
+                         "def build():\n"
+                         "    return B()\n";
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "base_mod.A";
+    defs[0].short_name = "A";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "base_mod";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "base_mod.A.__init__";
+    defs[1].short_name = "__init__";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "base_mod.A";
+    defs[1].def_module_qn = "base_mod";
+    defs[1].lang = CBM_LANG_PYTHON;
+    defs[2].qualified_name = "test.main.B";
+    defs[2].short_name = "B";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "test.main";
+    defs[2].embedded_types = "base_mod.A";
+    defs[2].lang = CBM_LANG_PYTHON;
+
+    const char *imp_names[] = {"A"};
+    const char *imp_qns[] = {"base_mod.A"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 3);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.main", reg,
+                                       imp_names, imp_qns, 1, NULL, &out, NULL);
+
+    ASSERT_EQ(find_resolved_arr(&out, "build", "__init__"), -1);
+    int idx = find_resolved_arr(&out, "build", "test.main.B");
+    ASSERT_GTE(idx, 0);
+    if (idx >= 0) {
+        ASSERT_STR_EQ(out.items[idx].callee_qn, "test.main.B");
+        ASSERT_STR_EQ(out.items[idx].strategy, "lsp_constructor");
+    }
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -5010,6 +5295,11 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_method_call_simple);
     RUN_TEST(pylsp_method_via_self);
     RUN_TEST(pylsp_constructor_call_returns_instance);
+    RUN_TEST(pylsp_constructor_call_targets_init);
+    RUN_TEST(pylsp_constructor_same_file_subclass_own_init_only);
+    RUN_TEST(pylsp_constructor_without_init_stays_on_class);
+    RUN_TEST(pylsp_callable_instance_call_skips_init);
+    RUN_TEST(pylsp_constructor_skips_builtin_init);
     RUN_TEST(pylsp_method_via_inheritance);
     RUN_TEST(pylsp_no_false_positive_on_unknown_method);
     /* Phases 7-8 — decorators, super(), multi-inheritance */
@@ -5028,6 +5318,8 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_cross_registry_interleaved_order);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
+    RUN_TEST(pylsp_crossfile_constructor_targets_init);
+    RUN_TEST(pylsp_crossfile_inherited_init_stays_on_class);
     RUN_TEST(pylsp_batch_two_files);
     RUN_TEST(pylsp_from_import_alias_equal_module_leaf_targets_imported_member);
     RUN_TEST(pylsp_project_prefixed_direct_alias_same_tail_is_not_from_import_reference);
