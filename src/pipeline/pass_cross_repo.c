@@ -720,6 +720,16 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         char method[CBM_SZ_32] = {0};
         json_str_prop(props, "url_path", url_path, sizeof(url_path));
         json_str_prop(props, "method", method, sizeof(method));
+        if (!method[0]) {
+            char callee[CBM_SZ_256] = {0};
+            json_str_prop(props, "callee", callee, sizeof(callee));
+            if (callee[0]) {
+                const char *m = cbm_service_pattern_http_method(callee);
+                if (m) {
+                    snprintf(method, sizeof(method), "%s", m);
+                }
+            }
+        }
         if (!url_path[0]) {
             continue;
         }
