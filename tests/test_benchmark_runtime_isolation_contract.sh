@@ -11,7 +11,9 @@ set -euo pipefail
 # an environment-probe fixture and require that no product process ever
 # receives the caller's runtime or cache, that the index benchmark records
 # the setup cost it now pays explicitly, and that a refused index fails the
-# run, names its cause, and leaves nothing behind.
+# run, names its cause, and leaves nothing behind. A daemon that refuses to
+# start or to stop fails the run the same way, and a kept runtime is handed
+# over only once its daemon stopped.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="$(mktemp -d)"
@@ -41,6 +43,16 @@ if [[ "${1-} ${2-}" == "cli index_repository" ]]; then
         exit 0
     fi
     echo "probe: index refused" >&2
+    exit 1
+fi
+if [[ "${1-} ${2-}" == "daemon start" && -n "${CBM_BENCH_PROBE_START_REFUSED-}" ]]; then
+    echo "probe: daemon start refused" >&2
+    exit 1
+fi
+# The product reports a busy refusal (a committed client still uses the
+# daemon) on stdout, so that is where the fixture reports its own.
+if [[ "${1-} ${2-}" == "daemon stop" && -n "${CBM_BENCH_PROBE_STOP_REFUSED-}" ]]; then
+    echo "probe: daemon NOT stopped, a committed client still uses it"
     exit 1
 fi
 [[ "${1-} ${2-}" == "daemon status" ]] && exit 1
@@ -136,6 +148,37 @@ grep -qF -- "${KEPT_CACHE}"$'\t'"${KEPT_RUNTIME}" "$KEEP_LOG" ||
     fail "runtime-root.txt does not name the runtime and cache the product processes used"
 rm -rf -- "$KEPT_ROOT"
 
+# The handoff promises a stopped daemon, so a kept runtime is handed over only
+# once `daemon stop` succeeded. A refused stop fails the run, writes no handoff
+# and keeps the root: the daemon may still be using it, so removing it is not
+# the harness's call. The refusal itself has to reach the output.
+STOP_LOG="$WORKDIR/keep-stop-refused-environment.log"
+STOP_HANDOFF="$WORKDIR/results/keep-stop-refused/runtime-root.txt"
+stop_rc=0
+CBM_CACHE_DIR="$CALLER_CACHE" \
+CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+CBM_BENCH_ENV_PROBE="$STOP_LOG" \
+CBM_BENCH_PROBE_INDEX_OK=1 \
+CBM_BENCH_PROBE_STOP_REFUSED=1 \
+CBM_BENCH_KEEP_RUNTIME=1 \
+    "$ROOT/scripts/benchmark-index.sh" "$ENV_PROBE" keep-stop-refused "$REPO" "$WORKDIR/results" \
+    > "$WORKDIR/keep-stop-refused.out" 2>&1 || stop_rc=$?
+[[ -s "$STOP_LOG" ]] || fail "benchmark-index (keep, refused stop) did not execute the environment-probe fixture"
+STOP_RUNTIME=$(normalize_path "$(tail -n 1 "$STOP_LOG" | cut -f2)")
+STOP_ROOT="${STOP_RUNTIME%/*}"
+stop_root_kept=0
+[[ ! -d "$STOP_ROOT/runtime" ]] || stop_root_kept=1
+# Removed here, before any verdict, so a failing assertion leaks no root.
+case "${STOP_ROOT##*/}" in
+cbmrt.?* | cbmrt-?*) rm -rf -- "$STOP_ROOT" ;;
+*) fail "benchmark-index (keep, refused stop) used an unexpected private root: $STOP_ROOT" ;;
+esac
+[[ "$stop_rc" -ne 0 ]] || fail "benchmark-index exited 0 although its daemon refused to stop"
+[[ ! -e "$STOP_HANDOFF" ]] || fail "benchmark-index handed over a runtime whose daemon refused to stop"
+(( stop_root_kept )) || fail "benchmark-index removed a runtime root whose daemon refused to stop"
+grep -q 'probe: daemon NOT stopped' "$WORKDIR/keep-stop-refused.out" ||
+    fail "benchmark-index did not surface why its daemon refused to stop"
+
 # Asked to keep the runtime and refused the index, the harness has nothing worth
 # keeping: the run fails, no root survives, and no handoff is written — nor left
 # over from an earlier run, since the evaluation loop reuses the results
@@ -159,6 +202,23 @@ done
 assert_isolated "benchmark-index (keep, refused index)" "$REFUSED_LOG"
 [[ ! -e "$REFUSED_HANDOFF" ]] || fail "benchmark-index left a handoff for an index that failed"
 
+# The same holds for a run that never reaches the index: one whose repository
+# does not exist fails during setup, and an earlier run's handoff in the reused
+# results directory must already be gone by then.
+SETUP_HANDOFF="$WORKDIR/results/setup-failed/runtime-root.txt"
+mkdir -p "${SETUP_HANDOFF%/*}"
+echo 'CBM_BENCH_RUNTIME_ROOT=/stale/root/from/an/earlier/run' > "$SETUP_HANDOFF"
+setup_rc=0
+CBM_CACHE_DIR="$CALLER_CACHE" \
+CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+CBM_BENCH_ENV_PROBE="$WORKDIR/setup-failed-environment.log" \
+CBM_BENCH_KEEP_RUNTIME=1 \
+    "$ROOT/scripts/benchmark-index.sh" "$ENV_PROBE" setup-failed "$WORKDIR/no-such-repo" "$WORKDIR/results" \
+    > "$WORKDIR/setup-failed.out" 2>&1 || setup_rc=$?
+[[ "$setup_rc" -ne 0 ]] || fail "benchmark-index exited 0 for a repository that does not exist"
+[[ ! -e "$SETUP_HANDOFF" ]] ||
+    fail "benchmark-index left an earlier handoff behind after a run that failed during setup"
+
 SEARCH_LOG="$WORKDIR/search-environment.log"
 CBM_CACHE_DIR="$CALLER_CACHE" \
 CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
@@ -174,6 +234,28 @@ grep -q -- '--- index/parse stderr ---' "$WORKDIR/search.out" ||
     fail "benchmark-search-graph hid the index stderr behind its own message"
 grep -q 'probe: index refused' "$WORKDIR/search.out" ||
     fail "benchmark-search-graph did not surface the cause of the index failure"
+
+# A private daemon that does not start fails either harness, and the product's
+# own explanation has to reach the output: "did not start" alone leaves the
+# operator with the symptom only.
+for harness in benchmark-index benchmark-search-graph; do
+    if [[ "$harness" == benchmark-index ]]; then
+        harness_args=("$ENV_PROBE" start-refused "$REPO" "$WORKDIR/results")
+    else
+        harness_args=("$ENV_PROBE" "$REPO")
+    fi
+    start_rc=0
+    CBM_CACHE_DIR="$CALLER_CACHE" \
+    CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+    CBM_BENCH_ENV_PROBE="$WORKDIR/$harness-start-refused-environment.log" \
+    CBM_BENCH_PROBE_START_REFUSED=1 \
+        "$ROOT/scripts/$harness.sh" "${harness_args[@]}" \
+        > "$WORKDIR/$harness-start-refused.out" 2>&1 || start_rc=$?
+    [[ "$start_rc" -ne 0 ]] || fail "$harness exited 0 although its private daemon did not start"
+    assert_isolated "$harness (daemon start refused)" "$WORKDIR/$harness-start-refused-environment.log"
+    grep -q 'probe: daemon start refused' "$WORKDIR/$harness-start-refused.out" ||
+        fail "$harness did not surface why its private daemon did not start"
+done
 
 # The request carrying the repository path has to be built as JSON. A path may
 # legitimately contain a quote or a backslash — hand-built JSON turns that into
