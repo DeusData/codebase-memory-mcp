@@ -963,6 +963,16 @@ mode. `index_status` keeps describing the published graph and its freshness.
 
 `manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
 
+`trace_path` exposes the start nodes' stored `self_recursive` (direct recursion)
+and `recursive` (direct recursion or a call-graph cycle) signals in both tree and
+JSON output. Across multiple start nodes, a flag is `true` if any records true,
+`false` if all record false, and `null` otherwise (including missing legacy
+metadata). These are static-analysis signals, not counts of resolved self-calls.
+Static `CALLS` indexing omits direct self-call edges; traces that include `CALLS` state
+`self_call_policy: omitted`. Caller/callee totals still count graph-reachable
+nodes, so a recursive function can have zero callees. Recursion metadata remains
+visible on continuation pages and when an output budget prevents rows from fitting.
+
 ## Graph Data Model
 
 ### Node Labels
