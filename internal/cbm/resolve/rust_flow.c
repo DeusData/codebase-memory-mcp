@@ -2147,8 +2147,6 @@ static void rs_bind_tuple_struct(rs_walk_t *w, TSNode node, const rs_type_t *typ
         /* A constructor pattern's head is never a local variable. */
         rs_ent_t ent =
             rs_lookup_lexical(&w->q, w->inst, w->blocks, w->nblocks, name ? name : "", RS_NS_VALUE);
-        (void)ignored;
-        (void)is_local;
         sel = rs_is_self_type(name) ? rs_value_name(w, name, &ignored, &is_local)
                                     : rs_sel_from_ent(w, &ent);
     } else if (!ts_node_is_null(head)) {
