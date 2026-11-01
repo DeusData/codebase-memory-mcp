@@ -1353,6 +1353,32 @@ TEST(resolver_js_project_known_gaps_abstain_with_a_reason) {
                            "const View = require(name);\n"
                            "function dynamicCaller() { return new View(); }\n"
                            "module.exports = dynamicCaller;\n"},
+        /* A JavaScript instance or inherited member. Nothing checks that `p.m` is still the
+         * class's: any write can replace it per instance. Tried: the TS receiver rules, which
+         * lean on the type checker; js_mode keeps them off and only own `this.m()` binds. */
+        {"lib/jsclass.js", "class Plain { m() { return 1; } }\n"
+                           "class Sub extends Plain { subRun() { return this.m(); } }\n"
+                           "function viaLocal() { const p = new Plain(); return p.m(); }\n"
+                           "module.exports = { Plain, Sub, viaLocal };\n"},
+        /* `super.m()` has no receiver form in ts_proof. `this.m()` selects the override,
+         * so super needs its own rule; reading it as `this` would pick the wrong method. */
+        {"src/sup.ts", "export class Base { over() { return 1; } }\n"
+                       "export class Kid extends Base {\n"
+                       "  over() { return 2; }\n"
+                       "  callSuper() { return super.over(); }\n"
+                       "}\n"},
+        /* A member assigned in a block may not run, so one assignment cannot stand for the
+         * member. Tried: only a module-level statement counts as defining it. */
+        {"lib/block.js", "const Owner = {};\n"
+                         "if (process.env.X) { Owner.m = function blockM() { return 1; }; }\n"
+                         "function blockCaller() { return Owner.m(); }\n"
+                         "module.exports = blockCaller;\n"},
+        /* A class type parameter blocks its name for the whole file: the walk records it at
+         * the module scope, because the class has no scope of its own yet. This loses the
+         * real `c: Cbaz` beside it and can never produce a wrong edge. */
+        {"src/generic.ts", "export class Cbaz {}\n"
+                           "export class Box<Cbaz> { item: Cbaz; }\n"
+                           "export function genericCaller(c: Cbaz) { return c; }\n"},
     };
     js_project_t project = {0};
     ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), 0));
@@ -1360,6 +1386,11 @@ TEST(resolver_js_project_known_gaps_abstain_with_a_reason) {
     ASSERT_EQ(js_project_edges(&project, "CALLS", "protoCaller", "lib.view.render"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "decodeCaller", "src.decode.decode"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "dynamicCaller", "lib.view.View"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "viaLocal", "lib.jsclass.Plain.m"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "subRun", "lib.jsclass.Plain.m"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "callSuper", "src.sup.Base.over"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "blockCaller", "lib.block.blockM"), 0);
+    ASSERT_EQ(js_project_edges(&project, "USES_TYPE", "genericCaller", "src.generic.Cbaz"), 0);
     js_project_free(&project);
     PASS();
 }
