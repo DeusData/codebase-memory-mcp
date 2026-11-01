@@ -64,10 +64,12 @@
  * PYTHON STRATEGY INVENTORY — every literal "lsp_..." emitted by py_lsp.c
  *   (grep '"lsp_' internal/cbm/lsp/py_lsp.c), with its keying site:
  *     lsp_direct                (py_lsp.c:1631)  module-local f()
- *     lsp_constructor           ClassName() with no user __init__ → the Class
- *     lsp_constructor_init      ClassName() with a user __init__ (on the class
- *                               or a declared base) → that __init__. The textual
- *                               callee leaf stays the class name; reason joins it.
+ *     lsp_constructor           ClassName() where the class declares no __init__
+ *                               of its own (an inherited one is not followed)
+ *                               → the Class
+ *     lsp_constructor_init      ClassName() where the class declares its own
+ *                               __init__ → that __init__. The textual callee
+ *                               leaf stays the class name; reason joins it.
  *     lsp_method                (py_lsp.c:1731)  obj.method() on a NAMED-typed
  *                                                receiver (covers self.other())
  *     lsp_super                 (py_lsp.c:1693)  super().method() resolved on a

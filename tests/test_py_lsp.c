@@ -403,26 +403,55 @@ TEST(pylsp_constructor_call_targets_init) {
     PASS();
 }
 
-/* class B(A) with only A.__init__ resolves construction of B to A.__init__. */
-TEST(pylsp_constructor_inherited_init) {
+/* Same-file subclasses: only an __init__ the class declares itself is a
+ * construction target. B(A) inherits A.__init__ but declares none, so B()
+ * stays on the class B (never A.__init__). C(A) declares its own __init__,
+ * so C() resolves to C.__init__ (never the inherited A.__init__). */
+static int count_build_rows(const CBMFileResult *r, const char *caller_leaf,
+                            const char *callee_qn, const char *strategy) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !rc->strategy)
+            continue;
+        const char *dot = strrchr(rc->caller_qn, '.');
+        const char *leaf = dot ? dot + 1 : rc->caller_qn;
+        if (strcmp(leaf, caller_leaf) == 0 && strcmp(rc->callee_qn, callee_qn) == 0 &&
+            strcmp(rc->strategy, strategy) == 0)
+            n++;
+    }
+    return n;
+}
+
+TEST(pylsp_constructor_same_file_subclass_own_init_only) {
     CBMFileResult *r = extract_py("class A:\n"
                                   "    def __init__(self):\n"
                                   "        self.ready = True\n"
                                   "class B(A):\n"
                                   "    def go(self):\n"
                                   "        return 1\n"
-                                  "def build():\n"
-                                  "    return B()\n");
+                                  "class C(A):\n"
+                                  "    def __init__(self):\n"
+                                  "        self.ready = False\n"
+                                  "def build_b():\n"
+                                  "    return B()\n"
+                                  "def build_c():\n"
+                                  "    return C()\n");
     ASSERT_NOT_NULL(r);
-    int idx = require_resolved(r, "build", "A.__init__");
+    /* B() keeps the class target; the inherited A.__init__ gets no row. */
+    ASSERT_EQ(count_build_rows(r, "build_b", "test.main.B", "lsp_constructor"), 1);
+    ASSERT_EQ(find_resolved(r, "build_b", "__init__"), -1);
+    /* C() binds to the __init__ C declares itself. */
+    int idx = require_resolved(r, "build_c", "test.main.C.__init__");
     ASSERT_GTE(idx, 0);
     if (idx >= 0) {
         const CBMResolvedCall *rc = &r->resolved_calls.items[idx];
         ASSERT_STR_EQ(rc->strategy, "lsp_constructor_init");
-        ASSERT(strstr(rc->callee_qn, "B.__init__") == NULL);
-        ASSERT(strncmp(rc->callee_qn, "builtins.", 9) != 0);
+        ASSERT_STR_EQ(rc->reason, "C");
     }
-    ASSERT_EQ(find_resolved(r, "build", "B.__init__"), -1);
+    ASSERT_EQ(find_resolved(r, "build_c", "test.main.A.__init__"), -1);
+    ASSERT_EQ(count_build_rows(r, "build_c", "test.main.C", "lsp_constructor"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -1126,10 +1155,11 @@ TEST(pylsp_crossfile_constructor_targets_init) {
     PASS();
 }
 
-/* class B(A) where A's __init__ lives in another module. The cross registry
- * records the real base QN; per-file registration would have stored
- * test.main.A and missed the base. */
-TEST(pylsp_crossfile_inherited_init) {
+/* class B(A) where A's __init__ lives in another module and B declares no
+ * __init__ of its own. Construction binds only to an __init__ the class
+ * declares itself, so B() stays on the class B and the inherited
+ * base_mod.A.__init__ gets no row. */
+TEST(pylsp_crossfile_inherited_init_stays_on_class) {
     const char *source = "from base_mod import A\n"
                          "class B(A):\n"
                          "    def go(self):\n"
@@ -1168,12 +1198,12 @@ TEST(pylsp_crossfile_inherited_init) {
     cbm_run_py_lsp_cross_with_registry(&arena, source, (int)strlen(source), "test.main", reg,
                                        imp_names, imp_qns, 1, NULL, &out, NULL);
 
-    int idx = find_resolved_arr(&out, "build", "base_mod.A.__init__");
+    ASSERT_EQ(find_resolved_arr(&out, "build", "__init__"), -1);
+    int idx = find_resolved_arr(&out, "build", "test.main.B");
     ASSERT_GTE(idx, 0);
     if (idx >= 0) {
-        ASSERT_STR_EQ(out.items[idx].strategy, "lsp_constructor_init");
-        ASSERT_STR_EQ(out.items[idx].reason, "B");
-        ASSERT(strstr(out.items[idx].callee_qn, "B.__init__") == NULL);
+        ASSERT_STR_EQ(out.items[idx].callee_qn, "test.main.B");
+        ASSERT_STR_EQ(out.items[idx].strategy, "lsp_constructor");
     }
     cbm_arena_destroy(&arena);
     PASS();
@@ -5266,7 +5296,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_method_via_self);
     RUN_TEST(pylsp_constructor_call_returns_instance);
     RUN_TEST(pylsp_constructor_call_targets_init);
-    RUN_TEST(pylsp_constructor_inherited_init);
+    RUN_TEST(pylsp_constructor_same_file_subclass_own_init_only);
     RUN_TEST(pylsp_constructor_without_init_stays_on_class);
     RUN_TEST(pylsp_callable_instance_call_skips_init);
     RUN_TEST(pylsp_constructor_skips_builtin_init);
@@ -5289,7 +5319,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
     RUN_TEST(pylsp_crossfile_constructor_targets_init);
-    RUN_TEST(pylsp_crossfile_inherited_init);
+    RUN_TEST(pylsp_crossfile_inherited_init_stays_on_class);
     RUN_TEST(pylsp_batch_two_files);
     RUN_TEST(pylsp_from_import_alias_equal_module_leaf_targets_imported_member);
     RUN_TEST(pylsp_project_prefixed_direct_alias_same_tail_is_not_from_import_reference);

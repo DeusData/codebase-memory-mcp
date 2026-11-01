@@ -3249,17 +3249,19 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                     py_emit_resolved_call_reason(ctx, qn, "lsp_import_alias", 0.85f, fname,
                                                  call_node);
                 } else if (qn && cbm_registry_lookup_type(ctx->registry, qn)) {
-                    /* ClassName() runs a user __init__ found on the class or,
-                     * depth-first, a declared base (the same walk
-                     * super().__init__ uses, not C3 MRO). Retarget only when
-                     * this binding IS the class being called. An instance
+                    /* ClassName() binds to the __init__ the class declares
+                     * itself. An inherited __init__ is not followed: B(A)
+                     * without its own __init__ keeps the call on B, so a base
+                     * constructor does not collect every subclass
+                     * construction as its caller. Retarget only when this
+                     * binding IS the class being called. An instance
                      * (`f = Foo(); f()`) keeps the class row: that call
                      * dispatches to __call__, and a reason-join would invent
                      * a Foo.__init__ edge. A builtins.* __init__ is not a
                      * project constructor, so the class target stays. */
                     const CBMRegisteredFunc *fi = NULL;
                     if (qn_short && strcmp(qn_short, fname) == 0) {
-                        fi = py_lookup_attribute(ctx, qn, "__init__");
+                        fi = cbm_registry_lookup_method(ctx->registry, qn, "__init__");
                     }
                     if (fi && fi->qualified_name &&
                         strncmp(fi->qualified_name, "builtins.", sizeof("builtins.") - 1) != 0) {

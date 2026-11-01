@@ -1853,6 +1853,49 @@ TEST(lrp_python_usage_instantiation) {
     PASS();
 }
 
+/* Python same-file subclasses in the graph: ClassName() binds only to an
+ * __init__ the class declares itself. B(A) declares none, so make_b keeps
+ * its CALLS edge on the class B and the inherited A.__init__ gets none.
+ * C(A) declares its own __init__, so make_c calls C.__init__, not C and not
+ * the inherited A.__init__. */
+TEST(lrp_python_subclass_constructor_own_init_only) {
+    static const LRP_File f[] = {{"main.py", "class A:\n"
+                                             "    def __init__(self):\n"
+                                             "        self.ready = True\n"
+                                             "\n"
+                                             "class B(A):\n"
+                                             "    def go(self):\n"
+                                             "        return 1\n"
+                                             "\n"
+                                             "class C(A):\n"
+                                             "    def __init__(self):\n"
+                                             "        self.ready = False\n"
+                                             "\n"
+                                             "def make_b():\n"
+                                             "    return B()\n"
+                                             "\n"
+                                             "def make_c():\n"
+                                             "    return C()\n"}};
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 1);
+    const char *p = store ? lp.project : NULL;
+    int b_class = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_b", "main.B");
+    int b_base_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_b", "main.A.__init__");
+    int c_own_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.C.__init__");
+    int c_class = lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.C");
+    int c_base_init =
+        lrp_exact_edge_by_qn_suffix(store, p, "CALLS", "main.make_c", "main.A.__init__");
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(b_class, 1);
+    ASSERT_EQ(b_base_init, 0);
+    ASSERT_EQ(c_own_init, 1);
+    ASSERT_EQ(c_class, 0);
+    ASSERT_EQ(c_base_init, 0);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * SUITE registration
  * ══════════════════════════════════════════════════════════════════════ */
@@ -1970,4 +2013,5 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_ts_usage_import_type_with_decoy);
     RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
     RUN_TEST(lrp_python_usage_instantiation);
+    RUN_TEST(lrp_python_subclass_constructor_own_init_only);
 }
