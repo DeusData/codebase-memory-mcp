@@ -2837,6 +2837,18 @@ static bool resolve_calls(file_resolver_t *resolver, CBMArena *arena) {
                            call))
             return false;
     }
+    size_t extra_count = 0;
+    const cbm_source_extra_call_t *extras =
+        cbm_source_unit_extra_calls(resolver->source_unit, &extra_count);
+    for (size_t e = 0; e < extra_count; e++) {
+        const cbm_source_extra_call_t *extra = &extras[e];
+        cbm_resolve_result_t outcome =
+            source_adapter_result(resolver, extra->name, extra->start, extra->end,
+                                  CBM_SOURCE_ORIGIN_RAW, true);
+        if (!record_result(resolver, extra->scope, extra->name, "CALLS", extra->start, extra->end,
+                           CBM_SOURCE_ORIGIN_RAW, outcome, NULL))
+            return false;
+    }
     return true;
 }
 

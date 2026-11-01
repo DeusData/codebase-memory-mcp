@@ -20,6 +20,8 @@ struct cbm_source_table {
 struct cbm_source_unit {
     cbm_source_site_t *sites;
     size_t count, capacity;
+    cbm_source_extra_call_t *extras;
+    size_t extra_count, extra_capacity;
     const char *failure;
 };
 
@@ -27,7 +29,8 @@ static const cbm_source_adapter_t *adapter_for(CBMLanguage language) {
     static const cbm_source_adapter_t *const adapters[] = {
         &cbm_source_adapter_php,     &cbm_source_adapter_elixir, &cbm_source_adapter_erlang,
         &cbm_source_adapter_perl,    &cbm_source_adapter_ruby,   &cbm_source_adapter_zig,
-        &cbm_source_adapter_haskell, &cbm_source_adapter_ocaml,  &cbm_source_adapter_dart,   &cbm_source_adapter_swift,
+        &cbm_source_adapter_haskell, &cbm_source_adapter_ocaml,  &cbm_source_adapter_dart,
+        &cbm_source_adapter_swift,
     };
     for (size_t i = 0; i < sizeof(adapters) / sizeof(adapters[0]); i++)
         if (adapters[i]->language == language)
@@ -327,6 +330,25 @@ void cbm_source_emit_facts(cbm_source_walk_t *walk, uint32_t start, uint32_t end
     cbm_source_unit_t *unit = walk->unit;
     if (!unit || end <= start)
         return;
+    if (walk->extra_name) {
+        if (!target)
+            return;
+        if (unit->extra_count == unit->extra_capacity) {
+            size_t capacity = unit->extra_capacity ? unit->extra_capacity * 2 : 32;
+            cbm_source_extra_call_t *extras =
+                cbm_arena_alloc(walk->arena, capacity * sizeof(*extras));
+            if (!extras) {
+                cbm_source_fail(walk, "source_adapter_allocation");
+                return;
+            }
+            if (unit->extra_count)
+                memcpy(extras, unit->extras, unit->extra_count * sizeof(*extras));
+            unit->extras = extras;
+            unit->extra_capacity = capacity;
+        }
+        unit->extras[unit->extra_count++] = (cbm_source_extra_call_t){
+            walk->extra_scope ? walk->extra_scope : "", walk->extra_name, start, end};
+    }
     if (unit->count == unit->capacity) {
         size_t capacity = unit->capacity ? unit->capacity * 2 : 64;
         cbm_source_site_t *sites = cbm_arena_alloc(walk->arena, capacity * sizeof(*sites));
@@ -466,6 +488,12 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
     if (unit->count > 1)
         qsort(unit->sites, unit->count, sizeof(*unit->sites), compare_site);
     return unit;
+}
+
+const cbm_source_extra_call_t *cbm_source_unit_extra_calls(const cbm_source_unit_t *unit,
+                                                           size_t *count) {
+    *count = unit && !unit->failure ? unit->extra_count : 0;
+    return *count ? unit->extras : NULL;
 }
 
 void cbm_source_unit_site(const cbm_source_unit_t *unit, uint32_t start, uint32_t end,

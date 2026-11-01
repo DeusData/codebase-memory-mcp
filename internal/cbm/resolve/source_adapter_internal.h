@@ -73,6 +73,9 @@ typedef struct cbm_source_walk {
     uint64_t visits;
     const char *failure;
     CBMHashTable *def_index; /* lazily built, owned by the walk */
+    /* Set around an emit for a site extraction has no carrier for. */
+    const char *extra_scope;
+    const char *extra_name;
 } cbm_source_walk_t;
 
 typedef void (*cbm_source_pass_fn)(cbm_source_walk_t *walk);

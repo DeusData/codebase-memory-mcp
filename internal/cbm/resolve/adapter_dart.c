@@ -26,8 +26,9 @@
  * binding.c; where these abstain, those keep their own stricter proofs.
  *
  * Known gaps, each abstaining: `part of a.b;` by library name (the file falls back
- * to the older rules), element types of collections and generics, conditional
- * imports, and cascade or deeper-chain calls, which extraction has no site for. */
+ * to the older rules), element types of collections and generics, and conditional
+ * imports. Calls deep in a selector chain and in cascades have no extraction carrier,
+ * so a decided one is reported as an extra site. */
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,7 @@ typedef struct {
     const char *library;
     const char *class_key;   /* enclosing class, or NULL */
     const char *type_params; /* ",T,U," in scope, or NULL */
+    const char *scope;       /* the enclosing definition's QN, or NULL */
     dart_local_t *locals;
     CBMHashTable *libraries;
     CBMHashTable *import_memo;
@@ -1095,6 +1097,17 @@ static void dart_emit_call(dart_ctx_t *ctx, uint32_t start, uint32_t end, const 
                           ref->kind == DART_CLASS ? CBM_RESOLVE_FACT_CLASS_CALLABLE : 0);
 }
 
+static void dart_emit_extra(dart_ctx_t *ctx, uint32_t start, uint32_t end, const char *name,
+                            const dart_ref_t *ref) {
+    if (!ctx->scope)
+        return;
+    ctx->walk->extra_scope = ctx->scope;
+    ctx->walk->extra_name = name;
+    dart_emit_call(ctx, start, end, ref);
+    ctx->walk->extra_scope = NULL;
+    ctx->walk->extra_name = NULL;
+}
+
 static void dart_visit(dart_ctx_t *ctx, TSNode node, unsigned depth);
 
 /* After a call: what the callee's declared return type says the value is. */
@@ -1133,12 +1146,28 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
                 const char *member = dart_selector_member(ctx, child);
                 dart_ref_t found = member ? dart_member(ctx, &current, member)
                                           : (dart_ref_t){.reason = "dart_computed_member"};
-                if (member && cbm_source_is(previous, "identifier") && dart_selector_is_call(next))
-                    dart_emit_call(ctx, ts_node_start_byte(previous), ts_node_end_byte(child),
-                                   &found);
+                if (member && dart_selector_is_call(next)) {
+                    if (cbm_source_is(previous, "identifier"))
+                        dart_emit_call(ctx, ts_node_start_byte(previous), ts_node_end_byte(child),
+                                       &found);
+                    else
+                        dart_emit_extra(ctx, ts_node_start_byte(child), ts_node_end_byte(next),
+                                        member, &found);
+                }
                 dart_visit(ctx, child, depth + 1);
                 current = found;
             } /* `x!` leaves x's type. */
+        } else if (cbm_source_is(child, "cascade_section")) {
+            /* `x..a()..b()`: each section selects on x, and the value stays x. */
+            TSNode selector = dart_find(child, "cascade_selector", 7);
+            const char *member = cbm_source_text(ctx->walk, dart_find(selector, "identifier", 7));
+            bool call = !ts_node_is_null(dart_find(child, "argument_part", 7));
+            if (member && call && ts_node_named_child_count(selector) == 1) {
+                dart_ref_t found = dart_member(ctx, &current, member);
+                dart_emit_extra(ctx, ts_node_start_byte(child), ts_node_end_byte(child), member,
+                                &found);
+            }
+            dart_visit(ctx, child, depth + 1);
         } else if (cbm_source_is(child, "initialized_identifier")) {
             /* `var a = 1, b = 2`: another name of this declaration, typed by itself. */
             dart_ref_t value = dart_visit_sequence(ctx, child, depth + 1, false);
@@ -1147,7 +1176,8 @@ static dart_ref_t dart_visit_sequence(dart_ctx_t *ctx, TSNode node, unsigned dep
         } else {
             current = (dart_ref_t){.reason = "dart_computed_receiver"};
             if (cbm_source_is(child, "identifier")) {
-                const char *name = (resolve_every_name || cbm_source_is(next, "selector"))
+                const char *name = (resolve_every_name || cbm_source_is(next, "selector") ||
+                                    cbm_source_is(next, "cascade_section"))
                                        ? cbm_source_text(ctx->walk, child)
                                        : NULL;
                 if (name)
@@ -1170,6 +1200,17 @@ static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode b
                                      unsigned depth) {
     dart_local_t *saved = ctx->locals;
     const char *saved_params = ctx->type_params;
+    const char *saved_scope = ctx->scope;
+    /* A named definition is the scope; a closure stays in the one around it. */
+    TSNode named = cbm_source_is(signature, "method_signature") ? ts_node_named_child(signature, 0)
+                                                                : signature;
+    TSNode definition = cbm_source_field(named, "name");
+    if (!ts_node_is_null(definition) && !cbm_source_is(signature, "formal_parameter_list")) {
+        const char *text = cbm_source_text(ctx->walk, definition);
+        ctx->scope =
+            text ? cbm_source_def_qn(ctx->walk, text, ts_node_start_point(definition).row + 1)
+                 : NULL;
+    }
     if (!ts_node_is_null(signature)) {
         if (cbm_source_is(signature, "method_signature") && ts_node_named_child_count(signature))
             ctx->type_params =
@@ -1193,6 +1234,7 @@ static void dart_visit_function_body(dart_ctx_t *ctx, TSNode signature, TSNode b
         dart_visit(ctx, body, depth + 1);
     ctx->locals = saved;
     ctx->type_params = saved_params;
+    ctx->scope = saved_scope;
 }
 
 /* A declaration's signature is followed by its sibling body. */

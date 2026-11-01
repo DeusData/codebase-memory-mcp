@@ -63,6 +63,17 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
                                          const CBMFileResult *result, CBMLanguage language,
                                          const char *file, const char *source, size_t source_len);
 
+/* Calls this language's rules prove at sites extraction has no carrier for, such as
+ * Ruby's bare method name or a call deep in a Dart selector chain. scope is the
+ * enclosing definition's QN, empty for the file. Only decided sites are listed. */
+typedef struct {
+    const char *scope;
+    const char *name;
+    uint32_t start, end;
+} cbm_source_extra_call_t;
+const cbm_source_extra_call_t *cbm_source_unit_extra_calls(const cbm_source_unit_t *unit,
+                                                           size_t *count);
+
 /* Exact occurrence lookup, independent of the extractor's spelling. Always
  * fills out; out->target is NULL for every abstention. */
 void cbm_source_unit_site(const cbm_source_unit_t *unit, uint32_t start, uint32_t end,

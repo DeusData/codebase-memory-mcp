@@ -501,6 +501,7 @@ typedef struct ruby_local {
     const char *name;
     TSNode value;
     uint32_t available_from;
+    uint32_t bound_from; /* where the first assignment's name is, as the parser sees it */
     int writes;
     bool blocked;
     struct ruby_local *next;
@@ -510,6 +511,7 @@ typedef struct {
     ruby_ctx_t base;
     ruby_self_t self;
     ruby_local_t *locals;
+    const char *scope; /* the enclosing def's QN; NULL in a class body or unknown */
 } ruby_visit_t;
 
 static ruby_local_t *ruby_local(ruby_visit_t *visit, const char *name) {
@@ -522,6 +524,7 @@ static ruby_local_t *ruby_local(ruby_visit_t *visit, const char *name) {
         return NULL;
     }
     local->name = name;
+    local->bound_from = UINT32_MAX;
     local->next = visit->locals;
     visit->locals = local;
     return local;
@@ -557,6 +560,8 @@ static void ruby_audit_locals(ruby_visit_t *visit, TSNode node, unsigned depth) 
                 local->writes++;
                 local->value = cbm_source_field(node, "right");
                 local->available_from = ts_node_end_byte(node);
+                if (ts_node_start_byte(left) < local->bound_from)
+                    local->bound_from = ts_node_start_byte(left);
             }
         } else {
             ruby_block_locals(visit, left, depth + 1);
@@ -572,6 +577,22 @@ static void ruby_audit_locals(ruby_visit_t *visit, TSNode node, unsigned depth) 
             depth + 1);
     } else if (cbm_source_is(node, "for")) {
         ruby_block_locals(visit, cbm_source_field(node, "pattern"), depth + 1);
+    } else if (strstr(ts_node_type(node), "pattern")) {
+        /* `in {x:}` and `=> x` bind what they name. */
+        ruby_block_locals(visit, node, depth + 1);
+    } else if (cbm_source_is(node, "binary") &&
+               cbm_source_is(cbm_source_field(node, "left"), "regex")) {
+        /* `/(?<year>..)/ =~ s` binds year, by the literal's own text. */
+        const char *text = cbm_source_text(visit->base.walk, cbm_source_field(node, "left"));
+        for (const char *p = text ? strstr(text, "(?<") : NULL; p; p = strstr(p + 3, "(?<")) {
+            const char *close = strchr(p + 3, '>');
+            char *name = close ? cbm_arena_strndup(visit->base.walk->arena, p + 3,
+                                                   (size_t)(close - p - 3))
+                               : NULL;
+            ruby_local_t *local = name && name[0] ? ruby_local(visit, name) : NULL;
+            if (local)
+                local->blocked = true;
+        }
     }
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++)
@@ -639,6 +660,25 @@ static void ruby_visit_implicit_self(ruby_visit_t *visit, TSNode node, const cha
         break;
     }
     ruby_emit_lookup(visit, node, found, decl, current);
+}
+
+/* Ruby's parser reads a bare identifier as a local only when an assignment to it
+ * comes first in the scope, or it is a parameter. Otherwise it is a method call on
+ * self with no arguments, whatever a later assignment does. */
+static void ruby_visit_bare_identifier(ruby_visit_t *visit, TSNode node) {
+    cbm_source_walk_t *walk = visit->base.walk;
+    const char *name = cbm_source_text(walk, node);
+    if (!name || (visit->self != RUBY_SELF_MAIN && !visit->scope))
+        return;
+    uint32_t at = ts_node_start_byte(node);
+    for (const ruby_local_t *local = visit->locals; local; local = local->next)
+        if (!strcmp(local->name, name) && (local->blocked || at >= local->bound_from))
+            return;
+    walk->extra_scope = visit->scope;
+    walk->extra_name = name;
+    ruby_visit_implicit_self(visit, node, name);
+    walk->extra_scope = NULL;
+    walk->extra_name = NULL;
 }
 
 static void ruby_visit_constant_call(ruby_visit_t *visit, TSNode node, const char *owner,
@@ -735,6 +775,12 @@ static void ruby_visit_children(ruby_visit_t *visit, TSNode node, unsigned depth
 static void ruby_visit_def(ruby_visit_t *visit, TSNode node, ruby_self_t self, unsigned depth) {
     ruby_self_t saved_self = visit->self;
     ruby_local_t *saved_locals = visit->locals;
+    const char *saved_scope = visit->scope;
+    TSNode def_name = cbm_source_field(node, "name");
+    const char *def_text = cbm_source_text(visit->base.walk, def_name);
+    visit->scope = def_text ? cbm_source_def_qn(visit->base.walk, def_text,
+                                                ts_node_start_point(def_name).row + 1)
+                            : NULL;
     visit->self = self;
     visit->locals = NULL;
     TSNode parameters = cbm_source_field(node, "parameters");
@@ -747,12 +793,40 @@ static void ruby_visit_def(ruby_visit_t *visit, TSNode node, ruby_self_t self, u
     }
     visit->self = saved_self;
     visit->locals = saved_locals;
+    visit->scope = saved_scope;
 }
 
 static void ruby_visit(ruby_visit_t *visit, TSNode node, unsigned depth) {
     cbm_source_walk_t *walk = visit->base.walk;
-    if (!cbm_source_step(walk, depth))
+    if (ts_node_is_null(node) || !cbm_source_step(walk, depth))
         return;
+    if (cbm_source_is(node, "identifier")) {
+        ruby_visit_bare_identifier(visit, node);
+        return;
+    }
+    /* These hold names being bound or spelled, not values being read. */
+    const char *syntax = ts_node_type(node);
+    if (!strcmp(syntax, "block_parameters") || !strcmp(syntax, "lambda_parameters") ||
+        !strcmp(syntax, "method_parameters") || !strcmp(syntax, "left_assignment_list") ||
+        !strcmp(syntax, "exception_variable") || !strcmp(syntax, "alias") ||
+        !strcmp(syntax, "undef") || strstr(syntax, "pattern"))
+        return;
+    if (!strcmp(syntax, "assignment") || !strcmp(syntax, "operator_assignment")) {
+        TSNode left = cbm_source_field(node, "left");
+        if (!cbm_source_is(left, "identifier"))
+            ruby_visit(visit, left, depth + 1);
+        ruby_visit(visit, cbm_source_field(node, "right"), depth + 1);
+        return;
+    }
+    if (!strcmp(syntax, "scope_resolution")) {
+        ruby_visit(visit, cbm_source_field(node, "scope"), depth + 1);
+        return;
+    }
+    if (!strcmp(syntax, "for")) {
+        ruby_visit(visit, cbm_source_field(node, "value"), depth + 1);
+        ruby_visit(visit, cbm_source_field(node, "body"), depth + 1);
+        return;
+    }
     if (cbm_source_is(node, "class") || cbm_source_is(node, "module")) {
         const char *owner = ruby_declared_owner(&visit->base, cbm_source_field(node, "name"));
         TSNode body = cbm_source_field(node, "body");

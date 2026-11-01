@@ -354,6 +354,11 @@ static int ruby_target_edges(const char *source, const char *rel) {
 TEST(resolver_pipeline_ruby_parenthesized_call_binds_its_top_level_def) {
     ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target()\nend\n", "main.rb"), 1);
     ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target 1\nend\n", "main.rb"), 1);
+    /* A bare name no assignment precedes is a call too: the parser reads it so. */
+    ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target\nend\n", "main.rb"), 1);
+    ASSERT_EQ(ruby_target_edges("def target\n 1\nend\ndef caller\n target\n target = 2\nend\n",
+                                "main.rb"),
+              1);
     /* A local of that name cannot capture a call with parentheses. */
     ASSERT_EQ(
         ruby_target_edges("def target\n 1\nend\ndef caller\n target = 2\n target()\nend\n", "main.rb"),
@@ -363,6 +368,12 @@ TEST(resolver_pipeline_ruby_parenthesized_call_binds_its_top_level_def) {
 
 TEST(resolver_pipeline_ruby_redefinition_and_metaprogramming_abstain) {
     const char *const sources[] = {
+        /* A bare name after its assignment is the local, read on either side. */
+        "def target\n 1\nend\ndef caller\n target = 2\n target\nend\n",
+        "def target\n 1\nend\ndef caller\n target = 2\n target = target + 1\nend\n",
+        "def target\n 1\nend\ndef caller(target)\n target\nend\n",
+        "def target\n 1\nend\ndef caller\n [1].each { |target| target }\nend\n",
+        "def target\n 1\nend\ndef caller(s)\n /(?<target>x)/ =~ s\n target\nend\n",
         /* Two definitions of one name. */
         "def target\n 1\nend\ndef target\n 2\nend\ndef caller\n target()\nend\n",
         /* `define_method` replaces the literal name in the class. */
