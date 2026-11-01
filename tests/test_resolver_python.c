@@ -858,7 +858,23 @@ TEST(resolver_python_module_level_instance_has_its_class) {
 TEST(resolver_python_decorators_keep_identity_only_when_proven) {
     static const python_proof_file_t decorators = {
         "lib/deco.py",
-        "from functools import wraps\n"
+        "from functools import wraps, update_wrapper\n"
+        "def wraps_called(function):\n"
+        "    def inner(*args):\n        return function(*args)\n"
+        "    return wraps(function)(inner)\n"
+        "def updates(function):\n"
+        "    def inner(*args):\n        return function(*args)\n"
+        "    update_wrapper(inner, function)\n"
+        "    return inner\n"
+        "def update_returned(function):\n"
+        "    def inner(*args):\n        return function(*args)\n"
+        "    return update_wrapper(inner, function)\n"
+        "def hands_on(function):\n    return tagged('x')(function)\n"
+        "def hands_on_direct(function):\n    return same(function)\n"
+        "def hands_to_bad(function):\n    return replace(function)\n"
+        "class only(classmethod):\n"
+        "    def __get__(self, instance, owner=None):\n"
+        "        return super().__get__(instance, owner)\n"
         "def same(function):\n    return function\n"
         "def logged(function):\n"
         "    @wraps(function)\n"
@@ -892,12 +908,15 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
         {"@either(path='p')", 1}, {"@replace", 0},     {"@nothing", 0},        {"@opaque", 0},
         {"@swallow", 0},       {"@conditional", 0},    {"@generated", 0},      {"@tagged", 0},
         {"@same('x')", 0},     {"@external_deco", 0},  {"@same\n@replace", 0}, {"@same\n@logged", 1},
+        {"@wraps_called", 1},  {"@updates", 1},        {"@update_returned", 1},
+        {"@hands_on", 1},      {"@hands_on_direct", 1}, {"@hands_to_bad", 0},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char source[768];
         snprintf(source, sizeof(source),
                  "from lib.deco import same, logged, tagged, either, replace, nothing, opaque, "
-                 "swallow, conditional, generated\nfrom external import external_deco\n"
+                 "swallow, conditional, generated, wraps_called, updates, update_returned, "
+                 "hands_on, hands_on_direct, hands_to_bad\nfrom external import external_deco\n"
                  "%s\ndef target():\n    return 1\ndef run():\n    return target()\n",
                  cases[i].decorator);
         const python_proof_file_t files[] = {{"main.py", source}, decorators};
@@ -923,6 +942,10 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
                 {"main.py", "from external import wrap\n@wrap\nclass Base:\n"
                             "    def save(self):\n        return 1\n"
                             "class Child(Base):\n    def run(self):\n        return super().save()\n"});
+    EXPECT_CALL("classmethod subclass binds the function", "main.py", "go", "Method", 1,
+                {"main.py", "from lib.deco import only\nclass A:\n    @only\n    def go(cls):\n"
+                            "        return 1\ndef run():\n    return A.go()\n"},
+                decorators);
     /* Standard library facts, and only for the real module. */
     EXPECT_CALL("stdlib cache", "main.py", "target", "Function", 1,
                 {"main.py", "import functools\n@functools.lru_cache(maxsize=1)\ndef target():\n"

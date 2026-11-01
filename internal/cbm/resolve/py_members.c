@@ -66,6 +66,8 @@ typedef struct py_class py_class_t;
 typedef struct {
     py_ref_t result;
     unsigned shape;
+    py_ref_t delegate;
+    bool delegate_applied;
     /* Unannotated: the class every return statement agrees on, settled at seal. */
     py_ref_t *returned;
     uint32_t returned_count;
@@ -428,6 +430,9 @@ static bool py_note_function(cbm_py_members_t *members, const cbm_resolve_bindin
     function->result = py_capture_type(members, index, scratch, imports, member->return_chain,
                                        member->chain_scope);
     function->shape = member->shape;
+    function->delegate_applied = member->delegate_applied;
+    function->delegate =
+        py_capture(members, index, scratch, imports, member->delegate_chain, member->chain_scope);
     uint32_t count = 0;
     while (member->returned && member->returned[count])
         count++;
@@ -985,6 +990,22 @@ static bool py_stdlib_property(const char *canonical) {
            !strcmp(canonical, "abc.abstractproperty");
 }
 
+/* The source proves it keeps identity in this form, or hands the function on to a
+ * decorator that does. */
+static bool py_function_keeps(const py_eval_t *eval, const char *qualified_name, bool applied,
+                              unsigned depth) {
+    const py_function_t *function = cbm_ht_get(eval->members->functions, qualified_name);
+    if (!function || depth > 4)
+        return false;
+    if (function->shape & (applied ? CBM_PY_SHAPE_FACTORY : CBM_PY_SHAPE_DIRECT))
+        return true;
+    if (applied || !(function->shape & CBM_PY_SHAPE_DELEGATES))
+        return false;
+    py_value_t next = py_eval_ref(eval, &function->delegate, depth + 1);
+    return next.kind == PY_VALUE_FUNCTION &&
+           py_function_keeps(eval, next.qualified_name, function->delegate_applied, depth + 1);
+}
+
 static py_keep_t py_decorator_verdict(const py_eval_t *eval, const py_decorator_t *decorator) {
     py_ref_t bare = decorator->ref;
     if (bare.kind == PY_REF_UNBOUND && (!bare.tail || !bare.tail[0])) {
@@ -1001,10 +1022,17 @@ static py_keep_t py_decorator_verdict(const py_eval_t *eval, const py_decorator_
         return !decorator->applied && py_stdlib_property(decorator->canonical) ? PY_KEEP_PROPERTY
                                                                                : PY_KEEP_NONE;
     }
-    if (value.kind == PY_VALUE_FUNCTION) {
-        const py_function_t *function = cbm_ht_get(eval->members->functions, value.qualified_name);
-        unsigned needed = decorator->applied ? CBM_PY_SHAPE_FACTORY : CBM_PY_SHAPE_DIRECT;
-        return function && (function->shape & needed) ? PY_KEEP_IDENTITY : PY_KEEP_NONE;
+    if (value.kind == PY_VALUE_FUNCTION)
+        return py_function_keeps(eval, value.qualified_name, decorator->applied, 0)
+                   ? PY_KEEP_IDENTITY
+                   : PY_KEEP_NONE;
+    /* A classmethod or staticmethod subclass binds the same function. */
+    for (uint32_t i = 0;
+         value.kind == PY_VALUE_CLASS && !decorator->applied && i < value.cls->base_count; i++) {
+        const py_ref_t *base = &value.cls->bases[i];
+        if (base->kind == PY_REF_UNBOUND && (!base->tail || !base->tail[0]) &&
+            (!strcmp(base->name, "classmethod") || !strcmp(base->name, "staticmethod")))
+            return PY_KEEP_IDENTITY;
     }
     /* A descriptor class: `@cached_property` reads run the function once. */
     if (value.kind == PY_VALUE_CLASS && !decorator->applied && py_own_member(value.cls, "__get__"))

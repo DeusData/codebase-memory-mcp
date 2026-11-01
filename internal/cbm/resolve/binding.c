@@ -119,6 +119,9 @@ struct cbm_resolve_binding_index {
     size_t python_member_count, python_member_capacity;
     cbm_resolve_python_decorated_t *python_decorated;
     size_t python_decorated_count, python_decorated_capacity;
+    /* Set while python_decorator_shape reads one function's returns. */
+    const char *python_shape_delegate;
+    bool python_shape_delegate_applied;
     const char *http_default_target, *http_default_base;
     cbm_resolve_http_dependency_t *http_dependencies;
     size_t http_dependency_count, http_dependency_capacity;
@@ -1221,8 +1224,108 @@ static unsigned python_decorator_shape(cbm_resolve_binding_index_t *index, TSNod
     const char *parameter = kind_is(first, "identifier") ? node_text(index, first) : NULL;
     unsigned shape = 0;
     bool failed = false;
+    if (depth == 0) {
+        index->python_shape_delegate = NULL;
+        index->python_shape_delegate_applied = false;
+    }
     python_collect_returns(index, body, function, parameter, depth, &shape, &failed);
     return failed ? 0 : shape;
+}
+
+static bool python_is_parameter(cbm_resolve_binding_index_t *index, TSNode node,
+                                const char *parameter) {
+    const char *text = parameter && kind_is(node, "identifier") ? node_text(index, node) : NULL;
+    return text && !strcmp(text, parameter);
+}
+
+static TSNode python_call_argument(TSNode call, uint32_t position) {
+    TSNode args = field(call, "arguments");
+    return !ts_node_is_null(args) && ts_node_named_child_count(args) > position
+               ? ts_node_named_child(args, position)
+               : (TSNode){0};
+}
+
+/* update_wrapper(g, fn) anywhere in this body, outside nested scopes. */
+static bool python_body_updates_wrapper(cbm_resolve_binding_index_t *index, TSNode node,
+                                        const char *wrapper, const char *parameter,
+                                        unsigned depth) {
+    if (ts_node_is_null(node) || depth > 16)
+        return false;
+    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (kind_is(child, "function_definition") || kind_is(child, "class_definition") ||
+            kind_is(child, "decorated_definition") || kind_is(child, "lambda"))
+            continue;
+        if (kind_is(child, "call")) {
+            const char *callee = python_chain(index, field(child, "function"), 0);
+            const char *imported = callee ? python_import_canonical(index, callee) : NULL;
+            if (imported && !strcmp(imported, "functools.update_wrapper") &&
+                python_is_parameter(index, python_call_argument(child, 0), wrapper) &&
+                python_is_parameter(index, python_call_argument(child, 1), parameter))
+                return true;
+        }
+        if (python_body_updates_wrapper(index, child, wrapper, parameter, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* The return hands the function to another decorator: X(fn) or X(...)(fn). Which
+ * function X names, and what it does, is decided across files. */
+static bool python_note_delegate(cbm_resolve_binding_index_t *index, TSNode callee, bool applied,
+                                 unsigned *shape) {
+    const char *chain = python_chain(index, callee, 0);
+    if (!chain || (index->python_shape_delegate && strcmp(index->python_shape_delegate, chain)))
+        return false;
+    index->python_shape_delegate = chain;
+    index->python_shape_delegate_applied = applied;
+    *shape |= CBM_PY_SHAPE_DELEGATES;
+    return true;
+}
+
+static void python_classify_call_return(cbm_resolve_binding_index_t *index, TSNode value,
+                                        TSNode owner, const char *parameter, unsigned depth,
+                                        unsigned *shape, bool *failed) {
+    TSNode body = field(owner, "body"), callee = field(value, "function");
+    const char *name = kind_is(callee, "identifier") ? node_text(index, callee) : NULL;
+    /* decorator(func), the both-ways form: a local decorator applied here. */
+    TSNode local = name ? python_local_def(index, body, name, 0) : (TSNode){0};
+    if (!ts_node_is_null(local) &&
+        (python_decorator_shape(index, local, depth + 1) & CBM_PY_SHAPE_DIRECT)) {
+        *shape |= CBM_PY_SHAPE_DIRECT;
+        return;
+    }
+    TSNode first = python_call_argument(value, 0);
+    const char *first_name = kind_is(first, "identifier") ? node_text(index, first) : NULL;
+    TSNode wrapper = first_name ? python_local_def(index, body, first_name, 0) : (TSNode){0};
+    /* wraps(fn)(g) and update_wrapper(g, fn): g calls fn. */
+    if (kind_is(callee, "call")) {
+        const char *outer = python_chain(index, field(callee, "function"), 0);
+        const char *imported = outer ? python_import_canonical(index, outer) : NULL;
+        if (imported && !strcmp(imported, "functools.wraps") && !ts_node_is_null(wrapper) &&
+            python_is_parameter(index, python_call_argument(callee, 0), parameter) &&
+            python_calls_name(index, field(wrapper, "body"), parameter, 0)) {
+            *shape |= CBM_PY_SHAPE_DIRECT;
+            return;
+        }
+        if (depth == 0 && python_is_parameter(index, first, parameter) &&
+            python_note_delegate(index, field(callee, "function"), true, shape))
+            return;
+        *failed = true;
+        return;
+    }
+    const char *spelled = python_chain(index, callee, 0);
+    const char *imported = spelled ? python_import_canonical(index, spelled) : NULL;
+    if (imported && !strcmp(imported, "functools.update_wrapper") && !ts_node_is_null(wrapper) &&
+        python_is_parameter(index, python_call_argument(value, 1), parameter) &&
+        python_calls_name(index, field(wrapper, "body"), parameter, 0)) {
+        *shape |= CBM_PY_SHAPE_DIRECT;
+        return;
+    }
+    if (depth == 0 && python_is_parameter(index, first, parameter) &&
+        python_note_delegate(index, callee, false, shape))
+        return;
+    *failed = true;
 }
 
 static void python_classify_return(cbm_resolve_binding_index_t *index, TSNode value, TSNode owner,
@@ -1240,7 +1343,9 @@ static void python_classify_return(cbm_resolve_binding_index_t *index, TSNode va
             *failed = true;
             return;
         }
-        if (parameter && python_wrapper_of(index, local, parameter)) {
+        if (parameter && (python_wrapper_of(index, local, parameter) ||
+                          (python_body_updates_wrapper(index, body, name, parameter, 0) &&
+                           python_calls_name(index, field(local, "body"), parameter, 0)))) {
             *shape |= CBM_PY_SHAPE_DIRECT;
             return;
         }
@@ -1250,16 +1355,9 @@ static void python_classify_return(cbm_resolve_binding_index_t *index, TSNode va
             *failed = true;
         return;
     }
-    /* decorator(func), the both-ways form: a local decorator applied here. */
     if (kind_is(value, "call")) {
-        TSNode callee = field(value, "function");
-        const char *name = kind_is(callee, "identifier") ? node_text(index, callee) : NULL;
-        TSNode local = name ? python_local_def(index, body, name, 0) : (TSNode){0};
-        if (!ts_node_is_null(local) &&
-            (python_decorator_shape(index, local, depth + 1) & CBM_PY_SHAPE_DIRECT)) {
-            *shape |= CBM_PY_SHAPE_DIRECT;
-            return;
-        }
+        python_classify_call_return(index, value, owner, parameter, depth, shape, failed);
+        return;
     }
     *failed = true;
 }
@@ -1453,6 +1551,15 @@ static cbm_resolve_python_member_t *python_add_member(cbm_resolve_binding_index_
     return entry->target ? entry : NULL;
 }
 
+static void python_note_member_shape(cbm_resolve_binding_index_t *index,
+                                     cbm_resolve_python_member_t *member, TSNode function) {
+    member->shape = python_decorator_shape(index, function, 0);
+    if (member->shape & CBM_PY_SHAPE_DELEGATES) {
+        member->delegate_chain = index->python_shape_delegate;
+        member->delegate_applied = index->python_shape_delegate_applied;
+    }
+}
+
 /* A def directly in a class body. Its decorators are classified with the file's
  * imports once they are all known. */
 static void python_note_method(cbm_resolve_binding_index_t *index, TSNode node, const char *parent,
@@ -1467,7 +1574,7 @@ static void python_note_method(cbm_resolve_binding_index_t *index, TSNode node, 
     member->return_chain = python_annotation_chain(index, field(node, "return_type"), 0);
     member->chain_scope = owner;
     if (!index->scopes[owner].class_scope)
-        member->shape = python_decorator_shape(index, node, 0);
+        python_note_member_shape(index, member, node);
     if (!parent || strcmp(parent, "decorated_definition"))
         return;
     TSNode decorated = ts_node_parent(node);
@@ -1493,7 +1600,6 @@ static void python_note_method(cbm_resolve_binding_index_t *index, TSNode node, 
  * return, or as a decorator its source proves. */
 static void python_note_function(cbm_resolve_binding_index_t *index, TSNode node, uint32_t owner) {
     const char *return_chain = python_annotation_chain(index, field(node, "return_type"), 0);
-    unsigned shape = python_decorator_shape(index, node, 0);
     cbm_resolve_python_member_t *member =
         python_add_member(index, owner, node_text(index, field(node, "name")),
                           CBM_PY_MEMBER_FUNCTION, ts_node_start_byte(node));
@@ -1503,7 +1609,7 @@ static void python_note_function(cbm_resolve_binding_index_t *index, TSNode node
     }
     member->return_chain = return_chain;
     member->chain_scope = owner;
-    member->shape = shape;
+    python_note_member_shape(index, member, node);
 }
 
 /* Class-level assignment or declaration. No graph node carries it, but it stops

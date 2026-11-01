@@ -51,7 +51,12 @@ typedef enum {
 } cbm_resolve_python_member_kind_t;
 
 /* What a function does when used as a decorator, proven from its source. */
-enum { CBM_PY_SHAPE_DIRECT = 1u << 0, CBM_PY_SHAPE_FACTORY = 1u << 1 };
+enum {
+    CBM_PY_SHAPE_DIRECT = 1u << 0,
+    CBM_PY_SHAPE_FACTORY = 1u << 1,
+    /* It hands the function to another decorator, named by delegate_chain. */
+    CBM_PY_SHAPE_DELEGATES = 1u << 2
+};
 
 typedef struct {
     uint32_t owner_scope, chain_scope, at;
@@ -61,6 +66,8 @@ typedef struct {
     const char *return_chain, *value_chain, *type_chain;
     bool none_value;
     unsigned shape;
+    const char *delegate_chain;
+    bool delegate_applied;
     /* What the function returns, as access paths in its own scope. NULL when a
      * return is not followable or the function is a generator. */
     const char *const *returned;
