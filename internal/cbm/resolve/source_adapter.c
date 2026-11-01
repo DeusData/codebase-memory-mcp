@@ -261,7 +261,11 @@ cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner
                 table->failed = true;
                 return NULL;
             }
-        } else if (strcmp(first->owner, decl->owner) || strcmp(first->name, decl->name)) {
+        } else if (strcmp(first->owner, decl->owner) ||
+                   (strcmp(first->name, decl->name) &&
+                    !(first->flags & decl->flags & CBM_SOURCE_DECL_F_TYPE))) {
+            /* One owner's two type-like declarations are one node: a Scala class and its
+             * companion object. */
             first->flags |= CBM_SOURCE_DECL_F_QN_SHARED;
             decl->flags |= CBM_SOURCE_DECL_F_QN_SHARED;
         }

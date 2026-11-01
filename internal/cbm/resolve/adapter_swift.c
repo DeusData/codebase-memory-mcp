@@ -1228,7 +1228,13 @@ static void swift_visit_type(swift_ctx_t *ctx, TSNode node, unsigned depth) {
 
 static void swift_visit_property(swift_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!ctx->in_function) {
-        swift_visit_children(ctx, node, depth);
+        /* A member's name is in the table; binding it here would hide its type. */
+        uint32_t members = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < members; i++) {
+            TSNode part = ts_node_named_child(node, i);
+            if (!cbm_source_is(part, "pattern") && !cbm_source_is(part, "modifiers"))
+                swift_visit(ctx, part, depth + 1);
+        }
         return;
     }
     TSNode value = cbm_source_field(node, "value");

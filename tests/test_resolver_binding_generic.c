@@ -446,8 +446,11 @@ TEST(resolver_binding_dart_cross_file_conflicts_and_missing_namespace) {
     const dart_golden_t fixtures[] = {
         {"import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
          "int target() => 2;\n", GENERIC_PROJECT ".lib.target", false},
+        /* This pinned an abstention. Two imports providing one name are an error at its
+         * use, so in code that compiles missing.dart, likely generated, cannot provide
+         * target, and lib.dart's is the one selected. */
         {"import 'lib.dart';\nimport 'missing.dart';\nvoid caller() { target(); }\n", NULL,
-         GENERIC_PROJECT ".lib.target", false},
+         GENERIC_PROJECT ".lib.target", true},
         {"import 'lib.dart';\nimport 'other.dart';\nvoid caller() { target(); }\n",
          "var target = 2;\n", GENERIC_PROJECT ".lib.target", false},
         {"import 'lib.dart';\nvoid caller() { _target(); }\n", NULL, GENERIC_PROJECT ".lib._target",
