@@ -911,6 +911,10 @@ static int cx_measure_pair(void) {
 static bool cx_resolver_linear(const CxMetrics *a, const CxMetrics *b) {
     bool ok = true;
     for (unsigned i = 0; i < CBM_RESOLVE_STAT_COUNT; i++) {
+        /* Only languages with root-level semantic facts walk syntax here; the
+         * flat-file test below gates this counter with a corpus that does. */
+        if (i == CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS)
+            continue;
         uint64_t first = a->resolver.values[i], second = b->resolver.values[i];
         double ratio = cx_ratio((double)second, (double)first);
         printf("    resolver_%s %llu -> %llu (ratio %.2f)\n",
@@ -1506,7 +1510,44 @@ TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work) {
     PASS();
 }
 
+/* One file whose top level grows, not more files. TypeScript's declaration
+ * baselines held the semantic pass for over 11 minutes on one such root, because
+ * fetching a child by index walks from the first child: the steps to enumerate
+ * n children were n*n/2. Doubling the file must only double them. */
+enum { CX_FLAT_CLASSES_PER_K = 500 };
+
+static int cx_build_flat_ts(const char *root, int k) {
+    char path[1200];
+    int pn = snprintf(path, sizeof(path), "%s/flat.ts", root);
+    if (pn < 0 || (size_t)pn >= sizeof(path))
+        return -1;
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    bool written = true;
+    for (int i = 0; written && i < k * CX_FLAT_CLASSES_PER_K; i++)
+        written = fprintf(f, "export class Flat%d {}\n", i) >= 0;
+    return fclose(f) == 0 && written ? 0 : -1;
+}
+
+TEST(complexity_flat_file_syntax_walk_is_linear) {
+    CxMetrics a = {0}, b = {0};
+    ASSERT_EQ(cx_measure(cx_build_flat_ts, "cbm_cxflat_a", "cbm_cxflat_b", &a, &b), 0);
+    uint64_t first = a.resolver.values[CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS];
+    uint64_t second = b.resolver.values[CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS];
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    syntax_child_steps %llu -> %llu (ratio %.2f, linear ~2, quadratic ~4)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    /* Non-vacuous: every class at the root was reached in both runs. */
+    ASSERT_GTE(first, (uint64_t)(CX_K_BASE * CX_FLAT_CLASSES_PER_K));
+    ASSERT_GTE(second, (uint64_t)(2 * CX_K_BASE * CX_FLAT_CLASSES_PER_K));
+    ASSERT_GTE(a.nodes, CX_K_BASE * CX_FLAT_CLASSES_PER_K);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_flat_file_syntax_walk_is_linear);
     RUN_TEST(complexity_resolver_counters_are_run_scoped);
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);

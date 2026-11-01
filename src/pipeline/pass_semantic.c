@@ -1,3 +1,4 @@
+#include "resolve/stats.h"
 #include "pipeline/import_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 /*
@@ -263,6 +264,8 @@ static bool semantic_class_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline
         return false;
     int count = 0;
     for (uint32_t i = 0; i < children; i++) {
+        /* The fetch walks from the first child every time. */
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, (uint64_t)i + 1);
         TSNode node = ts_node_named_child(root, i);
         if (semantic_ecma(info->language) && semantic_is(node, "export_statement"))
             node = ts_node_child_by_field_name(node, "declaration", 11);
