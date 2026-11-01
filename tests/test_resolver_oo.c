@@ -716,6 +716,37 @@ TEST(resolver_oo_csharp_static_selection_parallel) {
 
 /* One Rust crate with no src/main.rs fails the import context. That says
  * nothing about Java's namespaces (found on Elasticsearch's libs). */
+/* A work budget must not decide graph content: the last site of a very large file
+ * binds exactly like the first. Real case: a 4,000-line form-binding test in Play lost
+ * thousands of sites to a per-file proof budget, in no particular order of importance. */
+TEST(resolver_oo_large_file_binds_its_last_site) {
+    enum { SITES = 40000 };
+    const char *head = "package big;\nclass Big {\n  void target() {}\n  void many() {\n";
+    const char *tail = "  }\n  void last() { target(); }\n}\n";
+    size_t capacity = strlen(head) + strlen(tail) + (size_t)SITES * 14 + 1;
+    char *text = malloc(capacity);
+    ASSERT_NOT_NULL(text);
+    char *at = text + snprintf(text, capacity, "%s", head);
+    for (int i = 0; i < SITES; i++) {
+        memcpy(at, "    target();\n", 14);
+        at += 14;
+    }
+    snprintf(at, capacity - (size_t)(at - text), "%s", tail);
+    OOFile files[] = {{"big/Big.java", text}};
+    OOIndex index;
+    bool opened = oo_open(&index, files, 1, false, "java");
+    int failed = 0;
+    if (opened) {
+        OO_EXPECT("CALLS", "Big.many", "Big.target", 1);
+        OO_EXPECT("CALLS", "Big.last", "Big.target", 1);
+    }
+    oo_close(&index);
+    free(text);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(failed, 0);
+    PASS();
+}
+
 static const OOFile MIXED_FILES[] = {
     {"native/Cargo.toml", "[package]\nname = \"native\"\nversion = \"0.1.0\"\n"},
     {"native/src/lib.rs", "pub fn f() -> i32 { 1 }\n"},
@@ -743,4 +774,5 @@ SUITE(resolver_oo) {
     RUN_TEST(resolver_oo_csharp_static_selection);
     RUN_TEST(resolver_oo_csharp_static_selection_parallel);
     RUN_TEST(resolver_oo_rust_context_failure_keeps_java_imports);
+    RUN_TEST(resolver_oo_large_file_binds_its_last_site);
 }
