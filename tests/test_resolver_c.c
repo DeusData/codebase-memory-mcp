@@ -2566,7 +2566,75 @@ TEST(resolver_cpp_known_gaps_stay_honest) {
     PASS();
 }
 
+/* A precision sample on neovim found `HAS_KEY(opts, win_text_height, start_row)` bound as a
+ * reference to the function win_text_height. The macro pastes that word into another name. */
+#define C_TU_MACRO_ARGS_HEADER                                                                  \
+    "#ifndef KEYS_H\n"                                                                          \
+    "#define KEYS_H\n"                                                                          \
+    "#define HAS_KEY(d, typ, key) (KEYSET_OPTIDX_##typ##__##key & (d)->is_set__##typ##_)\n"     \
+    "int win_text_height(int x);\n"                                                             \
+    "extern int start_row;\n"                                                                   \
+    "#endif\n"
+#define C_TU_MACRO_ARGS_IMPL                                                                    \
+    "#include \"keys.h\"\n"                                                                     \
+    "int win_text_height(int x) { return x; }\n"                                                \
+    "int start_row;\n"
+#define C_TU_MACRO_ARGS_USE                                                                     \
+    "#include \"keys.h\"\n"                                                                     \
+    "int take_callback(int (*cb)(int));\n"                                                      \
+    "int pasted(int *a) { return HAS_KEY(a, win_text_height, start_row); }\n"                   \
+    "int real_reference(void) { return take_callback(win_text_height); }\n"                     \
+    "int real_value(void) { return start_row; }\n"
+static const RQ_Source C_TU_MACRO_ARGS[] = {
+    {.path = "keys.h", .text = C_TU_MACRO_ARGS_HEADER},
+    {.path = "keys.c", .text = C_TU_MACRO_ARGS_IMPL},
+    {.path = "use_keys.c", .text = C_TU_MACRO_ARGS_USE}};
+
+TEST(resolver_c_bare_macro_arguments_prove_nothing) {
+    const char *use = C_TU_MACRO_ARGS_USE;
+    const RQ_Expected expected[] = {
+        {.case_id = "function-argument-of-a-function",
+         .site = C_TU_WORD("use_keys.c", use, "use_keys.real_reference", "take_callback(win",
+                           "win_text_height"),
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "keys.c",
+                    .suffix = "keys.win_text_height",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "int win_text_height(int x) { return x; }"}},
+        {.case_id = "value-outside-the-macro",
+         .site = C_TU_WORD("use_keys.c", use, "use_keys.real_value", "return start_row", "start_row"),
+         .relation = "USAGE",
+         .target = {.file = "keys.c",
+                    .suffix = "keys.start_row",
+                    .label = "Variable",
+                    .declaration_line = 3,
+                    .declaration_text = "int start_row;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "pasted-function-name",
+         .site = C_TU_WORD("use_keys.c", use, "use_keys.pasted", "HAS_KEY(a, ", "win_text_height"),
+         .relation = "CALL_REFERENCE",
+         .any_target = true},
+        {.case_id = "pasted-value-name",
+         .site = C_TU_WORD("use_keys.c", use, "use_keys.pasted", "HAS_KEY(a, ", "start_row"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-macro-args",
+                             .sources = C_TU_MACRO_ARGS,
+                             .source_count = sizeof(C_TU_MACRO_ARGS) / sizeof(C_TU_MACRO_ARGS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_bare_macro_arguments_prove_nothing);
     RUN_TEST(resolver_cpp_known_gaps_stay_honest);
     RUN_TEST(resolver_c_large_file_keeps_its_last_call);
     RUN_TEST(resolver_c_initializer_macro_declares_the_global);
