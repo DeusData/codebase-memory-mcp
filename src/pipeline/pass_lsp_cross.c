@@ -671,7 +671,9 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         }
     }
     dst->lang = lang;
-    dst->alias_target = (lang == CBM_LANG_GO && src->alias_target)
+    dst->alias_target = ((lang == CBM_LANG_GO || lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
+                          lang == CBM_LANG_CUDA) &&
+                         src->alias_target)
                             ? cbm_arena_strdup(arena, src->alias_target)
                             : NULL;
     dst->decorators = NULL;
@@ -1131,6 +1133,75 @@ static int pxc_build_py_namespace_records(CBMArena *arena, const CBMFileResult *
     return written;
 }
 
+static bool pxc_is_c_family(CBMLanguage language) {
+    return language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA;
+}
+
+/* Source facts for one C-family file's definitions, and one more record: what the
+ * file declares for its includers, and which project files it includes. Those
+ * includes are the proven ones, so an include this index cannot place stops the
+ * chain there rather than guessing where it leads. */
+static void pxc_collect_c_file(const cbm_pipeline_ctx_t *ctx, CBMArena *arena, const char *source,
+                               int source_length, CBMFileResult *fr, const cbm_file_info_t *file,
+                               CBMLSPDef *defs, int *idx, int room, int file_start) {
+    int count = *idx - file_start;
+    CBMCFileFacts *facts = ctx ? cbm_arena_calloc(arena, sizeof(*facts)) : NULL;
+    const char *module = cbm_arena_strdup(arena, fr->module_qn);
+    if (facts) {
+        size_t path_len = strlen(file->rel_path);
+        facts->plain_header = path_len > 2 && !strcmp(file->rel_path + path_len - 2, ".h");
+        facts->module_qn = module;
+        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, file->rel_path, "__file__");
+        facts->file_qn = file_qn ? cbm_arena_strdup(arena, file_qn) : NULL;
+        free(file_qn);
+    }
+    (void)cbm_c_collect_file_facts(arena, source, source_length, module, file->language, defs,
+                                   count, facts);
+    if (!facts || count >= room)
+        return;
+    for (int i = 0; i < count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        const char *target = def->graph_qualified_name;
+        if (!def->label || strcmp(def->label, "Method") || !def->short_name || !target)
+            continue;
+        /* The name written before the member: `K` of `M.ns.K.m`. */
+        size_t length = strlen(target), leaf = strlen(def->short_name);
+        const char *owner = NULL;
+        if (length > leaf + 1 && target[length - leaf - 1] == '.') {
+            size_t end = length - leaf - 1, start = end;
+            while (start > 0 && target[start - 1] != '.')
+                start--;
+            owner = cbm_arena_strndup(arena, target + start, end - start);
+        }
+        (void)cbm_c_facts_add_method(arena, facts, def->short_name, target, owner,
+                                     def->signature_param_types ? def->signature_param_count : -1);
+    }
+    const cbm_resolve_import_snapshot_t *snapshot =
+        cbm_pipeline_import_snapshot(ctx->gbuf, ctx->project_name, file->rel_path, fr);
+    for (size_t i = 0; snapshot && i < snapshot->count; i++) {
+        const cbm_resolve_import_fact_t *fact = &snapshot->items[i];
+        if (cbm_resolve_admit(&fact->dependency) && cbm_resolve_admit(&fact->binding) &&
+            fact->dependency.target) {
+            (void)cbm_c_facts_add_include(arena, facts,
+                                          cbm_arena_strdup(arena, fact->dependency.target));
+            continue;
+        }
+        char *generated = cbm_pipeline_c_generated_source(ctx, file->rel_path, fact->module_path);
+        if (generated)
+            (void)cbm_c_facts_add_generated(arena, facts, cbm_arena_strdup(arena, generated));
+        free(generated);
+    }
+    CBMLSPDef *record = &defs[count];
+    memset(record, 0, sizeof(*record));
+    record->qualified_name = cbm_arena_sprintf(arena, "%s.@c-file-facts", module);
+    record->short_name = "@c-file-facts";
+    record->label = CBM_C_FILE_FACTS_LABEL;
+    record->def_module_qn = module;
+    record->lang = file->language;
+    record->c_file_facts = facts;
+    (*idx)++;
+}
+
 /* Collect a project-wide CBMLSPDef[] from all cached results. Returns a
  * malloc'd array (caller frees) of length *out_count. String fields are
  * borrowed from cache[i]->arena and from def_modules[i] (also borrowed).
@@ -1163,6 +1234,9 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             }
         }
         total += defs;
+        if (ctx && pxc_is_c_family(files[i].language)) {
+            total += 1; /* the file's declaration facts */
+        }
         if (files[i].language == CBM_LANG_RUST) {
             total += impls;
         }
@@ -1305,8 +1379,8 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *are
             }
             if (files[fi].language == CBM_LANG_C || files[fi].language == CBM_LANG_CPP ||
                 files[fi].language == CBM_LANG_CUDA)
-                (void)cbm_c_collect_source_facts(arena, source, source_length, fr->module_qn,
-                                                 defs + file_start, idx - file_start);
+                pxc_collect_c_file(ctx, arena, source, source_length, fr, &files[fi],
+                                   defs + file_start, &idx, capacity - file_start, file_start);
             else if (files[fi].language == CBM_LANG_GO)
                 (void)cbm_go_collect_source_facts(arena, source, source_length, def_modules[fi],
                                                   defs + file_start, idx - file_start);
@@ -1955,6 +2029,9 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     if (!dst_calls || !src_out)
         return;
 
+    /* Every proof of this file comes through here. Its size follows the file, and proof
+     * work counts hashed bytes, so a cap silently cost a large file its last rows, at a
+     * point that moved with the length of the checkout path. */
     cbm_resolve_proof_pool_t proof_pool;
     cbm_resolve_proof_pool_init_project(&proof_pool, dst_arena);
     cbm_resolve_proof_clone_session_t proofs;

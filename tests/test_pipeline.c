@@ -15550,8 +15550,8 @@ static void write_c_header_namesake_fixture(const char *tmp, int pad_files) {
                     "{\n"
                     "\tput_page(page);\n"
                     "}\n");
-    /* No include search roots configure this system spelling. A same-named
-     * project header is not evidence that the compiler would select it. */
+    /* No include search roots are configured, and exactly one project file ends in
+     * this spelling, so it is the file any -I could select: the real kernel shape. */
     write_temp_file(tmp, "drivers/net/unconfigured.c",
                     "#include <linux/mm.h>\n"
                     "void unconfigured_free(struct page *page) { put_page(page); }\n");
@@ -15635,7 +15635,7 @@ TEST(pipeline_c_call_reaches_header_function_beside_field) {
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
 
-    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Field"), 0);
 
     cbm_store_close(s);
@@ -15673,7 +15673,7 @@ TEST(pipeline_c_call_reaches_header_function_beside_field_parallel) {
     ASSERT_EQ(labelled_call_count(s, project, "mte_dump_tag_range", "put_page", "Field"), 0);
     ASSERT_EQ(labelled_call_count(s, project, "recv_buffer_free", "put_page", "Field"), 0);
 
-    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 0);
+    ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Function"), 1);
     ASSERT_EQ(labelled_call_count(s, project, "unconfigured_free", "put_page", "Field"), 0);
 
     cbm_store_close(s);
@@ -16125,6 +16125,79 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
         "conditional, parenthesized, return and binary expressions, not initializer_pair values; "
         "no guessed name supplies proof.";
     static const RQ_Expected expected[] = {
+        /* Parameter types and reads that the translation-unit rules now bind. */
+        {.case_id = "c.field.use-beta-param-type",
+         .site = {.file = "use_beta.c", .caller = "use_beta.use_beta", .start_byte = 32, .end_byte = 36},
+         .relation = "USAGE",
+         .target = {.file = "beta.h",
+                    .suffix = "beta.Beta",
+                    .label = "Class",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct {"}},
+        {.case_id = "c.field.guarded-alpha-read",
+         .site = {.file = "guarded.c", .caller = "guarded.guarded_alpha", .start_byte = 108, .end_byte = 113},
+         .relation = "USAGE",
+         .target = {.file = "alpha.h",
+                    .suffix = "alpha.Alpha.count",
+                    .label = "Field",
+                    .declaration_line = 5,
+                    .declaration_text = "    int count;"}},
+        {.case_id = "c.field.guarded-beta-param-type",
+         .site = {.file = "guarded.c", .caller = "guarded.guarded_beta", .start_byte = 140, .end_byte = 144},
+         .relation = "USAGE",
+         .target = {.file = "beta.h",
+                    .suffix = "beta.Beta",
+                    .label = "Class",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct {"}},
+        {.case_id = "c.field.guarded-beta-read",
+         .site = {.file = "guarded.c", .caller = "guarded.guarded_beta", .start_byte = 165, .end_byte = 170},
+         .relation = "USAGE",
+         .target = {.file = "beta.h",
+                    .suffix = "beta.Beta.count",
+                    .label = "Field",
+                    .declaration_line = 5,
+                    .declaration_text = "    int count;"}},
+        {.case_id = "c.field.hdr-beta-param-type",
+         .site = {.file = "inline.h", .caller = "inline.hdr_beta", .start_byte = 168, .end_byte = 172},
+         .relation = "USAGE",
+         .target = {.file = "beta.h",
+                    .suffix = "beta.Beta",
+                    .label = "Class",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct {"}},
+        {.case_id = "c.field.hdr-own-typedef-param-type",
+         .site = {.file = "inline.h", .caller = "inline.hdr_own_typedef", .start_byte = 408, .end_byte = 414},
+         .relation = "USAGE",
+         .target = {.file = "inline.h",
+                    .suffix = "inline.HdrBuf",
+                    .label = "Class",
+                    .declaration_line = 13,
+                    .declaration_text = "typedef struct {"}},
+        {.case_id = "c.field.use-remote-param-type",
+         .site = {.file = "mix.c", .caller = "mix.use_remote", .start_byte = 120, .end_byte = 124},
+         .relation = "USAGE",
+         .target = {.file = "beta.h",
+                    .suffix = "beta.Beta",
+                    .label = "Class",
+                    .declaration_line = 4,
+                    .declaration_text = "typedef struct {"}},
+        {.case_id = "c.field.global-alpha-read",
+         .site = {.file = "globals.c", .caller = "globals.read_alpha_global", .start_byte = 163, .end_byte = 168},
+         .relation = "USAGE",
+         .target = {.file = "alpha.h",
+                    .suffix = "alpha.Alpha.count",
+                    .label = "Field",
+                    .declaration_line = 5,
+                    .declaration_text = "    int count;"}},
+        {.case_id = "c.field.global-beta-read",
+         .site = {.file = "globals.c", .caller = "globals.read_beta_global", .start_byte = 220, .end_byte = 225},
+         .relation = "USAGE",
+         .target = {.file = "beta.h",
+                    .suffix = "beta.Beta.count",
+                    .label = "Field",
+                    .declaration_line = 5,
+                    .declaration_text = "    int count;"}},
         {.case_id = "c.field.alpha-count-0",
          /* Literal source: a->count */
          .site = {.file = "use_alpha.c",
@@ -16153,7 +16226,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16169,7 +16242,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-WRITE-ROLE",
          .why = c_field_write_why,
          .tried = c_field_write_tried},
@@ -16201,7 +16274,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-ANONYMOUS-TYPEDEF-OWNER",
          .why = c_field_typedef_why,
          .tried = c_field_typedef_tried},
@@ -16217,7 +16290,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-WRITE-ROLE",
          .why = c_field_write_why,
          .tried = c_field_write_tried},
@@ -16233,7 +16306,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 6,
                     .declaration_text = "    int alpha_only;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16249,7 +16322,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 6,
                     .declaration_text = "    int beta_only;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-ANONYMOUS-TYPEDEF-OWNER",
          .why = c_field_typedef_why,
          .tried = c_field_typedef_tried},
@@ -16308,7 +16381,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 10,
                     .declaration_text = "    struct Ops *ops;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16372,7 +16445,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 14,
                     .declaration_text = "    struct Dev *devs, *spare;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16388,7 +16461,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 11,
                     .declaration_text = "    int id;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-COMPOSITE-RECEIVER",
          .why = c_field_chain_why,
          .tried = c_field_chain_tried},
@@ -16404,7 +16477,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 15,
                     .declaration_text = "    struct Dev fixed[2];"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16420,7 +16493,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 11,
                     .declaration_text = "    int id;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-COMPOSITE-RECEIVER",
          .why = c_field_chain_why,
          .tried = c_field_chain_tried},
@@ -16436,7 +16509,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 14,
                     .declaration_text = "    struct Dev *devs, *spare;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16452,7 +16525,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 11,
                     .declaration_text = "    int id;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-COMPOSITE-RECEIVER",
          .why = c_field_chain_why,
          .tried = c_field_chain_tried},
@@ -16466,7 +16539,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16494,7 +16567,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-ANONYMOUS-TYPEDEF-OWNER",
          .why = c_field_typedef_why,
          .tried = c_field_typedef_tried},
@@ -16510,7 +16583,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 14,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-ANONYMOUS-TYPEDEF-OWNER",
          .why = c_field_typedef_why,
          .tried = c_field_typedef_tried},
@@ -16528,7 +16601,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 18,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-PP-HEADER-CERTIFICATE",
          .why = "The genuine field access needs the included header dependency closure. "
                 "Expanded bytes, configuration and matching spans do not prove that "
@@ -16547,7 +16620,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 5,
                     .declaration_text = "    int count;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-WRITE-ROLE",
          .why = c_field_write_why,
          .tried = c_field_write_tried},
@@ -16674,7 +16747,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Field",
                     .declaration_line = 11,
                     .declaration_text = "    int id;"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-GUARDED-OWNER",
          .why = c_field_guard_why,
          .tried = c_field_guard_tried},
@@ -16775,7 +16848,7 @@ static bool c_member_fields_quality(cbm_store_t *store, const char *project, con
                     .label = "Variable",
                     .declaration_line = 6,
                     .declaration_text = "static struct Ops table_ops = {"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-FIELD-INITIALIZER-VALUE",
          .why = c_field_global_value_why,
          .tried = c_field_global_value_tried},
@@ -27367,7 +27440,7 @@ TEST(pipeline_cpp_enum_reference_reaches_flat_enumerator_c1) {
                     .label = "Variable",
                     .declaration_line = 1,
                     .declaration_text = "enum Color { RED, GREEN };"},
-         .mode = RQ_KNOWN_GAP,
+         .mode = RQ_REQUIRED,
          .gap_id = "C-ENUM-LEXICAL-VALUE",
          .why = "The enumerator has an exact declaration but no admitted enum-value lexical "
                 "binding proof.",
@@ -36420,7 +36493,7 @@ static bool cpp_recv_quality(const CppRecvRun *r, unsigned scenario) {
                      .suffix = "SecdManager.SecdManager.getInstance",
                      .declaration_line = 3,
                      .declaration_text = "SecdManager *SecdManager::getInstance() {"},
-          .mode = RQ_KNOWN_GAP,
+          .mode = RQ_REQUIRED,
           .gap_id = "CPP-FACTORY-VISIBILITY-PROOF",
           .why = "The unconfigured include roots and header-to-definition binding are not a closed "
                  "declaration lookup; static class-member selection has no complete source proof "
@@ -36469,7 +36542,7 @@ static bool cpp_recv_quality(const CppRecvRun *r, unsigned scenario) {
                      .suffix = "SecdManager.Registry.instance",
                      .declaration_line = 14,
                      .declaration_text = "Registry &Registry::instance() {"},
-          .mode = RQ_KNOWN_GAP,
+          .mode = RQ_REQUIRED,
           .gap_id = "CPP-FACTORY-VISIBILITY-PROOF",
           .why = "The unconfigured include roots and header-to-definition binding are not a closed "
                  "declaration lookup; static class-member selection has no complete source proof "
@@ -36515,7 +36588,7 @@ static bool cpp_recv_quality(const CppRecvRun *r, unsigned scenario) {
                      .declaration_line = 21,
                      .declaration_text = "std::unique_ptr<Widget> Widget::create() { return "
                                          "std::make_unique<Widget>(); }"},
-          .mode = RQ_KNOWN_GAP,
+          .mode = RQ_REQUIRED,
           .gap_id = "CPP-FACTORY-VISIBILITY-PROOF",
           .why = "The unconfigured include roots and header-to-definition binding are not a closed "
                  "declaration lookup; static class-member selection has no complete source proof "
@@ -36562,7 +36635,7 @@ static bool cpp_recv_quality(const CppRecvRun *r, unsigned scenario) {
                      .declaration_line = 25,
                      .declaration_text = "std::shared_ptr<Session> Session::open() { return "
                                          "std::make_shared<Session>(); }"},
-          .mode = RQ_KNOWN_GAP,
+          .mode = RQ_REQUIRED,
           .gap_id = "CPP-FACTORY-VISIBILITY-PROOF",
           .why = "The unconfigured include roots and header-to-definition binding are not a closed "
                  "declaration lookup; static class-member selection has no complete source proof "

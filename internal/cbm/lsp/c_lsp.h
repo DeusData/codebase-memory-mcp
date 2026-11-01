@@ -24,6 +24,17 @@ typedef struct {
     struct CProofDeclaration *proof_declarations;
     int proof_declaration_count, proof_declaration_cap;
     struct CProofInclude *proof_includes;
+    /* The translation unit: every file this one includes, through other files
+     * too, with the point in this file where it became visible. */
+    struct CTUModule *tu_modules;
+    uint32_t tu_cap, tu_count;
+    const struct CBMCDeclIndex *c_decls;
+    const char *own_file_qn; /* NULL when only the module identifies this file */
+    /* C++: the class whose member function this is, inline or out of line. Its members
+     * are found before anything at namespace scope. */
+    const CBMRegisteredType *proof_method_class;
+    bool proof_class_scope_checked; /* the current name was looked for in that class */
+    bool plain_header;              /* this TU is a .h, so its own language is its includer's */
     const cbm_resolve_import_snapshot_t *import_facts;
     bool require_import_proofs;
     struct CProofBuiltinBinding *proof_builtins;
@@ -173,7 +184,7 @@ struct CLSPEvalMemoSlot {
 
 /* Conservative syntax audit shared with the source-fact collector. Only direct,
  * fixed-arity free signatures with explicitly written builtin types qualify. */
-bool cbm_c_preprocessor_domain_unsupported(TSNode root);
+bool cbm_c_preprocessor_domain_unsupported(TSNode root, const char *source);
 const CBMType *cbm_c_builtin_annotation(CBMArena *arena, const char *source, TSNode type);
 const CBMType *cbm_c_free_signature(CBMArena *arena, const char *source, TSNode declaration,
                                     bool cpp_mode);

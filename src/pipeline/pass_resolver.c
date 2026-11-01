@@ -100,6 +100,10 @@ typedef struct {
     /* cfg twins and one type's repeated impl methods are one graph identity;
      * the Rust adapter separately rejects a QN two scopes of a file claim. */
     bool rust;
+    /* A C file's #if branches define one name more than once. The graph holds one
+     * node for them, with each branch's span as a variant, so an edge to or from
+     * that node is true of the configurations it was found in. */
+    bool c_variants;
 } target_proof_t;
 
 typedef struct {
@@ -394,6 +398,11 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         bool same_span = prior->start_line == definition->start_line &&
                          prior->end_line == definition->end_line;
         prior->cross_file |= strcmp(prior->file, file) != 0;
+        if (same_owner &&
+            (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA)) {
+            prior->c_variants = true;
+            return true;
+        }
         if (same_owner && !same_span && cbm_oo_language(language) &&
             (strcmp(definition->label, "Class") != 0 || language == CBM_LANG_CSHARP))
             prior->overload_set = true;
@@ -568,8 +577,9 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
         return true;
     if (strcmp(proof->label, node->label))
         return false;
-    return proof->overload_set || (proof->start_line == (uint32_t)node->start_line &&
-                                   proof->end_line == (uint32_t)node->end_line);
+    return proof->overload_set || proof->c_variants ||
+           (proof->start_line == (uint32_t)node->start_line &&
+            proof->end_line == (uint32_t)node->end_line);
 }
 
 /* JavaScript nests functions freely and extraction names them flat, so two
@@ -3695,6 +3705,11 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
                                 : proof;
         }
     }
+    /* The C adapter's semantic rows are the whole translation-unit lookup. With no
+     * row there is no second, name-based way to arrive at a target. */
+    if (file->language == CBM_LANG_C || file->language == CBM_LANG_CPP ||
+        file->language == CBM_LANG_CUDA)
+        return unresolved("c_translation_unit_binding_unproven");
     if (file->language == CBM_LANG_DART) {
         cbm_resolve_result_t proof = dart_name_result(resolver, name);
         return cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
@@ -4203,6 +4218,12 @@ static bool resolve_writes(file_resolver_t *resolver, CBMArena *arena) {
         const semantic_site_t *site =
             find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte, rw->site_end_byte,
                           rw->source_origin, CBM_RESOLVED_FIELD_REFERENCE);
+        if (!site && !rw->is_member_access &&
+            (resolver->file->language == CBM_LANG_C || resolver->file->language == CBM_LANG_CPP ||
+             resolver->file->language == CBM_LANG_CUDA))
+            site =
+                find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte,
+                              rw->site_end_byte, rw->source_origin, CBM_RESOLVED_VALUE_REFERENCE);
         cbm_resolve_result_t outcome;
         if (site)
             outcome = semantic_result(resolver, site, arena);

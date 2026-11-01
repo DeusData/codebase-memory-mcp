@@ -25,11 +25,17 @@ static const edge_row_t edge_rows[] = {
      "Exact project package paths from the source's module, its go.mod replace directives and "
      "the enclosing go.work; every other package abstains."},
     {CBM_LANG_C, C_EDGES,
-     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+     "Literal include paths, configured search roots, and a spelling only one project "
+     "file can satisfy; translation-unit visibility through includes; unproved "
+     "preprocessing abstains."},
     {CBM_LANG_CPP, C_EDGES,
-     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+     "Literal include paths, configured search roots, and a spelling only one project "
+     "file can satisfy; translation-unit visibility through includes; unproved "
+     "preprocessing abstains."},
     {CBM_LANG_CUDA, C_EDGES,
-     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+     "Literal include paths, configured search roots, and a spelling only one project "
+     "file can satisfy; translation-unit visibility through includes; unproved "
+     "preprocessing abstains."},
     {CBM_LANG_OBJC, EDGE(IMPORTS),
      "Literal include paths and configured search roots only; no semantic proof bridge "
      "advertised."},
@@ -248,7 +254,8 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = "Exact visibility and owner proofs; unsupported overload, template, ADL "
+        out->limitation = "Exact visibility and owner proofs; overloads of one parameter count "
+                          "with separate nodes, templates, ADL with a second visible function "
                           "and callable-field selection abstain.";
         break;
     case CBM_LANG_JAVASCRIPT:

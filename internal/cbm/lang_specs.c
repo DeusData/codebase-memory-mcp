@@ -365,7 +365,7 @@ static const char *cpp_branch_types[] = {"if_statement",    "for_statement",    
                                          "while_statement", "switch_statement", "case_statement",
                                          "try_statement",   "catch_clause",     NULL};
 static const char *cpp_var_types[] = {"declaration", NULL};
-static const char *cpp_assign_types[] = {"assignment_expression", NULL};
+static const char *cpp_assign_types[] = {"assignment_expression", "update_expression", NULL};
 static const char *cpp_throw_types[] = {"throw_statement", NULL};
 
 // ==================== C# ====================
@@ -490,7 +490,7 @@ static const char *c_branch_types[] = {"if_statement",
                                        "case_statement",
                                        NULL};
 static const char *c_var_types[] = {"declaration", NULL};
-static const char *c_assign_types[] = {"assignment_expression", NULL};
+static const char *c_assign_types[] = {"assignment_expression", "update_expression", NULL};
 
 // ==================== BASH ====================
 static const char *bash_func_types[] = {"function_definition", NULL};

@@ -1279,6 +1279,12 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
  * same-length view of it. Offsets and lines are the source's own. */
 TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
                                    uint32_t source_len, TSParseOptions opts);
+/* As above for C-family source. A word that can only be an attribute macro is left out
+ * of the parse, so `class LLVM_ABI StringRef {` reads as the class. Offsets and positions
+ * stay those of the real file. Every C-family whole-file parse goes through here, so the
+ * extraction and the semantic passes read one tree shape. */
+TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
+                           TSParseOptions opts);
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.

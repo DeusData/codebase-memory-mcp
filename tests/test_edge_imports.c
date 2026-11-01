@@ -3266,6 +3266,123 @@ TEST(ei_strict_rust_ambiguous_declared_module_is_not_ranked) {
     PASS();
 }
 
+/* The IMPORTS targets of one file, as a count and whether target_file is among them. */
+static int ei_import_count(cbm_store_t *store, const char *project, const char *source_file,
+                           const char *target_file) {
+    int64_t source = ei_node_id_for_file_label(store, project, source_file, "File");
+    int64_t expected = target_file ? ei_node_id_for_file_label(store, project, target_file, "File")
+                                   : 0;
+    if (source <= 0 || (target_file && expected <= 0))
+        return -1;
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    if (cbm_store_find_edges_by_source_type(store, source, "IMPORTS", &edges, &count) !=
+        CBM_STORE_OK)
+        return -1;
+    int matched = 0;
+    for (int i = 0; i < count; i++)
+        matched += edges[i].target_id == expected;
+    int total = count;
+    cbm_store_free_edges(edges, count);
+    return target_file ? (matched == 1 && total == 1 ? 1 : -1) : total;
+}
+
+/* No build configuration: an include spelled so that exactly one project file ends
+ * in that path, at a component boundary, names that file. */
+TEST(ei_c_unique_include_spelling_binds_its_one_project_file) {
+    static const EILangFile files[] = {
+        {"include/suite.h", "int suite(void);\n"},
+        {"src/state.c", "#include \"suite.h\"\n"},
+        {"src/nvim/api/buffer.h", "int api(void);\n"},
+        {"src/nvim/buffer.c", "#include \"nvim/api/buffer.h\"\n"},
+        {"include/linux/mm.h", "int mm(void);\n"},
+        {"drivers/net/rx.c", "#include <linux/mm.h>\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, 6);
+    ASSERT_NOT_NULL(store);
+    int quoted = ei_import_count(store, lp.project, "src/state.c", "include/suite.h");
+    int rooted = ei_import_count(store, lp.project, "src/nvim/buffer.c", "src/nvim/api/buffer.h");
+    int angle = ei_import_count(store, lp.project, "drivers/net/rx.c", "include/linux/mm.h");
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(quoted, 1);
+    ASSERT_EQ(rooted, 1);
+    ASSERT_EQ(angle, 1);
+    PASS();
+}
+
+TEST(ei_c_include_spelling_collision_abstains_honestly) {
+    static const EILangFile files[] = {
+        {"src/sds.h", "int a(void);\n"},
+        {"deps/hiredis/sds.h", "int b(void);\n"},
+        {"src/sds.c", "#include \"sds.h\"\n"},
+        {"deps/hiredis/sds.c", "#include \"sds.h\"\n"},
+        {"modules/m.c", "#include \"sds.h\"\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, 5);
+    ASSERT_NOT_NULL(store);
+    /* Beside the includer the search is exact, whatever else shares the name. */
+    int beside = ei_import_count(store, lp.project, "src/sds.c", "src/sds.h");
+    int vendored = ei_import_count(store, lp.project, "deps/hiredis/sds.c", "deps/hiredis/sds.h");
+    /* Elsewhere nothing says which of the two a -I would select, however near. */
+    int elsewhere = ei_import_count(store, lp.project, "modules/m.c", NULL);
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(beside, 1);
+    ASSERT_EQ(vendored, 1);
+    ASSERT_EQ(elsewhere, 0);
+    PASS();
+}
+
+TEST(ei_c_toolchain_header_never_binds_a_project_namesake) {
+    static const EILangFile files[] = {
+        {"compat/string.h", "int a(void);\n"},
+        {"compat/sys/types.h", "int b(void);\n"},
+        {"compat/stdio.h", "int c(void);\n"},
+        {"src/main.c",
+         "#include <string.h>\n#include <sys/types.h>\n#include \"stdio.h\"\nint main(void);\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, 4);
+    ASSERT_NOT_NULL(store);
+    int count = ei_import_count(store, lp.project, "src/main.c", NULL);
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+TEST(ei_c_partial_or_relative_spelling_never_matches_by_suffix) {
+    static const EILangFile files[] = {
+        {"src/buffer.h", "int a(void);\n"},
+        {"src/main.c", "#include \"uffer.h\"\n#include \"../other/buffer.h\"\n"
+                       "#include \"src/../src/buffer.h\"\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, 2);
+    ASSERT_NOT_NULL(store);
+    int count = ei_import_count(store, lp.project, "src/main.c", NULL);
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* A compile entry says where this file searches. A project file those roots do not
+ * reach is not selected, even when its spelling would be unique. */
+TEST(ei_c_configured_roots_stop_inference) {
+    static const EILangFile files[] = {
+        {"main.cpp", "#include <target.h>\nint main() { return 0; }\n"},
+        {"elsewhere/target.h", "int a();\n"},
+        {"user/unrelated.h", "int b();\n"},
+    };
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files_configured(&lp, files, 3, "-I user");
+    ASSERT_NOT_NULL(store);
+    int count = ei_import_count(store, lp.project, "main.cpp", NULL);
+    ei_cleanup(&lp, store);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
 TEST(ei_strict_configured_include_group_order) {
     static const EILangFile files[] = {
         {"main.cpp", "#include <target.h>\n#include \"quote.h\"\nint main() { return 0; }\n"},
@@ -3342,6 +3459,11 @@ SUITE(edge_imports) {
     RUN_TEST(ei_strict_rust_custom_crate_root_and_decoy);
     RUN_TEST(ei_strict_rust_ambiguous_declared_module_is_not_ranked);
     RUN_TEST(ei_strict_configured_include_group_order);
+    RUN_TEST(ei_c_unique_include_spelling_binds_its_one_project_file);
+    RUN_TEST(ei_c_include_spelling_collision_abstains_honestly);
+    RUN_TEST(ei_c_toolchain_header_never_binds_a_project_namesake);
+    RUN_TEST(ei_c_partial_or_relative_spelling_never_matches_by_suffix);
+    RUN_TEST(ei_c_configured_roots_stop_inference);
 
     RUN_TEST(ei_strict_quoted_include_exact_target_and_unmodeled_system_gap);
     RUN_TEST(ei_strict_bare_es_package_does_not_bind_root_module);
