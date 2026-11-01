@@ -33,6 +33,10 @@ typedef struct {
     const char *superclass_ref; /* raw dotted superclass spelling, or NULL */
     const char *superclass_qn;  /* resolved QN (table/stdlib), or NULL */
     bool is_module;             /* `module` (mixin source) vs `class` */
+    /* Method-lookup visit marks: the stamp of the last walk that searched
+     * this class on the instance / singleton side (ruby_walk_seen). */
+    unsigned int seen_instance;
+    unsigned int seen_singleton;
 } RubyClassInfo;
 
 /* One `include`/`prepend`/`extend` record: owner class QN → module ref. */
@@ -128,6 +132,10 @@ typedef struct {
     /* Recursion guards. */
     int eval_depth;
     int walk_depth;
+
+    /* Stamp of the current method-lookup walk; each walk takes a fresh one
+     * so marks left by earlier walks never match. */
+    unsigned int lookup_stamp;
 
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;

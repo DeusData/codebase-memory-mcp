@@ -78,6 +78,7 @@
  */
 
 #include "ruby_lsp.h"
+#include "lsp_work.h"
 #include "../helpers.h"
 #include "../arena.h"
 #include <ctype.h>
@@ -470,12 +471,53 @@ static const CBMRegisteredFunc *ruby_own_singleton_method(RubyLSPContext *ctx, c
  * from that point on no hit is trustworthy and callers must emit nothing —
  * including NOT falling through to a same-named top-level def or to the
  * Object typing fallback. Hits found BEFORE the unseen ancestor in Ruby's
- * lookup order are still returned. */
+ * lookup order are still returned.
+ *
+ * Each lookup is one walk: the `blocked` flag plus a visit stamp. Ruby
+ * linearizes ancestors, so a module reached a second time in one walk
+ * (`prepend M; include M`, two includes sharing a module) was already
+ * searched and missed: a hit or a block would have ended the walk. Skipping
+ * the repeat keeps a lookup linear in the ancestors it can see; without it
+ * every module that both prepends and includes the next one doubles the
+ * paths per level. */
+typedef struct {
+    bool blocked;
+    unsigned int stamp;
+} RubyLookupWalk;
+
+static RubyLookupWalk ruby_walk_begin(RubyLSPContext *ctx) {
+    if (++ctx->lookup_stamp == 0) {
+        /* Wrapped: clear every mark so no class looks visited. */
+        for (int i = 0; i < ctx->class_count; i++) {
+            ctx->classes[i].seen_instance = 0;
+            ctx->classes[i].seen_singleton = 0;
+        }
+        ctx->lookup_stamp = 1;
+    }
+    RubyLookupWalk w = {false, ctx->lookup_stamp};
+    return w;
+}
+
+/* Marks `class_qn` searched on one side (instance or singleton) in this walk;
+ * true when it already was. Only the file's class table is marked: mixins
+ * and superclass refs are recorded for those classes alone, so a type outside
+ * the table (a stdlib type) has nothing to expand and is never a repeat. */
+static bool ruby_walk_seen(RubyLSPContext *ctx, RubyLookupWalk *w, const char *class_qn,
+                           bool singleton) {
+    RubyClassInfo *ci = ruby_class_by_qn(ctx, class_qn);
+    if (!ci)
+        return false;
+    unsigned int *mark = singleton ? &ci->seen_singleton : &ci->seen_instance;
+    if (*mark == w->stamp)
+        return true;
+    *mark = w->stamp;
+    return false;
+}
 
 static const CBMRegisteredFunc *ruby_lookup_instance_method_depth(RubyLSPContext *ctx,
                                                                   const char *class_qn,
                                                                   const char *method_name,
-                                                                  int depth, bool *blocked);
+                                                                  int depth, RubyLookupWalk *w);
 
 /* True when the class declares a superclass the finalize step could not
  * resolve (stdlib-seeded conventions like ApplicationRecord DO resolve). */
@@ -489,18 +531,18 @@ static bool ruby_superclass_unresolved(RubyLSPContext *ctx, const char *class_qn
  * before any hit blocks the walk. */
 static const CBMRegisteredFunc *ruby_lookup_in_mixins(RubyLSPContext *ctx, const char *owner_qn,
                                                       RubyMixinKind kind, const char *method_name,
-                                                      int depth, bool *blocked) {
+                                                      int depth, RubyLookupWalk *w) {
     for (int i = ctx->mixin_count - 1; i >= 0; i--) {
         RubyMixinInfo *mi = &ctx->mixins[i];
         if (mi->kind != kind || strcmp(mi->owner_qn, owner_qn) != 0)
             continue;
         if (!mi->module_qn) {
-            *blocked = true; /* unseen module — it may define/shadow the method */
+            w->blocked = true; /* unseen module — it may define/shadow the method */
             return NULL;
         }
         const CBMRegisteredFunc *f =
-            ruby_lookup_instance_method_depth(ctx, mi->module_qn, method_name, depth + 1, blocked);
-        if (f || *blocked)
+            ruby_lookup_instance_method_depth(ctx, mi->module_qn, method_name, depth + 1, w);
+        if (f || w->blocked)
             return f;
     }
     return NULL;
@@ -509,29 +551,32 @@ static const CBMRegisteredFunc *ruby_lookup_in_mixins(RubyLSPContext *ctx, const
 static const CBMRegisteredFunc *ruby_lookup_instance_method_depth(RubyLSPContext *ctx,
                                                                   const char *class_qn,
                                                                   const char *method_name,
-                                                                  int depth, bool *blocked) {
+                                                                  int depth, RubyLookupWalk *w) {
     if (!ctx || !class_qn || !method_name || depth > RUBY_LOOKUP_MAX_DEPTH)
         return NULL;
+    CBM_LSP_WORK(1);
+    if (ruby_walk_seen(ctx, w, class_qn, false))
+        return NULL; /* searched earlier in this walk: a repeat can only miss */
     /* Prepended modules shadow the class's own methods — an unresolved
      * prepend therefore blocks even an own-method hit. */
     const CBMRegisteredFunc *f =
-        ruby_lookup_in_mixins(ctx, class_qn, RUBY_MIXIN_PREPEND, method_name, depth, blocked);
-    if (f || *blocked)
+        ruby_lookup_in_mixins(ctx, class_qn, RUBY_MIXIN_PREPEND, method_name, depth, w);
+    if (f || w->blocked)
         return f;
     f = ruby_own_instance_method(ctx, class_qn, method_name);
     if (f)
         return f;
     /* An unresolved include stops the walk before the superclass chain. */
-    f = ruby_lookup_in_mixins(ctx, class_qn, RUBY_MIXIN_INCLUDE, method_name, depth, blocked);
-    if (f || *blocked)
+    f = ruby_lookup_in_mixins(ctx, class_qn, RUBY_MIXIN_INCLUDE, method_name, depth, w);
+    if (f || w->blocked)
         return f;
     if (ruby_superclass_unresolved(ctx, class_qn)) {
-        *blocked = true;
+        w->blocked = true;
         return NULL;
     }
     const char *sup = ruby_superclass_qn(ctx, class_qn);
     if (sup && strcmp(sup, class_qn) != 0)
-        return ruby_lookup_instance_method_depth(ctx, sup, method_name, depth + 1, blocked);
+        return ruby_lookup_instance_method_depth(ctx, sup, method_name, depth + 1, w);
     return NULL;
 }
 
@@ -540,10 +585,10 @@ static const CBMRegisteredFunc *ruby_lookup_instance_method_depth(RubyLSPContext
 static const CBMRegisteredFunc *ruby_lookup_instance_method_b(RubyLSPContext *ctx,
                                                               const char *class_qn,
                                                               const char *method_name,
-                                                              bool *blocked) {
+                                                              RubyLookupWalk *w) {
     const CBMRegisteredFunc *f =
-        ruby_lookup_instance_method_depth(ctx, class_qn, method_name, 0, blocked);
-    if (f || *blocked)
+        ruby_lookup_instance_method_depth(ctx, class_qn, method_name, 0, w);
+    if (f || w->blocked)
         return f;
     /* Universal receiver fallback (Object / ActiveSupport predicates) —
      * typing only; Object methods are stdlib entries, never project defs. */
@@ -554,37 +599,44 @@ static const CBMRegisteredFunc *ruby_lookup_instance_method_b(RubyLSPContext *ct
 
 const CBMRegisteredFunc *ruby_lookup_instance_method(RubyLSPContext *ctx, const char *class_qn,
                                                      const char *method_name) {
-    bool blocked = false;
-    return ruby_lookup_instance_method_b(ctx, class_qn, method_name, &blocked);
+    if (!ctx)
+        return NULL;
+    RubyLookupWalk w = ruby_walk_begin(ctx);
+    return ruby_lookup_instance_method_b(ctx, class_qn, method_name, &w);
 }
 
 static const CBMRegisteredFunc *ruby_lookup_singleton_method_depth(RubyLSPContext *ctx,
                                                                    const char *class_qn,
                                                                    const char *method_name,
-                                                                   int depth, bool *blocked) {
+                                                                   int depth, RubyLookupWalk *w) {
     if (!ctx || !class_qn || !method_name || depth > RUBY_LOOKUP_MAX_DEPTH)
         return NULL;
+    CBM_LSP_WORK(1);
+    if (ruby_walk_seen(ctx, w, class_qn, true))
+        return NULL; /* searched earlier in this walk: a repeat can only miss */
     const CBMRegisteredFunc *f = ruby_own_singleton_method(ctx, class_qn, method_name);
     if (f)
         return f;
     /* `extend Mod` adds Mod's instance methods class-side. */
-    f = ruby_lookup_in_mixins(ctx, class_qn, RUBY_MIXIN_EXTEND, method_name, depth, blocked);
-    if (f || *blocked)
+    f = ruby_lookup_in_mixins(ctx, class_qn, RUBY_MIXIN_EXTEND, method_name, depth, w);
+    if (f || w->blocked)
         return f;
     if (ruby_superclass_unresolved(ctx, class_qn)) {
-        *blocked = true;
+        w->blocked = true;
         return NULL;
     }
     const char *sup = ruby_superclass_qn(ctx, class_qn);
     if (sup && strcmp(sup, class_qn) != 0)
-        return ruby_lookup_singleton_method_depth(ctx, sup, method_name, depth + 1, blocked);
+        return ruby_lookup_singleton_method_depth(ctx, sup, method_name, depth + 1, w);
     return NULL;
 }
 
 const CBMRegisteredFunc *ruby_lookup_singleton_method(RubyLSPContext *ctx, const char *class_qn,
                                                       const char *method_name) {
-    bool blocked = false;
-    return ruby_lookup_singleton_method_depth(ctx, class_qn, method_name, 0, &blocked);
+    if (!ctx)
+        return NULL;
+    RubyLookupWalk w = ruby_walk_begin(ctx);
+    return ruby_lookup_singleton_method_depth(ctx, class_qn, method_name, 0, &w);
 }
 
 /* ── ActiveRecord model detection (typing special case) ─────────── */
@@ -878,13 +930,11 @@ static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool
         if (ctx->self_unknown)
             return cbm_type_unknown(); /* receiver is a rebound self — zero-edge */
         if (ctx->enclosing_class_qn) {
-            bool blocked = false;
+            RubyLookupWalk w = ruby_walk_begin(ctx);
             const CBMRegisteredFunc *f =
                 ctx->in_singleton_method
-                    ? ruby_lookup_singleton_method_depth(ctx, ctx->enclosing_class_qn, mname, 0,
-                                                         &blocked)
-                    : ruby_lookup_instance_method_depth(ctx, ctx->enclosing_class_qn, mname, 0,
-                                                        &blocked);
+                    ? ruby_lookup_singleton_method_depth(ctx, ctx->enclosing_class_qn, mname, 0, &w)
+                    : ruby_lookup_instance_method_depth(ctx, ctx->enclosing_class_qn, mname, 0, &w);
             if (f) {
                 if (emit)
                     ruby_emit_resolved(ctx, f->qualified_name, "ruby_self_dispatch", RUBY_CONF_HIGH,
@@ -893,7 +943,7 @@ static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool
             }
             /* An unseen ancestor may define this method: do NOT fall through
              * to a same-named top-level def. */
-            if (blocked)
+            if (w.blocked)
                 return cbm_type_unknown();
         }
         const CBMRegisteredFunc *f =
@@ -915,12 +965,11 @@ static const CBMType *ruby_eval_call_type(RubyLSPContext *ctx, TSNode call, bool
     if (strcmp(rk, "self") == 0) {
         if (!ctx->enclosing_class_qn || ctx->self_unknown)
             return cbm_type_unknown();
-        bool blocked = false;
-        const CBMRegisteredFunc *f = ctx->in_singleton_method
-                                         ? ruby_lookup_singleton_method_depth(
-                                               ctx, ctx->enclosing_class_qn, mname, 0, &blocked)
-                                         : ruby_lookup_instance_method_depth(
-                                               ctx, ctx->enclosing_class_qn, mname, 0, &blocked);
+        RubyLookupWalk w = ruby_walk_begin(ctx);
+        const CBMRegisteredFunc *f =
+            ctx->in_singleton_method
+                ? ruby_lookup_singleton_method_depth(ctx, ctx->enclosing_class_qn, mname, 0, &w)
+                : ruby_lookup_instance_method_depth(ctx, ctx->enclosing_class_qn, mname, 0, &w);
         if (f) {
             if (emit)
                 ruby_emit_resolved(ctx, f->qualified_name, "ruby_self_dispatch", RUBY_CONF_HIGH,
@@ -967,22 +1016,22 @@ static void ruby_resolve_super(RubyLSPContext *ctx, TSNode site) {
     const char *mname = strrchr(fq, '.');
     mname = mname ? mname + 1 : fq;
     const CBMRegisteredFunc *f = NULL;
-    bool blocked = false;
+    RubyLookupWalk w = ruby_walk_begin(ctx);
     /* Search order mirrors Ruby: includes of the class, then superclass
      * chain — the class's OWN def is the caller and must be skipped. An
      * unresolved mixin or superclass on the way blocks the walk. */
     f = ruby_lookup_in_mixins(ctx, ctx->enclosing_class_qn,
                               ctx->in_singleton_method ? RUBY_MIXIN_EXTEND : RUBY_MIXIN_INCLUDE,
-                              mname, 0, &blocked);
-    if (!f && !blocked && !ruby_superclass_unresolved(ctx, ctx->enclosing_class_qn)) {
+                              mname, 0, &w);
+    if (!f && !w.blocked && !ruby_superclass_unresolved(ctx, ctx->enclosing_class_qn)) {
         const char *sup = ruby_superclass_qn(ctx, ctx->enclosing_class_qn);
         if (sup) {
             f = ctx->in_singleton_method
-                    ? ruby_lookup_singleton_method_depth(ctx, sup, mname, 0, &blocked)
-                    : ruby_lookup_instance_method_depth(ctx, sup, mname, 0, &blocked);
+                    ? ruby_lookup_singleton_method_depth(ctx, sup, mname, 0, &w)
+                    : ruby_lookup_instance_method_depth(ctx, sup, mname, 0, &w);
         }
     }
-    if (f && !blocked)
+    if (f && !w.blocked)
         ruby_emit_resolved(ctx, f->qualified_name, "ruby_method_super", RUBY_CONF_HIGH, site);
     /* No known parent or unresolved — zero-edge guarantee. */
 }

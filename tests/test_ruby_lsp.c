@@ -40,6 +40,9 @@
 #include "cbm.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ruby_lsp.h"
+#include "lsp/lsp_work.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Helpers (mirror test_perl_lsp.c) ──────────────────────────── */
@@ -1317,6 +1320,116 @@ TEST(rubylsp_self_rebinding_blocks_no_edge) {
     PASS();
 }
 
+/* ── 17. Bounded resolver work ────────────────────────────────────
+ *
+ * Measured with counters, never with a clock (O9): CBM_LSP_WORK
+ * (lsp_work.h, seam builds) for lookup work, and the result arena's
+ * cumulative allocation for bytes built. Each fixture is measured at n and
+ * 2n: linear work doubles (ratio about 2); anything worse lands above the
+ * gate of 3. */
+
+static uint64_t rubylsp_counted_work(const char *src, size_t *arena_bytes) {
+    (void)cbm_lsp_work_take();
+    CBMFileResult *r = extract_ruby(src);
+    uint64_t work = cbm_lsp_work_take();
+    if (arena_bytes)
+        *arena_bytes = r ? cbm_arena_total(&r->arena) : 0;
+    if (r)
+        cbm_free_result(r);
+    return work;
+}
+
+/* n modules where every module both prepends and includes the next one;
+ * the last defines one method. `Probe` reaches M0 through `include`
+ * (instance side) or `extend` (class side) and calls a method nobody
+ * defines, so the lookup must miss after searching every ancestor. */
+static char *rubylsp_mixin_chain_src(int n, bool class_side) {
+    size_t cap = (size_t)n * 96 + 256;
+    char *src = (char *)malloc(cap);
+    if (!src)
+        return NULL;
+    size_t off = 0;
+    for (int i = 0; i < n; i++) {
+        if (i + 1 < n)
+            off += (size_t)snprintf(src + off, cap - off,
+                                    "module M%d\n  prepend M%d\n  include M%d\nend\n", i, i + 1,
+                                    i + 1);
+        else
+            off += (size_t)snprintf(src + off, cap - off,
+                                    "module M%d\n  def leaf\n    1\n  end\nend\n", i);
+    }
+    if (class_side)
+        (void)snprintf(src + off, cap - off,
+                       "class Probe\n  extend M0\n  def self.run\n    nobody_defines_this()\n"
+                       "  end\nend\n");
+    else
+        (void)snprintf(src + off, cap - off,
+                       "class Probe\n  include M0\n  def run\n    nobody_defines_this()\n"
+                       "  end\nend\n");
+    return src;
+}
+
+static uint64_t rubylsp_mixin_chain_work(int n, bool class_side) {
+    char *src = rubylsp_mixin_chain_src(n, class_side);
+    if (!src)
+        return 0;
+    uint64_t work = rubylsp_counted_work(src, NULL);
+    free(src);
+    return work;
+}
+
+/* Review ask (a): Ruby linearizes ancestors, so a module reached through
+ * two paths (`prepend M; include M`, a diamond) is searched once. Without a
+ * visited set every level of the chain doubles the paths: 2^n visits
+ * (measured 4 -> 20,744 for n = 2..14). With it a miss costs one visit per
+ * module. Positive controls: the doubled pair still resolves through the
+ * prepend, and a diamond resolves to the shared module exactly once. */
+TEST(rubylsp_mixin_walk_visits_each_module_once) {
+    uint64_t inst_n = rubylsp_mixin_chain_work(6, false);
+    uint64_t inst_2n = rubylsp_mixin_chain_work(12, false);
+    uint64_t cls_n = rubylsp_mixin_chain_work(6, true);
+    uint64_t cls_2n = rubylsp_mixin_chain_work(12, true);
+    printf("  mixin chain work: instance n=6 %llu, n=12 %llu; class side n=6 %llu, n=12 %llu\n",
+           (unsigned long long)inst_n, (unsigned long long)inst_2n, (unsigned long long)cls_n,
+           (unsigned long long)cls_2n);
+    ASSERT(inst_n > 0 && cls_n > 0);
+    ASSERT(inst_2n <= 3 * inst_n);
+    ASSERT(cls_2n <= 3 * cls_n);
+
+    const char *src = "module Shared\n"
+                      "  def hello\n"
+                      "    1\n"
+                      "  end\n"
+                      "end\n"
+                      "module Left\n"
+                      "  include Shared\n"
+                      "end\n"
+                      "module Right\n"
+                      "  include Shared\n"
+                      "end\n"
+                      "module Twice\n"
+                      "  def twice\n"
+                      "    2\n"
+                      "  end\n"
+                      "end\n"
+                      "class Diamond\n"
+                      "  include Left\n"
+                      "  include Right\n"
+                      "  prepend Twice\n"
+                      "  include Twice\n"
+                      "  def run\n"
+                      "    hello()\n"
+                      "    twice()\n"
+                      "  end\n"
+                      "end\n";
+    CBMFileResult *r = extract_ruby(src);
+    ASSERT(r);
+    ASSERT(count_resolved_exact(r, "test.main.Diamond.run", "test.main.Shared.hello") == 1);
+    ASSERT(count_resolved_exact(r, "test.main.Diamond.run", "test.main.Twice.twice") == 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── suite ──────────────────────────────────────────────────────── */
 
 void suite_ruby_lsp(void) {
@@ -1353,4 +1466,5 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_send_no_edge);
     RUN_TEST(rubylsp_dynamic_dispatch_family_no_edge);
     RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
+    RUN_TEST(rubylsp_mixin_walk_visits_each_module_once);
 }
