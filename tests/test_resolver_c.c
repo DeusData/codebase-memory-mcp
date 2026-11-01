@@ -2528,19 +2528,16 @@ TEST(resolver_cpp_known_gaps_stay_honest) {
                 "declarations give a receiver its type here.",
          .tried = "Written declaration types are followed through typedefs, fields and declared "
                   "return types. Initializer flow is left out on purpose: it can go stale."},
-        {.case_id = "overloads-of-one-parameter-count",
+        /* Not a gap: the two definitions are one graph node, so which overload the call
+         * selects does not change the edge. */
+        {.case_id = "overloads-sharing-one-node",
          .site = {.file = "cxx_gaps_use.cpp", .caller = "llvm.useConstOverload", .needle = "V.parts()"},
          .relation = "CALLS",
          .target = {.file = "cxx_gaps.cpp",
                     .suffix = "cxx_gaps.Value.parts",
                     .label = "Method",
-                    .declaration_line = 3,
-                    .declaration_text = "int *Value::parts() { return 0; }"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "cpp-same-count-overloads",
-         .why = "Overloads are told apart by parameter count only. Const-ness and conversion "
-                "ranking are not modelled, and the two definitions share one graph QN.",
-         .tried = "Seen on IEEEFloat::significandParts. Arity selection binds the rest; these abstain."},
+                    .declaration_line = 4,
+                    .declaration_text = "const int *Value::parts() const { return 0; }"}},
         {.case_id = "explicit-template-arguments",
          .site = {.file = "cxx_gaps_use.cpp",
                   .caller = "llvm.useFunctionTemplate",
@@ -2564,7 +2561,7 @@ TEST(resolver_cpp_known_gaps_stay_honest) {
                              .source_count = sizeof(C_TU_CXX_GAPS) / sizeof(C_TU_CXX_GAPS[0]),
                              .expected = expected,
                              .expected_count = sizeof(expected) / sizeof(expected[0]),
-                             .known_gaps = sizeof(expected) / sizeof(expected[0])};
+                             .known_gaps = sizeof(expected) / sizeof(expected[0]) - 1};
     for (int driver = 0; driver < 2; driver++)
         ASSERT(c_tu_run(&fixture, driver));
     PASS();
