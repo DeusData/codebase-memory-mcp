@@ -719,7 +719,7 @@ overwrite user-modified agents.
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
 | Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, post-`Read` coverage, and a drift note after repeated searches without a graph call |
-| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, skill, three read-only agents; `SessionStart` + `SubagentStart`, `PreToolUse` graph lookup for `Bash` searches |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, `~/.agents/skills/codebase-memory/SKILL.md`, three read-only agents; `SessionStart` + `SubagentStart`, `PreToolUse` graph lookup for `Bash` searches |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
 | OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
@@ -768,6 +768,11 @@ For Codex, install keeps only a tiny managed activation pointer in global
 `$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory` skill.
 Fresh installs create the pointer, upgrades replace the legacy full managed block while preserving
 all user-owned bytes, and uninstall removes only the managed pointer.
+Skill placement follows the cross-client user skill root and does not follow
+`CODEX_HOME`. On upgrade, the installer migrates an installer-owned legacy
+`$CODEX_HOME/skills/codebase-memory/SKILL.md` only after verifying the canonical
+copy. Modified or foreign files are preserved; `--force` explicitly authorizes
+replacement before migration.
 
 ### Sessions, compaction, and subagents
 
@@ -957,6 +962,16 @@ mode. `index_status` keeps describing the published graph and its freshness.
 `manage_adr(mode='set_sections')` writes one or more sections by name and splices them into the stored document, so text outside the named sections (including a preamble, code fences and section ordering) is preserved byte-for-byte. Any `## Heading` works, not just the conventional PURPOSE / STACK / ARCHITECTURE / PATTERNS / TRADEOFFS / PHILOSOPHY set; names match exactly, including case. Writing the same section twice is a no-op, so a retry after a lost response cannot duplicate content.
 
 `manage_adr` query modes (`get` and `sections`) use the server's cached query store so they can proceed while a same-project reindex is running. If another process publishes a replacement store during reindexing, they can return the pre-publication ADR until idle eviction refreshes that cache. Updates remain serialized through the project mutation guard.
+
+`trace_path` exposes the start nodes' stored `self_recursive` (direct recursion)
+and `recursive` (direct recursion or a call-graph cycle) signals in both tree and
+JSON output. Across multiple start nodes, a flag is `true` if any records true,
+`false` if all record false, and `null` otherwise (including missing legacy
+metadata). These are static-analysis signals, not counts of resolved self-calls.
+Static `CALLS` indexing omits direct self-call edges; traces that include `CALLS` state
+`self_call_policy: omitted`. Caller/callee totals still count graph-reachable
+nodes, so a recursive function can have zero callees. Recursion metadata remains
+visible on continuation pages and when an output budget prevents rows from fitting.
 
 ## Graph Data Model
 

@@ -13,6 +13,7 @@
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
 #include "pipeline/lsp_surface.h"
+#include "pipeline/worker_pool.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/helm_template.h"
@@ -119,6 +120,269 @@ TEST(pipeline_create_free) {
     ASSERT_NOT_NULL(p);
     ASSERT_STR_EQ(cbm_pipeline_project_name(p), "some-path");
     cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_background_worker_policy_preserves_overrides) {
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+
+    cbm_pipeline_t *foreground = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    cbm_pipeline_t *background = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(foreground);
+    ASSERT_NOT_NULL(background);
+    cbm_pipeline_set_background(background, true);
+
+    int foreground_default = cbm_pipeline_worker_count(foreground);
+    int background_default = cbm_pipeline_worker_count(background);
+    bool defaults_match = foreground_default == cbm_default_worker_count(true) &&
+                          background_default == cbm_pipeline_background_worker_width(
+                                                    cbm_default_worker_count(true),
+                                                    cbm_default_worker_count(false)) &&
+                          foreground_default >= 1 && background_default >= 1 &&
+                          (foreground_default < 2 || background_default >= 2);
+
+    /* A pinned single worker leaves no parallel route to preserve. */
+    cbm_setenv("CBM_WORKERS", "1", 1);
+    bool env_override =
+        cbm_pipeline_worker_count(foreground) == 1 && cbm_pipeline_worker_count(background) == 1;
+    cbm_setenv("CBM_WORKERS", "3", 1);
+    env_override = env_override && cbm_pipeline_worker_count(foreground) == 3 &&
+                   cbm_pipeline_worker_count(background) == 3;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    bool recovery_override = cbm_pipeline_worker_count(foreground) == 1 &&
+                             cbm_pipeline_worker_count(background) == 1;
+
+    cbm_pipeline_free(foreground);
+    cbm_pipeline_free(background);
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+
+    ASSERT_TRUE(defaults_match);
+    ASSERT_TRUE(env_override);
+    ASSERT_TRUE(recovery_override);
+    PASS();
+}
+
+/* An automatic refresh keeps CPU headroom but never falls to one worker, the
+ * sequential route, while the foreground width could run in parallel. Each
+ * host shape is given as the two widths cbm_default_worker_count() derives
+ * from it (foreground: every core; headroom: performance cores minus one, at
+ * least one), so the verdict does not depend on the machine running it. */
+TEST(pipeline_background_worker_width_keeps_parallel_route) {
+    /* One core: foreground 1, headroom 1. Nothing to preserve. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(1, 1), 1);
+    /* Two performance cores: headroom alone would be 1. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(2, 1), 2);
+    /* Two performance cores beside efficiency cores: same floor. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(8, 1), 2);
+    /* Larger hosts keep their headroom unchanged. */
+    ASSERT_EQ(cbm_pipeline_background_worker_width(3, 2), 2);
+    ASSERT_EQ(cbm_pipeline_background_worker_width(4, 3), 3);
+    ASSERT_EQ(cbm_pipeline_background_worker_width(18, 5), 5);
+    PASS();
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+enum { SURFACE_BUDGET_FILES = 5 };
+
+typedef struct {
+    atomic_int expected;
+    atomic_int arrivals;
+    atomic_int live;
+    atomic_int peak;
+    atomic_bool released;
+    atomic_int visits[SURFACE_BUDGET_FILES];
+    int helpers;
+} surface_budget_probe_t;
+
+static void surface_budget_spawned(int count, int helpers, void *arg) {
+    surface_budget_probe_t *probe = arg;
+    probe->helpers = helpers;
+    int participants = helpers + 1;
+    atomic_store(&probe->expected, count < participants ? count : participants);
+}
+
+static void surface_budget_row(int index, bool entering, void *arg) {
+    surface_budget_probe_t *probe = arg;
+    if (!entering) {
+        atomic_fetch_sub(&probe->live, 1);
+        return;
+    }
+    atomic_fetch_add(&probe->visits[index], 1);
+    int live = atomic_fetch_add(&probe->live, 1) + 1;
+    int peak = atomic_load(&probe->peak);
+    while (peak < live && !atomic_compare_exchange_weak(&probe->peak, &peak, live)) {}
+    atomic_fetch_add(&probe->arrivals, 1);
+    /* No timing window: hold the first wave until every possible participant
+     * has entered. The post-spawn observation accounts for partial thread
+     * creation and serial fallback, so neither can strand this gate. The test
+     * runner's watchdog bounds a broken dispatch without making time a verdict. */
+    while (!atomic_load(&probe->released)) {
+        int expected = atomic_load(&probe->expected);
+        if (expected > 0 && atomic_load(&probe->arrivals) >= expected) {
+            atomic_store(&probe->released, true);
+        }
+    }
+}
+
+TEST(pipeline_surface_respects_total_worker_budget) {
+    CBMFileResult results[SURFACE_BUDGET_FILES] = {0};
+    CBMFileResult *cache[SURFACE_BUDGET_FILES];
+    cbm_file_info_t files[SURFACE_BUDGET_FILES] = {
+        {.rel_path = "a.go", .language = CBM_LANG_GO},
+        {.rel_path = "b.go", .language = CBM_LANG_GO},
+        {.rel_path = "c.go", .language = CBM_LANG_GO},
+        {.rel_path = "d.go", .language = CBM_LANG_GO},
+        {.rel_path = "e.go", .language = CBM_LANG_GO},
+    };
+    surface_budget_probe_t probe = {0};
+    for (int i = 0; i < SURFACE_BUDGET_FILES; i++) {
+        cache[i] = &results[i];
+        atomic_init(&probe.visits[i], 0);
+    }
+    cache[1] = NULL; /* The skipped row must not change stable file ordering. */
+    atomic_init(&probe.expected, 0);
+    atomic_init(&probe.arrivals, 0);
+    atomic_init(&probe.live, 0);
+    atomic_init(&probe.peak, 0);
+    atomic_init(&probe.released, false);
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_setenv("CBM_WORKERS", "2", 1);
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_pipeline_t *pipeline = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    cbm_pipeline_set_background(pipeline, true);
+    cbm_pipeline_ctx_t ctx = {.pipeline = pipeline};
+    cbm_lsp_surface_row_t *rows = NULL;
+    int count = 0;
+    cbm_parallel_test_set_spawn_observer(surface_budget_spawned, &probe);
+    cbm_lsp_surface_test_set_row_observer(surface_budget_row, &probe);
+    int rc = cbm_lsp_surface_build_rows(&ctx, "budget", cache, files, SURFACE_BUDGET_FILES, NULL,
+                                        NULL, &rows, &count);
+    int parallel_peak = atomic_load(&probe.peak);
+    int parallel_helpers = probe.helpers;
+    atomic_store(&probe.expected, 0);
+    atomic_store(&probe.arrivals, 0);
+    atomic_store(&probe.peak, 0);
+    atomic_store(&probe.released, false);
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    cbm_lsp_surface_row_t *serial_rows = NULL;
+    int serial_count = 0;
+    int serial_rc = cbm_lsp_surface_build_rows(&ctx, "budget", cache, files, SURFACE_BUDGET_FILES,
+                                               NULL, NULL, &serial_rows, &serial_count);
+    cbm_lsp_surface_test_set_row_observer(NULL, NULL);
+    cbm_parallel_test_set_spawn_observer(NULL, NULL);
+    bool same = rc == 0 && serial_rc == 0 && rows && serial_rows &&
+                count == SURFACE_BUDGET_FILES - 1 && count == serial_count;
+    for (int i = 0; same && i < count; i++) {
+        same = strcmp(rows[i].rel_path, files[i < 1 ? i : i + 1].rel_path) == 0 &&
+               strcmp(rows[i].defs_json, serial_rows[i].defs_json) == 0 &&
+               strcmp(rows[i].surface_sha, serial_rows[i].surface_sha) == 0;
+    }
+    cbm_store_free_lsp_surfaces(rows, count);
+    cbm_store_free_lsp_surfaces(serial_rows, serial_count);
+    cbm_pipeline_free(pipeline);
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(serial_rc, 0);
+    ASSERT_TRUE(same);
+    ASSERT_GTE(parallel_helpers, 1); /* A serial setup is not a concurrency repro. */
+    ASSERT_EQ(probe.helpers, 0);
+    ASSERT_EQ(atomic_load(&probe.live), 0);
+    for (int i = 0; i < SURFACE_BUDGET_FILES; i++) {
+        ASSERT_EQ(atomic_load(&probe.visits[i]), 2);
+    }
+    ASSERT_EQ(atomic_load(&probe.peak), 1);
+    ASSERT_EQ(parallel_peak, 2);
+    PASS();
+}
+#endif
+
+TEST(pipeline_background_policy_preserves_index_results) {
+    ASSERT_EQ(setup_test_repo(), 0);
+    /* 64 fillers plus setup_test_repo's three files exceed MIN_FILES_FOR_PARALLEL
+     * (50). Below that threshold both policies take the sequential path, so the
+     * comparison stays green even with the background policy removed. */
+    for (int i = 0; i < 64; i++) {
+        char name[32];
+        char body[96];
+        (void)snprintf(name, sizeof(name), "pad%02d.go", i);
+        (void)snprintf(body, sizeof(body), "package main\n\nfunc Pad%02d() int {\n\treturn %d\n}\n",
+                       i, i);
+        if (th_write_file(TH_PATH(g_tmpdir, name), body) != 0) {
+            teardown_test_repo();
+            FAIL("failed to pad fixture past MIN_FILES_FOR_PARALLEL");
+        }
+    }
+
+    /* An inherited CBM_WORKERS pin makes both runs use the same count. Drop it
+     * so this compares an all-core index against a headroom index. */
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_test_repo();
+        FAIL("failed to save worker env");
+    }
+    cbm_unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+
+    char foreground_db[512];
+    char background_db[512];
+    (void)snprintf(foreground_db, sizeof(foreground_db), "%s/foreground.db", g_tmpdir);
+    (void)snprintf(background_db, sizeof(background_db), "%s/background.db", g_tmpdir);
+
+    cbm_pipeline_t *foreground = cbm_pipeline_new(g_tmpdir, foreground_db, CBM_MODE_FULL);
+    cbm_pipeline_t *background = cbm_pipeline_new(g_tmpdir, background_db, CBM_MODE_FULL);
+    int foreground_rc = -1;
+    int background_rc = -1;
+    int foreground_nodes = -1;
+    int foreground_edges = -1;
+    int background_nodes = -1;
+    int background_edges = -1;
+    bool created = foreground && background;
+    if (created) {
+        cbm_pipeline_set_background(background, true);
+        foreground_rc = cbm_pipeline_run(foreground);
+        background_rc = cbm_pipeline_run(background);
+        cbm_pipeline_get_committed_counts(foreground, &foreground_nodes, &foreground_edges);
+        cbm_pipeline_get_committed_counts(background, &background_nodes, &background_edges);
+    }
+
+    cbm_pipeline_free(foreground);
+    cbm_pipeline_free(background);
+    teardown_test_repo();
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+
+    ASSERT_TRUE(created);
+    ASSERT_EQ(foreground_rc, 0);
+    ASSERT_EQ(background_rc, 0);
+    ASSERT_GT(foreground_nodes, 0);
+    ASSERT_EQ(background_nodes, foreground_nodes);
+    ASSERT_EQ(background_edges, foreground_edges);
     PASS();
 }
 
@@ -9344,8 +9608,8 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
 
     cbm_file_hash_t *manifest = NULL;
     int manifest_count = -1;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-fail-closed", root_path, NULL, 0, NULL,
-                                                  0, NULL, NULL, &manifest, &manifest_count);
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-fail-closed", root_path, NULL, 0,
+                                                  NULL, 0, NULL, NULL, &manifest, &manifest_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
     th_rmtree(tmp);
 
@@ -9373,7 +9637,7 @@ TEST(pipeline_semantic_manifest_skips_unreadable_subdirectory) {
 
     cbm_file_hash_t *manifest = NULL;
     int manifest_count = -1;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-skip-locked", tmp, NULL, 0, NULL, 0,
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-skip-locked", tmp, NULL, 0, NULL, 0,
                                                   NULL, NULL, &manifest, &manifest_count);
 
     bool found_sibling_gitignore = false;
@@ -11662,6 +11926,221 @@ TEST(pipeline_go_bare_init_binds_nothing_parallel) {
     } else {
         cbm_unsetenv("CBM_WORKERS");
     }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_parallel_field_hint_requires_owner_segment) {
+    /* #1927: try_field_type_hint (parallel resolver only) matched the hinted
+     * type name as a raw SUBSTRING of the candidate QN. A single-letter
+     * receiver — `f.Close()` on an *os.File — hints "F", and "F" is a
+     * substring of "…FileStore.Close", so a stdlib call was rebound to an
+     * arbitrary project method at PP_FIELD_HINT_CONF and presented as
+     * field_type_hint (the one weak strategy the Go selector guard trusts).
+     * The hint must fire only when the candidate's OWNING segment — the
+     * dot-segment immediately before the method — EQUALS the hinted type;
+     * otherwise the resolution stays a weak short-name match and the Go
+     * guard (#1906) drops it. >= 50 files forces pass_parallel.c, the only
+     * path that runs try_field_type_hint(). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_fth_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "go.mod", "module example.com/fxhint\n\ngo 1.22\n");
+    /* Two project methods named Close → the registry resolves f.Close() as an
+     * ambiguous short-name match (candidate_count 2), the shape the hint
+     * upgrades. FileStore's QN carries the capital F the buggy substring
+     * latches onto; Conn is the second candidate. */
+    write_temp_file(tmp, "filestore/filestore.go",
+                    "package filestore\n"
+                    "\n"
+                    "type FileStore struct{ open bool }\n"
+                    "\n"
+                    "func (fs *FileStore) Close() {\n"
+                    "\tfs.open = false\n"
+                    "}\n");
+    write_temp_file(tmp, "conn/conn.go",
+                    "package conn\n"
+                    "\n"
+                    "type Conn struct{ live bool }\n"
+                    "\n"
+                    "func (cn *Conn) Close() {\n"
+                    "\tcn.live = false\n"
+                    "}\n");
+    /* Two project methods named Find → same ambiguity, but here the receiver
+     * variable IS named after its type (`finder`), the case the hint exists
+     * for: the owning segment of Finder.Find equals the hinted "Finder". */
+    write_temp_file(tmp, "finder/finder.go",
+                    "package finder\n"
+                    "\n"
+                    "type Finder struct{ n int }\n"
+                    "\n"
+                    "func NewFinder() *Finder { return &Finder{n: 1} }\n"
+                    "\n"
+                    "func (fi *Finder) Find(id int) int {\n"
+                    "\treturn fi.n + id\n"
+                    "}\n");
+    write_temp_file(tmp, "locator/locator.go",
+                    "package locator\n"
+                    "\n"
+                    "type Locator struct{ n int }\n"
+                    "\n"
+                    "func (lo *Locator) Find(id int) int {\n"
+                    "\treturn lo.n - id\n"
+                    "}\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"os\"\n"
+                    "\n"
+                    "\txf \"example.com/fxhint/finder\"\n"
+                    ")\n"
+                    "\n"
+                    "func Lookup(path string) int64 {\n"
+                    "\tf, err := os.Open(path)\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\tdefer f.Close()\n"
+                    "\tst, err := f.Stat()\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\treturn st.Size()\n"
+                    "}\n"
+                    "\n"
+                    "func UseFinder(id int) int {\n"
+                    "\tfinder := xf.NewFinder()\n"
+                    "\treturn finder.Find(id)\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_fth.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Reproduce-first: RED before the fix. The substring hint rebinds the
+     * stdlib f.Close() to FileStore.Close ("F" ⊂ QN) at high confidence and
+     * the Go guard keeps it. With segment equality the upgrade is refused,
+     * the match stays suffix_match, and the Go guard drops it. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "Lookup", "Close"));
+    /* (2) The intended hint case survives: `finder` names its type, so the
+     * owning segment of Finder.Find equals the hint. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UseFinder", "Find"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment);
+
+TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment) {
+    /* #1927, non-Go twin. Go no longer runs try_field_type_hint (e554a2ab),
+     * but every other language on the parallel path still does, and C# is the
+     * hint's intended consumer (it strips the _ / m_ field prefixes). C#
+     * method names are PascalCase, so a one-letter receiver hints a letter
+     * that every candidate QN already contains in the METHOD name: `w.Write()`
+     * hints "W", and a raw substring test accepts "...FileStore.Write" and
+     * "...Conn.Write" alike, whichever the registry lists first. The hint must
+     * bind only a candidate whose OWNING segment equals the hinted type.
+     * >= 50 files forces pass_parallel.c, the only path with the hint. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cs_fth_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Two project methods named Write: an untyped receiver resolves as an
+     * ambiguous short-name match (candidate_count 2), the shape the hint
+     * upgrades. */
+    write_temp_file(tmp, "Storage/FileStore.cs",
+                    "namespace Storage {\n"
+                    "    public class FileStore {\n"
+                    "        private int written;\n"
+                    "        public void Write(int v) { written += v; }\n"
+                    "        public void Put(int v) { written = v; }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "Net/Conn.cs",
+                    "namespace Net {\n"
+                    "    public class Conn {\n"
+                    "        private int sent;\n"
+                    "        public void Write(int v) { sent += v; }\n"
+                    "    }\n"
+                    "}\n");
+    /* Two project methods named Put, one owned by Store: the receiver `store`
+     * names its type, the case the hint exists for. FileStore's QN also
+     * contains "Store", so only segment equality picks Store.Put whatever
+     * the candidate order. */
+    write_temp_file(tmp, "Repo/Store.cs",
+                    "namespace Repo {\n"
+                    "    public class Store {\n"
+                    "        private int held;\n"
+                    "        public void Put(int v) { held = v; }\n"
+                    "    }\n"
+                    "}\n");
+    write_temp_file(tmp, "App/Worker.cs",
+                    "namespace App {\n"
+                    "    public class Worker {\n"
+                    "        public void Log(System.IO.StreamWriter w) {\n"
+                    "            w.Write(1);\n"
+                    "        }\n"
+                    "        public void Keep() {\n"
+                    "            var store = Services.Resolve();\n"
+                    "            store.Put(2);\n"
+                    "        }\n"
+                    "    }\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[192];
+        snprintf(name, sizeof(name), "Pad/Filler%d.cs", i);
+        snprintf(body, sizeof(body),
+                 "namespace Pad {\n    public class Filler%d {\n"
+                 "        public int Get%d() { return %d; }\n    }\n}\n",
+                 i, i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cs_fth.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Reproduce-first: RED before the fix. "W" is a substring of every
+     * Write candidate, so the old hint upgraded the StreamWriter call to an
+     * arbitrary project Write at PP_FIELD_HINT_CONF. No owner segment is "W",
+     * so the fixed hint must not fire at all. */
+    ASSERT_FALSE(cross_file_call_has_strategy(s, project, "Log", "Write", "field_type_hint"));
+    /* (2) The intended hint case binds the owner it names, never FileStore. */
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".Store.Put", "field_type_hint"), 1);
+    ASSERT_EQ(count_calls_with(s, project, ".Keep", ".FileStore.Put", NULL), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
     th_rmtree(tmp);
     PASS();
 }
@@ -15971,6 +16450,203 @@ TEST(pipeline_typed_http_call_has_no_arg_url_twin) {
 
 TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential) {
     return typed_http_no_url_twin_case(0);
+}
+
+/* Issue #2768: Angular HttpClient calls (this.http.get, this.httpClient.post,
+ * this.http.delete) emit HTTP_CALLS edges typed with the method verb, and are
+ * never misclassified as route registrations. */
+static int angular_http_client_typed_case(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_angular_http_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/item.service.ts",
+                    "import { Injectable } from '@angular/core';\n"
+                    "import { HttpClient } from '@angular/common/http';\n"
+                    "\n"
+                    "@Injectable({ providedIn: 'root' })\n"
+                    "export class ItemService {\n"
+                    "  constructor(private http: HttpClient) {}\n"
+                    "\n"
+                    "  getItems() {\n"
+                    "    return this.http.get('/items/list');\n"
+                    "  }\n"
+                    "\n"
+                    "  getItem(id: string) {\n"
+                    "    return this.http.get(`/items/${id}`);\n"
+                    "  }\n"
+                    "\n"
+                    "  createItem(item: any) {\n"
+                    "    return this.http.post('/items', item);\n"
+                    "  }\n"
+                    "\n"
+                    "  deleteItem(id: string) {\n"
+                    "    return this.http.delete(`/items/${id}`);\n"
+                    "  }\n"
+                    "\n"
+                    "  updateItem(id: string, item: any) {\n"
+                    "    return this.http\n"
+                    "      .put(`/items/${id}`, item);\n"
+                    "  }\n"
+                    "}\n");
+
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/angular_http.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Assert exact HTTP_CALLS with proper methods */
+    ASSERT_EQ(http_calls_to_route(s, project, "getItems", "__route__GET__/items/list"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "getItem", "__route__GET__/items/{}"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "createItem", "__route__POST__/items"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "deleteItem", "__route__DELETE__/items/{}"), 1);
+    /* A chain wrapped before the verb (prettier style) is the same client call */
+    ASSERT_EQ(http_calls_to_route(s, project, "updateItem", "__route__PUT__/items/{}"), 1);
+    ASSERT_EQ(http_calls_to_route(s, project, "updateItem", "__route__ANY__"), 0);
+
+    /* Assert no ANY twins */
+    ASSERT_EQ(http_calls_to_route(s, project, "getItems", "__route__ANY__"), 0);
+    ASSERT_EQ(http_calls_to_route(s, project, "getItem", "__route__ANY__"), 0);
+    ASSERT_EQ(http_calls_to_route(s, project, "createItem", "__route__ANY__"), 0);
+    ASSERT_EQ(http_calls_to_route(s, project, "deleteItem", "__route__ANY__"), 0);
+
+    /* Angular service must NOT emit HANDLES edges (not a server route registration) */
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HANDLES"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_angular_http_client_typed_parallel) {
+    return angular_http_client_typed_case(52);
+}
+
+TEST(pipeline_angular_http_client_typed_sequential) {
+    return angular_http_client_typed_case(0);
+}
+
+/* #2768: the arg-URL heuristic (detect_url_in_args, via=arg_url) covers calls
+ * no service pattern knows, and it now types the edge with the verb the callee
+ * names instead of minting a method-less __route__ANY__ route. Two wrapper
+ * shapes reach it on the parallel resolver:
+ *   - a project wrapper method whose verb is not a route-registration suffix
+ *     (`this.api.head('/items/health')`, `.options(...)`), resolved to the
+ *     project method, so the URL may be the first argument;
+ *   - a route-verb wrapper (`.get`) whose URL is not route shaped for the
+ *     registration reader: here a keyword it does not read as a path
+ *     (`self.session.get(resource="/items/list")`).
+ * Parallel only: the sequential resolver has no arg-URL heuristic (#2848). */
+TEST(pipeline_arg_url_wrapper_call_typed_with_verb_issue2768) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_arg_url_verb_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/items.api.ts",
+                    "export class ItemsApi {\n"
+                    "  head(path: string): Promise<Response> {\n"
+                    "    return fetch(path, { method: 'HEAD' });\n"
+                    "  }\n"
+                    "  options(path: string): Promise<Response> {\n"
+                    "    return fetch(path, { method: 'OPTIONS' });\n"
+                    "  }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/item.service.ts",
+                    "import { ItemsApi } from './items.api';\n"
+                    "export class ItemService {\n"
+                    "  constructor(private readonly api: ItemsApi) {}\n"
+                    "  pingItems() {\n"
+                    "    return this.api.head('/items/health');\n"
+                    "  }\n"
+                    "  probeItems() {\n"
+                    "    return this.api.options('/items/list');\n"
+                    "  }\n"
+                    "}\n");
+    write_temp_file(tmp, "src/reader.py",
+                    "class ItemsSession:\n"
+                    "    def get(self, *args, **kwargs):\n"
+                    "        return args\n"
+                    "\n"
+                    "class Reader:\n"
+                    "    def __init__(self):\n"
+                    "        self.session = ItemsSession()\n"
+                    "\n"
+                    "    def read_items(self):\n"
+                    "        return self.session.get(resource=\"/items/list\")\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_verb.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    static const struct {
+        const char *caller;
+        const char *typed_route;
+    } wrapped[] = {{"pingItems", "__route__HEAD__/items/health"},
+                   {"probeItems", "__route__OPTIONS__/items/list"},
+                   {"read_items", "__route__GET__/items/list"}};
+    for (size_t i = 0; i < sizeof(wrapped) / sizeof(wrapped[0]); i++) {
+        /* The edge carries the callee's verb ... */
+        ASSERT_EQ(http_calls_to_route(s, project, wrapped[i].caller, wrapped[i].typed_route), 1);
+        /* ... and is the call site's only HTTP_CALLS edge: no ANY twin. */
+        ASSERT_EQ(http_calls_to_route(s, project, wrapped[i].caller, "__route__ANY__"), 0);
+        ASSERT_EQ(http_calls_to_route(s, project, wrapped[i].caller, "__route__"), 1);
+    }
+    /* Not a route registration */
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HANDLES"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
 }
 
 /* #706 / #1147 end to end: a URL composed from module constants reaches the
@@ -30326,6 +31002,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_lock_release_allows_contender);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
+    RUN_TEST(pipeline_background_worker_policy_preserves_overrides);
+    RUN_TEST(pipeline_background_worker_width_keeps_parallel_route);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_surface_respects_total_worker_budget);
+#endif
+    RUN_TEST(pipeline_background_policy_preserves_index_results);
     RUN_TEST(pipeline_null_repo);
     RUN_TEST(pipeline_free_null);
     RUN_TEST(pipeline_cancel);
@@ -30415,6 +31097,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_receiver_parallel_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed);
     RUN_TEST(pipeline_go_multi_return_receiver_is_typed_parallel);
+    RUN_TEST(pipeline_go_parallel_field_hint_requires_owner_segment);
+    RUN_TEST(pipeline_csharp_parallel_field_hint_requires_owner_segment);
     RUN_TEST(pipeline_go_multi_init_nodes_survive);
     RUN_TEST(pipeline_go_init_lsp_edges_per_file);
     RUN_TEST(pipeline_go_init_lsp_edges_per_file_parallel);
@@ -30471,6 +31155,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential);
+    RUN_TEST(pipeline_angular_http_client_typed_parallel);
+    RUN_TEST(pipeline_angular_http_client_typed_sequential);
+    RUN_TEST(pipeline_arg_url_wrapper_call_typed_with_verb_issue2768);
     RUN_TEST(pipeline_url_constant_folding_http_calls_issue706_1147);
     RUN_TEST(pipeline_folded_topics_preserve_identity_sequential_parallel);
     RUN_TEST(pipeline_relative_folded_wrapper_url_candidates);

@@ -6180,6 +6180,149 @@ TEST(cli_zed_mcp_jsonc_comments) {
     PASS();
 }
 
+#ifndef _WIN32
+TEST(cli_install_agent_config_symlinks_issue2671) {
+    /* Refs #2671: dotfiles checkout pattern where agent config directory is a
+     * user-owned symlink into dotfiles under the user's home directory. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/Library/Application Support", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/Zed", parent_dir);
+#else
+    char parent_dir[512];
+    snprintf(parent_dir, sizeof(parent_dir), "%s/.config", tmpdir);
+    test_mkdirp(parent_dir);
+    char zed_link[512];
+    snprintf(zed_link, sizeof(zed_link), "%s/zed", parent_dir);
+#endif
+
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
+
+    /* Dangling symlink and symlink to a regular file must remain undetected. */
+    char dangling_target[512];
+    snprintf(dangling_target, sizeof(dangling_target), "%s/dotfiles/missing-zed", tmpdir);
+    ASSERT_EQ(symlink(dangling_target, zed_link), 0);
+    bool dangling_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    ASSERT_EQ(symlink(dotfiles_settings, zed_link), 0);
+    bool file_link_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    /* Symlink resolving to a directory not owned by the invoking user must be refused. */
+    char foreign_dir[512];
+    const char *unowned_target = "/";
+    if (geteuid() == 0) {
+        snprintf(foreign_dir, sizeof(foreign_dir), "%s/dotfiles/foreign-zed", tmpdir);
+        test_mkdirp(foreign_dir);
+        ASSERT_EQ(chown(foreign_dir, 65534, 65534), 0);
+        unowned_target = foreign_dir;
+    }
+    ASSERT_EQ(symlink(unowned_target, zed_link), 0);
+    bool unowned_target_detected = cbm_detect_agents(tmpdir).zed;
+    ASSERT_EQ(cbm_unlink(zed_link), 0);
+
+    ASSERT_EQ(symlink(dotfiles_zed, zed_link), 0);
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT(!dangling_detected);
+    ASSERT(!file_link_detected);
+    ASSERT(!unowned_target_detected);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+
+TEST(cli_install_agent_config_file_symlink_issue2671) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm-file-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dotfiles_zed[512];
+    snprintf(dotfiles_zed, sizeof(dotfiles_zed), "%s/dotfiles/zed", tmpdir);
+    test_mkdirp(dotfiles_zed);
+    char dotfiles_settings[512];
+    snprintf(dotfiles_settings, sizeof(dotfiles_settings), "%s/settings.json", dotfiles_zed);
+    write_test_file(dotfiles_settings, "{\"theme\": \"Ayu Dark\"}\n");
+
+#ifdef __APPLE__
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/Library/Application Support/Zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#else
+    char zed_dir[512];
+    snprintf(zed_dir, sizeof(zed_dir), "%s/.config/zed", tmpdir);
+    test_mkdirp(zed_dir);
+    char zed_settings_link[512];
+    snprintf(zed_settings_link, sizeof(zed_settings_link), "%s/settings.json", zed_dir);
+    ASSERT_EQ(symlink("../../dotfiles/zed/settings.json", zed_settings_link), 0);
+#endif
+
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
+
+    cbm_cli_set_client_selection_for_testing("zed");
+    int rc = cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
+
+    char *after = read_test_file_alloc(dotfiles_settings);
+    bool has_cbm = after && strstr(after, "codebase-memory-mcp") != NULL;
+    bool has_original = after && strstr(after, "Ayu Dark") != NULL;
+    free(after);
+
+    struct stat st;
+    ASSERT_EQ(lstat(zed_settings_link, &st), 0);
+    bool still_symlink = S_ISLNK(st.st_mode);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 0);
+    ASSERT(has_cbm);
+    ASSERT(has_original);
+    ASSERT(still_symlink);
+    PASS();
+}
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  *  PATH management tests (port of TestCLI_InstallPATHAppend)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -8151,7 +8294,6 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
                          strstr(plan, "\"instruction_files_planned\"");
     const char *const planned[] = {
         "/.claude/agents/codebase-memory.md",
-        "/vendor-codex/skills/codebase-memory/SKILL.md",
         "/vendor-codex/agents/codebase-memory.toml",
         "/.cursor/skills/codebase-memory/SKILL.md",
         "/.cursor/agents/codebase-memory.md",
@@ -8314,13 +8456,12 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     free(profile);
 
     const char *const skill_files[] = {
-        "/skills/codebase-memory/SKILL.md",
         "/.cursor/skills/codebase-memory/SKILL.md",
         "/.config/opencode/skills/codebase-memory/SKILL.md",
         "/.factory/skills/codebase-memory/SKILL.md",
         "/.agents/skills/codebase-memory/SKILL.md",
     };
-    const char *const skill_roots[] = {codex_home, tmpdir, tmpdir, tmpdir, tmpdir};
+    const char *const skill_roots[] = {tmpdir, tmpdir, tmpdir, tmpdir};
     for (size_t i = 0U; files_ok && i < sizeof(skill_files) / sizeof(skill_files[0]); i++) {
         snprintf(path, sizeof(path), "%s%s", skill_roots[i], skill_files[i]);
         files_ok = test_file_contains_all(path, graph_terms, 3);
@@ -9429,6 +9570,127 @@ TEST(cli_dry_run_predicts_refused_hook_script_issue1387) {
         FAIL("stdout capture failed");
     if (!warned)
         FAIL("dry-run must predict a refused hook-script rewrite (#1387)");
+    PASS();
+}
+
+/* #2204: the OpenCode adapter is an auto-loaded module, and the generated block
+ * tells readers to "remove the markers to take ownership". A marker-less file
+ * with content is the user's: appending the block to a hand-ported module
+ * produces a file the client cannot even parse (the prelude redeclares the
+ * user's own import and const names, and both sides declare a default export).
+ * The installer must leave that file alone, and the dry run must say so instead
+ * of promising a write it will not make. A dry run never writes, so the byte
+ * check below follows a REAL install: that is the run that appended. */
+TEST(cli_extension_leaves_user_owned_module_untouched_issue2204) {
+    char home[256];
+    char bin[320];
+    if (!client_detect_fixture(home, sizeof(home), bin, sizeof(bin)))
+        FAIL("cbm_mkdtemp failed");
+
+    /* An `opencode` CLI on the isolated PATH marks OpenCode as installed. */
+    char exe[512];
+    snprintf(exe, sizeof(exe), "%s/opencode", bin);
+    if (write_test_file(exe, "#!/bin/sh\nexit 0\n") != 0 || chmod(exe, 0755) != 0)
+        FAIL("opencode fixture failed");
+
+    char plugins_dir[512];
+    snprintf(plugins_dir, sizeof(plugins_dir), "%s/.config/opencode/plugins", home);
+    test_mkdirp(plugins_dir);
+    char plugin_path[768];
+    snprintf(plugin_path, sizeof(plugin_path), "%s/cbm-augment.ts", plugins_dir);
+    const char foreign[] = "import { spawn } from 'node:child_process';\n"
+                           "const BIN = '/opt/other/codebase-memory-mcp';\n"
+                           "export default { id: 'codebase-memory-augment', setup() {} };\n";
+    if (write_test_file(plugin_path, foreign) != 0)
+        FAIL("foreign module fixture failed");
+
+    client_detect_env_t saved = client_detect_env_isolate(bin);
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    bool redirected = false;
+    if (capture && saved_stdout >= 0) {
+        fflush(stdout);
+        redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
+    }
+    long plan_output_start = -1;
+    long plan_output_end = -1;
+    char *plan = NULL;
+    if (redirected) {
+        (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, true);
+        fflush(stdout);
+        /* The --plan receipt (#388) replays the same path with writes off. It
+         * must not list a module the run leaves alone, and it must print
+         * nothing: stdout carries the receipt JSON. */
+        plan_output_start = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
+        plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+        fflush(stdout);
+        /* The real install, the run #2204 is about. */
+        plan_output_end = (long)lseek(STDOUT_FILENO, 0, SEEK_CUR);
+        (void)cbm_install_agent_configs(home, "/opt/other/codebase-memory-mcp", false, false);
+        fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (saved_stdout >= 0)
+        close(saved_stdout);
+
+    char bytes[512] = {0};
+    FILE *file = cbm_fopen(plugin_path, "rb");
+    size_t got = file ? fread(bytes, 1U, sizeof(bytes) - 1U, file) : 0U;
+    if (file)
+        fclose(file);
+
+    /* Control: with the user's module gone the receipt does list the path, so
+     * the omission above cannot pass just because OpenCode went undetected. */
+    char *control_plan = NULL;
+    if (unlink(plugin_path) == 0)
+        control_plan = cbm_build_install_plan_json(home, "/opt/other/codebase-memory-mcp");
+    client_detect_env_restore(&saved);
+
+    char output[16384] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+
+    /* Each phase owns its slice of stdout: [0, start) dry run, [start, end)
+     * plan mode, [end, len) real install, so no phase passes on another's
+     * line. Checked back to front, cutting the buffer at each boundary. */
+    bool sliced = plan_output_start >= 0 && plan_output_end >= plan_output_start &&
+                  (size_t)plan_output_end <= strlen(output);
+    bool reported =
+        sliced && strstr(output + plan_output_end, "cbm-augment.ts left untouched") != NULL;
+    if (sliced)
+        output[plan_output_end] = '\0';
+    bool plan_silent = sliced && strstr(output + plan_output_start, "cbm-augment.ts") == NULL;
+    if (sliced)
+        output[plan_output_start] = '\0';
+    bool warned =
+        sliced && strstr(output, "cbm-augment.ts") != NULL && strstr(output, "not ours") != NULL;
+    bool untouched = got == sizeof(foreign) - 1U && memcmp(bytes, foreign, got) == 0;
+    bool plan_omits = plan && strstr(plan, "cbm-augment.ts") == NULL;
+    bool control_lists = control_plan && strstr(control_plan, "cbm-augment.ts") != NULL;
+    free(plan);
+    free(control_plan);
+
+    test_rmdir_r(home);
+    if (!redirected)
+        FAIL("stdout capture failed");
+    if (!sliced)
+        FAIL("stdout capture lost a phase boundary");
+    if (!warned)
+        FAIL("dry-run must predict an untouched user-owned OpenCode module (#2204)");
+    if (!untouched)
+        FAIL("a real install must leave the user-owned OpenCode module byte-identical (#2204)");
+    if (!reported)
+        FAIL("a real install must report the user-owned OpenCode module as left untouched (#2204)");
+    if (!plan_omits)
+        FAIL("the install plan must not list a module the run leaves untouched (#2204)");
+    if (!plan_silent)
+        FAIL("plan mode must keep stdout for the receipt JSON (#2204)");
+    if (!control_lists)
+        FAIL("control: the install plan must list the module once it is not user-owned");
     PASS();
 }
 #endif
@@ -10840,12 +11102,21 @@ TEST(cli_codex_respects_codex_home) {
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     char expected_config[640];
     snprintf(expected_config, sizeof(expected_config), "%s/config.toml", codex_home);
+    char expected_skill[640];
+    char legacy_skill[640];
+    snprintf(expected_skill, sizeof(expected_skill), "%s/.agents/skills/codebase-memory/SKILL.md",
+             tmpdir);
+    snprintf(legacy_skill, sizeof(legacy_skill), "%s/skills/codebase-memory/SKILL.md", codex_home);
     yyjson_doc *plan_doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
     bool plans_config =
         test_json_string_array_contains(plan_root, "config_files_planned", expected_config);
     bool plans_instructions = test_json_string_array_contains(
         plan_root, "instruction_files_planned", expected_instructions);
+    bool plans_canonical_skill =
+        test_json_string_array_contains(plan_root, "skill_files_planned", expected_skill);
+    bool plans_legacy_skill =
+        test_json_string_array_contains(plan_root, "skill_files_planned", legacy_skill);
     bool plans_cleanup = json && strstr(json, "remove_managed_block_if_present") != NULL;
     char *instructions_after = read_test_file_alloc(expected_instructions);
     bool plan_preserved_user_file =
@@ -10859,9 +11130,10 @@ TEST(cli_codex_respects_codex_home) {
 
     if (!agents.codex)
         FAIL("Codex detection must honor CODEX_HOME");
-    if (!plans_config || !plans_instructions || plans_cleanup || !plan_preserved_user_file)
+    if (!plans_config || !plans_instructions || !plans_canonical_skill || plans_legacy_skill ||
+        plans_cleanup || !plan_preserved_user_file)
         FAIL("Codex plan must include the managed activation pointer under CODEX_HOME without "
-             "mutating existing user content");
+             "mutating existing user content, and use HOME/.agents for the skill");
     PASS();
 }
 
@@ -10880,7 +11152,7 @@ TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
     snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
     snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_home);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_home);
-    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_home);
+    snprintf(skill_path, sizeof(skill_path), "%s/.agents/skills/codebase-memory/SKILL.md", tmpdir);
     snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_home);
 #ifdef _WIN32
     snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
@@ -10985,7 +11257,6 @@ TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-
     if (!fresh_pointer_installed || !other_surfaces_installed || !unowned_preserved ||
         !managed_migrated_once || !marker_only_migrated || !malformed_preserved ||
         !uninstall_preserved_foreign)
@@ -11034,6 +11305,408 @@ TEST(cli_grok_respects_grok_home) {
     if (!planned || !no_hooks)
         FAIL("Grok install plan must place config, rules, skill, and agents under GROK_HOME "
              "and never plan a hook");
+    PASS();
+}
+
+static bool cli_test_file_equals(const char *path, const char *expected) {
+    char *data = read_test_file_alloc(path);
+    bool equal = data && strcmp(data, expected) == 0;
+    free(data);
+    return equal;
+}
+
+TEST(cli_codex_skill_migrates_owned_legacy_to_agents_root) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-migrate-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char legacy_root[640];
+    char legacy_file[768];
+    char sibling_file[768];
+    char canonical_file[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/vendor-codex", tmpdir);
+    snprintf(legacy_root, sizeof(legacy_root), "%s/skills", codex_home);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/codebase-memory/SKILL.md", legacy_root);
+    snprintf(sibling_file, sizeof(sibling_file), "%s/codebase-memory/notes.md", legacy_root);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/.agents/skills/codebase-memory/SKILL.md",
+             tmpdir);
+    test_mkdirp(codex_home);
+    ASSERT_EQ(cbm_install_skills(legacy_root, false, false), CBM_SKILL_COUNT);
+    write_test_file(sibling_file, "user notes\n");
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    int dry_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, true);
+    struct stat state;
+    bool dry_safe = dry_rc == 0 && stat(canonical_file, &state) != 0 &&
+                    cli_test_file_equals(legacy_file, cbm_get_skills()[0].content);
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    bool plan_ok = plan && strstr(plan, canonical_file) && strstr(plan, legacy_file) &&
+                   strstr(plan, "cleanup_actions_planned") &&
+                   strstr(plan, "remove_owned_legacy_copy_if_migrated");
+    bool plan_safe = stat(canonical_file, &state) != 0 &&
+                     cli_test_file_equals(legacy_file, cbm_get_skills()[0].content);
+    free(plan);
+
+    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool migrated =
+        install_rc == 0 && cli_test_file_equals(canonical_file, cbm_get_skills()[0].content) &&
+        stat(legacy_file, &state) != 0 && cli_test_file_equals(sibling_file, "user notes\n");
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+
+    if (!dry_safe || !plan_ok || !plan_safe || !migrated)
+        FAIL("Codex owned legacy skill migration must be previewable, destination-first, and "
+             "sibling-safe");
+    PASS();
+}
+
+TEST(cli_codex_skill_migrates_every_released_legacy_payload) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-released-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char legacy_dir[768];
+    char legacy_file[768];
+    char canonical_file[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/skills/codebase-memory", codex_home);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/SKILL.md", legacy_dir);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/.agents/skills/codebase-memory/SKILL.md",
+             tmpdir);
+    test_mkdirp(codex_home);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+    cbm_cli_set_client_selection_for_testing("codex");
+
+    size_t released_count = cbm_cli_released_skill_content_count();
+    bool migrated_all = released_count == 4U;
+    for (size_t i = 0U; migrated_all && i < released_count; i++) {
+        const char *released = cbm_cli_released_skill_content_at(i);
+        test_mkdirp(legacy_dir);
+        if (!released || write_test_file(legacy_file, released) != 0) {
+            migrated_all = false;
+            break;
+        }
+        (void)remove(canonical_file);
+        int rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+        struct stat state;
+        migrated_all = rc == 0 &&
+                       cli_test_file_equals(canonical_file, cbm_get_skills()[0].content) &&
+                       stat(legacy_file, &state) != 0;
+        if (!migrated_all || write_test_file(canonical_file, released) != 0) {
+            migrated_all = false;
+            break;
+        }
+        rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+        migrated_all = rc == 0 && cli_test_file_equals(canonical_file, cbm_get_skills()[0].content);
+    }
+
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!migrated_all)
+        FAIL("Codex must migrate every released skill payload from legacy and canonical paths");
+    PASS();
+}
+
+TEST(cli_codex_foreign_legacy_does_not_block_shared_clients) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-shared-client-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *foreign = "---\nname: codebase-memory\n---\nUser-owned legacy skill.\n";
+    char codex_home[512];
+    char legacy_dir[768];
+    char legacy_file[768];
+    char openhands_dir[512];
+    char canonical_file[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/skills/codebase-memory", codex_home);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/SKILL.md", legacy_dir);
+    snprintf(openhands_dir, sizeof(openhands_dir), "%s/.openhands", tmpdir);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/.agents/skills/codebase-memory/SKILL.md",
+             tmpdir);
+    test_mkdirp(legacy_dir);
+    test_mkdirp(openhands_dir);
+    write_test_file(legacy_file, foreign);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    bool plan_keeps_shared_install = plan && strstr(plan, canonical_file) &&
+                                     !strstr(plan, "remove_owned_legacy_copy_if_migrated");
+    free(plan);
+    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int repeat_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool installed = install_rc == 0 && repeat_rc == 0 &&
+                     cli_test_file_equals(legacy_file, foreign) &&
+                     cli_test_file_equals(canonical_file, cbm_get_skills()[0].content);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!plan_keeps_shared_install || !installed)
+        FAIL("A foreign Codex legacy skill must not suppress another client's shared skill");
+    PASS();
+}
+
+TEST(cli_codex_skill_preserves_foreign_legacy_until_force) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-foreign-legacy-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *foreign = "---\nname: codebase-memory\n---\nUser-owned legacy skill.\n";
+    char codex_home[512];
+    char legacy_dir[768];
+    char legacy_file[768];
+    char sibling_file[768];
+    char canonical_file[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/vendor-codex", tmpdir);
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/skills/codebase-memory", codex_home);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/SKILL.md", legacy_dir);
+    snprintf(sibling_file, sizeof(sibling_file), "%s/user.txt", legacy_dir);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/.agents/skills/codebase-memory/SKILL.md",
+             tmpdir);
+    test_mkdirp(legacy_dir);
+    write_test_file(legacy_file, foreign);
+    write_test_file(sibling_file, "keep\n");
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+    cbm_cli_set_client_selection_for_testing("codex");
+
+    int normal_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    struct stat state;
+    bool preserved = normal_rc == 0 && cli_test_file_equals(legacy_file, foreign) &&
+                     stat(canonical_file, &state) != 0;
+    int force_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", true, false);
+    bool forced = force_rc == 0 &&
+                  cli_test_file_equals(canonical_file, cbm_get_skills()[0].content) &&
+                  stat(legacy_file, &state) != 0 && cli_test_file_equals(sibling_file, "keep\n");
+
+    cbm_cli_set_client_selection_for_testing(NULL);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!preserved || !forced)
+        FAIL("Codex must preserve foreign legacy content unless --force authorizes replacement");
+    PASS();
+}
+
+TEST(cli_codex_skill_preserves_foreign_canonical_and_owned_legacy) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-foreign-canonical-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *foreign = "---\nname: codebase-memory\n---\nUser-owned canonical skill.\n";
+    char codex_home[512];
+    char legacy_root[640];
+    char legacy_file[768];
+    char canonical_dir[768];
+    char canonical_file[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/vendor-codex", tmpdir);
+    snprintf(legacy_root, sizeof(legacy_root), "%s/skills", codex_home);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/codebase-memory/SKILL.md", legacy_root);
+    snprintf(canonical_dir, sizeof(canonical_dir), "%s/.agents/skills/codebase-memory", tmpdir);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/SKILL.md", canonical_dir);
+    test_mkdirp(codex_home);
+    ASSERT_EQ(cbm_install_skills(legacy_root, false, false), CBM_SKILL_COUNT);
+    test_mkdirp(canonical_dir);
+    write_test_file(canonical_file, foreign);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    int normal_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool preserved = normal_rc == 0 && cli_test_file_equals(canonical_file, foreign) &&
+                     cli_test_file_equals(legacy_file, cbm_get_skills()[0].content);
+    int force_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", true, false);
+    struct stat state;
+    bool forced = force_rc == 0 &&
+                  cli_test_file_equals(canonical_file, cbm_get_skills()[0].content) &&
+                  stat(legacy_file, &state) != 0;
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!preserved || !forced)
+        FAIL("Codex must preserve conflicting canonical bytes and its owned legacy copy until "
+             "--force");
+    PASS();
+}
+
+TEST(cli_codex_skill_failed_destination_preserves_owned_legacy) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-failed-destination-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char legacy_root[640];
+    char legacy_file[768];
+    char canonical_root[640];
+    char blocked_path[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/vendor-codex", tmpdir);
+    snprintf(legacy_root, sizeof(legacy_root), "%s/skills", codex_home);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/codebase-memory/SKILL.md", legacy_root);
+    snprintf(canonical_root, sizeof(canonical_root), "%s/.agents/skills", tmpdir);
+    snprintf(blocked_path, sizeof(blocked_path), "%s/codebase-memory", canonical_root);
+    test_mkdirp(codex_home);
+    ASSERT_EQ(cbm_install_skills(legacy_root, false, false), CBM_SKILL_COUNT);
+    test_mkdirp(canonical_root);
+    write_test_file(blocked_path, "not a directory\n");
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+    int rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool safe = rc != 0 && cli_test_file_equals(blocked_path, "not a directory\n") &&
+                cli_test_file_equals(legacy_file, cbm_get_skills()[0].content);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!safe)
+        FAIL("Codex migration must retain the owned legacy copy when canonical publication fails");
+    PASS();
+}
+
+TEST(cli_codex_skill_uninstall_cleans_both_owned_locations) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char canonical_root[640];
+    char legacy_root[640];
+    char canonical_file[768];
+    char legacy_file[768];
+    char binary_dir[640];
+    char binary_path[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
+    snprintf(canonical_root, sizeof(canonical_root), "%s/.agents/skills", tmpdir);
+    snprintf(legacy_root, sizeof(legacy_root), "%s/skills", codex_home);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/codebase-memory/SKILL.md", canonical_root);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/codebase-memory/SKILL.md", legacy_root);
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    test_mkdirp(codex_home);
+    test_mkdirp(binary_dir);
+    write_test_file(binary_path, "installed binary\n");
+    ASSERT_EQ(cbm_install_skills(canonical_root, false, false), CBM_SKILL_COUNT);
+    ASSERT_EQ(cbm_install_skills(legacy_root, false, false), CBM_SKILL_COUNT);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+    char *argv[] = {"uninstall", "--yes"};
+    int owned_rc = cli_test_cmd_uninstall(2, argv);
+    struct stat state;
+    bool owned_removed =
+        owned_rc == 0 && stat(canonical_file, &state) != 0 && stat(legacy_file, &state) != 0;
+
+    const char *foreign = "---\nname: codebase-memory\n---\nUser-owned canonical skill.\n";
+    write_test_file(binary_path, "installed binary\n");
+    bool mixed_seeded = cbm_install_skills(canonical_root, false, false) == CBM_SKILL_COUNT &&
+                        cbm_install_skills(legacy_root, false, false) == CBM_SKILL_COUNT;
+    if (mixed_seeded) {
+        write_test_file(canonical_file, foreign);
+    }
+    int mixed_rc = mixed_seeded ? cli_test_cmd_uninstall(2, argv) : 1;
+    bool mixed_safe = mixed_rc == 0 && cli_test_file_equals(canonical_file, foreign) &&
+                      stat(legacy_file, &state) != 0;
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!owned_removed || !mixed_safe)
+        FAIL("Codex uninstall must clean both owned roots while preserving foreign skill bytes");
+    PASS();
+}
+
+TEST(cli_codex_skill_deduplicates_agents_codex_home) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-same-root-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char skill_file[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.agents", tmpdir);
+    snprintf(skill_file, sizeof(skill_file), "%s/skills/codebase-memory/SKILL.md", codex_home);
+    test_mkdirp(codex_home);
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    bool deduplicated = install_rc == 0 &&
+                        cli_test_file_equals(skill_file, cbm_get_skills()[0].content) && plan &&
+                        !strstr(plan, "remove_owned_legacy_copy_if_migrated");
+    free(plan);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+    if (!deduplicated)
+        FAIL("Codex must treat HOME/.agents and CODEX_HOME as one skill root when they coincide");
     PASS();
 }
 
@@ -13663,7 +14336,7 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     int uninstall_rc = cli_test_cmd_uninstall(1, uninstall_argv);
     char skill_path[768];
     char agent_path[768];
-    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/.agents/skills/codebase-memory/SKILL.md", tmpdir);
     snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.toml", codex_dir);
     struct stat state;
     hooks = read_test_file_alloc(hooks_path);
@@ -13807,9 +14480,16 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
     char codex_dir[512];
     char config_path[640];
     char agents_path[640];
+    char legacy_root[640];
+    char legacy_file[768];
+    char canonical_file[768];
     snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
     snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_dir);
+    snprintf(legacy_root, sizeof(legacy_root), "%s/skills", codex_dir);
+    snprintf(legacy_file, sizeof(legacy_file), "%s/codebase-memory/SKILL.md", legacy_root);
+    snprintf(canonical_file, sizeof(canonical_file), "%s/.agents/skills/codebase-memory/SKILL.md",
+             tmpdir);
     if (test_mkdirp(codex_dir) != 0) {
         test_rmdir_r(tmpdir);
         FAIL("failed to create Codex preflight fixture directory");
@@ -13822,6 +14502,10 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
         test_rmdir_r(tmpdir);
         FAIL("failed to write Codex preflight fixture config");
     }
+    if (cbm_install_skills(legacy_root, false, false) != CBM_SKILL_COUNT) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to seed owned legacy Codex skill");
+    }
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -13829,6 +14513,7 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CODEX_HOME");
+    cbm_cli_set_client_selection_for_testing("codex");
 
     FILE *capture = tmpfile();
     int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
@@ -13863,8 +14548,11 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
     }
     char *after = read_test_file_alloc(config_path);
     char *agents_after = read_test_file_alloc(agents_path);
+    struct stat state;
     bool unchanged = after && strcmp(after, ambiguous) == 0 && agents_after &&
-                     strcmp(agents_after, test_codex_activation_block) == 0;
+                     strcmp(agents_after, test_codex_activation_block) == 0 &&
+                     stat(canonical_file, &state) != 0 &&
+                     cli_test_file_equals(legacy_file, cbm_get_skills()[0].content);
     bool diagnostic =
         strstr(output, "Codex CLI:\nerror: agent_config agent=Codex CLI op=hook_preflight path=") !=
             NULL &&
@@ -13872,6 +14560,7 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
     free(after);
     free(agents_after);
 
+    cbm_cli_set_client_selection_for_testing(NULL);
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
@@ -19579,6 +20268,10 @@ SUITE(cli) {
     RUN_TEST(cli_zed_mcp_preserves_settings);
     RUN_TEST(cli_zed_mcp_uninstall);
     RUN_TEST(cli_zed_mcp_jsonc_comments);
+#ifndef _WIN32
+    RUN_TEST(cli_install_agent_config_symlinks_issue2671);
+    RUN_TEST(cli_install_agent_config_file_symlink_issue2671);
+#endif
 
     /* PATH management (3 tests) */
     RUN_TEST(cli_ensure_path_append);
@@ -19663,6 +20356,7 @@ SUITE(cli) {
 #endif
 #ifndef _WIN32
     RUN_TEST(cli_dry_run_predicts_refused_hook_script_issue1387);
+    RUN_TEST(cli_extension_leaves_user_owned_module_untouched_issue2204);
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);
@@ -19680,6 +20374,14 @@ SUITE(cli) {
     RUN_TEST(cli_codex_respects_codex_home);
     RUN_TEST(cli_grok_respects_grok_home);
     RUN_TEST(cli_codex_install_uses_global_activation_pointer_issue1689);
+    RUN_TEST(cli_codex_skill_migrates_owned_legacy_to_agents_root);
+    RUN_TEST(cli_codex_skill_migrates_every_released_legacy_payload);
+    RUN_TEST(cli_codex_foreign_legacy_does_not_block_shared_clients);
+    RUN_TEST(cli_codex_skill_preserves_foreign_legacy_until_force);
+    RUN_TEST(cli_codex_skill_preserves_foreign_canonical_and_owned_legacy);
+    RUN_TEST(cli_codex_skill_failed_destination_preserves_owned_legacy);
+    RUN_TEST(cli_codex_skill_uninstall_cleans_both_owned_locations);
+    RUN_TEST(cli_codex_skill_deduplicates_agents_codex_home);
     RUN_TEST(cli_gemini_session_hook_uses_json_for_all_sources);
     RUN_TEST(cli_gemini_installs_dedicated_graph_subagent);
     RUN_TEST(cli_antigravity_does_not_imply_gemini);

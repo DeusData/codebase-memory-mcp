@@ -252,6 +252,21 @@ TEST(artifact_export_roundtrip_keeps_adr) {
     cbm_store_adr_free(&adr);
     cbm_store_close(dst);
 
+    /* The fresh destination sidecar is marked migrated after the import, so a
+     * later reindex's migrate-before-delete is a no-op. Opening the sidecar for
+     * the restore already commits the marker; the restore itself adds none. */
+    char side[1100];
+    snprintf(side, sizeof(side), "%s.adr.db", import_db);
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open_v2(side, &raw, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(
+        sqlite3_prepare_v2(raw, "SELECT value FROM adr_meta WHERE key='migrated';", -1, &st, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+
     cleanup_dir(g_tmpdir);
     PASS();
 }
@@ -386,6 +401,42 @@ TEST(artifact_import_restores_adr_when_local_absent) {
     ASSERT_STR_EQ(adr.content, "# Decision\nshared A");
     cbm_store_adr_free(&adr);
     cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* A failed ADR restore must not be silent (#2315 follow-up). A DIRECTORY at
+ * "<db>.adr.db" makes the sidecar open fail deterministically (no hook). The
+ * graph DB is already installed when the restore runs, so the import still
+ * succeeds (best-effort, unchanged), but the team ADR that did not arrive is
+ * logged with the store's reason instead of being dropped without a trace. */
+TEST(artifact_import_logs_failed_adr_restore) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", "# Decision\nshared A"), CBM_STORE_OK);
+    cbm_store_close(src);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    char adr_dir[1100];
+    snprintf(adr_dir, sizeof(adr_dir), "%s.adr.db", import_db);
+    ASSERT_EQ(cbm_mkdir(adr_dir), 0);
+
+    capture_logs_start();
+    int rc = cbm_artifact_import(g_repo, import_db);
+    const char *logs = capture_logs_end();
+
+    ASSERT_EQ(rc, 0); /* the graph DB is installed; the restore stays best-effort */
+    ASSERT_TRUE(cbm_file_exists(import_db));
+    const char *line = strstr(logs, "level=warn msg=artifact.import err=adr_restore");
+    ASSERT_NOT_NULL(line);
+    /* The store's reason is carried (the text log format maps spaces to '_'). */
+    ASSERT(strstr(line, "detail=adr_sidecar_open") != NULL);
 
     cleanup_dir(g_tmpdir);
     PASS();
@@ -1361,6 +1412,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_export_without_adr_does_not_resurrect_legacy_row);
     RUN_TEST(artifact_import_does_not_clobber_local_adr);
     RUN_TEST(artifact_import_restores_adr_when_local_absent);
+    RUN_TEST(artifact_import_logs_failed_adr_restore);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
     RUN_TEST(artifact_commit_hash);

@@ -2621,19 +2621,37 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, 
         if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
             continue;
         }
+        const char *method = cbm_service_pattern_http_method(call->callee_name);
+        const char *prefix = method ? method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__ANY__%s",
+        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix,
                  cbm_route_canon_path(norm, cpath, sizeof(cpath)));
-        int64_t route_id = cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0,
-                                                "{\"source\":\"arg_url\"}");
+        char route_props[CBM_SZ_256];
+        if (method) {
+            snprintf(route_props, sizeof(route_props), "{\"source\":\"arg_url\",\"method\":\"%s\"}",
+                     method);
+        } else {
+            snprintf(route_props, sizeof(route_props), "{\"source\":\"arg_url\"}");
+        }
+        int64_t route_id =
+            cbm_gbuf_upsert_node(gbuf, "Route", norm, route_qn, "", 0, 0, route_props);
         char esc_c[CBM_SZ_256];
         char esc_n[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
         cbm_json_escape(esc_n, sizeof(esc_n), norm);
-        char eprops[CBM_SZ_512];
-        snprintf(eprops, sizeof(eprops),
-                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
+        /* Two escaped 255-byte strings plus the fixed keys and the verb: 1K
+         * never truncates the JSON (512 could, once the method was added). */
+        char eprops[CBM_SZ_1K];
+        if (method) {
+            snprintf(
+                eprops, sizeof(eprops),
+                "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\",\"method\":\"%s\"}",
+                esc_c, esc_n, method);
+        } else {
+            snprintf(eprops, sizeof(eprops),
+                     "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
+        }
         cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
         break;
     }
@@ -2985,6 +3003,29 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
 /* Field type hint resolution for obj.Method() with multiple candidates.
  * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
  * checks if TypeName.Method or ITypeName.Method exists among candidates. */
+/* #1927: the hint may only bind a candidate whose OWNING dot-segment — the
+ * segment immediately before the method name — EQUALS the hinted type. The
+ * previous raw strstr() accepted the hinted name anywhere in the QN, so a
+ * single-letter receiver (`f.Close()` → hint "F") matched nearly every
+ * candidate ("F" ⊂ "…FileStore.Close", the method name included) and rebound
+ * a call whose resolution had already failed to an arbitrary project symbol
+ * at PP_FIELD_HINT_CONF. Segment equality keeps the intended
+ * variable-named-after-its-type case (`repo.Find()` → `Repo.Find`,
+ * lrp_go_s8_field_type_hint) and picks the candidate whose owner actually
+ * carries the name instead of whichever QN contains the letters. */
+static bool fth_owner_segment_is(const char *candidate_qn, const char *type_name) {
+    const char *last_dot = strrchr(candidate_qn, '.');
+    if (!last_dot || last_dot == candidate_qn) {
+        return false;
+    }
+    const char *seg_start = last_dot;
+    while (seg_start > candidate_qn && seg_start[-1] != '.') {
+        seg_start--;
+    }
+    size_t seg_len = (size_t)(last_dot - seg_start);
+    return seg_len > 0 && strncmp(seg_start, type_name, seg_len) == 0 && type_name[seg_len] == '\0';
+}
+
 static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
                                 int64_t source_id) {
     if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
@@ -3024,7 +3065,8 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
-        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+        if (fth_owner_segment_is(cands[ci], type_name) ||
+            fth_owner_segment_is(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
                 res->qualified_name = cands[ci];
