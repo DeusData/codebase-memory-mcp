@@ -3764,7 +3764,9 @@ static const cbm_gbuf_node_t *python_on_search_path(const cbm_pipeline_ctx_t *ct
                                                     const char *source_rel, const char *normalized,
                                                     const cbm_gbuf_node_t *rooted) {
     python_search_t search;
-    if (!source_rel || !python_search_path(ctx, source_rel, &search))
+    if (!source_rel || !source_rel[0])
+        return rooted;
+    if (!python_search_path(ctx, source_rel, &search))
         return NULL;
     if (!search.base[0])
         return rooted;
