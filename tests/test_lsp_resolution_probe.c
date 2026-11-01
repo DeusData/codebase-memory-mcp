@@ -760,77 +760,47 @@ static const LRP_Golden LRP_GOLDEN[] = {
      "The visible external prototype and the unique project definition have identical builtin "
      "signatures and C linkage. The source-audited external-definition bridge supports this "
      "cross-file call; prototype materialization is not required."},
-    {"lrp_c_s2_funcptr_in_struct", "main.c", "run", "make_ops()", 0, "main.c", "make_ops", "CALLS",
-     2, "Ops make_ops(void);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
-    {"lrp_c_s3_constructor", "main.c", "make_buf", "buf_new(n)", 0, "main.c", "buf_new", "CALLS", 2,
-     "Buf *buf_new(int cap);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
+    {"lrp_c_s2_funcptr_in_struct", "main.c", "run", "make_ops()", 0, "ops.c", "make_ops", "CALLS", 5,
+     "Ops make_ops(void) {", true, false,
+     "A prototype in the calling file declares the external name, and the one definition of "
+     "that name in the project is the target.",
+     "The earlier golden named the prototype, which has no graph node, and recorded a gap. The "
+     "translation-unit rules bind the definition, so the golden now names it."},
+    {"lrp_c_s3_constructor", "main.c", "make_buf", "buf_new(n)", 0, "buf.c", "buf_new", "CALLS", 4,
+     "Buf *buf_new(int cap) {", true, false,
+     "A prototype in the calling file declares the external name, and the one definition of "
+     "that name in the project is the target.",
+     "The earlier golden named the prototype, which has no graph node, and recorded a gap. The "
+     "translation-unit rules bind the definition, so the golden now names it."},
     {"lrp_c_s4_static_local", "main.c", "run", "exported(n)", 0, "util.c", "exported", "CALLS", 3,
      "int exported(int x) { return helper(x); }", true, false, NULL,
      "The visible external prototype binds the unique compatible external definition in util.c. "
      "The separate same-file helper call remains required, and main.run to the static helper "
      "remains explicitly forbidden."},
-    {"lrp_c_s5_chained_deref", "main.c", "run", "node_val(head->next)", 0, "main.c", "node_val",
-     "CALLS", 2, "int node_val(const Node *n);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
-    {"lrp_c_s6_base_method", "circle.c", "run", "shape_color(&c->base)", 0, "circle.c",
-     "shape_color", "CALLS", 3, "int shape_color(const Shape *s);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
-    {"lrp_c_s7_generic_callback", "sort.c", "my_sort", "int_cmp(&arr[0], &arr[1])", 0, "sort.c",
-     "int_cmp", "CALLS", 2, "int int_cmp(const void *a, const void *b);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
-    {"lrp_c_s8_field_call", "service.c", "run", "log_msg(&svc->logger, m)", 0, "service.c",
-     "log_msg", "CALLS", 3, "void log_msg(const Logger *l, const char *msg);", false, false,
-     "The visible prototype is a source declaration, but C extraction registers only function "
-     "definitions; no graph node or exact registry declaration exists for the prototype. Cross-TU "
-     "definition equivalence is a separate gap requiring an explicit linkage unit and compatible "
-     "effective linkage/signature.",
-     "Reviewed lang_specs.c c_func_types, extract_defs.c resolve_func_name_c_family, c_lsp.c "
-     "c_proof_collect/c_proof_domain; Source audit reported binding_not_found. Existing "
-     "resolver_c "
-     "source-prototype unit controls inject declaration identities and therefore do not test "
-     "materialization."},
+    {"lrp_c_s5_chained_deref", "main.c", "run", "node_val(head->next)", 0, "node.c", "node_val",
+     "CALLS", 3, "int node_val(const Node *n) { return n->val; }", true, false,
+     "A prototype in the calling file declares the external name, and the one definition of "
+     "that name in the project is the target.",
+     "The earlier golden named the prototype, which has no graph node, and recorded a gap. The "
+     "translation-unit rules bind the definition, so the golden now names it."},
+    {"lrp_c_s6_base_method", "circle.c", "run", "shape_color(&c->base)", 0, "shape.c", "shape_color",
+     "CALLS", 3, "int shape_color(const Shape *s) { return s->color; }", true, false,
+     "A prototype in the calling file declares the external name, and the one definition of "
+     "that name in the project is the target.",
+     "The earlier golden named the prototype, which has no graph node, and recorded a gap. The "
+     "translation-unit rules bind the definition, so the golden now names it."},
+    {"lrp_c_s7_generic_callback", "sort.c", "my_sort", "int_cmp(&arr[0], &arr[1])", 0, "compare.c",
+     "int_cmp", "CALLS", 1, "int int_cmp(const void *a, const void *b) {", true, false,
+     "A prototype in the calling file declares the external name, and the one definition of "
+     "that name in the project is the target.",
+     "The earlier golden named the prototype, which has no graph node, and recorded a gap. The "
+     "translation-unit rules bind the definition, so the golden now names it."},
+    {"lrp_c_s8_field_call", "service.c", "run", "log_msg(&svc->logger, m)", 0, "logger.c", "log_msg",
+     "CALLS", 3, "void log_msg(const Logger *l, const char *msg) { (void)l; (void)msg; }", true, false,
+     "A prototype in the calling file declares the external name, and the one definition of "
+     "that name in the project is the target.",
+     "The earlier golden named the prototype, which has no graph node, and recorded a gap. The "
+     "translation-unit rules bind the definition, so the golden now names it."},
     {"lrp_c_s2_funcptr_in_struct", "main.c", "run", "o.compute(n)", 0, "ops.c", "double_it",
      "CALLS", 3, "static int double_it(int x) { return x * 2; }", false, false,
      "Requires proving make_ops linkage to this implementation, its returned struct field "
