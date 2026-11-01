@@ -1165,6 +1165,11 @@ TEST(resolver_generation_abstained_rows_compose_one_fact_per_site) {
                                 "e.project AND s.fact=e.proof)",
                                 0),
               0);
+    /* Nothing can cite a composed fact, so writing it keeps no digest in memory. The
+     * facts it rests on are still cited, so theirs stay. */
+    int64_t facts = generation_scalar(db, "SELECT count(*) FROM resolver_facts", 0);
+    ASSERT_GT(facts, 2);
+    ASSERT_EQ((int64_t)cbm_store_resolver_test_held_digests(), facts - 2);
     cbm_store_close(store);
     cbm_gbuf_free(gb);
     generation_fixture_destroy(&f);

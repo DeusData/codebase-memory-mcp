@@ -176,7 +176,8 @@ enum {
 
 typedef struct {
     const cbm_resolve_proof_t *node;
-    size_t id;
+    uint32_t id;
+    uint32_t digest; /* Index into digests. */
 } evidence_id_t;
 typedef struct {
     const char *text;
@@ -206,13 +207,15 @@ typedef struct {
     sqlite3_int64 pid;
     sqlite3_stmt *text, *fact, *support, *occurrence;
     evidence_id_t *ids;
-    size_t capacity, count;
+    size_t capacity, id_count;
+    size_t count; /* Facts written, which is also the last fact id. */
     unsigned char *digests;
-    size_t digest_capacity;
+    size_t digest_capacity, digest_count;
+    unsigned char last_digest[DIGEST_BYTES];
     dict_slot_t *dict;
     size_t dict_capacity, dict_count;
     dict_cache_t *cache;
-    sqlite3_int64 *row_facts;
+    uint32_t *row_facts;
     verified_source_t verified[VERIFIED_SOURCE_SLOTS];
     CBMArena owned;
     type_digest_t *types;
@@ -232,8 +235,12 @@ static bool bind_text(sqlite3_stmt *s, int col, const char *value) {
 }
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
 static uint64_t progress_rows = PROGRESS_ROWS;
+static size_t held_digests;
 void cbm_store_resolver_test_set_progress_rows(uint64_t rows) {
     progress_rows = rows ? rows : PROGRESS_ROWS;
+}
+size_t cbm_store_resolver_test_held_digests(void) {
+    return held_digests;
 }
 #else
 enum { progress_rows = PROGRESS_ROWS };
@@ -361,8 +368,13 @@ static evidence_id_t *find_id(evidence_write_t *w, const cbm_resolve_proof_t *no
     evidence_id_t *entry = id_slot(w, node);
     return entry->node ? entry : NULL;
 }
+/* Room for one more node. Only a node needs a slot and a digest: other facts cite a
+ * fact through its node, and a composed fact is cited only by its own row. About half
+ * the facts of a large repository are composed. */
 static bool grow_ids(evidence_write_t *w) {
-    if (w->count >= w->digest_capacity) {
+    if (w->digest_count >= UINT32_MAX)
+        return false;
+    if (w->digest_count >= w->digest_capacity) {
         size_t next = w->digest_capacity ? w->digest_capacity * 2 : 64;
         if (next < w->digest_capacity || next > SIZE_MAX / DIGEST_BYTES)
             return false;
@@ -372,7 +384,7 @@ static bool grow_ids(evidence_write_t *w) {
         w->digests = digests;
         w->digest_capacity = next;
     }
-    if (w->capacity && w->count < w->capacity / 2)
+    if (w->capacity && w->id_count < w->capacity / 2)
         return true;
     size_t next = w->capacity ? w->capacity * 2 : 64;
     if (next < w->capacity || next > SIZE_MAX / sizeof(*w->ids))
@@ -391,7 +403,16 @@ static bool grow_ids(evidence_write_t *w) {
     return true;
 }
 static const unsigned char *id_digest(const evidence_write_t *w, const evidence_id_t *entry) {
-    return w->digests + (entry->id - 1) * DIGEST_BYTES;
+    return w->digests + (size_t)entry->digest * DIGEST_BYTES;
+}
+/* Call grow_ids first. */
+static void hold_id(evidence_write_t *w, const cbm_resolve_proof_t *node, uint32_t id,
+                    const unsigned char *digest) {
+    memcpy(w->digests + w->digest_count * DIGEST_BYTES, digest, DIGEST_BYTES);
+    *id_slot(w, node) =
+        (evidence_id_t){.node = node, .id = id, .digest = (uint32_t)w->digest_count};
+    w->digest_count++;
+    w->id_count++;
 }
 static void digest_hex(const unsigned char *digest, char output[65]) {
     static const char hex[] = "0123456789abcdef";
@@ -650,13 +671,13 @@ static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, si
 /* node is NULL for a composed fact, which only its row will ever cite. */
 static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v,
                        const cbm_resolve_proof_t *node, size_t *written) {
-    if (!v || !source_matches(w, &v->source) || !grow_ids(w))
+    if (!v || !source_matches(w, &v->source) || w->count >= UINT32_MAX || (node && !grow_ids(w)))
         return false;
     bool plain = fact_plain_text(&w->fact_text, v);
     char *json = plain ? NULL : fact_json(v);
     if (!plain && !json)
         return false;
-    evidence_id_t entry = {.node = node, .id = w->count + 1};
+    uint32_t id = (uint32_t)(w->count + 1);
     cbm_sha256_ctx hash;
     cbm_sha256_init(&hash);
     cbm_resolve_hash_text(&hash, plain ? w->fact_text.bytes : json);
@@ -668,25 +689,24 @@ static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v,
             char hex[65];
             digest_hex(id_digest(w, premise), hex);
             cbm_resolve_hash_text(&hash, hex);
-            ok = finish_row(
-                w, w->support,
-                sqlite3_bind_int64(w->support, 1, w->pid) == SQLITE_OK &&
-                    sqlite3_bind_int64(w->support, 2, (sqlite3_int64)entry.id) == SQLITE_OK &&
-                    sqlite3_bind_int64(w->support, 3, (sqlite3_int64)i) == SQLITE_OK &&
-                    sqlite3_bind_int64(w->support, 4, (sqlite3_int64)premise->id) == SQLITE_OK,
-                "supports");
+            ok = finish_row(w, w->support,
+                            sqlite3_bind_int64(w->support, 1, w->pid) == SQLITE_OK &&
+                                sqlite3_bind_int64(w->support, 2, (sqlite3_int64)id) == SQLITE_OK &&
+                                sqlite3_bind_int64(w->support, 3, (sqlite3_int64)i) == SQLITE_OK &&
+                                sqlite3_bind_int64(w->support, 4, (sqlite3_int64)premise->id) ==
+                                    SQLITE_OK,
+                            "supports");
         }
     }
-    unsigned char *digest = w->digests + w->count * DIGEST_BYTES;
-    cbm_sha256_final(&hash, digest);
+    cbm_sha256_final(&hash, w->last_digest);
     cbm_free(CBM_MEM_CLASS_OTHER, json);
-    ok = ok && note_type_digest(w, v, digest) &&
-         finish_row(w, w->fact, bind_fact(w, v, entry.id, digest), "facts");
+    ok = ok && note_type_digest(w, v, w->last_digest) &&
+         finish_row(w, w->fact, bind_fact(w, v, id, w->last_digest), "facts");
     if (ok) {
         if (node)
-            *id_slot(w, node) = entry;
+            hold_id(w, node, id, w->last_digest);
         w->count++;
-        *written = entry.id;
+        *written = id;
     }
     return ok;
 }
@@ -770,12 +790,14 @@ static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_
         if (same && !find_id(w, node)) {
             if (!grow_ids(w))
                 return false;
-            *id_slot(w, node) = (evidence_id_t){.node = node, .id = *last_id};
+            hold_id(w, node, (uint32_t)*last_id, w->last_digest);
             return true;
         }
         if (!write_facts_from(w, node))
             return false;
-        *last_id = find_id(w, node)->id;
+        const evidence_id_t *entry = find_id(w, node);
+        *last_id = entry->id;
+        memcpy(w->last_digest, id_digest(w, entry), DIGEST_BYTES);
         return true;
     }
     const cbm_resolve_record_t *row = root_row(root);
@@ -789,7 +811,7 @@ static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_
         if (!write_fact(w, &fact.view, NULL, last_id))
             return false;
     }
-    w->row_facts[row - rows] = (sqlite3_int64)*last_id;
+    w->row_facts[row - rows] = (uint32_t)*last_id;
     return true;
 }
 static bool write_facts(evidence_write_t *w, fact_root_t *roots, size_t count,
@@ -1089,7 +1111,9 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
         (!summaries && summary_count) || count > (SIZE_MAX - summary_count) / 2 ||
         file_count > SIZE_MAX / sizeof(void *) || summary_count > SIZE_MAX / sizeof(void *))
         return false;
-    size_t root_capacity = count * 2 + summary_count;
+    size_t root_capacity = summary_count;
+    for (size_t i = 0; i < count; i++)
+        root_capacity += (rows[i].result.proof != NULL) + (rows[i].binding_proof != NULL);
     if (root_capacity > SIZE_MAX / sizeof(fact_root_t))
         return false;
     fact_root_t *roots =
@@ -1133,6 +1157,9 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     w->commit_batches = commit_batches;
     cbm_arena_init(&w->owned);
     w->row_facts = count ? cbm_calloc(CBM_MEM_CLASS_STORE, count * sizeof(*w->row_facts)) : NULL;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    held_digests = 0;
+#endif
     ok = ok && (!count || w->row_facts);
     for (size_t i = 0; ok && i < count; i++)
         ok = collect_row_roots(w, &rows[i], roots, &root_count);
@@ -1146,6 +1173,9 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     sqlite3_finalize(w->fact);
     sqlite3_finalize(w->support);
     sqlite3_finalize(w->occurrence);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    held_digests = w->digest_count;
+#endif
     cbm_free(CBM_MEM_CLASS_STORE, w->ids);
     cbm_free(CBM_MEM_CLASS_STORE, w->digests);
     cbm_free(CBM_MEM_CLASS_STORE, w->dict);
