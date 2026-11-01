@@ -736,11 +736,13 @@ static int compare_roots(const void *left, const void *right) {
         return x ? 1 : (y ? -1 : 0);
     return cbm_resolve_proof_view_compare(x, y);
 }
-/* Roots that compare equal are one fact, as interning would have made them: the
- * first writes it and the others take its id. */
+/* A composed root that compares equal to its neighbour is one fact with it, as
+ * interning would have made them: the first writes it and the others take its id.
+ * Two nodes are the same fact only if they are the same node. */
 static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_root_t *previous,
                        const cbm_resolve_record_t *rows, size_t *last_id) {
-    bool same = previous && !compare_roots(previous, root);
+    bool same =
+        previous && (root_is_row(root) || root_is_row(previous)) && !compare_roots(previous, root);
     if (!root_is_row(root)) {
         const cbm_resolve_proof_t *node = (const cbm_resolve_proof_t *)root->ref;
         if (same && !find_id(w, node)) {
@@ -771,6 +773,9 @@ static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_
 static bool write_facts(evidence_write_t *w, fact_root_t *roots, size_t count,
                         const cbm_resolve_record_t *rows) {
     fact_root_project = w->project;
+    char total[32];
+    (void)snprintf(total, sizeof(total), "%zu", count);
+    cbm_log_info("resolver.evidence.progress", "stage", "sort_roots", "roots", total);
     if (count > 1)
         qsort(roots, count, sizeof(*roots), compare_roots);
     size_t last_id = 0;
