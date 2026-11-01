@@ -346,6 +346,10 @@ static cbm_ecma_value_t ecma_name(ecma_walk_t *walk, const char *file, const cha
         }
         return (cbm_ecma_value_t){.status = module->complete ? CBM_ECMA_ABSENT : CBM_ECMA_UNKNOWN};
     }
+    /* `module.exports = require('./app')`: every name is that module's. */
+    if (module->whole && module->whole->dependency && module->whole->known &&
+        !module->whole->conflict && !module->whole->member && !module->whole->default_import)
+        return ecma_name(walk, module->whole->dependency, name);
     /* `module.exports = createApp` has createApp's own members. */
     if (module->whole && !module->whole->is_object) {
         cbm_ecma_value_t whole = ecma_entry_value(walk, module->whole);

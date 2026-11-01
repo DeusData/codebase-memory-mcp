@@ -2713,6 +2713,22 @@ static cbm_resolve_result_t ecma_import_result(file_resolver_t *resolver,
     const char *target = value.status == CBM_ECMA_DECLARATION ? value.target : NULL;
     if (target && value.member)
         target = ecma_member_target(resolver, target, value.member);
+    /* `exports = module.exports = createApp; exports.named = named`: the required value
+     * is one object, so the module's own names answer before createApp's members. */
+    if (target && rest && import->is_require && !import->member) {
+        const char *segment = rest + 1;
+        rest = strchr(segment, '.');
+        const char *member = cbm_arena_strndup(resolver->arena, segment,
+                                               rest ? (size_t)(rest - segment) : strlen(segment));
+        if (!member) {
+            query.failed = true;
+            return ecma_finish(&query, result);
+        }
+        value = cbm_ecma_lookup(resolver->shared->ecma, file, member, &query);
+        target = value.status == CBM_ECMA_DECLARATION ? value.target : NULL;
+        if (target && value.member)
+            target = ecma_member_target(resolver, target, value.member);
+    }
     while (rest && (value.status == CBM_ECMA_NAMESPACE || target)) {
         const char *segment = rest + 1;
         rest = strchr(segment, '.');

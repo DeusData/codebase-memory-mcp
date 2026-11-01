@@ -1169,9 +1169,37 @@ static int js_project_commonjs_case(int padding) {
                         "  each.other();\n"
                         "}\n"
                         "function shadowed(helper) { return helper(); }\n"},
+        /* Writes before the last `module.exports =` went to the replaced object, and a
+         * plain `exports = x` detaches the name from module.exports altogether. */
+        {"lib/order.js", "exports.early = function early() { return 1; };\n"
+                         "module.exports.early2 = function early2() { return 1; };\n"
+                         "exports = module.exports = whole;\n"
+                         "function whole() { return 1; }\n"
+                         "exports.late = function late() { return 1; };\n"
+                         "module.exports.late2 = function late2() { return 1; };\n"},
+        {"lib/rebind.js", "exports = { lost };\n"
+                          "exports.lost2 = lost2;\n"
+                          "function lost() { return 1; }\n"
+                          "function lost2() { return 1; }\n"},
+        {"test/order_use.js", "const order = require('../lib/order');\n"
+                              "const { lost, lost2 } = require('../lib/rebind');\n"
+                              "function orderRun() { order(); order.late(); order.late2(); }\n"
+                              "function orderDecoys() {\n"
+                              "  order.early();\n"
+                              "  order.early2();\n"
+                              "  lost();\n"
+                              "  lost2();\n"
+                              "}\n"},
     };
     js_project_t project = {0};
     ASSERT(js_project_index(&project, files, sizeof(files) / sizeof(files[0]), padding));
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderRun", "lib.order.whole"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderRun", "lib.order.late"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderRun", "lib.order.late2"), 1);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderDecoys", "lib.order.early"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderDecoys", "lib.order.early2"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderDecoys", "lib.rebind.lost"), 0);
+    ASSERT_EQ(js_project_edges(&project, "CALLS", "orderDecoys", "lib.rebind.lost2"), 0);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "run", "lib.app.createApplication"), 1);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "run", "lib.app.named"), 1);
     ASSERT_EQ(js_project_edges(&project, "CALLS", "run", "lib.app.extra"), 1);

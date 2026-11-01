@@ -174,7 +174,7 @@ struct cbm_resolve_binding_index {
     size_t js_raw_export_count, js_raw_export_capacity;
     cbm_resolve_js_export_t *js_exports;
     size_t js_export_count;
-    bool js_commonjs, js_whole_export, js_exports_rebound, js_exports_open;
+    bool js_commonjs, js_whole_export, js_exports_rebound, js_exports_detached, js_exports_open;
     const char **js_export_aliases;
     size_t js_export_alias_count, js_export_alias_capacity;
     js_member_t *js_members;
@@ -1524,7 +1524,10 @@ static void note_javascript_commonjs(cbm_resolve_binding_index_t *index, TSNode 
         return;
     TSNode left = field(node, "left"), right = field(node, "right");
     if (js_identifier_is(index, left, "exports")) {
-        index->js_exports_rebound |= js_chain_writes_module_exports(index, right);
+        /* `exports = module.exports = x` keeps them one object. `exports = x` does not. */
+        bool chained = js_chain_writes_module_exports(index, right);
+        index->js_exports_rebound |= chained;
+        index->js_exports_detached |= !chained;
         return;
     }
     if (kind_is(left, "subscript_expression"))
@@ -3145,6 +3148,11 @@ static void js_settle_exports(cbm_resolve_binding_index_t *index) {
                          : 0) |
                     ((row->flags & BINDING_TYPE_DECLARATION) ? CBM_RESOLVE_EXPORT_TYPE : 0)};
     }
+    size_t last_whole = 0;
+    for (size_t r = 0; r < index->js_raw_export_count; r++) {
+        if (index->js_raw_exports[r].whole)
+            last_whole = r;
+    }
     for (size_t r = 0; r < index->js_raw_export_count; r++) {
         const js_raw_export_t *raw = &index->js_raw_exports[r];
         if (raw->owner && !js_owner_is_alias(index, raw->owner))
@@ -3152,8 +3160,13 @@ static void js_settle_exports(cbm_resolve_binding_index_t *index) {
         cbm_resolve_js_export_t *out = &index->js_exports[index->js_export_count++];
         *out = (cbm_resolve_js_export_t){
             .name = raw->export_name, .kind = raw->kind, .whole = raw->whole};
-        /* `module.exports = x` replaces the object a bare `exports.y` wrote to. */
-        if (raw->bare_exports && index->js_whole_export && !index->js_exports_rebound)
+        /* `module.exports = x` replaces the object a bare `exports.y` wrote to, and any
+         * `exports.y` or `module.exports.y` written before it. A plain `exports = x`
+         * detaches the name, so the bare writes never reach module.exports at all. */
+        if (raw->bare_exports &&
+            (index->js_exports_detached || (index->js_whole_export && !index->js_exports_rebound)))
+            continue;
+        if (!raw->whole && !raw->owner && r < last_whole)
             continue;
         switch (raw->value) {
         case JS_VALUE_IDENTIFIER:
