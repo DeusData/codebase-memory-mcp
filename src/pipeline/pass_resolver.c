@@ -81,7 +81,7 @@ typedef struct {
     target_file_t *other_files;
     bool ambiguous;
     /* A different kind sharing the QN (C: struct and function) is no variant. */
-    bool mixed_kinds;
+    bool mixed_kinds, rebound;
 } target_proof_t;
 
 typedef struct {
@@ -255,6 +255,28 @@ static bool target_declared_in(const target_proof_t *target, const char *file) {
     return false;
 }
 
+/* Overloads, trait impls and build-tag twins all stay live, so one node is exact for any of them.
+ * Elsewhere a later declaration of a name rebinds it, as a second Python def does, and the bodies
+ * are not equivalent: selecting that node would claim edges from a body nothing may reach. */
+static bool declarations_coexist(CBMLanguage language) {
+    switch (language) {
+    case CBM_LANG_GO:
+    case CBM_LANG_RUST:
+    case CBM_LANG_JAVA:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_CPP:
+    case CBM_LANG_C:
+    case CBM_LANG_SWIFT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *definition,
                        const char *file, CBMLanguage language) {
     if (!definition->qualified_name || !definition->label || !file)
@@ -265,6 +287,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
         prior->ambiguous |= !same_owner || prior->start_line != definition->start_line ||
                             prior->end_line != definition->end_line || language == CBM_LANG_PYTHON;
         prior->mixed_kinds |= strcmp(prior->label, definition->label) != 0;
+        prior->rebound |= !declarations_coexist(language);
         if (!target_declared_in(prior, file)) {
             target_file_t *other = cbm_arena_calloc(&resolver->arena, sizeof(*other));
             const char *copy = cbm_arena_strdup(&resolver->arena, file);
@@ -290,6 +313,7 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     entry->start_line = definition->start_line;
     entry->end_line = definition->end_line;
     entry->declarations = 1;
+    entry->rebound = !declarations_coexist(language);
     if (!entry->file || !entry->label)
         return false;
     cbm_ht_set(resolver->targets, key, entry);
@@ -413,7 +437,7 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
      * reaches the same node, so selecting that node is exact whichever member a site
      * means. The node must still be one the census recorded. */
     if (proof->ambiguous)
-        return !proof->mixed_kinds && !strcmp(proof->label, node->label) &&
+        return !proof->mixed_kinds && !proof->rebound && !strcmp(proof->label, node->label) &&
                target_declared_in(proof, node->file_path);
     return !strcmp(proof->file, node->file_path) && !strcmp(proof->label, node->label) &&
            node->start_line >= 0 && node->end_line >= 0 &&
@@ -433,7 +457,8 @@ static bool source_identity_holds(const file_resolver_t *resolver, const cbm_gbu
         resolver->shared && resolver->shared->complete && source->qualified_name
             ? cbm_ht_get(resolver->shared->targets, source->qualified_name)
             : NULL;
-    if (proof && proof->ambiguous && !proof->mixed_kinds && source != resolver->file_node)
+    if (proof && proof->ambiguous && !proof->mixed_kinds && !proof->rebound &&
+        source != resolver->file_node)
         return target_materialized(resolver, source) && target_declared_in(proof, file);
     if (strcmp(source->file_path, file))
         return false;
