@@ -2825,9 +2825,9 @@ static bool resolve_writes(file_resolver_t *resolver, CBMArena *arena) {
             find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte, rw->site_end_byte,
                           rw->source_origin, CBM_RESOLVED_FIELD_REFERENCE);
         if (!site && !rw->is_member_access)
-            site = find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte,
-                                 rw->site_end_byte, rw->source_origin,
-                                 CBM_RESOLVED_VALUE_REFERENCE);
+            site =
+                find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte,
+                              rw->site_end_byte, rw->source_origin, CBM_RESOLVED_VALUE_REFERENCE);
         cbm_resolve_result_t outcome =
             site ? semantic_result(resolver, site, arena)
             : rw->is_member_access
