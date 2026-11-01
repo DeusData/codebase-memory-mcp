@@ -782,6 +782,20 @@ static void cbm_attr_check_declaration(TSNode node, const char *source, CBMAttrW
             return;
         }
     }
+    /* `LUA_API int (lua_gettop) (lua_State *L);` reads as a function returning a function, which
+     * no valid declaration is, so the word the grammar took for the type is the macro. A macro
+     * that wraps the name, `STATUS DEFINE(foo)(int x)`, has the capitals on the inner word. */
+    if (!ts_node_is_null(type) && !strcmp(ts_node_type(type), "type_identifier") &&
+        !strcmp(declarator_kind, "function_declarator") && cbm_attr_all_caps(source, type)) {
+        TSNode inner = ts_node_child_by_field_name(declarator, "declarator", 10);
+        TSNode inner_name =
+            ts_node_is_null(inner) ? inner : ts_node_child_by_field_name(inner, "declarator", 10);
+        if (!ts_node_is_null(inner_name) && !strcmp(ts_node_type(inner), "function_declarator") &&
+            !cbm_attr_all_caps(source, inner_name)) {
+            cbm_attr_word_add(words, type);
+            return;
+        }
+    }
     uint32_t declarator_start = ts_node_start_byte(declarator);
     uint32_t count = ts_node_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
