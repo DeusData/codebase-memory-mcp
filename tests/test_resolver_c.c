@@ -1932,6 +1932,11 @@ TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
     "#define FOR_ALL_TABS(tp) for (tabpage_T *(tp) = first_tabpage; (tp); (tp) = (tp)->tp_next)\n" \
     "#define LOG_LINE(s) log_line(s)\n"                                                         \
     "void log_line(const char *s);\n"                                                           \
+    "struct item {\n"                                                                           \
+    "  union {\n"                                                                               \
+    "    int value;\n"                                                                          \
+    "  };\n"                                                                                    \
+    "};\n"                                                                                      \
     "#endif\n"
 #define C_TU_GAPS_SOURCE                                                                        \
     "#include \"gaps.h\"\n"                                                                     \
@@ -1946,7 +1951,8 @@ TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
     "  }\n"                                                                                     \
     "  return n;\n"                                                                             \
     "}\n"                                                                                       \
-    "void use_macro(void) { LOG_LINE(\"x\"); }\n"
+    "void use_macro(void) { LOG_LINE(\"x\"); }\n"                                               \
+    "int use_union(struct item *o) { return o->value; }\n"
 static const RQ_Source C_TU_GAPS[] = {{.path = "gaps.h", .text = C_TU_GAPS_HEADER},
                                       {.path = "gaps.c", .text = C_TU_GAPS_SOURCE},
                                       {.path = "use_gaps.c", .text = C_TU_GAPS_USE}};
@@ -1968,6 +1974,20 @@ TEST(resolver_c_known_gaps_stay_honest) {
                 "expand macros, so tp has no declared type and its members stay unknown.",
          .tried = "Read neovim's FOR_ALL_* loops. Guessing the type from the macro text needs "
                   "expansion rules this resolver does not have."},
+        {.case_id = "anonymous-aggregate-member",
+         .site = C_TU_WORD("use_gaps.c", use, "use_gaps.use_union", "o->value", "value"),
+         .relation = "USAGE",
+         .target = {.file = "gaps.h",
+                    .suffix = "gaps.item.value",
+                    .label = "Field",
+                    .declaration_line = 12,
+                    .declaration_text = "    int value;"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "c-anonymous-aggregate-member",
+         .why = "Members of an anonymous struct or union get no Field node, so there is nothing to "
+                "bind. Neovim's `data` union in Object and redis's `u` unions have this form.",
+         .tried = "A nested aggregate with a tag binds through the tag. Without one, extraction "
+                  "must first attach the members to the enclosing struct."},
         {.case_id = "function-like-macro",
          .site = {.file = "use_gaps.c", .caller = "use_gaps.use_macro", .needle = "LOG_LINE(\"x\")"},
          .relation = "CALLS",
@@ -2718,7 +2738,76 @@ TEST(resolver_cpp_nested_aliases_and_protected_members) {
     PASS();
 }
 
+/* neovim's typval_T: `rettv->vval.v_number` goes through a union defined where its member
+ * is declared. Two such unions have a member of one name, so only the tag can tell them apart. */
+#define C_TU_NESTED_HEADER                                                                      \
+    "#ifndef TYPVAL_H\n"                                                                        \
+    "#define TYPVAL_H\n"                                                                        \
+    "typedef struct {\n"                                                                        \
+    "  int v_type;\n"                                                                           \
+    "  union number_union {\n"                                                                  \
+    "    long value;\n"                                                                         \
+    "  } vval;\n"                                                                               \
+    "  union string_union {\n"                                                                  \
+    "    char *value;\n"                                                                        \
+    "  } sval;\n"                                                                               \
+    "} typval_T;\n"                                                                             \
+    "#endif\n"
+#define C_TU_NESTED_USE                                                                         \
+    "#include \"typval.h\"\n"                                                                   \
+    "void set_number(typval_T *rettv) { rettv->vval.value = 0; }\n"                             \
+    "char *get_string(typval_T tv) { return tv.sval.value; }\n"
+static const RQ_Source C_TU_NESTED[] = {{.path = "typval.h", .text = C_TU_NESTED_HEADER},
+                                        {.path = "use_typval.c", .text = C_TU_NESTED_USE}};
+
+TEST(resolver_c_member_through_a_union_defined_in_place) {
+    const char *use = C_TU_NESTED_USE;
+    const RQ_Expected expected[] = {
+        {.case_id = "write-through-a-tagged-union",
+         .site = C_TU_WORD("use_typval.c", use, "use_typval.set_number", "vval.value", "value"),
+         .relation = "WRITES",
+         .target = {.file = "typval.h",
+                    .suffix = "typval.number_union.value",
+                    .label = "Field",
+                    .declaration_line = 6,
+                    .declaration_text = "    long value;"}},
+        {.case_id = "read-through-the-other-tagged-union",
+         .site = C_TU_WORD("use_typval.c", use, "use_typval.get_string", "sval.value", "value"),
+         .relation = "USAGE",
+         .target = {.file = "typval.h",
+                    .suffix = "typval.string_union.value",
+                    .label = "Field",
+                    .declaration_line = 9,
+                    .declaration_text = "    char *value;"}},
+        {.case_id = "the-member-holding-the-union",
+         .site = C_TU_WORD("use_typval.c", use, "use_typval.get_string", "tv.sval", "sval"),
+         .relation = "USAGE",
+         .target = {.file = "typval.h",
+                    .suffix = "typval.typval_T.sval",
+                    .label = "Field",
+                    .declaration_line = 8,
+                    .declaration_text = "  union string_union {"}},
+        {.case_id = "the-parameter-type",
+         .site = C_TU_WORD("use_typval.c", use, "use_typval.get_string", "get_string(typval_T", "typval_T"),
+         .relation = "USAGE",
+         .target = {.file = "typval.h",
+                    .suffix = "typval.typval_T",
+                    .label = "Class",
+                    .declaration_line = 3,
+                    .declaration_text = "typedef struct {"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-nested",
+                             .sources = C_TU_NESTED,
+                             .source_count = sizeof(C_TU_NESTED) / sizeof(C_TU_NESTED[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_member_through_a_union_defined_in_place);
     RUN_TEST(resolver_cpp_nested_aliases_and_protected_members);
     RUN_TEST(resolver_c_bare_macro_arguments_prove_nothing);
     RUN_TEST(resolver_cpp_known_gaps_stay_honest);
