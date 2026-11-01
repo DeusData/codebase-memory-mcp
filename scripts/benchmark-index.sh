@@ -52,6 +52,7 @@ trap bench_finish EXIT
 # it the failure below could name only its symptom.
 BENCH_TMP=$(mktemp -d)
 INDEX_ERR="$BENCH_TMP/index-stderr.log"
+DAEMON_START_LOG="$BENCH_TMP/daemon-start.log"
 
 # Resolve symlinks
 REPO=$(cd "$REPO" && pwd -P)
@@ -90,8 +91,14 @@ echo "$LOC" > "$OUT/loc.txt"
 # total-time.txt is their sum — the figure comparable with earlier runs, which
 # paid activation inside the index timing whenever no daemon was already warm.
 SETUP_START_MS=$(bench_now_ms)
-if ! "$BINARY" daemon start >/dev/null 2>&1; then
+# Its output is kept for the failure path: the product names why a daemon did
+# not start, and that is the part an operator needs.
+if ! "$BINARY" daemon start >"$DAEMON_START_LOG" 2>&1; then
   echo "  $LANG: private daemon did not start" >&2
+  if [ -s "$DAEMON_START_LOG" ]; then
+    echo "--- daemon start output ---" >&2
+    cat "$DAEMON_START_LOG" >&2
+  fi
   exit 1
 fi
 
