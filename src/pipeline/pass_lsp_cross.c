@@ -1948,7 +1948,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         return;
 
     cbm_resolve_proof_pool_t proof_pool;
-    cbm_resolve_proof_pool_init(&proof_pool, dst_arena, 0, 0, 0);
+    cbm_resolve_proof_pool_init_project(&proof_pool, dst_arena);
     cbm_resolve_proof_clone_session_t proofs;
     (void)cbm_resolve_proof_clone_begin(&proofs, &proof_pool);
     /* The complete source batch remains alive until clone_end. A shared

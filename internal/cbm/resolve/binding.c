@@ -2353,7 +2353,7 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
     index->observation = cbm_arena_calloc(arena, sizeof(*index->observation));
     if (!index->observation)
         return NULL;
-    cbm_resolve_proof_pool_init(&index->observation->pool, arena, 0, 0, 0);
+    cbm_resolve_proof_pool_init_project(&index->observation->pool, arena);
     cbm_resolve_proof_source_t captured = {
         .module = result ? result->module_qn : NULL,
         .scope = result ? result->module_qn : NULL,
