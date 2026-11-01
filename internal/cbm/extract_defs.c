@@ -8978,6 +8978,13 @@ static void extract_c_typedef(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
         def.is_exported = cbm_is_exported(name, ctx->language);
         def.docstring = extract_docstring(ctx, node, name);
+        /* What this name aliases, as written: a tag or another typedef name. A
+         * member access through the alias reaches that type's fields. */
+        if (tag_kind && !ts_node_is_null(tag_node)) {
+            def.alias_target = cbm_node_text(a, tag_node, ctx->source);
+        } else if (strcmp(tk, "type_identifier") == 0) {
+            def.alias_target = cbm_node_text(a, type, ctx->source);
+        }
         cbm_defs_push(&ctx->result->defs, a, def);
     }
     ts_tree_cursor_delete(&cursor);

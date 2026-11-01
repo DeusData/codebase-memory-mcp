@@ -22,11 +22,17 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_GO, SOURCE_EDGES,
      "Exact project package paths with configured roots; unresolved external packages abstain."},
     {CBM_LANG_C, C_EDGES,
-     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+     "Literal include paths, configured search roots, and a spelling only one project "
+     "file can satisfy; translation-unit visibility through includes; unproved "
+     "preprocessing abstains."},
     {CBM_LANG_CPP, C_EDGES,
-     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+     "Literal include paths, configured search roots, and a spelling only one project "
+     "file can satisfy; translation-unit visibility through includes; unproved "
+     "preprocessing abstains."},
     {CBM_LANG_CUDA, C_EDGES,
-     "Literal include paths and configured search roots only; unproved preprocessing abstains."},
+     "Literal include paths, configured search roots, and a spelling only one project "
+     "file can satisfy; translation-unit visibility through includes; unproved "
+     "preprocessing abstains."},
     {CBM_LANG_OBJC, EDGE(IMPORTS),
      "Literal include paths and configured search roots only; no semantic proof bridge "
      "advertised."},

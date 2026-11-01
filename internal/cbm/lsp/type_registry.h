@@ -48,7 +48,9 @@ enum {
     CBM_SOURCE_DECL_EXTERN_C = 1u << 12,
     /* Audited fixed parameters with no type, reference, default or unpacking.
      * PHP may apply them to exact positional values without coercion rules. */
-    CBM_SOURCE_DECL_UNTYPED_VALUE_PARAMETERS = 1u << 13
+    CBM_SOURCE_DECL_UNTYPED_VALUE_PARAMETERS = 1u << 13,
+    /* C family: inside a preprocessor branch, so it exists in some configurations. */
+    CBM_SOURCE_DECL_CONDITIONAL = 1u << 14
 };
 
 // Registered function/method with full type signature.
@@ -80,6 +82,8 @@ typedef struct {
      * Unqualified source names retain their spelling until the language
      * adapter proves the declaration's type-name lookup domain. */
     const CBMType *source_signature;
+    int source_arity; /* C family: fixed parameter count + 1; 0 when not fixed. */
+    const char *source_file_qn; /* C family: the File that holds this declaration. */
     const char *source_namespace;
 } CBMRegisteredFunc;
 
@@ -116,6 +120,7 @@ typedef struct {
     bool export_binding_proven;
     const char *declaration_identity;
     const char *graph_qualified_name; /* original canonical source graph identity, if different */
+    const char *source_file_qn;       /* C family: the File that holds this declaration */
     uint32_t source_flags;
 } CBMRegisteredType;
 
@@ -250,6 +255,9 @@ typedef struct CBMTypeRegistry {
     const char **export_keys;
     const char **export_targets;
     int export_count;
+
+    /* C family: what each file declares for its includers (see c_proof.h). */
+    const struct CBMCDeclIndex *c_decls;
 } CBMTypeRegistry;
 
 /* Read-only iterator over every exact namespace/name candidate in every

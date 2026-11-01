@@ -167,7 +167,12 @@ void c_lsp_init(CLSPContext *ctx, CBMArena *arena, const char *source, int sourc
     ctx->resolved_calls = out;
     ctx->source_origin = CBM_SOURCE_ORIGIN_RAW;
     ctx->current_scope = cbm_scope_push(arena, NULL);
-    cbm_resolve_types_init(&ctx->field_types, arena, 0);
+    /* One type fact per declaration and one proof per distinct occurrence fact, so
+     * the totals follow the file's own size. A cap here does not bound anything;
+     * it withholds every later edge of a large file, at a point that even moves
+     * with the checkout path's length, because every hashed byte counts as work. */
+    cbm_resolve_types_init(&ctx->field_types, arena, UINT64_MAX);
+    cbm_resolve_proof_pool_init_project(&ctx->field_types.proofs, arena);
     (void)cbm_lsp_proof_standalone_context(&ctx->field_types, source, source_len, module_qn,
                                            CBM_SOURCE_ORIGIN_RAW);
 
@@ -266,8 +271,9 @@ static TSNode c_fp_unwrap_parentheses(CLSPContext *ctx, TSNode node) {
     for (unsigned depth = 0;
          !ts_node_is_null(node) && !strcmp(ts_node_type(node), "parenthesized_expression");
          depth++) {
+        /* Only this expression's reading is lost. The rest of the file still has
+         * its own scopes, which a latch here would withhold from every later site. */
         if (depth == 64 || ts_node_has_error(node)) {
-            ctx->binding_failed = true;
             return (TSNode){0};
         }
         TSNode expression = {0};
@@ -1039,6 +1045,7 @@ typedef struct CProofDeclaration {
     TSNode site;
     const CBMType *signature;
     bool external, c_linkage;
+    bool no_prototype; /* C `int f();` says nothing of the parameters */
 } CProofDeclaration;
 
 typedef struct CProofBuiltinBinding {
@@ -1049,6 +1056,7 @@ typedef struct CProofBuiltinBinding {
 typedef struct CProofInclude {
     const char *path;
     const char *module;
+    const char *file_qn; /* the included File, when the import facts name one */
     uint32_t at;
     const cbm_resolve_proof_t *binding_proof;
 } CProofInclude;
@@ -1064,6 +1072,112 @@ typedef struct CProofUsing {
 
 static cbm_resolve_result_t c_proof_missing(const char *reason) {
     return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED, .reason = reason};
+}
+
+/* One file this translation unit includes, directly or through other files. Its key
+ * is the File QN, since a header and its source share a module QN; a caller with no
+ * import facts has only the include table's module to go on. */
+typedef struct CTUModule {
+    const char *module;
+    uint32_t at; /* where the direct include that reaches it stands in this file */
+    const cbm_resolve_proof_t *via;
+    bool exports_only; /* reached through a header generated from this source file */
+} CTUModule;
+
+static uint32_t c_tu_hash(const char *text, size_t length) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < length; i++)
+        hash = (hash ^ (unsigned char)text[i]) * 16777619u;
+    return hash;
+}
+
+static CTUModule *c_tu_find(CLSPContext *ctx, const char *module, size_t length) {
+    if (!ctx->tu_cap)
+        return NULL;
+    uint32_t mask = ctx->tu_cap - 1;
+    for (uint32_t slot = c_tu_hash(module, length) & mask;; slot = (slot + 1) & mask) {
+        CTUModule *entry = &ctx->tu_modules[slot];
+        if (!entry->module)
+            return NULL;
+        if (!strncmp(entry->module, module, length) && !entry->module[length])
+            return entry;
+    }
+}
+
+static bool c_tu_add(CLSPContext *ctx, const char *module, uint32_t at,
+                     const cbm_resolve_proof_t *via, bool exports_only) {
+    if ((ctx->tu_count + 1) * 10 >= ctx->tu_cap * 7) {
+        uint32_t cap = ctx->tu_cap ? ctx->tu_cap * 2 : 64;
+        CTUModule *next = cbm_arena_calloc(ctx->arena, (size_t)cap * sizeof(*next));
+        if (!next) {
+            ctx->binding_failed = true;
+            return false;
+        }
+        for (uint32_t i = 0; i < ctx->tu_cap; i++) {
+            const CTUModule *old = &ctx->tu_modules[i];
+            if (!old->module)
+                continue;
+            uint32_t slot = c_tu_hash(old->module, strlen(old->module)) & (cap - 1);
+            while (next[slot].module)
+                slot = (slot + 1) & (cap - 1);
+            next[slot] = *old;
+        }
+        ctx->tu_modules = next;
+        ctx->tu_cap = cap;
+    }
+    uint32_t mask = ctx->tu_cap - 1;
+    uint32_t slot = c_tu_hash(module, strlen(module)) & mask;
+    while (ctx->tu_modules[slot].module)
+        slot = (slot + 1) & mask;
+    ctx->tu_modules[slot] =
+        (CTUModule){.module = module, .at = at, .via = via, .exports_only = exports_only};
+    ctx->tu_count++;
+    return true;
+}
+
+/* The unit's entry for a declaration held in this file, or with this module prefix. */
+static const CTUModule *c_tu_for_declaration(CLSPContext *ctx, const char *file_qn,
+                                             const char *qn, size_t module_len) {
+    return file_qn ? c_tu_find(ctx, file_qn, strlen(file_qn)) : c_tu_find(ctx, qn, module_len);
+}
+
+static const char *c_own_file_key(const CLSPContext *ctx) {
+    return ctx->own_file_qn ? ctx->own_file_qn : ctx->module_qn;
+}
+
+static bool c_is_own_declaration(const CLSPContext *ctx, const char *file_qn, const char *qn,
+                                 size_t module_len) {
+    if (file_qn && ctx->own_file_qn)
+        return !strcmp(file_qn, ctx->own_file_qn);
+    return ctx->module_qn && module_len == ctx->module_qn_len &&
+           !strncmp(qn, ctx->module_qn, module_len);
+}
+
+/* The included file holding this declaration QN, visible at this point in this file.
+ * Without file identities a QN may nest inside its module (`m.Outer.Inner`), so try
+ * each prefix. */
+static const CTUModule *c_tu_owner(CLSPContext *ctx, const char *qn, uint32_t at) {
+    CBMTypeQNIter iterator;
+    cbm_registry_types_with_qn(ctx->proof_registry, qn, &iterator);
+    const CBMRegisteredType *candidate;
+    while ((candidate = cbm_type_qn_next(&iterator, NULL))) {
+        if (!candidate->source_file_qn)
+            continue;
+        const CTUModule *entry =
+            c_tu_find(ctx, candidate->source_file_qn, strlen(candidate->source_file_qn));
+        if (entry && !entry->exports_only && entry->at < at)
+            return entry;
+    }
+    for (const char *dot = strrchr(qn, '.'); dot; dot--) {
+        if (*dot == '.') {
+            const CTUModule *entry = c_tu_find(ctx, qn, (size_t)(dot - qn));
+            if (entry && !entry->exports_only && entry->at < at)
+                return entry;
+        }
+        if (dot == qn)
+            break;
+    }
+    return NULL;
 }
 
 /* Preserve every namespace segment. In particular, inline ABI namespaces
@@ -1219,12 +1333,13 @@ static bool c_proof_c_linkage(CLSPContext *ctx, TSNode node) {
 }
 
 static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, int depth) {
-    if (depth > CBM_LSP_MAX_LOOKUP_DEPTH) {
-        ctx->binding_failed = true;
+    /* An #elif chain nests a level per branch. Past this depth declarations go
+     * uncollected, so their uses abstain; nothing else in the file is affected. */
+    if (depth > 512)
         return;
-    }
     const char *kind = ts_node_type(node);
-    if (!strcmp(kind, "struct_specifier") || !strcmp(kind, "class_specifier")) {
+    if (!strcmp(kind, "struct_specifier") || !strcmp(kind, "class_specifier") ||
+        !strcmp(kind, "union_specifier") || !strcmp(kind, "enum_specifier")) {
         TSNode name = ts_node_child_by_field_name(node, "name", 4);
         const char *text = ts_node_is_null(name) ? NULL : c_node_text(ctx, name);
         const char *qn = text ? cbm_arena_sprintf(ctx->arena, "$type:%s.%s", owner, text) : NULL;
@@ -1236,6 +1351,32 @@ static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, in
         c_proof_include_site(ctx, node);
         return;
     }
+    if (!strcmp(kind, "preproc_def") || !strcmp(kind, "preproc_function_def")) {
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        const char *text = ts_node_is_null(name) ? NULL : c_node_text(ctx, name);
+        const char *key = text ? cbm_arena_sprintf(ctx->arena, "$macro:%s", text) : NULL;
+        if (key)
+            c_proof_add_declaration(ctx, key, ts_node_end_byte(name));
+        return;
+    }
+    if (!strcmp(kind, "type_definition")) {
+        TSNode type = ts_node_child_by_field_name(node, "type", 4);
+        if (!ts_node_is_null(type))
+            c_proof_collect(ctx, type, owner, depth + 1);
+        TSNode alias = ts_node_child_by_field_name(node, "declarator", 10);
+        for (int hop = 0; hop < 8 && !ts_node_is_null(alias); hop++) {
+            if (!strcmp(ts_node_type(alias), "type_identifier")) {
+                const char *text = c_node_text(ctx, alias);
+                const char *qn =
+                    text ? cbm_arena_sprintf(ctx->arena, "$type:%s.%s", owner, text) : NULL;
+                if (qn)
+                    c_proof_add_declaration(ctx, qn, ts_node_end_byte(alias));
+                break;
+            }
+            alias = ts_node_child_by_field_name(alias, "declarator", 10);
+        }
+        return;
+    }
     if (!strcmp(kind, "function_definition") || !strcmp(kind, "declaration")) {
         uint32_t count = 0;
         TSNode *kids = cbm_lsp_collect_children(ctx->arena, node, &count);
@@ -1245,7 +1386,8 @@ static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, in
         }
         for (uint32_t i = 0; i < count; i++) {
             const char *child_kind = ts_node_type(kids[i]);
-            if (!strcmp(child_kind, "struct_specifier") || !strcmp(child_kind, "class_specifier")) {
+            if (!strcmp(child_kind, "struct_specifier") || !strcmp(child_kind, "class_specifier") ||
+                !strcmp(child_kind, "union_specifier") || !strcmp(child_kind, "enum_specifier")) {
                 c_proof_collect(ctx, kids[i], owner, depth + 1);
                 continue;
             }
@@ -1265,6 +1407,12 @@ static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, in
                             cbm_c_free_signature(ctx->arena, ctx->source, node, ctx->cpp_mode);
                         decl->external = !c_proof_internal_declaration(ctx, node);
                         decl->c_linkage = c_proof_c_linkage(ctx, node);
+                        TSNode list = ts_node_parent(name_node);
+                        list = ts_node_is_null(list)
+                                   ? list
+                                   : ts_node_child_by_field_name(list, "parameters", 10);
+                        decl->no_prototype = !ctx->cpp_mode && !ts_node_is_null(list) &&
+                                             !ts_node_named_child_count(list);
                     }
                 } else {
                     ctx->binding_failed = true;
@@ -1292,10 +1440,14 @@ static void c_proof_collect(CLSPContext *ctx, TSNode node, const char *owner, in
         c_proof_collect(ctx, body, qn, depth + 1);
         return;
     }
-    /* Conditional compilation, templates, classes and local prototypes need
-     * additional domain proofs. They are not inferred from their text. */
+    /* A branch of conditional compilation declares its names in the configurations
+     * that compile it, and code using them compiles only in those. Error recovery
+     * around a directive leaves complete declarations inside the ERROR. Templates,
+     * classes and local prototypes need additional domain proofs. */
     if (strcmp(kind, "translation_unit") && strcmp(kind, "declaration_list") &&
-        strcmp(kind, "linkage_specification"))
+        strcmp(kind, "linkage_specification") && strcmp(kind, "preproc_if") &&
+        strcmp(kind, "preproc_ifdef") && strcmp(kind, "preproc_else") &&
+        strcmp(kind, "preproc_elif") && strcmp(kind, "preproc_elifdef") && strcmp(kind, "ERROR"))
         return;
     TSTreeCursor cursor = ts_tree_cursor_new(node);
     if (ts_tree_cursor_goto_first_child(&cursor)) {
@@ -1341,8 +1493,83 @@ static bool c_proof_configured_wrapper(CLSPContext *ctx, TSNode node) {
  * depend on. Real C nests that deep: an #ifdef inside an else-if chain puts redis
  * src/defrag.c past 16 levels, and treating that as a failure of the whole file
  * withheld every proof in it. */
+static uint32_t c_proof_first_error(CLSPContext *ctx, TSNode root);
+static uint32_t c_proof_first_declaring_error(CLSPContext *ctx, TSNode body);
+
 static void c_proof_audit_syntax(CLSPContext *ctx, TSNode root) {
-    ctx->proof_syntax_limit = ts_node_end_byte(root);
+    ctx->proof_syntax_limit = c_proof_first_error(ctx, root);
+}
+
+/* A function's own scopes are read from its own subtree. A file-scope syntax error
+ * elsewhere, nearly always an #ifdef that splits a statement, says nothing about
+ * them: tree-sitter resumes at the next complete top-level item, and a file-scope
+ * declaration lost in the error can only hide a name no proof would then find.
+ * Within a function nothing after its first error is read. Configured test owners
+ * keep the whole file's first error, since they name their bodies through the
+ * surrounding text. */
+static void c_proof_enter_function(CLSPContext *ctx, TSNode func_node) {
+    if (ctx->test_definition_owners && ctx->test_definition_owners->has_test_definition_owners)
+        return;
+    /* Attribute macros between the parameters and the brace put the error in the
+     * header, ahead of a perfectly readable body. */
+    TSNode body = ts_node_child_by_field_name(func_node, "body", 4);
+    ctx->proof_syntax_limit = !ts_node_is_null(body) && ts_node_has_error(body)
+                                  ? c_proof_first_declaring_error(ctx, body)
+                                  : ts_node_end_byte(func_node);
+}
+
+/* What a syntax error can do to a later site in the same function is hide a local
+ * declaration, and then a global of that name would seem to be in reach. An error
+ * holding no type and no pair of adjacent names cannot be a declaration: it is an
+ * #ifdef inside an expression, or a stray token, and what follows reads normally. */
+static bool c_proof_error_may_declare(TSNode error) {
+    uint32_t count = ts_node_named_child_count(error);
+    bool previous_identifier = false;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(error, i);
+        const char *kind = ts_node_type(child);
+        if (!strcmp(kind, "comment"))
+            continue;
+        if (!strcmp(kind, "primitive_type") || !strcmp(kind, "type_identifier") ||
+            !strcmp(kind, "sized_type_specifier") || !strcmp(kind, "struct_specifier") ||
+            !strcmp(kind, "union_specifier") || !strcmp(kind, "enum_specifier") ||
+            !strcmp(kind, "declaration") || !strcmp(kind, "storage_class_specifier") ||
+            !strcmp(kind, "type_qualifier") || !strcmp(kind, "init_declarator") ||
+            !strcmp(kind, "pointer_declarator") || !strcmp(kind, "array_declarator"))
+            return true;
+        bool identifier = !strcmp(kind, "identifier");
+        if (identifier && previous_identifier)
+            return true;
+        previous_identifier = identifier;
+    }
+    return false;
+}
+
+static uint32_t c_proof_first_declaring_error(CLSPContext *ctx, TSNode body) {
+    uint32_t limit = ts_node_end_byte(body);
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    bool walking = true;
+    while (walking) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_has_error(node) && !c_proof_configured_wrapper(ctx, node)) {
+            if (ts_node_is_error(node)) {
+                if (c_proof_error_may_declare(node)) {
+                    limit = ts_node_start_byte(node);
+                    break;
+                }
+            } else if (ts_tree_cursor_goto_first_child(&cursor)) {
+                continue;
+            }
+        }
+        while (walking && !ts_tree_cursor_goto_next_sibling(&cursor))
+            walking = ts_tree_cursor_goto_parent(&cursor);
+    }
+    ts_tree_cursor_delete(&cursor);
+    return limit;
+}
+
+static uint32_t c_proof_first_error(CLSPContext *ctx, TSNode root) {
+    uint32_t limit = ts_node_end_byte(root);
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     bool walking = true;
     while (walking) {
@@ -1350,7 +1577,7 @@ static void c_proof_audit_syntax(CLSPContext *ctx, TSNode root) {
         bool faulty = ts_node_has_error(node) || ts_node_is_missing(node);
         if (faulty && !c_proof_configured_wrapper(ctx, node)) {
             if (ts_node_is_error(node) || ts_node_is_missing(node)) {
-                ctx->proof_syntax_limit = ts_node_start_byte(node);
+                limit = ts_node_start_byte(node);
                 break;
             }
             if (ts_tree_cursor_goto_first_child(&cursor))
@@ -1360,11 +1587,104 @@ static void c_proof_audit_syntax(CLSPContext *ctx, TSNode root) {
             walking = ts_tree_cursor_goto_parent(&cursor);
     }
     ts_tree_cursor_delete(&cursor);
+    return limit;
+}
+
+static int c_proof_include_site_compare(const void *left, const void *right) {
+    const CProofInclude *a = left, *b = right;
+    if (a->at != b->at)
+        return a->at < b->at ? -1 : 1;
+    int order = strcmp(a->path, b->path);
+    return order ? order : strcmp(a->module, b->module);
+}
+
+/* Everything this file sees through its includes, each at the point the direct
+ * include that reaches it stands. A branch makes its includes conditional, not
+ * absent: a name found through one was still declared there in the configurations
+ * that compile the use. A caller defining a header's guard first keeps it out. */
+static void c_proof_build_translation_unit(CLSPContext *ctx) {
+    if (!ctx->include_count || !ctx->proof_includes)
+        return;
+    CProofInclude *direct = cbm_arena_alloc(ctx->arena, (size_t)ctx->include_count * sizeof(*direct));
+    if (!direct) {
+        ctx->binding_failed = true;
+        return;
+    }
+    memcpy(direct, ctx->proof_includes, (size_t)ctx->include_count * sizeof(*direct));
+    qsort(direct, (size_t)ctx->include_count, sizeof(*direct), c_proof_include_site_compare);
+    size_t queue_cap = 64, head = 0, tail = 0;
+    const char **queue = cbm_arena_alloc(ctx->arena, queue_cap * sizeof(*queue));
+    if (!queue) {
+        ctx->binding_failed = true;
+        return;
+    }
+    for (int i = 0; i < ctx->include_count; i++) {
+        const CProofInclude *include = &direct[i];
+        if (include->at == UINT32_MAX || !include->module[0])
+            continue;
+        const char *direct_key = include->file_qn ? include->file_qn : include->module;
+        const char *own_key = c_own_file_key(ctx);
+        const CBMCFileFacts *facts = cbm_c_file_facts(ctx->c_decls, direct_key);
+        if (facts && facts->guard) {
+            const char *key = cbm_arena_sprintf(ctx->arena, "$macro:%s", facts->guard);
+            if (key && c_proof_declared(ctx, key, include->at))
+                continue;
+        }
+        if (c_tu_find(ctx, direct_key, strlen(direct_key)) || !strcmp(direct_key, own_key))
+            continue;
+        if (!c_tu_add(ctx, direct_key, include->at, include->binding_proof, false))
+            return;
+        head = tail = 0;
+        queue[tail++] = direct_key;
+        while (head < tail) {
+            facts = cbm_c_file_facts(ctx->c_decls, queue[head++]);
+            if (!facts)
+                continue;
+            for (int g = 0; g < facts->generated_count; g++) {
+                const char *source = facts->generated_for[g];
+                if (!c_tu_find(ctx, source, strlen(source)) && strcmp(source, own_key) &&
+                    !c_tu_add(ctx, source, include->at, include->binding_proof, true))
+                    return;
+            }
+            for (int n = 0; n < facts->include_count; n++) {
+                const char *next = facts->includes[n];
+                if (c_tu_find(ctx, next, strlen(next)) || !strcmp(next, own_key))
+                    continue;
+                if (!c_tu_add(ctx, next, include->at, include->binding_proof, false))
+                    return;
+                if (tail == queue_cap) {
+                    /* Consumed entries are dead: reuse their room before growing. */
+                    size_t live = tail - head;
+                    size_t cap = live * 2 >= queue_cap ? queue_cap * 2 : queue_cap;
+                    const char **grown = cap == queue_cap
+                                             ? queue
+                                             : cbm_arena_alloc(ctx->arena, cap * sizeof(*grown));
+                    if (!grown) {
+                        ctx->binding_failed = true;
+                        return;
+                    }
+                    memmove(grown, queue + head, live * sizeof(*grown));
+                    queue = grown;
+                    queue_cap = cap;
+                    head = 0;
+                    tail = live;
+                }
+                queue[tail++] = next;
+            }
+        }
+    }
 }
 
 static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
     ctx->proof_registry = c_proof_registry_snapshot(ctx, ctx->registry, 0);
-    ctx->proof_preprocessor_unknown = cbm_c_preprocessor_domain_unsupported(root);
+    ctx->proof_preprocessor_unknown = cbm_c_preprocessor_domain_unsupported(root, ctx->source);
+    for (const CBMTypeRegistry *link = ctx->registry; link && !ctx->c_decls; link = link->fallback)
+        ctx->c_decls = link->c_decls;
+    ctx->own_file_qn = ctx->import_facts ? ctx->import_facts->source.scope : NULL;
+    const CBMCFileFacts *own_facts = cbm_c_file_facts(ctx->c_decls, c_own_file_key(ctx));
+    /* A .h with no C++ syntax of its own reads as C: no overloads, no argument-
+     * dependent lookup, and C linkage whichever language includes it. */
+    ctx->plain_header = own_facts && own_facts->plain_header && !own_facts->cpp_syntax;
     c_proof_audit_syntax(ctx, root);
     if (!ctx->proof_registry || !ctx->module_qn || ctx->binding_failed) {
         ctx->binding_failed = true;
@@ -1401,8 +1721,10 @@ static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
             const cbm_resolve_import_fact_t *fact = facts ? cbm_ht_get(facts, include.path) : NULL;
             if (fact && cbm_resolve_admit(&fact->dependency) && cbm_resolve_admit(&fact->binding) &&
                 fact->dependency.proof && fact->binding.proof &&
-                !strcmp(fact->binding.target, include.module))
+                !strcmp(fact->binding.target, include.module)) {
                 include.binding_proof = fact->binding.proof;
+                include.file_qn = fact->dependency.target;
+            }
             ctx->proof_includes[i] = include;
         }
         cbm_ht_free(facts);
@@ -1413,6 +1735,7 @@ static void c_proof_prepare(CLSPContext *ctx, TSNode root) {
     if (ctx->proof_declaration_count)
         qsort(ctx->proof_declarations, (size_t)ctx->proof_declaration_count,
               sizeof(*ctx->proof_declarations), c_proof_declaration_compare);
+    c_proof_build_translation_unit(ctx);
 }
 
 static void c_proof_record_using(CLSPContext *ctx, TSNode node) {
@@ -1464,7 +1787,12 @@ static cbm_resolve_method_candidate_t c_proof_classify(const cbm_resolve_method_
             : candidate->qualified_name;
     proof.graph_target_exact = proof.graph_target != NULL;
     proof.declaration_identity = candidate->declaration_identity;
-    proof.declaration_identity_exact = candidate->declaration_identity != NULL;
+    /* The #if branches of one file define a function more than once, and the graph
+     * holds them as one node. One file and one graph identity is one declaration. */
+    if (candidate->source_file_qn && proof.graph_target)
+        proof.declaration_identity =
+            cbm_arena_sprintf(ctx->arena, "%s|%s", candidate->source_file_qn, proof.graph_target);
+    proof.declaration_identity_exact = proof.declaration_identity != NULL;
     return proof;
 }
 
@@ -1520,12 +1848,9 @@ static cbm_resolve_result_t c_proof_type_import(CLSPContext *ctx, const char *qn
     const char *key = cbm_arena_sprintf(ctx->arena, "$type:%s", qn);
     if (!ctx->require_import_proofs || (key && c_proof_declared(ctx, key, at)))
         return result;
-    for (int i = 0; i < ctx->include_count; i++) {
-        const CProofInclude *include = &ctx->proof_includes[i];
-        size_t size = strlen(include->module);
-        if (include->at < at && size && !strncmp(qn, include->module, size) && qn[size] == '.')
-            return c_proof_import_join(ctx, result, include->binding_proof, CBM_PROOF_TYPE_BIND);
-    }
+    const CTUModule *owner = c_tu_owner(ctx, qn, at);
+    if (owner)
+        return c_proof_import_join(ctx, result, owner->via, CBM_PROOF_TYPE_BIND);
     return c_proof_missing("c_type_import_predecessor_missing");
 }
 
@@ -1577,14 +1902,58 @@ static bool c_proof_signature_equal(const CBMType *left, const CBMType *right) {
  * short-name guess. Every project candidate in that indexed bucket must have
  * audited linkage facts; incompatible, duplicate and unknown definitions close
  * the domain without a target. Static definitions belong to other TUs. */
+/* Does a translation unit rooted at this file include that one? A definition whose
+ * own file sees the prototype was compiled against it. */
+static bool c_proof_file_reaches(CLSPContext *ctx, const char *from, const char *to) {
+    if (!strcmp(from, to))
+        return true;
+    enum { REACH_LIMIT = 4096 };
+    const char **seen = cbm_arena_alloc(ctx->arena, REACH_LIMIT * sizeof(*seen));
+    if (!seen)
+        return false;
+    int head = 0, tail = 0;
+    seen[tail++] = from;
+    while (head < tail) {
+        const CBMCFileFacts *facts = cbm_c_file_facts(ctx->c_decls, seen[head++]);
+        for (int n = 0; facts && n < facts->include_count; n++) {
+            const char *next = facts->includes[n];
+            if (!strcmp(next, to))
+                return true;
+            bool known = false;
+            for (int k = 0; k < tail && !known; k++)
+                known = !strcmp(seen[k], next);
+            if (!known && tail < REACH_LIMIT)
+                seen[tail++] = next;
+        }
+    }
+    return false;
+}
+
+static const char *c_proof_func_file(CLSPContext *ctx, const CBMRegisteredFunc *candidate,
+                                     const char *relative) {
+    if (candidate->source_file_qn)
+        return candidate->source_file_qn;
+    size_t qn = strlen(candidate->qualified_name), rel = strlen(relative);
+    return qn > rel + 1 ? cbm_arena_strndup(ctx->arena, candidate->qualified_name, qn - rel - 1)
+                        : NULL;
+}
+
+/* `declaring` names the file holding the visible prototype, or NULL when that is
+ * this file. Several definitions of one external name are several programs in one
+ * repository. The one whose own file includes this prototype was compiled against
+ * it, which is what makes it the definition of this declaration. */
 static cbm_resolve_result_t c_proof_external_definition(CLSPContext *ctx, const char *relative,
-                                                        const CBMType *signature, bool c_linkage) {
+                                                        const CBMType *signature, int arity,
+                                                        bool c_linkage, bool any_linkage,
+                                                        const char *declaring) {
     if (ctx->proof_preprocessor_unknown)
         return c_proof_missing("c_external_preprocessor_domain_unproven");
     const char *leaf = strrchr(relative, '.');
     const char *name = leaf ? leaf + 1 : relative;
     size_t namespace_len = leaf ? (size_t)(leaf - relative) : 0;
     const CBMRegisteredFunc *chosen = NULL;
+    const CBMRegisteredFunc *compiled_against = NULL;
+    int definitions = 0, compiled_count = 0;
     CBMFreeFuncIter iterator;
     cbm_registry_free_funcs_by_short_name_chain(ctx->proof_registry, name, &iterator);
     int index;
@@ -1599,26 +1968,45 @@ static cbm_resolve_result_t c_proof_external_definition(CLSPContext *ctx, const 
         if (candidate->source_flags & CBM_SOURCE_DECL_STATIC)
             continue;
         bool candidate_c = (candidate->source_flags & CBM_SOURCE_DECL_EXTERN_C) != 0;
-        if (candidate_c != c_linkage)
+        if (!any_linkage && candidate_c != c_linkage)
             continue;
-        if (!c_linkage && (strlen(candidate->source_namespace) != namespace_len ||
-                           strncmp(candidate->source_namespace, relative, namespace_len)))
+        if (!candidate_c && (strlen(candidate->source_namespace) != namespace_len ||
+                             strncmp(candidate->source_namespace, relative, namespace_len)))
             continue;
-        if (!signature || !candidate->source_signature ||
-            !c_proof_signature_equal(signature, candidate->source_signature))
+        /* C identifies an external name by spelling. Signatures are compared to
+         * reject what a compiler would reject, as far as each is understood:
+         * builtin types exactly, and otherwise the parameter count. */
+        if (signature && candidate->source_signature) {
+            if (!c_proof_signature_equal(signature, candidate->source_signature))
+                return c_proof_missing("c_external_signature_conflict");
+        } else if (arity >= 0 && candidate->source_arity && candidate->source_arity != arity + 1) {
             return c_proof_missing("c_external_signature_conflict");
+        }
         if (!(candidate->source_flags & CBM_SOURCE_FUNCTION_DEFINITION))
             continue;
         if (!candidate->declaration_identity || !candidate->graph_qualified_name ||
             candidate->type_param_names)
             return c_proof_missing("c_external_definition_identity_missing");
-        if (chosen && (strcmp(chosen->declaration_identity, candidate->declaration_identity) ||
-                       strcmp(chosen->graph_qualified_name, candidate->graph_qualified_name)))
+        /* #if variants of one definition share one graph node. */
+        if (chosen && !strcmp(chosen->graph_qualified_name, candidate->graph_qualified_name))
+            continue;
+        definitions++;
+        if (declaring && definitions <= 64) {
+            const char *file = c_proof_func_file(ctx, candidate, relative);
+            if (file && c_proof_file_reaches(ctx, file, declaring)) {
+                compiled_against = candidate;
+                compiled_count++;
+            }
+        }
+        chosen = candidate;
+    }
+    if (definitions > 1) {
+        if (compiled_count != 1)
             return (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_AMBIGUOUS,
                                           .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
                                           .candidate_count = 2,
                                           .reason = "c_external_definitions_conflict"};
-        chosen = candidate;
+        chosen = compiled_against;
     }
     return chosen ? c_proof_query(ctx, chosen->qualified_name, CBM_RESOLVE_RULE_SCOPE_BINDING)
                   : (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
@@ -1644,17 +2032,20 @@ static cbm_resolve_result_t c_proof_visible_prototype(CLSPContext *ctx, const ch
         const CProofDeclaration *decl = &ctx->proof_declarations[i];
         if (decl->at >= at || ts_node_is_null(decl->site))
             continue;
-        if (!decl->external || !decl->signature ||
-            (signature &&
-             (!c_proof_signature_equal(signature, decl->signature) || linkage != decl->c_linkage)))
+        if (!decl->external || decl->no_prototype ||
+            (!ts_node_is_null(site) &&
+             ((signature && decl->signature && !c_proof_signature_equal(signature, decl->signature)) ||
+              linkage != decl->c_linkage)))
             return c_proof_missing("c_prototype_linkage_unsupported");
-        signature = decl->signature;
+        if (decl->signature)
+            signature = decl->signature;
         linkage = decl->c_linkage;
         site = decl->site;
     }
-    if (!signature)
+    if (ts_node_is_null(site))
         return result;
-    result = c_proof_external_definition(ctx, relative, signature, linkage);
+    result = c_proof_external_definition(ctx, relative, signature, -1, linkage,
+                                         ctx->plain_header && !linkage, c_own_file_key(ctx));
     return cbm_resolve_admit(&result)
                ? cbm_lsp_proof_rule(
                      &ctx->field_types, result, site, "c-external-prototype", relative,
@@ -1684,6 +2075,15 @@ static cbm_resolve_result_t c_proof_domain(CLSPContext *ctx, const char *relativ
             local_result = c_proof_visible_prototype(ctx, local, relative, at);
         if (!c_proof_merge(&result, local_result))
             return result;
+    } else {
+        /* A use before this file's own top-level definition compiled against an
+         * earlier declaration, written in some header if not here. File scope has
+         * one meaning for an ordinary name, so that declaration is of this function. */
+        const CBMRegisteredFunc *registered = cbm_registry_lookup_func(ctx->proof_registry, local);
+        uint32_t own = CBM_SOURCE_DECL_TOP_LEVEL | CBM_SOURCE_FUNCTION_DEFINITION;
+        if (registered && (registered->source_flags & own) == own &&
+            !c_proof_merge(&result, c_proof_query(ctx, local, CBM_RESOLVE_RULE_SCOPE_BINDING)))
+            return result;
     }
     for (int i = 0; i < ctx->include_count; i++) {
         const CProofInclude *include = &ctx->proof_includes[i];
@@ -1695,14 +2095,98 @@ static cbm_resolve_result_t c_proof_domain(CLSPContext *ctx, const char *relativ
              !strcmp(include->path, ctx->proof_includes[i + 1].path) &&
              strcmp(include->module, ctx->proof_includes[i + 1].module)))
             return c_proof_missing("c_include_mapping_conflict");
-        const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", include->module, relative);
+    }
+    /* What an included file defines: one candidate per project function of this
+     * name, kept when its file is in this translation unit. */
+    const char *leaf = strrchr(relative, '.');
+    leaf = leaf ? leaf + 1 : relative;
+    size_t relative_len = strlen(relative);
+    CBMFreeFuncIter iterator;
+    cbm_registry_free_funcs_by_short_name_chain(ctx->proof_registry, leaf, &iterator);
+    int index;
+    while ((index = cbm_free_func_iter_next(&iterator)) >= 0) {
+        const CBMRegisteredFunc *candidate = &iterator.reg->funcs[index];
+        const char *qn = candidate->qualified_name;
+        size_t qn_len = qn ? strlen(qn) : 0;
+        if (qn_len <= relative_len + 1 || qn[qn_len - relative_len - 1] != '.' ||
+            strcmp(qn + qn_len - relative_len, relative))
+            continue;
+        const CTUModule *entry =
+            c_tu_for_declaration(ctx, candidate->source_file_qn, qn, qn_len - relative_len - 1);
+        if (!entry || entry->at >= at)
+            continue;
+        if (entry->exports_only &&
+            (!(candidate->source_flags & CBM_SOURCE_FUNCTION_DEFINITION) ||
+             (candidate->source_flags & CBM_SOURCE_DECL_STATIC)))
+            continue;
         cbm_resolve_result_t imported = c_proof_query(ctx, qn, CBM_RESOLVE_RULE_IMPORT_BINDING);
-        imported =
-            c_proof_import_join(ctx, imported, include->binding_proof, CBM_PROOF_IMPORT_BINDING);
+        imported = c_proof_import_join(ctx, imported, entry->via, CBM_PROOF_IMPORT_BINDING);
         if (!c_proof_merge(&result, imported))
             return result;
     }
+    /* What an included file only declares. The call is to the external name, so
+     * the edge goes to the definition with that name, wherever it is compiled. */
+    const CBMCDecl *declared = NULL;
+    const CTUModule *declared_via = NULL;
+    const CBMType *signature = NULL;
+    int arity = -1;
+    bool c_linkage = !ctx->cpp_mode;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, relative); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind != CBM_C_DECL_PROTOTYPE || !(decl->flags & CBM_C_DECL_EXTERNAL) ||
+            strcmp(decl->name, relative))
+            continue;
+        const CTUModule *entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+        if (!entry || entry->exports_only || entry->at >= at)
+            continue;
+        if (signature && decl->signature && !c_proof_signature_equal(signature, decl->signature))
+            return c_proof_missing("c_prototype_linkage_unsupported");
+        if (decl->signature)
+            signature = decl->signature;
+        if (decl->arity >= 0)
+            arity = decl->arity;
+        if (decl->flags & CBM_C_DECL_C_LINKAGE)
+            c_linkage = true;
+        declared = decl;
+        declared_via = entry;
+    }
+    if (declared) {
+        cbm_resolve_result_t external = c_proof_external_definition(
+            ctx, relative, signature, arity, c_linkage, ctx->plain_header && !c_linkage,
+            declared->file);
+        if (cbm_resolve_admit(&external)) {
+            external = c_proof_import_join(ctx, external, declared_via->via, CBM_PROOF_IMPORT_BINDING);
+            if (cbm_resolve_admit(&external)) {
+                TSNode none = {0};
+                external = cbm_lsp_proof_rule(
+                    &ctx->field_types, external, none, "c-header-prototype", relative,
+                    "visible-header-prototype;compatible-signature;unique-external-definition",
+                    NULL);
+            }
+        }
+        if (!c_proof_merge(&result, external))
+            return result;
+    }
     return result;
+}
+
+/* A macro of this name may rewrite any use, and which definition wins depends on
+ * the configuration. No function of the name is proven at such a use. */
+static bool c_proof_macro_visible(CLSPContext *ctx, const char *name, uint32_t at) {
+    const char *key = cbm_arena_sprintf(ctx->arena, "$macro:%s", name);
+    if (!key || c_proof_declared(ctx, key, at))
+        return true;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind != CBM_C_DECL_MACRO || strcmp(decl->name, name))
+            continue;
+        const CTUModule *entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+        if (entry && !entry->exports_only && entry->at < at)
+            return true;
+    }
+    return false;
 }
 
 static bool c_proof_using_visible(CLSPContext *ctx, const CProofUsing *using, uint32_t at) {
@@ -1737,6 +2221,8 @@ static cbm_resolve_result_t c_proof_name_lookup(CLSPContext *ctx, const char *te
     }
     if (cbm_scope_contains(ctx->current_scope, name))
         return c_proof_missing("c_name_shadowed");
+    if (c_proof_macro_visible(ctx, name, at))
+        return c_proof_missing("c_macro_may_rewrite_name");
     cbm_resolve_result_t result = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE};
     const char *relative =
         ctx->current_namespace &&
@@ -1850,7 +2336,7 @@ static bool c_proof_builtin_argument(CLSPContext *ctx, TSNode argument);
 
 static bool c_proof_call_domain(CLSPContext *ctx, TSNode call, TSNode function,
                                 const cbm_resolve_result_t *proof) {
-    if (!ctx->cpp_mode || proof->rule == CBM_RESOLVE_RULE_CALLABLE_BINDING ||
+    if (!ctx->cpp_mode || ctx->plain_header || proof->rule == CBM_RESOLVE_RULE_CALLABLE_BINDING ||
         strcmp(ts_node_type(function), "identifier"))
         return true;
     TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
@@ -4257,18 +4743,18 @@ static const CBMRegisteredType *c_field_owner_by_short_name(CLSPContext *ctx, co
         const char *qn = candidate->qualified_name;
         if (!qn || (members_only && !c_type_has_members(candidate)))
             continue;
-        for (int inc = 0; inc < ctx->include_count; inc++) {
-            const char *module = ctx->include_ns_qns[inc];
-            size_t length = module ? strlen(module) : 0;
-            if (!length || strncmp(qn, module, length) || qn[length] != '.' ||
-                strcmp(qn + length + 1, shortn))
-                continue;
-            *found = true;
-            if (included && strcmp(included->qualified_name, qn))
-                ambiguous = true;
-            included = candidate;
-            break;
-        }
+        size_t qn_len = strlen(qn), short_len = strlen(shortn);
+        if (qn_len <= short_len + 1 || qn[qn_len - short_len - 1] != '.' ||
+            strcmp(qn + qn_len - short_len, shortn))
+            continue;
+        const CTUModule *entry =
+            c_tu_for_declaration(ctx, candidate->source_file_qn, qn, qn_len - short_len - 1);
+        if (!entry || entry->exports_only)
+            continue;
+        *found = true;
+        if (included && strcmp(included->qualified_name, qn))
+            ambiguous = true;
+        included = candidate;
     }
     return ambiguous ? NULL : included;
 }
@@ -4343,33 +4829,83 @@ static const CBMRegisteredType *c_lookup_field_owner(CLSPContext *ctx, const cha
  * spelling. In particular, an unresolved `A` may have received the synthetic
  * current-module prefix; that prefix is not a declaration identity. */
 static const CBMRegisteredType *c_proof_direct_class(CLSPContext *ctx, const char *qn, uint32_t at);
+static const CBMRegisteredType *c_proof_field_class(CLSPContext *ctx, const char *qn, uint32_t at);
 
+/* Every declaration of this type name the translation unit sees. A name may be
+ * declared repeatedly: `typedef struct X X;` beside `struct X {...}`, or the same
+ * typedef in several headers. Those denote one type. Anything else is a conflict. */
 static const CBMRegisteredType *c_proof_included_annotation(CLSPContext *ctx, const char *name,
                                                             bool *found) {
     const CBMRegisteredType *chosen = NULL;
     *found = false;
-    for (int i = 0; i < ctx->include_count; i++) {
-        const char *module = ctx->include_ns_qns[i];
-        const char *qn = module ? cbm_arena_sprintf(ctx->arena, "%s.%s", module, name) : NULL;
-        if (!qn) {
-            *found = true;
-            return NULL;
-        }
-        CBMTypeQNIter iterator;
-        cbm_registry_types_with_qn(ctx->proof_registry, qn, &iterator);
-        const CBMRegisteredType *candidate;
-        while ((candidate = cbm_type_qn_next(&iterator, NULL))) {
-            *found = true;
-            if (chosen && strcmp(chosen->qualified_name, candidate->qualified_name))
-                return NULL;
+    size_t name_len = strlen(name);
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->proof_registry, name, &it);
+    int index;
+    while ((index = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType *candidate = &it.reg->types[index];
+        const char *qn = candidate->qualified_name;
+        size_t qn_len = qn ? strlen(qn) : 0;
+        if (qn_len <= name_len + 1 || qn[qn_len - name_len - 1] != '.' ||
+            strcmp(qn + qn_len - name_len, name))
+            continue;
+        size_t module_len = qn_len - name_len - 1;
+        bool own = c_is_own_declaration(ctx, candidate->source_file_qn, qn, module_len);
+        const CTUModule *entry =
+            own ? NULL : c_tu_for_declaration(ctx, candidate->source_file_qn, qn, module_len);
+        if (!own && (!entry || entry->exports_only))
+            continue;
+        *found = true;
+        if (!chosen || !strcmp(chosen->qualified_name, qn)) {
             chosen = candidate;
+            continue;
         }
-        if (!iterator.complete) {
-            *found = true;
-            return NULL;
+        if (chosen->alias_of && candidate->alias_of &&
+            !strcmp(chosen->alias_of, candidate->alias_of))
+            continue;
+        if (chosen->alias_of && !strcmp(chosen->alias_of, name)) {
+            chosen = candidate;
+            continue;
         }
+        if (candidate->alias_of && !strcmp(candidate->alias_of, name))
+            continue;
+        return NULL;
     }
     return chosen;
+}
+
+/* The declaration a type name denotes at this point: this file's own, or the
+ * single one its includes make visible. Explicit qualification stays intact. */
+static const CBMRegisteredType *c_proof_type_by_name(CLSPContext *ctx, const char *name) {
+    const CBMRegisteredType *local = c_resolve_field_owner_type(ctx, c_build_qn(ctx, name));
+    /* Keep explicit qualification intact. An unqualified source name also
+     * searches every included module, retaining memberless and unsupported
+     * declarations as competitors. */
+    if (strchr(name, '.') || strstr(name, "::"))
+        return local;
+    bool found = false;
+    const CBMRegisteredType *included = c_proof_included_annotation(ctx, name, &found);
+    if (found && (!included || (local && strcmp(local->qualified_name, included->qualified_name))))
+        return NULL;
+    return included ? included : local;
+}
+
+/* Through typedef names to what they alias, in the unit's own view of each name.
+ * A name that aliases itself (`typedef struct X X;`) means the tag of that name. */
+static const CBMRegisteredType *c_proof_follow_alias(CLSPContext *ctx,
+                                                     const CBMRegisteredType *type) {
+    for (int hop = 0; type && type->alias_of && hop < 8; hop++) {
+        if (type->short_name && !strcmp(type->alias_of, type->short_name)) {
+            bool found = false;
+            const CBMRegisteredType *tag =
+                c_proof_included_annotation(ctx, type->alias_of, &found);
+            if (!tag || tag == type || tag->alias_of)
+                return NULL;
+            return tag;
+        }
+        type = c_proof_type_by_name(ctx, type->alias_of);
+    }
+    return type && !type->alias_of ? type : NULL;
 }
 
 static const CBMRegisteredType *c_annotation_owner(CLSPContext *ctx, TSNode site) {
@@ -4396,18 +4932,7 @@ static const CBMRegisteredType *c_annotation_owner(CLSPContext *ctx, TSNode site
         const char *name = c_node_text(ctx, annotation);
         if (!name)
             return NULL;
-        const CBMRegisteredType *local = c_resolve_field_owner_type(ctx, c_build_qn(ctx, name));
-        /* Keep explicit qualification intact. An unqualified source name also
-         * searches exact include-module + name keys, retaining memberless and
-         * unsupported declarations as competitors. */
-        if (strchr(name, '.') || strstr(name, "::"))
-            return local;
-        bool found = false;
-        const CBMRegisteredType *included = c_proof_included_annotation(ctx, name, &found);
-        if (found &&
-            (!included || (local && strcmp(local->qualified_name, included->qualified_name))))
-            return NULL;
-        return included ? included : local;
+        return c_proof_follow_alias(ctx, c_proof_type_by_name(ctx, name));
     }
     return NULL;
 }
@@ -4426,6 +4951,8 @@ static const CBMType *c_proof_annotation_type(CLSPContext *ctx, const CBMType *t
             c_proof_annotation_type(ctx, type->data.pointer.elem, owner, depth + 1);
         return inner ? cbm_type_pointer(ctx->arena, inner) : NULL;
     }
+    if (type->kind == CBM_TYPE_SLICE)
+        return c_proof_annotation_type(ctx, type->data.slice.elem, owner, depth + 1);
     if (type->kind == CBM_TYPE_REFERENCE || type->kind == CBM_TYPE_RVALUE_REF) {
         const CBMType *inner =
             c_proof_annotation_type(ctx, type->data.reference.elem, owner, depth + 1);
@@ -4507,7 +5034,7 @@ static void c_observe_declared_binding(CLSPContext *ctx, const char *name, const
     const CBMRegisteredType *owner = c_annotation_owner(ctx, site);
     if (!owner || !owner->qualified_name)
         return;
-    owner = c_proof_direct_class(ctx, owner->qualified_name, ts_node_start_byte(site));
+    owner = c_proof_field_class(ctx, owner->qualified_name, ts_node_start_byte(site));
     if (!owner)
         return;
     cbm_resolve_result_t proof = cbm_lsp_proof_type_lookup(
@@ -5546,6 +6073,34 @@ static void c_emit_resolved_call_at(CLSPContext *ctx, const char *callee_qn, con
     c_emit_resolved_call_orig_at(ctx, callee_qn, NULL, strategy, confidence, site);
 }
 
+/* Is this node the object of an assignment or increment? `a->b = 1` writes b, and
+ * `a->b.c = 1` writes c while only reading b. */
+static bool c_written_lvalue(TSNode site) {
+    TSNode node = site;
+    TSNode parent = ts_node_parent(node);
+    /* The member half of `a->b` stands for the whole access. */
+    if (!ts_node_is_null(parent) && !strcmp(ts_node_type(parent), "field_expression")) {
+        TSNode field = ts_node_child_by_field_name(parent, "field", 5);
+        if (ts_node_is_null(field) || !ts_node_eq(field, node))
+            return false;
+        node = parent;
+        parent = ts_node_parent(node);
+    }
+    while (!ts_node_is_null(parent) && !strcmp(ts_node_type(parent), "parenthesized_expression")) {
+        node = parent;
+        parent = ts_node_parent(node);
+    }
+    if (ts_node_is_null(parent))
+        return false;
+    const char *kind = ts_node_type(parent);
+    if (!strcmp(kind, "update_expression"))
+        return true;
+    if (strcmp(kind, "assignment_expression"))
+        return false;
+    TSNode left = ts_node_child_by_field_name(parent, "left", 4);
+    return !ts_node_is_null(left) && ts_node_eq(left, node);
+}
+
 static void c_emit_proven(CLSPContext *ctx, const cbm_resolve_result_t *proof,
                           const char *source_name, CBMResolvedKind kind, TSNode site) {
     if (!ctx->resolved_calls || !ctx->enclosing_func_qn || ts_node_is_null(site) ||
@@ -5553,6 +6108,10 @@ static void c_emit_proven(CLSPContext *ctx, const cbm_resolve_result_t *proof,
         !cbm_resolve_admit(proof))
         return;
     const char *relation = kind == CBM_RESOLVED_INVOCATION ? "CALLS" : "CALL_REFERENCE";
+    if (kind == CBM_RESOLVED_TYPE_REFERENCE)
+        relation = "USAGE";
+    if (kind == CBM_RESOLVED_VALUE_REFERENCE)
+        relation = c_written_lvalue(site) ? "WRITES" : "USAGE";
     if (kind == CBM_RESOLVED_CALL_REFERENCE) {
         TSNode parent = ts_node_parent(site);
         const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
@@ -5635,7 +6194,7 @@ static bool c_field_receiver_proven(CLSPContext *ctx, TSNode expression, const C
         const CBMRegisteredType *owner = c_annotation_owner(ctx, expression);
         if (!owner || !owner->qualified_name)
             return false;
-        owner = c_proof_direct_class(ctx, owner->qualified_name, ts_node_start_byte(expression));
+        owner = c_proof_field_class(ctx, owner->qualified_name, ts_node_start_byte(expression));
         if (!owner || cbm_type_is_unknown(observed))
             return false;
         cbm_resolve_result_t proof = cbm_lsp_proof_type_lookup(
@@ -5673,24 +6232,33 @@ static bool c_proof_type_visible(CLSPContext *ctx, const char *qn, uint32_t at) 
         return false;
     if (c_proof_declared(ctx, key, at))
         return true;
-    for (int i = 0; i < ctx->include_count; i++) {
-        const CProofInclude *include = &ctx->proof_includes[i];
-        size_t length = strlen(include->module);
-        if (include->at < at && !strncmp(qn, include->module, length) && qn[length] == '.')
-            return true;
-    }
-    return false;
+    return c_tu_owner(ctx, qn, at) != NULL;
 }
 
+static const CBMRegisteredType *c_proof_class_with(CLSPContext *ctx, const char *qn, uint32_t at,
+                                                   uint32_t required);
+
+/* The whole class is understood: a member name not listed here does not exist. */
 static const CBMRegisteredType *c_proof_direct_class(CLSPContext *ctx, const char *qn,
                                                      uint32_t at) {
+    return c_proof_class_with(ctx, qn, at,
+                              CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_CLASS_DOMAIN_COMPLETE);
+}
+
+/* The class is exact. A field written in its own body is that field whatever else
+ * the body holds: a directive, a nested type, a base class hidden by the member. */
+static const CBMRegisteredType *c_proof_field_class(CLSPContext *ctx, const char *qn, uint32_t at) {
+    return c_proof_class_with(ctx, qn, at, CBM_SOURCE_DECL_KNOWN);
+}
+
+static const CBMRegisteredType *c_proof_class_with(CLSPContext *ctx, const char *qn, uint32_t at,
+                                                   uint32_t required) {
     if (!qn || !c_proof_type_visible(ctx, qn, at))
         return NULL;
     CBMTypeQNIter iterator;
     cbm_registry_types_with_qn(ctx->proof_registry, qn, &iterator);
     const CBMRegisteredType *chosen = NULL, *candidate;
     while ((candidate = cbm_type_qn_next(&iterator, NULL))) {
-        uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
         if (!candidate->project_source || !candidate->declaration_identity ||
             !candidate->graph_qualified_name || (candidate->source_flags & required) != required ||
             candidate->alias_of || candidate->type_param_names)
@@ -5817,7 +6385,7 @@ static void c_publish_field_owner(CLSPContext *ctx, const char *type_qn, const c
                  CBM_RESOLVE_FACT_RECEIVER_TYPED | CBM_RESOLVE_FACT_OCCURRENCE_EXACT};
     if (receiver_proof) {
         const CBMRegisteredType *exact =
-            c_proof_direct_class(ctx, type_qn, ts_node_start_byte(site));
+            c_proof_field_class(ctx, type_qn, ts_node_start_byte(site));
         unsigned matches = 0, slot = 0;
         if (exact && exact == owner && exact->field_names) {
             unsigned i = 0;
@@ -5858,16 +6426,145 @@ static void c_publish_field_owner(CLSPContext *ctx, const char *type_qn, const c
                                            detail, owner_proof);
             else
                 proof.analysis = CBM_RESOLVE_ANALYSIS_FAILED;
-            /* This producer establishes a field value occurrence. Assignment
-             * and read/write classification need their own AST authority; a
-             * generic field record must not authorize every access relation. */
+            /* This producer establishes a field value occurrence. Whether it is
+             * written is read here from the AST, the same way the extractor's
+             * assignment record does, and a write also serves as a usage. */
             proof = cbm_lsp_proof_occurrence(&ctx->field_types, proof, site, ctx->enclosing_func_qn,
-                                             field_name, "USAGE");
+                                             field_name, c_written_lvalue(site) ? "WRITES" : "USAGE");
             resolved.evidence = cbm_lsp_proof_evidence(proof);
         }
     }
     if (resolved.callee_qn)
         c_publish_resolved_call(ctx, resolved);
+}
+
+/* The base type name written in a field's declaration: `struct Ops *` is Ops. */
+static const char *c_field_type_name(const CBMType *type) {
+    for (int hop = 0; type && hop < 8; hop++) {
+        if (type->kind == CBM_TYPE_POINTER) {
+            type = type->data.pointer.elem;
+        } else if (type->kind == CBM_TYPE_SLICE) {
+            type = type->data.slice.elem;
+        } else if (type->kind == CBM_TYPE_REFERENCE || type->kind == CBM_TYPE_RVALUE_REF) {
+            type = type->data.reference.elem;
+        } else if (type->kind == CBM_TYPE_NAMED) {
+            const char *qn = type->data.named.qualified_name;
+            const char *dot = qn ? strrchr(qn, '.') : NULL;
+            return dot ? dot + 1 : qn;
+        } else {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* The written type of a file-scope object this unit sees. Every declaration of an
+ * object has one type, so a disagreement says this is not one object. */
+static const char *c_proof_value_type_name(CLSPContext *ctx, const char *name, uint32_t at) {
+    const char *type_name = NULL;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if ((decl->kind != CBM_C_DECL_EXTERN_VALUE && decl->kind != CBM_C_DECL_VALUE) ||
+            strcmp(decl->name, name) || !decl->type_name)
+            continue;
+        if (strcmp(decl->file, c_own_file_key(ctx))) {
+            const CTUModule *entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+            if (!entry || entry->exports_only || entry->at >= at)
+                continue;
+        }
+        if (type_name && strcmp(type_name, decl->type_name))
+            return NULL;
+        type_name = decl->type_name;
+    }
+    return type_name;
+}
+
+/* The struct an expression denotes, as the written declarations along it establish
+ * it: a typed name, an extern object, a member of a known struct, or any of those
+ * under `*`, `&`, `[]` and parentheses. No initializer is consulted and nothing
+ * about the value flows in, so reassignment cannot make it stale. */
+static const CBMRegisteredType *c_proof_expression_owner(CLSPContext *ctx, TSNode node, int depth,
+                                                         const cbm_resolve_proof_t **proof) {
+    if (depth > 16 || ts_node_is_null(node) || ctx->eval_failure)
+        return NULL;
+    const char *kind = ts_node_type(node);
+    uint32_t at = ts_node_start_byte(node);
+    if (!strcmp(kind, "parenthesized_expression") && ts_node_named_child_count(node) == 1)
+        return c_proof_expression_owner(ctx, ts_node_named_child(node, 0), depth + 1, proof);
+    if (!strcmp(kind, "subscript_expression") || !strcmp(kind, "pointer_expression"))
+        return c_proof_expression_owner(ctx, ts_node_child_by_field_name(node, "argument", 8),
+                                        depth + 1, proof);
+    if (!strcmp(kind, "field_expression")) {
+        const CBMRegisteredType *base = c_proof_expression_owner(
+            ctx, ts_node_child_by_field_name(node, "argument", 8), depth + 1, proof);
+        TSNode field = ts_node_child_by_field_name(node, "field", 5);
+        const char *name = !base || ts_node_is_null(field) ? NULL : c_node_text(ctx, field);
+        if (!name || !base->field_names || !base->field_types)
+            return NULL;
+        for (unsigned i = 0; i < 16384 && base->field_names[i]; i++) {
+            if (strcmp(base->field_names[i], name))
+                continue;
+            const char *type_name = c_field_type_name(base->field_types[i]);
+            const CBMRegisteredType *owner =
+                type_name ? c_proof_follow_alias(ctx, c_proof_type_by_name(ctx, type_name)) : NULL;
+            return owner ? c_proof_field_class(ctx, owner->qualified_name, at) : NULL;
+        }
+        return NULL;
+    }
+    if (!strcmp(kind, "call_expression")) {
+        /* What a call returns is written on the function it selects. */
+        cbm_resolve_result_t callee =
+            c_callable_proof(ctx, ts_node_child_by_field_name(node, "function", 8));
+        const CBMRegisteredFunc *function =
+            cbm_resolve_admit(&callee)
+                ? cbm_registry_lookup_func(ctx->proof_registry, callee.target)
+                : NULL;
+        const CBMType *written =
+            function && function->signature && function->signature->kind == CBM_TYPE_FUNC &&
+                    function->signature->data.func.return_types
+                ? function->signature->data.func.return_types[0]
+                : NULL;
+        const char *type_name = c_field_type_name(written);
+        const CBMRegisteredType *owner =
+            type_name ? c_proof_follow_alias(ctx, c_proof_type_by_name(ctx, type_name)) : NULL;
+        owner = owner ? c_proof_field_class(ctx, owner->qualified_name, at) : NULL;
+        if (!owner)
+            return NULL;
+        *proof = callee.proof;
+        return owner;
+    }
+    if (strcmp(kind, "identifier"))
+        return NULL;
+    const char *name = c_node_text(ctx, node);
+    if (!name)
+        return NULL;
+    cbm_resolve_type_fact_t fact =
+        cbm_resolve_types_lookup(&ctx->field_types, ctx->current_scope, name, at);
+    if (fact.status == CBM_RESOLVE_TYPE_KNOWN && fact.evidence.target && fact.evidence.proof) {
+        *proof = fact.evidence.proof;
+        return c_proof_field_class(ctx, fact.evidence.target, at);
+    }
+    /* A name bound in this function that the fact above does not type is opaque. */
+    if (cbm_scope_contains(ctx->current_scope, name))
+        return NULL;
+    const char *type_name = c_proof_value_type_name(ctx, name, at);
+    if (!type_name)
+        return NULL;
+    const CBMRegisteredType *owner =
+        c_proof_follow_alias(ctx, c_proof_type_by_name(ctx, type_name));
+    owner = owner ? c_proof_field_class(ctx, owner->qualified_name, at) : NULL;
+    if (!owner)
+        return NULL;
+    cbm_resolve_result_t typed = cbm_lsp_proof_type_lookup(
+        &ctx->field_types, name, node, "c-extern-object-type", owner->qualified_name,
+        owner->declaration_identity, owner->graph_qualified_name, owner->source_flags,
+        "visible-extern-declaration;written-type");
+    typed = c_proof_type_import(ctx, owner->qualified_name, at, typed);
+    if (!cbm_resolve_admit(&typed))
+        return NULL;
+    *proof = typed.proof;
+    return owner;
 }
 
 static void c_emit_field_reference(CLSPContext *ctx, TSNode node) {
@@ -5881,6 +6578,14 @@ static void c_emit_field_reference(CLSPContext *ctx, TSNode node) {
     char *field_name = c_node_text(ctx, field);
     if (!field_name || !field_name[0])
         return;
+    if (!ctx->cpp_mode || ctx->plain_header) {
+        const cbm_resolve_proof_t *owner_proof = NULL;
+        const CBMRegisteredType *owner = c_proof_expression_owner(ctx, argument, 0, &owner_proof);
+        if (owner && owner_proof) {
+            c_publish_field_owner(ctx, owner->qualified_name, field_name, field, owner_proof);
+            return;
+        }
+    }
     const CBMType *object_type = c_eval_expr_type(ctx, argument);
     const char *type_qn = NULL;
     const cbm_resolve_proof_t *receiver_proof = NULL;
@@ -6023,6 +6728,281 @@ static void c_walk_initializer_list(CLSPContext *ctx, TSNode list) {
         position++;
         c_resolve_calls_in_node(ctx, child);
     }
+}
+
+/* A binding nearer than file scope: a parameter or a block-scope name. */
+static bool c_name_bound_locally(CLSPContext *ctx, const char *name) {
+    for (const CBMScope *scope = ctx->current_scope; scope && scope->parent; scope = scope->parent)
+        if (cbm_scope_lookup_local(scope, name))
+            return true;
+    return false;
+}
+
+/* The name a declarator introduces, through `*`, `[]` and `(*name)(int)`. */
+static TSNode c_declarator_identifier(TSNode declarator) {
+    for (int hop = 0; hop < 16 && !ts_node_is_null(declarator); hop++) {
+        const char *kind = ts_node_type(declarator);
+        if (!strcmp(kind, "identifier"))
+            return declarator;
+        TSNode inner = ts_node_child_by_field_name(declarator, "declarator", 10);
+        if (ts_node_is_null(inner) && !strcmp(kind, "parenthesized_declarator") &&
+            ts_node_named_child_count(declarator))
+            inner = ts_node_named_child(declarator, 0);
+        declarator = inner;
+    }
+    return (TSNode){0};
+}
+
+/* A local name hides a file-scope one from its declaration on, even when nothing
+ * else about it is understood: a callback parameter `int (*fn)(int)`, for one. */
+static void c_bind_declared_names(CLSPContext *ctx, TSNode node, const char *kind) {
+    if (strcmp(kind, "parameter_declaration") && strcmp(kind, "optional_parameter_declaration") &&
+        strcmp(kind, "declaration"))
+        return;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor))
+        do {
+            const char *field = ts_tree_cursor_current_field_name(&cursor);
+            if (!field || strcmp(field, "declarator"))
+                continue;
+            TSNode name = c_declarator_identifier(ts_tree_cursor_current_node(&cursor));
+            const char *text = ts_node_is_null(name) ? NULL : c_node_text(ctx, name);
+            if (text && !cbm_scope_lookup_local(ctx->current_scope, text))
+                c_scope_bind(ctx, text, cbm_type_unknown());
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* An extern declaration of this object the translation unit sees. */
+static const CBMCDecl *c_proof_extern_value(CLSPContext *ctx, const char *name, uint32_t at,
+                                            const CTUModule **via) {
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind != CBM_C_DECL_EXTERN_VALUE || strcmp(decl->name, name))
+            continue;
+        if (!strcmp(decl->file, c_own_file_key(ctx)))
+            return decl;
+        const CTUModule *entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+        if (entry && !entry->exports_only && entry->at < at) {
+            *via = entry;
+            return decl;
+        }
+    }
+    return NULL;
+}
+
+/* An exact graph declaration chosen by the rules around this call. */
+static cbm_resolve_result_t c_proof_declaration_lookup(CLSPContext *ctx, const char *spelling,
+                                                       TSNode site, const char *target,
+                                                       const char *decision, bool imported) {
+    cbm_resolve_proof_key_t key = {.lookup_domain = spelling,
+                                   .lookup_key = spelling,
+                                   .declaration_identity = target,
+                                   .start_byte = ts_node_start_byte(site),
+                                   .end_byte = ts_node_end_byte(site),
+                                   .binding_identity = target,
+                                   .detail = decision};
+    cbm_resolve_result_t audit = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE, .reason = decision};
+    const cbm_resolve_proof_t *inputs[2];
+    inputs[0] = cbm_resolve_proof_leaf(&ctx->field_types.proofs, CBM_PROOF_ADAPTER_DOMAIN,
+                                       &ctx->field_types.proof_source, &key, &audit);
+    audit.binding = CBM_RESOLVE_BINDING_UNIQUE;
+    audit.domain = CBM_RESOLVE_DOMAIN_PROJECT;
+    audit.target = target;
+    audit.facts = CBM_RESOLVE_FACT_EXACT_TARGET;
+    audit.candidate_count = 1;
+    key.detail = "selected_declaration";
+    inputs[1] = cbm_resolve_proof_leaf(&ctx->field_types.proofs, CBM_PROOF_REGISTERED_DECLARATION,
+                                       NULL, &key, &audit);
+    cbm_resolve_result_t result = {
+        .binding = CBM_RESOLVE_BINDING_UNIQUE,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+        .rule = imported ? CBM_RESOLVE_RULE_IMPORT_BINDING : CBM_RESOLVE_RULE_SCOPE_BINDING,
+        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                 CBM_RESOLVE_FACT_OCCURRENCE_EXACT |
+                 (imported ? CBM_RESOLVE_FACT_IMPORT_BOUND : CBM_RESOLVE_FACT_SCOPE_BOUND),
+        .target = target,
+        .candidate_count = 1,
+        .reason = decision};
+    result.proof =
+        cbm_resolve_proof_derive(&ctx->field_types.proofs, CBM_PROOF_REGISTRY_LOOKUP,
+                                 &ctx->field_types.proof_source, &key, &result, inputs, 2, true);
+    if (!result.proof || result.proof->value.outcome.analysis != CBM_RESOLVE_ANALYSIS_COMPLETE)
+        return c_proof_missing("c_declaration_lookup_failed");
+    return result;
+}
+
+/* A file-scope object or enumerator in the translation unit. An extern declaration
+ * means the one definition of that external name in the project, as for functions. */
+static cbm_resolve_result_t c_proof_value(CLSPContext *ctx, const char *name, TSNode site) {
+    uint32_t at = ts_node_start_byte(site);
+    cbm_resolve_result_t result = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                   .reason = "c_visible_value_missing"};
+    const char *chosen = NULL;
+    const CTUModule *chosen_via = NULL;
+    const char *external = NULL;
+    int external_count = 0;
+    for (const CBMCDeclLink *link = cbm_c_decl_lookup(ctx->c_decls, name); link;
+         link = link->next) {
+        const CBMCDecl *decl = link->decl;
+        if (decl->kind != CBM_C_DECL_VALUE || strcmp(decl->name, name) || !decl->target)
+            continue;
+        if ((decl->flags & CBM_C_DECL_EXTERNAL) && strcmp(external ? external : "", decl->target)) {
+            external = decl->target;
+            external_count++;
+        }
+        const CTUModule *entry = NULL;
+        if (strcmp(decl->file, c_own_file_key(ctx))) {
+            entry = c_tu_find(ctx, decl->file, strlen(decl->file));
+            if (!entry || entry->exports_only || entry->at >= at)
+                continue;
+        }
+        if (chosen && strcmp(chosen, decl->target))
+            return (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_AMBIGUOUS,
+                                          .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                          .candidate_count = 2,
+                                          .reason = "c_visible_values_conflict"};
+        chosen = decl->target;
+        chosen_via = entry;
+    }
+    if (chosen) {
+        result = c_proof_declaration_lookup(ctx, name, site, chosen, "visible-file-scope-value",
+                                            chosen_via != NULL);
+        return chosen_via
+                   ? c_proof_import_join(ctx, result, chosen_via->via, CBM_PROOF_IMPORT_BINDING)
+                   : result;
+    }
+    const CTUModule *via = NULL;
+    const CBMCDecl *declared = c_proof_extern_value(ctx, name, at, &via);
+    if (!declared)
+        return result;
+    if (external_count > 1)
+        return (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                      .binding = CBM_RESOLVE_BINDING_AMBIGUOUS,
+                                      .candidate_count = 2,
+                                      .reason = "c_extern_value_definition_not_unique"};
+    /* With no definition in the project, the declaration itself is what the name
+     * selects, when it has a node of its own. */
+    if (!external && declared->target)
+        external = declared->target;
+    if (!external)
+        return result;
+    result = c_proof_declaration_lookup(ctx, name, site, external,
+                                        "visible-extern-declaration;unique-external-definition",
+                                        false);
+    return via ? c_proof_import_join(ctx, result, via->via, CBM_PROOF_IMPORT_BINDING) : result;
+}
+
+static void c_emit_value_reference(CLSPContext *ctx, TSNode node) {
+    if (!ctx->c_decls || !ctx->enclosing_func_qn || ctx->in_template)
+        return;
+    TSNode parent = ts_node_parent(node);
+    const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    /* Only expression positions: a declarator names what it declares, and a callee
+     * is the call's own proof. */
+    static const char *const not_values[] = {"init_declarator",     "pointer_declarator",
+                                             "array_declarator",    "function_declarator",
+                                             "parameter_declaration", "declaration",
+                                             "attribute_specifier", "preproc_defined",
+                                             "qualified_identifier", "field_designator",
+                                             "enumerator"};
+    for (size_t i = 0; i < sizeof(not_values) / sizeof(not_values[0]); i++) {
+        if (strcmp(parent_kind, not_values[i]))
+            continue;
+        TSNode value = ts_node_child_by_field_name(parent, "value", 5);
+        if (ts_node_is_null(value) || !ts_node_eq(value, node))
+            return;
+    }
+    if (!strcmp(parent_kind, "call_expression")) {
+        TSNode function = ts_node_child_by_field_name(parent, "function", 8);
+        if (!ts_node_is_null(function) && ts_node_eq(function, node))
+            return;
+    }
+    const char *name = c_node_text(ctx, node);
+    if (!name || c_name_bound_locally(ctx, name) ||
+        c_proof_macro_visible(ctx, name, ts_node_start_byte(node)))
+        return;
+    cbm_resolve_result_t proof = c_proof_value(ctx, name, node);
+    if (cbm_resolve_admit(&proof))
+        c_emit_proven(ctx, &proof, name, CBM_RESOLVED_VALUE_REFERENCE, node);
+}
+
+/* A function can declare its own `enum { LIMIT = 8 }` or `struct node { ... }`. Those
+ * names are in block scope and hide any file-scope namesake from here on. */
+static void c_bind_local_tag_and_enumerators(CLSPContext *ctx, TSNode node, const char *kind) {
+    if (strcmp(kind, "struct_specifier") && strcmp(kind, "union_specifier") &&
+        strcmp(kind, "enum_specifier"))
+        return;
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (ts_node_is_null(body))
+        return;
+    TSNode tag = ts_node_child_by_field_name(node, "name", 4);
+    const char *tag_name = ts_node_is_null(tag) ? NULL : c_node_text(ctx, tag);
+    if (tag_name)
+        c_scope_bind(ctx, tag_name, cbm_type_unknown());
+    if (strcmp(kind, "enum_specifier"))
+        return;
+    uint32_t count = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(body, i);
+        TSNode name = strcmp(ts_node_type(item), "enumerator")
+                          ? (TSNode){0}
+                          : ts_node_child_by_field_name(item, "name", 4);
+        const char *text = ts_node_is_null(name) ? NULL : c_node_text(ctx, name);
+        if (text)
+            c_scope_bind(ctx, text, cbm_type_unknown());
+    }
+}
+
+/* A written type name. Its declaration in this translation unit is the target,
+ * which is a typedef's own node, not what the typedef aliases. */
+static void c_emit_type_reference(CLSPContext *ctx, TSNode node) {
+    if (!ctx->enclosing_func_qn || ctx->in_template || ctx->enclosing_class_qn)
+        return;
+    /* `ns::Name` and `Tpl<Name>::x` are not looked up from here. */
+    TSNode parent = ts_node_parent(node);
+    const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    if (!strcmp(parent_kind, "qualified_identifier") || !strcmp(parent_kind, "template_type") ||
+        !strcmp(parent_kind, "scoped_type_identifier"))
+        return;
+    /* `struct node {...}` defines a tag here rather than using one. */
+    if ((!strcmp(parent_kind, "struct_specifier") || !strcmp(parent_kind, "union_specifier") ||
+         !strcmp(parent_kind, "enum_specifier")) &&
+        !ts_node_is_null(ts_node_child_by_field_name(parent, "body", 4)))
+        return;
+    const char *name = c_node_text(ctx, node);
+    if (!name || !ctx->module_qn || c_name_bound_locally(ctx, name) ||
+        c_proof_macro_visible(ctx, name, ts_node_start_byte(node)))
+        return;
+    const CBMRegisteredType *type = c_proof_type_by_name(ctx, name);
+    uint32_t at = ts_node_start_byte(node);
+    if (!type || !type->project_source || !type->graph_qualified_name ||
+        !c_proof_type_visible(ctx, type->qualified_name, at))
+        return;
+    /* A tag and an alias of the same spelling are one name to a C reader. Several
+     * different typedefs of it are not, whichever the lookup above happened to keep. */
+    cbm_resolve_result_t proof = cbm_lsp_proof_type_lookup(
+        &ctx->field_types, name, node, "c-written-type-name", type->qualified_name,
+        type->declaration_identity, type->graph_qualified_name, type->source_flags,
+        "visible-type-declaration");
+    proof = c_proof_type_import(ctx, type->qualified_name, at, proof);
+    if (cbm_resolve_admit(&proof))
+        c_emit_proven(ctx, &proof, name, CBM_RESOLVED_TYPE_REFERENCE, node);
+}
+
+/* The types in a function's own signature belong to that function's usage. */
+static void c_emit_signature_types(CLSPContext *ctx, TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > 32)
+        return;
+    if (!strcmp(ts_node_type(node), "type_identifier")) {
+        c_emit_type_reference(ctx, node);
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++)
+        c_emit_signature_types(ctx, ts_node_named_child(node, i), depth + 1);
 }
 
 /* A direct identifier argument denotes a precise callable value only when its
@@ -6169,6 +7149,14 @@ static void c_resolve_calls_in_node_inner(CLSPContext *ctx, TSNode node) {
     }
 
     c_resolve_callable_value_reference(ctx, node);
+    if (!strcmp(kind, "identifier"))
+        c_emit_value_reference(ctx, node);
+    else if (!strcmp(kind, "type_identifier"))
+        c_emit_type_reference(ctx, node);
+    else if (ctx->current_scope && ctx->current_scope->parent) {
+        c_bind_local_tag_and_enumerators(ctx, node, kind);
+        c_bind_declared_names(ctx, node, kind);
+    }
 
     // --- Member access: publish which type owns the field ---
     if (strcmp(kind, "field_expression") == 0) {
@@ -7163,6 +8151,12 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     if (ts_node_is_null(decl))
         return;
 
+    /* `void f(int a) ATTR { ... }` under the C++ grammar reads as a function named
+     * ATTR with no parameters, its real name and parameters lost in an ERROR. Which
+     * function this body belongs to, and what its parameters hide, is not known. */
+    if (!strcmp(ts_node_type(decl), "identifier"))
+        return;
+
     // Extract function name from declarator chain
     char *func_name = NULL;
     const char *saved_class_qn = ctx->enclosing_class_qn;
@@ -7344,6 +8338,9 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     // Push function scope
     CBMScope *saved_scope = ctx->current_scope;
     ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    uint32_t saved_syntax_limit = ctx->proof_syntax_limit;
+    if (!saved_func_qn || saved_func_qn == ctx->module_qn)
+        c_proof_enter_function(ctx, func_node);
 
     // Bind 'this' if in a method
     if (ctx->enclosing_class_qn) {
@@ -7368,6 +8365,7 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
                         defaulted_params++;
                 }
                 c_process_statement(ctx, param);
+                c_bind_declared_names(ctx, param, pk);
             }
         }
     }
@@ -7380,6 +8378,9 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
         }
     }
 
+    c_emit_signature_types(ctx, ts_node_child_by_field_name(func_node, "type", 4), 0);
+    c_emit_signature_types(ctx, params_node, 0);
+
     // Walk function body
     TSNode body = ts_node_child_by_field_name(func_node, "body", 4);
     if (!ts_node_is_null(body)) {
@@ -7390,6 +8391,7 @@ static void c_process_function(CLSPContext *ctx, TSNode func_node) {
     ctx->current_scope = saved_scope;
     ctx->enclosing_class_qn = saved_class_qn;
     ctx->enclosing_func_qn = saved_func_qn;
+    ctx->proof_syntax_limit = saved_syntax_limit;
 }
 
 // ============================================================================
@@ -7402,7 +8404,10 @@ static bool c_is_body_container(const char *kind) {
     return strcmp(kind, "preproc_if") == 0 || strcmp(kind, "preproc_ifdef") == 0 ||
            strcmp(kind, "preproc_else") == 0 || strcmp(kind, "preproc_elif") == 0 ||
            strcmp(kind, "preproc_elifdef") == 0 || strcmp(kind, "linkage_specification") == 0 ||
-           strcmp(kind, "declaration_list") == 0;
+           strcmp(kind, "declaration_list") == 0 ||
+           /* An #if that splits a brace leaves the rest of the file inside one ERROR,
+            * and complete functions sit in it with their own scopes intact. */
+           strcmp(kind, "ERROR") == 0;
 }
 
 // Process a top-level or nested declaration within a namespace/class body,
@@ -8619,8 +9624,12 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             rt.project_source = true;
             rt.graph_qualified_name = d->graph_qualified_name;
             rt.declaration_identity = d->declaration_identity;
+            rt.source_file_qn = d->source_file_qn;
             rt.source_flags = d->source_flags;
             rt.is_interface = d->is_interface;
+            /* `typedef struct Tag Name;`, `typedef Other Name;`: the written name.
+             * Each use resolves it in its own translation unit. */
+            rt.alias_of = d->alias_target;
 
             // Embedded/base types
             if (d->embedded_types) {
@@ -8702,6 +9711,8 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             rf.graph_qualified_name = d->graph_qualified_name;
             rf.source_flags = d->source_flags;
             rf.source_signature = d->source_signature;
+            rf.source_arity = d->source_arity;
+            rf.source_file_qn = d->source_file_qn;
             rf.source_namespace = d->namespace_name;
             if (rf.source_flags & CBM_SOURCE_DECL_FIXED_ARITY)
                 rf.min_params = d->signature_param_count;
@@ -8773,6 +9784,7 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
     }
     cbm_registry_finalize(reg);
     cbm_registry_build_type_short_index(reg);
+    reg->c_decls = cbm_c_decl_index_build(arena, defs, def_count);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -8948,6 +9960,7 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
     // comment for the rationale (linear-scan fallback otherwise).
     cbm_registry_finalize(&reg);
     cbm_registry_build_type_short_index(&reg);
+    reg.c_decls = cbm_c_decl_index_build(arena, defs, def_count);
 
     // Initialize context and run
     CLSPContext ctx;

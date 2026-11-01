@@ -2288,9 +2288,97 @@ static const cbm_gbuf_node_t *include_in_directory(const cbm_pipeline_ctx_t *ctx
     return cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, canonical + size + 1);
 }
 
+/* Headers the toolchain supplies. A project file spelled the same way is a
+ * compat shim or a vendored copy, and nothing here says the compiler would
+ * choose it over the toolchain's own, so these spellings never infer a target.
+ * Spellings under a system directory are matched by prefix in the caller. */
+static bool include_toolchain_spelling(const char *spelling) {
+    static const char *const names[] = {
+        "algorithm",     "alloca.h",     "any",           "arpa/inet.h",   "array",
+        "assert.h",      "atomic",       "bit",           "bitset",        "cassert",
+        "cctype",        "cerrno",       "cfloat",        "charconv",      "chrono",
+        "cinttypes",     "climits",      "clocale",       "cmath",         "codecvt",
+        "compare",       "complex",      "complex.h",     "concepts",      "condition_variable",
+        "coroutine",     "csetjmp",      "csignal",       "cstdarg",       "cstddef",
+        "cstdint",       "cstdio",       "cstdlib",       "cstring",       "ctime",
+        "ctype.h",       "cuchar",       "cwchar",        "cwctype",       "deque",
+        "dirent.h",      "dlfcn.h",      "errno.h",       "exception",     "execinfo.h",
+        "execution",     "expected",     "fcntl.h",       "fenv.h",        "filesystem",
+        "float.h",       "fnmatch.h",    "format",        "forward_list",  "fstream",
+        "functional",    "future",       "getopt.h",      "glob.h",        "grp.h",
+        "initializer_list", "inttypes.h", "iomanip",      "ios",           "iosfwd",
+        "iostream",      "iso646.h",     "istream",       "iterator",      "langinfo.h",
+        "latch",         "libgen.h",     "limits",        "limits.h",      "list",
+        "locale",        "locale.h",     "malloc.h",      "map",           "math.h",
+        "memory",        "memory_resource", "mutex",      "net/if.h",      "netdb.h",
+        "netinet/in.h",  "netinet/tcp.h", "new",          "numbers",       "numeric",
+        "optional",      "ostream",      "paths.h",       "poll.h",        "pthread.h",
+        "pwd.h",         "queue",        "random",        "ranges",        "ratio",
+        "regex",         "regex.h",      "resolv.h",      "sched.h",       "scoped_allocator",
+        "search.h",      "semaphore",    "semaphore.h",   "set",           "setjmp.h",
+        "shared_mutex",  "signal.h",     "source_location", "span",        "spawn.h",
+        "sstream",       "stack",        "stdalign.h",    "stdarg.h",      "stdatomic.h",
+        "stdbool.h",     "stddef.h",     "stdexcept",     "stdint.h",      "stdio.h",
+        "stdlib.h",      "stdnoreturn.h", "stop_token",   "streambuf",     "string",
+        "string.h",      "string_view",  "strings.h",     "syncstream",    "syslog.h",
+        "system_error",  "termios.h",    "tgmath.h",      "thread",        "threads.h",
+        "time.h",        "tuple",        "type_traits",   "typeindex",     "typeinfo",
+        "uchar.h",       "unistd.h",     "unordered_map", "unordered_set", "utility",
+        "utime.h",       "valarray",     "variant",       "vector",        "version",
+        "wchar.h",       "wctype.h",     "windows.h",     "winsock2.h",    "ws2tcpip.h",
+    };
+    /* Autoconf's output, under the build tree of whichever component is compiling.
+     * Another component's own config.h is the classic false match for it. */
+    if (!strcmp(spelling, "config.h"))
+        return true;
+    if (!strncmp(spelling, "sys/", 4) || !strncmp(spelling, "bits/", 5))
+        return true;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(spelling, names[i]))
+            return true;
+    return false;
+}
+
+/* With no build configuration for this file, the include's whole spelling is
+ * the remaining evidence: exactly one project file must end in that path, at a
+ * path-component boundary. That file is what a -I at its prefix selects, and no
+ * other project file could be selected by any -I. Several such files is a real
+ * collision, reported as ambiguous and never settled by nearness. */
+static const cbm_gbuf_node_t *resolve_inferred_include(const cbm_pipeline_ctx_t *ctx,
+                                                       const CBMImport *imp, CBMHashTable *map,
+                                                       bool *ambiguous, const char **reason) {
+    const char *spelling = imp->module_path;
+    *reason = "include_search_roots_unknown";
+    if (!map || !spelling[0] || spelling[0] == '/' || strchr(spelling, '\\') ||
+        strstr(spelling, "//") || !strncmp(spelling, "./", 2) || !strncmp(spelling, "../", 3) ||
+        strstr(spelling, "/../") || strstr(spelling, "/./"))
+        return NULL;
+    if (include_toolchain_spelling(spelling)) {
+        *reason = "include_toolchain_header";
+        return NULL;
+    }
+    char key[PKGMAP_PATH_BUF];
+    int length = snprintf(key, sizeof(key), "@cbm:incpath:%s", spelling);
+    if (length <= 0 || (size_t)length >= sizeof(key))
+        return NULL;
+    const char *rel = cbm_ht_get(map, key);
+    if (!rel) {
+        *reason = "include_not_in_project";
+        return NULL;
+    }
+    if (!strcmp(rel, ambiguous_pkgmap_value)) {
+        *ambiguous = true;
+        *reason = "include_path_ambiguous";
+        return NULL;
+    }
+    *reason = "include_unique_project_path";
+    return cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, rel);
+}
+
 static const cbm_gbuf_node_t *resolve_configured_include(const cbm_pipeline_ctx_t *ctx,
                                                          const char *source_rel,
-                                                         const CBMImport *imp, CBMHashTable *map) {
+                                                         const CBMImport *imp, CBMHashTable *map,
+                                                         bool *ambiguous, const char **reason) {
     if (!source_rel || (imp->kind != CBM_IMPORT_KIND_INCLUDE_QUOTED &&
                         imp->kind != CBM_IMPORT_KIND_INCLUDE_SYSTEM))
         return NULL;
@@ -2320,7 +2408,12 @@ static const cbm_gbuf_node_t *resolve_configured_include(const cbm_pipeline_ctx_
     int length = snprintf(key, sizeof(key), "@cbm:cc:%s", source_rel);
     const char *roots =
         map && length > 0 && (size_t)length < sizeof(key) ? cbm_ht_get(map, key) : NULL;
-    if (!roots || strcmp(roots, ambiguous_pkgmap_value) == 0)
+    /* A compile entry is authoritative for this file, including when it names
+     * no root that holds the header: nothing is inferred past configuration. */
+    if (!roots)
+        return resolve_inferred_include(ctx, imp, map, ambiguous, reason);
+    *reason = "configured_include_root";
+    if (strcmp(roots, ambiguous_pkgmap_value) == 0)
         return NULL;
     for (const char *p = roots; p && p[0];) {
         const char *end = strchr(p, '\n');
@@ -2851,9 +2944,32 @@ static bool rust_cargo_roots(rust_import_context_t *context, CBMFileResult **cac
     return success;
 }
 
+/* Every component-boundary suffix of every C-family file path, for the inferred
+ * include rule. A suffix shared by two files becomes the ambiguous marker. */
+static bool build_include_path_context(const cbm_file_info_t *files, int count, CBMHashTable *map) {
+    for (int i = 0; i < count; i++) {
+        CBMLanguage language = files[i].language;
+        if ((language != CBM_LANG_C && language != CBM_LANG_CPP && language != CBM_LANG_CUDA &&
+             language != CBM_LANG_OBJC) ||
+            !files[i].rel_path)
+            continue;
+        for (const char *suffix = files[i].rel_path; suffix;) {
+            char key[PKGMAP_PATH_BUF];
+            int length = snprintf(key, sizeof(key), "@cbm:incpath:%s", suffix);
+            if (length <= 0 || (size_t)length >= sizeof(key) ||
+                !import_fact_put(map, key, files[i].rel_path))
+                return false;
+            const char *slash = strchr(suffix, '/');
+            suffix = slash ? slash + 1 : NULL;
+        }
+    }
+    return true;
+}
+
 bool cbm_pipeline_import_context_build(const cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                        int count, CBMFileResult **cache, CBMHashTable *map) {
-    if (!ctx || !map || !build_compile_import_context(ctx, map))
+    if (!ctx || !map || !build_compile_import_context(ctx, map) ||
+        !build_include_path_context(files, count, map))
         return false;
     rust_import_context_t context = {.ctx = ctx, .map = map};
     for (int i = 0; i < count; i++)
@@ -4311,7 +4427,7 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
         lang == CBM_LANG_OBJC) {
         *reason = imp->kind == CBM_IMPORT_KIND_INCLUDE_QUOTED ? "quoted_include_path"
                                                               : "include_search_roots_unknown";
-        return resolve_configured_include(ctx, source_rel, imp, namespace_map);
+        return resolve_configured_include(ctx, source_rel, imp, namespace_map, ambiguous, reason);
     }
     if (lang == CBM_LANG_RUST) {
         *reason = "declared_rust_module_path";
@@ -5675,6 +5791,33 @@ int cbm_pipeline_rust_import_map(const cbm_gbuf_t *graph, const char *project,
                                  const char ***out_keys, const char ***out_values, int *out_count) {
     return source_import_map(graph, project, source_rel, result, false, out_keys, out_values,
                              out_count);
+}
+
+char *cbm_pipeline_c_generated_source(const cbm_pipeline_ctx_t *ctx, const char *includer,
+                                      const char *spelling) {
+    static const char suffix[] = ".h.generated.h";
+    size_t length = spelling ? strlen(spelling) : 0, suffix_len = sizeof(suffix) - 1;
+    CBMHashTable *map = cbm_pipeline_get_nsmap();
+    if (!ctx || !map || !includer || length <= suffix_len ||
+        strcmp(spelling + length - suffix_len, suffix))
+        return NULL;
+    char stem[PKGMAP_PATH_BUF], beside[PKGMAP_PATH_BUF], key[PKGMAP_PATH_BUF];
+    int written = snprintf(stem, sizeof(stem), "%.*s.c", (int)(length - suffix_len), spelling);
+    if (written <= 0 || (size_t)written >= sizeof(stem))
+        return NULL;
+    char *directory = path_dirname(includer);
+    bool near = directory && cbm_repo_rel_join(directory, stem, beside, sizeof(beside)) &&
+                cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, beside);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+    if (near)
+        return cbm_pipeline_fqn_compute(ctx->project_name, beside, "__file__");
+    written = snprintf(key, sizeof(key), "@cbm:incpath:%s", stem);
+    if (written <= 0 || (size_t)written >= sizeof(key))
+        return NULL;
+    const char *rel = cbm_ht_get(map, key);
+    if (!rel || !strcmp(rel, ambiguous_pkgmap_value))
+        return NULL;
+    return cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
 }
 
 int cbm_pipeline_c_include_map(const cbm_gbuf_t *graph, const char *project, const char *source_rel,

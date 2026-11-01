@@ -73,6 +73,10 @@ typedef struct {
     unsigned declarations;
     conditional_owner_t *conditional;
     bool ambiguous;
+    /* A C file's #if branches define one name more than once. The graph holds one
+     * node for them, with each branch's span as a variant, so an edge to or from
+     * that node is true of the configurations it was found in. */
+    bool c_variants;
 } target_proof_t;
 
 typedef struct {
@@ -244,6 +248,11 @@ static bool add_target(cbm_shared_resolver_t *resolver, const CBMDefinition *def
     target_proof_t *prior = cbm_ht_get(resolver->targets, definition->qualified_name);
     if (prior) {
         bool same_owner = !strcmp(prior->file, file) && !strcmp(prior->label, definition->label);
+        if (same_owner &&
+            (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA)) {
+            prior->c_variants = true;
+            return true;
+        }
         prior->ambiguous |= !same_owner || prior->start_line != definition->start_line ||
                             prior->end_line != definition->end_line || language == CBM_LANG_PYTHON;
         if (prior->declarations == 1 && same_owner) {
@@ -379,8 +388,8 @@ static bool target_materialized(const file_resolver_t *resolver, const cbm_gbuf_
     const target_proof_t *proof = cbm_ht_get(resolver->shared->targets, node->qualified_name);
     return proof && !proof->ambiguous && !strcmp(proof->file, node->file_path) &&
            !strcmp(proof->label, node->label) && node->start_line >= 0 && node->end_line >= 0 &&
-           proof->start_line == (uint32_t)node->start_line &&
-           proof->end_line == (uint32_t)node->end_line;
+           (proof->c_variants || (proof->start_line == (uint32_t)node->start_line &&
+                                  proof->end_line == (uint32_t)node->end_line));
 }
 
 typedef struct {
@@ -2504,6 +2513,11 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
     const cbm_resolver_file_t *file = resolver->file;
     if (!name || !name[0])
         return unresolved("reference_spelling_missing");
+    /* The C adapter's semantic rows are the whole translation-unit lookup. With no
+     * row there is no second, name-based way to arrive at a target. */
+    if (file->language == CBM_LANG_C || file->language == CBM_LANG_CPP ||
+        file->language == CBM_LANG_CUDA)
+        return unresolved("c_translation_unit_binding_unproven");
     if (file->language == CBM_LANG_DART) {
         cbm_resolve_result_t proof = dart_name_result(resolver, name);
         return cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
@@ -2810,6 +2824,10 @@ static bool resolve_writes(file_resolver_t *resolver, CBMArena *arena) {
         const semantic_site_t *site =
             find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte, rw->site_end_byte,
                           rw->source_origin, CBM_RESOLVED_FIELD_REFERENCE);
+        if (!site && !rw->is_member_access)
+            site = find_semantic(resolver, rw->enclosing_func_qn, rw->site_start_byte,
+                                 rw->site_end_byte, rw->source_origin,
+                                 CBM_RESOLVED_VALUE_REFERENCE);
         cbm_resolve_result_t outcome =
             site ? semantic_result(resolver, site, arena)
             : rw->is_member_access

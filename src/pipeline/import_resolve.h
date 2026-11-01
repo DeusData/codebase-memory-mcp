@@ -68,6 +68,12 @@ int cbm_pipeline_rust_import_map(const cbm_gbuf_t *, const char *, const char *,
                                  const CBMFileResult *, const char ***, const char ***, int *);
 /* Exact source include path -> declaration namespace, from the admission
  * snapshot; dependency File QNs keep their separate extension-bearing identity. */
+/* The File QN of the project source file a generated declaration header is made
+ * from (`buffer.h.generated.h`, written by the build from `buffer.c`), or NULL.
+ * The source file sits beside the includer or is the one project file of that
+ * spelling, as for any include. Caller frees. */
+char *cbm_pipeline_c_generated_source(const cbm_pipeline_ctx_t *ctx, const char *includer,
+                                      const char *spelling);
 int cbm_pipeline_c_include_map(const cbm_gbuf_t *, const char *, const char *,
                                const CBMFileResult *, const char ***, const char ***, int *);
 #endif
