@@ -1015,6 +1015,46 @@ bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *s
     return confidence < CONF_UNIQUE_NAME;
 }
 
+bool cbm_go_suppress_bare_init_bind(bool is_go, bool is_member, const char *name,
+                                    const char *strategy, const char *target_label) {
+    /* The Go spec gives `init` no binding in the package block: the
+     * identifier declares init functions and nothing else, and "init
+     * functions cannot be referred to from anywhere in a program". A method
+     * or a field named init is reached only through a selector (`x.init()`,
+     * `e.init`), which arrives here as is_member and is left alone. So a
+     * BARE `init` is always a local name: a closure (`init :=
+     * func(ctx) {...}; init(ctx)`, 22 kubernetes e2e storage suites), a
+     * parameter (`func sum(init func() ref.Val)`), or the `package init`
+     * clause of a directory named init. None of them is a project node.
+     *
+     * Every Go Function named init is a package init (no other package-level
+     * `init` can be declared), so that target is refused for every registry
+     * strategy. Before #1915 the flat QN made same_module bind the bare name
+     * to its own package's init; after it, the per-file QN misses there and
+     * the name fallback binds unrelated init methods instead. A Method or
+     * Field namesake is refused when only the name found it (the shared weak
+     * drop-list), which is how every such edge was minted. lsp_* answers are
+     * untouched: the sequential resolver emits them before its registry
+     * guards run, so refusing one here would split the two resolvers.
+     *
+     * Go-gated: elsewhere `init` is an ordinary name. A bare `init()` in a
+     * Java, C#, C++, Kotlin or Ruby method calls the class's own method, and
+     * a C, Python or JS `init` function is called by its bare name. */
+    if (!is_go || is_member || !name || strcmp(name, "init") != 0 || !target_label) {
+        return false;
+    }
+    if (strategy && strncmp(strategy, "lsp_", strlen("lsp_")) == 0) {
+        return false;
+    }
+    if (strcmp(target_label, "Function") == 0) {
+        return true;
+    }
+    if (strcmp(target_label, "Method") == 0 || strcmp(target_label, "Field") == 0) {
+        return weak_short_name_strategy(strategy);
+    }
+    return false;
+}
+
 /* Import-binding counterpart of the parameter guard above (#2127). An import
  * binds the identifier for the whole module; when that import is external it
  * never materializes, and the chain falls through to project-wide short-name
@@ -1370,6 +1410,30 @@ bool cbm_c_member_binds_by_owner(bool is_c, bool is_member_access) {
     return is_c && is_member_access;
 }
 
+bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label) {
+    /* A Java call expression never names data. `p.x()` is a method invocation
+     * whatever `x` spells elsewhere in the tree, so a CALLS edge into a
+     * Variable or a Field is a spelling collision and not a call.
+     *
+     * The bind is reached when the type-aware resolver finds no method to
+     * return: a record's accessors are implicit, so `record Point(double x,
+     * double y, double z)` declares no `x()` for java_lookup_method to find,
+     * and every `p.x()` falls through to the short-name registry — which
+     * matches the first `x` anywhere in the project, typically an unrelated
+     * class's private field. Measured on a 600-file Java tree (2026-09-22):
+     * 278 of 2444 CALLS edges landed on fields that way, and the callers of
+     * one four-field class absorbed every record read in the project.
+     *
+     * Java-gated, like the Go guard above, because the veto is only sound
+     * where no callable name can be anything but a method: Kotlin properties
+     * hold function values (`val f: () -> Unit; f()`) and C has function
+     * pointers, so both legitimately call through data. */
+    if (!is_java || !target_label) {
+        return false;
+    }
+    return strcmp(target_label, "Variable") == 0 || strcmp(target_label, "Field") == 0;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -1627,6 +1691,32 @@ void cbm_registry_add_lang_in_module(cbm_registry_t *r, const char *name,
     if (name && name[0] && strchr(derived, '#') && strcmp(name, primary) != 0) {
         index_under_name(r, name, owned_qn, lang);
     }
+}
+
+/* A generated member (a Java record's implicit accessor) is a definition the
+ * source never spells: no call names it except through its owner's type. The
+ * exact map holds it for the LSP targets and the import/same-module lookups,
+ * as it holds a Python function's locals; the by-name index does not, so no
+ * unique_name / suffix_match / field_type_hint / fuzzy guess can land on it. */
+void cbm_registry_add_qn_only(cbm_registry_t *r, const char *qualified_name, const char *label) {
+    if (!r || !qualified_name || !label) {
+        return;
+    }
+    (void)registry_add_exact(r, qualified_name, label);
+}
+
+bool cbm_def_props_generated(const char *const *extra_props) {
+    for (const char *const *kv = extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
+        if (strcmp(kv[0], CBM_PROP_GENERATED) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cbm_node_props_generated(const char *properties_json) {
+    /* The key as the definition passes write it: "generated":"<value>". */
+    return properties_json && strstr(properties_json, "\"" CBM_PROP_GENERATED "\":\"") != NULL;
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */

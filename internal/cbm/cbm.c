@@ -3924,7 +3924,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     uint64_t lsp_start = now_ns();
     if (!result->lsp_skipped) {
         if (language == CBM_LANG_GO) {
-            cbm_run_go_lsp(a, result, source, source_len, root);
+            cbm_run_go_lsp(a, result, source, source_len, root, rel_path);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
             if (!cbm_run_c_lsp_with_test_owners(a, result, source, source_len, root,
