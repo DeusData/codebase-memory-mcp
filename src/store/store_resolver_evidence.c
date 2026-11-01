@@ -166,6 +166,11 @@ typedef struct {
     sqlite3_int64 file;
     unsigned char digest[DIGEST_BYTES];
 } type_digest_t;
+typedef struct fact_text {
+    char *bytes;
+    size_t length, capacity;
+    bool plain;
+} fact_text_t;
 typedef struct {
     sqlite3 *db;
     const char *project;
@@ -184,6 +189,7 @@ typedef struct {
     uint64_t rows;
     const cbm_resolve_file_t *const *files;
     size_t file_count;
+    struct fact_text fact_text;
 } evidence_write_t;
 
 static const char *text(const char *value) {
@@ -427,6 +433,87 @@ static char *fact_json(const cbm_resolve_proof_view_t *v) {
     yyjson_mut_doc_free(doc);
     return json;
 }
+/* A fact's digest covers the JSON above, and building a document per fact was the
+ * largest cost of the write. Text with nothing to escape has only one spelling, so
+ * those facts, nearly all of them, write the same bytes directly; anything else
+ * goes through fact_json, which also handles text that is not UTF-8. */
+static void fact_append(fact_text_t *t, const char *bytes, size_t length) {
+    if (t->length + length + 1 > t->capacity) {
+        size_t next = t->capacity ? t->capacity * 2 : 4096;
+        while (next < t->length + length + 1)
+            next *= 2;
+        char *grown = cbm_realloc(CBM_MEM_CLASS_STORE, t->bytes, next);
+        if (!grown) {
+            t->plain = false;
+            return;
+        }
+        t->bytes = grown;
+        t->capacity = next;
+    }
+    memcpy(t->bytes + t->length, bytes, length);
+    t->length += length;
+}
+static void fact_str(fact_text_t *t, const char *key, size_t key_length, const char *value) {
+    size_t length = 0;
+    for (const unsigned char *p = (const unsigned char *)text(value); *p; p++, length++) {
+        if (*p < 0x20 || *p > 0x7e || *p == '"' || *p == '\\') {
+            t->plain = false;
+            return;
+        }
+    }
+    fact_append(t, key, key_length);
+    fact_append(t, text(value), length);
+    fact_append(t, "\"", 1);
+}
+static void fact_num(fact_text_t *t, const char *key, size_t key_length, uint64_t value) {
+    char digits[24];
+    size_t at = sizeof(digits);
+    do {
+        digits[--at] = (char)('0' + value % 10);
+        value /= 10;
+    } while (value);
+    fact_append(t, key, key_length);
+    fact_append(t, digits + at, sizeof(digits) - at);
+}
+/* True with t->bytes holding exactly what fact_json would have written. */
+static bool fact_plain_text(fact_text_t *t, const cbm_resolve_proof_view_t *v) {
+    t->length = 0;
+    t->plain = true;
+#define STR(name, value) fact_str(t, name, sizeof(name) - 1, value)
+#define NUM(name, value) fact_num(t, name, sizeof(name) - 1, (uint64_t)(value))
+    NUM("{\"kind\":", v->kind);
+    STR(",\"project\":\"", v->source.project);
+    STR(",\"file\":\"", v->source.file);
+    STR(",\"module\":\"", v->source.module);
+    STR(",\"scope\":\"", v->source.scope);
+    STR(",\"content_identity\":\"", v->source.content_identity);
+    STR(",\"configuration_identity\":\"", v->source.configuration_identity);
+    NUM(",\"source_origin\":", v->source.source_origin);
+    STR(",\"lookup_domain\":\"", v->key.lookup_domain);
+    STR(",\"lookup_key\":\"", v->key.lookup_key);
+    STR(",\"declaration_identity\":\"", v->key.declaration_identity);
+    STR(",\"binding_identity\":\"", v->key.binding_identity);
+    STR(",\"type_identity\":\"", v->key.type_identity);
+    STR(",\"detail\":\"", v->key.detail);
+    NUM(",\"start_byte\":", v->key.start_byte);
+    NUM(",\"end_byte\":", v->key.end_byte);
+    NUM(",\"origin\":", v->key.origin);
+    NUM(",\"flags\":", v->key.flags);
+    NUM(",\"lookup_closed\":", v->key.lookup_closed);
+    NUM(",\"binding\":", v->outcome.binding);
+    NUM(",\"domain\":", v->outcome.domain);
+    NUM(",\"analysis\":", v->outcome.analysis);
+    NUM(",\"rule\":", v->outcome.rule);
+    NUM(",\"facts\":", v->outcome.facts);
+    STR(",\"target\":\"", v->outcome.target);
+    NUM(",\"candidate_count\":", v->outcome.candidate_count);
+    STR(",\"reason\":\"", v->outcome.reason);
+    NUM(",\"predecessors_closed\":", v->predecessors_closed);
+#undef STR
+#undef NUM
+    fact_append(t, "}", 2);
+    return t->plain;
+}
 static bool note_type_digest(evidence_write_t *w, const cbm_resolve_proof_view_t *v,
                              const unsigned char *digest) {
     if (v->kind != CBM_PROOF_TYPE_BIND && v->kind != CBM_PROOF_TYPE_COPY &&
@@ -486,13 +573,14 @@ static bool write_fact(const cbm_resolve_proof_t *node, void *context) {
     const cbm_resolve_proof_view_t *v = cbm_resolve_proof_view(node);
     if (!v || !source_matches(w, &v->source) || !grow_ids(w))
         return false;
-    char *json = fact_json(v);
-    if (!json)
+    bool plain = fact_plain_text(&w->fact_text, v);
+    char *json = plain ? NULL : fact_json(v);
+    if (!plain && !json)
         return false;
     evidence_id_t entry = {.node = node, .id = w->count + 1};
     cbm_sha256_ctx hash;
     cbm_sha256_init(&hash);
-    cbm_resolve_hash_text(&hash, json);
+    cbm_resolve_hash_text(&hash, plain ? w->fact_text.bytes : json);
     bool ok = true;
     for (size_t i = 0; ok && i < v->premise_count; i++) {
         evidence_id_t *premise = find_id(w, v->premises[i]);
@@ -835,6 +923,7 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     cbm_free(CBM_MEM_CLASS_STORE, w.digests);
     cbm_free(CBM_MEM_CLASS_STORE, w.dict);
     cbm_free(CBM_MEM_CLASS_STORE, w.types);
+    cbm_free(CBM_MEM_CLASS_STORE, w.fact_text.bytes);
     cbm_free(CBM_MEM_CLASS_STORE, cache);
     cbm_arena_destroy(&w.owned);
     cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
