@@ -357,15 +357,18 @@ typedef struct {
     const char *target_label; /* NULL: Function */
 } cv_recovered_t;
 static const cv_recovered_t cv_recovered[] = {
-    {"cv_python_if-1", 5, 6, "    def pick():"}, {"cv_python_if-2", 8, 9, "    def pick():"},
-    {"cv_c_platform_files-1", 0, 0, NULL},       {"cv_c_platform_files-2", 0, 0, NULL},
-    {"cv_c_platform_directories-1", 0, 0, NULL}, {"cv_c_platform_directories-2", 0, 0, NULL},
+    {"cv_python_if-1", 5, 6, "    def pick():", NULL},
+    {"cv_python_if-2", 8, 9, "    def pick():", NULL},
+    {"cv_c_platform_files-1", 0, 0, NULL, NULL},
+    {"cv_c_platform_files-2", 0, 0, NULL, NULL},
+    {"cv_c_platform_directories-1", 0, 0, NULL, NULL},
+    {"cv_c_platform_directories-2", 0, 0, NULL, NULL},
     /* Rust cfg twins are one node, whose canonical range is the last twin. */
-    {"cv_rust_cfg_free_functions-1", 4, 4, "fn pick() { alpha(); }"},
-    {"cv_rust_cfg_free_functions-2", 6, 6, "fn pick() { beta(); }"},
-    {"cv_rust_cfg_free_functions-3", 0, 0, NULL},
-    {"cv_rust_cfg_methods-1", 6, 6, "    fn pick(&self) { alpha(); }"},
-    {"cv_rust_cfg_methods-2", 8, 8, "    fn pick(&self) { beta(); }"},
+    {"cv_rust_cfg_free_functions-1", 4, 4, "fn pick() { alpha(); }", NULL},
+    {"cv_rust_cfg_free_functions-2", 6, 6, "fn pick() { beta(); }", NULL},
+    {"cv_rust_cfg_free_functions-3", 0, 0, NULL, NULL},
+    {"cv_rust_cfg_methods-1", 6, 6, "    fn pick(&self) { alpha(); }", NULL},
+    {"cv_rust_cfg_methods-2", 8, 8, "    fn pick(&self) { beta(); }", NULL},
     {"cv_rust_cfg_methods-3", 0, 0, NULL, "Method"},
 };
 
