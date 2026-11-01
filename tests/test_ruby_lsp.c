@@ -1498,6 +1498,32 @@ TEST(rubylsp_const_path_is_linear) {
     PASS();
 }
 
+/* Review ask (c): the stdlib seed must survive allocation failure. A
+ * zero-initialised arena has no blocks and no grow size, so every
+ * allocation from it returns NULL. The seed must not write through a NULL
+ * return-type vector, and must not register an entry whose formatted name
+ * came back NULL (a NULL QN would reach strcmp in finalize and in every later
+ * lookup). */
+TEST(rubylsp_stdlib_seed_survives_alloc_failure) {
+    CBMArena reg_arena;
+    cbm_arena_init(&reg_arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &reg_arena);
+    CBMArena dead;
+    memset(&dead, 0, sizeof(dead));
+    cbm_ruby_stdlib_register(&reg, &dead);
+    ASSERT(reg.type_count > 0);
+    ASSERT(reg.func_count > 0); /* Kernel built-ins carry literal names */
+    for (int i = 0; i < reg.func_count; i++) {
+        ASSERT(reg.funcs[i].qualified_name != NULL);
+        ASSERT(reg.funcs[i].short_name != NULL);
+    }
+    cbm_registry_finalize(&reg);
+    ASSERT(cbm_registry_lookup_func(&reg, "puts") != NULL);
+    cbm_arena_destroy(&reg_arena);
+    PASS();
+}
+
 /* ── suite ──────────────────────────────────────────────────────── */
 
 void suite_ruby_lsp(void) {
@@ -1536,4 +1562,5 @@ void suite_ruby_lsp(void) {
     RUN_TEST(rubylsp_self_rebinding_blocks_no_edge);
     RUN_TEST(rubylsp_mixin_walk_visits_each_module_once);
     RUN_TEST(rubylsp_const_path_is_linear);
+    RUN_TEST(rubylsp_stdlib_seed_survives_alloc_failure);
 }
