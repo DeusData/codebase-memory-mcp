@@ -531,6 +531,7 @@ PIPELINE_SRCS = \
     internal/cbm/resolve/policy.c \
     internal/cbm/resolve/types.c \
     internal/cbm/resolve/binding.c \
+    internal/cbm/resolve/py_members.c \
     internal/cbm/resolve/symbols.c \
     internal/cbm/lsp/ts_proof.c \
     internal/cbm/lsp/php_proof.c \

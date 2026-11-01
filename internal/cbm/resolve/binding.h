@@ -7,6 +7,90 @@
 
 typedef struct cbm_resolve_binding_index cbm_resolve_binding_index_t;
 
+/* A Python import inside a function or under a statement. It binds in the scope
+ * that executes it, unlike the top-level imports the extractor records. */
+typedef struct {
+    CBMImport import;
+    uint32_t at, scope;
+    bool annotation_only; /* under `if TYPE_CHECKING:`: no runtime binding or load */
+} cbm_resolve_python_nested_import_t;
+
+/* How a name reaches its value in one scope. A chain is an access path with
+ * call arguments dropped; see python_chain. */
+typedef enum {
+    CBM_PY_ROOT_UNKNOWN = 0,
+    CBM_PY_ROOT_UNBOUND,           /* no scope binds it: a builtin, or a star import */
+    CBM_PY_ROOT_IMPORT,            /* an import binding */
+    CBM_PY_ROOT_ANNOTATION_IMPORT, /* bound for annotations only */
+    CBM_PY_ROOT_DECLARATION,       /* a def or class */
+    CBM_PY_ROOT_MODULE_VALUE,      /* one module-level assignment */
+    CBM_PY_ROOT_ASSIGNED,          /* one local assignment; chain is its value */
+    CBM_PY_ROOT_ASSIGNED_MANY,     /* only plain assignments and None; chains lists them */
+    CBM_PY_ROOT_TYPED,             /* one annotated binder; chain names its class */
+    CBM_PY_ROOT_SELF_PARAMETER,    /* a method's first parameter: an instance of owner */
+    CBM_PY_ROOT_CLASS_PARAMETER    /* classmethod first parameter: owner itself */
+} cbm_resolve_python_root_kind_t;
+
+typedef struct {
+    cbm_resolve_python_root_kind_t kind;
+    const char *target; /* declaration or variable QN */
+    const char *owner;  /* class QN for the two parameter kinds */
+    const char *chain;
+    const char *const *chains;
+    uint32_t chain_count;
+    uint32_t chain_scope, at;
+    bool value_typed; /* MODULE_VALUE: chain is an annotation, not the value */
+    const cbm_resolve_python_nested_import_t *nested;
+} cbm_resolve_python_root_t;
+
+typedef enum {
+    CBM_PY_MEMBER_FUNCTION = 0, /* a def in the class body */
+    CBM_PY_MEMBER_VALUE,        /* anything else the class body binds */
+    CBM_PY_MEMBER_INSTANCE,     /* self.x = ..., or a bare `x: T` declaration */
+    CBM_PY_MEMBER_OPAQUE        /* conditionally defined: the name stops lookup */
+} cbm_resolve_python_member_kind_t;
+
+/* What a function does when used as a decorator, proven from its source. */
+enum { CBM_PY_SHAPE_DIRECT = 1u << 0, CBM_PY_SHAPE_FACTORY = 1u << 1 };
+
+typedef struct {
+    uint32_t owner_scope, chain_scope, at;
+    const char *owner, *name, *target;
+    cbm_resolve_python_member_kind_t kind;
+    const char *const *decorators;
+    const char *return_chain, *value_chain, *type_chain;
+    bool none_value;
+    unsigned shape;
+    /* What the function returns, as access paths in its own scope. NULL when a
+     * return is not followable or the function is a generator. */
+    const char *const *returned;
+    uint32_t returned_scope;
+} cbm_resolve_python_member_t;
+
+/* A def or class under decorators. canonical holds the imported spelling of each
+ * decorator, NULL where the root is not a top-level import. */
+typedef struct {
+    const char *target, *name;
+    uint32_t scope;
+    bool is_class;
+    const char *const *decorators;
+    const char *const *canonical;
+} cbm_resolve_python_decorated_t;
+
+typedef struct {
+    const char *qualified_name;
+    uint32_t scope, header_scope;
+    const char **bases; /* access paths, source order */
+    uint32_t base_count;
+    bool unknown_base; /* a base expression that has no access path */
+} cbm_resolve_python_class_t;
+
+/* `from module_path import *` at module level; at is the statement's end. */
+typedef struct {
+    const char *module_path;
+    uint32_t at;
+} cbm_resolve_python_star_t;
+
 /* Build once per source file. Borrows result/source until the arena is freed.
  * Supported syntax is deliberately explicit: Python module functions and
  * direct imports, Lua local functions, and explicit JavaScript/TypeScript
@@ -104,10 +188,10 @@ typedef struct {
     bool has_show;
 } cbm_resolve_source_import_t;
 
-/* Strong, source-audited Python absence domain. Inert package initialization
- * only: imports, assignments, classes, decorators, defaults, dynamic attributes
- * and conditional/effectful statements remain open. Names are sorted and may
- * include NULL entries for non-module scopes; copy while the index is alive. */
+/* Source-audited Python absence domain: every statement that binds at module
+ * level was seen, and module __getattr__ is absent. Star imports are judged by
+ * the shared resolver. Names are sorted and may include NULL entries for
+ * non-module scopes; copy while the index is alive. */
 /* Dynamic execution/module registry access remains an unknown project effect. */
 bool cbm_resolve_binding_python_effects_complete(const cbm_resolve_binding_index_t *);
 /* Conservatively includes writes and unknown alias/callee escapes. */
@@ -115,7 +199,58 @@ bool cbm_resolve_binding_python_import_escaped(const cbm_resolve_binding_index_t
 bool cbm_resolve_binding_python_namespace_closed(const cbm_resolve_binding_index_t *index);
 size_t cbm_resolve_binding_python_namespace_size(const cbm_resolve_binding_index_t *index);
 const char *cbm_resolve_binding_python_namespace_name(const cbm_resolve_binding_index_t *index,
-                                                      size_t offset);
+                                                      size_t offset, uint32_t *at);
+size_t cbm_resolve_binding_python_class_count(const cbm_resolve_binding_index_t *index);
+const cbm_resolve_python_class_t *cbm_resolve_binding_python_class_at(
+    const cbm_resolve_binding_index_t *index, size_t offset);
+size_t cbm_resolve_binding_python_member_count(const cbm_resolve_binding_index_t *index);
+const cbm_resolve_python_member_t *cbm_resolve_binding_python_member_at(
+    const cbm_resolve_binding_index_t *index, size_t offset);
+/* The access path and lexical scope of an attribute or call occurrence. */
+bool cbm_resolve_binding_python_site(const cbm_resolve_binding_index_t *index, const char *name,
+                                     uint32_t start, uint32_t end, CBMSourceOrigin origin,
+                                     const char **chain, uint32_t *scope);
+/* The class a method scope belongs to; NULL outside a method. */
+const char *cbm_resolve_binding_python_method_owner(const cbm_resolve_binding_index_t *index,
+                                                    uint32_t scope);
+/* What `name` denotes from this scope. at != 0 refuses a binder after that byte. */
+cbm_resolve_python_root_t cbm_resolve_binding_python_root(const cbm_resolve_binding_index_t *index,
+                                                          const char *name, size_t length,
+                                                          uint32_t scope, uint32_t at);
+cbm_resolve_result_t cbm_resolve_binding_python_member(const cbm_resolve_binding_index_t *index,
+                                                       const char *name, uint32_t start,
+                                                       uint32_t end, CBMSourceOrigin origin,
+                                                       const char *owner, const char *target,
+                                                       bool class_target, bool property_read);
+/* The reason on a read that runs a property: a usage of it, never a callable reference. */
+#define CBM_RESOLVE_PYTHON_PROPERTY_READ "python_receiver_property_read"
+size_t cbm_resolve_binding_python_decorated_count(const cbm_resolve_binding_index_t *index);
+const cbm_resolve_python_decorated_t *cbm_resolve_binding_python_decorated_at(
+    const cbm_resolve_binding_index_t *index, size_t offset);
+/* The decorators keep this declaration's identity: treat it as undecorated. */
+void cbm_resolve_binding_python_keep_decorated(cbm_resolve_binding_index_t *index,
+                                               const cbm_resolve_python_decorated_t *item);
+/* The chain's root is a top-level import, and together they spell this path. */
+bool cbm_resolve_binding_python_import_is(const cbm_resolve_binding_index_t *index,
+                                          const char *chain, const char *canonical);
+size_t cbm_resolve_binding_python_star_count(const cbm_resolve_binding_index_t *index);
+const cbm_resolve_python_star_t *cbm_resolve_binding_python_star_at(
+    const cbm_resolve_binding_index_t *index, size_t offset);
+/* Names bound before this byte are unknown: a star import of an unknown module
+ * can rebind them. Build sets the conservative last star; the shared resolver
+ * lowers it once it knows which star sources are closed. */
+void cbm_resolve_binding_python_set_star_barrier(cbm_resolve_binding_index_t *index,
+                                                 uint32_t barrier);
+size_t cbm_resolve_binding_python_nested_count(const cbm_resolve_binding_index_t *index);
+const cbm_resolve_python_nested_import_t *cbm_resolve_binding_python_nested_at(
+    const cbm_resolve_binding_index_t *index, size_t offset);
+/* True when this import is its scope's only binder of the name. */
+bool cbm_resolve_binding_python_nested_audited(const cbm_resolve_binding_index_t *index,
+                                               const cbm_resolve_python_nested_import_t *import);
+/* The nested import that the exact occurrence's root name lexically resolves to. */
+const cbm_resolve_python_nested_import_t *cbm_resolve_binding_python_nested_site(
+    const cbm_resolve_binding_index_t *index, const char *name, uint32_t start, uint32_t end,
+    CBMSourceOrigin origin);
 
 bool cbm_resolve_binding_namespace_complete(const cbm_resolve_binding_index_t *index);
 size_t cbm_resolve_binding_namespace_size(const cbm_resolve_binding_index_t *index);

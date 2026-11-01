@@ -44,9 +44,9 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_SVELTE, CALLABLE_EDGES,
      "One inline script with audited lexical bindings; only static markup and bare-identifier "
      "event references are supported. Multiple contexts and template effects abstain."},
-    {CBM_LANG_PYTHON, SOURCE_EDGES | EDGE(USES_TYPE),
-     "Static project imports and bounded reexports; dynamic imports and unknown package roots "
-     "abstain."},
+    {CBM_LANG_PYTHON, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
+     "Static project imports, reexports and closed star imports; dynamic imports, unknown star "
+     "sources and unknown package roots abstain."},
     {CBM_LANG_JAVA, EDGE(IMPORTS) | CALLABLE_EDGES,
      "Exact declared package members; incomplete or competing namespace candidates abstain."},
     {CBM_LANG_KOTLIN, TYPED_EDGES | EDGE(CALL_REFERENCE) | EDGE(USAGE),
@@ -257,8 +257,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
         out->limitation =
-            "Explicit imports and bounded reexports; ordinary declared receivers and "
-            "aliases; dynamic/inherited lookup and decorated callable identity abstain.";
+            "Imports, reexports and closed star imports; self, cls and super through C3 order; "
+            "receivers typed by construction or annotation; decorators proven to keep identity. "
+            "Untyped receivers, computed bases, class values and unproven decorators abstain.";
         break;
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
