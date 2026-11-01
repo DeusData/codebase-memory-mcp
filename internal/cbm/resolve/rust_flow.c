@@ -108,6 +108,7 @@ typedef struct {
     /* The element of the last `.collect()` walked, and where that call ends. */
     const rs_type_t *collected;
     uint32_t collected_end;
+    int64_t collected_delta;
     /* The first argument's type, when the call being selected has walked it. */
     const rs_type_t *call_arg0;
     /* Types the enclosing call gives a closure argument's parameters. */
@@ -2745,6 +2746,7 @@ static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode ca
         /* `let all: Vec<_> = it.collect();`: the let fills the placeholder. */
         w->collected = rs_element_of(w, receiver);
         w->collected_end = ts_node_end_byte(call);
+        w->collected_delta = w->site_delta;
     }
     return rs_ext_method_ret(w, receiver, name, args.closure_ret);
 }
@@ -3588,10 +3590,12 @@ static void rs_walk_let(rs_walk_t *w, TSNode node, bool has_cfg) {
         type = rs_lower(&env, rs_tsyn_from(&w->b, annotation));
     }
     if (!ts_node_is_null(value)) {
+        w->collected = NULL;
         const rs_type_t *value_type = rs_walk_expr(w, value);
         if (!type || type->kind == RT_UNKNOWN)
             type = value_type;
-        else if (w->collected && w->collected_end == ts_node_end_byte(value))
+        else if (w->collected && w->collected_end == ts_node_end_byte(value) &&
+                 w->collected_delta == w->site_delta)
             type = rs_collect_into(w->arena, type, w->collected, 0);
     }
     TSNode alternative = rs_field(node, "alternative");
