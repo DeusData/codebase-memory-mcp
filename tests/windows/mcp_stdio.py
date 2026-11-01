@@ -148,6 +148,7 @@ class McpServer:
                 self.proc.kill()
             except Exception:
                 pass
+        self._stderr_thread.join(timeout=10)
 
 
 def wait_projects_with_stats(server, timeout=90.0, poll=1.0):
