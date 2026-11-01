@@ -1422,6 +1422,14 @@ TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator) {
          "fn compared(mut all: Vec<Thing>) { all.sort_by(|a, b| { a.run(); b.run(); todo!() }); }\n"
          "fn folded(all: Vec<Other>) { all.into_iter().fold(0, |_sum, item| { item.run(); 0 }); }\n"
          "fn best(all: Vec<Other>) { all.iter().max_by_key(|item| item.run()); }\n"
+         "fn visit(pick: &impl Fn(&Thing) -> bool) { todo!() }\n"
+         "fn by_reference() { visit(&|item| { item.run(); true }); }\n"
+         "fn bump_seq(all: bumpalo::collections::Vec<'_, Thing>) { for t in all { t.run(); } }\n"
+         "fn third_party(all: hashbrown::HashMap<i32, Other>) {\n"
+         "    for (_, v) in all.iter() { v.run(); }\n"
+         "    all.get(&1).unwrap().run();\n"
+         "}\n"
+         "fn lookalike(all: other_crate::HashMap<i32, Other>) { all.get(&1).unwrap().run(); }\n"
          "fn main() {}\n"}};
     RUST_ROUTES(store, root, files) {
         ASSERT_NOT_NULL(store);
@@ -1439,6 +1447,11 @@ TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator) {
         ASSERT_EQ(rust_edge(store, "CALLS", "src.main.folded", "src.main.Other.run"), 1);
         ASSERT_EQ(rust_edge(store, "CALLS", "src.main.folded", "src.main.Thing.run"), 0);
         ASSERT_EQ(rust_edge(store, "CALLS", "src.main.best", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.by_reference", "src.main.Thing.run"), 1);
+        /* Named third-party containers read like std; an unlisted lookalike does not. */
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.bump_seq", "src.main.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.third_party", "src.main.Other.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.lookalike", "src.main.Other.run"), 0);
         /* The placeholder is not a name that failed to resolve. */
         ASSERT(rust_occurrence_reason(store, "USAGE", "_", "rust_inferred_type"));
     }
@@ -1485,6 +1498,40 @@ TEST(resolver_rust_deferred_let_takes_its_type_from_the_assignment) {
     PASS();
 }
 
+/* meilitool's `Index::new(..).with_context(..)?`: the trait is named, so its signature is known.
+ * The same method through another crate's Context says nothing about the result. */
+TEST(resolver_rust_anyhow_context_keeps_the_success_type) {
+    static const rust_proof_file_t files[] = {
+        {"Cargo.toml",
+         "[package]\nname = \"demo\"\nedition = \"2021\"\n"
+         "[dependencies]\nanyhow = \"1\"\nother = \"1\"\n"},
+        {"src/main.rs",
+         "mod a;\nmod b;\nmod thing;\nfn main() {}\n"},
+        {"src/thing.rs",
+         "pub struct Thing;\nimpl Thing { pub fn run(&self) {}\n"
+         " pub fn make() -> std::io::Result<Thing> { Ok(Thing) } }\n"},
+        {"src/a.rs",
+         "use anyhow::Context;\nuse crate::thing::Thing;\n"
+         "fn result() -> anyhow::Result<()> {\n"
+         "    let t = Thing::make().with_context(|| \"opening\")?;\n"
+         "    t.run();\n"
+         "    Ok(())\n"
+         "}\n"},
+        {"src/b.rs",
+         "use other::Context;\nuse crate::thing::Thing;\n"
+         "fn lookalike() -> anyhow::Result<()> {\n"
+         "    let t = Thing::make().with_context(|| \"opening\")?;\n"
+         "    t.run();\n"
+         "    Ok(())\n"
+         "}\n"}};
+    RUST_ROUTES(store, root, files) {
+        ASSERT_NOT_NULL(store);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.a.result", "src.thing.Thing.run"), 1);
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.b.lookalike", "src.thing.Thing.run"), 0);
+    }
+    PASS();
+}
+
 SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_same_module_item_ignores_the_files_other_syntax);
     RUN_TEST(resolver_rust_use_tree_binds_one_name_per_leaf);
@@ -1511,6 +1558,7 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_unreached_file_reports_its_crate_as_unknown);
     RUN_TEST(resolver_rust_collect_fills_the_placeholder_from_the_iterator);
     RUN_TEST(resolver_rust_deferred_let_takes_its_type_from_the_assignment);
+    RUN_TEST(resolver_rust_anyhow_context_keeps_the_success_type);
     RUN_TEST(resolver_rust_local_impl_preserves_import_domain);
     RUN_TEST(resolver_rust_primitive_arguments_and_private_self_require_proofs);
     RUN_TEST(resolver_rust_declared_module_and_use_keep_exact_target);
