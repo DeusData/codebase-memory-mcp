@@ -1194,6 +1194,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
+        /* `companion object { }` is named Companion by the language. */
+        if (ts_node_is_null(name_node) && state && state->enclosing_class_qn &&
+            strcmp(ts_node_type(node), "companion_object") == 0) {
+            return cbm_arena_sprintf(ctx->arena, "%s.Companion", state->enclosing_class_qn);
+        }
     }
     /* Objective-C: class_interface / class_implementation have no `name` field;
      * the class name is a plain `identifier` child. Without this the walk pushes

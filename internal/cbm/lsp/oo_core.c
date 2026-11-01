@@ -245,6 +245,27 @@ const CBMDefinition *oo_defs_find(const oo_defs_t *defs, char kind, uint32_t lin
 
 /* ── Hierarchy ──────────────────────────────────────────────────────── */
 
+static bool oo_broken_node(TSNode node) {
+    return ts_node_is_error(node) || ts_node_is_missing(node);
+}
+
+bool oo_members_broken(TSNode declaration) {
+    uint32_t count = ts_node_child_count(declaration);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_child(declaration, i);
+        if (oo_broken_node(child))
+            return true;
+        const char *kind = ts_node_type(child);
+        if (!strstr(kind, "body") && !strstr(kind, "declaration_list"))
+            continue;
+        uint32_t members = ts_node_child_count(child);
+        for (uint32_t m = 0; m < members; m++)
+            if (oo_broken_node(ts_node_child(child, m)))
+                return true;
+    }
+    return false;
+}
+
 const oo_type_t *oo_unalias(const cbm_oo_index_t *ix, const oo_type_t *type) {
     for (int hops = 0; type && type->alias_of && hops < 16; hops++) {
         oo_scope_t scope = oo_scope_of_type(type);
@@ -296,7 +317,7 @@ bool oo_hierarchy_complete(const cbm_oo_index_t *ix, const oo_type_t *type) {
         for (int i = 0; i < current->super_count; i++) {
             const oo_type_t *next = current->supers[i].resolved;
             if (!next)
-                return false;
+                continue; /* supers_complete says it is a closed external. */
             bool seen = false;
             for (int j = 0; j < tail && !seen; j++)
                 seen = queue[j] == next;
@@ -500,8 +521,12 @@ oo_name_t oo_resolve_name(const cbm_oo_index_t *ix, const oo_scope_t *scope, con
     if (!oo_lexical_name(ix, scope, first, &head))
         head = scope->file->language == CBM_LANG_CSHARP ? oo_cs_simple(ix, scope, first)
                                                         : oo_jvm_simple(ix, scope, first);
-    if (!dot)
+    if (!dot) {
+        /* `first` dies with this frame; `name` holds the same text. */
+        if (head.status == OO_NAME_EXTERNAL && head.external == first)
+            head.external = name;
         return head;
+    }
     if (head.status == OO_NAME_TYPE) {
         const oo_type_t *type = head.type;
         const char *rest = dot + 1;
@@ -670,6 +695,259 @@ bool oo_type_shaped(const char *name) {
     return false;
 }
 
+/* JDK, Kotlin and .NET supertypes small enough to list. A class naming only
+ * these still has a known member set, because the interface members it must
+ * implement are declared in its own body. */
+static const struct {
+    const char *type;
+    const char *members;
+} OO_CLOSED_SUPERS[] = {
+    {"AutoCloseable", "close"},
+    {"Closeable", "close"},
+    {"Comparable", "compareTo"},
+    {"Serializable", ""},
+    {"Cloneable", "clone"},
+    {"Runnable", "run"},
+    {"Callable", "call"},
+    {"Iterable", "iterator forEach spliterator"},
+    {"Iterator", "hasNext next remove forEachRemaining"},
+    {"MutableIterator", "hasNext next remove"},
+    {"Supplier", "get"},
+    {"Consumer", "accept andThen"},
+    {"BiConsumer", "accept andThen"},
+    {"Function", "apply andThen compose"},
+    {"BiFunction", "apply andThen"},
+    {"Predicate", "test and or negate"},
+    {"Comparator", "compare reversed thenComparing"},
+    {"Any", "toString equals hashCode"},
+    {"Object", "toString equals hashCode getClass notify notifyAll wait clone finalize"},
+    {"Throwable", "getMessage getCause getLocalizedMessage printStackTrace getStackTrace "
+                  "setStackTrace initCause fillInStackTrace addSuppressed getSuppressed "
+                  "message cause stackTraceToString"},
+    {"Exception", "getMessage getCause getLocalizedMessage printStackTrace getStackTrace "
+                  "setStackTrace initCause fillInStackTrace addSuppressed getSuppressed "
+                  "message cause stackTraceToString"},
+    {"RuntimeException", "getMessage getCause getLocalizedMessage printStackTrace getStackTrace "
+                         "setStackTrace initCause fillInStackTrace addSuppressed getSuppressed "
+                         "message cause stackTraceToString"},
+    {"IDisposable", "Dispose"},
+    {"IAsyncDisposable", "DisposeAsync"},
+    {"ICloneable", "Clone"},
+    {"IComparable", "CompareTo"},
+    {"IEquatable", "Equals"},
+    {"IEnumerable", "GetEnumerator"},
+    {"IEnumerator", "Current MoveNext Reset Dispose"},
+};
+
+static bool oo_word_in(const char *words, const char *word) {
+    size_t length = strlen(word);
+    for (const char *p = words; (p = strstr(p, word)) != NULL; p += length) {
+        bool start = p == words || p[-1] == ' ';
+        bool end = p[length] == ' ' || p[length] == '\0';
+        if (start && end)
+            return true;
+    }
+    return false;
+}
+
+/* The leaf of a spelled name, without its arity. */
+static const char *oo_plain_leaf(const char *name, char *buffer, size_t capacity) {
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    const char *leaf = dot ? dot + 1 : name;
+    if (!leaf)
+        return NULL;
+    size_t length = strcspn(leaf, "`");
+    if (length >= capacity)
+        return NULL;
+    memcpy(buffer, leaf, length);
+    buffer[length] = '\0';
+    return buffer;
+}
+
+static bool oo_closed_super(const char *name) {
+    char leaf[64];
+    if (!oo_plain_leaf(name, leaf, sizeof(leaf)))
+        return false;
+    for (size_t i = 0; i < sizeof(OO_CLOSED_SUPERS) / sizeof(OO_CLOSED_SUPERS[0]); i++)
+        if (!strcmp(OO_CLOSED_SUPERS[i].type, leaf))
+            return true;
+    return false;
+}
+
+bool oo_closed_member(const char *name) {
+    if (!name)
+        return false;
+    for (size_t i = 0; i < sizeof(OO_CLOSED_SUPERS) / sizeof(OO_CLOSED_SUPERS[0]); i++)
+        if (oo_word_in(OO_CLOSED_SUPERS[i].members, name))
+            return true;
+    return false;
+}
+
+static bool oo_name_in(const char *leaf, const char *const *names) {
+    for (int i = 0; names[i]; i++)
+        if (!strcmp(leaf, names[i]))
+            return true;
+    return false;
+}
+
+static const char *const OO_ONE_ARG_COLLECTIONS[] = {"Iterable",
+                                                     "MutableIterable",
+                                                     "Collection",
+                                                     "MutableCollection",
+                                                     "List",
+                                                     "MutableList",
+                                                     "ArrayList",
+                                                     "LinkedList",
+                                                     "Set",
+                                                     "MutableSet",
+                                                     "HashSet",
+                                                     "LinkedHashSet",
+                                                     "TreeSet",
+                                                     "SortedSet",
+                                                     "NavigableSet",
+                                                     "Queue",
+                                                     "Deque",
+                                                     "ArrayDeque",
+                                                     "Vector",
+                                                     "Sequence",
+                                                     "Flow",
+                                                     "Array",
+                                                     "Iterator",
+                                                     "ListIterator",
+                                                     "MutableIterator",
+                                                     "Stream",
+                                                     "Optional",
+                                                     "IEnumerable",
+                                                     "ICollection",
+                                                     "IList",
+                                                     "IReadOnlyList",
+                                                     "IReadOnlyCollection",
+                                                     "ISet",
+                                                     "Stack",
+                                                     "IEnumerator",
+                                                     "Span",
+                                                     "ReadOnlySpan",
+                                                     "Memory",
+                                                     "ReadOnlyMemory",
+                                                     NULL};
+
+oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value) {
+    if (!value)
+        return oo_value_unknown();
+    if (value->dims > 0) {
+        oo_value_t element = *value;
+        element.dims--;
+        element.classref = false;
+        return element;
+    }
+    char leaf[64];
+    if (value->external && value->arg_count == 1 &&
+        oo_plain_leaf(value->external, leaf, sizeof(leaf)) &&
+        oo_name_in(leaf, OO_ONE_ARG_COLLECTIONS))
+        return value->args[0];
+    if (!value->type)
+        return oo_value_unknown();
+    /* A project type's own Iterable<X> supertype, with its arguments substituted. */
+    const oo_type_t *visited[32];
+    int seen = 0;
+    oo_value_t current = *value;
+    for (int hops = 0; hops < 32 && current.type; hops++) {
+        bool repeat = false;
+        for (int i = 0; i < seen; i++)
+            repeat = repeat || visited[i] == current.type;
+        if (repeat)
+            break;
+        visited[seen++] = current.type;
+        oo_subst_t *subst = oo_subst_of(w, &current);
+        const oo_type_t *type = current.type;
+        oo_value_t next = oo_value_unknown();
+        for (int i = 0; i < type->super_count; i++) {
+            const oo_super_t *super = &type->supers[i];
+            oo_scope_t scope = {.file = super->file, .ns = super->ns, .owner = type};
+            oo_value_t candidate = oo_value_from_ref(w, super->ref, &scope, subst);
+            if (candidate.external && candidate.arg_count == 1 &&
+                oo_plain_leaf(candidate.external, leaf, sizeof(leaf)) &&
+                oo_name_in(leaf, OO_ONE_ARG_COLLECTIONS))
+                return candidate.args[0];
+            if (candidate.type && !next.type)
+                next = candidate;
+        }
+        current = next;
+    }
+    return oo_value_unknown();
+}
+
+oo_value_t oo_external_member_return(oo_walk_t *w, const oo_value_t *value, const char *name) {
+    char leaf[64];
+    if (!value || !name || !value->external || value->dims ||
+        !oo_plain_leaf(value->external, leaf, sizeof(leaf)))
+        return oo_value_unknown();
+    static const char *const elements[] = {"get",
+                                           "first",
+                                           "last",
+                                           "single",
+                                           "firstOrNull",
+                                           "lastOrNull",
+                                           "singleOrNull",
+                                           "getOrNull",
+                                           "next",
+                                           "peek",
+                                           "poll",
+                                           "pop",
+                                           "element",
+                                           "removeFirst",
+                                           "removeLast",
+                                           "getFirst",
+                                           "getLast",
+                                           "orElse",
+                                           "orElseThrow",
+                                           "orElseGet",
+                                           "orNull",
+                                           "getOrThrow",
+                                           "Current",
+                                           "First",
+                                           "Last",
+                                           "Single",
+                                           "FirstOrDefault",
+                                           "LastOrDefault",
+                                           "SingleOrDefault",
+                                           "ElementAt",
+                                           NULL};
+    static const char *const same[] = {
+        "iterator",   "listIterator", "stream",  "filter",        "sorted", "distinct",
+        "limit",      "skip",         "toList",  "toMutableList", "toSet",  "asSequence",
+        "asIterable", "reversed",     "subList", "take",          "drop",   "filterNotNull",
+        "Where",      "ToList",       "ToArray", "AsEnumerable",  NULL};
+    if (value->arg_count == 1 && oo_name_in(leaf, OO_ONE_ARG_COLLECTIONS)) {
+        if (oo_name_in(name, elements))
+            return value->args[0];
+        if (oo_name_in(name, same)) {
+            oo_value_t copy = *value;
+            copy.classref = false;
+            return copy;
+        }
+    }
+    static const char *const maps[] = {"Map",
+                                       "MutableMap",
+                                       "HashMap",
+                                       "LinkedHashMap",
+                                       "TreeMap",
+                                       "SortedMap",
+                                       "NavigableMap",
+                                       "ConcurrentHashMap",
+                                       "ConcurrentMap",
+                                       "Dictionary",
+                                       "IDictionary",
+                                       "IReadOnlyDictionary",
+                                       NULL};
+    static const char *const map_values[] = {"get",       "getValue", "getOrDefault",    "getOrPut",
+                                             "getOrElse", "remove",   "computeIfAbsent", NULL};
+    if (value->arg_count == 2 && oo_name_in(leaf, maps) && oo_name_in(name, map_values))
+        return value->args[1];
+    (void)w;
+    return oo_value_unknown();
+}
+
 /* ── Member selection ───────────────────────────────────────────────── */
 
 typedef struct {
@@ -793,6 +1071,9 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
     oo_scope_t scope = oo_scope_of_callable(callable);
     for (int i = 0; i < argc && i < OO_ARG_SLOTS; i++) {
         int index = i < callable->param_count ? i : callable->param_count - 1;
+        /* A closing function literal lands on the last parameter, defaults between. */
+        if (args[i].function_literal && i == argc - 1)
+            index = callable->param_count - 1;
         if (index < 0 || !callable->params || !callable->params[index])
             continue;
         if (callable->max_args < 0 && index == callable->param_count - 1)
@@ -801,6 +1082,25 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
             continue;
         oo_value_t parameter = oo_value_from_ref(w, callable->params[index], &scope, subst);
         const oo_value_t *argument = &args[i];
+        if (argument->function_literal) {
+            /* A literal converts to a function type or an interface, nothing else. */
+            if (parameter.type && !(parameter.type->flags & OO_F_INTERFACE))
+                return true;
+            if (parameter.external && (oo_builtin_name(oo_leaf(parameter.external)) ||
+                                       !strcmp(oo_leaf(parameter.external), "String")))
+                return true;
+            continue;
+        }
+        if (parameter.fn_ref) {
+            /* A value whose whole hierarchy is known is not a function. */
+            if (argument->type && oo_hierarchy_complete(w->ix, argument->type))
+                return true;
+            if (argument->external && !argument->fn_ref &&
+                (oo_builtin_name(oo_leaf(argument->external)) ||
+                 !strcmp(oo_leaf(argument->external), "String")))
+                return true;
+            continue;
+        }
         if (parameter.type && argument->type) {
             if (parameter.dims != argument->dims ||
                 !oo_is_subtype(w->ix, argument->type, parameter.type)) {
@@ -864,8 +1164,10 @@ static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, in
     return out;
 }
 
-oo_select_t oo_select_method(oo_walk_t *w, const oo_value_t *receiver, const char *name, int argc,
-                             const oo_value_t *args, bool static_only) {
+static oo_select_t oo_select_in_hierarchy(oo_walk_t *w, const oo_value_t *receiver,
+                                          const char *name, int argc, const oo_value_t *args,
+                                          bool static_only, oo_extension_accepts_fn accepts,
+                                          const oo_value_t *extended) {
     if (!receiver || !receiver->type || !name || receiver->dims)
         return (oo_select_t){.status = OO_SEL_NONE};
     oo_hierarchy_t walk, *h = &walk;
@@ -880,7 +1182,10 @@ oo_select_t oo_select_method(oo_walk_t *w, const oo_value_t *receiver, const cha
         oo_step_t step = h->steps[h->head++];
         for (const oo_callable_t *c = oo_lookup_methods(w->ix, step.type->qn, name); c;
              c = c->next) {
-            if ((c->flags & OO_F_CTOR) || c->receiver)
+            if (c->flags & OO_F_CTOR)
+                continue;
+            /* A member extension is applicable only to its declared receiver. */
+            if (accepts ? !c->receiver || !accepts(w, c, extended) : c->receiver != NULL)
                 continue;
             seen = true;
             if ((c->flags & OO_F_PRIVATE) && !oo_private_visible(w, step.type))
@@ -908,6 +1213,17 @@ oo_select_t oo_select_method(oo_walk_t *w, const oo_value_t *receiver, const cha
     return (oo_select_t){.status = !h->truncated && oo_hierarchy_complete(w->ix, receiver->type)
                                        ? OO_SEL_NONE
                                        : OO_SEL_INCOMPLETE};
+}
+
+oo_select_t oo_select_method(oo_walk_t *w, const oo_value_t *receiver, const char *name, int argc,
+                             const oo_value_t *args, bool static_only) {
+    return oo_select_in_hierarchy(w, receiver, name, argc, args, static_only, NULL, NULL);
+}
+
+oo_select_t oo_select_member_extension(oo_walk_t *w, const oo_value_t *dispatch,
+                                       const oo_value_t *extended, const char *name, int argc,
+                                       const oo_value_t *args, oo_extension_accepts_fn accepts) {
+    return oo_select_in_hierarchy(w, dispatch, name, argc, args, false, accepts, extended);
 }
 
 oo_select_t oo_select_constructor(oo_walk_t *w, const oo_value_t *receiver, int argc,
@@ -1070,7 +1386,8 @@ static void oo_resolve_supers(cbm_oo_index_t *ix) {
                     }
                 }
                 super->external = name.status == OO_NAME_EXTERNAL;
-                complete = false;
+                if (!super->external || !oo_closed_super(super->ref->name))
+                    complete = false;
             }
             type->supers_complete = complete;
         }
@@ -1261,21 +1578,6 @@ static void oo_emit_row(oo_walk_t *w, const oo_carrier_t *carrier, TSNode site, 
                                    .end_byte = end,
                                    .origin = source.source_origin,
                                    .detail = decision};
-    cbm_resolve_result_t audit = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE, .reason = decision};
-    const cbm_resolve_proof_t *inputs[2];
-    inputs[0] = cbm_resolve_proof_leaf(pool, CBM_PROOF_ADAPTER_DOMAIN, &source, &key, &audit);
-    cbm_resolve_proof_key_t declaration = key;
-    declaration.declaration_identity = target;
-    declaration.detail = "selected_declaration";
-    cbm_resolve_result_t selected = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
-                                     .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-                                     .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-                                     .target = target,
-                                     .facts = CBM_RESOLVE_FACT_EXACT_TARGET,
-                                     .candidate_count = 1,
-                                     .reason = "selected_declaration"};
-    inputs[1] = cbm_resolve_proof_leaf(pool, CBM_PROOF_REGISTERED_DECLARATION, NULL, &declaration,
-                                       &selected);
     cbm_resolve_result_t result = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
                                    .domain = CBM_RESOLVE_DOMAIN_PROJECT,
                                    .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
@@ -1284,10 +1586,9 @@ static void oo_emit_row(oo_walk_t *w, const oo_carrier_t *carrier, TSNode site, 
                                    .target = target,
                                    .candidate_count = 1,
                                    .reason = decision};
-    cbm_resolve_proof_key_t lookup = key;
-    lookup.detail = "complete_static_member_selection";
-    const cbm_resolve_proof_t *semantic = cbm_resolve_proof_derive(
-        pool, CBM_PROOF_REGISTRY_LOOKUP, &source, &lookup, &result, inputs, 2, true);
+    /* The language rule's decision, as one leaf: a project holds millions. */
+    const cbm_resolve_proof_t *semantic =
+        cbm_resolve_proof_leaf(pool, CBM_PROOF_ADAPTER_DOMAIN, &source, &key, &result);
     if (!semantic)
         return;
     /* The exact AST role at this site, established where the walker stands. */

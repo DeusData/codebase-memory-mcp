@@ -147,13 +147,22 @@ struct cbm_oo_index {
     bool sealed, failed;
 };
 
+/* Members an anonymous object declares itself: they have no index entry and
+ * hide whatever its supertype offers under the name. */
+typedef struct {
+    const char **names;
+    int count;
+} oo_hidden_t;
+
 typedef struct oo_value {
     const oo_type_t *type;
     const char *external; /* Known name with no project declaration. */
     const struct oo_value *args;
     int arg_count;
     int dims;
-    bool classref; /* Denotes the type itself rather than an instance. */
+    bool classref;         /* Denotes the type itself rather than an instance. */
+    bool function_literal; /* An argument spelled as a lambda: its own type is not read. */
+    const oo_hidden_t *hidden;
     /* Kotlin function value. */
     const struct oo_value *fn_receiver;
     const struct oo_value *fn_return;
@@ -308,10 +317,26 @@ oo_subst_t *oo_subst_of(oo_walk_t *w, const oo_value_t *value);
 bool oo_is_subtype(const cbm_oo_index_t *ix, const oo_type_t *type, const oo_type_t *super);
 /* An upper-case initial and at least one lower-case letter. */
 bool oo_type_shaped(const char *name);
+/* A member of a well-known external supertype whose member list is closed. A
+ * free function of this name cannot be told apart from the inherited member. */
+bool oo_closed_member(const char *name);
+/* The element a collection-like value yields, or unknown. */
+oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value);
+/* The declared result of a standard collection accessor, or unknown. */
+oo_value_t oo_external_member_return(oo_walk_t *w, const oo_value_t *value, const char *name);
 /* Follows a type's aliases to the declared type. */
 const oo_type_t *oo_unalias(const cbm_oo_index_t *ix, const oo_type_t *type);
 
 /* Static member selection over a receiver's whole known hierarchy. */
+/* An error directly among a declaration's members, or in its head, can hide a
+ * member. One inside a member's body cannot. */
+bool oo_members_broken(TSNode declaration);
+typedef bool (*oo_extension_accepts_fn)(oo_walk_t *w, const oo_callable_t *callable,
+                                        const oo_value_t *value);
+/* A member extension of `dispatch`'s hierarchy whose receiver takes `extended`. */
+oo_select_t oo_select_member_extension(oo_walk_t *w, const oo_value_t *dispatch,
+                                       const oo_value_t *extended, const char *name, int argc,
+                                       const oo_value_t *args, oo_extension_accepts_fn accepts);
 oo_select_t oo_select_method(oo_walk_t *w, const oo_value_t *receiver, const char *name, int argc,
                              const oo_value_t *args, bool static_only);
 oo_select_t oo_select_constructor(oo_walk_t *w, const oo_value_t *receiver, int argc,

@@ -422,7 +422,7 @@ static void ch_type(ch_t *h, TSNode node, oo_type_t *owner, const char *ns) {
         flags |= OO_F_INTERFACE;
     if (cs_is(node, "enum_declaration"))
         flags |= OO_F_ENUM;
-    if (ts_node_has_error(node))
+    if (oo_members_broken(node))
         flags |= OO_F_INCOMPLETE;
     const CBMDefinition *def = oo_defs_find(&h->defs, 'T', cs_line(node), name);
     oo_type_t *type = oo_index_type(h->ix, qn, identity, h->file, ns, owner,
@@ -819,6 +819,8 @@ static oo_value_t cw_member_call(cw_t *c, TSNode site, const oo_value_t *receive
     if (receiver->classref || (!receiver->type && !receiver->external))
         return oo_value_unknown();
     oo_select_t extension = cw_select_extension(c, receiver, name, argc, args);
+    if (extension.status != OO_SEL_UNIQUE)
+        return oo_external_member_return(w, receiver, name);
     return cw_emit_selected(c, site, &extension, "csharp-extension-method");
 }
 
@@ -841,10 +843,15 @@ static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
             oo_select_t selected = oo_select_method(w, &r->value, name, argc, args, false);
             return cw_emit_selected(c, site, &selected, "csharp-enclosing-type-member");
         }
+        /* A delegate-typed member of this name is the member lookup's answer. */
+        oo_subst_t *field_subst = NULL;
+        bool field_incomplete = false;
+        if (oo_find_field(w, &r->value, name, &field_subst, &field_incomplete))
+            return oo_value_unknown();
         if (!oo_hierarchy_complete(w->ix, r->value.type))
             complete = false;
     }
-    if (!complete)
+    if (!complete || oo_closed_member(name))
         return oo_value_unknown();
     /* `using static`: every imported type's members compete. */
     const oo_type_t *found = NULL;
@@ -981,6 +988,14 @@ static oo_value_t cw_identifier(cw_t *c, TSNode node) {
             if (value.type && !strcmp(value.type->name, name))
                 value.classref = false;
             return value;
+        }
+        /* A method group: the argument to `Select(Foo)` names a declaration. */
+        if (oo_has_method_named(w, &r->value, name)) {
+            oo_select_t selected = oo_select_method(w, &r->value, name, -1, NULL, false);
+            if (selected.status == OO_SEL_UNIQUE && selected.callable->graph_qn)
+                oo_emit_usage(w, node, selected.callable->graph_qn, CBM_RESOLVED_CALL_REFERENCE,
+                              CBM_RESOLVE_RULE_TYPE_MEMBER, "csharp-method-group");
+            return oo_value_unknown();
         }
         if (incomplete) {
             obscurable = true;
@@ -1137,23 +1152,7 @@ static oo_value_t cw_foreach(cw_t *c, TSNode node) {
     oo_frame_push(w, &frame);
     TSNode left = cs_field(node, "left");
     TSNode type = cs_field(node, "type");
-    oo_value_t element = oo_value_unknown();
-    if (iterable.dims > 0) {
-        element = iterable;
-        element.dims--;
-        element.classref = false;
-    } else if (iterable.external && iterable.arg_count == 1) {
-        static const char *const known[] = {
-            "IEnumerable", "ICollection", "IList", "List",  "IReadOnlyList", "IReadOnlyCollection",
-            "HashSet",     "ISet",        "Queue", "Stack", "LinkedList",    NULL};
-        const char *leaf = strrchr(iterable.external, '.');
-        leaf = leaf ? leaf + 1 : iterable.external;
-        for (int i = 0; known[i]; i++) {
-            size_t length = strlen(known[i]);
-            if (!strncmp(leaf, known[i], length) && leaf[length] == '`')
-                element = iterable.args[0];
-        }
-    }
+    oo_value_t element = oo_element_of(w, &iterable);
     if (cs_is(left, "identifier")) {
         oo_value_t value =
             ts_node_is_null(type) ? oo_value_unknown() : cw_declared(c, type, element);
@@ -1386,7 +1385,8 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
             array.classref = false;
             return array;
         }
-        return oo_value_unknown();
+        /* An indexer of a known collection reads its element. */
+        return oo_external_member_return(w, &array, "get");
     }
     if (!strcmp(kind, "conditional_access_expression")) {
         oo_value_t receiver = cw_expr(c, cs_field(node, "condition"));

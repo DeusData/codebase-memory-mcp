@@ -614,7 +614,7 @@ static void kh_type(kh_t *h, TSNode node, oo_type_t *owner) {
         flags |= OO_F_PRIVATE;
     if (modifiers & KT_MOD_INNER)
         flags |= OO_F_INNER;
-    if (ts_node_has_error(node))
+    if (oo_members_broken(node))
         flags |= OO_F_INCOMPLETE;
     const CBMDefinition *def = oo_defs_find(&h->defs, 'T', kt_line(node), name);
     oo_type_t *type = oo_index_type(h->ix, qn, name, h->file, h->file->package, owner,
@@ -774,15 +774,36 @@ static void kt_level_functions(oo_walk_t *w, const oo_scope_t *scope, const char
     }
 }
 
-/* Does this extension's declared receiver accept the value? */
-static bool kt_receiver_accepts(oo_walk_t *w, const oo_callable_t *callable,
-                                const oo_value_t *value) {
-    const oo_typeref_t *ref = callable->receiver;
+/* `import kotlin.test.assertEquals`: the name is bound, outside the project. It
+ * shadows every lower level, so a project namesake there is not a candidate. */
+static bool kt_explicit_external(oo_walk_t *w, const oo_scope_t *scope, const char *name) {
+    const oo_file_t *file = scope->file;
+    for (int i = 0; i < file->import_count; i++) {
+        const oo_import_t *import = &file->imports[i];
+        if (import->star || !import->local || strcmp(import->local, name))
+            continue;
+        const char *dot = strrchr(import->path, '.');
+        const char *leaf = dot ? dot + 1 : import->path;
+        const char *prefix =
+            dot ? cbm_arena_strndup(w->arena, import->path, (size_t)(dot - import->path)) : "";
+        if (!prefix)
+            return true;
+        const oo_type_t *owner = oo_lookup_type(w->ix, prefix);
+        if (!oo_lookup_functions(w->ix, prefix, leaf) &&
+            !(owner && oo_lookup_methods(w->ix, owner->qn, leaf)) &&
+            !oo_lookup_type(w->ix, import->path) && !oo_lookup_props(w->ix, prefix, leaf))
+            return true;
+    }
+    return false;
+}
+
+/* Does an extension's declared receiver accept the value? */
+static bool kt_ref_accepts(oo_walk_t *w, const oo_typeref_t *ref, oo_scope_t scope,
+                           const oo_value_t *value) {
     if (!ref || !value || ref->function)
         return false;
     if (!ref->name)
         return false;
-    oo_scope_t scope = oo_scope_of_callable(callable);
     oo_name_t name = oo_resolve_name(w->ix, &scope, ref->name);
     if (name.status == OO_NAME_TPARAM) {
         if (!name.tparam->bound)
@@ -808,6 +829,19 @@ static bool kt_receiver_accepts(oo_walk_t *w, const oo_callable_t *callable,
         actual = actual ? actual + 1 : value->external;
         return !strcmp(declared, actual);
     }
+    return false;
+}
+
+static bool kt_receiver_accepts(oo_walk_t *w, const oo_callable_t *callable,
+                                const oo_value_t *value) {
+    return kt_ref_accepts(w, callable->receiver, oo_scope_of_callable(callable), value);
+}
+
+static bool kt_hidden(const oo_value_t *value, const char *name) {
+    if (value->hidden)
+        for (int i = 0; i < value->hidden->count; i++)
+            if (!strcmp(value->hidden->names[i], name))
+                return true;
     return false;
 }
 
@@ -838,6 +872,8 @@ static oo_select_t kt_select_list(oo_walk_t *w, const kt_list_t *list, int argc,
 static oo_select_t kt_select_extension(oo_walk_t *w, const oo_scope_t *scope,
                                        const oo_value_t *value, const char *name, int argc,
                                        const oo_value_t *args) {
+    if (kt_explicit_external(w, scope, name))
+        return (oo_select_t){.status = OO_SEL_NONE};
     for (int level = 0; level < KT_LEVEL_COUNT; level++) {
         kt_list_t list = {.count = 0};
         kt_level_functions(w, scope, name, level, &list);
@@ -852,9 +888,53 @@ static oo_select_t kt_select_extension(oo_walk_t *w, const oo_scope_t *scope,
     return (oo_select_t){.status = OO_SEL_NONE};
 }
 
-/* A member call on a value, or a member of a type named by the value. */
-static oo_select_t kt_select_member(oo_walk_t *w, const oo_scope_t *scope, const oo_value_t *value,
-                                    const char *name, int argc, const oo_value_t *args) {
+/* Kotlin spec 11.3: a member extension of an implicit receiver, innermost first. */
+static oo_select_t kt_implicit_member_extension(oo_walk_t *w, const oo_value_t *extended,
+                                                const char *name, int argc,
+                                                const oo_value_t *args) {
+    bool unknown = false;
+    bool no_outer_instance = false;
+    for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
+        bool blocked =
+            no_outer_instance && !(r->value.type && (r->value.type->flags & OO_F_OBJECT));
+        no_outer_instance = no_outer_instance || r->static_context;
+        if (blocked)
+            continue;
+        if (r->unknown) {
+            unknown = true;
+            continue;
+        }
+        if (!r->value.type || kt_hidden(&r->value, name))
+            continue;
+        oo_select_t selected = oo_select_member_extension(w, &r->value, extended, name, argc, args,
+                                                          kt_receiver_accepts);
+        if (selected.status == OO_SEL_UNIQUE || selected.status == OO_SEL_AMBIGUOUS)
+            return unknown ? (oo_select_t){.status = OO_SEL_AMBIGUOUS} : selected;
+    }
+    return (oo_select_t){.status = OO_SEL_NONE};
+}
+
+/* The same for a declaration read out of context: its owners are its receivers. */
+static oo_select_t kt_owner_member_extension(oo_walk_t *w, const oo_scope_t *scope,
+                                             const oo_value_t *extended, const char *name, int argc,
+                                             const oo_value_t *args) {
+    for (const oo_type_t *type = scope->owner; type; type = type->owner) {
+        oo_value_t dispatch = oo_value_of_type(type);
+        oo_select_t selected = oo_select_member_extension(w, &dispatch, extended, name, argc, args,
+                                                          kt_receiver_accepts);
+        if (selected.status == OO_SEL_UNIQUE || selected.status == OO_SEL_AMBIGUOUS)
+            return selected;
+    }
+    return (oo_select_t){.status = OO_SEL_NONE};
+}
+
+/* A member call on a value, or a member of a type named by the value. `walking`
+ * says the walk's implicit receivers are the ones in scope at this site. */
+static oo_select_t kt_select_member_at(oo_walk_t *w, const oo_scope_t *scope,
+                                       const oo_value_t *value, const char *name, int argc,
+                                       const oo_value_t *args, bool walking) {
+    if (kt_hidden(value, name))
+        return (oo_select_t){.status = OO_SEL_AMBIGUOUS};
     oo_value_t receiver = *value;
     if (value->classref && value->type) {
         const oo_type_t *type = value->type;
@@ -872,10 +952,23 @@ static oo_select_t kt_select_member(oo_walk_t *w, const oo_scope_t *scope, const
                                        : (oo_select_t){.status = OO_SEL_NONE};
     if (member.status == OO_SEL_UNIQUE || member.status == OO_SEL_AMBIGUOUS)
         return member;
+    /* Every value has Any's members, and a member beats any extension. */
+    if (!strcmp(name, "toString") || !strcmp(name, "equals") || !strcmp(name, "hashCode"))
+        return (oo_select_t){.status = OO_SEL_NONE};
+    oo_select_t member_extension =
+        walking ? kt_implicit_member_extension(w, &receiver, name, argc, args)
+                : kt_owner_member_extension(w, scope, &receiver, name, argc, args);
+    if (member_extension.status == OO_SEL_UNIQUE || member_extension.status == OO_SEL_AMBIGUOUS)
+        return member_extension;
     oo_select_t extension = kt_select_extension(w, scope, &receiver, name, argc, args);
     if (extension.status == OO_SEL_UNIQUE || extension.status == OO_SEL_AMBIGUOUS)
         return extension;
     return member.status == OO_SEL_INCOMPLETE ? member : (oo_select_t){.status = OO_SEL_NONE};
+}
+
+static oo_select_t kt_select_member(oo_walk_t *w, const oo_scope_t *scope, const oo_value_t *value,
+                                    const char *name, int argc, const oo_value_t *args) {
+    return kt_select_member_at(w, scope, value, name, argc, args, true);
 }
 
 /* A property of a value, member first and then a visible extension property. */
@@ -943,6 +1036,61 @@ static const oo_field_t *kt_free_property(oo_walk_t *w, const oo_scope_t *scope,
     return found;
 }
 
+static bool kt_property_accepts(oo_walk_t *w, const oo_field_t *field, const oo_value_t *value) {
+    return kt_ref_accepts(w, field->receiver, oo_scope_of_field(field), value);
+}
+
+/* An extension property on a value: the first import level that offers one
+ * decides, as for functions. */
+static const oo_field_t *kt_extension_property(oo_walk_t *w, const oo_scope_t *scope,
+                                               const oo_value_t *value, const char *name) {
+    const oo_file_t *file = scope->file;
+    const oo_field_t *found = NULL;
+    for (int i = 0; i < file->import_count; i++) {
+        const oo_import_t *import = &file->imports[i];
+        if (import->star || !import->local || strcmp(import->local, name))
+            continue;
+        const char *dot = strrchr(import->path, '.');
+        const char *leaf = dot ? dot + 1 : import->path;
+        const char *prefix =
+            dot ? cbm_arena_strndup(w->arena, import->path, (size_t)(dot - import->path)) : "";
+        if (!prefix)
+            return NULL;
+        for (const oo_field_t *f = oo_lookup_props(w->ix, prefix, leaf); f; f = f->next) {
+            if (!f->receiver || !kt_property_accepts(w, f, value))
+                continue;
+            if (found && found != f)
+                return NULL;
+            found = f;
+        }
+    }
+    if (found)
+        return found;
+    for (const oo_field_t *f = oo_lookup_props(w->ix, file->package, name); f; f = f->next) {
+        if (!f->receiver || ((f->flags & OO_F_PRIVATE) && strcmp(f->file->rel, file->rel)) ||
+            !kt_property_accepts(w, f, value))
+            continue;
+        if (found)
+            return NULL;
+        found = f;
+    }
+    if (found)
+        return found;
+    for (int i = 0; i < file->import_count; i++) {
+        const oo_import_t *import = &file->imports[i];
+        if (!import->star)
+            continue;
+        for (const oo_field_t *f = oo_lookup_props(w->ix, import->path, name); f; f = f->next) {
+            if (!f->receiver || (f->flags & OO_F_PRIVATE) || !kt_property_accepts(w, f, value))
+                continue;
+            if (found && found != f)
+                return NULL;
+            found = f;
+        }
+    }
+    return found;
+}
+
 /* A bare name in a declaration's summary: members of the enclosing types, then
  * free functions and types of its file. Summaries carry no local bindings. */
 static oo_value_t kt_summary_first(oo_walk_t *w, const oo_sumstep_t *step, const oo_scope_t *scope,
@@ -998,7 +1146,10 @@ static oo_value_t kt_summary_first(oo_walk_t *w, const oo_sumstep_t *step, const
     oo_value_t value = oo_value_from_ref(w, &ref, scope, subst);
     if (value.type && step->argc < 0)
         value.classref = true;
-    return value.type || step->argc >= 0 ? value : oo_value_unknown();
+    if (value.type)
+        return value;
+    /* An external constructor spelled like a type keeps its name and arguments. */
+    return step->argc >= 0 && oo_type_shaped(step->name) ? value : oo_value_unknown();
 }
 
 oo_value_t oo_kotlin_eval_summary(oo_walk_t *w, const oo_exprsum_t *summary,
@@ -1010,7 +1161,8 @@ oo_value_t oo_kotlin_eval_summary(oo_walk_t *w, const oo_exprsum_t *summary,
     for (int i = 1; i < summary->count && oo_value_known(&value); i++) {
         const oo_sumstep_t *step = &summary->steps[i];
         if (step->argc >= 0) {
-            oo_select_t selected = kt_select_member(w, scope, &value, step->name, step->argc, NULL);
+            oo_select_t selected =
+                kt_select_member_at(w, scope, &value, step->name, step->argc, NULL, false);
             if (selected.status != OO_SEL_UNIQUE) {
                 value = oo_value_unknown();
                 break;
@@ -1041,10 +1193,13 @@ static oo_value_t kt_field_type(oo_walk_t *w, const oo_field_t *field, const oo_
 
 /* ── Walk ───────────────────────────────────────────────────────────── */
 
+typedef struct kw_args kw_args_t;
+
 typedef struct {
     oo_walk_t *w;
     kt_text_t text;
     int depth;
+    kw_args_t *free_args;
 } kw_t;
 
 static oo_value_t kw_expr(kw_t *k, TSNode node);
@@ -1225,39 +1380,9 @@ static bool kt_stdlib_plain_lambda(const char *name) {
     return false;
 }
 
-static oo_value_t kt_element_of(const oo_value_t *collection) {
-    if (collection->dims > 0) {
-        oo_value_t element = *collection;
-        element.dims--;
-        return element;
-    }
-    if (collection->external && collection->arg_count == 1) {
-        static const char *const known[] = {"List",
-                                            "MutableList",
-                                            "Collection",
-                                            "MutableCollection",
-                                            "Iterable",
-                                            "MutableIterable",
-                                            "Set",
-                                            "MutableSet",
-                                            "Sequence",
-                                            "Array",
-                                            "ArrayList",
-                                            "HashSet",
-                                            "LinkedHashSet",
-                                            "Flow",
-                                            NULL};
-        const char *leaf = strrchr(collection->external, '.');
-        leaf = leaf ? leaf + 1 : collection->external;
-        for (int i = 0; known[i]; i++)
-            if (!strcmp(leaf, known[i]))
-                return collection->args[0];
-    }
-    return oo_value_unknown();
-}
-
 /* Lambda facts of a standard library function on a known receiver. */
-static void kt_stdlib_lambda(const char *name, const oo_value_t *receiver, kw_lambda_ctx_t *ctx) {
+static void kt_stdlib_lambda(oo_walk_t *w, const char *name, const oo_value_t *receiver,
+                             kw_lambda_ctx_t *ctx) {
     if (!strcmp(name, "let") || !strcmp(name, "also") || !strcmp(name, "takeIf") ||
         !strcmp(name, "takeUnless") || !strcmp(name, "use")) {
         ctx->no_receiver = true;
@@ -1281,7 +1406,7 @@ static void kt_stdlib_lambda(const char *name, const oo_value_t *receiver, kw_la
     if (kt_stdlib_plain_lambda(name)) {
         ctx->no_receiver = true;
         if (receiver) {
-            oo_value_t element = kt_element_of(receiver);
+            oo_value_t element = oo_element_of(w, receiver);
             if (oo_value_known(&element) && strcmp(name, "fold") && strcmp(name, "reduce") &&
                 strcmp(name, "forEachIndexed") && strcmp(name, "mapIndexed")) {
                 ctx->it = element;
@@ -1401,13 +1526,30 @@ static oo_value_t kw_lambda(kw_t *k, TSNode lambda, const oo_value_t *expected,
 
 /* Value arguments and trailing lambdas, walked once each. A lambda's expected
  * type is read from the selected declaration, so lambdas wait for selection. */
-typedef struct {
+struct kw_args {
     TSNode nodes[32];
     oo_value_t values[32];
     bool lambda[32];
     int count;
     bool overflow;
-} kw_args_t;
+    kw_args_t *next_free;
+};
+
+static kw_args_t *kw_args_take(kw_t *k) {
+    kw_args_t *args = k->free_args;
+    if (args)
+        k->free_args = args->next_free;
+    else
+        args = cbm_arena_alloc(k->w->arena, sizeof(*args));
+    return args;
+}
+
+static void kw_args_give(kw_t *k, kw_args_t *args) {
+    if (args) {
+        args->next_free = k->free_args;
+        k->free_args = args;
+    }
+}
 
 static TSNode kw_lambda_of(TSNode argument) {
     TSNode node = argument;
@@ -1440,10 +1582,14 @@ static void kw_collect_args(kw_t *k, TSNode suffix, kw_args_t *args) {
         args->nodes[args->count] = argument;
         args->lambda[args->count] = !ts_node_is_null(lambda);
         args->values[args->count] = oo_value_unknown();
+        args->values[args->count].function_literal = !ts_node_is_null(lambda);
         if (ts_node_is_null(lambda)) {
             uint32_t parts = ts_node_named_child_count(argument);
             TSNode value = parts ? ts_node_named_child(argument, parts - 1) : (TSNode){0};
-            args->values[args->count] = kw_expr(k, value);
+            oo_value_t read = kw_expr(k, value);
+            /* A named argument lands on a parameter of that name, not this position. */
+            if (parts < 2 || !kt_is(ts_node_named_child(argument, 0), "simple_identifier"))
+                args->values[args->count] = read;
         }
         args->count++;
     }
@@ -1455,6 +1601,7 @@ static void kw_collect_args(kw_t *k, TSNode suffix, kw_args_t *args) {
         args->nodes[args->count] = child;
         args->lambda[args->count] = true;
         args->values[args->count] = oo_value_unknown();
+        args->values[args->count].function_literal = true;
         args->count++;
     }
 }
@@ -1504,13 +1651,47 @@ typedef struct {
     oo_select_t selected;
     bool stop;
     bool unknown_receiver;
+    bool extension;
 } kw_implicit_t;
 
-static kw_implicit_t kw_implicit_member(kw_t *k, const char *name, int argc,
+/* An extension applicable to one implicit receiver: member extensions, then the
+ * import levels. Under an unknown closer receiver only an explicit import, which
+ * spells out this very name, is still believable. */
+static oo_select_t kw_extension_on_implicit(oo_walk_t *w, const oo_value_t *value, const char *name,
+                                            int argc, const oo_value_t *args, bool explicit_only) {
+    if (!explicit_only) {
+        oo_select_t member = kt_implicit_member_extension(w, value, name, argc, args);
+        if (member.status == OO_SEL_UNIQUE || member.status == OO_SEL_AMBIGUOUS)
+            return member;
+    }
+    if (kt_explicit_external(w, &w->scope, name))
+        return (oo_select_t){.status = OO_SEL_NONE};
+    int levels = explicit_only ? KT_LEVEL_EXPLICIT + 1 : KT_LEVEL_COUNT;
+    for (int level = 0; level < levels; level++) {
+        kt_list_t list = {.count = 0};
+        kt_level_functions(w, &w->scope, name, level, &list);
+        if (list.overflow)
+            return (oo_select_t){.status = OO_SEL_AMBIGUOUS};
+        if (!list.count)
+            continue;
+        oo_select_t extension = kt_select_list(w, &list, argc, args, value, true);
+        if (extension.status == OO_SEL_UNIQUE || extension.status == OO_SEL_AMBIGUOUS)
+            return extension;
+    }
+    return (oo_select_t){.status = OO_SEL_NONE};
+}
+
+static kw_implicit_t kw_implicit_member(kw_t *k, TSNode name_site, const char *name, int argc,
                                         const oo_value_t *args) {
     oo_walk_t *w = k->w;
     kw_implicit_t out = {0};
+    bool no_outer_instance = false;
     for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
+        bool blocked =
+            no_outer_instance && !(r->value.type && (r->value.type->flags & OO_F_OBJECT));
+        no_outer_instance = no_outer_instance || r->static_context;
+        if (blocked)
+            continue;
         for (int i = 0; i < r->own_count; i++) {
             if (!strcmp(r->own_names[i], name)) {
                 out.stop = true;
@@ -1523,6 +1704,10 @@ static kw_implicit_t kw_implicit_member(kw_t *k, const char *name, int argc,
         }
         if (!r->value.type)
             continue;
+        if (kt_hidden(&r->value, name)) {
+            out.stop = true;
+            return out;
+        }
         oo_select_t selected = oo_select_method(w, &r->value, name, argc, args, false);
         if (selected.status == OO_SEL_UNIQUE || selected.status == OO_SEL_AMBIGUOUS) {
             /* A closer unknown receiver could still declare the name. */
@@ -1534,15 +1719,47 @@ static kw_implicit_t kw_implicit_member(kw_t *k, const char *name, int argc,
             out.stop = true;
             return out;
         }
+        /* `f()` on a member property is its invoke, not a free function f. */
+        oo_subst_t *field_subst = NULL;
+        bool field_incomplete = false;
+        const oo_field_t *property =
+            oo_find_field(w, &r->value, name, &field_subst, &field_incomplete);
+        if (property) {
+            out.stop = true;
+            if (!out.unknown_receiver) {
+                oo_value_t value = kt_field_type(w, property, field_subst);
+                if (value.type && argc >= 0)
+                    out.selected = kt_select_member(w, &w->scope, &value, "invoke", argc, args);
+                if (out.selected.status != OO_SEL_UNIQUE)
+                    out.selected = (oo_select_t){.status = OO_SEL_NONE};
+                else if (property->graph_qn)
+                    oo_emit_usage(w, name_site, property->graph_qn, CBM_RESOLVED_VALUE_REFERENCE,
+                                  CBM_RESOLVE_RULE_TYPE_MEMBER,
+                                  "kotlin-implicit-receiver-property");
+            }
+            return out;
+        }
         if (selected.status == OO_SEL_INCOMPLETE)
             out.unknown_receiver = true;
+        /* Kotlin spec 11.3: extensions on this receiver come before the next
+         * receiver's members. */
+        oo_select_t extension =
+            oo_closed_member(name)
+                ? (oo_select_t){.status = OO_SEL_NONE}
+                : kw_extension_on_implicit(w, &r->value, name, argc, args, out.unknown_receiver);
+        if (extension.status == OO_SEL_UNIQUE || extension.status == OO_SEL_AMBIGUOUS) {
+            out.selected = extension;
+            out.extension = true;
+            out.stop = true;
+            return out;
+        }
     }
     return out;
 }
 
-/* Extensions on any implicit receiver; plain functions and constructors. */
+/* Top-level functions that take no receiver, and constructors. */
 static oo_select_t kw_free_call(kw_t *k, const char *name, int argc, const oo_value_t *args,
-                                bool *constructor, oo_value_t *type_value) {
+                                bool *constructor, oo_value_t *type_value, bool explicit_only) {
     oo_walk_t *w = k->w;
     *constructor = false;
     *type_value = oo_value_unknown();
@@ -1551,31 +1768,38 @@ static oo_select_t kw_free_call(kw_t *k, const char *name, int argc, const oo_va
     bool shadowed_type = oo_lookup_local(w, cbm_arena_sprintf(w->arena, "#type:%s", name)) != NULL;
     if (shadowed_type)
         return (oo_select_t){.status = OO_SEL_AMBIGUOUS};
-    for (int level = 0; level < KT_LEVEL_COUNT; level++) {
+    if (kt_explicit_external(w, &w->scope, name)) {
+        /* Only its own classifier could still be meant, and that was this import. */
+        return (oo_select_t){.status = OO_SEL_NONE};
+    }
+    int levels = explicit_only ? KT_LEVEL_EXPLICIT + 1 : KT_LEVEL_COUNT;
+    for (int level = 0; level < levels; level++) {
         kt_list_t list = {.count = 0};
         kt_level_functions(w, &w->scope, name, level, &list);
         if (list.overflow)
             return (oo_select_t){.status = OO_SEL_AMBIGUOUS};
-        if (list.count) {
-            oo_select_t plain = kt_select_list(w, &list, argc, args, NULL, false);
-            if (plain.status == OO_SEL_UNIQUE || plain.status == OO_SEL_AMBIGUOUS)
-                return plain;
-            for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
-                if (r->unknown || !r->value.type)
-                    continue;
-                oo_select_t extension = kt_select_list(w, &list, argc, args, &r->value, true);
-                if (extension.status == OO_SEL_UNIQUE || extension.status == OO_SEL_AMBIGUOUS)
-                    return extension;
-            }
-        }
+        if (!list.count)
+            continue;
+        oo_select_t plain = kt_select_list(w, &list, argc, args, NULL, false);
+        if (plain.status == OO_SEL_UNIQUE || plain.status == OO_SEL_AMBIGUOUS)
+            return plain;
     }
     (void)ref;
-    if (type_name.status == OO_NAME_TYPE) {
+    if (type_name.status == OO_NAME_TYPE && (!explicit_only || type_name.via_import)) {
         const oo_type_t *type = oo_unalias(w->ix, type_name.type);
         if (!type)
             return (oo_select_t){.status = OO_SEL_AMBIGUOUS};
         *type_value = oo_value_of_type(type);
+        if (type->flags & OO_F_OBJECT)
+            return oo_select_method(w, type_value, "invoke", argc, args, false);
         oo_select_t selected = oo_select_constructor(w, type_value, argc, args);
+        if (selected.status != OO_SEL_UNIQUE && selected.status != OO_SEL_AMBIGUOUS &&
+            type->companion) {
+            oo_value_t companion = oo_value_of_type(type->companion);
+            oo_select_t invoke = oo_select_method(w, &companion, "invoke", argc, args, false);
+            if (invoke.status == OO_SEL_UNIQUE || invoke.status == OO_SEL_AMBIGUOUS)
+                return invoke;
+        }
         *constructor = true;
         return selected;
     }
@@ -1618,10 +1842,38 @@ static const oo_typeref_t **kw_type_args(kw_t *k, TSNode suffix) {
     return args;
 }
 
-static oo_value_t kw_bare_call(kw_t *k, TSNode node, TSNode callee, TSNode suffix) {
+/* The standard collection factories: their element is the explicit type
+ * argument, or the first argument's type. A project function of the name was
+ * selected before this is consulted. */
+static oo_value_t kt_factory_value(kw_t *k, const char *name, TSNode suffix,
+                                   const kw_args_t *args) {
+    static const char *const factories[] = {
+        "listOf",    "mutableListOf", "arrayListOf", "listOfNotNull", "setOf", "mutableSetOf",
+        "hashSetOf", "linkedSetOf",   "sequenceOf",  "arrayOf",       NULL};
+    bool known = false;
+    for (int i = 0; factories[i]; i++)
+        known = known || !strcmp(factories[i], name);
+    if (!known)
+        return oo_value_unknown();
+    oo_value_t element = args->count && !args->lambda[0] ? args->values[0] : oo_value_unknown();
+    const oo_typeref_t **type_args = kw_type_args(k, suffix);
+    if (type_args && type_args[0] && !type_args[1])
+        element = kw_ref(k, type_args[0]);
+    element.classref = false;
+    oo_value_t *slot = cbm_arena_alloc(k->w->arena, sizeof(*slot));
+    if (!slot || !oo_value_known(&element))
+        return oo_value_unknown();
+    *slot = element;
+    oo_value_t value = oo_value_external("List");
+    value.args = slot;
+    value.arg_count = 1;
+    return value;
+}
+
+static oo_value_t kw_bare_call_with(kw_t *k, TSNode node, TSNode callee, TSNode suffix,
+                                    kw_args_t *args) {
     oo_walk_t *w = k->w;
     const char *name = kt_name(&k->text, callee);
-    kw_args_t *args = cbm_arena_alloc(w->arena, sizeof(*args));
     if (!args || !name) {
         kw_children(k, node);
         return oo_value_unknown();
@@ -1633,11 +1885,22 @@ static oo_value_t kw_bare_call(kw_t *k, TSNode node, TSNode callee, TSNode suffi
      * Neither has a declaration this walk can name. */
     const oo_local_t *local = oo_lookup_local(w, name);
     if (local) {
+        oo_select_t invoke = local->value.type ? kt_select_member(w, &w->scope, &local->value,
+                                                                  "invoke", argc, values)
+                                               : (oo_select_t){.status = OO_SEL_NONE};
+        if (invoke.status == OO_SEL_UNIQUE) {
+            if (invoke.callable->graph_qn)
+                oo_emit_call(w, node, invoke.callable->graph_qn, CBM_RESOLVE_RULE_TYPE_MEMBER,
+                             CBM_RESOLVE_FACT_RECEIVER_TYPED, "kotlin-local-invoke");
+            kw_lambda_ctx_t ctx = {0};
+            (void)kw_finish_lambdas(k, args, invoke.callable, invoke.subst, &ctx);
+            return oo_callable_return(w, invoke.callable, invoke.subst);
+        }
         kw_lambda_ctx_t ctx = {.no_receiver = true};
         (void)kw_finish_lambdas(k, args, NULL, NULL, &ctx);
         return local->value.fn_return ? *local->value.fn_return : oo_value_unknown();
     }
-    kw_implicit_t implicit = kw_implicit_member(k, name, argc, values);
+    kw_implicit_t implicit = kw_implicit_member(k, callee, name, argc, values);
     const oo_callable_t *target = NULL;
     const oo_subst_t *subst = NULL;
     oo_value_t result = oo_value_unknown();
@@ -1648,10 +1911,15 @@ static oo_value_t kw_bare_call(kw_t *k, TSNode node, TSNode callee, TSNode suffi
         subst = implicit.selected.subst;
         if (target->graph_qn)
             oo_emit_call(w, node, target->graph_qn, CBM_RESOLVE_RULE_TYPE_MEMBER,
-                         CBM_RESOLVE_FACT_RECEIVER_TYPED, "kotlin-implicit-receiver-member");
+                         CBM_RESOLVE_FACT_RECEIVER_TYPED,
+                         implicit.extension ? "kotlin-implicit-receiver-extension"
+                                            : "kotlin-implicit-receiver-member");
         result = oo_callable_return(w, target, subst);
-    } else if (!implicit.stop && !implicit.unknown_receiver) {
-        oo_select_t selected = kw_free_call(k, name, argc, values, &constructor, &type_value);
+    } else if (!implicit.stop && !oo_closed_member(name)) {
+        /* An unlistable implicit receiver could hide a free function. An explicit
+         * import spells out this very name, and would be useless if it did. */
+        oo_select_t selected = kw_free_call(k, name, argc, values, &constructor, &type_value,
+                                            implicit.unknown_receiver);
         if (constructor) {
             kw_emit_constructor(k, node, &selected, &type_value);
             result = type_value;
@@ -1672,7 +1940,9 @@ static oo_value_t kw_bare_call(kw_t *k, TSNode node, TSNode callee, TSNode suffi
             }
             result = oo_callable_return(w, target, NULL);
         }
-    } else if (implicit.unknown_receiver && oo_type_shaped(name)) {
+    }
+    if (!target && !constructor && !implicit.stop && implicit.unknown_receiver &&
+        oo_type_shaped(name)) {
         /* Members are named in lower case by convention: a type-shaped name is
          * not plausibly a member of the unknown receiver. Only an exact
          * classifier lookup may then read it as a constructor. */
@@ -1700,16 +1970,39 @@ static oo_value_t kw_bare_call(kw_t *k, TSNode node, TSNode callee, TSNode suffi
             ctx.no_receiver = true;
             ctx.result_is_lambda = true;
         } else {
-            kt_stdlib_lambda(name, NULL, &ctx);
+            kt_stdlib_lambda(w, name, NULL, &ctx);
         }
     }
     oo_value_t lambda_value = kw_finish_lambdas(k, args, target, subst, &ctx);
     if (!target && ctx.result_is_lambda)
         return lambda_value;
+    if (!target && !constructor && !oo_value_known(&result))
+        return kt_factory_value(k, name, suffix, args);
     return result;
 }
 
-static oo_value_t kw_member_call(kw_t *k, TSNode node, TSNode navigation, TSNode suffix) {
+static oo_value_t kw_bare_call(kw_t *k, TSNode node, TSNode callee, TSNode suffix) {
+    kw_args_t *args = kw_args_take(k);
+    oo_value_t value = kw_bare_call_with(k, node, callee, suffix, args);
+    kw_args_give(k, args);
+    return value;
+}
+
+/* The result of a standard collection transform. */
+static oo_value_t kt_list_of(oo_walk_t *w, oo_value_t element) {
+    oo_value_t *slot = cbm_arena_alloc(w->arena, sizeof(*slot));
+    if (!slot || !oo_value_known(&element))
+        return oo_value_unknown();
+    *slot = element;
+    slot->classref = false;
+    oo_value_t list = oo_value_external("List");
+    list.args = slot;
+    list.arg_count = 1;
+    return list;
+}
+
+static oo_value_t kw_member_call_with(kw_t *k, TSNode node, TSNode navigation, TSNode suffix,
+                                      kw_args_t *args) {
     oo_walk_t *w = k->w;
     uint32_t parts = ts_node_named_child_count(navigation);
     TSNode receiver_node = parts ? ts_node_named_child(navigation, 0) : (TSNode){0};
@@ -1720,7 +2013,6 @@ static oo_value_t kw_member_call(kw_t *k, TSNode node, TSNode navigation, TSNode
     bool super_call = kt_is(receiver_node, "super_expression");
     if (!super_call)
         receiver = kw_expr(k, receiver_node);
-    kw_args_t *args = cbm_arena_alloc(w->arena, sizeof(*args));
     if (!args || !name) {
         if (args)
             kw_collect_args(k, suffix, args);
@@ -1789,34 +2081,59 @@ static oo_value_t kw_member_call(kw_t *k, TSNode node, TSNode navigation, TSNode
     }
     kw_lambda_ctx_t ctx = {0};
     if (!target)
-        kt_stdlib_lambda(name, &receiver, &ctx);
+        kt_stdlib_lambda(w, name, &receiver, &ctx);
     oo_value_t lambda_value = kw_finish_lambdas(k, args, target, subst, &ctx);
     if (!target) {
         if (ctx.result_is_lambda)
             return lambda_value;
-        if (ctx.result_is_self || ctx.result_is_same) {
+        if (ctx.result_is_self) {
             oo_value_t same = receiver;
             same.classref = false;
             return same;
         }
+        if (ctx.result_is_same) {
+            oo_value_t same = receiver;
+            same.classref = false;
+            return receiver.type ? kt_list_of(w, oo_element_of(w, &receiver)) : same;
+        }
         if (ctx.result_is_element)
-            return kt_element_of(&receiver);
-        /* The collection accessors whose result is its element. */
-        if (receiver.external && receiver.arg_count >= 1 &&
-            (!strcmp(name, "first") || !strcmp(name, "last") || !strcmp(name, "single") ||
-             !strcmp(name, "get") || !strcmp(name, "firstOrNull") || !strcmp(name, "lastOrNull") ||
-             !strcmp(name, "singleOrNull") || !strcmp(name, "getOrNull")))
-            return kt_element_of(&receiver);
+            return oo_element_of(w, &receiver);
+        /* `map` and friends collect what the lambda produced. */
+        if (args->count && args->lambda[args->count - 1] && oo_value_known(&lambda_value) &&
+            (!strcmp(name, "map") || !strcmp(name, "mapNotNull") || !strcmp(name, "mapIndexed")))
+            return kt_list_of(w, lambda_value);
+        /* Standard accessors on a project type that is itself a collection. */
+        if (receiver.type && (!strcmp(name, "first") || !strcmp(name, "last") ||
+                              !strcmp(name, "single") || !strcmp(name, "firstOrNull") ||
+                              !strcmp(name, "lastOrNull") || !strcmp(name, "singleOrNull")))
+            return oo_element_of(w, &receiver);
+        if (receiver.type &&
+            (!strcmp(name, "toList") || !strcmp(name, "toMutableList") || !strcmp(name, "toSet") ||
+             !strcmp(name, "asSequence") || !strcmp(name, "asIterable") ||
+             !strcmp(name, "reversed") || !strcmp(name, "take") || !strcmp(name, "drop") ||
+             !strcmp(name, "distinct") || !strcmp(name, "filterNotNull")))
+            return kt_list_of(w, oo_element_of(w, &receiver));
+        if (receiver.external)
+            return oo_external_member_return(w, &receiver, name);
     }
     return result;
 }
 
+static oo_value_t kw_member_call(kw_t *k, TSNode node, TSNode navigation, TSNode suffix) {
+    kw_args_t *args = kw_args_take(k);
+    oo_value_t value = kw_member_call_with(k, node, navigation, suffix, args);
+    kw_args_give(k, args);
+    return value;
+}
+
 /* An object expression: its body is a class body the grammar sometimes reads
  * as a trailing lambda. */
-static void kw_object_body(kw_t *k, TSNode object, TSNode members) {
+static oo_value_t kw_object_body(kw_t *k, TSNode object, TSNode members) {
     oo_walk_t *w = k->w;
     uint32_t count = ts_node_named_child_count(object);
     int pushed = 0;
+    oo_value_t only_super = oo_value_unknown();
+    int supers = 0;
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_named_child(object, i);
         if (!kt_is(child, "delegation_specifier"))
@@ -1828,6 +2145,8 @@ static void kw_object_body(kw_t *k, TSNode object, TSNode members) {
         if (!ts_node_is_null(constructor))
             kw_children(k, kt_child(constructor, "value_arguments"));
         oo_value_t value = kw_ref(k, kt_typeref(&k->text, user));
+        only_super = value;
+        supers++;
         oo_receiver_t *receiver = oo_receiver_push(w, value, false);
         if (receiver) {
             receiver->unknown = !value.type;
@@ -1835,6 +2154,7 @@ static void kw_object_body(kw_t *k, TSNode object, TSNode members) {
         }
     }
     /* The object's own members hide everything else and have no index entry. */
+    oo_hidden_t *hidden = cbm_arena_calloc(w->arena, sizeof(*hidden));
     oo_receiver_t *own = oo_receiver_push(w, oo_value_unknown(), false);
     if (own) {
         pushed++;
@@ -1856,6 +2176,10 @@ static void kw_object_body(kw_t *k, TSNode object, TSNode members) {
         }
         own->own_names = names;
         own->own_count = n;
+        if (hidden) {
+            hidden->names = names;
+            hidden->count = n;
+        }
     }
     oo_frame_t frame;
     oo_frame_push(w, &frame);
@@ -1863,6 +2187,12 @@ static void kw_object_body(kw_t *k, TSNode object, TSNode members) {
     oo_frame_pop(w);
     for (int i = 0; i < pushed; i++)
         oo_receiver_pop(w);
+    /* Reached from outside, it is a value of its one supertype, minus what it
+     * declares itself. Several supertypes are an intersection this does not model. */
+    if (supers != 1 || !hidden || !only_super.type)
+        return oo_value_unknown();
+    only_super.hidden = hidden;
+    return only_super;
 }
 
 static oo_value_t kw_call(kw_t *k, TSNode node) {
@@ -1872,8 +2202,7 @@ static oo_value_t kw_call(kw_t *k, TSNode node) {
     if (kt_is(callee, "object_literal")) {
         /* The grammar's reading of `object : T(...) { members }`. */
         TSNode lambda = kt_child(kt_child(suffix, "annotated_lambda"), "lambda_literal");
-        kw_object_body(k, callee, kt_child(lambda, "statements"));
-        return oo_value_unknown();
+        return kw_object_body(k, callee, kt_child(lambda, "statements"));
     }
     if (ts_node_is_null(suffix)) {
         kw_children(k, node);
@@ -1885,11 +2214,12 @@ static oo_value_t kw_call(kw_t *k, TSNode node) {
         return kw_member_call(k, node, callee, suffix);
     /* The callee is some other expression: an invocation of its value. */
     oo_value_t value = kw_expr(k, callee);
-    kw_args_t *args = cbm_arena_alloc(k->w->arena, sizeof(*args));
+    kw_args_t *args = kw_args_take(k);
     if (args) {
         kw_collect_args(k, suffix, args);
         kw_lambda_ctx_t ctx = {.no_receiver = true};
         (void)kw_finish_lambdas(k, args, NULL, NULL, &ctx);
+        kw_args_give(k, args);
     }
     return value.fn_return ? *value.fn_return : oo_value_unknown();
 }
@@ -1904,7 +2234,13 @@ static oo_value_t kw_identifier(kw_t *k, TSNode node) {
     if (local)
         return local->value;
     bool unknown = false;
+    bool no_outer_instance = false;
     for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
+        bool blocked =
+            no_outer_instance && !(r->value.type && (r->value.type->flags & OO_F_OBJECT));
+        no_outer_instance = no_outer_instance || r->static_context;
+        if (blocked)
+            continue;
         for (int i = 0; i < r->own_count; i++)
             if (!strcmp(r->own_names[i], name))
                 return oo_value_unknown();
@@ -1927,6 +2263,19 @@ static oo_value_t kw_identifier(kw_t *k, TSNode node) {
         }
         if (field || incomplete)
             unknown = true;
+        if (!unknown) {
+            const oo_field_t *extension = kt_extension_property(w, &w->scope, &r->value, name);
+            if (extension) {
+                if (extension->graph_qn) {
+                    oo_emit_usage(w, node, extension->graph_qn, CBM_RESOLVED_VALUE_REFERENCE,
+                                  CBM_RESOLVE_RULE_IMPORT_BINDING,
+                                  "kotlin-implicit-receiver-extension-property");
+                    oo_emit_rw(w, node, extension->graph_qn,
+                               "kotlin-implicit-receiver-extension-property");
+                }
+                return kt_field_type(w, extension, NULL);
+            }
+        }
     }
     if (!unknown) {
         const oo_field_t *field = kt_free_property(w, &w->scope, name);
@@ -1980,7 +2329,7 @@ static oo_value_t kw_navigation(kw_t *k, TSNode node) {
         }
     }
     oo_value_t receiver = kw_expr(k, receiver_node);
-    if (!name || (!receiver.type && !receiver.external))
+    if (!name || (!receiver.type && !receiver.external) || kt_hidden(&receiver, name))
         return oo_value_unknown();
     if (receiver.type) {
         oo_subst_t *subst = NULL;
@@ -2009,6 +2358,17 @@ static oo_value_t kw_navigation(kw_t *k, TSNode node) {
                 value.classref = true;
                 return value;
             }
+        }
+    }
+    if (!receiver.classref) {
+        const oo_field_t *extension = kt_extension_property(w, &w->scope, &receiver, name);
+        if (extension) {
+            if (extension->graph_qn) {
+                oo_emit_usage(w, name_node, extension->graph_qn, CBM_RESOLVED_VALUE_REFERENCE,
+                              CBM_RESOLVE_RULE_IMPORT_BINDING, "kotlin-extension-property");
+                oo_emit_rw(w, name_node, extension->graph_qn, "kotlin-extension-property");
+            }
+            return kt_field_type(w, extension, NULL);
         }
     }
     return oo_value_unknown();
@@ -2143,11 +2503,9 @@ static oo_value_t kw_indexing(kw_t *k, TSNode node) {
     oo_value_t value = kw_operator(k, node, "get", &receiver, args, argc);
     if (oo_value_known(&value))
         return value;
-    if (receiver.external && receiver.arg_count == 1)
-        return kt_element_of(&receiver);
     if (receiver.dims)
-        return kt_element_of(&receiver);
-    return oo_value_unknown();
+        return oo_element_of(k->w, &receiver);
+    return oo_external_member_return(k->w, &receiver, "get");
 }
 
 /* Type narrowing that the language itself applies to a stable local. */
@@ -2320,7 +2678,7 @@ static oo_value_t kw_for(kw_t *k, TSNode node) {
         const char *name = kt_name(&k->text, kt_child(variable, "simple_identifier"));
         TSNode declared = kt_after_colon(variable, "=", NULL);
         oo_bind(w, name,
-                ts_node_is_null(declared) ? kt_element_of(&iterable)
+                ts_node_is_null(declared) ? oo_element_of(w, &iterable)
                                           : kw_ref(k, kt_typeref(&k->text, declared)));
     }
     (void)kw_expr(k, body);
@@ -2366,13 +2724,14 @@ static oo_value_t kw_callable_reference(kw_t *k, TSNode node) {
     const oo_callable_t *target = NULL;
     if (parts == 1) {
         /* `::name`: every declaration of the name competes. */
-        kw_implicit_t implicit = kw_implicit_member(k, name, -1, NULL);
+        kw_implicit_t implicit = kw_implicit_member(k, member, name, -1, NULL);
         if (implicit.selected.status == OO_SEL_UNIQUE)
             target = implicit.selected.callable;
         else if (!implicit.stop && !implicit.unknown_receiver && !oo_lookup_local(w, name)) {
             bool constructor = false;
             oo_value_t type_value = oo_value_unknown();
-            oo_select_t selected = kw_free_call(k, name, -1, NULL, &constructor, &type_value);
+            oo_select_t selected =
+                kw_free_call(k, name, -1, NULL, &constructor, &type_value, false);
             if (selected.status == OO_SEL_UNIQUE && !constructor)
                 target = selected.callable;
         }
@@ -2611,10 +2970,8 @@ static oo_value_t kw_expr_kind(kw_t *k, TSNode node, const char *kind) {
         oo_frame_pop(w);
         return oo_value_unknown();
     }
-    if (!strcmp(kind, "object_literal")) {
-        kw_object_body(k, node, kt_child(node, "class_body"));
-        return oo_value_unknown();
-    }
+    if (!strcmp(kind, "object_literal"))
+        return kw_object_body(k, node, kt_child(node, "class_body"));
     if (!strcmp(kind, "function_declaration")) {
         /* A local function shadows every other callable of the name. */
         const char *name = kt_name(&k->text, kt_child(node, "simple_identifier"));
@@ -2857,8 +3214,10 @@ static void kw_class_like(kw_t *k, TSNode node, const oo_type_t *owner) {
         if (oo_receiver_push(w, oo_value_of_type(type->companion), false))
             pushed++;
     }
+    /* Only an inner class holds an outer instance. */
     oo_receiver_t *receiver =
-        oo_receiver_push(w, usable ? oo_value_of_type(type) : oo_value_unknown(), false);
+        oo_receiver_push(w, usable ? oo_value_of_type(type) : oo_value_unknown(),
+                         !(usable && (type->flags & OO_F_INNER)));
     if (receiver) {
         pushed++;
         receiver->unknown = !usable;

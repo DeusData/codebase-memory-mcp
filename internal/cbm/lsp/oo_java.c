@@ -474,7 +474,7 @@ static void jh_type(jh_t *h, TSNode node, const oo_type_t *owner) {
         flags |= OO_F_INTERFACE;
     if (j_is(node, "enum_declaration"))
         flags |= OO_F_ENUM;
-    if (ts_node_has_error(node))
+    if (oo_members_broken(node))
         flags |= OO_F_INCOMPLETE;
     oo_type_t *type =
         oo_index_type(h->ix, qn, name, h->file, "", owner, jh_graph(h, 'T', node, name), flags);
@@ -799,7 +799,7 @@ static oo_value_t jw_bare_call(jw_t *j, TSNode site, const char *name, int argc,
     /* A single-static import spells out this very name: a shadowing inherited
      * member would make that import useless, so it is taken even when a
      * supertype is unindexed. */
-    return jw_static_import_call(j, site, name, argc, args, complete);
+    return jw_static_import_call(j, site, name, argc, args, complete && !oo_closed_member(name));
 }
 
 /* The innermost `this`, or `Outer.this`. */
@@ -996,7 +996,7 @@ static oo_value_t jw_method_invocation(jw_t *j, TSNode node) {
     int argc = 0;
     const oo_value_t *args = jw_arguments(j, arguments, &argc);
     if (!receiver.type)
-        return oo_value_unknown();
+        return oo_external_member_return(w, &receiver, name);
     return jw_select_emit(j, node, &receiver, name, argc, args, receiver.classref,
                           receiver.classref ? "java-static-member"
                                             : "java-declared-receiver-member");
@@ -1143,35 +1143,13 @@ static oo_value_t jw_lambda(jw_t *j, TSNode node) {
     return oo_value_unknown();
 }
 
-/* The element a for-each variable takes. A project type's Iterable parameter
- * is not modelled, and neither is a map's entry view: those stay unknown. */
-static oo_value_t jw_element_of(const oo_value_t *iterable) {
-    oo_value_t value = oo_value_unknown();
-    if (iterable->dims > 0) {
-        value = *iterable;
-        value.dims--;
-        value.classref = false;
-    } else if (iterable->external && iterable->arg_count == 1) {
-        static const char *const known[] = {
-            "Iterable", "Collection",    "List",    "ArrayList", "LinkedList",   "Set",
-            "HashSet",  "LinkedHashSet", "TreeSet", "SortedSet", "NavigableSet", "Queue",
-            "Deque",    "ArrayDeque",    "Vector",  NULL};
-        const char *leaf = strrchr(iterable->external, '.');
-        leaf = leaf ? leaf + 1 : iterable->external;
-        for (int i = 0; known[i]; i++)
-            if (!strcmp(leaf, known[i]))
-                value = iterable->args[0];
-    }
-    return value;
-}
-
 static oo_value_t jw_enhanced_for(jw_t *j, TSNode node) {
     oo_walk_t *w = j->w;
     oo_frame_t frame;
     oo_value_t iterable = jw_expr(j, j_field(node, "value"));
     oo_frame_push(w, &frame);
     jw_bind_declared(j, j_text(&j->text, j_field(node, "name")), j_field(node, "type"),
-                     jw_element_of(&iterable), j_dimensions(j_field(node, "dimensions")));
+                     oo_element_of(w, &iterable), j_dimensions(j_field(node, "dimensions")));
     (void)jw_expr(j, j_field(node, "body"));
     oo_frame_pop(w);
     return oo_value_unknown();
