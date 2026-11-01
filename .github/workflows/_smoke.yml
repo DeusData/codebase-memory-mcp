@@ -146,7 +146,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq clamav > /dev/null 2>&1
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update -qq && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y -qq clamav > /dev/null 2>&1
           # apt auto-starts the clamav-freshclam daemon, which holds a lock on
           # freshclam's log/db; stop it so the manual freshclam below can run
           # (else: "Failed to lock the log file ... Resource temporarily unavailable").

@@ -56,7 +56,7 @@ jobs:
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
         timeout-minutes: 10
-        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
+        run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev
 
       - name: Run bug-reproduction board
         if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == matrix.group }}
