@@ -36,6 +36,7 @@ typedef struct hs_local {
 
 typedef struct {
     cbm_source_walk_t *walk;
+    bool reference; /* the name being read is a value, not a call head */
     const char *module;
     hs_import_t *imports;
     size_t import_count;
@@ -198,7 +199,9 @@ static void hs_bind_decls(hs_ctx_t *ctx, TSNode binds) {
 
 static void hs_emit(hs_ctx_t *ctx, TSNode site, const char *target, cbm_resolve_rule_t rule,
                     const char *domain, const char *reason) {
-    cbm_source_emit_node(ctx->walk, site, CBM_SOURCE_SITE_CALL, target, rule, domain, reason);
+    cbm_source_emit_node(ctx->walk, site,
+                         ctx->reference ? CBM_SOURCE_SITE_REFERENCE : CBM_SOURCE_SITE_CALL, target,
+                         rule, domain, reason);
 }
 
 static void hs_resolve_bare(hs_ctx_t *ctx, TSNode site, const char *name) {
@@ -293,8 +296,14 @@ static void hs_visit_children(hs_ctx_t *ctx, TSNode node, unsigned depth) {
     if (ts_tree_cursor_goto_first_child(&cursor)) {
         do {
             TSNode child = ts_tree_cursor_current_node(&cursor);
-            if (ts_node_is_named(child))
-                hs_visit(ctx, child, depth + 1);
+            if (!ts_node_is_named(child))
+                continue;
+            /* These fields hold names being bound or spelled, not read. */
+            const char *field = ts_tree_cursor_current_field_name(&cursor);
+            if (cbm_source_is(child, "variable") && field &&
+                (!strcmp(field, "name") || !strcmp(field, "pattern") || !strcmp(field, "patterns")))
+                continue;
+            hs_visit(ctx, child, depth + 1);
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
     ts_tree_cursor_delete(&cursor);
@@ -304,6 +313,19 @@ static void hs_visit(hs_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
     const char *kind = ts_node_type(node);
+    /* A name read as a value follows the same lookup as a call head. */
+    if (!strcmp(kind, "variable")) {
+        const char *name = cbm_source_text(ctx->walk, node);
+        ctx->reference = true;
+        if (name)
+            hs_resolve_bare(ctx, node, name);
+        ctx->reference = false;
+        return;
+    }
+    /* A qualified name's parts and a signature's names are not reads. */
+    if (!strcmp(kind, "qualified") || !strcmp(kind, "signature") || !strcmp(kind, "patterns") ||
+        !strcmp(kind, "imports") || !strcmp(kind, "exports") || !strcmp(kind, "header"))
+        return;
     /* A do statement's or generator's pattern holds for the statements after it.
      * Leaving it bound until the enclosing `do` ends can only make more names
      * local, which abstains, so it never needs a tighter scope. */
@@ -372,4 +394,5 @@ static void hs_resolve(cbm_source_walk_t *walk) {
 const cbm_source_adapter_t cbm_source_adapter_haskell = {.language = CBM_LANG_HASKELL,
                                                          .collect = hs_collect,
                                                          .resolve = hs_resolve,
-                                                         .one_name_one_node = true};
+                                                         .one_name_one_node = true,
+                                                         .decides_references = true};

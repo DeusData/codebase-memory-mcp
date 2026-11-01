@@ -33,6 +33,7 @@ typedef struct ocaml_open {
 
 typedef struct {
     cbm_source_walk_t *walk;
+    bool reference; /* the name being read is a value, not an application */
     const char *unit;
     ocaml_name_t *locals;
     ocaml_open_t *opens;
@@ -202,7 +203,9 @@ static bool ocaml_unit_closed(const ocaml_ctx_t *ctx, const char *unit) {
 
 static void ocaml_emit(ocaml_ctx_t *ctx, TSNode site, const char *target, cbm_resolve_rule_t rule,
                        const char *domain, const char *reason) {
-    cbm_source_emit_node(ctx->walk, site, CBM_SOURCE_SITE_CALL, target, rule, domain, reason);
+    cbm_source_emit_node(ctx->walk, site,
+                         ctx->reference ? CBM_SOURCE_SITE_REFERENCE : CBM_SOURCE_SITE_CALL, target,
+                         rule, domain, reason);
 }
 
 static void ocaml_visit_application(ocaml_ctx_t *ctx, TSNode site, TSNode function, uint32_t at) {
@@ -364,6 +367,13 @@ static void ocaml_visit(ocaml_ctx_t *ctx, TSNode node, unsigned depth) {
     if (!cbm_source_step(ctx->walk, depth))
         return;
     const char *kind = ts_node_type(node);
+    if (!strcmp(kind, "value_path")) {
+        /* A name read as a value follows the same lookup as an application's head. */
+        ctx->reference = true;
+        ocaml_visit_application(ctx, node, node, ts_node_start_byte(node));
+        ctx->reference = false;
+        return;
+    }
     if (!strcmp(kind, "open_module")) {
         ocaml_note_open(ctx, node);
         return;
@@ -431,5 +441,7 @@ static void ocaml_resolve(cbm_source_walk_t *walk) {
     ocaml_visit_children(&ctx, walk->root, 0);
 }
 
-const cbm_source_adapter_t cbm_source_adapter_ocaml = {
-    .language = CBM_LANG_OCAML, .collect = ocaml_collect, .resolve = ocaml_resolve};
+const cbm_source_adapter_t cbm_source_adapter_ocaml = {.language = CBM_LANG_OCAML,
+                                                       .collect = ocaml_collect,
+                                                       .resolve = ocaml_resolve,
+                                                       .decides_references = true};

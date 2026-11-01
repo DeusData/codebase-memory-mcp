@@ -67,8 +67,8 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_PERL, EDGE(IMPORTS) | EDGE(CALLS),
      "use of a module found under the lib directory of an ancestor of the importing file; other "
      "@INC entries are not known and abstain."},
-    {CBM_LANG_HASKELL, EDGE(CALLS), NULL},
-    {CBM_LANG_OCAML, EDGE(CALLS), NULL},
+    {CBM_LANG_HASKELL, EDGE(CALLS) | EDGE(USAGE), NULL},
+    {CBM_LANG_OCAML, EDGE(CALLS) | EDGE(USAGE), NULL},
     {CBM_LANG_RUBY, EDGE(IMPORTS) | EDGE(CALLS),
      "require_relative of a literal path, and require of a path under the lib directory of an "
      "ancestor of the importing file; other load paths and interpolation abstain."},
