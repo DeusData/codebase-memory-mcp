@@ -1779,6 +1779,7 @@ extern void suite_git_context(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
+extern void suite_rust_field_receiver(void);
 extern void suite_pipeline(void);
 extern void suite_pipeline_objectscript_timeout(void);
 extern void suite_pipeline_conventions(void);
@@ -2387,6 +2388,7 @@ int main(int argc, char **argv) {
 
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
+    RUN_SELECTED_SUITE(rust_field_receiver);
     RUN_SELECTED_SUITE(pipeline);
     RUN_SELECTED_SUITE(pipeline_objectscript_timeout);
     RUN_SELECTED_SUITE(pipeline_conventions);
