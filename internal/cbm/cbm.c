@@ -4462,13 +4462,15 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
-        .unrepaired_root = unrepaired ? ts_tree_root_node(unrepaired) : (TSNode){0},
         .macro_table = macro_table,
         .return_type_table = return_type_table,
         .walk_budget_nodes = cbm_walk_max_nodes(),
         .test_declarations = test_declarations,
         .test_declarations_raw_source = true,
     };
+    if (unrepaired) {
+        ctx.unrepaired_root = ts_tree_root_node(unrepaired);
+    }
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
