@@ -428,14 +428,15 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
                    "// context surfaces other clients get through hook configuration: graph\n"
                    "// lookup after grep/glob, index-coverage notes after read, session-start\n"
                    "// tier routing (carried on the first tool result of each session), and\n"
-                   "// reinjection after compaction inside the compaction request itself.\n"
+                   "// on OpenCode 1.18.x reinjection after compaction.\n"
                    "//\n"
                    "// Two runtimes load this module:\n"
                    "// - OpenCode 1.18.x dispatches the hooks returned by server(ctx).\n"
                    "// - OpenCode 2 ignores server and calls setup(ctx), which registers the\n"
-                   "//   same behaviour on the context's tool and session hook domains. Each\n"
-                   "//   registration fails open, and the matching server() hook yields once\n"
-                   "//   its domain has registered.\n");
+                   "//   tool hook on the context's tool domain. The registration fails open,\n"
+                   "//   and the server() tool hook yields once it has registered. OpenCode 2\n"
+                   "//   gets no note after compaction: no compaction channel has been run on\n"
+                   "//   a real 2.x host yet.\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
@@ -519,11 +520,10 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
               "  return result;\n"
               "}\n\n");
 
-    /* Per-domain registration flags: a host that dispatches both server() and
-     * setup() with domains must not append the note twice. The server() hook
-     * for a domain yields once setup() registered that same domain. */
-    sb_append(&sb, "let toolHooksRegistered = false;\n"
-                   "let sessionHooksRegistered = false;\n\n");
+    /* A host that dispatches both server() and setup() with a tool domain must
+     * not append the note twice: the server() tool hook yields once setup()
+     * registered the tool domain. */
+    sb_append(&sb, "let toolHooksRegistered = false;\n\n");
 
     sb_append(
         &sb,
@@ -575,7 +575,6 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
         "      // Documented (experimental) compaction surface: output.context is the\n"
         "      // mutable array of context strings for the rebuilt session.\n"
         "      'experimental.session.compacting': async (_input, output) => {\n"
-        "        if (sessionHooksRegistered) return;\n"
         "        const note = await lifecycle();\n"
         "        if (note && Array.isArray(output?.context)) {\n"
         "          output.context.push(note);\n"
@@ -584,8 +583,8 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
         "    };\n"
         "  },\n"
         "  // OpenCode 2 runtime: default.server is ignored and setup(ctx) registers\n"
-        "  // the hooks on the context domains. Each registration fails open, so one\n"
-        "  // missing domain cannot break the host or the other domain.\n"
+        "  // the tool hook on the context's tool domain. The registration fails\n"
+        "  // open, so a missing domain cannot break the host.\n"
         "  async setup(ctx) {\n"
         "    const seen = new Set();\n"
         "    const dirs = new Map();\n"
@@ -644,34 +643,6 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
         "        toolHooksRegistered = true;\n"
         "      } catch {\n"
         "        // Fail open: the server() tool hook stays active.\n"
-        "      }\n"
-        "    }\n"
-        "    // OpenCode 2 compaction: the hook receives the compaction request, and\n"
-        "    // its messages are the input the summary is built from. The note is\n"
-        "    // added there as a text message, as the server() path adds it to\n"
-        "    // output.context, so it stays inside the compaction and out of the\n"
-        "    // system prompt. Hosts without the hook or the array skip reinjection\n"
-        "    // rather than failing the plugin.\n"
-        "    if (ctx?.session?.hook) {\n"
-        "      try {\n"
-        "        await ctx.session.hook('compaction', async (event) => {\n"
-        "          if (!Array.isArray(event?.messages)) return;\n"
-        "          const dir = await dirFor(event?.sessionID);\n"
-        "          if (!dir) return;\n"
-        "          const note = await lifecycle(dir);\n"
-        "          if (!note) return;\n"
-        "          try {\n"
-        "            event.messages.push({\n"
-        "              role: 'user',\n"
-        "              content: [{ type: 'text', text: note }],\n"
-        "            });\n"
-        "          } catch {\n"
-        "            // Fail open: reinjection is best-effort.\n"
-        "          }\n"
-        "        });\n"
-        "        sessionHooksRegistered = true;\n"
-        "      } catch {\n"
-        "        // Fail open: the server() compaction hook stays active.\n"
         "      }\n"
         "    }\n"
         "  },\n"

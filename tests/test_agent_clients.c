@@ -1344,11 +1344,10 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
 
 /* #2077/#2089/#2204: the two OpenCode runtimes read different entries of the
  * default export. 1.18.x dispatches the hooks returned by `server(ctx)`; 2.x
- * ignores `server` and calls `setup(ctx)`, whose context provides the tool and
- * session hook domains. Registrations fail open per domain, so the matching
- * server() hook yields once its domain is registered. The post-compaction note
- * goes into the compaction request's messages, never the system prompt (pinned
- * by the compaction test below). */
+ * ignores `server` and calls `setup(ctx)`, whose context provides the tool hook
+ * domain. The registration fails open, and the server() tool hook yields once
+ * it is registered. OpenCode 2 adds no note to a compaction (pinned by the
+ * compaction test below). */
 TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
@@ -1360,8 +1359,6 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
      * 2.x, so setup is no longer the empty placeholder #2089 pinned. */
     ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
     ASSERT_NOT_NULL(strstr(js, "ctx.tool.hook('execute.after'"));
-    ASSERT_NOT_NULL(strstr(js, "ctx.session.hook('compaction'"));
-    ASSERT_NULL(strstr(js, "ctx.session.hook('context'"));
     /* content is the surface the model reads; prefer it over output, and never
      * synthesize content that would hide the tool's own result. */
     const char *content_first = strstr(js, "if (typeof result.content === 'string') {");
@@ -1382,11 +1379,9 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
      * location in a multi-project server. */
     ASSERT_NULL(strstr(js, "ctx?.location?.directory"));
     ASSERT_NULL(strstr(js, "pendingReinject"));
-    /* Registrations fail open per domain; the server() hooks yield per domain. */
+    /* The registration fails open; the server() tool hook yields once it is in. */
     ASSERT_NOT_NULL(strstr(js, "toolHooksRegistered = true;"));
-    ASSERT_NOT_NULL(strstr(js, "sessionHooksRegistered = true;"));
     ASSERT_NOT_NULL(strstr(js, "if (toolHooksRegistered) return;"));
-    ASSERT_NOT_NULL(strstr(js, "if (sessionHooksRegistered) return;"));
     ASSERT_NOT_NULL(strstr(js, "catch {"));
     ASSERT_NOT_NULL(strstr(js, "event.result = appendResult(event.result, extra);"));
     /* The empty setup placeholder and the old named export must both be gone. */
@@ -1396,38 +1391,23 @@ TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
     PASS();
 }
 
-/* #2204: on OpenCode 2 the post-compaction note stays inside the compaction,
- * at the level the 1.18.x path uses (output.context). The `compaction` hook
- * receives the compaction request, whose `messages` are the input the summary
- * is built from, so the note is pushed there as a text message. It must never
- * reach the system prompt: not through `event.system`, and not through a
- * session instruction entry, which OpenCode renders into the system array of
- * every later request. */
-TEST(client_adapter_opencode_v2_compaction_note_goes_into_the_compaction_messages) {
+/* #2204: OpenCode 2 gets no note after compaction until a compaction channel has
+ * run on a real 2.x host. A plain object pushed into `event.messages` would be
+ * rejected, if at all, inside OpenCode's own compaction, where the plugin's
+ * try/catch cannot reach it, so an untested channel could break compaction for
+ * every OpenCode 2 user. The note must not reach the system prompt either: not
+ * through `event.system`, and not through a session instruction entry. The
+ * 1.18.x server() path keeps its documented compaction surface. */
+TEST(client_adapter_opencode_v2_adds_no_note_to_the_compaction) {
     char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(js);
-    const char *hook = strstr(js, "ctx.session.hook('compaction'");
-    const char *push = strstr(js, "event.messages.push({");
-    const char *registered = strstr(js, "sessionHooksRegistered = true;");
-    ASSERT_NOT_NULL(hook);
-    ASSERT_NOT_NULL(push);
-    ASSERT_NOT_NULL(registered);
-    /* The push lives inside the compaction registration. */
-    ASSERT_TRUE(hook < push);
-    ASSERT_TRUE(push < registered);
-    /* A text message that carries the note. */
-    const char *role = strstr(push, "role: 'user',");
-    const char *text = strstr(push, "content: [{ type: 'text', text: note }],");
-    ASSERT_NOT_NULL(role);
-    ASSERT_NOT_NULL(text);
-    ASSERT_TRUE(role < registered);
-    ASSERT_TRUE(text < registered);
-    /* Fail open: a host whose event has no messages array skips reinjection. */
-    ASSERT_NOT_NULL(strstr(js, "if (!Array.isArray(event?.messages)) return;"));
-    /* Never the system prompt, and no session instruction entry. */
+    ASSERT_NULL(strstr(js, "ctx.session.hook("));
+    ASSERT_NULL(strstr(js, "event.messages"));
+    ASSERT_NULL(strstr(js, "sessionHooksRegistered"));
     ASSERT_NULL(strstr(js, ".system"));
     ASSERT_NULL(strstr(js, "instructions"));
     ASSERT_NULL(strstr(js, "entry.put"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
     free(js);
     PASS();
 }
@@ -1529,7 +1509,7 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
-    RUN_TEST(client_adapter_opencode_v2_compaction_note_goes_into_the_compaction_messages);
+    RUN_TEST(client_adapter_opencode_v2_adds_no_note_to_the_compaction);
     RUN_TEST(client_adapter_opencode_v2_append_result_never_creates_note_only_content);
     RUN_TEST(client_adapter_opencode_bounds_a_hung_hook_augment_child);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
