@@ -39,6 +39,9 @@ bool cbm_shared_resolver_exports_complete(const cbm_shared_resolver_t *resolver)
  * facts remain UNKNOWN and can never be donated as a lexical type. */
 void cbm_shared_resolver_fact(const cbm_shared_resolver_t *, const char *,
                               cbm_resolve_solver_result_t *);
+/* A Python class's proven project base, in source order: NULL past the end. */
+const char *cbm_shared_resolver_python_base(const cbm_shared_resolver_t *resolver,
+                                            const char *qualified_name, size_t offset);
 bool cbm_shared_resolver_owns_proof(const cbm_shared_resolver_t *resolver,
                                     const cbm_resolve_proof_t *proof);
 

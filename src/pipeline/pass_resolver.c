@@ -12,6 +12,7 @@
 #include "resolve/binding.h"
 #include "resolve/lookup.h"
 #include "resolve/policy.h"
+#include "resolve/py_members.h"
 #include "resolve/snapshot.h"
 #include "resolve/solver.h"
 #include "lsp/go_stabilize.h"
@@ -98,12 +99,41 @@ typedef struct {
 } target_proof_t;
 
 typedef struct {
+    const char *module; /* exact project module, NULL when not one */
+    uint32_t at;
+} python_star_source_t;
+
+typedef struct {
     const char *module_qn;
     cbm_resolve_proof_source_t source;
     bool complete, ambiguous, python_mutated;
-    const char **python_names;
+    const char **python_names; /* module-level binders, sorted, parallel to python_name_at */
+    uint32_t *python_name_at;
     size_t python_name_count;
+    python_star_source_t *python_stars; /* source order */
+    size_t python_star_count;
+    /* Names before this byte are unknown: a star of an unknown module follows. */
+    uint32_t python_open_barrier;
+    /* A literal __all__ is the star-import interface; otherwise the public names. */
+    const char **python_all;
+    size_t python_all_count;
+    bool python_all_literal, python_all_unknown;
+    /* Memo for that interface: state 0 unvisited, 1 in progress, 2 done. */
+    const char **python_visible;
+    size_t python_visible_count;
+    unsigned char python_visible_state;
+    bool python_visible_open;
 } namespace_proof_t;
+
+typedef struct {
+    const char *local, *path, *key;
+    CBMImportKind kind;
+} python_nested_entry_t;
+
+typedef struct {
+    python_nested_entry_t *items;
+    size_t count, capacity;
+} python_nested_list_t;
 
 typedef struct python_pending_import {
     const char *key, *slot, *parent_file, *child_file, *member, *escape_root, *escape_slot;
@@ -149,6 +179,9 @@ struct cbm_shared_resolver {
     CBMHashTable *python_namespaces;
     bool python_unknown_namespace_escape;
     cbm_ecma_table_t *ecma;
+    CBMHashTable *python_star_provided; /* "<module>.<name>" a closed star import binds */
+    CBMHashTable *python_nested;        /* file -> python_nested_list_t */
+    cbm_py_members_t *python_members;
     CBMHashTable *http_defaults, *http_sites, *http_unsafe;
     CBMHashTable *http_candidates, *http_veto;
     http_candidate_import_t *http_candidate_imports;
@@ -811,8 +844,86 @@ static bool export_language(CBMLanguage language) {
            language == CBM_LANG_ARKTS || language == CBM_LANG_DART || language == CBM_LANG_RUST;
 }
 
-static bool capture_python_namespace(cbm_shared_resolver_t *resolver, const CBMFileResult *result,
-                                     const char *file, const cbm_resolve_binding_index_t *index) {
+/* A star import takes __all__ when it is a static literal. Anything else that
+ * binds __all__ leaves the interface unknown, never the public-name fallback. */
+static bool capture_python_all(cbm_shared_resolver_t *resolver, namespace_proof_t *entry,
+                               const CBMFileResult *result) {
+    const CBMPyNamespaceFacts *facts = &result->py_namespace;
+    if (facts->status != CBM_PY_NS_COMPLETE) {
+        size_t low = 0, high = entry->python_name_count;
+        while (low < high) {
+            size_t middle = low + (high - low) / 2;
+            if (strcmp(entry->python_names[middle], "__all__") < 0)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        entry->python_all_unknown =
+            low < entry->python_name_count && !strcmp(entry->python_names[low], "__all__");
+        return true;
+    }
+    size_t total = 0;
+    for (int i = 0; i < facts->count; i++)
+        total += facts->items[i].name_count > 0 ? (size_t)facts->items[i].name_count : 0;
+    const char **names = total ? cbm_arena_alloc(&resolver->arena, total * sizeof(*names)) : NULL;
+    if (total && !names)
+        return false;
+    for (int i = 0; i < facts->count; i++) {
+        const CBMPyNamespaceFact *fact = &facts->items[i];
+        if (fact->kind == CBM_PY_NS_ALL_UNKNOWN) {
+            entry->python_all_unknown = true;
+            continue;
+        }
+        if (fact->kind == CBM_PY_NS_ALL_DELETE || fact->kind == CBM_PY_NS_ALL_SET) {
+            entry->python_all_count = 0;
+            entry->python_all_literal = fact->kind == CBM_PY_NS_ALL_SET;
+            entry->python_all_unknown = false;
+        }
+        if (fact->kind != CBM_PY_NS_ALL_SET && fact->kind != CBM_PY_NS_ALL_APPEND)
+            continue;
+        entry->python_all_literal = true;
+        for (int n = 0; n < fact->name_count; n++) {
+            names[entry->python_all_count] = cbm_arena_strdup(&resolver->arena, fact->names[n]);
+            if (!names[entry->python_all_count])
+                return false;
+            entry->python_all_count++;
+        }
+    }
+    entry->python_all = names;
+    return true;
+}
+
+static bool capture_python_stars(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
+                                 namespace_proof_t *entry, const char *file,
+                                 const cbm_resolve_binding_index_t *index) {
+    size_t count = cbm_resolve_binding_python_star_count(index);
+    if (!count)
+        return true;
+    entry->python_stars = cbm_arena_calloc(&resolver->arena, count * sizeof(*entry->python_stars));
+    if (!entry->python_stars)
+        return false;
+    for (size_t i = 0; i < count; i++) {
+        const cbm_resolve_python_star_t *star = cbm_resolve_binding_python_star_at(index, i);
+        CBMImport path = {.local_name = star->module_path,
+                          .module_path = star->module_path,
+                          .kind = CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS};
+        bool module = false;
+        char *slot =
+            cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name, file, &path, &module);
+        const char *copy = slot && module ? cbm_arena_strdup(&resolver->arena, slot) : NULL;
+        bool lost = slot && module && !copy;
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
+        if (lost)
+            return false;
+        entry->python_stars[i] = (python_star_source_t){.module = copy, .at = star->at};
+    }
+    entry->python_star_count = count;
+    return true;
+}
+
+static bool capture_python_namespace(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
+                                     const CBMFileResult *result, const char *file,
+                                     const cbm_resolve_binding_index_t *index) {
     namespace_proof_t *prior = cbm_ht_get(resolver->namespaces, file);
     if (prior) {
         prior->ambiguous = true;
@@ -835,24 +946,29 @@ static bool capture_python_namespace(cbm_shared_resolver_t *resolver, const CBMF
     entry->source = context.source;
     entry->module_qn = module;
     entry->complete = cbm_resolve_binding_python_namespace_closed(index);
-    if (!cbm_resolve_binding_python_effects_complete(index))
-        resolver->python_unknown_namespace_escape = true;
     size_t count = cbm_resolve_binding_python_namespace_size(index);
     if (count > SIZE_MAX / sizeof(*entry->python_names))
         return false;
     entry->python_names =
         count ? cbm_arena_alloc(&resolver->arena, count * sizeof(*entry->python_names)) : NULL;
-    if (count && !entry->python_names)
+    entry->python_name_at =
+        count ? cbm_arena_alloc(&resolver->arena, count * sizeof(*entry->python_name_at)) : NULL;
+    if (count && (!entry->python_names || !entry->python_name_at))
         return false;
     for (size_t i = 0; i < count; i++) {
-        const char *name = cbm_resolve_binding_python_namespace_name(index, i);
+        uint32_t at = 0;
+        const char *name = cbm_resolve_binding_python_namespace_name(index, i, &at);
         if (!name)
             continue;
         const char *copy = cbm_arena_strdup(&resolver->arena, name);
         if (!copy)
             return false;
+        entry->python_name_at[entry->python_name_count] = at;
         entry->python_names[entry->python_name_count++] = copy;
     }
+    if (!capture_python_all(resolver, entry, result) ||
+        !capture_python_stars(resolver, ctx, entry, file, index))
+        return false;
     cbm_ht_set(resolver->namespaces, path, entry);
     namespace_proof_t *same_module = cbm_ht_get(resolver->python_namespaces, module);
     if (same_module) {
@@ -1248,6 +1364,172 @@ static cbm_resolve_binding_index_t *binding_build_for(CBMArena *arena, const CBM
                                                      declared);
 }
 
+/* `import a.b` binds the package a, and a.c reads through it. A dotted root import
+ * therefore also needs a fact for a itself, once per file and only when no plain
+ * `import a` already provides one. */
+static bool python_root_fact_needed(const CBMFileResult *result, int position) {
+    const CBMImport *import = &result->imports.items[position];
+    if (import->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !import->module_path ||
+        !import->local_name || !strchr(import->module_path, '.') ||
+        !cbm_import_binds_runtime_name(import))
+        return false;
+    for (int i = 0; i < result->imports.count; i++) {
+        const CBMImport *other = &result->imports.items[i];
+        if (other->kind != CBM_IMPORT_KIND_PYTHON_MODULE_ROOT || !other->local_name ||
+            !other->module_path || strcmp(other->local_name, import->local_name) ||
+            !cbm_import_binds_runtime_name(other))
+            continue;
+        if (!strchr(other->module_path, '.') || i < position)
+            return false;
+    }
+    return true;
+}
+
+static const char *python_root_key(CBMArena *arena, const char *file, const char *local) {
+    return cbm_arena_sprintf(arena, "python_root:%zu:%s:%s", strlen(file), file, local);
+}
+
+static const char *python_nested_key(CBMArena *arena, const char *file, uint32_t at,
+                                     const char *local) {
+    return cbm_arena_sprintf(arena, "python_nested:%zu:%s:%u:%s", strlen(file), file, at, local);
+}
+
+static bool python_note_nested(cbm_shared_resolver_t *resolver, const char *file,
+                               const CBMImport *import, const char *key) {
+    python_nested_list_t *list = cbm_ht_get(resolver->python_nested, file);
+    if (!list) {
+        list = cbm_arena_calloc(&resolver->arena, sizeof(*list));
+        const char *path = cbm_arena_strdup(&resolver->arena, file);
+        if (!list || !path)
+            return false;
+        cbm_ht_set(resolver->python_nested, path, list);
+        if (cbm_ht_get(resolver->python_nested, path) != list)
+            return false;
+    }
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity ? list->capacity * 2 : 8;
+        python_nested_entry_t *items = cbm_arena_alloc(&resolver->arena, capacity * sizeof(*items));
+        if (!items)
+            return false;
+        if (list->count)
+            memcpy(items, list->items, list->count * sizeof(*items));
+        list->items = items;
+        list->capacity = capacity;
+    }
+    python_nested_entry_t entry = {.local = cbm_arena_strdup(&resolver->arena, import->local_name),
+                                   .path = cbm_arena_strdup(&resolver->arena, import->module_path),
+                                   .key = key,
+                                   .kind = import->kind};
+    if (!entry.local || !entry.path)
+        return false;
+    list->items[list->count++] = entry;
+    return true;
+}
+
+/* The part of a dotted use below an import's binding: `import a.b` binds the
+ * package root, so only `a.b` and what follows it reach that module's fact. */
+static bool python_nested_suffix(const char *local, const char *path, CBMImportKind kind,
+                                 const char *name, const char **suffix) {
+    const char *base = kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT ? path : local;
+    size_t length = strlen(base);
+    if (strncmp(name, base, length) || (name[length] && name[length] != '.'))
+        return false;
+    *suffix = name[length] ? name + length + 1 : NULL;
+    return true;
+}
+
+/* Every source-audited import gets its own immutable fact. `exported` is false
+ * for a function-scoped import: it binds no module attribute. */
+static bool python_export_import(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
+                                 const CBMFileResult *result, const char *file, CBMArena *arena,
+                                 const cbm_resolve_binding_index_t *index, const CBMImport *import,
+                                 const char *fact_key, bool audited, bool exported, bool runs) {
+    bool module = false;
+    char *slot = audited ? cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name, file,
+                                                           import, &module)
+                         : NULL;
+    const cbm_resolve_proof_t *audit =
+        fact_key ? export_audit(resolver, result, file, fact_key, slot, (unsigned)import->kind,
+                                audited, "source_python_import_audit", import)
+                 : NULL;
+    const char *loaded = NULL;
+    /* A TYPE_CHECKING import never runs, so it loads nothing and writes nothing. */
+    bool ok =
+        fact_key && audit && (!runs || python_loaded_module(resolver, ctx, file, import, &loaded));
+    const cbm_resolve_proof_t *load_audit =
+        ok && loaded
+            ? export_audit(resolver, result, file, fact_key, loaded, (unsigned)import->kind, false,
+                           "python_explicit_module_load_barrier", import)
+            : NULL;
+    ok = ok && (!loaded || load_audit) &&
+         defer_python_import(
+             resolver, ctx, file, import, fact_key, slot, module, audited,
+             runs && cbm_resolve_binding_python_import_escaped(index, import->local_name), audit,
+             loaded, load_audit);
+    /* A plain dotted import binds only a package root, not the loaded leaf
+     * under that root's exported name. Exact module-path uses still retain
+     * the private import fact above. */
+    bool dotted_root = import->kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT && import->module_path &&
+                       strchr(import->module_path, '.');
+    const char *key = cbm_fqn_compute(arena, ctx->project_name, file, import->local_name);
+    if (ok && key && !dotted_root && exported) {
+        const cbm_resolve_proof_t *binding = export_audit(
+            resolver, result, file, key, NULL, 0, audited, "source_python_export_audit", NULL);
+        ok = add_export(resolver, key, file, 0, audited, fact_key, binding);
+    }
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
+    return ok;
+}
+
+static CBMHashTable *python_import_map(CBMArena *arena, const char *file,
+                                       const CBMFileResult *result);
+
+typedef struct {
+    const char *file, *module;
+    const CBMHashTable *imports;
+    const CBMHashTable *star_provided;
+} python_member_imports_t;
+
+/* The import fact a dotted chain's root reaches, and what remains of the chain. */
+static const char *python_member_import_key(void *context, CBMArena *arena,
+                                            const cbm_resolve_python_nested_import_t *nested,
+                                            const char *chain, const char **rest) {
+    python_member_imports_t *lookup = context;
+    size_t dotted = strcspn(chain, "(");
+    if (nested) {
+        const char *base = nested->import.kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT
+                               ? nested->import.module_path
+                               : nested->import.local_name;
+        size_t length = strlen(base);
+        if (length > dotted || strncmp(chain, base, length) ||
+            (chain[length] && chain[length] != '.' && chain[length] != '('))
+            return NULL;
+        *rest = chain + length;
+        return python_nested_key(arena, lookup->file, nested->at, nested->import.local_name);
+    }
+    char *prefix = cbm_arena_strndup(arena, chain, dotted);
+    size_t length = dotted;
+    while (prefix && length) {
+        prefix[length] = '\0';
+        const python_import_t *import = cbm_ht_get(lookup->imports, prefix);
+        if (import) {
+            *rest = chain + length;
+            return import->ambiguous ? NULL : import->slot;
+        }
+        while (length && chain[--length] != '.') {}
+    }
+    return NULL;
+}
+
+static const char *python_member_star_key(void *context, CBMArena *arena, const char *name) {
+    python_member_imports_t *lookup = context;
+    if (!lookup->star_provided || !lookup->module)
+        return NULL;
+    const char *key = cbm_arena_sprintf(
+        arena, "%.*s.%s", (int)cbm_fqn_symbol_scope_len(lookup->module), lookup->module, name);
+    return key && cbm_ht_get(lookup->star_provided, key) ? export_solver_key(arena, key) : NULL;
+}
+
 static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
                         const CBMFileResult *result, const cbm_file_info_t *file) {
     if (!export_language(file->language))
@@ -1273,13 +1555,15 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
     result = owner_source_view(result, file->language, source, length, &source_view, &owner_tree);
     cbm_resolve_binding_index_t *index =
         binding_build_for(&arena, result, file->language, file->rel_path, source, length);
+    /* Whether a star can rebind an earlier name is judged across modules. */
+    cbm_resolve_binding_python_set_star_barrier(index, 0);
     /* Sequential extraction releases raw buffers. Audit the same verified
      * bytes used for exports instead of requiring parallel source retention.
      * The owner summary copies identities and stores spans, never this buffer. */
     bool ok = index && note_conditional_owners(resolver, result, file->rel_path, file->language,
                                                source, length);
     if (ok && file->language == CBM_LANG_PYTHON)
-        ok = capture_python_namespace(resolver, result, file->rel_path, index);
+        ok = capture_python_namespace(resolver, ctx, result, file->rel_path, index);
     if (ok && ecma_language(file->language)) {
         const char *key =
             cbm_arena_sprintf(&arena, "ecma_module:%zu:%s", strlen(file->rel_path), file->rel_path);
@@ -1365,51 +1649,44 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
         const CBMImport *import = &result->imports.items[i];
         if (!import->local_name || !cbm_import_binds_runtime_name(import))
             continue;
-        bool audited = cbm_resolve_binding_import(index, import->local_name);
-        bool module = false;
-        char *slot = audited ? cbm_pipeline_python_import_slot(ctx->gbuf, ctx->project_name,
-                                                               file->rel_path, import, &module)
-                             : NULL;
-        const char *fact_key = python_import_key(&resolver->arena, file->rel_path, i);
-        const cbm_resolve_proof_t *audit =
-            fact_key ? export_audit(resolver, result, file->rel_path, fact_key, slot,
-                                    (unsigned)import->kind, audited, "source_python_import_audit",
-                                    import)
-                     : NULL;
-        if (!fact_key || !audit) {
-            cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
-            ok = false;
-            break;
+        ok =
+            python_export_import(resolver, ctx, result, file->rel_path, &arena, index, import,
+                                 python_import_key(&resolver->arena, file->rel_path, i),
+                                 cbm_resolve_binding_import(index, import->local_name), true, true);
+        if (ok && python_root_fact_needed(result, i)) {
+            CBMImport root = *import;
+            root.module_path = import->local_name;
+            ok = python_export_import(
+                resolver, ctx, result, file->rel_path, &arena, index, &root,
+                python_root_key(&resolver->arena, file->rel_path, import->local_name),
+                cbm_resolve_binding_import(index, import->local_name), false, false);
         }
-        bool escaped = cbm_resolve_binding_python_import_escaped(index, import->local_name);
-        const char *loaded = NULL;
-        if (!python_loaded_module(resolver, ctx, file->rel_path, import, &loaded)) {
-            cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
-            ok = false;
-            break;
-        }
-        const cbm_resolve_proof_t *load_audit =
-            loaded ? export_audit(resolver, result, file->rel_path, fact_key, loaded,
-                                  (unsigned)import->kind, false,
-                                  "python_explicit_module_load_barrier", import)
-                   : NULL;
-        ok = (!loaded || load_audit) &&
-             defer_python_import(resolver, ctx, file->rel_path, import, fact_key, slot, module,
-                                 audited, escaped, audit, loaded, load_audit);
-        /* A plain dotted import binds only a package root, not the loaded leaf
-         * under that root's exported name. Exact module-path uses still retain
-         * the private import fact above. */
-        bool dotted_root = import->kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT &&
-                           import->module_path && strchr(import->module_path, '.');
+    }
+    size_t nested = ok && file->language == CBM_LANG_PYTHON
+                        ? cbm_resolve_binding_python_nested_count(index)
+                        : 0;
+    for (size_t i = 0; ok && i < nested; i++) {
+        const cbm_resolve_python_nested_import_t *item =
+            cbm_resolve_binding_python_nested_at(index, i);
         const char *key =
-            cbm_fqn_compute(&arena, ctx->project_name, file->rel_path, import->local_name);
-        if (ok && key && !dotted_root) {
-            const cbm_resolve_proof_t *exported =
-                export_audit(resolver, result, file->rel_path, key, NULL, 0, audited,
-                             "source_python_export_audit", NULL);
-            ok = add_export(resolver, key, file->rel_path, 0, audited, fact_key, exported);
-        }
-        cbm_free(CBM_MEM_CLASS_SEMANTIC, slot);
+            python_nested_key(&resolver->arena, file->rel_path, item->at, item->import.local_name);
+        ok = key && python_note_nested(resolver, file->rel_path, &item->import, key) &&
+             python_export_import(
+                 resolver, ctx, result, file->rel_path, &arena, index, &item->import, key,
+                 cbm_resolve_binding_python_nested_audited(index, item),
+                 item->scope == 0 && !item->annotation_only, !item->annotation_only);
+    }
+    if (ok && file->language == CBM_LANG_PYTHON && cbm_resolve_binding_status(index) &&
+        !strcmp(cbm_resolve_binding_status(index), "binding_complete_supported_subset")) {
+        CBMHashTable *imports = python_import_map(&arena, file->rel_path, result);
+        python_member_imports_t lookup = {.file = file->rel_path,
+                                          .module = result->module_qn,
+                                          .imports = imports,
+                                          .star_provided = resolver->python_star_provided};
+        /* Star sources settle later, so a star-only base name is unknown here. */
+        cbm_py_import_lookup_t table = {&lookup, python_member_import_key, NULL};
+        ok = imports && cbm_py_members_add_file(resolver->python_members, index, &table);
+        cbm_ht_free(imports);
     }
     if (owner_tree)
         ts_tree_delete(owner_tree);
@@ -1433,8 +1710,14 @@ static int compare_export(const void *left, const void *right) {
     return strcmp((*(export_proof_t *const *)left)->key, (*(export_proof_t *const *)right)->key);
 }
 
-static bool python_namespace_absent(const namespace_proof_t *parent, const char *name) {
-    if (!parent || !parent->complete || parent->ambiguous || parent->python_mutated || !name)
+static bool python_namespace_absent(cbm_shared_resolver_t *resolver,
+                                    const namespace_proof_t *parent, const char *name) {
+    if (!parent || !parent->complete || parent->ambiguous || parent->python_mutated || !name ||
+        parent->python_open_barrier)
+        return false;
+    /* A closed star import binds this name as a value, not the submodule. */
+    const char *qualified = cbm_arena_sprintf(&resolver->arena, "%s.%s", parent->module_qn, name);
+    if (!qualified || cbm_ht_get(resolver->python_star_provided, qualified))
         return false;
     size_t low = 0, high = parent->python_name_count;
     while (low < high) {
@@ -1512,12 +1795,12 @@ static bool collect_python_module_loads(cbm_shared_resolver_t *resolver) {
                 !add_export(resolver, module, loaded->source.file, 0, false, NULL,
                             import->load_audit))
                 return false;
+            /* The load installs this one child on its parent: the same module
+             * identity a submodule import names, so it closes no other name. */
             char *dot = strrchr(module, '.');
             if (!dot)
                 break;
             *dot = '\0';
-            if (loaded)
-                invalidate_python_namespace(resolver, module);
         }
     }
     return true;
@@ -1528,39 +1811,321 @@ static void collect_python_namespace_effects(cbm_shared_resolver_t *resolver) {
          import = import->next) {
         if (!import->escaped)
             continue;
+        /* A module object handed to unknown code can be written through, so
+         * its own namespace loses the absence proof. A value escaping does not
+         * reach any other module's namespace. */
         invalidate_python_namespace(resolver, import->escape_root);
-        if (import->escape_module) {
+        if (import->escape_module)
             invalidate_python_namespace(resolver, import->escape_slot);
+    }
+}
+
+/* The names `from module import *` binds. Unknown when __all__ is not a static
+ * literal, when the module was not fully audited, or through an unknown star. */
+static void python_star_interface(cbm_shared_resolver_t *resolver, namespace_proof_t *module) {
+    if (module->python_visible_state == 2)
+        return;
+    if (module->python_visible_state == 1 || !module->complete || module->ambiguous ||
+        module->python_all_unknown) {
+        module->python_visible_open = true;
+        if (module->python_visible_state == 0)
+            module->python_visible_state = 2;
+        return;
+    }
+    module->python_visible_state = 1;
+    if (module->python_all_literal) {
+        module->python_visible = module->python_all;
+        module->python_visible_count = module->python_all_count;
+        module->python_visible_state = 2;
+        return;
+    }
+    size_t total = module->python_name_count;
+    for (size_t s = 0; s < module->python_star_count; s++) {
+        namespace_proof_t *source =
+            module->python_stars[s].module
+                ? cbm_ht_get(resolver->python_namespaces, module->python_stars[s].module)
+                : NULL;
+        if (!source) {
+            module->python_visible_open = true;
             continue;
         }
-        /* Only a source-audited direct callable declaration excludes a module
-         * alias here. A graph Variable alone proves no value identity. Pending
-         * re-exports stay unknown, independent of file/import iteration order. */
-        const target_proof_t *target =
-            import->escape_slot ? cbm_ht_get(resolver->targets, import->escape_slot) : NULL;
-        const export_proof_t *declaration =
-            import->escape_slot ? cbm_ht_get(resolver->exports, import->escape_slot) : NULL;
-        bool callable = target && !target->ambiguous && target->label &&
-                        (!strcmp(target->label, "Function") || !strcmp(target->label, "Class")) &&
-                        declaration && declaration->supported && !declaration->ambiguous &&
-                        !declaration->dependency;
-        if (import->escape_slot && !callable)
-            resolver->python_unknown_namespace_escape = true;
+        python_star_interface(resolver, source);
+        module->python_visible_open |= source->python_visible_open;
+        total += source->python_visible_count;
     }
+    const char **names = total ? cbm_arena_alloc(&resolver->arena, total * sizeof(*names)) : NULL;
+    if (total && !names) {
+        module->python_visible_open = true;
+        module->python_visible_state = 2;
+        return;
+    }
+    size_t count = 0;
+    for (size_t n = 0; n < module->python_name_count; n++)
+        if (module->python_names[n][0] != '_')
+            names[count++] = module->python_names[n];
+    for (size_t s = 0; s < module->python_star_count; s++) {
+        namespace_proof_t *source =
+            module->python_stars[s].module
+                ? cbm_ht_get(resolver->python_namespaces, module->python_stars[s].module)
+                : NULL;
+        for (size_t n = 0; source && n < source->python_visible_count; n++)
+            names[count++] = source->python_visible[n];
+    }
+    module->python_visible = names;
+    module->python_visible_count = count;
+    module->python_visible_state = 2;
+}
+
+static bool python_explicit_after(const namespace_proof_t *module, const char *name, uint32_t at) {
+    size_t low = 0, high = module->python_name_count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        if (strcmp(module->python_names[middle], name) < 0)
+            low = middle + 1;
+        else
+            high = middle;
+    }
+    for (; low < module->python_name_count && !strcmp(module->python_names[low], name); low++)
+        if (module->python_name_at[low] >= at)
+            return true;
+    return false;
+}
+
+/* Last star wins; a later explicit binder wins over any star. An unknown star
+ * can rebind whatever precedes it, so that stops the walk. */
+static bool python_expand_module_stars(cbm_shared_resolver_t *resolver, namespace_proof_t *module) {
+    for (size_t s = module->python_star_count; s-- > 0;) {
+        const python_star_source_t *star = &module->python_stars[s];
+        namespace_proof_t *source =
+            star->module ? cbm_ht_get(resolver->python_namespaces, star->module) : NULL;
+        if (source)
+            python_star_interface(resolver, source);
+        if (!source || source->python_visible_open) {
+            module->python_open_barrier = star->at;
+            for (size_t n = 0; n < module->python_name_count; n++) {
+                if (module->python_name_at[n] >= star->at)
+                    continue;
+                const char *key = cbm_arena_sprintf(&resolver->arena, "%s.%s", module->module_qn,
+                                                    module->python_names[n]);
+                export_proof_t *entry = key ? cbm_ht_get(resolver->exports, key) : NULL;
+                if (!key)
+                    return false;
+                if (entry) {
+                    entry->supported = false;
+                    entry->dependency = NULL;
+                }
+            }
+            return true;
+        }
+        for (size_t n = 0; n < source->python_visible_count; n++) {
+            const char *name = source->python_visible[n];
+            const char *key = cbm_arena_sprintf(&resolver->arena, "%s.%s", module->module_qn, name);
+            const char *origin =
+                cbm_arena_sprintf(&resolver->arena, "%s.%s", source->module_qn, name);
+            if (!key || !origin)
+                return false;
+            if (cbm_ht_get(resolver->python_star_provided, key) ||
+                python_explicit_after(module, name, star->at))
+                continue;
+            cbm_resolve_proof_key_t lookup = {.lookup_domain = source->module_qn,
+                                              .lookup_key = name,
+                                              .binding_identity = key,
+                                              .declaration_identity = origin,
+                                              .detail = "python_closed_star_import"};
+            cbm_resolve_result_t outcome = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                            .binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                            .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                            .target = origin,
+                                            .candidate_count = 1,
+                                            .reason = lookup.detail};
+            const cbm_resolve_proof_t *audit = cbm_resolve_proof_leaf(
+                &resolver->proofs, CBM_PROOF_ADAPTER_DOMAIN, &module->source, &lookup, &outcome);
+            const char *dependency = export_solver_key(&resolver->arena, origin);
+            if (!audit || !dependency ||
+                !add_export(resolver, key, module->source.file, 0, true, dependency, audit))
+                return false;
+            cbm_ht_set(resolver->python_star_provided, key, source);
+            if (cbm_ht_get(resolver->python_star_provided, key) != source)
+                return false;
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    namespace_proof_t **items;
+    size_t count;
+} python_namespace_list_t;
+
+static void collect_python_namespace(const char *key, void *value, void *context) {
+    (void)key;
+    python_namespace_list_t *list = context;
+    list->items[list->count++] = value;
+}
+
+static int compare_python_namespace(const void *left, const void *right) {
+    return strcmp((*(namespace_proof_t *const *)left)->module_qn,
+                  (*(namespace_proof_t *const *)right)->module_qn);
+}
+
+static bool expand_python_stars(cbm_shared_resolver_t *resolver) {
+    size_t count = cbm_ht_count(resolver->python_namespaces);
+    if (!count)
+        return true;
+    namespace_proof_t **items = cbm_arena_alloc(&resolver->arena, count * sizeof(*items));
+    if (!items)
+        return false;
+    python_namespace_list_t list = {.items = items};
+    cbm_ht_foreach(resolver->python_namespaces, collect_python_namespace, &list);
+    qsort(items, list.count, sizeof(*items), compare_python_namespace);
+    for (size_t i = 0; i < list.count; i++)
+        if (items[i]->python_star_count && !python_expand_module_stars(resolver, items[i]))
+            return false;
+    return true;
+}
+
+/* Decorators must be judged before exports stabilize, because a kept declaration
+ * is an export. These follow the same import facts one hop at a time. */
+typedef struct {
+    cbm_shared_resolver_t *resolver;
+    CBMHashTable *by_key; /* fact key -> python_pending_import_t */
+} python_presolve_t;
+
+static bool python_presolve_follow(const python_presolve_t *presolve, const char *key,
+                                   const char **target, bool *module, bool *external) {
+    const cbm_shared_resolver_t *resolver = presolve->resolver;
+    for (unsigned hop = 0; hop < 32; hop++) {
+        const python_pending_import_t *import = cbm_ht_get(presolve->by_key, key);
+        if (import) {
+            if (!import->audited)
+                return false;
+            if (!import->slot) {
+                *external = true;
+                return false;
+            }
+            if (import->module) {
+                *target = import->slot;
+                *module = true;
+                return true;
+            }
+            key = import->slot;
+        }
+        const export_proof_t *entry = cbm_ht_get(resolver->exports, key);
+        if (!entry || entry->ambiguous)
+            return false;
+        if (!entry->dependency) {
+            *target = entry->key;
+            return true;
+        }
+        key = entry->dependency;
+        /* A star dependency is keyed as a solver export. */
+        if (!strncmp(key, "export:", 7)) {
+            const char *colon = strchr(key + 7, ':');
+            if (!colon)
+                return false;
+            key = colon + 1;
+        }
+    }
+    return false;
+}
+
+static bool python_presolve_import_value(const void *context, const char *key, const char **target,
+                                         bool *module, bool *external) {
+    return python_presolve_follow(context, key, target, module, external);
+}
+
+static bool python_presolve_module_member(const void *context, CBMArena *arena, const char *module,
+                                          const char *name, const char **target, bool *is_module) {
+    const python_presolve_t *presolve = context;
+    const char *member = cbm_arena_sprintf(arena, "%s.%s", module, name);
+    bool external = false;
+    if (!member)
+        return false;
+    if (python_presolve_follow(presolve, member, target, is_module, &external))
+        return true;
+    const namespace_proof_t *child = cbm_ht_get(presolve->resolver->python_namespaces, member);
+    if (!child || child->ambiguous)
+        return false;
+    *target = child->module_qn;
+    *is_module = true;
+    return true;
+}
+
+static const char *python_presolve_label(const void *context, const char *qualified_name) {
+    const python_presolve_t *presolve = context;
+    const target_proof_t *target = cbm_ht_get(presolve->resolver->targets, qualified_name);
+    return target && !target->ambiguous ? target->label : NULL;
+}
+
+/* A kept declaration exports as if undecorated. */
+static bool python_publish_kept(void *context, const char *target, bool is_class) {
+    cbm_shared_resolver_t *resolver = context;
+    export_proof_t *entry = cbm_ht_get(resolver->exports, target);
+    if (!entry || entry->ambiguous || entry->dependency)
+        return true;
+    const namespace_proof_t *module = NULL;
+    const char *dot = strrchr(target, '.');
+    if (dot) {
+        const char *scope = cbm_arena_strndup(&resolver->arena, target, (size_t)(dot - target));
+        module = scope ? cbm_ht_get(resolver->python_namespaces, scope) : NULL;
+    }
+    if (!module)
+        return true;
+    cbm_resolve_proof_key_t lookup = {.lookup_domain = module->module_qn,
+                                      .lookup_key = target,
+                                      .binding_identity = target,
+                                      .declaration_identity = target,
+                                      .detail = "python_decorators_keep_declaration"};
+    cbm_resolve_result_t outcome = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                    .binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                    .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                    .target = target,
+                                    .candidate_count = 1,
+                                    .reason = lookup.detail};
+    const cbm_resolve_proof_t *audit = cbm_resolve_proof_leaf(
+        &resolver->proofs, CBM_PROOF_ADAPTER_DOMAIN, &module->source, &lookup, &outcome);
+    export_support_t *support = cbm_arena_calloc(&resolver->arena, sizeof(*support));
+    if (!audit || !support)
+        return false;
+    support->audit = audit;
+    entry->supports = support;
+    entry->support_count = 1;
+    entry->supported = true;
+    entry->kind = CBM_RESOLVE_EXPORT_VALUE | (is_class ? CBM_RESOLVE_EXPORT_TYPE : 0);
+    return true;
+}
+
+static bool decide_python_decorated(cbm_shared_resolver_t *resolver) {
+    CBMHashTable *by_key = cbm_ht_create(256);
+    if (!by_key)
+        return false;
+    for (python_pending_import_t *import = resolver->python_imports; import; import = import->next)
+        cbm_ht_set(by_key, import->key, import);
+    python_presolve_t presolve = {.resolver = resolver, .by_key = by_key};
+    cbm_py_members_env_t env = {.context = &presolve,
+                                .import_value = python_presolve_import_value,
+                                .module_member = python_presolve_module_member,
+                                .label = python_presolve_label};
+    bool ok = cbm_py_members_decide_decorated(resolver->python_members, &env, python_publish_kept,
+                                              resolver);
+    cbm_ht_free(by_key);
+    return ok;
 }
 
 static bool settle_python_imports(cbm_shared_resolver_t *resolver) {
     if (!collect_python_module_loads(resolver))
         return false;
     collect_python_namespace_effects(resolver);
+    if (!expand_python_stars(resolver))
+        return false;
     for (python_pending_import_t *import = resolver->python_imports; import;
          import = import->next) {
         const namespace_proof_t *parent =
             import->parent_file ? cbm_ht_get(resolver->namespaces, import->parent_file) : NULL;
         const namespace_proof_t *child =
             import->child_file ? cbm_ht_get(resolver->namespaces, import->child_file) : NULL;
-        if (!resolver->python_unknown_namespace_escape && child && !child->ambiguous &&
-            !child->python_mutated && python_namespace_absent(parent, import->member)) {
+        if (child && !child->ambiguous && !child->python_mutated &&
+            python_namespace_absent(resolver, parent, import->member)) {
             const cbm_resolve_proof_t *proof =
                 python_submodule_proof(resolver, import, parent, child);
             if (!proof)
@@ -1586,7 +2151,8 @@ static bool settle_python_imports(cbm_shared_resolver_t *resolver) {
         if (!ok)
             return false;
     }
-    return true;
+    /* Submodule proofs above decided which imports are modules. */
+    return decide_python_decorated(resolver);
 }
 
 static bool stabilize_exports(cbm_shared_resolver_t *resolver) {
@@ -1690,6 +2256,20 @@ static CBMHashTable *python_import_map(CBMArena *arena, const char *file,
             return NULL;
         }
     }
+    for (int i = 0; i < result->imports.count; i++) {
+        if (!python_root_fact_needed(result, i))
+            continue;
+        const char *local = result->imports.items[i].local_name;
+        python_import_t *entry = cbm_arena_calloc(arena, sizeof(*entry));
+        const char *key = cbm_arena_strdup(arena, local);
+        const char *slot = python_root_key(arena, file, local);
+        if (!entry || !key || !slot) {
+            cbm_ht_free(map);
+            return NULL;
+        }
+        entry->slot = slot;
+        cbm_ht_set(map, key, entry);
+    }
     return map;
 }
 
@@ -1698,10 +2278,48 @@ static const char *python_query_key(CBMArena *arena, const char *import_key, con
                              strlen(suffix), suffix);
 }
 
+static bool collect_python_member_query(cbm_shared_resolver_t *resolver, CBMArena *arena,
+                                        const char *slot, const char *suffix) {
+    if (!suffix || !suffix[0] || strchr(suffix, '.'))
+        return true;
+    cbm_resolve_solver_result_t binding;
+    cbm_resolve_solver_get(resolver->solver, slot, &binding);
+    if (binding.status != CBM_SOLVER_KNOWN || !binding.value.module)
+        return true;
+    const char *key = python_query_key(arena, slot, suffix);
+    if (!key)
+        return false;
+    if (cbm_ht_get(resolver->python_queries, key))
+        return true;
+    if (cbm_ht_count(resolver->python_queries) >= 1000000) {
+        resolver->complete = false;
+        return true;
+    }
+    python_query_t *query = cbm_arena_calloc(&resolver->arena, sizeof(*query));
+    const char *saved_key = cbm_arena_strdup(&resolver->arena, key);
+    if (!query || !saved_key)
+        return false;
+    *query = (python_query_t){.key = saved_key,
+                              .import_key = cbm_arena_strdup(&resolver->arena, slot),
+                              .suffix = cbm_arena_strdup(&resolver->arena, suffix)};
+    if (!query->import_key || !query->suffix)
+        return false;
+    cbm_ht_set(resolver->python_queries, saved_key, query);
+    return cbm_ht_get(resolver->python_queries, saved_key) == query;
+}
+
 static bool collect_python_query(cbm_shared_resolver_t *resolver, CBMArena *arena,
-                                 const CBMHashTable *imports, const char *name) {
+                                 const CBMHashTable *imports, const python_nested_list_t *nested,
+                                 const char *name) {
     if (!name || !name[0])
         return true;
+    for (size_t i = 0; nested && i < nested->count; i++) {
+        const python_nested_entry_t *entry = &nested->items[i];
+        const char *suffix = NULL;
+        if (python_nested_suffix(entry->local, entry->path, entry->kind, name, &suffix) &&
+            !collect_python_member_query(resolver, arena, entry->key, suffix))
+            return false;
+    }
     char *prefix = cbm_arena_strdup(arena, name);
     if (!prefix)
         return false;
@@ -1711,33 +2329,8 @@ static bool collect_python_query(cbm_shared_resolver_t *resolver, CBMArena *aren
         const python_import_t *import = cbm_ht_get(imports, prefix);
         if (import) {
             const char *suffix = name[length] ? name + length + 1 : NULL;
-            if (import->ambiguous || !suffix || !suffix[0] || strchr(suffix, '.'))
-                return true;
-            cbm_resolve_solver_result_t binding;
-            cbm_resolve_solver_get(resolver->solver, import->slot, &binding);
-            if (binding.status != CBM_SOLVER_KNOWN || !binding.value.module)
-                return true;
-            const char *key = python_query_key(arena, import->slot, suffix);
-            if (!key)
-                return false;
-            if (cbm_ht_get(resolver->python_queries, key))
-                return true;
-            if (cbm_ht_count(resolver->python_queries) >= 1000000) {
-                resolver->complete = false;
-                return true;
-            }
-            python_query_t *query = cbm_arena_calloc(&resolver->arena, sizeof(*query));
-            const char *saved_key = cbm_arena_strdup(&resolver->arena, key);
-            if (!query || !saved_key)
-                return false;
-            *query =
-                (python_query_t){.key = saved_key,
-                                 .import_key = cbm_arena_strdup(&resolver->arena, import->slot),
-                                 .suffix = cbm_arena_strdup(&resolver->arena, suffix)};
-            if (!query->import_key || !query->suffix)
-                return false;
-            cbm_ht_set(resolver->python_queries, saved_key, query);
-            return cbm_ht_get(resolver->python_queries, saved_key) == query;
+            return import->ambiguous ||
+                   collect_python_member_query(resolver, arena, import->slot, suffix);
         }
         while (length && name[--length] != '.') {}
     }
@@ -1836,6 +2429,60 @@ static bool settle_python_query(cbm_shared_resolver_t *resolver, python_query_t 
     return query->result.proof != NULL;
 }
 
+static bool python_env_import_value(const void *context, const char *key, const char **target,
+                                    bool *module, bool *external) {
+    const cbm_shared_resolver_t *resolver = context;
+    cbm_resolve_solver_result_t binding;
+    cbm_resolve_solver_get(resolver->solver, key, &binding);
+    if (binding.status == CBM_SOLVER_KNOWN) {
+        *target = binding.value.target;
+        *module = binding.value.module;
+        return *target != NULL;
+    }
+    /* A leaf import with no project slot: the path names no project module. */
+    *external =
+        binding.status == CBM_SOLVER_UNKNOWN && binding.proof && binding.dependency_count == 0;
+    return false;
+}
+
+static bool python_env_module_member(const void *context, CBMArena *arena, const char *module,
+                                     const char *name, const char **target, bool *is_module) {
+    const cbm_shared_resolver_t *resolver = context;
+    const char *member = cbm_arena_sprintf(arena, "%s.%s", module, name);
+    const char *key = member ? export_solver_key(arena, member) : NULL;
+    if (!key)
+        return false;
+    cbm_resolve_solver_result_t binding;
+    cbm_resolve_solver_get(resolver->solver, key, &binding);
+    if (binding.status == CBM_SOLVER_KNOWN) {
+        *target = binding.value.target;
+        *is_module = binding.value.module;
+        return *target != NULL;
+    }
+    /* An attribute no module-level binder provides reads the loaded submodule. */
+    namespace_proof_t *parent = cbm_ht_get(resolver->python_namespaces, module);
+    namespace_proof_t *child = cbm_ht_get(resolver->python_namespaces, member);
+    if (binding.proof || !child || child->ambiguous || !parent || !parent->complete ||
+        parent->ambiguous || parent->python_open_barrier)
+        return false;
+    *target = child->module_qn;
+    *is_module = true;
+    return true;
+}
+
+static const char *python_env_label(const void *context, const char *qualified_name) {
+    const cbm_shared_resolver_t *resolver = context;
+    const target_proof_t *target = cbm_ht_get(resolver->targets, qualified_name);
+    return target && !target->ambiguous ? target->label : NULL;
+}
+
+static cbm_py_members_env_t python_members_env(const cbm_shared_resolver_t *resolver) {
+    return (cbm_py_members_env_t){.context = resolver,
+                                  .import_value = python_env_import_value,
+                                  .module_member = python_env_module_member,
+                                  .label = python_env_label};
+}
+
 static bool prepare_python_queries(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
                                    const cbm_file_info_t *files, int file_count,
                                    CBMFileResult **cache) {
@@ -1856,16 +2503,19 @@ static bool prepare_python_queries(cbm_shared_resolver_t *resolver, const cbm_pi
         CBMArena arena;
         cbm_arena_init(&arena);
         CBMHashTable *imports = python_import_map(&arena, files[f].rel_path, result);
+        const python_nested_list_t *nested = cbm_ht_get(resolver->python_nested, files[f].rel_path);
         bool ok = imports != NULL;
         for (int i = 0; ok && i < result->calls.count; i++)
-            ok =
-                collect_python_query(resolver, &arena, imports, result->calls.items[i].callee_name);
+            ok = collect_python_query(resolver, &arena, imports, nested,
+                                      result->calls.items[i].callee_name);
         for (int i = 0; ok && i < result->usages.count; i++)
-            ok = collect_python_query(resolver, &arena, imports, result->usages.items[i].ref_name);
+            ok = collect_python_query(resolver, &arena, imports, nested,
+                                      result->usages.items[i].ref_name);
         for (int i = 0; ok && i < result->rw.count; i++)
-            ok = collect_python_query(resolver, &arena, imports, result->rw.items[i].var_name);
+            ok = collect_python_query(resolver, &arena, imports, nested,
+                                      result->rw.items[i].var_name);
         for (int i = 0; ok && i < result->type_refs.count; i++)
-            ok = collect_python_query(resolver, &arena, imports,
+            ok = collect_python_query(resolver, &arena, imports, nested,
                                       result->type_refs.items[i].type_name);
         cbm_ht_free(imports);
         cbm_arena_destroy(&arena);
@@ -1990,6 +2640,9 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->namespaces = cbm_ht_create(128);
     resolver->python_queries = cbm_ht_create(128);
     resolver->python_namespaces = cbm_ht_create(128);
+    resolver->python_star_provided = cbm_ht_create(128);
+    resolver->python_nested = cbm_ht_create(128);
+    resolver->python_members = cbm_py_members_new();
     resolver->http_defaults = cbm_ht_create(128);
     resolver->http_sites = cbm_ht_create(128);
     resolver->http_unsafe = cbm_ht_create(128);
@@ -2005,10 +2658,11 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->ecma = cbm_ecma_table_new(&resolver->arena);
     resolver->complete = true;
     if (!resolver->exports || !resolver->targets || !resolver->namespaces ||
-        !resolver->python_queries || !resolver->python_namespaces || !resolver->http_defaults ||
-        !resolver->http_sites || !resolver->http_unsafe || !resolver->http_candidates ||
-        !resolver->http_veto || !resolver->project || !resolver->solver || !resolver->go_types ||
-        !resolver->ecma) {
+        !resolver->python_queries || !resolver->python_namespaces ||
+        !resolver->python_star_provided || !resolver->python_nested || !resolver->python_members ||
+        !resolver->http_defaults || !resolver->http_sites || !resolver->http_unsafe ||
+        !resolver->http_candidates || !resolver->http_veto || !resolver->project ||
+        !resolver->solver || !resolver->go_types || !resolver->ecma) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -2058,6 +2712,11 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         !cbm_go_stabilization_seal(resolver->go_types) ||
         !prepare_python_queries(resolver, ctx, files, file_count, cache)) {
         cbm_log_error("resolver.build.error", "reason", "settle_failed");
+        cbm_shared_resolver_free(resolver);
+        return NULL;
+    }
+    cbm_py_members_env_t python_env = python_members_env(resolver);
+    if (!cbm_py_members_seal(resolver->python_members, &python_env)) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -2186,6 +2845,11 @@ void cbm_shared_resolver_fact(const cbm_shared_resolver_t *resolver, const char 
     cbm_resolve_solver_get(resolver ? resolver->solver : NULL, key, out);
 }
 
+const char *cbm_shared_resolver_python_base(const cbm_shared_resolver_t *resolver,
+                                            const char *qualified_name, size_t offset) {
+    return resolver ? cbm_py_members_base(resolver->python_members, qualified_name, offset) : NULL;
+}
+
 bool cbm_shared_resolver_owns_proof(const cbm_shared_resolver_t *resolver,
                                     const cbm_resolve_proof_t *proof) {
     return resolver && cbm_resolve_proof_pool_owns(&resolver->proofs, proof);
@@ -2199,6 +2863,9 @@ void cbm_shared_resolver_free(cbm_shared_resolver_t *resolver) {
     cbm_ht_free(resolver->namespaces);
     cbm_ht_free(resolver->python_queries);
     cbm_ht_free(resolver->python_namespaces);
+    cbm_ht_free(resolver->python_star_provided);
+    cbm_ht_free(resolver->python_nested);
+    cbm_py_members_free(resolver->python_members);
     cbm_ht_free(resolver->http_defaults);
     cbm_ht_free(resolver->http_sites);
     cbm_ht_free(resolver->http_unsafe);
@@ -2389,10 +3056,40 @@ static cbm_resolve_result_t python_export_result(file_resolver_t *resolver, cons
     return outcome;
 }
 
-static bool python_import_result(file_resolver_t *resolver, const char *name,
+/* A name that no scope binds, provided by a closed star import of this module. */
+static bool python_star_result(file_resolver_t *resolver, const char *name,
+                               cbm_resolve_result_t *result) {
+    if (!resolver->shared || !resolver->shared->python_star_provided ||
+        !resolver->file->result->module_qn || strchr(name, '.'))
+        return false;
+    const char *module = resolver->file->result->module_qn;
+    const char *key = cbm_arena_sprintf(resolver->arena, "%.*s.%s",
+                                        (int)cbm_fqn_symbol_scope_len(module), module, name);
+    if (!key || !cbm_ht_get(resolver->shared->python_star_provided, key))
+        return false;
+    *result = python_export_result(resolver, export_solver_key(resolver->arena, key), NULL);
+    return true;
+}
+
+static bool python_import_result(file_resolver_t *resolver, const char *name, uint32_t start,
+                                 uint32_t end, CBMSourceOrigin origin,
                                  cbm_resolve_result_t *result) {
     if (!resolver->python_imports)
         return false;
+    const cbm_resolve_python_nested_import_t *nested =
+        cbm_resolve_binding_python_nested_site(resolver->bindings, name, start, end, origin);
+    if (nested) {
+        const char *suffix = NULL;
+        *result =
+            python_nested_suffix(nested->import.local_name, nested->import.module_path,
+                                 nested->import.kind, name, &suffix)
+                ? python_export_result(resolver,
+                                       python_nested_key(resolver->arena, resolver->file->rel_path,
+                                                         nested->at, nested->import.local_name),
+                                       suffix)
+                : unresolved("python_nested_import_path_mismatch");
+        return true;
+    }
     size_t length = strlen(name);
     while (length) {
         const char *prefix = cbm_arena_strndup(resolver->arena, name, length);
@@ -2412,6 +3109,17 @@ static bool python_import_result(file_resolver_t *resolver, const char *name,
         while (length && name[--length] != '.') {}
     }
     return false;
+}
+
+/* An explicit module binder a later closed star overrides: only a binder after
+ * the star stays explicit, see python_expand_module_stars. */
+static bool python_star_rebinds(const file_resolver_t *resolver, const char *name) {
+    const char *module = resolver->file->result->module_qn;
+    if (!resolver->shared || !module || strchr(name, '.'))
+        return false;
+    const char *key = cbm_arena_sprintf(resolver->arena, "%.*s.%s",
+                                        (int)cbm_fqn_symbol_scope_len(module), module, name);
+    return key && cbm_ht_get(resolver->shared->python_star_provided, key);
 }
 
 static bool prepare_source_imports(file_resolver_t *resolver) {
@@ -2922,6 +3630,28 @@ static cbm_resolve_result_t ecma_import_result(file_resolver_t *resolver,
     return ecma_finish(&query, result);
 }
 
+static bool python_member_result(file_resolver_t *resolver, const char *name, uint32_t start,
+                                 uint32_t end, CBMSourceOrigin origin, bool invocation,
+                                 cbm_resolve_result_t *out) {
+    const cbm_shared_resolver_t *shared = resolver->shared;
+    if (!shared || !shared->complete || !shared->python_members || !resolver->python_imports)
+        return false;
+    python_member_imports_t lookup = {.file = resolver->file->rel_path,
+                                      .module = resolver->file->result->module_qn,
+                                      .imports = resolver->python_imports,
+                                      .star_provided = shared->python_star_provided};
+    cbm_py_import_lookup_t table = {&lookup, python_member_import_key, python_member_star_key};
+    cbm_py_members_env_t env = python_members_env(shared);
+    return cbm_py_members_resolve(shared->python_members, &env, &table, resolver->bindings,
+                                  resolver->arena, name, start, end, origin, invocation, out);
+}
+
+static bool python_target_is_variable(const file_resolver_t *resolver, const char *qualified_name) {
+    const target_proof_t *target =
+        resolver->shared ? cbm_ht_get(resolver->shared->targets, qualified_name) : NULL;
+    return target && target->label && !strcmp(target->label, "Variable");
+}
+
 static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char *name,
                                            const char *scope, uint32_t start, uint32_t end,
                                            CBMSourceOrigin origin, bool invocation) {
@@ -2957,12 +3687,33 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
     if (file->language == CBM_LANG_PYTHON) {
         cbm_resolve_result_t proof =
             cbm_resolve_binding_local(resolver->bindings, name, start, end, origin);
-        if (cbm_resolve_admit(&proof))
-            return proof;
-        if (python_import_result(resolver, name, &proof))
-            return proof.target ? cbm_resolve_binding_validate(resolver->bindings, name, start, end,
-                                                               origin, proof)
-                                : proof;
+        if (cbm_resolve_admit(&proof)) {
+            cbm_resolve_result_t held;
+            if (invocation && python_target_is_variable(resolver, proof.target) &&
+                python_member_result(resolver, name, start, end, origin, invocation, &held))
+                return held;
+            return python_star_rebinds(resolver, name) ? unresolved("python_star_rebinding")
+                                                       : proof;
+        }
+        if (python_import_result(resolver, name, start, end, origin, &proof) ||
+            python_star_result(resolver, name, &proof)) {
+            cbm_resolve_result_t bound =
+                proof.target ? cbm_resolve_binding_validate(resolver->bindings, name, start, end,
+                                                            origin, proof)
+                             : proof;
+            /* Calling a variable calls what it holds, when that has a fact. */
+            bool value_call = invocation && proof.target && cbm_resolve_admit(&bound) &&
+                              python_target_is_variable(resolver, proof.target);
+            cbm_resolve_result_t member;
+            return (!cbm_resolve_admit(&bound) || value_call) &&
+                           python_member_result(resolver, name, start, end, origin, invocation,
+                                                &member)
+                       ? member
+                       : bound;
+        }
+        cbm_resolve_result_t member;
+        if (python_member_result(resolver, name, start, end, origin, invocation, &member))
+            return member;
     }
     cbm_resolution_t candidate = cbm_registry_resolve_observed(
         file->registry, name, file->module_qn, file->import_keys, file->import_values,
@@ -3338,6 +4089,9 @@ static bool resolve_usages(file_resolver_t *resolver, CBMArena *arena) {
         if (!site && usage->may_be_call_reference && cbm_resolve_admit(&outcome) &&
             callable_node(cbm_gbuf_find_by_qn(resolver->file->graph, outcome.target)))
             relation = "CALL_REFERENCE";
+        /* Reading a property hands over its result, not the function. */
+        if (!site && outcome.reason && !strcmp(outcome.reason, CBM_RESOLVE_PYTHON_PROPERTY_READ))
+            relation = "USAGE";
         if (!record_result(resolver, usage->enclosing_func_qn, usage->ref_name, relation,
                            usage->site_start_byte, usage->site_end_byte, usage->source_origin,
                            outcome, NULL))
@@ -3428,6 +4182,16 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
         cbm_pipeline_file_node(file->graph, file->ctx->project_name, file->rel_path);
     resolver.bindings =
         binding_build_for(&arena, file->result, file->language, file->rel_path, source, length);
+    if (file->language == CBM_LANG_PYTHON && shared && file->result->module_qn) {
+        const char *module = file->result->module_qn;
+        const char *scope = cbm_arena_strndup(&arena, module, cbm_fqn_symbol_scope_len(module));
+        const namespace_proof_t *namespace =
+            scope ? cbm_ht_get(shared->python_namespaces, scope) : NULL;
+        if (namespace)
+            cbm_resolve_binding_python_set_star_barrier(resolver.bindings,
+                                                        namespace->python_open_barrier);
+        cbm_py_members_apply_decorated(shared->python_members, resolver.bindings);
+    }
     bool begun = cbm_gbuf_resolution_begin(file->output);
     bool ok = begun && resolver.bindings &&
               cbm_resolve_binding_set_identity(resolver.bindings, file->ctx->project_name,

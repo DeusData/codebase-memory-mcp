@@ -370,13 +370,7 @@ static const RQ_Expected fastapi_call_obligations[] = {
           .declaration_line = 36,
           .declaration_text =
               "def is_body_allowed_for_status_code(status_code: Union[int, str, None]) -> bool:"},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "fastapi-utils-formatted-value-export",
-     .why = "The exact imported function is genuine, but formatted-value effects elsewhere in "
-            "utils.py prevent the current whole-file export proof.",
-     .tried =
-         "Audited the explicit import and target declaration in pinned 0.99.1 source; "
-         "the full pipeline is checked against this source obligation without a name fallback."},
+     .mode = RQ_REQUIRED},
     {.case_id = "handler-validation-encoder",
      .site = {.file = "fastapi/exception_handlers.py",
               .caller = "fastapi.exception_handlers.request_validation_exception_handler",
@@ -388,13 +382,7 @@ static const RQ_Expected fastapi_call_obligations[] = {
                 .label = "Function",
                 .declaration_line = 29,
                 .declaration_text = "def jsonable_encoder("},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "fastapi-encoder-dynamic-namespace-export",
-     .why = "The exact imported function is genuine, but vars(obj) in encoders.py prevents the "
-            "current whole-file export proof.",
-     .tried =
-         "Audited the explicit import and target declaration in pinned 0.99.1 source; "
-         "the full pipeline is checked against this source obligation without a name fallback."},
+     .mode = RQ_REQUIRED},
     {.case_id = "handler-websocket-encoder",
      .site = {.file = "fastapi/exception_handlers.py",
               .caller = "fastapi.exception_handlers.websocket_request_validation_exception_handler",
@@ -406,13 +394,7 @@ static const RQ_Expected fastapi_call_obligations[] = {
                 .label = "Function",
                 .declaration_line = 29,
                 .declaration_text = "def jsonable_encoder("},
-     .mode = RQ_KNOWN_GAP,
-     .gap_id = "fastapi-encoder-dynamic-namespace-export",
-     .why = "The exact imported function is genuine, but vars(obj) in encoders.py prevents the "
-            "current whole-file export proof.",
-     .tried =
-         "Audited the explicit import and target declaration in pinned 0.99.1 source; "
-         "the full pipeline is checked against this source obligation without a name fallback."},
+     .mode = RQ_REQUIRED},
 };
 
 /* Read bytes without executing/importing the external fixture. CRLF checkouts
@@ -531,7 +513,7 @@ static bool fastapi_call_quality(void) {
                                        sizeof(sources) / sizeof(sources[0]), expected,
                                        sizeof(expected) / sizeof(expected[0]), NULL, 0, &report,
                                        stderr) &&
-         report.genuine == 7 && report.found == 4 && report.missing == 3;
+         report.genuine == 7 && report.found == 7 && report.missing == 0;
     if (store)
         cbm_store_close(store);
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++)
@@ -542,9 +524,8 @@ static bool fastapi_call_quality(void) {
 }
 
 /* This consumer checks a physical File import, not a symbol-call occurrence.
- * Python import carriers currently have explicit legacy 0/0 coordinates; do
- * not pretend those are exact source spans. Require exact endpoints, current
- * generation, pinned source snapshots and agreement between row and edge. */
+ * Python import occurrences carry the exact clause span. Require exact endpoints,
+ * current generation, pinned source snapshots and agreement between row and edge. */
 static bool fastapi_physical_import(void) {
     static const char *const paths[] = {"fastapi/security/oauth2.py", "fastapi/security/utils.py"};
     RQ_Source sources[2] = {0};
@@ -564,12 +545,18 @@ static bool fastapi_physical_import(void) {
     int nf = snprintf(from, sizeof(from), "%s.fastapi.security.oauth2.py.__file__", g_project);
     int nt = snprintf(to, sizeof(to), "%s.fastapi.security.utils.py.__file__", g_project);
     ok = ok && nf > 0 && (size_t)nf < sizeof(from) && nt > 0 && (size_t)nt < sizeof(to);
+    /* The occurrence's span is the imported name's clause in the audited source. */
+    static const char statement[] = "from fastapi.security.utils import ";
+    static const char clause[] = "get_authorization_scheme_param";
+    const char *line = ok ? strstr(sources[0].text, statement) : NULL;
+    int64_t clause_start = line ? (int64_t)(line - sources[0].text) + (int64_t)strlen(statement) : 0;
+    ok = ok && line != NULL;
     const char *sql = "SELECT COUNT(*) FROM resolver_occurrences r "
                       "JOIN nodes s ON s.project=r.project AND s.qualified_name=r.scope "
                       "JOIN nodes t ON t.project=r.project AND t.qualified_name=r.target "
                       "WHERE r.project=?1 AND r.file_path=?2 AND r.scope=?3 AND r.target=?4 "
                       "AND r.relation='IMPORTS' AND r.emitted=1 AND r.rules_version=?5 "
-                      "AND r.source_origin=?6 AND r.start_byte=0 AND r.end_byte=0 "
+                      "AND r.source_origin=?6 AND r.start_byte=?8 AND r.end_byte=?9 "
                       "AND s.label='File' AND s.file_path=?2 AND t.label='File' AND t.file_path=?7 "
                       "AND (SELECT COUNT(*) FROM edges e WHERE e.project=r.project "
                       "AND e.source_id=s.id AND e.target_id=t.id AND e.type='IMPORTS')=1";
@@ -582,6 +569,8 @@ static bool fastapi_physical_import(void) {
          sqlite3_bind_int(stmt, 5, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
          sqlite3_bind_int(stmt, 6, CBM_SOURCE_ORIGIN_RAW) == SQLITE_OK &&
          sqlite3_bind_text(stmt, 7, paths[1], -1, SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 8, clause_start) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 9, clause_start + (int64_t)strlen(clause)) == SQLITE_OK &&
          sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1 &&
          sqlite3_step(stmt) == SQLITE_DONE;
     sqlite3_finalize(stmt);

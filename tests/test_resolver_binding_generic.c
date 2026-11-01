@@ -830,11 +830,13 @@ TEST(resolver_binding_python_ordinary_lua_names_are_lexical) {
 }
 
 TEST(resolver_binding_language_dynamic_controls_remain_blocked) {
-    const char *python[] = {"exec('target = None')",          "eval('1')",
-                            "globals()['target'] = None",     "locals()['target'] = None",
-                            "vars()['target'] = None",        "setattr(value, 'target', None)",
-                            "delattr(value, 'target')",       "__import__('unknown')",
-                            "value.__dict__['target'] = None"};
+    /* setattr, delattr, __dict__ and __import__ cannot rebind a name audited here,
+     * so they left this list: resolver_python_only_real_namespace_effects_are_dynamic
+     * pins them. */
+    const char *python[] = {"exec('target = None')",      "eval('1')",
+                            "globals()['target'] = None", "locals()['target'] = None",
+                            "vars()['target'] = None",
+                            "setattr(sys.modules[__name__], 'target', None)"};
     const char *lua[] = {"debug.getregistry()",
                          "load('return nil')",
                          "rawset(_G, 'target', nil)",
@@ -1010,33 +1012,35 @@ TEST(resolver_binding_python_crossfile_language_names_and_real_effects) {
     PASS();
 }
 
-/* Literal formatting introduces no namespace bindings or user conversion
- * hooks. Unknown values remain an effect boundary, including nested width
- * expressions; recursive source auditing must not skip these children. */
+/* Formatting is an ordinary read: __format__ can run user code exactly as any
+ * call in the file can, and neither rebinds an audited name. Recursive source
+ * auditing still sees a walrus target or dynamic name inside the braces. */
 TEST(resolver_binding_python_literal_formatting_preserves_exact_bindings) {
     const struct {
         const char *expression;
         bool supported;
         bool effects_complete;
+        bool audited;
     } cases[] = {
-        {"f'code={404}'", true, true},
-        {"f'value={-2:+04}'", true, true},
-        {"f\"name={'x'!r:>4}\"", true, true},
-        {"f'{{escaped}}:{1}'", true, true},
-        {"f'{12:{3}}'", true, true},
-        {"f'{True!s}:{None!r}:{2.5!a}'", true, true},
-        {"f\"nested={f'{1}'}\"", true, true},
-        {"f'{(1)}'", true, true},
-        {"f'{value}'", false, true},
-        {"f'{value!r}'", false, true},
-        {"f'{unknown()}'", false, true},
-        {"f'{value.member}'", false, true},
-        {"f'{value[0]}'", false, true},
-        {"f'{1:{width}}'", false, true},
-        {"f'{(target := None)}'", false, true},
-        {"f\"{eval('1')}\"", false, false},
-        {"f\"{exec('target = None')}\"", false, false},
-        {"f\"{globals().__setitem__('target', None)}\"", false, false},
+        {"f'code={404}'", true, true, true},
+        {"f'value={-2:+04}'", true, true, true},
+        {"f\"name={'x'!r:>4}\"", true, true, true},
+        {"f'{{escaped}}:{1}'", true, true, true},
+        {"f'{12:{3}}'", true, true, true},
+        {"f'{True!s}:{None!r}:{2.5!a}'", true, true, true},
+        {"f\"nested={f'{1}'}\"", true, true, true},
+        {"f'{(1)}'", true, true, true},
+        {"f'{value}'", true, true, true},
+        {"f'{value!r}'", true, true, true},
+        {"f'{unknown()}'", true, true, true},
+        {"f'{value.member}'", true, true, true},
+        {"f'{value[0]}'", true, true, true},
+        {"f'{1:{width}}'", true, true, true},
+        /* The walrus rebinds target alone; the file's audit stays complete. */
+        {"f'{(target := None)}'", false, true, true},
+        {"f\"{eval('1')}\"", false, false, false},
+        {"f\"{exec('target = None')}\"", false, false, false},
+        {"f\"{globals().__setitem__('target', None)}\"", false, false, false},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         char source[768];
@@ -1063,11 +1067,11 @@ TEST(resolver_binding_python_literal_formatting_preserves_exact_bindings) {
         bool complete =
             !strcmp(cbm_resolve_binding_status(index), "binding_complete_supported_subset");
         bool effects = cbm_resolve_binding_python_effects_complete(index);
-        /* Supporting a positive binding does not make this module's executed
-         * assignment an inert closed namespace for wildcard absence proofs. */
+        /* A completed audit saw every module-level binder, assignments included. */
         bool closed = cbm_resolve_binding_python_namespace_closed(index);
         if (exact != cases[i].supported || exported != cases[i].supported ||
-            complete != cases[i].supported || effects != cases[i].effects_complete || closed)
+            complete != cases[i].audited || effects != cases[i].effects_complete ||
+            closed != cases[i].audited)
             fprintf(
                 stderr,
                 "Python formatting case=%zu status=%s exact=%d export=%d effects=%d closed=%d\n", i,
@@ -1076,9 +1080,9 @@ TEST(resolver_binding_python_literal_formatting_preserves_exact_bindings) {
         cbm_free_result(file);
         ASSERT_EQ(exact, cases[i].supported);
         ASSERT_EQ(exported, cases[i].supported);
-        ASSERT_EQ(complete, cases[i].supported);
+        ASSERT_EQ(complete, cases[i].audited);
         ASSERT_EQ(effects, cases[i].effects_complete);
-        ASSERT(!closed);
+        ASSERT_EQ(closed, cases[i].audited);
     }
     PASS();
 }
@@ -1113,7 +1117,8 @@ TEST(resolver_binding_python_formatting_keeps_module_escape_and_rebinding_guards
         bool escaped = cbm_resolve_binding_python_import_escaped(index, "library");
         cbm_arena_destroy(&arena);
         cbm_free_result(file);
-        ASSERT(!admitted);
+        /* The escape is recorded against library; target itself stays proven. */
+        ASSERT_EQ(admitted, i == 0);
         if (i == 0)
             ASSERT(escaped);
     }
@@ -1412,7 +1417,8 @@ TEST(resolver_binding_python_annotation_scope_and_effects) {
         {"def caller():\n    callback: object\n    callback()\n", false, true, true},
         {"class Box:\n    callback: object\ndef caller():\n    callback()\n", true, true, true},
         {"callback: object = other\ndef caller():\n    callback()\n", false, false, true},
-        {"callback: factory()\ndef caller():\n    callback()\n", false, false, true},
+        /* An annotation expression is a read, as on an assignment: the import stands. */
+        {"callback: factory()\ndef caller():\n    callback()\n", true, true, true},
         {"callback: eval('object')\ndef caller():\n    callback()\n", false, false, false},
         {"__annotations__ = box\ncallback: object\ndef caller():\n    callback()\n", false, false,
          true},
@@ -1492,6 +1498,15 @@ static const RQ_Source PYTHON_ANNOTATION_SOURCES[] = {
          "mapping\ncallback: object\ndef changedStorage():\n    callback()\n"},
     {.path = "decoy.py", .text = "def handler():\n    pass\n"}};
 static const RQ_Expected PYTHON_ANNOTATION_EXPECTED[] = {
+    /* callback: annotation() reads annotation; it does not rebind callback. */
+    {.case_id = "effectful-annotation-keeps-the-import",
+     .site = {.file = "effects.py", .caller = "effect", .start_byte = 112, .end_byte = 122},
+     .relation = "CALLS",
+     .target = {.file = "target.py",
+                .suffix = "target.handler",
+                .label = "Function",
+                .declaration_line = 1,
+                .declaration_text = "def handler():"}},
     {.case_id = "original-module-callable-reference",
      .site = {.file = "use.py", .caller = "crossArgument", .start_byte = 113, .end_byte = 121},
      .relation = "CALL_REFERENCE",
@@ -1693,10 +1708,6 @@ static const RQ_Forbidden PYTHON_ANNOTATION_FORBIDDEN[] = {
      .site = {.file = "local.py", .caller = "after", .start_byte = 127, .end_byte = 137},
      .relation = "CALLS",
      .any_target = true},
-    {.case_id = "effect-no-proved-callable",
-     .site = {.file = "effects.py", .caller = "effect", .start_byte = 112, .end_byte = 122},
-     .relation = "CALLS",
-     .any_target = true},
     {.case_id = "changedStorage-no-proved-callable",
      .site = {.file = "storage.py", .caller = "changedStorage", .start_byte = 137, .end_byte = 147},
      .relation = "CALLS",
@@ -1757,8 +1768,8 @@ TEST(resolver_binding_python_annotation_pipeline_roles_and_exports) {
             cbm_store_close(store);
         th_cleanup(root);
         ASSERT(ok);
-        ASSERT_EQ(report.genuine, 5);
-        ASSERT_EQ(report.found, 4);
+        ASSERT_EQ(report.genuine, 6);
+        ASSERT_EQ(report.found, 5);
         ASSERT_EQ(report.missing, 1);
         ASSERT_EQ(report.required_missing + report.wrong, 0);
     }
@@ -1933,19 +1944,13 @@ TEST(resolver_binding_python_annotation_containers_and_parameter_separators) {
         {"def caller(value: Optional[str] = globals().__setitem__('target', "
          "None)):\n    return target()\n",
          false},
-        /* QUALITY GAP python-pep695-binding-audit. WHY: these genuine target()
-         * calls have unsupported declaration type scopes. TRIED: the source
-         * audit still rejects the declaration's type_parameter, independently
-         * of newly admitted generic-annotation argument containers. This is
-         * a capability assertion, not a forbidden semantic target. */
-        {"def caller[T](value: T):\n    return target()\n", false},
-        {"class Container[T]:\n    pass\ndef caller():\n    return target()\n", false},
-        /* QUALITY GAP python-annotation-subscription-effects. WHY: a no-value
-         * annotation preserves this genuine runtime target binding, but the
-         * subscription effect audit is intentionally unproved. TRIED: retain
-         * python_inert_annotation's existing barrier; do not count this miss
-         * as a false-positive target or weaken the separate annotation oracle. */
-        {"target: Optional[str]\ndef caller():\n    return target()\n", false},
+        /* PEP 695 type parameters bind inside the declaration they head. */
+        {"def caller[T](value: T):\n    return target()\n", true},
+        {"class Container[T]:\n    pass\ndef caller():\n    return target()\n", true},
+        {"type Alias = int\ndef caller():\n    return target()\n", true},
+        {"def caller[target](value: target):\n    return target()\n", false},
+        /* A no-value annotation binds nothing and its expression is a read. */
+        {"target: Optional[str]\ndef caller():\n    return target()\n", true},
         {"def caller(value: Optional[str]):\n    pair = 1, "
          "globals().__setitem__('target', None)\n    return target()\n",
          false},

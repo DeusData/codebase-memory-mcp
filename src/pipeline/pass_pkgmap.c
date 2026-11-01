@@ -3747,6 +3747,77 @@ static const cbm_gbuf_node_t *python_configured_module(const cbm_pipeline_ctx_t 
     }
 }
 
+typedef struct {
+    char base[PKGMAP_PATH_BUF]; /* empty at the repo root */
+    char own[PKGMAP_PATH_BUF];  /* the file's top-level package, empty outside one */
+} python_search_t;
+
+/* Where a file's absolute imports look first. A file inside a package was loaded under
+ * that package, so the directory above its topmost __init__.py is on sys.path. A file
+ * outside any package is a script or a test, and its own directory is. */
+static bool python_search_path(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
+                               python_search_t *search) {
+    search->own[0] = '\0';
+    int length = snprintf(search->base, sizeof(search->base), "%s", source_rel);
+    if (length <= 0 || (size_t)length >= sizeof(search->base))
+        return false;
+    char *slash = strrchr(search->base, '/');
+    if (!slash) {
+        search->base[0] = '\0';
+        return true;
+    }
+    *slash = '\0';
+    for (;;) {
+        char init[PKGMAP_PATH_BUF];
+        int size = snprintf(init, sizeof(init), "%s/__init__.py", search->base);
+        if (size <= 0 || (size_t)size >= sizeof(init))
+            return false;
+        if (!python_module_file(ctx, init))
+            return true;
+        slash = strrchr(search->base, '/');
+        size = snprintf(search->own, sizeof(search->own), "%s", slash ? slash + 1 : search->base);
+        if (size <= 0 || (size_t)size >= sizeof(search->own))
+            return false;
+        if (!slash) {
+            search->base[0] = '\0';
+            return true;
+        }
+        *slash = '\0';
+    }
+}
+
+/* An absolute import, given what it names relative to the repo root. Python takes the first
+ * match on sys.path, and only the file's own search directory is known. Two different
+ * modules leave the choice to a path we cannot see, except for the file's own package,
+ * which is certain. */
+static const cbm_gbuf_node_t *python_on_search_path(const cbm_pipeline_ctx_t *ctx,
+                                                    const char *source_rel, const char *normalized,
+                                                    const cbm_gbuf_node_t *rooted) {
+    python_search_t search;
+    if (!source_rel || !source_rel[0])
+        return rooted;
+    if (!python_search_path(ctx, source_rel, &search))
+        return NULL;
+    if (!search.base[0])
+        return rooted;
+    char near_path[PKGMAP_PATH_BUF], head_path[PKGMAP_PATH_BUF];
+    int head = (int)strcspn(normalized, "/");
+    int near_size = snprintf(near_path, sizeof(near_path), "%s/%s", search.base, normalized);
+    int head_size =
+        snprintf(head_path, sizeof(head_path), "%s/%.*s", search.base, head, normalized);
+    if (near_size <= 0 || (size_t)near_size >= sizeof(near_path) || head_size <= 0 ||
+        (size_t)head_size >= sizeof(head_path))
+        return NULL;
+    const cbm_gbuf_node_t *found = python_module_at_path(ctx, near_path);
+    if (found) {
+        bool own =
+            (int)strlen(search.own) == head && !strncmp(search.own, normalized, (size_t)head);
+        return !rooted || own ? found : NULL;
+    }
+    /* A module of that first name here hides the one at the root, whatever it lacks. */
+    return python_module_at_path(ctx, head_path) ? NULL : rooted;
+}
+
 static const cbm_gbuf_node_t *python_exact_module(const cbm_pipeline_ctx_t *ctx,
                                                   const char *source_rel, const char *path) {
     if (!python_import_path(path))
@@ -3772,11 +3843,13 @@ static const cbm_gbuf_node_t *python_exact_module(const cbm_pipeline_ctx_t *ctx,
     free(relative);
     if (length < 0 || (size_t)length >= sizeof(normalized))
         return NULL;
-    if (path[0] != '.')
-        for (char *p = normalized; *p; p++)
-            if (*p == '.')
-                *p = '/';
-    return python_module_at_path(ctx, normalized);
+    if (path[0] == '.')
+        return python_module_at_path(ctx, normalized);
+    for (char *p = normalized; *p; p++)
+        if (*p == '.')
+            *p = '/';
+    return python_on_search_path(ctx, source_rel, normalized,
+                                 python_module_at_path(ctx, normalized));
 }
 
 static bool python_source_import_kind(CBMImportKind kind) {
