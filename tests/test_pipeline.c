@@ -13578,7 +13578,7 @@ static void write_go_init_lsp_fixture(const char *tmp, int pad_files) {
 
 /* Each init's LSP-resolved edges start at that init's own node. */
 static int assert_go_init_lsp_edges(cbm_store_t *s, const char *project) {
-    const char *lsp = "\"strategy\":\"lsp_";
+    const char *lsp = "\"strategy\":\"shared_resolver\"";
     ASSERT_GTE(go_calls_between(s, project, ".reg.init#a.go:1", ".reg.Codec.register", lsp), 1);
     ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:1", ".reg.Store.register", lsp), 1);
     ASSERT_GTE(go_calls_between(s, project, ".reg.init#b.go:2", ".reg.Store.warm", lsp), 1);
