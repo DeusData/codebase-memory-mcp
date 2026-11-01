@@ -1263,6 +1263,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         return SKIP_ONE;
     }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        evidence->candidate_qn = cbm_registry_diagnostic_candidate(
+            ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang);
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,
          * `httpx.post`) — the import map skips it (no node) and no project symbol

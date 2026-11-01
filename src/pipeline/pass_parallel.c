@@ -3606,6 +3606,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            site_evidence->candidate_qn = cbm_registry_diagnostic_candidate(
+                rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang);
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,

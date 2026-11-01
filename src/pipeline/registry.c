@@ -2636,6 +2636,20 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
                                    import_map_count, lang_scope_len(module_qn, lang), skip_members);
 }
 
+const char *cbm_registry_diagnostic_candidate(const cbm_registry_t *r, const char *callee_name,
+                                              const char *module_qn, const char **keys,
+                                              const char **values, int count, CBMLanguage lang) {
+    if (!r || !callee_name || !module_qn) {
+        return NULL;
+    }
+    cbm_resolution_t guess = registry_resolve_chain(r, callee_name, module_qn, keys, values, count,
+                                                    lang_scope_len(module_qn, lang), false);
+    return guess.qualified_name && guess.qualified_name[0] &&
+                   !cbm_registry_name_guess_vetoed(r, lang, &guess)
+               ? guess.qualified_name
+               : NULL;
+}
+
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
 
 /* Method QNs are path-based: <project>.<dirs>.<file stem>.<Class>.<method>.
