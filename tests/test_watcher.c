@@ -2260,6 +2260,124 @@ TEST(watcher_sustained_failure_logs_once_issue2015) {
     PASS();
 }
 
+/* ── Success cooldown (#2835) ─────────────────────────────────────── */
+
+TEST(success_delay_fast_index_keeps_interval) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 0), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1666), 5000); /* 3x < interval */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 20000), 60000);
+    PASS();
+}
+
+TEST(success_delay_slow_index_scales_by_factor) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 1667), 5001);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 10000), 30000);
+    /* 5-minute rebuild → next poll 15 min after it finishes. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(60000, 300000), 900000);
+    PASS();
+}
+
+TEST(success_delay_clamped_and_degenerate) {
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 600000), 1800000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, 600001), 1800000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MAX), 1800000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, -1), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(5000, INT64_MIN), 5000);
+    ASSERT_EQ(cbm_watcher_success_delay_ms(-1, 0), 0);
+    /* Never below the caller's own cadence, even above the ceiling. */
+    ASSERT_EQ(cbm_watcher_success_delay_ms(INT_MAX, INT64_MAX), INT_MAX);
+    PASS();
+}
+
+TEST(success_delay_is_monotonic) {
+    int previous = cbm_watcher_success_delay_ms(5000, 0);
+    for (int64_t e = 0; e <= 2000000; e += 997) {
+        int delay = cbm_watcher_success_delay_ms(5000, e);
+        ASSERT_TRUE(delay >= previous);
+        ASSERT_TRUE(delay >= 5000 && delay <= 1800000);
+        previous = delay;
+    }
+    PASS();
+}
+
+/* Wire-up: the cooldown must be measured around the real index_fn call. An
+ * instant callback keeps the plain cadence (no cooldown line); a callback
+ * slower than interval/3 (5000/3 ms) extends it and logs once. */
+static int cooldown_log_hits = 0;
+static void cooldown_log_sink(const char *line) {
+    if (line && strstr(line, "watcher.cooldown") != NULL) {
+        cooldown_log_hits++;
+    }
+}
+static int slow_index_sleep_ms = 0;
+static int slow_index_calls = 0;
+static int slow_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    slow_index_calls++;
+    if (slow_index_sleep_ms > 0) {
+        cbm_usleep((unsigned)slow_index_sleep_ms * 1000U);
+    }
+    return 0;
+}
+
+TEST(watcher_success_cooldown_measures_index_issue2835) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cool_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    char p[300];
+    th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, slow_index_callback, NULL);
+    cbm_watcher_watch(w, "cool-repo", tmpdir);
+    slow_index_calls = 0;
+    slow_index_sleep_ms = 0;
+    cbm_watcher_poll_once(w); /* baseline */
+
+    CBMLogLevel old_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cooldown_log_hits = 0;
+    cbm_log_set_sink(cooldown_log_sink);
+
+    /* Instant index: no cooldown. Loop on the attempt count (a transient git
+     * probe failure makes a poll a no-op, see the sustained-failure test). */
+    th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "a\n");
+    while (slow_index_calls < 1) {
+        cbm_watcher_touch(w, "cool-repo");
+        cbm_watcher_poll_once(w);
+    }
+    int fast_hits = cooldown_log_hits;
+
+    /* 1.8 s index → 3 x 1800 = 5400 ms > 5000 ms interval: cooldown. */
+    slow_index_sleep_ms = 1800;
+    th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "b\n");
+    while (slow_index_calls < 2) {
+        cbm_watcher_touch(w, "cool-repo");
+        cbm_watcher_poll_once(w);
+    }
+
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(old_level);
+
+    ASSERT_EQ(fast_hits, 0);
+    ASSERT_EQ(cooldown_log_hits, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_index_failure_count_unknown_project) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -4043,6 +4161,11 @@ SUITE(watcher) {
     RUN_TEST(index_backoff_never_schedules_sooner_than_the_interval);
     RUN_TEST(watcher_index_failure_streak_increments_and_resets_issue2015);
     RUN_TEST(watcher_index_failure_backoff_gates_repolling_issue2015);
+    RUN_TEST(success_delay_fast_index_keeps_interval);
+    RUN_TEST(success_delay_slow_index_scales_by_factor);
+    RUN_TEST(success_delay_clamped_and_degenerate);
+    RUN_TEST(success_delay_is_monotonic);
+    RUN_TEST(watcher_success_cooldown_measures_index_issue2835);
     RUN_TEST(watcher_sustained_failure_logs_once_issue2015);
     RUN_TEST(watcher_index_failure_count_unknown_project);
     RUN_TEST(watcher_project_info_publishes_scan_issue2167);
