@@ -216,10 +216,11 @@ TEST(resolver_ts_large_class_keeps_every_method_proof) {
     size_t size = strlen(head) + CALLS * strlen(line) + strlen(tail) + 1;
     char *source = malloc(size);
     ASSERT_NOT_NULL(source);
-    char *at = source + sprintf(source, "%s", head);
+    char *at = source;
+    at += snprintf(at, size, "%s", head);
     for (int i = 0; i < CALLS; i++)
-        at += sprintf(at, "%s", line);
-    sprintf(at, "%s", tail);
+        at += snprintf(at, size - (size_t)(at - source), "%s", line);
+    snprintf(at, size - (size_t)(at - source), "%s", tail);
     CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT, "test",
                                            "main.ts", 0, NULL, NULL);
     ASSERT_NOT_NULL(file);

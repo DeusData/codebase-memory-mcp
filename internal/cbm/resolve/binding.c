@@ -1352,8 +1352,7 @@ static void javascript_this_owner(cbm_resolve_binding_index_t *index, TSNode nod
             state->js_this_owner = node_text(index, owner);
             return;
         }
-        if (kind_is(owner, "member_expression") &&
-            kind_is(field(owner, "object"), "identifier") &&
+        if (kind_is(owner, "member_expression") && kind_is(field(owner, "object"), "identifier") &&
             kind_is(field(owner, "property"), "property_identifier")) {
             const char *property = node_text(index, field(owner, "property"));
             if (property && !strcmp(property, "prototype")) {
@@ -1364,8 +1363,10 @@ static void javascript_this_owner(cbm_resolve_binding_index_t *index, TSNode nod
         return;
     }
     /* A member of `const Owner = {...}` or `Owner.prototype = {...}`. */
-    TSNode literal = kind_is(node, "method_definition") ? ts_node_parent(node) : ts_node_parent(parent);
-    if (!kind_is(literal, "object") || (!kind_is(node, "method_definition") && !kind_is(parent, "pair")))
+    TSNode literal =
+        kind_is(node, "method_definition") ? ts_node_parent(node) : ts_node_parent(parent);
+    if (!kind_is(literal, "object") ||
+        (!kind_is(node, "method_definition") && !kind_is(parent, "pair")))
         return;
     TSNode holder = ts_node_parent(literal);
     if (kind_is(holder, "variable_declarator") && ts_node_eq(literal, field(holder, "value")) &&
@@ -4171,34 +4172,32 @@ cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_ind
         holder->js_import)
         return binding_query_finish(index, &query, result);
     js_member_t probe = {.owner = owner, .member = dot + 1, .prototype = prototype};
-    const js_member_t *row =
-        index->js_member_count ? bsearch(&probe, index->js_members, index->js_member_count,
-                                         sizeof(*index->js_members), js_compare_member)
-                               : NULL;
+    const js_member_t *row = index->js_member_count
+                                 ? bsearch(&probe, index->js_members, index->js_member_count,
+                                           sizeof(*index->js_members), js_compare_member)
+                                 : NULL;
     js_member_t computed = {.owner = owner, .member = JS_MEMBER_COMPUTED, .prototype = prototype};
     if (row && index->js_member_count &&
         bsearch(&computed, index->js_members, index->js_member_count, sizeof(*index->js_members),
                 js_compare_member))
         row = NULL;
-    (void)cbm_resolve_lookup_observe(&query, owner, dot + 1, row ? row->target : NULL,
-                                     row && row->target ? CBM_RESOLVE_BINDING_UNIQUE
-                                                        : CBM_RESOLVE_BINDING_UNRESOLVED,
-                                     CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
-                                     row && row->target ? "js_member_declaration_observed"
-                                                        : "js_member_declaration_absent");
+    (void)cbm_resolve_lookup_observe(
+        &query, owner, dot + 1, row ? row->target : NULL,
+        row && row->target ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        CBM_RESOLVE_ANALYSIS_COMPLETE, 0, true,
+        row && row->target ? "js_member_declaration_observed" : "js_member_declaration_absent");
     if (!row || !row->target || row->conflict)
         return binding_query_finish(index, &query, result);
-    result = (cbm_resolve_result_t){.binding = CBM_RESOLVE_BINDING_UNIQUE,
-                                    .domain = CBM_RESOLVE_DOMAIN_PROJECT,
-                                    .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
-                                    .rule = CBM_RESOLVE_RULE_SCOPE_BINDING,
-                                    .facts = CBM_RESOLVE_FACT_EXACT_TARGET |
-                                             CBM_RESOLVE_FACT_SCOPE_BOUND |
-                                             CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                                             CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
-                                    .target = row->target,
-                                    .candidate_count = 1,
-                                    .reason = "js_member_declaration"};
+    result = (cbm_resolve_result_t){
+        .binding = CBM_RESOLVE_BINDING_UNIQUE,
+        .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+        .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+        .rule = CBM_RESOLVE_RULE_SCOPE_BINDING,
+        .facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_SCOPE_BOUND |
+                 CBM_RESOLVE_FACT_LOOKUP_COMPLETE | CBM_RESOLVE_FACT_OCCURRENCE_EXACT,
+        .target = row->target,
+        .candidate_count = 1,
+        .reason = "js_member_declaration"};
     return binding_query_finish(index, &query, result);
 }
 
