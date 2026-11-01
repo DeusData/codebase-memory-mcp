@@ -3113,8 +3113,10 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                                              call_node);
                     return;
                 }
-                // Fall through to qualified_name fallback.
-                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, member);
+                // Fall through to qualified_name fallback. The diagnostic joins its
+                // call site by spelling, so an alias reports the name the file wrote;
+                // an exported name here would outlive the edge a later proof admits.
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, name);
                 ts_emit_unresolved_call_at(ctx, qn, "import_symbol_not_in_registry", call_node);
                 return;
             }

@@ -12194,6 +12194,18 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     cbm_node_free_fields(&exported_node);
     bool renamed_class = cross_file_call_has_strategy(s, project, "viaRenamedClass",
                                                       "pingUniqueQrs", "shared_resolver");
+    /* An admitted alias call is not an unresolved one. */
+    int alias_rows = 0;
+    static const char *const alias_files[] = {"src/renamed.ts", "src/wrapper.ts"};
+    for (size_t f = 0; f < sizeof(alias_files) / sizeof(alias_files[0]); f++) {
+        cbm_coverage_row_t *rows = NULL;
+        int row_count = 0;
+        ASSERT_EQ(cbm_store_coverage_get_path(s, project, alias_files[f], &rows, &row_count),
+                  CBM_STORE_OK);
+        for (int i = 0; i < row_count; i++)
+            alias_rows += strcmp(rows[i].kind, "unresolved_calls") == 0;
+        cbm_store_free_coverage(rows, row_count);
+    }
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -12204,6 +12216,7 @@ TEST(pipeline_ts_renamed_import_call_issue2297) {
     ASSERT_TRUE(wrapper);
     ASSERT_FALSE(recursive);
     ASSERT_TRUE(renamed_class);
+    ASSERT_EQ(alias_rows, 0);
     PASS();
 }
 
