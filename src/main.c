@@ -2801,6 +2801,112 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     return ui_result;
 }
 
+/* One path from an endpoint to a usable MCP client: bootstrap (including the
+ * one-shot upgrade retry) and the session context. The initial connection and
+ * the reconnect supplier share it so a future bootstrap or context change
+ * cannot land in only one of them. `session_live` selects bootstrap failure
+ * reporting: before the session exists stdout carries a JSON-RPC error
+ * (#1539); during a reconnect the session is live, and an unsolicited id:null
+ * frame would corrupt it, so diagnostics go to stderr only. A rejected
+ * session context keeps its pre-existing stderr-only report on both paths. */
+typedef struct {
+    cbm_daemon_process_role_t role;
+    const cbm_daemon_build_identity_t *identity;
+    const char *executable_path;
+    cbm_mcp_tool_profile_t tool_profile;
+    uint32_t startup_timeout_ms;
+    bool set_session_context;
+} main_mcp_session_config_t;
+
+static void main_report_endpoint_failure(const main_mcp_session_config_t *config,
+                                         bool session_live) {
+    const char *why = cbm_daemon_ipc_validation_detail();
+    char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+    (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s%s",
+                   session_live ? " during reconnect" : "", (why && why[0]) ? ": " : "",
+                   (why && why[0]) ? why : "");
+    if (session_live) {
+        (void)fprintf(stderr, "codebase-memory-mcp: %s\n", message);
+        return;
+    }
+    main_report_client_failure(config->role, message);
+}
+
+static cbm_daemon_runtime_client_t *main_establish_mcp_session(
+    const main_mcp_session_config_t *config, const cbm_daemon_ipc_endpoint_t *endpoint,
+    bool session_live) {
+    cbm_daemon_bootstrap_config_t bootstrap_config = {
+        .role = config->role,
+        .endpoint = endpoint,
+        .identity = config->identity,
+        .executable_path = config->executable_path,
+        .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
+        .startup_timeout_ms = config->startup_timeout_ms,
+    };
+    cbm_daemon_bootstrap_result_t result;
+    cbm_daemon_bootstrap_status_t status =
+        main_client_bootstrap_with_upgrade(&bootstrap_config, &result, true);
+    if (status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !result.client) {
+        if (session_live) {
+            const char *message = result.message[0]
+                                      ? result.message
+                                      : "CBM daemon connection failed during reconnect";
+            (void)fprintf(stderr, "codebase-memory-mcp: %s%s%s\n", message,
+                          result.remedy[0] ? " " : "", result.remedy);
+        } else {
+            main_report_client_bootstrap_failure(config->role, &result);
+        }
+        return NULL;
+    }
+    /* Startup requests on the connected client wait within the startup budget,
+     * like the bootstrap before them: a 1 s bound on the reply (a probe
+     * budget) ended the server whenever the daemon's UI save ran long, which
+     * the smoke's `--ui=true --port` run saw as a binary without UI assets. */
+    if (config->set_session_context &&
+        !main_set_client_context(result.client, NULL, config->tool_profile, NULL, NULL,
+                                 config->startup_timeout_ms)) {
+        (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
+        (void)cbm_daemon_runtime_client_close(result.client, MAIN_CLOSE_TIMEOUT_MS);
+        return NULL;
+    }
+    return result.client;
+}
+
+/* #2796: supplier for the MCP frontend's daemon_lost callback. Re-runs the
+ * whole connect-or-spawn leg with the session context and hands the frontend
+ * the replacement. The dead client remains owned by the frontend (the stdin
+ * reader and maintenance monitor may still observe it; the frontend closes it
+ * after the swap and frees it once every frontend thread has stopped), so this
+ * callback only replaces. Runs on the frontend worker thread while the stdin
+ * reader and maintenance monitor are live; bootstrap's POSIX fork child keeps
+ * only async-signal-safe calls for that reason. It reports to stderr only and
+ * never touches the agent's stdio. UI flags are not re-applied: the daemon
+ * persists its UI configuration and a re-spawned daemon reads it back. */
+typedef struct {
+    main_mcp_session_config_t session;
+} main_mcp_daemon_lost_context_t;
+
+static cbm_daemon_runtime_client_t *main_mcp_daemon_lost(void *context,
+                                                         cbm_daemon_runtime_client_t *dead_client) {
+    main_mcp_daemon_lost_context_t *lost = context;
+    (void)dead_client;
+    if (atomic_load(&g_shutdown)) {
+        /* SIGTERM/SIGINT already closed stdin: do not cold-start a daemon for
+         * a session that is on its way out. */
+        return NULL;
+    }
+    cbm_log_warn("mcp.frontend.daemon_lost_reconnect");
+    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
+    if (!endpoint) {
+        main_report_endpoint_failure(&lost->session, true);
+        return NULL;
+    }
+    cbm_daemon_runtime_client_t *replacement =
+        main_establish_mcp_session(&lost->session, endpoint, true);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    return replacement;
+}
+
 int main(int argc, char **argv) {
     /* Must remain the first statement: see allocator binding contract above. */
     cbm_alloc_init();
@@ -3260,17 +3366,21 @@ int main(int argc, char **argv) {
         return result;
     }
 
+    main_mcp_session_config_t session_config = {
+        .role = role,
+        .identity = &identity,
+        .executable_path = executable_path,
+        .tool_profile = tool_profile,
+        .startup_timeout_ms = main_startup_timeout_ms(),
+        .set_session_context = role == CBM_DAEMON_PROCESS_MCP_CLIENT,
+    };
     cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     if (!endpoint) {
         /* #1582: this is where an ownership/ancestry refusal lands, and it was
          * the silent one — stderr only, so an MCP client saw a transport that
          * closed with no explanation. Include the validation detail, which
          * names the directory and the rule that refused. */
-        const char *why = cbm_daemon_ipc_validation_detail();
-        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
-        (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s",
-                       (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
-        main_report_client_failure(role, message);
+        main_report_endpoint_failure(&session_config, false);
         return EXIT_FAILURE;
     }
 
@@ -3378,39 +3488,15 @@ int main(int argc, char **argv) {
         return EXIT_SUCCESS;
     }
 
-    cbm_daemon_bootstrap_config_t bootstrap_config = {
-        .role = role,
-        .endpoint = endpoint,
-        .identity = &identity,
-        .executable_path = executable_path,
-        .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
-        .startup_timeout_ms = main_startup_timeout_ms(),
-    };
-    cbm_daemon_bootstrap_result_t bootstrap_result;
-    cbm_daemon_bootstrap_status_t bootstrap_status =
-        main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result, true);
+    cbm_daemon_runtime_client_t *session_client =
+        main_establish_mcp_session(&session_config, endpoint, false);
     cbm_daemon_ipc_endpoint_free(endpoint);
-    if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
-        main_report_client_bootstrap_failure(role, &bootstrap_result);
+    if (!session_client) {
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
     }
 
-    g_daemon_client = bootstrap_result.client;
-
-    /* Startup requests on the connected client wait within the startup budget,
-     * like the bootstrap before them: a 1 s bound on the reply (a probe budget)
-     * ended the server whenever the daemon's UI save ran long, which the smoke's
-     * `--ui=true --port` run saw as a binary without UI assets. */
-    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
-        !main_set_client_context(g_daemon_client, NULL, tool_profile, NULL, NULL,
-                                 bootstrap_config.startup_timeout_ms)) {
-        (void)fprintf(stderr, "codebase-memory-mcp: daemon session context was rejected\n");
-        (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
-        g_daemon_client = NULL;
-        (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
-        return EXIT_FAILURE;
-    }
+    g_daemon_client = session_client;
 
     /* Persist UI mutations only after the exact-build HELLO succeeds. A
      * conflicting binary must be observationally read-only: applying its
@@ -3425,7 +3511,7 @@ int main(int argc, char **argv) {
         if (update_mask != 0 &&
             cbm_daemon_application_client_set_ui_config(
                 g_daemon_client, update_mask, ui_enabled, ui_port,
-                bootstrap_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+                session_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
             (void)fprintf(stderr, "codebase-memory-mcp: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;
@@ -3450,8 +3536,13 @@ int main(int argc, char **argv) {
     }
 
     setup_signal_handlers();
-    int result = cbm_daemon_frontend_mcp_run(g_daemon_client, client_cohort_manager, stdin, stdout);
-    g_daemon_client = NULL; /* frontend consumed the handle */
+    main_mcp_daemon_lost_context_t daemon_lost_context = {
+        .session = session_config,
+    };
+    cbm_daemon_runtime_client_t *frontend_client = g_daemon_client;
+    g_daemon_client = NULL; /* frontend owns the handle from here on */
+    int result = cbm_daemon_frontend_mcp_run(frontend_client, client_cohort_manager, stdin, stdout,
+                                             main_mcp_daemon_lost, &daemon_lost_context);
     bool client_cohort_cleanup =
         main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
     atomic_store(&g_shutdown, 1);

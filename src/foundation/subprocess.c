@@ -27,6 +27,7 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #ifdef __APPLE__
 #include <paths.h>
@@ -1434,7 +1435,15 @@ static void cbm_posix_reset_child_signals(void) {
 static bool g_force_close_range_enosys = false;
 #endif
 
-static cbm_fd_close_strategy_t cbm_posix_close_fds_from(int lowfd, long max_fd) {
+long cbm_posix_fd_close_cap(void) {
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0 || max_fd > 1048576L) {
+        max_fd = 65536L;
+    }
+    return max_fd;
+}
+
+cbm_fd_close_strategy_t cbm_posix_close_fds_from(int lowfd, long max_fd) {
 #if defined(__linux__) && defined(SYS_close_range)
     bool range_unavailable = false;
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -1448,6 +1457,13 @@ static cbm_fd_close_strategy_t cbm_posix_close_fds_from(int lowfd, long max_fd) 
     closefrom(lowfd);
     return CBM_FD_CLOSEFROM;
 #endif
+    /* close() takes an int, so descriptors above INT_MAX cannot exist. Clamp
+     * inside the implementation: the exported function must not depend on a
+     * caller respecting the cap contract, or an int loop variable would wrap
+     * and never terminate in the fork child. */
+    if (max_fd > INT_MAX) {
+        max_fd = INT_MAX;
+    }
     for (int fd = lowfd; fd < max_fd; fd++) {
         (void)close(fd);
     }
@@ -1701,10 +1717,7 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
     }
     int child_output = stdout_capture >= 0 ? stdout_capture : output;
 
-    long max_fd = sysconf(_SC_OPEN_MAX);
-    if (max_fd < 0 || max_fd > 1048576L) {
-        max_fd = 65536L;
-    }
+    long max_fd = cbm_posix_fd_close_cap();
 
     pid_t pid = -1;
 #ifdef __APPLE__

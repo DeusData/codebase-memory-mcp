@@ -5,6 +5,7 @@
 #include "test_helpers.h"
 
 #include "daemon/frontend.h"
+#include "daemon/frontend_liveness.h"
 #include "daemon/ipc.h"
 #include "daemon/service.h"
 #include "daemon/version_cohort.h"
@@ -22,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -213,7 +215,7 @@ static int frontend_test_close_fd(int fd) {
 static void *frontend_idle_run(void *opaque) {
     frontend_idle_run_t *run = opaque;
     run->result =
-        cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output);
+        cbm_daemon_frontend_mcp_run(run->client, run->manager, run->input, run->output, NULL, NULL);
     return NULL;
 }
 #endif
@@ -255,6 +257,10 @@ typedef struct {
      * of failing the session); the release is a state transition, not a
      * timeout, so the drain that follows is deterministic. */
     atomic_bool release_first_request;
+    /* Reconnect regression mode: answer every request with CANCELLED so a
+     * frontend that retries anything other than a transport failure is
+     * observable (it would invoke the replacement callback). */
+    atomic_bool cancel_requests;
     int request_observed_fd;
     int session_cancel_fd;
 } frontend_eof_application_context_t;
@@ -294,6 +300,19 @@ static cbm_daemon_build_identity_t frontend_test_identity(void) {
     return identity;
 }
 
+/* A service and every client that must reconnect to it share this identity;
+ * the replacement-connect is rejected when the build fingerprint differs. */
+static cbm_daemon_build_identity_t frontend_runtime_identity(const char *build) {
+    return (cbm_daemon_build_identity_t){
+        .semantic_version = "2.4.0",
+        .build_fingerprint = build,
+        .cache_fingerprint = FRONTEND_TEST_CACHE,
+        .protocol_abi = 3,
+        .store_abi = 11,
+        .feature_abi = 7,
+    };
+}
+
 static cbm_daemon_runtime_application_session_t *frontend_eof_application_session_open(
     void *opaque, cbm_daemon_client_id_t client_id, uint64_t authenticated_process_id) {
     frontend_eof_application_context_t *context = opaque;
@@ -325,6 +344,9 @@ static cbm_daemon_runtime_application_status_t frontend_eof_application_request(
     *response_out = NULL;
     *response_length_out = 0;
     int request_index = atomic_fetch_add_explicit(&context->requests, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&context->cancel_requests, memory_order_acquire)) {
+        return CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
+    }
     if (request_index == 0 &&
         atomic_load_explicit(&context->block_first_request, memory_order_acquire)) {
         atomic_store_explicit(&context->first_request_started, true, memory_order_release);
@@ -464,6 +486,7 @@ static bool frontend_eof_fixture_start(frontend_eof_fixture_t *fixture, const ch
     atomic_init(&fixture->application.block_first_request, true);
     atomic_init(&fixture->application.first_request_started, false);
     atomic_init(&fixture->application.release_first_request, false);
+    atomic_init(&fixture->application.cancel_requests, false);
     fixture->application.request_observed_fd = -1;
     fixture->application.session_cancel_fd = -1;
     char key[CBM_DAEMON_KEY_SIZE];
@@ -477,14 +500,7 @@ static bool frontend_eof_fixture_start(frontend_eof_fixture_t *fixture, const ch
     }
     fixture->endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
     fixture->manager = fixture->endpoint ? cbm_version_cohort_manager_new(fixture->endpoint) : NULL;
-    cbm_daemon_build_identity_t identity = {
-        .semantic_version = "2.4.0",
-        .build_fingerprint = build,
-        .cache_fingerprint = FRONTEND_TEST_CACHE,
-        .protocol_abi = 3,
-        .store_abi = 11,
-        .feature_abi = 7,
-    };
+    cbm_daemon_build_identity_t identity = frontend_runtime_identity(build);
     cbm_daemon_runtime_application_callbacks_t callbacks = {
         .context = &fixture->application,
         .session_open = frontend_eof_application_session_open,
@@ -579,7 +595,7 @@ static int frontend_eof_child_run(const char *parent, bool overflow) {
 
     cbm_daemon_runtime_client_t *frontend_client = fixture.client;
     fixture.client = NULL; /* cbm_daemon_frontend_mcp_run consumes it. */
-    int result = cbm_daemon_frontend_mcp_run(frontend_client, fixture.manager, input, output);
+    int result = cbm_daemon_frontend_mcp_run(frontend_client, fixture.manager, input, output, NULL, NULL);
     bool joined = cbm_thread_join(&writer_thread) == 0;
     bool writer_ok = atomic_load_explicit(&writer.finished, memory_order_acquire) &&
                      atomic_load_explicit(&writer.succeeded, memory_order_acquire);
@@ -658,6 +674,346 @@ static bool frontend_eof_run_isolated(const char *tag, bool overflow) {
         (void)fprintf(stderr, "frontend EOF fixture %s: cleanup failed\n", tag);
     }
     return child_ok && cleaned;
+}
+
+/* #2796: a transport failure must move the session to a replacement daemon
+ * and re-issue the interrupted request; a daemon CANCELLED answer must reach
+ * the caller unchanged and must not trigger a reconnect; a supplier that
+ * cannot replace the client must fail-stop instead of hanging. */
+typedef enum {
+    FRONTEND_RECONNECT_OK,
+    FRONTEND_RECONNECT_CANCEL,
+    FRONTEND_RECONNECT_NULL,
+    FRONTEND_RECONNECT_RETURN_DEAD,
+    FRONTEND_RECONNECT_RETRY,
+} frontend_reconnect_mode_t;
+
+typedef struct {
+    cbm_daemon_ipc_endpoint_t *endpoint;
+    cbm_daemon_build_identity_t identity;
+    char build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char marker[FRONTEND_TEST_PATH_CAP];
+    frontend_reconnect_mode_t mode;
+    /* RETRY: the first replacement is a client whose daemon is already gone;
+     * the second callback connects to endpoint instead. */
+    cbm_daemon_runtime_client_t *retry_dead;
+    atomic_int calls;
+} frontend_reconnect_callback_t;
+
+static void frontend_reconnect_mark(frontend_reconnect_callback_t *callback) {
+    int fd = open(callback->marker, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "1", 1);
+        (void)close(fd);
+    }
+}
+
+static cbm_daemon_runtime_client_t *frontend_reconnect_supply(
+    void *opaque, cbm_daemon_runtime_client_t *dead_client) {
+    frontend_reconnect_callback_t *callback = opaque;
+    int call = atomic_fetch_add_explicit(&callback->calls, 1, memory_order_relaxed);
+    if (callback->mode == FRONTEND_RECONNECT_NULL ||
+        callback->mode == FRONTEND_RECONNECT_RETURN_DEAD) {
+        /* The worker fail-stops with _Exit, so the parent cannot read this
+         * counter; leave a marker the runner checks after waitpid. */
+        frontend_reconnect_mark(callback);
+        return callback->mode == FRONTEND_RECONNECT_RETURN_DEAD ? dead_client : NULL;
+    }
+    if (callback->mode == FRONTEND_RECONNECT_RETRY && call == 0 && callback->retry_dead) {
+        cbm_daemon_runtime_client_t *client = callback->retry_dead;
+        callback->retry_dead = NULL;
+        return client;
+    }
+    if (callback->mode == FRONTEND_RECONNECT_RETRY && call != 1) {
+        return NULL;
+    }
+    cbm_daemon_runtime_connect_result_t result = {0};
+    cbm_daemon_runtime_client_t *client = cbm_daemon_runtime_client_connect(
+        callback->endpoint, &callback->identity, FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS, &result);
+    if (!client || result.status != CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED) {
+        if (client) {
+            (void)cbm_daemon_runtime_client_close(client, FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS);
+        }
+        return NULL;
+    }
+    return client;
+}
+
+static bool frontend_reconnect_callback_init(frontend_reconnect_callback_t *callback,
+                                             cbm_daemon_ipc_endpoint_t *endpoint,
+                                             const char *marker, frontend_reconnect_mode_t mode) {
+    memset(callback, 0, sizeof(*callback));
+    callback->endpoint = endpoint;
+    callback->mode = mode;
+    atomic_init(&callback->calls, 0);
+    int written = snprintf(callback->marker, sizeof(callback->marker), "%s", marker);
+    if (written <= 0 || written >= (int)sizeof(callback->marker) ||
+        !cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), callback->build)) {
+        return false;
+    }
+    callback->identity = frontend_runtime_identity(callback->build);
+    return true;
+}
+
+static bool frontend_reconnect_fixtures_finish(frontend_eof_fixture_t *first,
+                                               frontend_eof_fixture_t *replacement,
+                                               frontend_eof_fixture_t *second) {
+    bool ok = frontend_eof_fixture_finish(first);
+    ok = frontend_eof_fixture_finish(replacement) && ok;
+    if (second) {
+        ok = frontend_eof_fixture_finish(second) && ok;
+    }
+    return ok;
+}
+
+static int frontend_reconnect_child_run(const char *parent, frontend_reconnect_mode_t mode) {
+    bool cancel_requests = mode == FRONTEND_RECONNECT_CANCEL;
+    bool retry_mode = mode == FRONTEND_RECONNECT_RETRY;
+    char parent_a[FRONTEND_TEST_PATH_CAP];
+    char parent_b[FRONTEND_TEST_PATH_CAP];
+    char parent_c[FRONTEND_TEST_PATH_CAP];
+    /* AF_UNIX socket paths add cbm-daemon-<euid>/cbm-<key>.sock below this
+     * parent; macOS sun_path is 104 bytes, so keep both components short. */
+    int written = snprintf(parent_a, sizeof(parent_a), "%s/a", parent);
+    if (written <= 0 || written >= (int)sizeof(parent_a)) {
+        return 70;
+    }
+    written = snprintf(parent_b, sizeof(parent_b), "%s/b", parent);
+    if (written <= 0 || written >= (int)sizeof(parent_b)) {
+        return 70;
+    }
+    written = snprintf(parent_c, sizeof(parent_c), "%s/c", parent);
+    if (written <= 0 || written >= (int)sizeof(parent_c) || mkdir(parent_a, 0700) != 0 ||
+        mkdir(parent_b, 0700) != 0 || (retry_mode && mkdir(parent_c, 0700) != 0)) {
+        return 71;
+    }
+
+    frontend_eof_fixture_t first = {0};
+    frontend_eof_fixture_t replacement = {0};
+    frontend_eof_fixture_t second = {0};
+    bool first_started = frontend_eof_fixture_start(&first, parent_a);
+    bool replacement_started = first_started && frontend_eof_fixture_start(&replacement, parent_b);
+    bool second_started =
+        replacement_started && (!retry_mode || frontend_eof_fixture_start(&second, parent_c));
+    if (!second_started) {
+        (void)frontend_reconnect_fixtures_finish(&first, &replacement, retry_mode ? &second : NULL);
+        return 72;
+    }
+    atomic_store_explicit(&first.application.block_first_request, false, memory_order_release);
+    atomic_store_explicit(&replacement.application.block_first_request, false,
+                          memory_order_release);
+    atomic_store_explicit(&first.application.cancel_requests, cancel_requests,
+                          memory_order_release);
+    atomic_store_explicit(&replacement.application.cancel_requests, cancel_requests,
+                          memory_order_release);
+    if (retry_mode) {
+        atomic_store_explicit(&second.application.block_first_request, false, memory_order_release);
+        atomic_store_explicit(&second.application.cancel_requests, false, memory_order_release);
+    }
+
+    cbm_daemon_runtime_client_t *retry_dead = NULL;
+    bool services_stopped = true;
+    if (!cancel_requests) {
+        services_stopped =
+            cbm_daemon_runtime_service_stop(first.service, FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS) &&
+            cbm_daemon_runtime_service_free(first.service);
+        if (services_stopped) {
+            first.service = NULL;
+        }
+    }
+    if (services_stopped && retry_mode) {
+        retry_dead = replacement.client;
+        services_stopped = cbm_daemon_runtime_service_stop(replacement.service,
+                                                           FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS) &&
+                           cbm_daemon_runtime_service_free(replacement.service);
+        if (services_stopped) {
+            replacement.service = NULL;
+            replacement.client = NULL; /* the frontend owns the retry_dead handle */
+        }
+    }
+    if (!services_stopped) {
+        (void)frontend_reconnect_fixtures_finish(&first, &replacement, retry_mode ? &second : NULL);
+        return 73;
+    }
+
+    static const char request[] =
+        "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"reconnect-probe\"}\n";
+    int input_pipe[2] = {-1, -1};
+    bool request_written = false;
+    if (pipe(input_pipe) == 0) {
+        request_written =
+            write(input_pipe[1], request, sizeof(request) - 1) == (ssize_t)(sizeof(request) - 1);
+        (void)close(input_pipe[1]);
+        input_pipe[1] = -1;
+    }
+    FILE *input = request_written ? fdopen(input_pipe[0], "rb") : NULL;
+    if (!input) {
+        (void)close(input_pipe[0]);
+    }
+    FILE *output = tmpfile();
+    char marker[FRONTEND_TEST_PATH_CAP];
+    written = snprintf(marker, sizeof(marker), "%s/supplier-called", parent);
+    frontend_reconnect_callback_t callback;
+    cbm_daemon_ipc_endpoint_t *live_endpoint = retry_mode ? second.endpoint : replacement.endpoint;
+    bool callback_ready = input && output && written > 0 && written < (int)sizeof(marker) &&
+                          frontend_reconnect_callback_init(&callback, live_endpoint, marker, mode);
+    if (!callback_ready) {
+        if (input) {
+            (void)fclose(input);
+        }
+        if (output) {
+            (void)fclose(output);
+        }
+        if (retry_dead) {
+            /* The fixture no longer owns the extracted handle. */
+            (void)cbm_daemon_runtime_client_close(retry_dead, FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS);
+        }
+        (void)frontend_reconnect_fixtures_finish(&first, &replacement, retry_mode ? &second : NULL);
+        return 74;
+    }
+    callback.retry_dead = retry_dead;
+
+    cbm_daemon_runtime_client_t *frontend_client = first.client;
+    first.client = NULL; /* cbm_daemon_frontend_mcp_run consumes it. */
+    int result = cbm_daemon_frontend_mcp_run(frontend_client, first.manager, input, output,
+                                             frontend_reconnect_supply, &callback);
+    if (callback.retry_dead) {
+        /* No transport failure consumed the spare replacement. */
+        (void)cbm_daemon_runtime_client_close(callback.retry_dead,
+                                              FRONTEND_EOF_TEST_REQUEST_TIMEOUT_MS);
+        callback.retry_dead = NULL;
+    }
+
+    bool rewound = fflush(output) == 0 && fseek(output, 0, SEEK_SET) == 0;
+    char response[4096];
+    size_t response_length = rewound ? fread(response, 1, sizeof(response) - 1, output) : 0;
+    response[response_length] = '\0';
+    bool streams_closed = fclose(input) == 0;
+    streams_closed = fclose(output) == 0 && streams_closed;
+
+    int calls = atomic_load_explicit(&callback.calls, memory_order_acquire);
+    int first_requests = atomic_load_explicit(&first.application.requests, memory_order_acquire);
+    int replacement_requests =
+        atomic_load_explicit(&replacement.application.requests, memory_order_acquire);
+    int second_requests =
+        retry_mode ? atomic_load_explicit(&second.application.requests, memory_order_acquire) : 0;
+    bool fixtures_closed =
+        frontend_reconnect_fixtures_finish(&first, &replacement, retry_mode ? &second : NULL);
+
+    const char *id_hit = strstr(response, "\"id\":42");
+    bool single_response = id_hit && strstr(id_hit + 1, "\"id\":42") == NULL;
+    bool response_ok;
+    if (cancel_requests) {
+        response_ok = strstr(response, "Request cancelled") != NULL && single_response;
+    } else {
+        /* The fixture echoes the request body: requiring the unique method
+         * proves the final replacement daemon's OK payload reached the client,
+         * and the single id proves no duplicate/error frame was injected. */
+        response_ok = strstr(response, "\"method\":\"reconnect-probe\"") != NULL &&
+                      strstr(response, "\"error\"") == NULL && single_response;
+    }
+    bool calls_ok;
+    bool requests_ok;
+    if (mode == FRONTEND_RECONNECT_CANCEL) {
+        calls_ok = calls == 0;
+        requests_ok = first_requests == 1 && replacement_requests == 0 && second_requests == 0;
+    } else if (mode == FRONTEND_RECONNECT_RETRY) {
+        calls_ok = calls == 2;
+        requests_ok = first_requests == 0 && replacement_requests == 0 && second_requests == 1;
+    } else if (mode == FRONTEND_RECONNECT_OK) {
+        calls_ok = calls == 1;
+        requests_ok = first_requests == 0 && replacement_requests == 1 && second_requests == 0;
+    } else { /* NULL: unreachable unless the fail-stop changes into a return */
+        calls_ok = calls == 1;
+        requests_ok = false;
+    }
+    if (result == 0 && response_ok && calls_ok && requests_ok && streams_closed &&
+        fixtures_closed) {
+        return 0;
+    }
+    (void)fprintf(stderr,
+                  "frontend reconnect fixture: result=%d calls=%d first=%d replacement=%d "
+                  "second=%d response_ok=%d streams=%d fixtures=%d response=%s\n",
+                  result, calls, first_requests, replacement_requests, second_requests, response_ok,
+                  streams_closed, fixtures_closed, response);
+    return 75;
+}
+
+static bool frontend_reconnect_run_isolated(const char *tag, frontend_reconnect_mode_t mode) {
+    char parent[FRONTEND_TEST_PATH_CAP];
+    int written = snprintf(parent, sizeof(parent), "%s/reconnect-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || written >= (int)sizeof(parent) || !cbm_mkdtemp(parent)) {
+        return false;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        (void)signal(SIGALRM, SIG_DFL);
+        (void)alarm(FRONTEND_EOF_TEST_CATASTROPHIC_TIMEOUT_S);
+        _exit(frontend_reconnect_child_run(parent, mode));
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = child > 0 ? waitpid(child, &status, 0) : -1;
+    } while (waited < 0 && errno == EINTR);
+    char marker[FRONTEND_TEST_PATH_CAP];
+    int marker_written = snprintf(marker, sizeof(marker), "%s/supplier-called", parent);
+    bool supplier_consulted =
+        marker_written > 0 && marker_written < (int)sizeof(marker) && access(marker, F_OK) == 0;
+    bool expect_failure = mode == FRONTEND_RECONNECT_NULL || mode == FRONTEND_RECONNECT_RETURN_DEAD;
+    bool marker_ok = !expect_failure || supplier_consulted;
+    bool cleaned = th_rmtree(parent) == 0;
+    int expected = expect_failure ? EXIT_FAILURE : EXIT_SUCCESS;
+    bool child_ok = child > 0 && waited == child && WIFEXITED(status) &&
+                    WEXITSTATUS(status) == expected && marker_ok;
+    if (!marker_ok) {
+        (void)fprintf(stderr, "frontend reconnect fixture %s: supplier was not consulted\n", tag);
+    }
+    if (!child_ok) {
+        if (child <= 0) {
+            (void)fprintf(stderr, "frontend reconnect fixture %s: fork failed\n", tag);
+        } else if (waited != child) {
+            (void)fprintf(stderr, "frontend reconnect fixture %s: waitpid failed errno=%d\n", tag,
+                          errno);
+        } else if (WIFSIGNALED(status)) {
+            (void)fprintf(stderr, "frontend reconnect fixture %s: child signal=%d\n", tag,
+                          WTERMSIG(status));
+        } else if (WIFEXITED(status)) {
+            (void)fprintf(stderr, "frontend reconnect fixture %s: child exit=%d expected=%d\n", tag,
+                          WEXITSTATUS(status), expected);
+        } else {
+            (void)fprintf(stderr, "frontend reconnect fixture %s: unexpected child status\n", tag);
+        }
+    }
+    if (!cleaned) {
+        (void)fprintf(stderr, "frontend reconnect fixture %s: cleanup failed\n", tag);
+    }
+    return child_ok && cleaned;
+}
+
+TEST(daemon_frontend_reconnects_after_transport_failure) {
+    ASSERT_TRUE(frontend_reconnect_run_isolated("transport", FRONTEND_RECONNECT_OK));
+    PASS();
+}
+
+TEST(daemon_frontend_does_not_retry_daemon_cancellation) {
+    ASSERT_TRUE(frontend_reconnect_run_isolated("cancelled", FRONTEND_RECONNECT_CANCEL));
+    PASS();
+}
+
+TEST(daemon_frontend_fail_stops_without_a_replacement) {
+    ASSERT_TRUE(frontend_reconnect_run_isolated("no-supplier", FRONTEND_RECONNECT_NULL));
+    PASS();
+}
+
+TEST(daemon_frontend_rejects_returning_the_dead_client) {
+    ASSERT_TRUE(frontend_reconnect_run_isolated("return-dead", FRONTEND_RECONNECT_RETURN_DEAD));
+    PASS();
+}
+
+TEST(daemon_frontend_retries_across_two_replacements) {
+    ASSERT_TRUE(frontend_reconnect_run_isolated("retry", FRONTEND_RECONNECT_RETRY));
+    PASS();
 }
 
 static void frontend_test_release_lease(cbm_version_cohort_lease_t **lease) {
@@ -781,6 +1137,7 @@ static int frontend_backpressure_daemon_run(const char *parent, int ready_fd, in
     atomic_init(&application.block_first_request, false);
     atomic_init(&application.first_request_started, false);
     atomic_init(&application.release_first_request, false);
+    atomic_init(&application.cancel_requests, false);
     application.request_observed_fd = ready_fd;
     application.session_cancel_fd = cancel_fd;
     cbm_daemon_runtime_application_callbacks_t callbacks = {
@@ -920,7 +1277,7 @@ static int frontend_backpressure_frontend_run(const char *parent, int input_fd, 
         return 81;
     }
 
-    int result = cbm_daemon_frontend_mcp_run(client, manager, input, output);
+    int result = cbm_daemon_frontend_mcp_run(client, manager, input, output, NULL, NULL);
     bool joined = cbm_thread_join(&writer_thread) == 0;
     bool writer_ok = atomic_load_explicit(&writer.finished, memory_order_acquire) &&
                      atomic_load_explicit(&writer.succeeded, memory_order_acquire);
@@ -1419,7 +1776,7 @@ TEST(daemon_frontend_maintenance_exits_while_stdio_reader_is_blocked) {
             _exit(70);
         }
         int result = cbm_daemon_frontend_mcp_run((cbm_daemon_runtime_client_t *)(uintptr_t)1,
-                                                 manager, input, output);
+                                                 manager, input, output, NULL, NULL);
         (void)result;
         _exit(71);
     }
@@ -1677,7 +2034,98 @@ TEST(daemon_local_participant_monitor_joins_before_manager_teardown) {
     PASS();
 }
 
+TEST(daemon_frontend_liveness_treats_reconnect_as_progress) {
+    const uint64_t base = 1000; /* stand-in for the 15 s drain / 5 s watchdog */
+    const uint64_t grace = CBM_DAEMON_FRONTEND_RECONNECT_GRACE_MS;
+    cbm_daemon_frontend_liveness_t liveness;
+
+    /* A stuck request expires on the ordinary window. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 0);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base - 1, 0, false, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, base, 0, false, 0, base));
+
+    /* A completed item restarts that window. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 0);
+    cbm_daemon_frontend_liveness_progress(&liveness, base - 1);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base + base - 2, 0, false, 0, base));
+    ASSERT_FALSE(
+        cbm_daemon_frontend_liveness_wait(&liveness, base + base - 1, 0, false, 0, base));
+
+    /* A spawn in progress stretches the deadline to its grace even when the
+     * attempt counter does not change (the first observation anchors it). */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 1);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base, 1, true, 0, base));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base + grace - 1, 1, true, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, base + grace, 1, true, 0, base));
+
+    /* The attempt's real start anchors the grace: a waiter that begins much
+     * later spends the same budget instead of anchoring a fresh one. */
+    cbm_daemon_frontend_liveness_init(&liveness, 2 * grace, 1);
+    ASSERT_FALSE(
+        cbm_daemon_frontend_liveness_wait(&liveness, 2 * grace + base, 1, true, base, base));
+
+    /* The attempt ended: the retried exchange gets a fresh ordinary window
+     * instead of inheriting the spawn's remainder. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 0);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 1, 1, true, 0, base));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 2, 1, false, 0, base));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 2 + base - 1, 1, false, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, 2 + base, 1, false, 0, base));
+
+    /* An attempt that began and ended between polls still restarts the
+     * window when its counter becomes visible. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 0);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 10, 1, false, 0, base));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 10 + base - 1, 1, false, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, 10 + base, 1, false, 0, base));
+
+    /* A waiter initialized with a nonzero attempt count must not mistake its
+     * first poll for a counter change and restart the window. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 3);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base - 1, 3, false, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, base, 3, false, 0, base));
+
+    /* Ordinary progress does not extend the hard per-attempt grace. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 1);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base, 1, true, 0, base));
+    cbm_daemon_frontend_liveness_progress(&liveness, base + 10);
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, base + grace, 1, true, 0, base));
+
+    /* A new attempt that becomes visible while the previous one was observed
+     * restarts the grace at its own start instead of inheriting the old
+     * deadline. The new observation is deliberately after the old deadline. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 0);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base, 1, true, 0, base));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, base + grace + 1, 2, true,
+                                                  base + grace + 1, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, base + 2 * grace + 1, 2, true,
+                                                   base + grace + 1, base));
+
+    /* A start newer than the sampled `now` (the reader raced the attempt's
+     * timestamp) falls back to `now` rather than moving the deadline. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 1);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 100, 1, true, 200, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, 100 + grace, 1, true, 200, base));
+
+    /* The late re-sample grants the attempt its grace and is idempotent: a
+     * repeated call must not re-anchor a hung spawn. */
+    cbm_daemon_frontend_liveness_init(&liveness, 0, 0);
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, base, 0, false, 0, base));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_reconnect_late(&liveness, base, 1));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_reconnect_late(&liveness, base + 1, 1));
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, 1 + grace - 1, 0, true, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, 1 + grace, 0, true, 0, base));
+
+    /* The deadline arithmetic saturates instead of wrapping. */
+    cbm_daemon_frontend_liveness_init(&liveness, UINT64_MAX - 10, 0);
+    ASSERT_TRUE(cbm_daemon_frontend_liveness_wait(&liveness, UINT64_MAX - 1, 0, false, 0, base));
+    ASSERT_FALSE(cbm_daemon_frontend_liveness_wait(&liveness, UINT64_MAX, 0, false, 0, base));
+
+    PASS();
+}
+
 SUITE(daemon_frontend) {
+    RUN_TEST(daemon_frontend_liveness_treats_reconnect_as_progress);
     RUN_TEST(daemon_frontend_recognizes_exact_cancellation_notification);
     RUN_TEST(daemon_frontend_correlates_cancellation_to_exact_request);
     RUN_TEST(daemon_frontend_cancelled_index_reply_offers_async_issue2144);
@@ -1692,6 +2140,11 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_local_participant_monitor_allows_supervisor_containment_window);
     RUN_TEST(daemon_frontend_over_capacity_input_backpressures_without_loss);
     RUN_TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success);
+    RUN_TEST(daemon_frontend_reconnects_after_transport_failure);
+    RUN_TEST(daemon_frontend_does_not_retry_daemon_cancellation);
+    RUN_TEST(daemon_frontend_fail_stops_without_a_replacement);
+    RUN_TEST(daemon_frontend_rejects_returning_the_dead_client);
+    RUN_TEST(daemon_frontend_retries_across_two_replacements);
     RUN_TEST(daemon_frontend_stdout_backpressure_eof_fail_stops_and_cancels_session);
     RUN_TEST(daemon_frontend_stdout_backpressure_maintenance_stops_and_cancels_session);
 #endif

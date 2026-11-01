@@ -486,6 +486,7 @@ DAEMON_SRCS = \
     src/daemon/runtime.c \
     src/daemon/application.c \
     src/daemon/frontend.c \
+    src/daemon/frontend_liveness.c \
     src/daemon/host.c \
     src/daemon/bootstrap.c \
     src/daemon/ipc.c
