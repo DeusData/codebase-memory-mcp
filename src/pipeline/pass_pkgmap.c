@@ -5109,11 +5109,29 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
     cbm_resolve_import_fact_t *facts =
         count ? cbm_arena_calloc(&arena, count * sizeof(*facts)) : NULL;
     bool captured = !count || facts;
+    bool every_occurrence_valid = true;
     for (size_t i = 0; captured && i < count; i++) {
         const CBMImport *import = &result->imports.items[i];
+        /* An import with no occurrence to prove is one unsupported import, as the
+         * ordinary projection above records it, not a failed index: this file's
+         * imports stay incomplete, its bindings abstain, the generation publishes. */
         if (!import_occurrence_valid(result, import)) {
-            captured = false;
-            break;
+            every_occurrence_valid = false;
+            cbm_resolve_result_t unsupported = {.analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                                                .rule = CBM_RESOLVE_RULE_MODULE_PATH,
+                                                .reason = "import_occurrence_invalid"};
+            facts[i] = (cbm_resolve_import_fact_t){.local_name = import->local_name,
+                                                   .module_path = import->module_path,
+                                                   .member = import->member,
+                                                   .kind = import->kind,
+                                                   .is_default = import->is_default,
+                                                   .type_checking_only = import->type_checking_only,
+                                                   .start_byte = import->site_start_byte,
+                                                   .end_byte = import->site_end_byte,
+                                                   .source_origin = import->source_origin,
+                                                   .dependency = unsupported,
+                                                   .binding = unsupported};
+            continue;
         }
         const cbm_gbuf_node_t *dependency = NULL;
         cbm_resolve_result_t proof = resolve_import_observed(
@@ -5132,10 +5150,27 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
             .binding = source_import_binding(ctx, rel, import, namespace_map, c_family, dependency,
                                              proof, &context),
             .closed = proof.analysis == CBM_RESOLVE_ANALYSIS_COMPLETE};
-        captured = facts[i].dependency.proof && facts[i].binding.proof;
+        if (facts[i].dependency.proof && facts[i].binding.proof)
+            continue;
+        /* A file can exceed what one proof pool analyses: clang's own lexer tests
+         * include one header tens of thousands of times. That limits this file's
+         * imports, visibly, and no other file's. Only a failed allocation stops
+         * the generation. */
+        captured = pool.failure == CBM_RESOLVE_ANALYSIS_LIMITED;
+        if (captured) {
+            every_occurrence_valid = false;
+            cbm_resolve_result_t limited = {.analysis = CBM_RESOLVE_ANALYSIS_LIMITED,
+                                            .rule = CBM_RESOLVE_RULE_MODULE_PATH,
+                                            .reason = "import_analysis_limited"};
+            facts[i].dependency = limited;
+            facts[i].binding = limited;
+            facts[i].closed = false;
+        }
     }
-    cbm_resolve_import_snapshot_t snapshot = {
-        .source = context.source, .items = facts, .count = count, .complete = captured};
+    cbm_resolve_import_snapshot_t snapshot = {.source = context.source,
+                                              .items = facts,
+                                              .count = count,
+                                              .complete = captured && every_occurrence_valid};
     captured = captured && cbm_gbuf_capture_imports(ctx->gbuf, &snapshot);
 
     /* Compatibility projection only. No semantic consumer reads this JSON. */
@@ -5152,7 +5187,7 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
     yyjson_mut_val *array = doc ? yyjson_mut_arr(doc) : NULL;
     bool ok = captured && file && root && array &&
               (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
-              yyjson_mut_obj_add_int(doc, root, proof_key, 1) &&
+              yyjson_mut_obj_add_int(doc, root, proof_key, every_occurrence_valid ? 1 : 0) &&
               yyjson_mut_obj_add_val(doc, root, bindings_key, array);
     if (ok)
         yyjson_mut_doc_set_root(doc, root);
@@ -5181,8 +5216,10 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
         ok = cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, json) == 0;
     else
         ok = false;
-    if (!ok)
+    if (!ok) {
+        cbm_log_error("resolver.imports.error", "file", rel, "reason", "snapshot_not_written");
         cbm_gbuf_fail_resolutions(ctx->gbuf);
+    }
     free(json);
     yyjson_mut_doc_free(doc);
     yyjson_doc_free(old);
