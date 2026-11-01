@@ -62,6 +62,7 @@ static void csp_mark(csp_context_t *ctx, TSNode node, const char *qn, uint32_t f
     entry->definition->source_flags = flags;
     if (arity >= 0 && entry->definition->signature_param_count == arity)
         entry->definition->source_flags |= CBM_SOURCE_DECL_FIXED_ARITY;
+    entry->definition->source_arity = arity >= 0 ? arity + 1 : 0;
 }
 static TSNode csp_function_declarator(TSNode node) {
     TSNode decl = csp_field(node, "declarator");
@@ -355,7 +356,8 @@ static void csp_note_enumerators(csp_context_t *ctx, TSNode type, const char *ow
     uint32_t count = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
     for (uint32_t i = 0; i < count; i++) {
         TSNode item = ts_node_named_child(list, i);
-        const char *name = csp_is(item, "enumerator") ? csp_text(ctx, csp_field(item, "name")) : NULL;
+        const char *name =
+            csp_is(item, "enumerator") ? csp_text(ctx, csp_field(item, "name")) : NULL;
         CBMCDecl *fact = name ? csp_add_decl(ctx, CBM_C_DECL_VALUE, name, 0) : NULL;
         if (fact)
             fact->target = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module, name);
@@ -760,6 +762,18 @@ bool cbm_c_facts_add_include(CBMArena *arena, CBMCFileFacts *facts, const char *
                            file);
 }
 
+bool cbm_c_facts_add_method(CBMArena *arena, CBMCFileFacts *facts, const char *name,
+                            const char *target, const char *owner, int arity) {
+    csp_context_t ctx = {.arena = arena, .facts = facts, .module = facts->module_qn};
+    CBMCDecl *fact = csp_add_decl(&ctx, CBM_C_DECL_METHOD, name, 0);
+    if (!fact)
+        return false;
+    fact->target = target;
+    fact->type_name = owner;
+    fact->arity = arity;
+    return true;
+}
+
 bool cbm_c_facts_add_generated(CBMArena *arena, CBMCFileFacts *facts, const char *file) {
     return csp_append_file(arena, &facts->generated_for, &facts->generated_count,
                            &facts->generated_cap, file);
@@ -831,6 +845,16 @@ const CBMCDeclIndex *cbm_c_decl_index_build(CBMArena *arena, const CBMLSPDef *de
                 return NULL;
             *link = (CBMCDeclLink){.decl = decl, .next = index->names[bucket]};
             index->names[bucket] = link;
+            /* `ns.f` is also reachable by the name a call writes. */
+            const char *leaf = decl->kind == CBM_C_DECL_PROTOTYPE ? strrchr(decl->name, '.') : NULL;
+            if (leaf) {
+                bucket = csp_hash(leaf + 1) & index->name_mask;
+                link = cbm_arena_alloc(arena, sizeof(*link));
+                if (!link)
+                    return NULL;
+                *link = (CBMCDeclLink){.decl = decl, .next = index->names[bucket]};
+                index->names[bucket] = link;
+            }
         }
     }
     return index;

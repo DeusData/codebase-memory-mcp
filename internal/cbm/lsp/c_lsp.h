@@ -30,7 +30,11 @@ typedef struct {
     uint32_t tu_cap, tu_count;
     const struct CBMCDeclIndex *c_decls;
     const char *own_file_qn; /* NULL when only the module identifies this file */
-    bool plain_header;       /* this TU is a .h, so its own language is its includer's */
+    /* C++: the class whose member function this is, inline or out of line. Its members
+     * are found before anything at namespace scope. */
+    const CBMRegisteredType *proof_method_class;
+    bool proof_class_scope_checked; /* the current name was looked for in that class */
+    bool plain_header;              /* this TU is a .h, so its own language is its includer's */
     const cbm_resolve_import_snapshot_t *import_facts;
     bool require_import_proofs;
     struct CProofBuiltinBinding *proof_builtins;

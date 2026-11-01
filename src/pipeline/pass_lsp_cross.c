@@ -663,12 +663,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         }
     }
     dst->lang = lang;
-    dst->alias_target =
-        ((lang == CBM_LANG_GO || lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
-          lang == CBM_LANG_CUDA) &&
-         src->alias_target)
-            ? cbm_arena_strdup(arena, src->alias_target)
-            : NULL;
+    dst->alias_target = ((lang == CBM_LANG_GO || lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
+                          lang == CBM_LANG_CUDA) &&
+                         src->alias_target)
+                            ? cbm_arena_strdup(arena, src->alias_target)
+                            : NULL;
     dst->decorators = NULL;
     if (src->decorators) {
         int n = 0;
@@ -1152,6 +1151,23 @@ static void pxc_collect_c_file(const cbm_pipeline_ctx_t *ctx, CBMArena *arena, c
                                    count, facts);
     if (!facts || count >= room)
         return;
+    for (int i = 0; i < count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        const char *target = def->graph_qualified_name;
+        if (!def->label || strcmp(def->label, "Method") || !def->short_name || !target)
+            continue;
+        /* The name written before the member: `K` of `M.ns.K.m`. */
+        size_t length = strlen(target), leaf = strlen(def->short_name);
+        const char *owner = NULL;
+        if (length > leaf + 1 && target[length - leaf - 1] == '.') {
+            size_t end = length - leaf - 1, start = end;
+            while (start > 0 && target[start - 1] != '.')
+                start--;
+            owner = cbm_arena_strndup(arena, target + start, end - start);
+        }
+        (void)cbm_c_facts_add_method(arena, facts, def->short_name, target, owner,
+                                     def->signature_param_types ? def->signature_param_count : -1);
+    }
     const cbm_resolve_import_snapshot_t *snapshot =
         cbm_pipeline_import_snapshot(ctx->gbuf, ctx->project_name, file->rel_path, fr);
     for (size_t i = 0; snapshot && i < snapshot->count; i++) {
@@ -1162,8 +1178,7 @@ static void pxc_collect_c_file(const cbm_pipeline_ctx_t *ctx, CBMArena *arena, c
                                           cbm_arena_strdup(arena, fact->dependency.target));
             continue;
         }
-        char *generated =
-            cbm_pipeline_c_generated_source(ctx, file->rel_path, fact->module_path);
+        char *generated = cbm_pipeline_c_generated_source(ctx, file->rel_path, fact->module_path);
         if (generated)
             (void)cbm_c_facts_add_generated(arena, facts, cbm_arena_strdup(arena, generated));
         free(generated);

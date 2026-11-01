@@ -17,6 +17,7 @@ typedef enum {
     CBM_C_DECL_MACRO,         /* a #define of this name, in any branch */
     CBM_C_DECL_EXTERN_VALUE,  /* an extern object declaration */
     CBM_C_DECL_VALUE,         /* a graph Variable: object definition or enumerator */
+    CBM_C_DECL_METHOD,        /* an out-of-line or inline member definition */
 } CBMCDeclKind;
 
 enum {
@@ -29,7 +30,7 @@ typedef struct CBMCDecl {
     const char *file;         /* the declaring file's identity (see CBMCFileFacts) */
     const char *name;         /* namespace-relative name, dotted */
     const char *target;       /* VALUE: exact graph QN. Otherwise NULL. */
-    const char *type_name;    /* VALUE and EXTERN_VALUE: the written base type name */
+    const char *type_name;    /* VALUE, EXTERN_VALUE: written base type. METHOD: owner's name */
     const CBMType *signature; /* PROTOTYPE: builtin-only audited signature, else NULL */
     int arity;                /* PROTOTYPE: fixed parameter count, -1 when not fixed */
     uint32_t flags;
@@ -65,6 +66,10 @@ bool cbm_c_collect_file_facts(CBMArena *arena, const char *source, int length, c
 /* Each adds to facts, copying nothing: strings must outlive the facts. */
 bool cbm_c_facts_add_include(CBMArena *arena, CBMCFileFacts *facts, const char *file);
 bool cbm_c_facts_add_generated(CBMArena *arena, CBMCFileFacts *facts, const char *file);
+/* A member definition: `size_t StringRef::find(char C) const { ... }` has its class
+ * in another file, so the class alone cannot reach it. */
+bool cbm_c_facts_add_method(CBMArena *arena, CBMCFileFacts *facts, const char *name,
+                            const char *target, const char *owner, int arity);
 
 /* Immutable index over every file's facts. Built with the shared registry. */
 typedef struct CBMCDeclIndex CBMCDeclIndex;

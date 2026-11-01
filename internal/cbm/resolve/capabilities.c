@@ -244,8 +244,9 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
                              CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER |
                              CBM_RESOLVE_CAP_TYPE_FLOW | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = "Exact visibility and owner proofs; unsupported overload, template, ADL "
-                          "and callable-field selection abstain.";
+        out->limitation = "Exact visibility and owner proofs; overloads of one parameter count, "
+                          "templates, ADL with a second visible function and callable-field "
+                          "selection abstain.";
         break;
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
