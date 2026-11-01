@@ -1588,6 +1588,10 @@ TEST(resolver_c_member_access_follows_written_declarations) {
          .site = C_TU_WORD("src/use.c", use, "use.bump_flags", "c->flags++", "flags"),
          .relation = "WRITES",
          .target = flags},
+        {.case_id = "increment-also-reads",
+         .site = C_TU_WORD("src/use.c", use, "use.bump_flags", "c->flags++", "flags"),
+         .relation = "USAGE",
+         .target = flags},
     };
     const RQ_Forbidden forbidden[] = {
         {.case_id = "block-scope-struct-hides-the-global",
@@ -1865,7 +1869,7 @@ TEST(resolver_cpp_members_and_namespaces_bind_through_the_translation_unit) {
          .relation = "CALLS",
          .target = size},
         {.case_id = "overloaded-arrow-parameter-type",
-         .site = C_TU_WORD(use_file, use, "llvm.useArrow", "useArrow(", "Arrow"),
+         .site = C_TU_WORD(use_file, use, "llvm.useArrow", "(Arrow A) { return A->", "Arrow"),
          .relation = "USAGE",
          .target = arrow_type},
         {.case_id = "pointer-member-type",
@@ -2257,7 +2261,205 @@ TEST(resolver_cpp_reference_prototypes_and_scoped_members) {
     PASS();
 }
 
+/* Inside a member function the class's own names come first, also the ones with no graph
+ * node to bind: a pure virtual hides a free function of that name. */
+#define C_TU_HIDING_HEADER                                                                      \
+    "#ifndef PRINTER_H\n"                                                                       \
+    "#define PRINTER_H\n"                                                                       \
+    "int print(int x);\n"                                                                       \
+    "int render(int x);\n"                                                                      \
+    "int hidden(int x);\n"                                                                      \
+    "class Base {\n"                                                                            \
+    "public:\n"                                                                                 \
+    "  int render(int x) { return x; }\n"                                                       \
+    "};\n"                                                                                      \
+    "class Printer {\n"                                                                         \
+    "public:\n"                                                                                 \
+    "  virtual int print(int x) = 0;\n"                                                         \
+    "  int run() { return print(1); }\n"                                                        \
+    "  int free_ok() { return render(1); }\n"                                                   \
+    "};\n"                                                                                      \
+    "class Derived : public Base {\n"                                                           \
+    "public:\n"                                                                                 \
+    "  int go() { return render(4); }\n"                                                        \
+    "};\n"                                                                                      \
+    "class FromUnknown : public Unknown {\n"                                                    \
+    "public:\n"                                                                                 \
+    "  int go2() { return render(2); }\n"                                                       \
+    "};\n"                                                                                      \
+    "class WithType {\n"                                                                        \
+    "  using hidden = int;\n"                                                                   \
+    "public:\n"                                                                                 \
+    "  int go3() { return hidden(3); }\n"                                                       \
+    "};\n"                                                                                      \
+    "#endif\n"
+#define C_TU_HIDING_IMPL                                                                        \
+    "#include \"printer.h\"\n"                                                                  \
+    "int print(int x) { return x; }\n"                                                          \
+    "int render(int x) { return x; }\n"                                                         \
+    "int hidden(int x) { return x; }\n"
+static const RQ_Source C_TU_HIDING[] = {{.path = "printer.h", .text = C_TU_HIDING_HEADER},
+                                        {.path = "printer_impl.cpp", .text = C_TU_HIDING_IMPL}};
+
+TEST(resolver_cpp_class_names_hide_the_enclosing_scope) {
+    const RQ_Expected expected[] = {
+        {.case_id = "name-the-class-does-not-declare-is-the-free-function",
+         .site = {.file = "printer.h", .caller = "printer.Printer.free_ok", .needle = "render(1)"},
+         .relation = "CALLS",
+         .target = {.file = "printer_impl.cpp",
+                    .suffix = "printer_impl.render",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "int render(int x) { return x; }"}},
+        {.case_id = "name-a-known-base-declares",
+         .site = {.file = "printer.h", .caller = "printer.Derived.go", .needle = "render(4)"},
+         .relation = "CALLS",
+         .target = {.file = "printer.h",
+                    .suffix = "printer.Base.render",
+                    .label = "Method",
+                    .declaration_line = 8,
+                    .declaration_text = "  int render(int x) { return x; }"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "pure-virtual-hides-the-free-function",
+         .site = {.file = "printer.h", .caller = "printer.Printer.run", .needle = "print(1)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "unknown-base-may-declare-the-name",
+         .site = {.file = "printer.h", .caller = "printer.FromUnknown.go2", .needle = "render(2)"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "nested-type-hides-the-free-function",
+         .site = {.file = "printer.h", .caller = "printer.WithType.go3", .needle = "hidden(3)"},
+         .relation = "CALLS",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-hiding",
+                             .sources = C_TU_HIDING,
+                             .source_count = sizeof(C_TU_HIDING) / sizeof(C_TU_HIDING[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* neovim declares every global as `EXTERN win_T *curwin INIT( = NULL);`. */
+#define C_TU_GLOBALS_HEADER                                                                     \
+    "#ifndef GLOBALS_H\n"                                                                       \
+    "#define GLOBALS_H\n"                                                                       \
+    "typedef struct window_S win_T;\n"                                                          \
+    "struct window_S {\n"                                                                       \
+    "  int w_cursor;\n"                                                                         \
+    "};\n"                                                                                      \
+    "EXTERN win_T *curwin INIT( = NULL);\n"                                                     \
+    "EXTERN int Rows INIT( = 0);\n"                                                             \
+    "#endif\n"
+#define C_TU_GLOBALS_USE                                                                        \
+    "#include \"globals.h\"\n"                                                                  \
+    "int read_rows(void) { return Rows; }\n"                                                    \
+    "void set_cursor(int v) { curwin->w_cursor = v; }\n"                                        \
+    "int shadowed(int Rows) { return Rows; }\n"                                                 \
+    "int same(int a, int b) { return (a == b); }\n"
+static const RQ_Source C_TU_GLOBALS[] = {{.path = "globals.h", .text = C_TU_GLOBALS_HEADER},
+                                         {.path = "use_globals.c", .text = C_TU_GLOBALS_USE}};
+
+TEST(resolver_c_initializer_macro_declares_the_global) {
+    const char *use = C_TU_GLOBALS_USE;
+    const RQ_Expected expected[] = {
+        {.case_id = "global-with-initializer-macro",
+         .site = C_TU_WORD("use_globals.c", use, "use_globals.read_rows", "return Rows", "Rows"),
+         .relation = "USAGE",
+         .target = {.file = "globals.h",
+                    .suffix = "globals.Rows",
+                    .label = "Variable",
+                    .declaration_line = 8,
+                    .declaration_text = "EXTERN int Rows INIT( = 0);"}},
+        {.case_id = "pointer-global-with-initializer-macro",
+         .site = C_TU_WORD("use_globals.c", use, "use_globals.set_cursor", "curwin->", "curwin"),
+         .relation = "USAGE",
+         .target = {.file = "globals.h",
+                    .suffix = "globals.curwin",
+                    .label = "Variable",
+                    .declaration_line = 7,
+                    .declaration_text = "EXTERN win_T *curwin INIT( = NULL);"}},
+        {.case_id = "member-through-the-global",
+         .site = C_TU_WORD("use_globals.c", use, "use_globals.set_cursor", "curwin->w_cursor",
+                           "w_cursor"),
+         .relation = "WRITES",
+         .target = {.file = "globals.h",
+                    .suffix = "globals.window_S.w_cursor",
+                    .label = "Field",
+                    .declaration_line = 5,
+                    .declaration_text = "  int w_cursor;"}},
+    };
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "parameter-hides-the-global",
+         .site = C_TU_WORD("use_globals.c", use, "use_globals.shadowed", "return Rows", "Rows"),
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    const CTUCase fixture = {.suite = "c-tu-globals",
+                             .sources = C_TU_GLOBALS,
+                             .source_count = sizeof(C_TU_GLOBALS) / sizeof(C_TU_GLOBALS[0]),
+                             .expected = expected,
+                             .expected_count = sizeof(expected) / sizeof(expected[0]),
+                             .forbidden = forbidden,
+                             .forbidden_count = sizeof(forbidden) / sizeof(forbidden[0])};
+    for (int driver = 0; driver < 2; driver++)
+        ASSERT(c_tu_run(&fixture, driver));
+    PASS();
+}
+
+/* A file's proofs all pass through one copy on their way to the graph. A cap there cost a
+ * large file its last rows, so the call that matters here is the last one in the file. */
+TEST(resolver_c_large_file_keeps_its_last_call) {
+    enum { CALLS = 30000 };
+    const char *head = "int helper(int x) { return x; }\n"
+                       "int last_helper(int x) { return x; }\n"
+                       "int many(void) {\n"
+                       "  int n = 0;\n";
+    const char *line = "  n += helper(0);\n";
+    const char *tail = "  return n;\n"
+                       "}\n"
+                       "int last_one(void) { return last_helper(1); }\n";
+    size_t size = strlen(head) + (size_t)CALLS * strlen(line) + strlen(tail) + 1;
+    char *text = malloc(size);
+    ASSERT(text != NULL);
+    char *at = text + sprintf(text, "%s", head);
+    for (int i = 0; i < CALLS; i++)
+        at += sprintf(at, "%s", line);
+    sprintf(at, "%s", tail);
+    const RQ_Source sources[] = {{.path = "big.c", .text = text}};
+    const RQ_Expected expected[] = {
+        {.case_id = "last-call-of-a-large-file",
+         .site = {.file = "big.c", .caller = "big.last_one", .needle = "last_helper(1)"},
+         .relation = "CALLS",
+         .target = {.file = "big.c",
+                    .suffix = "big.last_helper",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "int last_helper(int x) { return x; }"}},
+    };
+    const CTUCase fixture = {.suite = "c-tu-large",
+                             .sources = sources,
+                             .source_count = 1,
+                             .expected = expected,
+                             .expected_count = 1};
+    bool ok = true;
+    for (int driver = 0; driver < 2; driver++)
+        ok = c_tu_run(&fixture, driver) && ok;
+    free(text);
+    ASSERT(ok);
+    PASS();
+}
+
 SUITE(resolver_c) {
+    RUN_TEST(resolver_c_large_file_keeps_its_last_call);
+    RUN_TEST(resolver_c_initializer_macro_declares_the_global);
+    RUN_TEST(resolver_cpp_class_names_hide_the_enclosing_scope);
     RUN_TEST(resolver_cpp_reference_prototypes_and_scoped_members);
     RUN_TEST(resolver_c_attribute_macros_do_not_hide_declarations);
     RUN_TEST(resolver_c_known_gaps_stay_honest);
