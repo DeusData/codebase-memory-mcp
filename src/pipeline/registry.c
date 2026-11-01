@@ -1973,13 +1973,67 @@ static const char *same_module_candidate(const cbm_registry_t *r, const char *mo
     return NULL;
 }
 
+static bool is_self_receiver(const char *prefix) {
+    if (!prefix || !prefix[0]) {
+        return true;
+    }
+    static const char *const self_receivers[] = {"self",  "this", "cls", "@self", "$this",
+                                                 "$self", "Me",   "me",  "Self",  NULL};
+    for (int i = 0; self_receivers[i]; i++) {
+        if (strcmp(prefix, self_receivers[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_same_module_receiver(const char *prefix, const char *module_qn) {
+    if (is_self_receiver(prefix)) {
+        return true;
+    }
+    if (!module_qn || !module_qn[0]) {
+        return false;
+    }
+    char norm_prefix[CBM_SZ_256];
+    size_t plen = strlen(prefix);
+    if (plen >= sizeof(norm_prefix)) {
+        plen = sizeof(norm_prefix) - 1;
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < plen && j + 1 < sizeof(norm_prefix); i++) {
+        if (prefix[i] == ':' && i + 1 < plen && prefix[i + 1] == ':') {
+            norm_prefix[j++] = '.';
+            i++;
+        } else {
+            norm_prefix[j++] = prefix[i];
+        }
+    }
+    norm_prefix[j] = '\0';
+
+    if (strcmp(norm_prefix, module_qn) == 0) {
+        return true;
+    }
+    size_t nlen = strlen(norm_prefix);
+    size_t mlen = strlen(module_qn);
+    if (mlen > nlen && module_qn[mlen - nlen - 1] == '.' &&
+        strcmp(module_qn + (mlen - nlen), norm_prefix) == 0) {
+        return true;
+    }
+    return false;
+}
+
 /* Strategy 2: Same-module match. Scoring elsewhere retains the raw file QN. */
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
-                                            const char *suffix, const char *module_qn,
-                                            size_t scope_len) {
+                                            const char *prefix, const char *suffix,
+                                            const char *module_qn, size_t scope_len,
+                                            CBMLanguage lang) {
     const char *stored_key = same_module_candidate(r, module_qn, scope_len, callee_name);
-    if (!stored_key && suffix && suffix[0])
-        stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
+    if (!stored_key && suffix && suffix[0]) {
+        if (lang == CBM_LANG_GO || is_same_module_receiver(prefix, module_qn) ||
+            strchr(suffix, '.') != NULL || strstr(suffix, "::") != NULL) {
+            stored_key = same_module_candidate(r, module_qn, scope_len, suffix);
+        }
+    }
     if (stored_key)
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     return empty_result();
@@ -2208,10 +2262,143 @@ static void candidates_without_members(const cbm_registry_t *r, const qn_array_t
                          .lang = side ? lang : NULL};
 }
 
+static bool qn_ends_with_qualified(const char *candidate_qn, const char *callee_name) {
+    if (!candidate_qn || !callee_name) {
+        return false;
+    }
+    char norm_callee[CBM_SZ_256];
+    size_t clen = strlen(callee_name);
+    if (clen >= sizeof(norm_callee)) {
+        clen = sizeof(norm_callee) - 1;
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < clen && j + 1 < sizeof(norm_callee); i++) {
+        if (callee_name[i] == ':' && i + 1 < clen && callee_name[i + 1] == ':') {
+            norm_callee[j++] = '.';
+            i++;
+        } else {
+            norm_callee[j++] = callee_name[i];
+        }
+    }
+    norm_callee[j] = '\0';
+
+    size_t nlen = strlen(norm_callee);
+    size_t qlen = strlen(candidate_qn);
+    if (qlen < nlen) {
+        return false;
+    }
+    if (strcmp(candidate_qn, norm_callee) == 0) {
+        return true;
+    }
+    if (qlen > nlen && candidate_qn[qlen - nlen - 1] == '.' &&
+        strcmp(candidate_qn + (qlen - nlen), norm_callee) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool is_builtin_candidate(const char *qn) {
+    if (!qn) {
+        return false;
+    }
+    return strncmp(qn, "builtins.", 9) == 0 || strncmp(qn, "<python-builtins>.", 18) == 0 ||
+           strncmp(qn, "<kotlin-builtins>.", 18) == 0;
+}
+
+static bool is_candidate_method(const cbm_registry_t *r, const char *qn) {
+    const char *label = cbm_registry_label_of(r, qn);
+    return label && strcmp(label, "Method") == 0;
+}
+
+static bool is_imported_receiver(const char *prefix, const char **import_keys, int import_count) {
+    if (!prefix || !import_keys || import_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < import_count; i++) {
+        if (import_keys[i] && strcmp(import_keys[i], prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_known_type_or_namespace(const cbm_registry_t *r, const char *name) {
+    if (!r || !name || !name[0]) {
+        return false;
+    }
+    const char *exact_label = cbm_registry_label_of(r, name);
+    if (exact_label &&
+        (strcmp(exact_label, "Class") == 0 || strcmp(exact_label, "Module") == 0 ||
+         strcmp(exact_label, "Namespace") == 0 || strcmp(exact_label, "Struct") == 0 ||
+         strcmp(exact_label, "Interface") == 0 || strcmp(exact_label, "Enum") == 0 ||
+         strcmp(exact_label, "Package") == 0)) {
+        return true;
+    }
+    const qn_array_t *arr = cbm_ht_get(r->by_name, name);
+    if (!arr) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        const char *label = cbm_registry_label_of(r, arr->items[i]);
+        if (label && (strcmp(label, "Class") == 0 || strcmp(label, "Module") == 0 ||
+                      strcmp(label, "Namespace") == 0 || strcmp(label, "Struct") == 0 ||
+                      strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
+                      strcmp(label, "Package") == 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool should_reject_receiver(const cbm_registry_t *r, const char *callee_name,
+                                   const char *candidate_qn, const char **import_keys,
+                                   int import_count) {
+    if (!callee_name || !candidate_qn) {
+        return false;
+    }
+    const char *dot = strchr(callee_name, '.');
+    const char *colons = strstr(callee_name, "::");
+    const char *sep = dot;
+    if (colons && (!sep || colons < sep)) {
+        sep = colons;
+    }
+    if (!sep) {
+        return false;
+    }
+    char prefix[CBM_SZ_256];
+    size_t plen = (size_t)(sep - callee_name);
+    if (plen >= sizeof(prefix)) {
+        plen = sizeof(prefix) - 1;
+    }
+    memcpy(prefix, callee_name, plen);
+    prefix[plen] = '\0';
+
+    if (is_self_receiver(prefix)) {
+        return false;
+    }
+    if (is_builtin_candidate(candidate_qn)) {
+        return false;
+    }
+    if (qn_ends_with_qualified(candidate_qn, callee_name)) {
+        return false;
+    }
+    if (!is_candidate_method(r, candidate_qn)) {
+        return true;
+    }
+    if (is_imported_receiver(prefix, import_keys, import_count)) {
+        return true;
+    }
+    if (is_known_type_or_namespace(r, prefix)) {
+        return true;
+    }
+    return false;
+}
+
 /* Strategies 3.5, 3 and 4 over one same-name candidate set. */
 static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const qn_array_t *arr,
                                                 const char *callee_name, const char *module_qn,
-                                                const char **import_vals, int import_count) {
+                                                const char **import_keys, const char **import_vals,
+                                                int import_count) {
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
@@ -2227,6 +2414,9 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
         if (!receiver_chain_admits(callee_name, arr->items[0])) {
             return empty_result();
         }
+        if (should_reject_receiver(r, callee_name, arr->items[0], import_keys, import_count)) {
+            return empty_result();
+        }
         double conf = CONF_UNIQUE_NAME;
         if (import_vals && import_count > 0 &&
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
@@ -2236,19 +2426,27 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
     }
 
     /* Strategy 4: multiple candidates */
+    cbm_resolution_t res;
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
-    }
-    const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
-                                               qn_lang_flags(arr), arr->count, module_qn);
-    if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
-            return empty_result();
+        res = resolve_multi_with_imports(r, arr, module_qn, import_vals, import_count);
+    } else {
+        const char *best = best_by_import_distance(r, (const char **)arr->items, qn_test_flags(arr),
+                                                   qn_lang_flags(arr), arr->count, module_qn);
+        if (best) {
+            if (!receiver_chain_admits(callee_name, best)) {
+                return empty_result();
+            }
+            double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
+            res = (cbm_resolution_t){best, "suffix_match", conf, arr->count};
+        } else {
+            res = empty_result();
         }
-        double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }
-    return empty_result();
+    if (res.qualified_name &&
+        should_reject_receiver(r, callee_name, res.qualified_name, import_keys, import_count)) {
+        return empty_result();
+    }
+    return res;
 }
 
 /* Strategy 3+4: Name lookup + suffix match. skip_members: the callee cannot
@@ -2259,8 +2457,9 @@ static cbm_resolution_t resolve_name_candidates(const cbm_registry_t *r, const q
  * 345 -> 9 callers (2026-10-13 graph audit). Dropping only the Fields made
  * libc `read()` the unique name of a C++ adapter's Method instead. */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
-                                            const char *module_qn, const char **import_vals,
-                                            int import_count, bool skip_members) {
+                                            const char *module_qn, const char **import_keys,
+                                            const char **import_vals, int import_count,
+                                            bool skip_members) {
     const char *lookup = simple_name(callee_name);
     const qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -2278,9 +2477,11 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         if (view.count == 0) {
             return empty_result();
         }
-        return resolve_name_candidates(r, &view, callee_name, module_qn, import_vals, import_count);
+        return resolve_name_candidates(r, &view, callee_name, module_qn, import_keys, import_vals,
+                                       import_count);
     }
-    return resolve_name_candidates(r, arr, callee_name, module_qn, import_vals, import_count);
+    return resolve_name_candidates(r, arr, callee_name, module_qn, import_keys, import_vals,
+                                   import_count);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —
@@ -2288,7 +2489,8 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
                                                const char **import_map_vals, int import_map_count,
-                                               size_t scope_len, bool skip_members) {
+                                               size_t scope_len, bool skip_members,
+                                               CBMLanguage lang) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -2321,12 +2523,12 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
         resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
-        res = resolve_same_module(r, callee_name, suffix, module_qn, scope_len);
+        res = resolve_same_module(r, callee_name, prefix, suffix, module_qn, scope_len, lang);
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
-                                  skip_members);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                  import_map_count, skip_members);
     }
     return res;
 }
@@ -2377,7 +2579,8 @@ bool cbm_registry_name_guess_vetoed(const cbm_registry_t *r, CBMLanguage caller_
 static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const char *callee_name,
                                                 const char *module_qn, const char **import_map_keys,
                                                 const char **import_map_vals, int import_map_count,
-                                                size_t scope_len, bool skip_members) {
+                                                size_t scope_len, bool skip_members,
+                                                CBMLanguage lang) {
     if (!r || !callee_name) {
         return empty_result();
     }
@@ -2392,7 +2595,7 @@ static cbm_resolution_t registry_resolve_scoped(const cbm_registry_t *r, const c
 
     cbm_resolution_t res =
         registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                               import_map_count, scope_len, skip_members);
+                               import_map_count, scope_len, skip_members, lang);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -2434,7 +2637,8 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, module_qn ? strlen(module_qn) : 0, false);
+                                   import_map_count, module_qn ? strlen(module_qn) : 0, false,
+                                   CBM_LANG_COUNT);
 }
 
 static size_t lang_scope_len(const char *module_qn, CBMLanguage lang) {
@@ -2447,7 +2651,7 @@ cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *
                                            const char **import_map_vals, int import_map_count,
                                            CBMLanguage lang) {
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), false);
+                                   import_map_count, lang_scope_len(module_qn, lang), false, lang);
 }
 
 cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const char *callee_name,
@@ -2461,7 +2665,8 @@ cbm_resolution_t cbm_registry_resolve_call_lang(const cbm_registry_t *r, const c
     bool skip_members = lang == CBM_LANG_C && callee_name && !strchr(callee_name, '.') &&
                         !strstr(callee_name, "->");
     return registry_resolve_scoped(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                   import_map_count, lang_scope_len(module_qn, lang), skip_members);
+                                   import_map_count, lang_scope_len(module_qn, lang), skip_members,
+                                   lang);
 }
 
 /* ── Class-qualified route handlers (PHP, #1146) ─────────────────── */
@@ -2629,7 +2834,8 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count, module_qn ? strlen(module_qn) : 0, false);
+                                  import_map_count, module_qn ? strlen(module_qn) : 0, false,
+                                  CBM_LANG_COUNT);
 }
 
 /* Python looks a bare name up in the calling def's own scope, then in each
