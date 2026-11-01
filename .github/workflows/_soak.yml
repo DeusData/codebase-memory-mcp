@@ -73,7 +73,7 @@ jobs:
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
       - name: Download selected release container
         if: ${{ inputs.use_release_artifacts }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ${{ runner.temp }}/cbm-selected-container
@@ -147,7 +147,7 @@ jobs:
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
       - name: Download selected release container
         if: ${{ inputs.use_release_artifacts }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-windows-amd64
           path: ${{ runner.temp }}/cbm-selected-container
@@ -225,7 +225,7 @@ jobs:
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
       - name: Download selected release container
         if: ${{ inputs.use_release_artifacts }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-windows-arm64
           path: ${{ runner.temp }}/cbm-selected-container
@@ -287,7 +287,7 @@ jobs:
         timeout-minutes: 10
         run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y python3 git
       - name: Download selected portable release container
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-linux-${{ matrix.arch }}-portable
           path: ${{ runner.temp }}/cbm-selected-container

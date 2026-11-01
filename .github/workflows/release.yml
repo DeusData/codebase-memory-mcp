@@ -185,7 +185,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download only selected release containers
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: binaries-*
           merge-multiple: true
@@ -194,7 +194,7 @@ jobs:
       # download above. Preserve only the three reviewable manifests that bind
       # candidate bytes, VT results, and the tuple-local decision.
       - name: Download candidate selection evidence separately
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-selection-evidence
           path: selection-evidence
@@ -617,7 +617,7 @@ jobs:
       # the release-draft job as a same-run artifact (not a draft-release
       # download — that would need contents beyond read plus gh).
       - name: Fetch release checksums
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-checksums
 
