@@ -2510,9 +2510,12 @@ TEST(tslsp_param_property_this_dispatch_issue514) {
         const CBMCall *call =
             ts514_call_site(r, source, sites[i].expression, sites[i].caller, sites[i].callee);
         extracted[i] = call != NULL;
-        resolved[i] = ts514_resolved_count(&r->resolved_calls, call,
-                                           i == 8 ? NULL : "test.main.CatService.findAll",
-                                           i == 8 ? NULL : "lsp_ts_method");
+        /* Constructor parameter properties now have a declared-field proof, so the
+         * receiver must be proved to the exact target; the strategy label is not the
+         * contract (see ts514_proved_count). The plain parameter stays unresolved. */
+        resolved[i] = i == 8 ? ts514_resolved_count(&r->resolved_calls, call, NULL, NULL)
+                             : ts514_proved_count(&r->resolved_calls, call,
+                                                  "test.main.CatService.findAll");
         if (i == 6)
             wrong_override = ts514_resolved_count(&r->resolved_calls, call,
                                                   "test.main.ServiceBase.findAll", NULL);
@@ -2569,10 +2572,10 @@ TEST(tslsp_field_new_initializer_issue514) {
     int base = ts514_definition_count(r, "test.main.Base.run");
     int derived = ts514_definition_count(r, "test.main.Derived.run");
     int control = ts514_proved_count(&r->resolved_calls, direct, "test.main.Tool.fire");
-    int inferred =
-        ts514_resolved_count(&r->resolved_calls, fresh, "test.main.Tool.fire", "lsp_ts_method");
-    int declared =
-        ts514_resolved_count(&r->resolved_calls, annotated, "test.main.Base.run", "lsp_ts_method");
+    /* A field initialized by `new` and an annotated field are proved receivers now,
+     * which is stricter than the inference label these two used to pin. */
+    int inferred = ts514_proved_count(&r->resolved_calls, fresh, "test.main.Tool.fire");
+    int declared = ts514_proved_count(&r->resolved_calls, annotated, "test.main.Base.run");
     int wrong = ts514_resolved_count(&r->resolved_calls, annotated, "test.main.Derived.run", NULL);
     int unknown = ts514_resolved_count(&r->resolved_calls, opaque, NULL, NULL);
     int arbitrary = ts514_resolved_count(&r->resolved_calls, factory, NULL, NULL);
