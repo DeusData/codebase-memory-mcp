@@ -2368,20 +2368,20 @@ TEST(resolver_cpp_class_names_hide_the_enclosing_scope) {
 
 /* neovim declares every global as `EXTERN win_T *curwin INIT( = NULL);`. */
 #define C_TU_GLOBALS_HEADER                                                                     \
-    "#ifndef GLOBALS_H\n"                                                                       \
-    "#define GLOBALS_H\n"                                                                       \
+    "#pragma once\n"                                                                            \
+    "// The way neovim's globals.h is written.\n"                                               \
     "typedef struct window_S win_T;\n"                                                          \
     "struct window_S {\n"                                                                       \
     "  int w_cursor;\n"                                                                         \
     "};\n"                                                                                      \
     "EXTERN win_T *curwin INIT( = NULL);\n"                                                     \
     "EXTERN int Rows INIT( = 0);\n"                                                             \
-    "LUA_API int (lua_gettop) (int *L);\n"                                                      \
-    "#endif\n"
+    "LUA_API int (lua_gettop) (int *L);\n"
 #define C_TU_GLOBALS_USE                                                                        \
     "#include \"globals.h\"\n"                                                                  \
     "int read_rows(void) { return Rows; }\n"                                                    \
     "void set_cursor(int v) { curwin->w_cursor = v; }\n"                                        \
+    "int read_cursor(void) { return curwin->w_cursor; }\n"                                      \
     "int shadowed(int Rows) { return Rows; }\n"                                                 \
     "int same(int a, int b) { return (a == b); }\n"                                             \
     "int top(int *L) { return lua_gettop(L); }\n"
@@ -2410,13 +2410,22 @@ TEST(resolver_c_initializer_macro_declares_the_global) {
                     .declaration_line = 8,
                     .declaration_text = "EXTERN int Rows INIT( = 0);"}},
         {.case_id = "pointer-global-with-initializer-macro",
-         .site = C_TU_WORD("use_globals.c", use, "use_globals.set_cursor", "curwin->", "curwin"),
+         .site = C_TU_WORD("use_globals.c", use, "use_globals.read_cursor", "return curwin", "curwin"),
          .relation = "USAGE",
          .target = {.file = "globals.h",
                     .suffix = "globals.curwin",
                     .label = "Variable",
                     .declaration_line = 7,
                     .declaration_text = "EXTERN win_T *curwin INIT( = NULL);"}},
+        {.case_id = "member-read-through-the-global",
+         .site = C_TU_WORD("use_globals.c", use, "use_globals.read_cursor", "return curwin->w_cursor",
+                           "w_cursor"),
+         .relation = "USAGE",
+         .target = {.file = "globals.h",
+                    .suffix = "globals.window_S.w_cursor",
+                    .label = "Field",
+                    .declaration_line = 5,
+                    .declaration_text = "  int w_cursor;"}},
         {.case_id = "member-through-the-global",
          .site = C_TU_WORD("use_globals.c", use, "use_globals.set_cursor", "curwin->w_cursor",
                            "w_cursor"),
