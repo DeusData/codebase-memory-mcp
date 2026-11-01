@@ -2804,8 +2804,13 @@ static const rs_type_t *rs_walk_method_call(rs_walk_t *w, TSNode call, TSNode ca
         sel = blocked;
     }
     rs_emit(w, CBM_RUST_SITE_CALL, ts_node_start_byte(call), ts_node_end_byte(call), &sel);
-    if (!ts_node_is_null(member))
-        rs_emit(w, CBM_RUST_SITE_REF, ts_node_start_byte(member), ts_node_end_byte(member), &sel);
+    /* The call is the use of this method. Inside a macro the extractor also records its
+     * name as a plain token; that token is not a second use. */
+    if (!ts_node_is_null(member)) {
+        rs_sel_t name_token = rs_sel_settled("rust_call_member_name", CBM_RESOLVE_DOMAIN_UNKNOWN);
+        rs_emit(w, CBM_RUST_SITE_REF, ts_node_start_byte(member), ts_node_end_byte(member),
+                &name_token);
+    }
     if (pick.fn)
         return rs_fn_return_for(w, pick.fn, pick.self_ty, types, args.count, 0);
     /* `.collect::<Vec<_>>()` and `.parse::<T>()` spell their result. */

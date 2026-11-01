@@ -2744,9 +2744,7 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     if (target && (strcmp(relation, "CALL_REFERENCE") == 0 || strcmp(relation, "CALLS") == 0) &&
         !callable_node(target) &&
         !(resolver->file->language == CBM_LANG_PYTHON && target->label &&
-          !strcmp(target->label, "Class") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE)) &&
-        !(resolver->file->language == CBM_LANG_RUST && target->label &&
-          !strcmp(target->label, "Struct") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
+          !strcmp(target->label, "Class") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
     }
