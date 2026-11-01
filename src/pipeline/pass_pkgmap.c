@@ -745,6 +745,12 @@ static void parse_pubspec_yaml(const char *source, int source_len, const char *r
         snprintf(entry, sizeof(entry), "%s%slib", dir[0] ? dir : "", dir[0] ? "/" : "");
         pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, name),
                          cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
+        /* A package: URI names a file under lib, which a dotted QN cannot express. */
+        char key[PKGMAP_PATH_BUF];
+        int written = snprintf(key, sizeof(key), "%s%s", CBM_PKGMAP_DART_ROOT_PREFIX, name);
+        if (written > 0 && (size_t)written < sizeof(key))
+            pkg_entries_push(entries, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, key),
+                             cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, entry));
         cbm_free(CBM_MEM_CLASS_SEMANTIC, dir);
     }
     cbm_yaml_free(root);
@@ -1438,7 +1444,9 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                 return NULL;
             }
             char *qn = we->items[i].node_fact || !strcmp(entry_rel, ambiguous_pkgmap_value) ||
-                               pkgmap_is_psr4_prefix(we->items[i].pkg_name)
+                               pkgmap_is_psr4_prefix(we->items[i].pkg_name) ||
+                               !strncmp(we->items[i].pkg_name, CBM_PKGMAP_DART_ROOT_PREFIX,
+                                        strlen(CBM_PKGMAP_DART_ROOT_PREFIX))
                            ? pkgmap_strndup(entry_rel, strlen(entry_rel))
                            : pkgmap_take_raw(cbm_pipeline_fqn_module(project_name, entry_rel));
             if (!qn) {
@@ -4472,6 +4480,25 @@ static const cbm_gbuf_node_t *resolve_import_target(const cbm_pipeline_ctx_t *ct
     }
     if (lang == CBM_LANG_DART) {
         *reason = "dart_import_uri_unproven";
+        if (imp->kind == CBM_IMPORT_KIND_DART_PACKAGE_URI) {
+            /* A pubspec's name maps package:name/x.dart to its lib/x.dart. */
+            const char *rest = imp->module_path + strlen("package:");
+            const char *slash = strchr(rest, '/');
+            CBMHashTable *packages = cbm_pipeline_get_pkgmap();
+            char name[PKGMAP_PATH_BUF], path[PKGMAP_PATH_BUF];
+            int length = slash ? snprintf(name, sizeof(name), "%s%.*s", CBM_PKGMAP_DART_ROOT_PREFIX,
+                                          (int)(slash - rest), rest)
+                               : 0;
+            if (!packages || length <= 0 || (size_t)length >= sizeof(name))
+                return NULL;
+            const char *lib = cbm_ht_get(packages, name);
+            *reason = "dart_package_not_in_project";
+            if (!lib || !cbm_repo_rel_join(lib, slash + 1, path, sizeof(path)))
+                return NULL;
+            *reason = "dart_package_uri_through_pubspec";
+            const cbm_gbuf_node_t *target = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path);
+            return target && import_language_matches(CBM_LANG_DART, target) ? target : NULL;
+        }
         if (imp->kind != CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH)
             return NULL;
         char *directory = path_dirname(source_rel);

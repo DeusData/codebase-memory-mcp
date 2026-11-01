@@ -82,6 +82,7 @@ typedef struct {
     cbm_source_pass_fn resolve;
     bool decides_references;
     bool one_name_one_node;
+    bool before_binding_rules;
 } cbm_source_adapter_t;
 
 /* Per-language rule tables. A row here is what makes a language supported. */
@@ -93,6 +94,7 @@ extern const cbm_source_adapter_t cbm_source_adapter_perl;
 extern const cbm_source_adapter_t cbm_source_adapter_ruby;
 extern const cbm_source_adapter_t cbm_source_adapter_haskell;
 extern const cbm_source_adapter_t cbm_source_adapter_ocaml;
+extern const cbm_source_adapter_t cbm_source_adapter_dart;
 
 /* One walk of a class chain. A class appears once on a linearized chain, so a
  * revisit adds nothing: a cycle or a diamond cannot make the walk exponential. */
@@ -149,11 +151,15 @@ void *cbm_source_table_alloc(cbm_source_walk_t *walk, size_t size);
  * the whole project, for this language. */
 const cbm_source_decl_t *cbm_source_lookup(const cbm_source_walk_t *walk, const char *owner,
                                            const char *name);
+const char *cbm_source_table_package(const cbm_source_table_t *table, const char *name);
 
 /* Phase two. Later rows for the same exact site replace earlier ones. */
 void cbm_source_emit(cbm_source_walk_t *walk, uint32_t start, uint32_t end,
                      cbm_source_site_kind_t kind, const char *target, cbm_resolve_rule_t rule,
                      const char *domain, const char *reason);
+void cbm_source_emit_facts(cbm_source_walk_t *walk, uint32_t start, uint32_t end,
+                           cbm_source_site_kind_t kind, const char *target, cbm_resolve_rule_t rule,
+                           const char *domain, const char *reason, uint32_t facts);
 static inline void cbm_source_emit_node(cbm_source_walk_t *walk, TSNode node,
                                         cbm_source_site_kind_t kind, const char *target,
                                         cbm_resolve_rule_t rule, const char *domain,

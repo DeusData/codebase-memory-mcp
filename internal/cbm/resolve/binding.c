@@ -2337,9 +2337,9 @@ static const char *javascript_symbol_scope(cbm_resolve_binding_index_t *index) {
 static void audit_http_default(cbm_resolve_binding_index_t *index, TSNode root);
 static void audit_http_escapes(cbm_resolve_binding_index_t *index);
 
-cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
-                                                       CBMLanguage language, const char *source,
-                                                       size_t source_len) {
+static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFileResult *result,
+                                                  CBMLanguage language, const char *source,
+                                                  size_t source_len, bool adapter_sites_only) {
     cbm_resolve_binding_index_t *index = arena ? cbm_arena_calloc(arena, sizeof(*index)) : NULL;
     if (!index) {
         return NULL;
@@ -2376,7 +2376,8 @@ cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CB
     }
     /* These languages state their rules per occurrence in adapter_<lang>.c.
      * This index only attests the exact site through cbm_resolve_binding_source_site. */
-    if (cbm_source_adapter_supported(language)) {
+    if (adapter_sites_only ||
+        (cbm_source_adapter_supported(language) && !cbm_source_adapter_has_binding_rules(language))) {
         index->analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
         index->reason = "source_adapter_binding";
         return index;
@@ -2878,6 +2879,20 @@ cbm_resolve_result_t cbm_resolve_binding_local(const cbm_resolve_binding_index_t
     return cbm_resolve_binding_validate(index, name, start, end, origin, result);
 }
 
+cbm_resolve_binding_index_t *cbm_resolve_binding_build(CBMArena *arena, const CBMFileResult *result,
+                                                       CBMLanguage language, const char *source,
+                                                       size_t source_len) {
+    return binding_build(arena, result, language, source, source_len, false);
+}
+
+cbm_resolve_binding_index_t *cbm_resolve_binding_source_index(CBMArena *arena,
+                                                              const CBMFileResult *result,
+                                                              CBMLanguage language,
+                                                              const char *source,
+                                                              size_t source_len) {
+    return binding_build(arena, result, language, source, source_len, true);
+}
+
 static uint32_t source_rule_fact(cbm_resolve_rule_t rule) {
     switch (rule) {
     case CBM_RESOLVE_RULE_SCOPE_BINDING:
@@ -2897,7 +2912,7 @@ cbm_resolve_result_t cbm_resolve_binding_source_site(const cbm_resolve_binding_i
                                                      const char *name, uint32_t start, uint32_t end,
                                                      CBMSourceOrigin origin, const char *domain,
                                                      const char *target, cbm_resolve_rule_t rule,
-                                                     const char *decision) {
+                                                     uint32_t facts, const char *decision) {
     cbm_resolve_lookup_t query;
     binding_query_begin(index, &query, name, start, end, origin);
     uint32_t fact = source_rule_fact(rule);
@@ -2916,7 +2931,7 @@ cbm_resolve_result_t cbm_resolve_binding_source_site(const cbm_resolve_binding_i
     result.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE;
     result.rule = rule;
     result.facts = CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
-                   CBM_RESOLVE_FACT_OCCURRENCE_EXACT | fact;
+                   CBM_RESOLVE_FACT_OCCURRENCE_EXACT | fact | facts;
     result.target = target;
     result.candidate_count = 1;
     return binding_query_finish(index, &query, result);

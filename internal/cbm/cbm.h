@@ -414,6 +414,7 @@ typedef enum {
     CBM_IMPORT_KIND_PYTHON_FROM,           // `from a import b`: binds member/submodule b
     CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH, // audited complete literal, relative to source file
     CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN,  // runtime include lookup has no captured path authority
+    CBM_IMPORT_KIND_DART_PACKAGE_URI,      // audited complete Dart `package:` literal
 } CBMImportKind;
 
 typedef struct {

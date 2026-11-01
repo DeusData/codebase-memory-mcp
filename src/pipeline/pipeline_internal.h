@@ -733,6 +733,8 @@ void cbm_pipeline_diagram_parent_edge(cbm_pipeline_ctx_t *ctx, const CBMDefiniti
 void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result);
 
 /* Get the current pipeline's package map (NULL if none). */
+/* Key prefix of a Dart package's repo-relative lib directory in the package map. */
+#define CBM_PKGMAP_DART_ROOT_PREFIX "@cbm:dart:"
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 

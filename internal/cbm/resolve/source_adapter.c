@@ -12,6 +12,7 @@ struct cbm_source_table {
     CBMArena arena;
     CBMHashTable *decls;
     CBMHashTable *qn_owners;
+    const CBMHashTable *packages;
     bool incomplete[CBM_LANG_COUNT];
     bool failed;
 };
@@ -26,7 +27,7 @@ static const cbm_source_adapter_t *adapter_for(CBMLanguage language) {
     static const cbm_source_adapter_t *const adapters[] = {
         &cbm_source_adapter_php,     &cbm_source_adapter_elixir, &cbm_source_adapter_erlang,
         &cbm_source_adapter_perl,    &cbm_source_adapter_ruby,   &cbm_source_adapter_zig,
-        &cbm_source_adapter_haskell, &cbm_source_adapter_ocaml,
+        &cbm_source_adapter_haskell, &cbm_source_adapter_ocaml,  &cbm_source_adapter_dart,
     };
     for (size_t i = 0; i < sizeof(adapters) / sizeof(adapters[0]); i++)
         if (adapters[i]->language == language)
@@ -46,6 +47,20 @@ bool cbm_source_adapter_one_name_one_node(CBMLanguage language) {
 bool cbm_source_adapter_decides_references(CBMLanguage language) {
     const cbm_source_adapter_t *adapter = adapter_for(language);
     return adapter && adapter->decides_references;
+}
+
+bool cbm_source_adapter_has_binding_rules(CBMLanguage language) {
+    const cbm_source_adapter_t *adapter = adapter_for(language);
+    return adapter && adapter->before_binding_rules;
+}
+
+void cbm_source_table_set_packages(cbm_source_table_t *table, const CBMHashTable *packages) {
+    if (table)
+        table->packages = packages;
+}
+
+const char *cbm_source_table_package(const cbm_source_table_t *table, const char *name) {
+    return table && table->packages && name ? cbm_ht_get(table->packages, name) : NULL;
 }
 
 cbm_source_table_t *cbm_source_table_new(void) {
@@ -303,6 +318,12 @@ const char *cbm_source_unique_qn(const cbm_source_decl_t *first, const char **re
 void cbm_source_emit(cbm_source_walk_t *walk, uint32_t start, uint32_t end,
                      cbm_source_site_kind_t kind, const char *target, cbm_resolve_rule_t rule,
                      const char *domain, const char *reason) {
+    cbm_source_emit_facts(walk, start, end, kind, target, rule, domain, reason, 0);
+}
+
+void cbm_source_emit_facts(cbm_source_walk_t *walk, uint32_t start, uint32_t end,
+                           cbm_source_site_kind_t kind, const char *target, cbm_resolve_rule_t rule,
+                           const char *domain, const char *reason, uint32_t facts) {
     cbm_source_unit_t *unit = walk->unit;
     if (!unit || end <= start)
         return;
@@ -325,7 +346,8 @@ void cbm_source_emit(cbm_source_walk_t *walk, uint32_t start, uint32_t end,
                             .outcome = {.target = target,
                                         .rule = target ? rule : CBM_RESOLVE_RULE_NONE,
                                         .domain = domain,
-                                        .reason = reason}};
+                                        .reason = reason,
+                                        .facts = target ? facts : 0}};
 }
 
 static TSTree *parse_source(const CBMFileResult *result, CBMLanguage language, const char *source,

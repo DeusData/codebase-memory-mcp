@@ -75,7 +75,9 @@ static const edge_row_t edge_rows[] = {
     {CBM_LANG_RUST, TYPED_EDGES,
      "Explicit crate/module trees and use paths; macros, attributes and unknown roots abstain."},
     {CBM_LANG_DART, EDGE(IMPORTS) | EDGE(CALLS),
-     "Direct URI imports with prefix and show/hide bindings; parts and reexports are unsupported."},
+     "Lexical scope, parts, exports, show/hide and prefixes; package: URIs through the pubspec "
+     "name; declared and constructed receiver types along class, mixin and superclass chains. "
+     "Collection element types, conditional imports and part-of by library name abstain."},
     {CBM_LANG_LUA, EDGE(CALLS), NULL},
     {CBM_LANG_CSS, EDGE(IMPORTS),
      "Top-level quoted literal imports before style rules, relative to the source stylesheet; "
@@ -368,9 +370,11 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         break;
     case CBM_LANG_DART:
         out->adapter = "dart_source";
-        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
-        out->limitation = "Direct public source bindings with URI, prefix and show/hide rules; "
-                          "parts, reexports and type propagation unimplemented.";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_DECLARED_TYPE | CBM_RESOLVE_CAP_MEMBER;
+        out->limitation = "Lexical scope, parts, exports and prefixes; declared and constructed "
+                          "receiver types; collection element types and conditional imports "
+                          "abstain.";
         break;
     case CBM_LANG_LUA:
         out->adapter = "lua_source";

@@ -3,6 +3,7 @@
 
 #include "../cbm.h"
 #include "model.h"
+#include "foundation/hash_table.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -30,6 +31,7 @@ typedef struct {
     cbm_resolve_rule_t rule; /* the language rule that selected it */
     const char *domain;      /* lookup domain the rule consulted */
     const char *reason;      /* stable decision or abstention reason */
+    uint32_t facts;          /* facts beyond the rule's own, such as a class call */
 } cbm_source_outcome_t;
 
 bool cbm_source_adapter_supported(CBMLanguage language);
@@ -38,9 +40,14 @@ bool cbm_source_adapter_supported(CBMLanguage language);
 bool cbm_source_adapter_one_name_one_node(CBMLanguage language);
 /* Relations this language's adapter actually decides. Others stay unsupported. */
 bool cbm_source_adapter_decides_references(CBMLanguage language);
+/* This language keeps older binding rules, which decide what its adapter leaves. */
+bool cbm_source_adapter_has_binding_rules(CBMLanguage language);
 
 cbm_source_table_t *cbm_source_table_new(void);
 void cbm_source_table_free(cbm_source_table_t *table);
+/* A key to a package's import root, from the project's manifests. Borrowed; must
+ * outlive the table. NULL means no package is known. */
+void cbm_source_table_set_packages(cbm_source_table_t *table, const CBMHashTable *packages);
 
 /* Phase one. Borrows nothing after return. A file that cannot be analyzed adds
  * no declarations and is reported through cbm_source_table_incomplete. */

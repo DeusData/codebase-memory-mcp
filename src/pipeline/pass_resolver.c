@@ -166,6 +166,9 @@ typedef struct {
     const cbm_gbuf_node_t *file_node;
     bool source_matches;
     const cbm_source_unit_t *source_unit;
+    /* Set when the language also has older binding rules: the adapter's sites are
+     * attested here, so they need not claim that older index is complete. */
+    cbm_resolve_binding_index_t *source_bindings;
 } file_resolver_t;
 
 static char *load_source(const char *path, size_t *length) {
@@ -1778,6 +1781,7 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->go_types =
         cbm_go_stabilization_new(&resolver->arena, &resolver->proofs, resolver->solver);
     resolver->source_table = cbm_source_table_new();
+    cbm_source_table_set_packages(resolver->source_table, cbm_pipeline_get_pkgmap());
     resolver->complete = true;
     if (!resolver->exports || !resolver->targets || !resolver->namespaces ||
         !resolver->python_queries || !resolver->python_namespaces || !resolver->http_defaults ||
@@ -2542,9 +2546,9 @@ static cbm_resolve_result_t source_adapter_result(file_resolver_t *resolver, con
                          invocation ? CBM_SOURCE_SITE_CALL : CBM_SOURCE_SITE_REFERENCE, &outcome);
     if (!outcome.target)
         return unresolved(outcome.reason);
-    return cbm_resolve_binding_source_site(resolver->bindings, name, start, end, origin,
-                                           outcome.domain, outcome.target, outcome.rule,
-                                           outcome.reason);
+    return cbm_resolve_binding_source_site(
+        resolver->source_bindings ? resolver->source_bindings : resolver->bindings, name, start,
+        end, origin, outcome.domain, outcome.target, outcome.rule, outcome.facts, outcome.reason);
 }
 
 static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char *name,
@@ -2553,11 +2557,20 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
     const cbm_resolver_file_t *file = resolver->file;
     if (!name || !name[0])
         return unresolved("reference_spelling_missing");
-    if (cbm_source_adapter_supported(file->language))
+    if (cbm_source_adapter_supported(file->language) &&
+        !cbm_source_adapter_has_binding_rules(file->language))
         return source_adapter_result(resolver, name, start, end, origin, invocation);
     if (file->language == CBM_LANG_DART) {
+        cbm_resolve_result_t decided =
+            source_adapter_result(resolver, name, start, end, origin, invocation);
+        if (decided.target)
+            return decided;
         cbm_resolve_result_t proof = dart_name_result(resolver, name);
-        return cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
+        proof = cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin, proof);
+        /* Both abstained: the occurrence's own reason says more than the file's. */
+        if (invocation && !cbm_resolve_admit(&proof))
+            proof.reason = decided.reason;
+        return proof;
     }
     if (file->language == CBM_LANG_PYTHON) {
         cbm_resolve_result_t proof =
@@ -2609,10 +2622,17 @@ static const cbm_resolve_proof_t *local_occurrence_proof(const file_resolver_t *
                                                          const char *relation, uint32_t start,
                                                          uint32_t end, CBMSourceOrigin origin,
                                                          const cbm_resolve_result_t *result) {
+    const cbm_resolve_binding_index_t *authority = resolver->bindings;
     const cbm_resolve_proof_t *local =
-        cbm_resolve_binding_site_proof(resolver->bindings, name, start, end, origin);
+        resolver->source_bindings
+            ? cbm_resolve_binding_site_proof(resolver->source_bindings, name, start, end, origin)
+            : NULL;
+    if (local)
+        authority = resolver->source_bindings;
+    else
+        local = cbm_resolve_binding_site_proof(resolver->bindings, name, start, end, origin);
     const cbm_resolve_proof_view_t *view = cbm_resolve_proof_view(local);
-    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(resolver->bindings);
+    cbm_resolve_lookup_context_t *context = cbm_resolve_binding_lookup_context(authority);
     if (!view || !context || !scope || !scope[0])
         return local;
     /* Incomplete or contradictory local authority must reach the sealer as
@@ -2712,8 +2732,10 @@ static bool record_result(const file_resolver_t *resolver, const char *scope, co
     }
     if (target && (strcmp(relation, "CALL_REFERENCE") == 0 || strcmp(relation, "CALLS") == 0) &&
         !callable_node(target) &&
-        !(resolver->file->language == CBM_LANG_PYTHON && target->label &&
-          !strcmp(target->label, "Class") && (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
+        !((resolver->file->language == CBM_LANG_PYTHON ||
+           resolver->file->language == CBM_LANG_DART) &&
+          target->label && !strcmp(target->label, "Class") &&
+          (result.facts & CBM_RESOLVE_FACT_CLASS_CALLABLE))) {
         result.facts &= ~CBM_RESOLVE_FACT_EXACT_TARGET;
         result.reason = "callable_target_not_callable";
     }
@@ -2943,11 +2965,17 @@ bool cbm_shared_resolver_file(const cbm_shared_resolver_t *shared,
         resolver.source_unit =
             cbm_source_unit_build(&arena, table, file->result, file->language, file->rel_path,
                                   matches ? source : NULL, length);
+        if (cbm_source_adapter_has_binding_rules(file->language))
+            resolver.source_bindings = cbm_resolve_binding_source_index(
+                &arena, file->result, file->language, source, length);
     }
     bool begun = cbm_gbuf_resolution_begin(file->output);
     bool ok = begun && resolver.bindings &&
               cbm_resolve_binding_set_identity(resolver.bindings, file->ctx->project_name,
                                                file->rel_path) &&
+              (!resolver.source_bindings ||
+               cbm_resolve_binding_set_identity(resolver.source_bindings, file->ctx->project_name,
+                                                file->rel_path)) &&
               prepare_source_imports(&resolver) && index_semantics(&resolver) &&
               resolve_calls(&resolver, &arena) && resolve_usages(&resolver, &arena) &&
               resolve_writes(&resolver, &arena) && resolve_types(&resolver);

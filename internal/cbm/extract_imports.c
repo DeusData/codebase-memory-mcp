@@ -2573,8 +2573,12 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
             }
             char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
             if (path && path[0]) {
+                bool package = !strncmp(path, "package:", 8) && !strpbrk(path, "\\$") &&
+                               dart_direct_import(node, uri);
                 CBMImport imp = {.local_name = path_last(a, path),
                                  .module_path = path,
+                                 .kind = package ? CBM_IMPORT_KIND_DART_PACKAGE_URI
+                                                 : CBM_IMPORT_KIND_DEFAULT,
                                  .site_start_byte = ts_node_start_byte(uri),
                                  .site_end_byte = ts_node_end_byte(uri),
                                  .source_origin = CBM_SOURCE_ORIGIN_RAW};
