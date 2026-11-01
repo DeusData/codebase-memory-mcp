@@ -1364,9 +1364,14 @@ typedef struct {
     double score;
 } cbm_vector_result_t;
 
-/* Search for nodes similar to the given query keywords using stored RI vectors.
- * Builds a merged query vector from the keywords, then does cosine scan via
- * the cbm_cosine_i8 SQL function joined with the nodes table.
+/* Hybrid semantic search over Function/Method/type nodes.  Keywords may be
+ * single words or whole sentences.  Two channels are fused with Reciprocal
+ * Rank Fusion: BM25 over nodes_fts (stopwords removed) and the cosine of each
+ * node's RI vector against one IDF-weighted query vector (built through the
+ * cbm_cosine_i8 SQL function).  Test symbols rank after all non-test symbols
+ * unless the query mentions tests.  `score` is the fused score (negative for
+ * demoted tests); the order is independent of `limit`, so a smaller limit
+ * always returns a prefix of a larger one.
  * Returns CBM_STORE_OK with results sorted by score DESC (possibly zero),
  * CBM_STORE_NOT_FOUND when the store carries no node_vectors table (lean
  * index — an empty universe, not a fault), or CBM_STORE_ERR when the scan
