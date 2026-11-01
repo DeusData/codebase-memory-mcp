@@ -273,6 +273,7 @@ typedef struct {
     bool have_uid;
     bool have_counter;
     bool have_unresolved_completeness;
+    bool is_view[GD_TABLE_COUNT];
 } gd_context_t;
 
 static const gd_table_t *gd_table(const gd_context_t *g, int index) {
@@ -514,11 +515,15 @@ static bool gd_table_kinds(gd_context_t *g, bool present[GD_TABLE_COUNT]) {
         }
         int index = gd_table_index(name);
         if (index >= 0) {
+            /* The resolver's logical tables may be views over its compact rows.
+             * The digest binds what they read back, whichever way it is stored. */
+            bool is_view = index >= GD_RESOLVER_FIRST && gd_text_eq(type, "view");
             if (present[index] || !gd_text_eq(name, gd_tables[index].name) ||
-                !gd_text_eq(type, "table")) {
+                (!is_view && !gd_text_eq(type, "table"))) {
                 return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
             }
             present[index] = true;
+            g->is_view[index] = is_view;
         }
     }
     if (rc != SQLITE_DONE || !gd_finalize(g)) {
@@ -551,14 +556,17 @@ static bool gd_table_kinds(gd_context_t *g, bool present[GD_TABLE_COUNT]) {
     return rc == SQLITE_DONE && gd_finalize(g);
 }
 
-static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected) {
+static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected, bool is_view) {
+    /* A view declares no key or column type of its own; the compact table
+     * underneath it holds the key, and each value's type is still checked. */
     if (sqlite3_column_type(g->stmt, GD_SCHEMA_PRIMARY_KEY) != SQLITE_INTEGER ||
         sqlite3_column_type(g->stmt, GD_SCHEMA_HIDDEN) != SQLITE_INTEGER ||
-        sqlite3_column_int64(g->stmt, GD_SCHEMA_PRIMARY_KEY) != expected->primary_key ||
+        (!is_view &&
+         sqlite3_column_int64(g->stmt, GD_SCHEMA_PRIMARY_KEY) != expected->primary_key) ||
         sqlite3_column_int64(g->stmt, GD_SCHEMA_HIDDEN) != expected->kind) {
         return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
     }
-    if (expected->primary_key && expected->types == GD_ALLOW_INTEGER) {
+    if (!is_view && expected->primary_key && expected->types == GD_ALLOW_INTEGER) {
         gd_text_t declared_type;
         if (!gd_read_text(g, GD_SCHEMA_DECLARED_TYPE, &declared_type)) {
             return false;
@@ -570,7 +578,7 @@ static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected) {
     return true;
 }
 
-static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
+static bool gd_columns(gd_context_t *g, const gd_table_t *table, bool is_view) {
     bool seen[GD_MAX_COLUMNS] = {false};
     bool coverage_meta = table == &gd_tables[GD_COVERAGE_META];
     int allowed_columns =
@@ -596,7 +604,7 @@ static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
             }
         }
         if (column < 0 || seen[column] || count == allowed_columns ||
-            !gd_column_schema(g, &table->columns[column])) {
+            !gd_column_schema(g, &table->columns[column], is_view)) {
             return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
         }
         seen[column] = true;
@@ -645,7 +653,7 @@ static bool gd_validate_schema(gd_context_t *g, bool present[GD_TABLE_COUNT],
         return false;
     }
     for (int i = 0; i < GD_TABLE_COUNT; i++) {
-        if (present[i] && !gd_columns(g, &gd_tables[i])) {
+        if (present[i] && !gd_columns(g, &gd_tables[i], g->is_view[i])) {
             return false;
         }
     }
