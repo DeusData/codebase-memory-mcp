@@ -43,7 +43,9 @@ jobs:
           #
           # NOTE: the *dynamic* linux binary is built in a pinned Ubuntu 22.04
           # container (_build.yml build-linux) and links glibc 2.35+; the
-          # composition gate (A6) asserts that floor on the built bytes, so no
+          # composition gate (A6) asserts that floor on the built bytes and
+          # each core Linux leg runs the binary in a plain container of that
+          # image (smoke-unix "Runtime start on the glibc floor"), so no
           # broad leg re-runs it on a 22.04 runner. Older-glibc coverage stays
           # the -portable (static) binary's job, exercised green by the
           # smoke-linux-portable broad legs (ubuntu-22.04 / 22.04-arm) and the
@@ -128,6 +130,18 @@ jobs:
           CBM_SMOKE_ARTIFACT_DIR: ${{ runner.temp }}/cbm-artifact
           SMOKE_REQUIRE_UI: "1"
           SMOKE_REQUIRE_WRAPPERS: "1"
+
+      # The standard (dynamic) Linux binary must START and INDEX on the oldest
+      # userland it claims (#2486): a plain container of the SAME pinned
+      # ubuntu:22.04 image _build.yml build-linux builds in, nothing installed.
+      # A6 asserts the floor on the bytes; this runs them, on both arches (each
+      # Linux leg checks its own artifact). The venue-parity contract holds
+      # this digest equal to build-linux's.
+      - name: Runtime start on the glibc floor (plain ubuntu:22.04)
+        if: matrix.goos == 'linux'
+        env:
+          CBM_FLOOR_IMAGE: ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+        run: scripts/ci/check-glibc-floor-runtime.sh --image "$CBM_FLOOR_IMAGE" "$RUNNER_TEMP/cbm-artifact/codebase-memory-mcp"
 
       - name: Security audits
         run: |

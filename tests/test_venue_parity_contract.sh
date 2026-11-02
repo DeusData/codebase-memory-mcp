@@ -264,9 +264,10 @@ for name, pattern, why in REQUIRED:
 # glibc floor (#2486; contract shape from #2573): the standard Linux release
 # binaries, amd64 AND arm64, build inside ONE ubuntu:22.04 image pinned by
 # digest; the composition gate is told that image's floor; the PR leg builds in
-# the same image with the same floor. A tag, a second digest, a Linux leg back
-# on a hosted runner's userland or a dropped floor lets the floor drift with no
-# other check noticing until a user's loader refuses the binary.
+# the same image with the same floor, and the release smoke runs the built
+# binary in a plain container of that image. A tag, a second digest, a Linux
+# leg back on a hosted runner's userland or a dropped floor lets the floor
+# drift with no other check noticing until a user's loader refuses the binary.
 def without_comments(text: str) -> str:
     return "\n".join(line for line in text.splitlines()
                      if not line.lstrip().startswith("#"))
@@ -298,9 +299,43 @@ if (workflows / "_build.yml").exists() and (workflows / "pr.yml").exists():
                 "prepare-release-candidates.sh" not in body:
             failures.append(f"{leg}: must run the composition gate on the "
                             f"container-built binary")
+    # The release smoke RUNS the standard Linux binary on that floor (user
+    # decision R105, #2887): every core smoke-unix Linux leg, amd64 AND arm64,
+    # starts and indexes its own artifact in a plain container of the SAME
+    # digest, in a step that gates like its siblings.
+    smoke_path = workflows / "_smoke.yml"
+    smoke_text = without_comments(smoke_path.read_text()) if smoke_path.exists() else ""
+    smoke_unix = job_body(smoke_text, "smoke-unix")
+    runtime = [step for step in re.split(r"(?m)^(?=      - )", smoke_unix)
+               if "scripts/ci/check-glibc-floor-runtime.sh" in step]
+    leg = "_smoke.yml smoke-unix runtime start check"
+    if len(runtime) != 1:
+        failures.append(f"{leg}: smoke-unix must run scripts/ci/check-glibc-floor-runtime.sh "
+                        f"in exactly one step, found {len(runtime)}")
+    else:
+        step = runtime[0]
+        if not re.search(r"(?m)^        if:\s*matrix\.goos == 'linux'\s*$", step):
+            failures.append(f"{leg}: must run on every Linux leg, amd64 and arm64 alike "
+                            "(`if: matrix.goos == 'linux'`)")
+        if "continue-on-error" in step or \
+                re.search(r"(?m)^    continue-on-error:", smoke_unix):
+            failures.append(f"{leg}: must gate the release smoke (no continue-on-error)")
+        images = set(re.findall(rf"({FLOOR_IMAGE})(?![0-9a-f])", step))
+        if len(images) != 1 or "--image" not in step:
+            failures.append(f"{leg}: must pass --image with the floor image pinned by "
+                            f"digest (ubuntu:22.04@sha256:<64 hex>), found {sorted(images)}")
+        else:
+            floor_images |= images
+    core_unix = re.search(r"(?ms)CORE_UNIX='\[(.*?)\]'", smoke_text)
+    linux_arches = sorted(re.findall(r'"goos":"linux","goarch":"(\w+)"',
+                                     core_unix.group(1) if core_unix else ""))
+    if linux_arches != ["amd64", "arm64"]:
+        failures.append("_smoke.yml setup-matrix: the core smoke-unix legs must cover linux "
+                        f"amd64 and arm64 (each runs the floor runtime check), found {linux_arches}")
     if len(floor_images) > 1:
-        failures.append("_build.yml build-linux and pr.yml glibc-floor must pin the SAME "
-                        "ubuntu:22.04 digest: " + ", ".join(sorted(floor_images)))
+        failures.append("_build.yml build-linux, pr.yml glibc-floor and the _smoke.yml runtime "
+                        "start check must pin the SAME ubuntu:22.04 digest: "
+                        + ", ".join(sorted(floor_images)))
     arches = sorted(re.findall(r"(?m)^          - arch:\s*(\S+)\s*$", build_linux))
     if arches != ["amd64", "arm64"]:
         failures.append("_build.yml build-linux: must build exactly the amd64 and arm64 "
@@ -449,6 +484,7 @@ scripts/ci/test-impact-shadow.sh
 scripts/ci/generate-sbom.py
 scripts/package-release.sh
 scripts/ci/smoke-artifact.sh
+scripts/ci/check-glibc-floor-runtime.sh
 scripts/fuzz.sh
 scripts/memwaste.sh
 test-infrastructure/run.sh
@@ -493,6 +529,7 @@ scripts/fuzz.sh
 scripts/memwaste.sh
 scripts/ci/select-lanes.sh
 scripts/ci/test-impact-shadow.sh
+scripts/ci/check-glibc-floor-runtime.sh
 "
     for entry in $STRICT_ENTRIES; do
         out=$(cd "$ROOT" && bash "$entry" --definitely-not-a-flag 2>&1) && rc=0 || rc=$?
