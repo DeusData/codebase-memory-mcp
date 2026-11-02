@@ -5678,7 +5678,9 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
                                               .complete = captured && every_occurrence_valid};
     captured = captured && cbm_gbuf_capture_imports(ctx->gbuf, &snapshot);
 
-    /* Compatibility projection only. No semantic consumer reads this JSON. */
+    /* Compatibility projection only. No semantic consumer reads this JSON. C keeps no
+     * list: a generated header can include tens of thousands of lines, and that list
+     * alone made one file node 9 MB. */
     const char *marker = c_family ? c_binding_marker : rust_binding_marker;
     const char *proof_key = c_family ? "c_includes_proven" : "rust_imports_proven";
     const char *bindings_key = c_family ? "c_include_bindings" : "rust_import_bindings";
@@ -5693,7 +5695,7 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
     bool ok = captured && file && root && array &&
               (!old_json || (old && yyjson_is_obj(yyjson_doc_get_root(old)))) &&
               yyjson_mut_obj_add_int(doc, root, proof_key, every_occurrence_valid ? 1 : 0) &&
-              yyjson_mut_obj_add_val(doc, root, bindings_key, array);
+              (c_family || yyjson_mut_obj_add_val(doc, root, bindings_key, array));
     if (ok)
         yyjson_mut_doc_set_root(doc, root);
     if (ok && old) {
@@ -5710,8 +5712,8 @@ static void source_write_binding_snapshot(cbm_pipeline_ctx_t *ctx, const CBMFile
             }
         }
     }
-    for (size_t i = 0; ok && i < count; i++) {
-        const cbm_resolve_result_t *proof = c_family ? &facts[i].dependency : &facts[i].binding;
+    for (size_t i = 0; ok && !c_family && i < count; i++) {
+        const cbm_resolve_result_t *proof = &facts[i].binding;
         const char *target = cbm_resolve_admit(proof) ? proof->target : NULL;
         yyjson_mut_val *entry = php_binding_json(doc, &result->imports.items[i], target);
         ok = entry && yyjson_mut_arr_add_val(array, entry);

@@ -2913,6 +2913,7 @@ TEST(resolver_c_file_past_the_proof_limit_does_not_stop_publication) {
     int rc = cbm_pipeline_run(pipeline);
     cbm_store_t *store = rc == 0 ? cbm_store_open_path(db) : NULL;
     int proven = -1;
+    int largest_node = -1;
     if (store) {
         sqlite3_stmt *statement = NULL;
         if (sqlite3_prepare_v2(cbm_store_get_db(store),
@@ -2923,12 +2924,23 @@ TEST(resolver_c_file_past_the_proof_limit_does_not_stop_publication) {
             sqlite3_step(statement) == SQLITE_ROW)
             proven = sqlite3_column_int(statement, 0);
         sqlite3_finalize(statement);
+        /* A file's own node does not grow with how often it repeats an include. */
+        statement = NULL;
+        if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                               "SELECT max(length(properties)) FROM nodes "
+                               "WHERE file_path='many.h'",
+                               -1, &statement, NULL) == SQLITE_OK &&
+            sqlite3_step(statement) == SQLITE_ROW)
+            largest_node = sqlite3_column_int(statement, 0);
+        sqlite3_finalize(statement);
         cbm_store_close(store);
     }
     cbm_pipeline_free(pipeline);
     th_cleanup(root);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(proven, 1);
+    ASSERT_GT(largest_node, 0);
+    ASSERT_LT(largest_node, 4096);
     PASS();
 }
 
