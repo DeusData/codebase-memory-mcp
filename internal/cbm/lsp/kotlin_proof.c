@@ -4,6 +4,7 @@
 #include "../resolve/policy.h"
 #include "../resolve/symbols.h"
 #include "foundation/hash_table.h"
+#include "../resolve/syntax_index.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -329,7 +330,7 @@ bool cbm_kotlin_collect_source_facts(CBMArena *arena, const char *source, int le
     if (!parser)
         return false;
     ts_parser_set_language(parser, tree_sitter_kotlin());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_plain(parser, source, (uint32_t)length);
     ts_parser_delete(parser);
     if (!tree)
         return false;

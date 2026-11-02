@@ -9,6 +9,7 @@
  */
 #include "simhash/minhash.h"
 #include "foundation/constants.h"
+#include "foundation/fast_format.h"
 #include "foundation/mem_core.h"
 #include "foundation/log.h"
 /* Inline all xxHash functions — avoids separate compilation unit. */
@@ -248,11 +249,19 @@ static int hash_trigrams(const char **tokens, int token_count, cbm_minhash_t *ou
             continue;
         }
 
-        int len = snprintf(trigram_buf, sizeof(trigram_buf), "%s|%s|%s", tokens[i],
-                           tokens[i + SKIP_ONE], tokens[i + TRIGRAM_WINDOW]);
-        if (len <= 0 || (size_t)len >= sizeof(trigram_buf)) {
+        /* This ran under snprintf's process-wide locale lock on macOS, once per trigram. */
+        size_t first = strlen(tokens[i]), second = strlen(tokens[i + SKIP_ONE]),
+               third = strlen(tokens[i + TRIGRAM_WINDOW]);
+        if (first + second + third + TRIGRAM_WINDOW >= sizeof(trigram_buf)) {
             continue;
         }
+        char *trigram_end = cbm_put_text(trigram_buf, tokens[i], first);
+        *trigram_end++ = '|';
+        trigram_end = cbm_put_text(trigram_end, tokens[i + SKIP_ONE], second);
+        *trigram_end++ = '|';
+        trigram_end = cbm_put_text(trigram_end, tokens[i + TRIGRAM_WINDOW], third);
+        *trigram_end = '\0';
+        int len = (int)(trigram_end - trigram_buf);
 
         /* A repeated trigram is the same string with the same weight: its
          * update would lower the same minima to the same values. Only a first

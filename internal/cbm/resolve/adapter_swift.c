@@ -41,6 +41,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 #define SWIFT_TYPE_RECORD "&type"
 #define SWIFT_IMPORTS "&imports"

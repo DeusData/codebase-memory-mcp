@@ -1,6 +1,7 @@
 #ifndef CBM_STORE_RESOLVER_EVIDENCE_H
 #define CBM_STORE_RESOLVER_EVIDENCE_H
 #include "resolve/record.h"
+#include "sqlite_writer.h"
 #include <sqlite3.h>
 /* Called inside the writer's savepoint. All roots must be owned by one canonical
  * generation DAG; the caller's graph stays alive through write. With commit_batches
@@ -10,7 +11,24 @@
 bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_resolve_record_t *rows,
                                  size_t count, const cbm_resolve_file_t *files, size_t file_count,
                                  const cbm_resolve_summary_t *summaries, size_t summary_count,
-                                 bool commit_batches);
+                                 bool commit_batches, int workers);
+/* The same write when the store is a new file still being built: facts, supports,
+ * occurrences and their text go straight into writer's pages, tens of millions of rows
+ * that SQL would take one at a time. The tables are ordinary and the views over them
+ * read back the same values. NULL on failure, which also fails the file. What is
+ * returned holds no fact and no digest, only what the store then inserts, and it
+ * borrows the same rows as this call until freed. */
+typedef struct cbm_resolver_stage cbm_resolver_stage_t;
+cbm_resolver_stage_t *cbm_store_resolver_stage_write(cbm_db_writer_t *writer, const char *project,
+                                                     const cbm_resolve_record_t *rows, size_t count,
+                                                     const cbm_resolve_file_t *files,
+                                                     size_t file_count,
+                                                     const cbm_resolve_summary_t *summaries,
+                                                     size_t summary_count, int workers);
+/* The rest of the write, on the finished file. */
+bool cbm_store_resolver_stage_finish(sqlite3 *db, const char *project,
+                                     const cbm_resolver_stage_t *stage);
+void cbm_store_resolver_stage_free(cbm_resolver_stage_t *stage);
 /* True when sql, as stored in sqlite_schema, is exactly how the writer defines this
  * logical view. A view of another name or definition is not this generation's data. */
 bool cbm_store_resolver_view_definition_current(const char *sql);

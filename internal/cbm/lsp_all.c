@@ -2,6 +2,7 @@
 // CGo only compiles .c files in the package directory, not subdirectories.
 // This file includes all LSP sources so they compile as part of the cbm package.
 
+#include "resolve/syntax_index.h"
 #include "lsp/type_rep.c"
 #include "lsp/scope.c"
 #include "lsp/type_registry.c"

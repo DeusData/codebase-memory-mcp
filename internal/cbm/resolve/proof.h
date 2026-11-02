@@ -6,6 +6,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* No fact is deeper than this, and each is deeper than all its premises. */
+#define CBM_RESOLVE_PROOF_MAX_DEPTH 256u
+
 /* Immutable captured-source identity. Empty fields explicitly mean unknown;
  * a caller must not recover them by re-reading a potentially changed file. */
 typedef struct {
@@ -74,6 +77,7 @@ struct cbm_resolve_proof {
     cbm_resolve_proof_view_t value;
 };
 
+enum { CBM_RESOLVE_PROOF_RECENT_TEXTS = 64 };
 typedef struct cbm_resolve_proof_entry cbm_resolve_proof_entry_t;
 typedef struct cbm_resolve_proof_text cbm_resolve_proof_text_t;
 typedef struct cbm_resolve_proof_pool {
@@ -82,6 +86,7 @@ typedef struct cbm_resolve_proof_pool {
     size_t capacity, count;
     cbm_resolve_proof_text_t *texts;
     size_t text_capacity, text_count;
+    const char *recent_texts[CBM_RESOLVE_PROOF_RECENT_TEXTS];
     uint64_t work, work_limit;
     size_t node_limit, premise_limit;
     cbm_resolve_analysis_t failure;
@@ -141,6 +146,13 @@ bool cbm_resolve_proof_compose(cbm_resolve_proof_view_t *out, cbm_resolve_proof_
                                const cbm_resolve_proof_key_t *key,
                                const cbm_resolve_result_t *outcome,
                                const cbm_resolve_proof_t **premises, size_t count, bool closed);
+/* The same view with no fingerprint, for a reader that only needs its fields. */
+bool cbm_resolve_proof_compose_payload(cbm_resolve_proof_view_t *out, cbm_resolve_proof_kind_t kind,
+                                       const cbm_resolve_proof_source_t *source,
+                                       const cbm_resolve_proof_key_t *key,
+                                       const cbm_resolve_result_t *outcome,
+                                       const cbm_resolve_proof_t **premises, size_t count,
+                                       bool closed);
 /* The ordering of cbm_resolve_proof_compare, for a view that has no node yet. */
 int cbm_resolve_proof_view_compare(const cbm_resolve_proof_view_t *a,
                                    const cbm_resolve_proof_view_t *b);

@@ -12381,7 +12381,10 @@ static bool c_lsp_cross_with_registry_run(
         c_lsp_add_include(&ctx, include_paths[i], include_ns_qns[i]);
     }
     c_memo_test_stage(&ctx, "cross");
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     c_lsp_process_file(&ctx, root);
+    cbm_syntax_index_end(&syntax);
 
     if (owns_tree) {
         ts_tree_delete(tree);
@@ -12518,7 +12521,10 @@ static bool c_lsp_cross_run(CBMArena *arena, const char *source, int source_len,
     }
 
     c_memo_test_stage(&ctx, "cross");
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     c_lsp_process_file(&ctx, root);
+    cbm_syntax_index_end(&syntax);
 
     if (owns_tree) {
         ts_tree_delete(tree);

@@ -9,6 +9,7 @@
  * The buffer frees everything in cbm_gbuf_free().
  */
 #include "foundation/constants.h"
+#include "foundation/fast_format.h"
 
 enum {
     GB_ERR = -1,
@@ -708,10 +709,28 @@ static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, con
             return;
         }
     }
+    size_t type_length = strlen(type);
+    if (src >= 0 && tgt >= 0 && type_length + 2 * CBM_PUT_U64_MAX + 3 <= bufsz) {
+        char *at = cbm_put_u64(buf, (uint64_t)src);
+        *at++ = ':';
+        at = cbm_put_u64(at, (uint64_t)tgt);
+        *at++ = ':';
+        at = cbm_put_text(at, type, type_length);
+        *at = '\0';
+        return;
+    }
     snprintf(buf, bufsz, "%lld:%lld:%s", (long long)src, (long long)tgt, type);
 }
 
 static void make_src_type_key(char *buf, size_t bufsz, int64_t src, const char *type) {
+    size_t type_length = strlen(type);
+    if (src >= 0 && type_length + CBM_PUT_U64_MAX + 2 <= bufsz) {
+        char *at = cbm_put_u64(buf, (uint64_t)src);
+        *at++ = ':';
+        at = cbm_put_text(at, type, type_length);
+        *at = '\0';
+        return;
+    }
     snprintf(buf, bufsz, "%lld:%s", (long long)src, type);
 }
 
@@ -2481,22 +2500,44 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
 }
 
 typedef struct {
-    const char *type;
-    cbm_gbuf_edge_keep_fn keep;
-} gbuf_type_unless_t;
+    const char *const *types;
+    size_t count;
+} gbuf_type_set_t;
 
-static bool gbuf_edge_type_unless(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
-    const gbuf_type_unless_t *rule = ud;
-    return strcmp(e->type, rule->type) == 0 && !rule->keep(gb, e);
+static bool gbuf_edge_in_types(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    (void)gb;
+    const gbuf_type_set_t *set = ud;
+    for (size_t i = 0; i < set->count; i++)
+        if (strcmp(e->type, set->types[i]) == 0)
+            return true;
+    return false;
 }
 
-int cbm_gbuf_delete_edges_by_type_unless(cbm_gbuf_t *gb, const char *type,
-                                         cbm_gbuf_edge_keep_fn keep) {
-    if (!gb || !type || !keep) {
+int cbm_gbuf_delete_edges_by_types(cbm_gbuf_t *gb, const char *const *types, size_t count) {
+    if (!gb || !types) {
         return CBM_NOT_FOUND;
     }
-    gbuf_type_unless_t rule = {type, keep};
-    return gbuf_delete_edges_if(gb, gbuf_edge_type_unless, &rule);
+    gbuf_type_set_t set = {types, count};
+    return gbuf_delete_edges_if(gb, gbuf_edge_in_types, &set);
+}
+
+typedef struct {
+    gbuf_type_set_t set;
+    cbm_gbuf_edge_keep_fn keep;
+} gbuf_types_unless_t;
+
+static bool gbuf_edge_types_unless(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    const gbuf_types_unless_t *rule = ud;
+    return gbuf_edge_in_types(gb, e, &rule->set) && !rule->keep(gb, e);
+}
+
+int cbm_gbuf_delete_edges_by_types_unless(cbm_gbuf_t *gb, const char *const *types, size_t count,
+                                          cbm_gbuf_edge_keep_fn keep) {
+    if (!gb || !types || !keep) {
+        return CBM_NOT_FOUND;
+    }
+    gbuf_types_unless_t rule = {{types, count}, keep};
+    return gbuf_delete_edges_if(gb, gbuf_edge_types_unless, &rule);
 }
 
 typedef struct {
@@ -3058,6 +3099,11 @@ static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fin
 }
 
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
+    return cbm_gbuf_dump_to_sqlite_with(gb, path, NULL, NULL);
+}
+
+int cbm_gbuf_dump_to_sqlite_with(cbm_gbuf_t *gb, const char *path, cbm_gbuf_dump_tables_fn tables,
+                                 void *context) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
@@ -3109,11 +3155,11 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         return CBM_NOT_FOUND;
     }
 
+    int rc = tables && !tables(w, context) ? CBM_NOT_FOUND : 0;
     CBM_PROF_START(t_append);
     enum { DUMP_PARTITION_NODES = 1 << 16 };
     bool free_heavy = false;
-    int rc = 0;
-    for (int off = 0; off < node_idx; off += DUMP_PARTITION_NODES) {
+    for (int off = 0; rc == 0 && off < node_idx; off += DUMP_PARTITION_NODES) {
         int chunk = node_idx - off;
         if (chunk > DUMP_PARTITION_NODES) {
             chunk = DUMP_PARTITION_NODES;

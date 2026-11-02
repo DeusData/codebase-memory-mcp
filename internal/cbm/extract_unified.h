@@ -128,6 +128,12 @@ typedef struct {
     uint8_t kind;
 } CBMPythonDirective;
 
+// The lowest node a usage classifier has climbed from to the root undecided.
+typedef struct {
+    TSNode node;
+    uint32_t depth;
+} CBMOccurrenceClimb;
+
 // WalkState tracks scope context during the unified cursor walk.
 // Replaces parent-chain walks for enclosing_func_qn, import context, etc.
 typedef struct {
@@ -135,6 +141,10 @@ typedef struct {
     const char *enclosing_class_qn;     // current class QN (NULL outside class)
     const TSTreeCursor *current_cursor; // unified walk cursor at the current node
     TSTreeCursor *occurrence_cursor;    // reusable parent-preserving classifier cursor
+    uint32_t walk_depth;                // depth of the current node in the unified walk
+    CBMOccurrenceClimb binding_climb;   // settled by is_binding_occurrence
+    CBMOccurrenceClimb label_climb;     // settled by is_call_argument_label_walk
+    CBMOccurrenceClimb write_climb;     // settled by is_write_occurrence
     CBMInvocationKind invocation_kind;  // exact active invocation/reference role
     TSNode callee_expr;                 // exact active callee expression, if any
     TSNode callee_leaf;                 // exact active terminal callee, if any

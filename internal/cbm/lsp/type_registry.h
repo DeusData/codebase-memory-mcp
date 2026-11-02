@@ -3,6 +3,7 @@
 
 #include "type_rep.h"
 #include "../arena.h"
+#include "lsp_neg_memo.h"
 #include <stdbool.h>
 
 // Language-specific function metadata. Added at struct tail so existing
@@ -163,6 +164,13 @@ typedef struct {
     int type_index;
 } CBMRegistryNamespaceTypeEntry;
 
+// The rows of funcs[] or types[] past their QN index, by name (see tail_arena).
+typedef struct {
+    CBMIdxMemo first; // a QN's first row among [start, synced)
+    int start;
+    int synced;
+} CBMRegistryTail;
+
 // Cross-file type/function registry.
 typedef struct CBMTypeRegistry {
     CBMRegisteredFunc *funcs;
@@ -193,6 +201,13 @@ typedef struct CBMTypeRegistry {
     CBMRegistryHashEntry *type_qn_entries;
     int type_qn_bucket_count;
     int type_qn_entry_count;
+
+    // Set by a caller whose lookups run while the registry fills: rows past the QN
+    // indexes are then found by name instead of by a scan, with the same answers.
+    // The arena must outlive the lookups. NULL keeps the scan and costs nothing.
+    CBMArena *tail_arena;
+    CBMRegistryTail func_tail;
+    CBMRegistryTail type_tail;
 
     // Methods indexed by (receiver_type, short_name) — chain holds overloads.
     int *method_buckets;
@@ -323,6 +338,9 @@ void cbm_registry_finalize(CBMTypeRegistry *reg);
 // pipeline-lifetime result arena, and per-file index allocations accumulated
 // there add GBs across a large repo (FastAPI incremental test: +1.1 GB RSS).
 void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena);
+// Indexes only the types, for a registry that is still filling. A scan finds the first
+// registration, so these answer with that one; a later finalize replaces them.
+void cbm_registry_index_types_into(CBMTypeRegistry *reg, CBMArena *idx_arena);
 
 // Build the optional final-QN-segment type index. Call immediately after
 // finalization. Consumers that do not opt in avoid its type_count-sized allocation
@@ -573,6 +591,10 @@ void cbm_registry_all_types_chain(const CBMTypeRegistry *head, CBMTypeShortIter 
  * mutate a shared registry, so the caller skips the refinement, exactly as the
  * sealed-registry no-op in cbm_registry_add_func does today. */
 CBMRegisteredFunc *cbm_registry_func_for_update(CBMTypeRegistry *head, const char *qualified_name);
+/* The first function registered under this name in reg itself, whichever order its index
+ * answers lookups in; a fallback registry is not consulted. */
+CBMRegisteredFunc *cbm_registry_first_own_func(CBMTypeRegistry *reg, const char *qualified_name);
+CBMRegisteredType *cbm_registry_first_own_type(CBMTypeRegistry *reg, const char *qualified_name);
 CBMRegisteredType *cbm_registry_type_for_update(CBMTypeRegistry *head, const char *qualified_name);
 
 // --- TS-specific helpers (return NULL for types without these signatures) ---

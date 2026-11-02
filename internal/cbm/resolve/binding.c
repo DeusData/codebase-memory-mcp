@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <string.h>
+#include "syntax_index.h"
 
 enum { BINDING_MAX_DEPTH = 512, BINDING_MAX_NODES = 1000000, BINDING_INITIAL_CAP = 32 };
 enum {
@@ -210,12 +211,19 @@ struct cbm_resolve_binding_index {
     binding_name_t *names;
     size_t name_count;
     size_t name_capacity;
+    struct binding_seen *seen;
+    size_t seen_capacity, seen_count, seen_rows;
+    const CBMImport **python_import_order;
+    size_t python_import_order_count;
+    bool python_import_order_ready;
     binding_site_t *sites;
     size_t site_count;
     size_t site_capacity;
     const char *reason;
     cbm_resolve_analysis_t analysis;
     bool javascript_module;
+    /* Only the manifest's declaration made this file a module. */
+    bool javascript_module_declared_only;
     bool python_annotation_binding_preserved;
     bool python_annotation_storage_bound;
     python_write_t *python_writes;  /* sorted by name */
@@ -347,6 +355,63 @@ static void add_name(cbm_resolve_binding_index_t *index, const char *name, uint3
     }
     names[index->name_count++] = (binding_name_t){
         .name = name, .target = target, .at = at, .flags = flags, .scope = index->current_scope};
+}
+
+/* Whether a (scope, name) is bound yet, asked while names still arrive in source order.
+ * Rows enter on the first question after they were added, so a file that never asks
+ * pays nothing and each row is hashed once however often the question is asked. */
+typedef struct binding_seen {
+    const char *name;
+    uint32_t scope;
+    bool import_root;
+} binding_seen_t;
+
+static size_t binding_seen_slot(const binding_seen_t *slots, size_t capacity, const char *name,
+                                uint32_t scope) {
+    uint64_t hash = UINT64_C(14695981039346656037) ^ scope;
+    for (const unsigned char *at = (const unsigned char *)name; *at; at++)
+        hash = (hash ^ *at) * UINT64_C(1099511628211);
+    size_t slot = (size_t)(hash ^ (hash >> 29)) & (capacity - 1);
+    while (slots[slot].name && (slots[slot].scope != scope || strcmp(slots[slot].name, name)))
+        slot = (slot + 1) & (capacity - 1);
+    return slot;
+}
+
+static const binding_seen_t *binding_seen_find(cbm_resolve_binding_index_t *index, const char *name,
+                                               uint32_t scope) {
+    size_t needed = (index->seen_count + index->name_count - index->seen_rows) * 2 + 1;
+    if (needed > index->seen_capacity) {
+        size_t capacity = index->seen_capacity ? index->seen_capacity : 32;
+        while (capacity < needed * 2)
+            capacity *= 2;
+        binding_seen_t *slots = cbm_arena_calloc(index->arena, capacity * sizeof(*slots));
+        if (!slots) {
+            fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "binding_allocation");
+            return NULL;
+        }
+        for (size_t i = 0; i < index->seen_capacity; i++)
+            if (index->seen[i].name)
+                slots[binding_seen_slot(slots, capacity, index->seen[i].name,
+                                        index->seen[i].scope)] = index->seen[i];
+        index->seen = slots;
+        index->seen_capacity = capacity;
+    }
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, index->name_count - index->seen_rows + 1);
+    for (; index->seen_rows < index->name_count; index->seen_rows++) {
+        const binding_name_t *row = &index->names[index->seen_rows];
+        binding_seen_t *slot = &index->seen[binding_seen_slot(index->seen, index->seen_capacity,
+                                                              row->name, row->scope)];
+        if (!slot->name) {
+            *slot = (binding_seen_t){.name = row->name, .scope = row->scope};
+            index->seen_count++;
+        }
+        slot->import_root |= row->import_root;
+    }
+    if (!index->seen_capacity)
+        return NULL;
+    const binding_seen_t *found =
+        &index->seen[binding_seen_slot(index->seen, index->seen_capacity, name, scope)];
+    return found->name ? found : NULL;
 }
 
 /* A value declaration never establishes callable identity. Mark both the
@@ -976,12 +1041,11 @@ static bool python_lexical_identifier(const char *parent, const char *field_name
 /* A parameter or local spelled `vars` or `eval` is not the builtin. Source
  * order suffices: a parameter or earlier binder has already been recorded, and
  * this runs only for the few identifiers spelled like a dynamic builtin. */
-static bool python_name_shadowed(const cbm_resolve_binding_index_t *index, const char *name) {
+static bool python_name_shadowed(cbm_resolve_binding_index_t *index, const char *name) {
     uint32_t scope = index->current_scope;
     for (unsigned depth = 0; depth < BINDING_MAX_DEPTH; depth++) {
-        for (size_t i = 0; i < index->name_count; i++)
-            if (index->names[i].scope == scope && !strcmp(index->names[i].name, name))
-                return true;
+        if (binding_seen_find(index, name, scope))
+            return true;
         if (!scope || scope >= index->scope_count)
             return false;
         scope = index->scopes[scope].parent;
@@ -1143,12 +1207,9 @@ static void python_note_nested_import(cbm_resolve_binding_index_t *index, TSNode
     index->names[index->name_count - 1].nested_import = (uint32_t)index->python_nested_count;
 }
 
-static bool python_root_import_bound(const cbm_resolve_binding_index_t *index, const char *name) {
-    for (size_t i = 0; name && i < index->name_count; i++)
-        if (index->names[i].import_root && index->names[i].scope == index->current_scope &&
-            !strcmp(index->names[i].name, name))
-            return true;
-    return false;
+static bool python_root_import_bound(cbm_resolve_binding_index_t *index, const char *name) {
+    const binding_seen_t *seen = name ? binding_seen_find(index, name, index->current_scope) : NULL;
+    return seen && seen->import_root;
 }
 
 static void note_import(cbm_resolve_binding_index_t *index, TSNode node, bool nested);
@@ -1493,20 +1554,57 @@ static const char *python_annotation_chain(cbm_resolve_binding_index_t *index, T
 /* The top-level imports the extractor recorded, joined with the rest of a chain:
  * `functools.wraps` for both `import functools; functools.wraps` and
  * `from functools import wraps`. NULL when the root is not such an import. */
+static int python_import_order_compare(const void *left, const void *right) {
+    const CBMImport *a = *(const CBMImport *const *)left, *b = *(const CBMImport *const *)right;
+    int order = strcmp(a->local_name, b->local_name);
+    return order ? order : (a > b) - (a < b);
+}
+/* A file's imports by local name and, within a name, in source order. */
+static void python_import_order(cbm_resolve_binding_index_t *index) {
+    index->python_import_order_ready = true;
+    int count = index->result->imports.count;
+    const CBMImport **order =
+        count > 0 ? cbm_arena_alloc(index->arena, (size_t)count * sizeof(*order)) : NULL;
+    if (!order)
+        return;
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        const CBMImport *import = &index->result->imports.items[i];
+        if (import->local_name && import->module_path)
+            order[used++] = import;
+    }
+    qsort(order, used, sizeof(*order), python_import_order_compare);
+    index->python_import_order = order;
+    index->python_import_order_count = used;
+}
 static const char *python_import_canonical(const cbm_resolve_binding_index_t *index,
                                            const char *chain) {
     size_t root = strcspn(chain, ".(");
-    for (int i = 0; i < index->result->imports.count; i++) {
-        const CBMImport *import = &index->result->imports.items[i];
-        if (!import->local_name || !import->module_path || strlen(import->local_name) != root ||
-            strncmp(import->local_name, chain, root))
-            continue;
-        if (import->kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT &&
-            strcmp(import->module_path, import->local_name))
-            return cbm_arena_strdup(index->arena, chain);
-        return cbm_arena_sprintf(index->arena, "%s%s", import->module_path, chain + root);
+    /* The order is a private cache of this one thread's index, even behind a const reader. */
+    if (!index->python_import_order_ready)
+        python_import_order((cbm_resolve_binding_index_t *)index);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    size_t low = 0, high = index->python_import_order_count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        const char *name = index->python_import_order[mid]->local_name;
+        int compare = strncmp(name, chain, root);
+        if (!compare && name[root])
+            compare = 1;
+        if (compare < 0)
+            low = mid + 1;
+        else
+            high = mid;
     }
-    return NULL;
+    if (low == index->python_import_order_count)
+        return NULL;
+    const CBMImport *import = index->python_import_order[low];
+    if (strlen(import->local_name) != root || strncmp(import->local_name, chain, root))
+        return NULL;
+    if (import->kind == CBM_IMPORT_KIND_PYTHON_MODULE_ROOT &&
+        strcmp(import->module_path, import->local_name))
+        return cbm_arena_strdup(index->arena, chain);
+    return cbm_arena_sprintf(index->arena, "%s%s", import->module_path, chain + root);
 }
 
 /* Every path through the block ends in return or raise: it cannot fall off the
@@ -4752,23 +4850,84 @@ static void js_apply_writes(cbm_resolve_binding_index_t *index) {
 /* Join each source declaration to its extracted definition by name and exact
  * lines. A function const gains callable identity from that definition; a
  * nested declaration has no target except through this join. */
+static int js_value_compare(const void *left, const void *right) {
+    const binding_name_t *a = *(const binding_name_t *const *)left;
+    const binding_name_t *b = *(const binding_name_t *const *)right;
+    int order = strcmp(a->name, b->name);
+    if (!order && (a->flags & BINDING_VALUE_DECLARATION) && !(a->flags & BINDING_FUNCTION_VALUE))
+        return strcmp(a->target, b->target);
+    if (!order)
+        order = (a->value_start_line > b->value_start_line) -
+                (a->value_start_line < b->value_start_line);
+    return order
+               ? order
+               : (a->value_end_line > b->value_end_line) - (a->value_end_line < b->value_end_line);
+}
+/* The rows one definition can touch: same name, and either the same value lines or, for a
+ * value declaration, the same target. A join on the name alone is quadratic in a name that
+ * repeats, as `data` or `render` does across a generated file. Which of the two a row is
+ * depends only on its flags, which this audit does not change until every join is done. */
+static const binding_name_t **js_value_rows(cbm_resolve_binding_index_t *index, bool declaration,
+                                            size_t *count) {
+    *count = 0;
+    const binding_name_t **rows =
+        index->name_count ? cbm_arena_alloc(index->arena, index->name_count * sizeof(*rows)) : NULL;
+    for (size_t n = 0; rows && n < index->name_count; n++) {
+        const binding_name_t *row = &index->names[n];
+        bool value =
+            (row->flags & BINDING_VALUE_DECLARATION) && !(row->flags & BINDING_FUNCTION_VALUE);
+        if (declaration ? value && row->target
+                        : !value && ((row->flags & BINDING_FUNCTION_VALUE) ||
+                                     (row->scope && (row->flags & (BINDING_DECLARATION |
+                                                                   BINDING_TYPE_DECLARATION)))))
+            rows[(*count)++] = row;
+    }
+    if (*count > 1)
+        qsort(rows, *count, sizeof(*rows), js_value_compare);
+    return rows;
+}
+static size_t js_value_first(const binding_name_t **rows, size_t count, const binding_name_t *key) {
+    size_t low = 0, high = count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (js_value_compare(&rows[mid], &key) < 0)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    return low;
+}
 static void audit_javascript_values(cbm_resolve_binding_index_t *index) {
+    size_t line_count = 0, target_count = 0;
+    const binding_name_t **by_lines = js_value_rows(index, false, &line_count);
+    const binding_name_t **by_target = js_value_rows(index, true, &target_count);
+    if (index->name_count && (!by_lines || !by_target)) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "binding_allocation");
+        return;
+    }
     for (int d = 0; d < index->result->defs.count; d++) {
         const CBMDefinition *definition = &index->result->defs.items[d];
         if (!definition->name || !definition->qualified_name)
             continue;
-        binding_name_t key = {.name = definition->name};
-        size_t low = 0, high = index->name_count;
-        while (low < high) {
-            size_t mid = low + (high - low) / 2;
-            if (strcmp(index->names[mid].name, key.name) < 0)
-                low = mid + 1;
-            else
-                high = mid;
-        }
-        for (size_t r = low;
-             r < index->name_count && !strcmp(index->names[r].name, definition->name); r++) {
-            binding_name_t *binding = &index->names[r];
+        binding_name_t line_key = {.name = definition->name,
+                                   .value_start_line = (uint32_t)definition->start_line,
+                                   .value_end_line = (uint32_t)definition->end_line};
+        binding_name_t target_key = {.name = definition->name,
+                                     .target = definition->qualified_name,
+                                     .flags = BINDING_VALUE_DECLARATION};
+        const binding_name_t *line_probe = &line_key, *target_probe = &target_key;
+        size_t at_line = js_value_first(by_lines, line_count, line_probe);
+        size_t at_target = js_value_first(by_target, target_count, target_probe);
+        for (;;) {
+            binding_name_t *binding = NULL;
+            if (at_line < line_count && !js_value_compare(&by_lines[at_line], &line_probe))
+                binding = (binding_name_t *)by_lines[at_line++];
+            else if (at_target < target_count &&
+                     !js_value_compare(&by_target[at_target], &target_probe))
+                binding = (binding_name_t *)by_target[at_target++];
+            if (!binding)
+                break;
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_CANDIDATE_VISITS, 1);
             bool lines = definition->start_line == binding->value_start_line &&
                          definition->end_line == binding->value_end_line;
             if (binding->flags & BINDING_FUNCTION_VALUE) {
@@ -5511,7 +5670,7 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
             owned_tree = language == CBM_LANG_RUST
                              ? cbm_parse_rust_file(parser, result->source_file, source,
                                                    (uint32_t)source_len, (TSParseOptions){0})
-                             : ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+                             : cbm_parse_plain(parser, source, (uint32_t)source_len);
         }
         if (parser) {
             ts_parser_delete(parser);
@@ -5546,6 +5705,8 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
             index->javascript_module = true;
         }
     }
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     if (!tree || (ts_node_has_error(ts_tree_root_node(tree)) && !inert_gaps) ||
         ts_node_end_byte(ts_tree_root_node(tree)) != tree_end) {
         index->reason = "incomplete_binding_tree";
@@ -5577,9 +5738,13 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
         }
         if (index->analysis == CBM_RESOLVE_ANALYSIS_COMPLETE) {
             if (javascript_language(language))
-                index->javascript_module |=
-                    declared_module || javascript_module_by_source(result, language);
+                index->javascript_module |= javascript_module_by_source(result, language);
             walk_tree(index, ts_tree_root_node(tree));
+            if (javascript_language(language)) {
+                index->javascript_module_declared_only =
+                    declared_module && !index->javascript_module;
+                index->javascript_module |= declared_module;
+            }
             if (language == CBM_LANG_PYTHON) {
                 python_namespace_effects(index, ts_tree_root_node(tree));
                 python_finish_narrows(index);
@@ -5615,9 +5780,21 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
         audit_http_escapes(index);
         audit_http_default(index, ts_tree_root_node(tree));
     }
+    cbm_syntax_index_end(&syntax);
     if (owned_tree)
         ts_tree_delete(owned_tree);
     return index;
+}
+
+bool cbm_resolve_binding_needs_declared_module(const cbm_resolve_binding_index_t *index) {
+    return index && index->javascript_module_declared_only;
+}
+
+void cbm_resolve_binding_release_source(cbm_resolve_binding_index_t *index) {
+    if (index) {
+        index->source = NULL;
+        index->source_len = 0;
+    }
 }
 
 cbm_resolve_binding_index_t *cbm_resolve_binding_build_declared_module(

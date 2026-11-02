@@ -32,6 +32,7 @@ enum {
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
+#include "resolve/syntax_index.h"
 
 // --- Portable substring search ---
 

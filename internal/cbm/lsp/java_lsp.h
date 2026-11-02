@@ -29,6 +29,7 @@
  *      enforced by lsp_resolve.h).
  */
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "../resolve/types.h"
@@ -73,7 +74,14 @@ typedef struct {
     const char **import_target_qns;
     int *import_kinds;
     int import_count;
+    CBMNameRows import_rows;
     int import_cap;
+
+    /* While signatures are patched: the registered functions' QNs, by name. */
+    const char **func_names;
+    int func_name_count;
+    CBMNameRows func_rows;
+    CBMArena *func_rows_arena;
 
     /* Current enclosing context. */
     const char *enclosing_method_qn;    /* QN of the nearest method/ctor */
@@ -95,6 +103,16 @@ typedef struct {
     /* Debug mode (CBM_LSP_DEBUG env). */
     bool debug;
 } JavaLSPContext;
+
+/* The imports with this local name, in table order. */
+static inline int java_import_first(JavaLSPContext *ctx, const char *name) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                               ctx->import_count, name);
+}
+static inline int java_import_next(const JavaLSPContext *ctx, const char *name, int row) {
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names, ctx->import_count, name,
+                              row);
+}
 
 bool cbm_java_collect_source_facts(CBMArena *arena, const char *source, int source_len,
                                    const char *module_qn, CBMLSPDef *defs, int def_count);

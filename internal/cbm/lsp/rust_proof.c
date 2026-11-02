@@ -7,6 +7,7 @@
 #include "foundation/hash_table.h"
 #include <stdlib.h>
 #include <string.h>
+#include "../resolve/syntax_index.h"
 
 typedef struct {
     const char *qn;
@@ -235,6 +236,8 @@ bool cbm_rust_collect_source_facts(CBMArena *arena, const char *source, int leng
                           .source = source,
                           .length = (size_t)length,
                           .failed = ts_node_has_error(root)};
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     facts.primitive_domain = rsp_primitive_domain(&facts, root);
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     if (!facts.failed && ts_tree_cursor_goto_first_child(&cursor))
@@ -249,6 +252,7 @@ bool cbm_rust_collect_source_facts(CBMArena *arena, const char *source, int leng
                 facts.failed = true;
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+    cbm_syntax_index_end(&syntax);
     ts_tree_delete(tree);
     if (facts.failed)
         return false;
@@ -835,6 +839,8 @@ static void rust_proof_resolve(CBMArena *arena, const char *source, int length,
     if (!tree)
         return;
     TSNode root = ts_tree_root_node(tree);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     /* Append through a private descriptor; publish only after complete analysis.
      * Arena growth preserves the original buffer and its committed prefix. */
     CBMResolvedCallArray staged = *out;
@@ -925,6 +931,7 @@ static void rust_proof_resolve(CBMArena *arena, const char *source, int length,
     cbm_ht_free(context.imports);
     cbm_ht_free(context.callers);
     cbm_ht_free(context.local_types);
+    cbm_syntax_index_end(&syntax);
     ts_tree_delete(tree);
 }
 

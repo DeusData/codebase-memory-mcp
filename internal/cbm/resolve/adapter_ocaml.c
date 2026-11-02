@@ -42,6 +42,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 #define OCAML_OPEN_ENDED "&open_ended"
 #define OCAML_MODULE_PREFIX "&module:"

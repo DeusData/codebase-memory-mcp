@@ -665,6 +665,27 @@ TEST(resolver_ts_duplicate_method_declarations_abstain) {
     PASS();
 }
 
+/* Sorted by start, the nested function's narrowing is the last one before the final call, and it
+ * ended before that call. The outer one still covers it; nothing covers the function after them. */
+TEST(resolver_ts_narrowing_outlives_a_nested_one) {
+    static const char source[] = "class C { run() {} } class D extends C { run() {} }\n"
+                                 "function outer(a: C) {\n"
+                                 "  if (a instanceof D) { a.run(); }\n"
+                                 "  function inner(a: C) { if (a instanceof D) { a.run(); } }\n"
+                                 "  a.run();\n"
+                                 "}\n"
+                                 "function after(a: C) { a.run(); }\n";
+    CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), CBM_LANG_TYPESCRIPT, "test",
+                                           "main.ts", 0, NULL, NULL);
+    ASSERT_NOT_NULL(file);
+    int declared = ts_proved_count(&file->resolved_calls, "test.main.C.run");
+    int narrower = ts_proved_count(&file->resolved_calls, "test.main.D.run");
+    cbm_free_result(file);
+    ASSERT_EQ(declared, 1);
+    ASSERT_EQ(narrower, 0);
+    PASS();
+}
+
 SUITE(resolver_ts) {
     RUN_TEST(resolver_ts_declared_receiver_selects_exact_occurrence);
     RUN_TEST(resolver_ts_unknown_union_and_later_shadow_abstain);
@@ -684,6 +705,7 @@ SUITE(resolver_ts) {
     RUN_TEST(resolver_ts_annotation_type_refs_are_exact_occurrences);
     RUN_TEST(resolver_ts_this_of_a_literal_method_is_not_the_class);
     RUN_TEST(resolver_ts_imported_type_requires_export_binding);
+    RUN_TEST(resolver_ts_narrowing_outlives_a_nested_one);
     RUN_TEST(resolver_ts_overlay_copies_coalesce_only_same_declaration);
     RUN_TEST(resolver_ts_duplicate_method_declarations_abstain);
 }

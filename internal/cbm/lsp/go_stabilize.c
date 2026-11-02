@@ -1,3 +1,4 @@
+#include "foundation/fast_format.h"
 #include "go_stabilize.h"
 #include "../helpers.h"
 #include "../resolve/policy.h"
@@ -7,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../resolve/syntax_index.h"
 
 extern const TSLanguage *tree_sitter_go(void);
 
@@ -2007,6 +2009,8 @@ bool cbm_go_stabilization_collect(cbm_go_stabilization_t *state, const CBMFileRe
     if (!tree)
         return false;
     TSNode root = ts_tree_root_node(tree);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     go_collect_t c = {.shared = state,
                       .result = result,
                       .source = source,
@@ -2038,6 +2042,7 @@ bool cbm_go_stabilization_collect(cbm_go_stabilization_t *state, const CBMFileRe
         cbm_ht_free(c.definitions);
         cbm_ht_free(c.calls);
         cbm_arena_destroy(&c.call_arena);
+        cbm_syntax_index_end(&syntax);
         ts_tree_delete(tree);
         return false;
     }
@@ -2161,6 +2166,7 @@ bool cbm_go_stabilization_collect(cbm_go_stabilization_t *state, const CBMFileRe
     cbm_ht_free(c.definitions);
     cbm_ht_free(c.calls);
     cbm_arena_destroy(&c.call_arena);
+    cbm_syntax_index_end(&syntax);
     ts_tree_delete(tree);
     return !state->failed;
 }
@@ -2438,12 +2444,21 @@ bool cbm_go_stabilization_call(const cbm_go_stabilization_t *state, const char *
         return false;
     /* Query keys live only for this call; shared tables and proof pools are read-only. */
     char key[4096];
-    int n = snprintf(key, sizeof(key), "go/site:%zu:%s:%u:%u", strlen(file), file, start, end);
-    if (n < 0 || (size_t)n >= sizeof(key)) {
+    size_t file_length = strlen(file);
+    if (file_length + 3 * CBM_PUT_U64_MAX + sizeof("go/site:::") >= sizeof(key)) {
         *out = (cbm_resolve_result_t){.analysis = CBM_RESOLVE_ANALYSIS_LIMITED,
                                       .reason = "shared_occurrence_identity_limit"};
         return true;
     }
+    char *key_end = cbm_put_text(key, "go/site:", sizeof("go/site:") - 1);
+    key_end = cbm_put_u64(key_end, file_length);
+    *key_end++ = ':';
+    key_end = cbm_put_text(key_end, file, file_length);
+    *key_end++ = ':';
+    key_end = cbm_put_u64(key_end, start);
+    *key_end++ = ':';
+    key_end = cbm_put_u64(key_end, end);
+    *key_end = '\0';
     const go_site_t *site = cbm_ht_get(state->sites, key);
     if (!site || !site->scope || strcmp(site->scope, scope))
         return false;

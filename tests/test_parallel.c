@@ -903,6 +903,26 @@ TEST(parallel_post_extract_projection_spills_before_resolve) {
     PASS();
 }
 
+/* What resolve was measured to add, in MB, on the release build. A projection under
+ * any of these keeps results in memory on a run that then goes over its budget. */
+TEST(parallel_post_extract_projection_covers_the_measured_growth) {
+    static const struct {
+        int64_t defs, refs, files, growth_mb;
+    } measured[] = {
+        {747710, 8543542, 40698, 26486}, /* elasticsearch */
+        {714993, 5377047, 21907, 8384},  /* kubernetes */
+        {286702, 2111808, 8195, 3301},   /* kilocode */
+        {95488, 591412, 5462, 1250},     /* django */
+        {50286, 424639, 5247, 899},      /* exposed */
+    };
+    for (size_t i = 0; i < sizeof(measured) / sizeof(measured[0]); i++) {
+        size_t projected = cbm_parallel_post_extract_growth_bytes(
+            measured[i].defs, measured[i].refs, measured[i].files);
+        ASSERT_GTE(projected, (size_t)measured[i].growth_mb * 1024 * 1024);
+    }
+    PASS();
+}
+
 /* ── Sequential cache: held like the parallel one ─────────────────── */
 
 /* The parallel extract caches each result without its parse tree and
@@ -7039,6 +7059,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_spill_mode_builds_the_same_graph);
     RUN_TEST(parallel_post_extract_projection_spills_before_resolve);
+    RUN_TEST(parallel_post_extract_projection_covers_the_measured_growth);
     RUN_TEST(sequential_definitions_cache_drops_trees_and_compacts);
     RUN_TEST(sequential_definitions_configured_failure_releases_work_arena);
     RUN_TEST(parallel_empty_files);

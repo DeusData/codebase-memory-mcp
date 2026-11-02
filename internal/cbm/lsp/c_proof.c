@@ -4,6 +4,7 @@
 #include "../callable_sig.h"
 #include "../helpers.h"
 #include "foundation/hash_table.h"
+#include "../resolve/syntax_index.h"
 #include <string.h>
 
 typedef struct {

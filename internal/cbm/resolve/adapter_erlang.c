@@ -15,6 +15,7 @@
  * function name in that module, which is what the graph can represent. */
 #include "source_adapter_internal.h"
 #include <stdlib.h>
+#include "syntax_index.h"
 
 enum { ERLANG_FLAG_EXPORTED = CBM_SOURCE_DECL_F_PUBLIC };
 

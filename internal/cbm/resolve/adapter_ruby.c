@@ -51,6 +51,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 enum { RUBY_MAX_NEST = 32, RUBY_MAX_BASES = 64 };
 

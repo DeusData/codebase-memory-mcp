@@ -1063,7 +1063,124 @@ TEST(sw_publish_failure_reports_the_rename_not_the_cleanup) {
     PASS();
 }
 
+static bool sw_scalar(sqlite3 *db, const char *sql, long long *out) {
+    sqlite3_stmt *stmt = NULL;
+    bool ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+              sqlite3_step(stmt) == SQLITE_ROW;
+    if (ok)
+        *out = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* Streamed tables interleave their pages and take every value width, NULL, a blob, text past
+ * the local payload limit (the writer spills it) and enough rows for interior pages. Tables
+ * begun before nodes share the file with them, and SQLite must find every row by key. */
+TEST(sw_streamed_tables_read_back) {
+    enum { ROWS = 200000, HUGE_ROW = 7, HUGE_TEXT = 200000 };
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+    cbm_db_writer_t *w = cbm_writer_open(path);
+    ASSERT_NOT_NULL(w);
+    static const char first_sql[] =
+        "CREATE TABLE stream_first(k INTEGER NOT NULL,o INTEGER NOT NULL,v TEXT,b BLOB,n INTEGER,"
+        "PRIMARY KEY(k,o)) WITHOUT ROWID";
+    static const char second_sql[] =
+        "CREATE TABLE stream_second(k INTEGER PRIMARY KEY,v INTEGER NOT NULL) WITHOUT ROWID";
+    static const char empty_sql[] =
+        "CREATE TABLE stream_empty(k INTEGER PRIMARY KEY) WITHOUT ROWID";
+    cbm_writer_table_t *first = cbm_writer_table_begin(w, "stream_first", first_sql);
+    cbm_writer_table_t *second = cbm_writer_table_begin(w, "stream_second", second_sql);
+    cbm_writer_table_t *empty = cbm_writer_table_begin(w, "stream_empty", empty_sql);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_NOT_NULL(empty);
+    char *huge = malloc(HUGE_TEXT + 1);
+    ASSERT_NOT_NULL(huge);
+    memset(huge, 'x', HUGE_TEXT);
+    huge[HUGE_TEXT] = '\0';
+    bool written = true;
+    for (int i = 0; written && i < ROWS; i++) {
+        char small_text[32];
+        snprintf(small_text, sizeof(small_text), "row_%d", i);
+        unsigned char digest[32] = {(unsigned char)i};
+        cbm_writer_row_begin(first);
+        cbm_writer_row_int(first, 1);
+        cbm_writer_row_int(first, i);
+        cbm_writer_row_text(first, i == HUGE_ROW ? huge : small_text);
+        cbm_writer_row_blob(first, digest, sizeof(digest));
+        if (i % 3)
+            cbm_writer_row_int(first, (long long)i * (i % 2 ? 100000 : -1));
+        else
+            cbm_writer_row_null(first);
+        written = cbm_writer_row_end(first);
+        cbm_writer_row_begin(second);
+        cbm_writer_row_int(second, i);
+        cbm_writer_row_int(second, i % 2);
+        written = written && cbm_writer_row_end(second);
+    }
+    free(huge);
+    ASSERT_TRUE(written);
+    ASSERT_TRUE(cbm_writer_table_end(first));
+    ASSERT_TRUE(cbm_writer_table_end(second));
+    ASSERT_TRUE(cbm_writer_table_end(empty));
+    CBMDumpNode node = {.id = 1,
+                        .project = "test",
+                        .label = "Function",
+                        .name = "n",
+                        .qualified_name = "test.n",
+                        .file_path = "f.c",
+                        .start_line = 1,
+                        .end_line = 2,
+                        .properties = "{}"};
+    ASSERT_EQ(cbm_writer_append_nodes(w, &node, 1), 0);
+    ASSERT_EQ(cbm_writer_finalize(w, "test", "/tmp/test", "2026-07-07T00:00:00Z", &node, 1, NULL, 0,
+                                  NULL, 0, NULL, 0),
+              0);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "ok");
+    sqlite3_finalize(stmt);
+    long long value = 0;
+    ASSERT_TRUE(sw_scalar(db, "SELECT count(*) FROM stream_first", &value));
+    ASSERT_EQ(value, ROWS);
+    ASSERT_TRUE(sw_scalar(db, "SELECT count(*) FROM stream_second", &value));
+    ASSERT_EQ(value, ROWS);
+    ASSERT_TRUE(sw_scalar(db, "SELECT count(*) FROM stream_empty", &value));
+    ASSERT_EQ(value, 0);
+    ASSERT_TRUE(sw_scalar(db, "SELECT count(*) FROM nodes", &value));
+    ASSERT_EQ(value, 1);
+    ASSERT_TRUE(sw_scalar(db, "SELECT length(v) FROM stream_first WHERE k=1 AND o=7", &value));
+    ASSERT_EQ(value, HUGE_TEXT);
+    ASSERT_TRUE(sw_scalar(db, "SELECT n FROM stream_first WHERE k=1 AND o=199999", &value));
+    ASSERT_EQ(value, 199999LL * 100000);
+    ASSERT_TRUE(sw_scalar(db, "SELECT n FROM stream_first WHERE k=1 AND o=100000", &value));
+    ASSERT_EQ(value, -100000);
+    ASSERT_TRUE(sw_scalar(db, "SELECT count(*) FROM stream_first WHERE k=1 AND o=99999 AND n IS NULL",
+                          &value));
+    ASSERT_EQ(value, 1);
+    ASSERT_TRUE(sw_scalar(db, "SELECT length(b) FROM stream_first WHERE k=1 AND o=5", &value));
+    ASSERT_EQ(value, 32);
+    ASSERT_TRUE(sw_scalar(db, "SELECT v FROM stream_second WHERE k=123457", &value));
+    ASSERT_EQ(value, 1);
+    /* Ordinary tables: SQLite can go on writing to them. */
+    ASSERT_EQ(sqlite3_exec(db, "INSERT INTO stream_empty VALUES(5);"
+                               "INSERT INTO stream_second VALUES(9999999,1);"
+                               "DELETE FROM stream_second WHERE k<100;"
+                               "PRAGMA integrity_check;",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+    cbm_unlink(path);
+    PASS();
+}
+
 SUITE(sqlite_writer) {
+    RUN_TEST(sw_streamed_tables_read_back);
     RUN_TEST(sw_minimal_data);
     RUN_TEST(sw_imports_local_name_unique);
     RUN_TEST(sw_scale_and_indexes);

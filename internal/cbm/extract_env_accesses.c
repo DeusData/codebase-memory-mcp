@@ -9,6 +9,7 @@
 #include <stdint.h>          // uint32_t
 #include <string.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 /* Minimum length for an env var name (e.g., "DB"). */
 enum { MIN_ENV_NAME_LEN = 2 };

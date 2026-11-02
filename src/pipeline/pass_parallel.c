@@ -99,6 +99,8 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "foundation/fast_format.h"
+#include "pipeline/binding_cache.h"
 #include "pipeline/shared_resolver.h"
 #include "pipeline/worker_pool.h"
 #include "resolve/policy.h"
@@ -1075,25 +1077,32 @@ static int pp_spill_sweep(extract_ctx_t *ec, int worker_id) {
  * So extraction end projects that growth from the result counts and spills
  * before handing over when charged + growth would cross the latch. A pure
  * function of counts (O9): the same repo decides the same way on every run.
- * Per-unit costs fitted 2026-09-25 (M5 Pro, release build, 8 workers) on the
- * charge growth from the parallel_extract mark to the parallel_resolve mark:
+ * Per-unit costs refitted 2026-11-02 for the strict resolver, whose proofs and
+ * occurrences made resolve grow far more per reference than the 160 bytes fitted
+ * before it (elasticsearch: projected 2534 MB, 25549 MB measured, 28.8 GB charged
+ * against a 24 GB budget with spill never entered). Charge growth from the
+ * parallel_extract mark to the parallel_resolve mark, default workers:
  *
- *   corpus    files   defs    calls+usages  growth   model
- *   go        21882  735895     5,504,282   1307 MB  1909 MB
- *   django     4169   75419       591,350    231 MB   215 MB
- *   kotlin     5247   49669       421,788    129 MB   166 MB
- *   rust        818   23717       265,957     79 MB    76 MB
- *   php        2435   14691       137,969     47 MB    58 MB
- *   openclaw  48203  748829   >= 7,402,832   2151 MB >= 2419 MB
+ *   corpus         files   defs    calls+usages  growth    model
+ *   elasticsearch  40698  747710     8,543,542  26486 MB  28933 MB
+ *   kubernetes     21907  714993     5,377,047   8384 MB  18479 MB
+ *   kilocode        8195  286702     2,111,808   3301 MB   7262 MB
+ *   django          5462   95488       591,412   1250 MB   2077 MB
+ *   exposed         5247   50286       424,639    899 MB   1479 MB
  *
- * It never under-reads by more than 7% (inside the budget/16 margin) and
- * over-reads Go by 46% -- the safe side: an unneeded spill costs disk reads,
- * never graph content (spilled and in-memory runs build the same graph). */
+ * It is fitted to the most expensive language per reference, Java, so it over-reads
+ * the others -- the safe side: an unneeded spill costs disk reads, never graph
+ * content (spilled and in-memory runs build the same graph). */
 enum {
     PP_POST_BYTES_PER_DEF = 1280,  /* registry entry + LSP def + cross registries */
-    PP_POST_BYTES_PER_REF = 160,   /* per call / usage: resolved edge + appends */
+    PP_POST_BYTES_PER_REF = 3400,  /* per call / usage: edge, proofs, occurrence, appends */
     PP_POST_BYTES_PER_FILE = 8192, /* per-file tables: modules, surfaces, imports */
 };
+
+size_t cbm_parallel_post_extract_growth_bytes(int64_t defs, int64_t refs, int64_t files) {
+    return (size_t)defs * PP_POST_BYTES_PER_DEF + (size_t)refs * PP_POST_BYTES_PER_REF +
+           (size_t)files * PP_POST_BYTES_PER_FILE;
+}
 
 static size_t pp_post_extract_growth(const extract_ctx_t *ec, int64_t *defs_out,
                                      int64_t *refs_out) {
@@ -1108,8 +1117,7 @@ static size_t pp_post_extract_growth(const extract_ctx_t *ec, int64_t *defs_out,
     }
     *defs_out = defs;
     *refs_out = refs;
-    return (size_t)defs * PP_POST_BYTES_PER_DEF + (size_t)refs * PP_POST_BYTES_PER_REF +
-           (size_t)ec->file_count * PP_POST_BYTES_PER_FILE;
+    return cbm_parallel_post_extract_growth_bytes(defs, refs, ec->file_count);
 }
 
 /* Enter spill mode at extraction end when the projected post-extraction growth
@@ -2360,10 +2368,11 @@ void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool
     if (n > 0 && (size_t)n < CBM_SZ_2K - PP_ESC_SPACE) {
         size_t pos = append_args_json(props, CBM_SZ_2K, (size_t)n, call);
         if (with_line && call->start_line > 0 && pos < CBM_SZ_2K - PP_LINE_MARGIN) {
-            int ln = snprintf(props + pos, CBM_SZ_2K - pos, ",\"line\":%d", call->start_line);
-            if (ln > 0) {
-                pos += (size_t)ln;
-            }
+            /* PP_LINE_MARGIN above leaves room for the key and every digit of an int. */
+            char *end = cbm_put_text(props + pos, ",\"line\":", sizeof(",\"line\":") - 1);
+            end = cbm_put_u64(end, (uint64_t)call->start_line);
+            *end = '\0';
+            pos = (size_t)(end - props);
         }
         if (pos < CBM_SZ_2K - SKIP_ONE) {
             props[pos] = '}';
@@ -3181,14 +3190,18 @@ static char *lsp_idx_key(const char *caller_qn, const char *leaf, bool exact_sit
     if (!key) {
         return NULL;
     }
-    int written = exact_site
-                      ? snprintf(key, cap, "%s|%s|%u:%u|%u", caller_qn, leaf, site_start_byte,
-                                 site_end_byte, (unsigned)source_origin)
-                      : snprintf(key, cap, "%s|%s|%u", caller_qn, leaf, (unsigned)source_origin);
-    if (written <= 0 || (size_t)written >= cap) {
-        free(key);
-        return NULL;
+    char *at = cbm_put_text(key, caller_qn, caller_len);
+    *at++ = '|';
+    at = cbm_put_text(at, leaf, leaf_len);
+    *at++ = '|';
+    if (exact_site) {
+        at = cbm_put_u64(at, site_start_byte);
+        *at++ = ':';
+        at = cbm_put_u64(at, site_end_byte);
+        *at++ = '|';
     }
+    at = cbm_put_u64(at, (unsigned)source_origin);
+    *at = '\0';
     return key;
 }
 
@@ -4565,6 +4578,9 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
             continue;
         }
 
+        /* Cross-file LSP, proofs and the shared resolver each parse this file. */
+        cbm_parse_memo_begin();
+
         /* Build import map ONCE (read-only access to main_gbuf). The
          * same imp_keys/imp_vals feed both the fused cross-file LSP
          * step below AND the resolve_file_* chain — no duplicate build. */
@@ -4782,6 +4798,7 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
         }
 
     resolve_file_cleanup:
+        cbm_parse_memo_end();
         /* Capture the resolved file and side evidence before releasing either,
          * including files loaded from the spill store. */
         resolve_capture_coverage(rc, rel, result, evidence);
@@ -4809,6 +4826,7 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
         ws->loaded = NULL;
     }
     cbm_pxc_set_rust_manifest(NULL);
+    cbm_parse_memo_end();
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_kind_in_set_free_cache(); /* a damaged source file's scan fills it here too */
@@ -4866,6 +4884,9 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_semantic_bindings_t *structural_bindings =
         cbm_semantic_bindings_build(ctx, files, file_count, result_cache);
+    /* The indexes hold memory the workers need, and each worker builds its own. */
+    cbm_binding_cache_free(ctx->binding_cache);
+    ctx->binding_cache = NULL;
     if (!structural_bindings) {
         cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
         cbm_aligned_free(workers);

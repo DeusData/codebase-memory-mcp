@@ -1,6 +1,7 @@
 #ifndef CBM_LSP_TS_LSP_H
 #define CBM_LSP_TS_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -33,6 +34,8 @@ typedef struct {
     const char **import_local_names;
     const char **import_module_qns;
     int import_count;
+    int import_capacity;
+    CBMNameRows import_rows;
 
     // Renamed named imports (`import { foo as bar }`): local binding -> the name
     // the module exports. Parallel arrays of length import_alias_count; a
@@ -78,6 +81,16 @@ typedef struct {
     struct CBMTSProofAudit *proof_audit;
     CBMResolveTypeMap proven_types;
 } TSLSPContext;
+
+/* The imports with this local name, in table order. */
+static inline int ts_import_first(TSLSPContext *ctx, const char *name) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                               ctx->import_count, name);
+}
+static inline int ts_import_next(const TSLSPContext *ctx, const char *name, int row) {
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names, ctx->import_count, name,
+                              row);
+}
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 // Complexity-regression seam: remaining expression-eval budget / warned flag

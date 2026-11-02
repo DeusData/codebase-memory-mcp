@@ -455,6 +455,12 @@ typedef struct {
     cbm_shared_resolver_t *shared_resolver;
     /* ECMAScript export surfaces, ready before the cross-file type pass. */
     struct cbm_ecma_table *ecma_surfaces;
+    /* Binding indexes for the single-threaded preparation passes; see binding_cache.h. */
+    struct cbm_binding_cache *binding_cache;
+    /* Threads a preparation pass may use for pure per-file work; see parse_batch.h. */
+    int prepare_workers;
+    /* What this run's go.mod and go.work files say; see cbm_go_module_memo_new. */
+    struct cbm_go_module_memo *go_module_memo;
     /* Immutable Rust name model, sealed before import edges are projected. */
     struct cbm_rust_project *rust_project;
     cbm_resolve_stats_t *resolver_stats; /* run-owned; workers borrow until join */
@@ -1310,6 +1316,10 @@ struct CBMModuleDefIndex;
  * pulling lsp/go_lsp.h into every TU that includes pipeline_internal.h.
  * Callers cast a CBMCrossLspRegistries* (defined in pass_lsp_cross.h). */
 
+/* What the phases after extraction are projected to add to the charge, from the result
+ * counts. A pure function, so a run's spill decision can be checked without running it. */
+size_t cbm_parallel_post_extract_growth_bytes(int64_t defs, int64_t refs, int64_t files);
+
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count,
@@ -1834,6 +1844,8 @@ typedef struct {
      * proxy buffer has no section text or function tokens to recompute
      * them); a row whose node is gone resolves to nothing when read. */
     bool doc_candidates_in_place;
+    /* Threads for the digests of the resolver evidence; below 2 means this thread. */
+    int workers;
 } cbm_pipeline_generation_t;
 
 /* Serialize and fully populate a sibling staging database, then atomically

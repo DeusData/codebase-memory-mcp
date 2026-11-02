@@ -39,6 +39,8 @@
  *   tuple_type, function_pointer_type.
  */
 
+#include "lsp_neg_memo.h"
+#include "lsp_work.h"
 #include "cs_lsp.h"
 #include "cs_proof.h"
 #include "lsp_node_iter.h"
@@ -3428,6 +3430,8 @@ static void cs_collect_class_fields(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
  * declared return type, then patching the registry's signatures.
  */
 
+enum { CS_MEMO_ARENA_BLOCK = 4096 };
+
 typedef struct {
     const char *qn;
     const CBMType *rt;
@@ -3437,16 +3441,16 @@ typedef struct {
     cs_method_rt_entry_t *items;
     int count;
     int cap;
+    CBMIdxMemo seen; /* a qualified name's row */
 } cs_method_rt_table_t;
 
 static void cs_method_rt_add(CBMArena *arena, cs_method_rt_table_t *tab, const char *qn,
                              const CBMType *rt) {
     if (!qn || !rt)
         return;
-    for (int i = 0; i < tab->count; i++) {
-        if (strcmp(tab->items[i].qn, qn) == 0)
-            return;
-    }
+    CBM_LSP_WORK(1);
+    if (cbm_idxmemo_get(&tab->seen, qn) >= 0)
+        return;
     if (tab->count + 1 >= tab->cap) {
         int new_cap = tab->cap ? tab->cap * 2 : 16;
         cs_method_rt_entry_t *ne =
@@ -3460,6 +3464,7 @@ static void cs_method_rt_add(CBMArena *arena, cs_method_rt_table_t *tab, const c
     }
     tab->items[tab->count].qn = qn;
     tab->items[tab->count].rt = rt;
+    cbm_idxmemo_put_if_absent(&tab->seen, arena, qn, tab->count);
     tab->count++;
 }
 
@@ -3577,26 +3582,29 @@ void cbm_cs_refine_ast_return_types(CSLSPContext *ctx, CBMTypeRegistry *reg, TSN
 
     cs_method_rt_table_t mtab = {0};
     cs_collect_method_return_types(ctx, root, &mtab);
+    /* Each method patches the first registration of its name. */
+    CBMArena memo_arena;
+    cbm_arena_init_lazy(&memo_arena, CS_MEMO_ARENA_BLOCK);
+    CBMIdxMemo first_of_name = {0};
+    for (int j = 0; mtab.count && j < reg->func_count; j++)
+        cbm_idxmemo_put_if_absent(&first_of_name, &memo_arena, reg->funcs[j].qualified_name, j);
     for (int i = 0; i < mtab.count; i++) {
         const char *qn = mtab.items[i].qn;
         const CBMType *rt = mtab.items[i].rt;
-        bool patched = false;
-        for (int j = 0; j < reg->func_count; j++) {
-            if (strcmp(reg->funcs[j].qualified_name, qn) == 0) {
-                const CBMType **rets =
-                    (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(const CBMType *));
-                if (rets) {
-                    rets[0] = rt;
-                    rets[1] = NULL;
-                    reg->funcs[j].signature =
-                        cbm_type_func_replace_returns(ctx->arena, reg->funcs[j].signature, rets);
-                }
-                patched = true;
-                break;
+        CBM_LSP_WORK(1);
+        int j = cbm_idxmemo_get(&first_of_name, qn);
+        if (j >= 0) {
+            const CBMType **rets =
+                (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(const CBMType *));
+            if (rets) {
+                rets[0] = rt;
+                rets[1] = NULL;
+                reg->funcs[j].signature =
+                    cbm_type_func_replace_returns(ctx->arena, reg->funcs[j].signature, rets);
             }
         }
-        (void)patched;
     }
+    cbm_arena_destroy(&memo_arena);
 }
 
 /* ── parse return type from CBMDefinition.return_type ──────────── */
@@ -3709,6 +3717,15 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         }
     }
 
+    /* The first registration of each name: the patches below ask once per definition. */
+    CBMArena memo_arena;
+    cbm_arena_init_lazy(&memo_arena, CS_MEMO_ARENA_BLOCK);
+    CBMIdxMemo first_func = {0}, first_type = {0};
+    for (int j = 0; j < reg.func_count; j++)
+        cbm_idxmemo_put_if_absent(&first_func, &memo_arena, reg.funcs[j].qualified_name, j);
+    for (int t = 0; t < reg.type_count; t++)
+        cbm_idxmemo_put_if_absent(&first_type, &memo_arena, reg.types[t].qualified_name, t);
+
     /* Phase C: build context for type resolution + run the resolver. */
     CSLSPContext ctx;
     cs_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
@@ -3731,15 +3748,14 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         const CBMType **param_types = cbm_type_materialize_signature_params(
             arena, d->signature_param_types, d->signature_param_count,
             cs_signature_param_type_adapter, &ctx);
-        for (int j = 0; j < reg.func_count; j++) {
-            if (strcmp(reg.funcs[j].qualified_name, d->qualified_name) != 0)
-                continue;
+        CBM_LSP_WORK(1);
+        int j = cbm_idxmemo_get(&first_func, d->qualified_name);
+        if (j >= 0) {
             const CBMType **return_types = NULL;
             if (reg.funcs[j].signature && reg.funcs[j].signature->kind == CBM_TYPE_FUNC) {
                 return_types = reg.funcs[j].signature->data.func.return_types;
             }
             reg.funcs[j].signature = cbm_type_func(arena, NULL, param_types, return_types);
-            break;
         }
     }
 
@@ -3753,17 +3769,16 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             continue;
         const CBMType *rt = cs_parse_return_type_text(&ctx, d->return_type);
         /* Find the registered func and patch its signature. */
-        for (int j = 0; j < reg.func_count; j++) {
-            if (strcmp(reg.funcs[j].qualified_name, d->qualified_name) == 0) {
-                const CBMType **rets =
-                    (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-                if (rets) {
-                    rets[0] = rt;
-                    rets[1] = NULL;
-                    reg.funcs[j].signature =
-                        cbm_type_func_replace_returns(arena, reg.funcs[j].signature, rets);
-                }
-                break;
+        CBM_LSP_WORK(1);
+        int j = cbm_idxmemo_get(&first_func, d->qualified_name);
+        if (j >= 0) {
+            const CBMType **rets =
+                (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+            if (rets) {
+                rets[0] = rt;
+                rets[1] = NULL;
+                reg.funcs[j].signature =
+                    cbm_type_func_replace_returns(arena, reg.funcs[j].signature, rets);
             }
         }
     }
@@ -3781,15 +3796,16 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             cs_fields_t *f = &tab.items[i];
             if (f->count == 0)
                 continue;
-            for (int t = 0; t < reg.type_count; t++) {
-                if (strcmp(reg.types[t].qualified_name, f->class_qn) == 0) {
-                    reg.types[t].field_names = f->field_names;
-                    reg.types[t].field_types = f->field_types;
-                    break;
-                }
+            CBM_LSP_WORK(1);
+            int t = cbm_idxmemo_get(&first_type, f->class_qn);
+            if (t >= 0) {
+                reg.types[t].field_names = f->field_names;
+                reg.types[t].field_types = f->field_types;
             }
         }
     }
+
+    cbm_arena_destroy(&memo_arena);
 
     /* Re-bind ctx state since collect_class_fields may have temporarily
      * adjusted namespace stack (it doesn't, but be safe). */

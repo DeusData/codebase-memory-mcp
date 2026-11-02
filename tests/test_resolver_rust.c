@@ -1615,6 +1615,73 @@ TEST(resolver_rust_trait_on_external_type_delegating_to_inherent) {
     PASS();
 }
 
+/* Enough impls on outside types to answer from rows by path and method: the same answers as the
+ * chains give, for a crate's Result alias, a delegating impl, two traits on one node, and two
+ * traits on two nodes. The first source stays under the rows' threshold, the second is over it. */
+#define RUST_OUTSIDE_IMPLS                                                                        \
+    "use std::process::Child as StdChild;\n"                                                      \
+    "mod a { pub trait One { fn apart(&self) -> u32; }\n"                                         \
+    " impl One for String { fn apart(&self) -> u32 { 1 } } }\n"                                   \
+    "mod b { pub trait Two { fn apart(&self) -> u32; }\n"                                         \
+    " impl Two for String { fn apart(&self) -> u32 { 2 } } }\n"                                   \
+    "use a::One;\nuse b::Two;\n"                                                                  \
+    "trait WithIndex<T> { fn with_index(self, i: usize) -> Option<T>; }\n"                        \
+    "impl<T, E> WithIndex<T> for Result<T, E> { fn with_index(self, i: usize) -> Option<T> { "    \
+    "self.ok() } }\n"                                                                             \
+    "trait Shout { fn shout(&self) -> String; }\n"                                                \
+    "impl Shout for String { fn shout(&self) -> String { self.clone() } }\n"                      \
+    "trait Wait { fn id(&self) -> u32; fn extra(&self) -> u32; }\n"                               \
+    "impl Wait for StdChild { fn id(&self) -> u32 { self.id() } fn extra(&self) -> u32 { 0 } }\n" \
+    "trait Three { fn near(&self) -> u32; }\n"                                                    \
+    "trait Four { fn near(&self) -> u32; }\n"                                                     \
+    "impl Three for String { fn near(&self) -> u32 { 3 } }\n"                                     \
+    "impl Four for String { fn near(&self) -> u32 { 4 } }\n"                                      \
+    "fn from_alias(r: heed::Result<u32>) { r.with_index(1); }\n"                                  \
+    "fn on_string(s: String) { s.shout(); }\n"                                                    \
+    "fn other_method(s: String) { s.len(); }\n"                                                   \
+    "fn inherent(c: StdChild) { c.id(); }\n"                                                      \
+    "fn trait_only(c: StdChild) { c.extra(); }\n"                                                 \
+    "fn one_node(s: String) { s.near(); }\n"                                                      \
+    "fn two_nodes(s: String) { s.apart(); }\n"                                                    \
+    "fn main() {}\n"
+#define RUST_OUTSIDE_IMPLS_MANIFEST \
+    "[package]\nname = \"demo\"\nedition = \"2021\"\n[dependencies]\nheed = \"1\"\n"
+#define RUST_OUTSIDE_IMPLS_ANSWERS(store)                                                          \
+    do {                                                                                           \
+        ASSERT_NOT_NULL(store);                                                                    \
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.from_alias", "src.main.Result.with_index"),  \
+                  1);                                                                              \
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.on_string", "src.main.String.shout"), 1);    \
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.other_method"), 0);                    \
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.inherent"), 0);                        \
+        ASSERT_EQ(rust_edge(store, "CALLS", "src.main.trait_only", "src.main.StdChild.extra"), 1); \
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.one_node"), 1);                        \
+        ASSERT_EQ(rust_edges_from(store, "CALLS", "src.main.two_nodes"), 0);                       \
+        ASSERT_TRUE(                                                                               \
+            rust_occurrence_reason(store, "CALLS", "c.id", "rust_external_receiver_method"));      \
+        ASSERT_TRUE(                                                                               \
+            rust_occurrence_reason(store, "CALLS", "s.apart", "rust_target_qn_collision"));        \
+    } while (0)
+TEST(resolver_rust_many_outside_impls_answer_as_few_do) {
+    static const rust_proof_file_t few[] = {{"Cargo.toml", RUST_OUTSIDE_IMPLS_MANIFEST},
+                                            {"src/main.rs", RUST_OUTSIDE_IMPLS}};
+    static const rust_proof_file_t many[] = {
+        {"Cargo.toml", RUST_OUTSIDE_IMPLS_MANIFEST},
+        {"src/main.rs",
+         "trait Pad { fn p0(&self); fn p1(&self); fn p2(&self); fn p3(&self); fn p4(&self);"
+         " fn p5(&self); fn p6(&self); fn p7(&self); fn p8(&self); }\n"
+         "impl Pad for u8 { fn p0(&self) {} fn p1(&self) {} fn p2(&self) {} fn p3(&self) {}"
+         " fn p4(&self) {} fn p5(&self) {} fn p6(&self) {} fn p7(&self) {} fn p8(&self) {} "
+         "}\n" RUST_OUTSIDE_IMPLS}};
+    RUST_ROUTES(store, root, few) {
+        RUST_OUTSIDE_IMPLS_ANSWERS(store);
+    }
+    RUST_ROUTES(store, root, many) {
+        RUST_OUTSIDE_IMPLS_ANSWERS(store);
+    }
+    PASS();
+}
+
 /* tokio's blocking.rs: `cfg_rt! { pub(crate) use crate::runtime::spawn_blocking; }` beside
  * `cfg_not_rt! { pub(crate) fn spawn_blocking() {} }`. Each configuration has a different declaration,
  * so neither is the answer. A plain #[cfg] twin is the same case. */
@@ -2629,6 +2696,7 @@ SUITE(resolver_rust) {
     RUN_TEST(resolver_rust_unrepaired_syntax_error_stays_unresolved);
     RUN_TEST(resolver_rust_spelled_external_type_takes_a_project_trait);
     RUN_TEST(resolver_rust_trait_on_external_type_delegating_to_inherent);
+    RUN_TEST(resolver_rust_many_outside_impls_answer_as_few_do);
     RUN_TEST(resolver_rust_conditional_use_beside_a_local_item_is_ambiguous);
     RUN_TEST(resolver_rust_wrapper_keeps_into_inner_for_itself);
     RUN_TEST(resolver_rust_pin_project_declares_its_struct);

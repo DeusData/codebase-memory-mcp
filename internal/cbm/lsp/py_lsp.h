@@ -1,6 +1,7 @@
 #ifndef CBM_LSP_PY_LSP_H
 #define CBM_LSP_PY_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -71,6 +72,9 @@ typedef struct {
     const char **import_module_qns;
     unsigned char *import_kinds; // internal PyDirectImportKind, classified once from the AST
     int import_count;
+    int import_capacity;
+    CBMNameRows import_rows;
+    struct PyImportJoin *import_join; // the statements' items by name, during a file's walk
 
     // Current function/class context for resolving `self`/`cls` and emitting
     // caller QNs.

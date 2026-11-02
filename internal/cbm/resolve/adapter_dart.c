@@ -32,6 +32,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 #define DART_LIBRARY_RECORD "&library"
 #define DART_CLASS_RECORD "&class"

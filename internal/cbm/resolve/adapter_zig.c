@@ -24,6 +24,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 enum { ZIG_MAX_RESOLVE_DEPTH = 16, ZIG_INITIAL_LOCALS = 32 };
 

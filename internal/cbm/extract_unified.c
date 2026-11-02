@@ -14,6 +14,7 @@ enum { MAX_INFRA_BINDINGS = 8 };
 #include <stdint.h> // uint32_t, uint8_t
 #include <string.h>
 #include <strings.h> // strcasecmp (ObjectScript type inference)
+#include "resolve/syntax_index.h"
 
 // --- Scope stack management ---
 
@@ -3059,6 +3060,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             CBMInvocationDescriptor invocation =
                 tf_module ? (CBMInvocationDescriptor){0} : handle_calls(ctx, node, spec, &state);
             if (!tf_module) {
+                state.walk_depth = depth;
                 handle_usages(ctx, node, spec, &state);
             }
             handle_throws(ctx, node, spec, &state);

@@ -7,6 +7,7 @@
 #include "foundation/hash_table.h"
 #include <stdlib.h>
 #include <string.h>
+#include "../resolve/syntax_index.h"
 
 typedef struct {
     const char *qn;
@@ -196,7 +197,7 @@ bool cbm_py_collect_source_facts(CBMArena *arena, const char *source, int length
     if (!parser)
         return false;
     ts_parser_set_language(parser, tree_sitter_python());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_plain(parser, source, (uint32_t)length);
     ts_parser_delete(parser);
     if (!tree)
         return false;
@@ -848,7 +849,7 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
     if (!parser)
         return;
     ts_parser_set_language(parser, tree_sitter_python());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_plain(parser, source, (uint32_t)length);
     ts_parser_delete(parser);
     if (!tree)
         return;
@@ -856,6 +857,8 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
     /* Append through a private descriptor; publish only after complete analysis.
      * Arena growth preserves the original buffer and its committed prefix. */
     CBMResolvedCallArray staged = *out;
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     pyp_context_t context = {.source = {.arena = arena,
                                         .source = source,
                                         .length = (size_t)length,
@@ -907,5 +910,6 @@ void cbm_py_proof_resolve(CBMArena *arena, const char *source, int length,
     cbm_ht_free(context.imports);
     cbm_ht_free(context.callers);
     cbm_ht_free(context.effects);
+    cbm_syntax_index_end(&syntax);
     ts_tree_delete(tree);
 }

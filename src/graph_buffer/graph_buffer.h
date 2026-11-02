@@ -9,6 +9,7 @@
 #ifndef CBM_GRAPH_BUFFER_H
 #define CBM_GRAPH_BUFFER_H
 
+#include "sqlite_writer.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -230,11 +231,13 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
+/* Several types in one walk of the edges and one rebuild of their indexes. */
+int cbm_gbuf_delete_edges_by_types(cbm_gbuf_t *gb, const char *const *types, size_t count);
 
-/* Delete all edges of a type that `keep` does not claim. */
+/* The same, leaving the edges `keep` claims. */
 typedef bool (*cbm_gbuf_edge_keep_fn)(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *edge);
-int cbm_gbuf_delete_edges_by_type_unless(cbm_gbuf_t *gb, const char *type,
-                                         cbm_gbuf_edge_keep_fn keep);
+int cbm_gbuf_delete_edges_by_types_unless(cbm_gbuf_t *gb, const char *const *types, size_t count,
+                                          cbm_gbuf_edge_keep_fn keep);
 
 /* Delete the edges of `type` whose source node has label `label`. */
 int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const char *label);
@@ -262,6 +265,11 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
  * Assigns sequential final IDs and remaps edge references.
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
+/* As above. tables runs once the file is open and before any node reaches it, to add
+ * tables of the caller's own; false fails the dump. */
+typedef bool (*cbm_gbuf_dump_tables_fn)(cbm_db_writer_t *writer, void *context);
+int cbm_gbuf_dump_to_sqlite_with(cbm_gbuf_t *gb, const char *path, cbm_gbuf_dump_tables_fn tables,
+                                 void *context);
 
 /* Flush the buffer to an existing store via the store API.
  * Deletes existing project data first. Returns 0 on success. */

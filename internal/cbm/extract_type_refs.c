@@ -12,6 +12,7 @@ enum { MIN_TYPE_LEN = 1 };
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 // Builtin types that should not generate USES_TYPE edges.
 static bool is_builtin_type(const char *name) {

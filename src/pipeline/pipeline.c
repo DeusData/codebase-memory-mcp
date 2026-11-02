@@ -20,6 +20,10 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 9 };
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/binding_cache.h"
+#include "pipeline/import_resolve.h"
+#include "foundation/fast_format.h"
+#include "store/store_resolver_evidence.h"
 #include "pipeline/doc_links.h"
 #include "pipeline/lsp_surface.h"
 #include "pipeline/lsp_resolve.h"
@@ -1451,14 +1455,28 @@ static char *unresolved_publication_key(const char *file, const char *scope, con
         cbm_utf8_lossy_dup(CBM_MEM_CLASS_RESOLVE, spelling, strlen(spelling), NULL);
     char *key = NULL;
     if (clean_file && clean_scope && clean_spelling) {
-        size_t cap = strlen(clean_file) + strlen(clean_scope) + strlen(clean_spelling) +
-                     strlen(content) + strlen(configuration) + 192;
+        const char *const parts[] = {clean_file, clean_scope, clean_spelling, content,
+                                     configuration};
+        size_t cap = 192;
+        for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++)
+            cap += strlen(parts[i]);
         key = cbm_alloc(CBM_MEM_CLASS_RESOLVE, cap);
-        if (key)
-            snprintf(key, cap, "%zu:%s|%zu:%s|%zu:%s|%zu:%s|%zu:%s|%u:%u:%u", strlen(clean_file),
-                     clean_file, strlen(clean_scope), clean_scope, strlen(clean_spelling),
-                     clean_spelling, strlen(content), content, strlen(configuration), configuration,
-                     start, end, origin);
+        if (key) {
+            char *at = key;
+            for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+                size_t length = strlen(parts[i]);
+                at = cbm_put_u64(at, length);
+                *at++ = ':';
+                at = cbm_put_text(at, parts[i], length);
+                *at++ = '|';
+            }
+            at = cbm_put_u64(at, start);
+            *at++ = ':';
+            at = cbm_put_u64(at, end);
+            *at++ = ':';
+            at = cbm_put_u64(at, origin);
+            *at = '\0';
+        }
     }
     cbm_free(CBM_MEM_CLASS_RESOLVE, clean_file);
     cbm_free(CBM_MEM_CLASS_RESOLVE, clean_scope);
@@ -3287,9 +3305,33 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 }
 
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */
+static int run_parallel_pipeline_body(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                      const cbm_file_info_t *files, int file_count,
+                                      int worker_count, struct timespec *t);
+
 static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                  const cbm_file_info_t *files, int file_count, int worker_count,
                                  struct timespec *t) {
+    ctx->go_module_memo = cbm_go_module_memo_new();
+    int rc = run_parallel_pipeline_body(p, ctx, files, file_count, worker_count, t);
+    cbm_go_module_memo_free(ctx->go_module_memo);
+    ctx->go_module_memo = NULL;
+    return rc;
+}
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Preparation builds its own indexes and parses, as it would with no cache to read. */
+bool cbm_pipeline_test_prepare_on_one_thread;
+#endif
+
+static int run_parallel_pipeline_body(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                      const cbm_file_info_t *files, int file_count,
+                                      int worker_count, struct timespec *t) {
+    ctx->prepare_workers = worker_count;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_pipeline_test_prepare_on_one_thread)
+        ctx->prepare_workers = 0;
+#endif
     cbm_log_info("pipeline.mode", "mode", "parallel", "workers", itoa_buf(worker_count), "files",
                  itoa_buf(file_count));
     _Atomic int64_t shared_ids;
@@ -3379,6 +3421,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * disk by now); the per-language cross registries share it. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
+    ctx->binding_cache =
+        cbm_binding_cache_build(ctx, files, file_count, cache, ctx->prepare_workers);
     CBM_PROF_START(t_collect_defs);
     if (run_cross_lsp) {
         ctx->ecma_surfaces = cbm_ecma_surfaces_build(ctx, files, file_count, cache);
@@ -3486,6 +3530,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
     if (rc == 0 && !cbm_gbuf_resolutions_own_shared(ctx->gbuf))
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+    cbm_binding_cache_free(ctx->binding_cache);
+    ctx->binding_cache = NULL;
     cbm_shared_resolver_free(ctx->shared_resolver);
     ctx->shared_resolver = NULL;
     cbm_ecma_surfaces_free(ctx->ecma_surfaces);
@@ -3776,11 +3822,16 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
     return promoted;
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* The evidence takes the SQL route, so a test can compare what the two routes store. */
+bool cbm_pipeline_test_resolver_stage_off;
+#endif
 /* Defined below, next to the other publication helpers. */
 static char *create_staging_path(const char *final_path);
 static char *create_staging_path_impl(const char *final_path, cbm_pipeline_t *frozen);
 static int publish_staged_impl(char *path, const cbm_pipeline_generation_t *generation,
-                               bool fts_wholesale, bool healthy, cbm_pipeline_t *frozen);
+                               bool fts_wholesale, bool healthy, cbm_pipeline_t *frozen,
+                               const cbm_resolver_stage_t *resolver_stage);
 static int finalize_staged_impl(char *path, const char *destination, atomic_int *cancelled,
                                 bool healthy, cbm_pipeline_t *frozen);
 
@@ -4104,6 +4155,33 @@ static int prepare_existing_generation_for_replace(const char *db_path,
     return 0;
 }
 
+/* A generation headed for a new file writes its evidence with the file. An incomplete one
+ * writes none here: publishing refuses it as it always did. */
+typedef struct {
+    const cbm_pipeline_generation_t *generation;
+    cbm_resolver_stage_t *stage;
+} resolver_stage_write_t;
+
+static bool resolver_stage_tables(cbm_db_writer_t *writer, void *context) {
+    resolver_stage_write_t *write = context;
+    const cbm_pipeline_generation_t *generation = write->generation;
+    if (!generation->gbuf || !cbm_gbuf_resolutions_complete(generation->gbuf))
+        return true;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (cbm_pipeline_test_resolver_stage_off)
+        return true;
+#endif
+    size_t count = 0, file_count = 0, summary_count = 0;
+    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(generation->gbuf, &count);
+    const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(generation->gbuf, &file_count);
+    const cbm_resolve_summary_t *summaries =
+        cbm_gbuf_resolver_summaries(generation->gbuf, &summary_count);
+    write->stage =
+        cbm_store_resolver_stage_write(writer, generation->project, rows, count, files, file_count,
+                                       summaries, summary_count, generation->workers);
+    return write->stage != NULL;
+}
+
 static int publish_generation_impl(const cbm_pipeline_generation_t *generation,
                                    cbm_pipeline_t *frozen) {
     if (!generation || !generation->gbuf || !generation->final_db_path || !generation->project ||
@@ -4133,26 +4211,34 @@ static int publish_generation_impl(const cbm_pipeline_generation_t *generation,
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
-    int dump_rc = cbm_gbuf_dump_to_sqlite(generation->gbuf, stage_path);
+    resolver_stage_write_t stage_write = {.generation = generation};
+    int dump_rc = cbm_gbuf_dump_to_sqlite_with(generation->gbuf, stage_path, resolver_stage_tables,
+                                               &stage_write);
     if (dump_rc != 0) {
+        cbm_store_resolver_stage_free(stage_write.stage);
         discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (cbm_pipeline_persist_test_take_failure_after_stage_dump()) {
+        cbm_store_resolver_stage_free(stage_write.stage);
         discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 #endif
     if (generation->cancelled && atomic_load(generation->cancelled)) {
+        cbm_store_resolver_stage_free(stage_write.stage);
         discard_generation_frozen(stage_path, frozen);
         free(stage_path);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
-    return publish_staged_impl(stage_path, generation, true, false, frozen);
+    int published =
+        publish_staged_impl(stage_path, generation, true, false, frozen, stage_write.stage);
+    cbm_store_resolver_stage_free(stage_write.stage);
+    return published;
 }
 
 /* Write the generation's doc_link_unresolved rows (plus the error marker when
@@ -4188,7 +4274,7 @@ static int publish_doc_links(cbm_store_t *store, const cbm_pipeline_generation_t
  * the nodes it created. */
 static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t *generation,
                                bool fts_wholesale, bool destination_known_healthy,
-                               cbm_pipeline_t *frozen) {
+                               cbm_pipeline_t *frozen, const cbm_resolver_stage_t *resolver_stage) {
     struct timespec t_pub;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     cbm_store_t *store = cbm_store_open_path(stage_path);
@@ -4221,7 +4307,11 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
     }
     /* Occurrence outcomes are part of this exact graph generation. They
      * publish atomically with it, including references that produced no edge. */
-    if (ok && generation->gbuf) {
+    if (ok && generation->gbuf && resolver_stage) {
+        ok = cbm_gbuf_resolutions_complete(generation->gbuf) &&
+             cbm_store_resolver_publish_stage(store, generation->project, resolver_stage) ==
+                 CBM_STORE_OK;
+    } else if (ok && generation->gbuf) {
         size_t count = 0;
         const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(generation->gbuf, &count);
         size_t file_count = 0, summary_count = 0;
@@ -4230,8 +4320,8 @@ static int publish_staged_impl(char *stage_path, const cbm_pipeline_generation_t
             cbm_gbuf_resolver_summaries(generation->gbuf, &summary_count);
         ok = cbm_gbuf_resolutions_complete(generation->gbuf) &&
              cbm_store_resolver_publish_generation(store, generation->project, rows, count, files,
-                                                   file_count, summaries,
-                                                   summary_count) == CBM_STORE_OK;
+                                                   file_count, summaries, summary_count,
+                                                   generation->workers) == CBM_STORE_OK;
     }
     /* ADRs are NOT written here: they live in the "<db>.adr.db" sidecar, which
      * this rebuild never touches, so there is nothing to re-apply. */
@@ -4328,7 +4418,7 @@ int cbm_pipeline_publish_generation(const cbm_pipeline_generation_t *generation)
 
 int cbm_pipeline_publish_staged(char *path, const cbm_pipeline_generation_t *generation,
                                 bool fts_wholesale, bool healthy) {
-    return publish_staged_impl(path, generation, fts_wholesale, healthy, NULL);
+    return publish_staged_impl(path, generation, fts_wholesale, healthy, NULL, NULL);
 }
 
 char *cbm_pipeline_create_staging_path(const char *final_path) {
@@ -4517,6 +4607,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
     }
     cbm_pipeline_generation_t generation = {
         .gbuf = p->gbuf,
+        .workers = cbm_pipeline_worker_count(p),
         .final_db_path = db_path,
         .project = p->project_name,
         .cancelled = p->cancelled,

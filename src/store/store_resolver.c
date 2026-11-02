@@ -250,7 +250,8 @@ static int resolver_write_generation(cbm_store_t *store, const char *project,
                                      const cbm_resolve_record_t *rows, size_t count,
                                      const cbm_resolve_file_t *files, size_t file_count,
                                      const cbm_resolve_summary_t *summaries, size_t summary_count,
-                                     bool commit_batches) {
+                                     bool commit_batches, int workers,
+                                     const cbm_resolver_stage_t *stage) {
     if (!store || !project || (!rows && count))
         return CBM_STORE_ERR;
     sqlite3 *db = cbm_store_get_db(store);
@@ -259,9 +260,11 @@ static int resolver_write_generation(cbm_store_t *store, const char *project,
         "rules_version INTEGER NOT NULL);";
     if (!db || sqlite3_exec(db, "SAVEPOINT resolver_replace", NULL, NULL, NULL) != SQLITE_OK)
         return CBM_STORE_ERR;
-    bool ok = sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
-              cbm_store_resolver_evidence(db, project, rows, count, files, file_count, summaries,
-                                          summary_count, commit_batches);
+    bool ok =
+        sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK &&
+        (stage ? cbm_store_resolver_stage_finish(db, project, stage)
+               : cbm_store_resolver_evidence(db, project, rows, count, files, file_count, summaries,
+                                             summary_count, commit_batches, workers));
     sqlite3_stmt *stmt = NULL;
     if (ok)
         ok = sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO resolver_generations VALUES(?,?)", -1,
@@ -291,16 +294,23 @@ int cbm_store_resolver_replace_generation(cbm_store_t *store, const char *projec
                                           const cbm_resolve_summary_t *summaries,
                                           size_t summary_count) {
     return resolver_write_generation(store, project, rows, count, files, file_count, summaries,
-                                     summary_count, false);
+                                     summary_count, false, 1, NULL);
 }
 
 int cbm_store_resolver_publish_generation(cbm_store_t *store, const char *project,
                                           const cbm_resolve_record_t *rows, size_t count,
                                           const cbm_resolve_file_t *files, size_t file_count,
                                           const cbm_resolve_summary_t *summaries,
-                                          size_t summary_count) {
+                                          size_t summary_count, int workers) {
     return resolver_write_generation(store, project, rows, count, files, file_count, summaries,
-                                     summary_count, true);
+                                     summary_count, true, workers, NULL);
+}
+
+int cbm_store_resolver_publish_stage(cbm_store_t *store, const char *project,
+                                     const cbm_resolver_stage_t *stage) {
+    return stage ? resolver_write_generation(store, project, NULL, 0, NULL, 0, NULL, 0, true, 1,
+                                             stage)
+                 : CBM_STORE_ERR;
 }
 
 static bool resolver_count_outcomes(sqlite3 *db, const char *project,

@@ -960,7 +960,7 @@ static oo_value_t jw_static_import_call(jw_t *j, TSNode site, const char *name, 
     oo_walk_t *w = j->w;
     const oo_file_t *file = w->f;
     /* A single-static import shadows every on-demand one (JLS 6.4.1). */
-    for (int i = 0; i < file->import_count; i++) {
+    for (int i = oo_import_after(file, name, -1); i >= 0; i = oo_import_after(file, name, i)) {
         const oo_import_t *import = &file->imports[i];
         if (!import->statik || import->star || !import->local || strcmp(import->local, name))
             continue;
@@ -1893,6 +1893,7 @@ void oo_java_resolve(oo_walk_t *w, TSNode root) {
                         .imports = imports,
                         .import_count = import_count,
                         .has_error = ts_node_has_error(root)};
+    oo_file_chain_imports(w->arena, file);
     w->f = file;
     w->scope = (oo_scope_t){.file = file, .ns = ""};
     uint32_t count = ts_node_named_child_count(root);

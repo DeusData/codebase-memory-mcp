@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "syntax_index.h"
 
 enum { RS_MAX_MODULE_DEPTH = 64, RS_MAX_SEGMENTS = 64 };
 
@@ -956,7 +957,95 @@ const rs_assoc_const_t *rs_const_named(const rs_assoc_const_t *const *sorted, in
     return NULL;
 }
 
+static int rs_impl_row_compare(const void *left, const void *right) {
+    const rs_impl_row_t *a = left, *b = right;
+    if (a->impl->start != b->impl->start)
+        return a->impl->start < b->impl->start ? -1 : 1;
+    return a->position - b->position;
+}
+
+static void rs_mod_index_impls(CBMArena *arena, rs_mod_t *mod) {
+    int count = 0;
+    for (const rs_impl_t *impl = mod->impls; impl; impl = impl->next)
+        count++;
+    if (count < CBM_NAME_ROWS_MIN)
+        return;
+    rs_impl_row_t *rows = cbm_arena_alloc(arena, (size_t)count * sizeof(*rows));
+    if (!rows)
+        return; /* the list still answers */
+    int at = 0;
+    for (const rs_impl_t *impl = mod->impls; impl; impl = impl->next, at++)
+        rows[at] = (rs_impl_row_t){.impl = impl, .position = at};
+    qsort(rows, (size_t)count, sizeof(*rows), rs_impl_row_compare);
+    mod->impl_rows = rows;
+    mod->nimpl_rows = count;
+}
+
+static void rs_mod_index_uses(CBMArena *arena, rs_mod_t *mod) {
+    int count = 0;
+    for (const rs_use_t *use = mod->uses; use; use = use->next)
+        count++;
+    if (count < CBM_NAME_ROWS_MIN)
+        return;
+    const rs_use_t **by_name = cbm_arena_alloc(arena, (size_t)count * sizeof(*by_name));
+    const rs_use_t **by_tail = cbm_arena_alloc(arena, (size_t)count * sizeof(*by_tail));
+    if (!by_name || !by_tail)
+        return; /* the list still answers */
+    int names = 0, tails = 0;
+    for (const rs_use_t *use = mod->uses; use; use = use->next) {
+        if (use->local) {
+            by_name[names] = use;
+            if (!cbm_name_rows_add(arena, &mod->use_name_rows, NULL, use->local, names++))
+                return;
+        }
+        if (use->nseg) {
+            by_tail[tails] = use;
+            if (!cbm_name_rows_add(arena, &mod->use_tail_rows, NULL, use->segs[use->nseg - 1],
+                                   tails++))
+                return;
+        }
+    }
+    mod->uses_by_name = by_name;
+    mod->uses_by_tail = by_tail;
+}
+
+/* The first or next use binding this local name, in list order. */
+const rs_use_t *rs_use_named(const rs_mod_t *mod, const rs_use_t *after, const char *name,
+                             int *row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (mod->uses_by_name) {
+        *row = after ? mod->use_name_rows.next[*row]
+                     : cbm_name_rows_lookup(&mod->use_name_rows, NULL, name);
+        return *row >= 0 ? mod->uses_by_name[*row] : NULL;
+    }
+    for (const rs_use_t *use = after ? after->next : mod->uses; use; use = use->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        if (use->local && !strcmp(use->local, name))
+            return use;
+    }
+    return NULL;
+}
+
+/* The first or next use whose path ends in this name, in list order. */
+const rs_use_t *rs_use_ending(const rs_mod_t *mod, const rs_use_t *after, const char *name,
+                              int *row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (mod->uses_by_tail) {
+        *row = after ? mod->use_tail_rows.next[*row]
+                     : cbm_name_rows_lookup(&mod->use_tail_rows, NULL, name);
+        return *row >= 0 ? mod->uses_by_tail[*row] : NULL;
+    }
+    for (const rs_use_t *use = after ? after->next : mod->uses; use; use = use->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        if (use->nseg && !strcmp(use->segs[use->nseg - 1], name))
+            return use;
+    }
+    return NULL;
+}
+
 void rs_mod_seal(CBMArena *arena, rs_mod_t *mod) {
+    rs_mod_index_impls(arena, mod);
+    rs_mod_index_uses(arena, mod);
     for (rs_impl_t *impl = mod->impls; impl; impl = impl->next)
         rs_consts_seal(arena, impl->consts, &impl->sorted_consts, &impl->nconsts);
     for (rs_item_t *item = mod->item_list; item; item = item->next)
@@ -1240,8 +1329,11 @@ bool cbm_rust_project_add_file(cbm_rust_project_t *project, const char *rel,
         builder.nwrapped = spans.nwrapped;
         file->expression_macros = spans.expressions;
         file->nexpression_macros = spans.nexpressions;
+        cbm_syntax_index_t syntax;
+        cbm_syntax_index_begin(&syntax, root.tree);
         rs_collect_items(&builder, top, root);
         rs_declare_macro_types(&builder, top);
+        cbm_syntax_index_end(&syntax);
         rs_claim_mod(&project->arena, claims, top);
         rs_mark_mod(claims, counts, top);
         rs_mod_seal(&project->arena, top);
@@ -1589,6 +1681,24 @@ static void rs_child_add(CBMArena *arena, rs_inst_t *inst, const char *name, rs_
     inst->children = entry;
 }
 
+static void rs_inst_chain_children(CBMArena *arena, rs_inst_t *inst) {
+    int count = 0;
+    for (const rs_child_t *child = inst->children; child; child = child->next)
+        count++;
+    if (count < CBM_NAME_ROWS_MIN)
+        return;
+    const rs_child_t **by_row = cbm_arena_alloc(arena, (size_t)count * sizeof(*by_row));
+    if (!by_row)
+        return; /* the list still answers */
+    int row = 0;
+    for (const rs_child_t *child = inst->children; child; child = child->next, row++) {
+        by_row[row] = child;
+        if (!cbm_name_rows_add(arena, &inst->child_rows, NULL, child->name, row))
+            return;
+    }
+    inst->child_by_row = by_row;
+}
+
 static void rs_note_macro_export(CBMArena *arena, rs_crate_t *crate, rs_item_t *item) {
     if (crate->nmacro_exports == crate->cap_macro_exports) {
         int cap = crate->cap_macro_exports ? crate->cap_macro_exports * 2 : 8;
@@ -1659,6 +1769,7 @@ static void rs_inst_children(cbm_rust_project_t *project, rs_inst_t *inst, unsig
                 : NULL;
         rs_child_add(arena, inst, item->name, child);
     }
+    rs_inst_chain_children(arena, inst);
 }
 
 static rs_inst_t *rs_inst_build(cbm_rust_project_t *project, rs_crate_t *crate, rs_mod_t *syn,
@@ -1996,6 +2107,63 @@ static void rs_settle_mod(rs_query_t *q, rs_mod_t *mod) {
         rs_settle_mod(q, child);
 }
 
+typedef struct {
+    rs_impl_t **heads;
+    int count;
+} rs_ext_heads_t;
+
+static void rs_ext_head(const char *key, void *value, void *context) {
+    (void)key;
+    rs_ext_heads_t *heads = context;
+    heads->heads[heads->count++] = value;
+}
+
+/* A path's rows go in together, in its chain's order, which decides between a delegating impl and
+ * an ambiguous pair: the rows visit what the chain would. Which path goes first only numbers them.
+ */
+static void rs_chain_ext_impls(cbm_rust_project_t *project) {
+    size_t paths = project->ext_impls ? cbm_ht_count(project->ext_impls) : 0;
+    if (!paths)
+        return;
+    rs_ext_heads_t heads = {.heads =
+                                cbm_arena_alloc(&project->arena, paths * sizeof(*heads.heads))};
+    if (!heads.heads)
+        return; /* the chains still answer */
+    cbm_ht_foreach(project->ext_impls, rs_ext_head, &heads);
+    int count = 0;
+    for (int path = 0; path < heads.count; path++) {
+        for (const rs_impl_t *impl = heads.heads[path]; impl; impl = impl->next_self) {
+            for (const rs_fn_t *fn = impl->methods; fn; fn = fn->next)
+                count++;
+            for (const rs_fn_t *fn = impl->trait_item ? impl->trait_item->methods : NULL; fn;
+                 fn = fn->next)
+                count++;
+        }
+    }
+    if (count < CBM_NAME_ROWS_MIN)
+        return;
+    const rs_impl_t **by_row = cbm_arena_alloc(&project->arena, (size_t)count * sizeof(*by_row));
+    if (!by_row)
+        return;
+    int row = 0;
+    for (int path = 0; path < heads.count; path++) {
+        for (const rs_impl_t *impl = heads.heads[path]; impl; impl = impl->next_self) {
+            const void *scope = rs_ext_scope(impl->ext_path);
+            const rs_fn_t *lists[] = {impl->methods,
+                                      impl->trait_item ? impl->trait_item->methods : NULL};
+            for (int list = 0; list < 2; list++) {
+                for (const rs_fn_t *fn = lists[list]; fn; fn = fn->next, row++) {
+                    by_row[row] = impl;
+                    if (!cbm_name_rows_add(&project->arena, &project->ext_rows, scope, fn->name,
+                                           row))
+                        return;
+                }
+            }
+        }
+    }
+    project->ext_by_row = by_row;
+}
+
 bool cbm_rust_project_seal(cbm_rust_project_t *project) {
     if (!project || project->sealed)
         return false;
@@ -2045,6 +2213,7 @@ bool cbm_rust_project_seal(cbm_rust_project_t *project) {
     rs_query_t q = {.project = project, .arena = arena};
     for (int i = 0; i < project->nfiles; i++)
         rs_settle_mod(&q, project->files[i]->root);
+    rs_chain_ext_impls(project);
     return true;
 }
 
@@ -2140,7 +2309,9 @@ static bool rs_ent_same(const rs_ent_t *a, const rs_ent_t *b) {
 
 static const rs_child_t *rs_child_of(const rs_inst_t *inst, const char *name, bool *ambiguous) {
     const rs_child_t *found = NULL;
-    for (const rs_child_t *child = inst->children; child; child = child->next) {
+    int row = -1;
+    for (const rs_child_t *child = rs_child_first(inst, name, &row); child;
+         child = rs_child_after(inst, child, &row)) {
         if (strcmp(child->name, name) != 0)
             continue;
         if (found && found->inst != child->inst && !(found->missing_file && child->missing_file)) {
@@ -2231,9 +2402,9 @@ static rs_ent_t rs_named_uses(rs_query_t *q, rs_inst_t *inst, const char *name, 
                               rs_inst_t *from) {
     rs_ent_t found = rs_ent(RS_ENT_NONE, RS_VIA_NONE);
     bool hidden = false, found_cfg = false;
-    for (const rs_use_t *use = inst->syn->uses; use; use = use->next) {
-        if (!use->local || strcmp(use->local, name) != 0)
-            continue;
+    int row = -1;
+    for (const rs_use_t *use = rs_use_named(inst->syn, NULL, name, &row); use;
+         use = rs_use_named(inst->syn, use, name, &row)) {
         if (!rs_visible(use->vis, inst->syn, from)) {
             hidden = true;
             continue;
@@ -2376,8 +2547,10 @@ static rs_ent_t rs_lookup_steps(rs_query_t *q, rs_inst_t *inst, const char *name
         /* `#[cfg(a)] use x::f; #[cfg(not(a))] fn f() {}`: one name, a different declaration under
          * each configuration, and nothing here says which one applies. Without cfg this does
          * not compile, so only a conditional use can stand beside a local item. */
-        for (const rs_use_t *use = inst->syn->uses; use; use = use->next) {
-            if (!use->has_cfg || !use->local || strcmp(use->local, name) != 0)
+        int row = -1;
+        for (const rs_use_t *use = rs_use_named(inst->syn, NULL, name, &row); use;
+             use = rs_use_named(inst->syn, use, name, &row)) {
+            if (!use->has_cfg)
                 continue;
             rs_ent_t imported = rs_named_uses(q, inst, name, ns, from);
             if (rs_ent_found(&imported) && !rs_ent_same(&ent, &imported))

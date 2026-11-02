@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 enum { SOURCE_MAX_VISITS = 4000000, SOURCE_MAX_DEPTH = 400 };
 
@@ -624,7 +625,10 @@ bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
                               .source_len = source_len,
                               .writable = table,
                               .root = ts_tree_root_node(tree)};
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     (usable ? adapter->collect : adapter->collect_unusable)(&walk);
+    cbm_syntax_index_end(&syntax);
     cbm_ht_free(walk.def_index);
     if (walk.failure)
         table->incomplete[language] = true;
@@ -676,7 +680,10 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
                               .table = table,
                               .unit = unit,
                               .root = ts_tree_root_node(tree)};
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     adapter->resolve(&walk);
+    cbm_syntax_index_end(&syntax);
     cbm_ht_free(walk.def_index);
     if (walk.failure) {
         unit->failure = walk.failure;
