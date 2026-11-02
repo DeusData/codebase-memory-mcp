@@ -1422,10 +1422,9 @@ static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
 /* JS/TS barrels. An import that lands on a Folder (`./svc` -> svc/index.ts)
  * or on a module that only re-exports the name never reaches the declaring
  * module, so `module.Name` is not in the registry and DI member calls on the
- * imported type stay unresolved. Follow the barrel's own IMPORTS edges (its
- * `export ... from` statements) to the one module that defines `name`. Those
- * edges do not record which names each statement re-exports, so the
- * definition node is the proof; two different definitions fail closed. */
+ * imported type stay unresolved. Follow only the barrel's re-export IMPORTS
+ * edges, preserving `export { original as public }` names across each hop.
+ * The definition node is the proof; two different definitions fail closed. */
 enum { PXC_BARREL_MAX_DEPTH = 8 };
 
 static bool pxc_is_js_family(CBMLanguage lang) {
@@ -1445,6 +1444,30 @@ static char *pxc_defined_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_n
     return NULL;
 }
 
+static bool pxc_edge_string_prop(const char *json, const char *key, char *out, size_t out_sz) {
+    if (!json || !key || !out || out_sz == 0) {
+        return false;
+    }
+    char needle[CBM_SZ_64];
+    int wrote = snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (wrote <= 0 || (size_t)wrote >= sizeof(needle)) {
+        return false;
+    }
+    const char *start = strstr(json, needle);
+    if (!start) {
+        return false;
+    }
+    start += (size_t)wrote;
+    const char *end = strchr(start, '"');
+    size_t len = end ? (size_t)(end - start) : 0;
+    if (!end || len == 0 || len >= out_sz || memchr(start, '\\', len)) {
+        return false;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
+}
+
 /* `visited` holds barrel file QNs already searched for `name`: barrels form
  * DAGs (and cycles) where one lib index is reachable through many paths, and
  * re-walking it on each path is exponential in the depth cap. */
@@ -1453,6 +1476,13 @@ static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_na
                                   CBMHashTable *visited) {
     if (!target || !target->label || !target->file_path || depth > PXC_BARREL_MAX_DEPTH) {
         return NULL;
+    }
+    if (strcmp(target->label, "Module") != 0 && strcmp(target->label, "Folder") != 0 &&
+        strcmp(target->label, "File") != 0) {
+        /* A named re-export edge reaches a definition directly when ordinary
+         * import resolution proved its imported member. The edge metadata has
+         * already matched the public/imported names at the caller above. */
+        return target->qualified_name ? strdup(target->qualified_name) : NULL;
     }
     static const char *const index_names[] = {"index.ts", "index.tsx", "index.mts",
                                               "index.js", "index.jsx", "index.mjs"};
@@ -1488,8 +1518,27 @@ static char *pxc_barrel_symbol_qn(const cbm_gbuf_t *gbuf, const char *project_na
     }
     char *found = NULL;
     for (int i = 0; i < edge_count; i++) {
+        char kind[CBM_SZ_16];
+        char public_name[CBM_SZ_256];
+        char imported_name[CBM_SZ_256];
+        if (!pxc_edge_string_prop(edges[i]->properties_json, "reexport", kind, sizeof(kind))) {
+            continue;
+        }
+        const char *next_name = name;
+        if (strcmp(kind, "named") == 0) {
+            if (!pxc_edge_string_prop(edges[i]->properties_json, "local_name", public_name,
+                                      sizeof(public_name)) ||
+                strcmp(public_name, name) != 0 ||
+                !pxc_edge_string_prop(edges[i]->properties_json, "imported", imported_name,
+                                      sizeof(imported_name))) {
+                continue;
+            }
+            next_name = imported_name;
+        } else if (strcmp(kind, "star") != 0) {
+            continue;
+        }
         const cbm_gbuf_node_t *next = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
-        char *qn = pxc_barrel_symbol_qn(gbuf, project_name, next, name, depth + 1, visited);
+        char *qn = pxc_barrel_symbol_qn(gbuf, project_name, next, next_name, depth + 1, visited);
         if (!qn) {
             continue;
         }

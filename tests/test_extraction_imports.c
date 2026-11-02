@@ -1310,6 +1310,30 @@ TEST(es_named_import_member_survives_compaction) {
     PASS();
 }
 
+TEST(es_reexport_names_and_star_survive_compaction) {
+    CBMFileResult *r = do_extract("export { internal as publicName, plain } from './child.js';\n"
+                                  "export * from './nested.js';\n",
+                                  CBM_LANG_TYPESCRIPT, "barrel.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_result_compact(r);
+    const CBMImport *renamed = imp_by_local(r, "publicName");
+    const CBMImport *plain = imp_by_local(r, "plain");
+    const CBMImport *star = imp_by_local(r, "*");
+    ASSERT_NOT_NULL(renamed);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_NOT_NULL(star);
+    ASSERT_STR_EQ(renamed->module_path, "./child.js");
+    ASSERT_STR_EQ(renamed->member, "internal");
+    ASSERT_EQ(renamed->reexport, CBM_REEXPORT_NAMED);
+    ASSERT_STR_EQ(plain->member, "plain");
+    ASSERT_EQ(plain->reexport, CBM_REEXPORT_NAMED);
+    ASSERT_STR_EQ(star->module_path, "./nested.js");
+    ASSERT_EQ(star->reexport, CBM_REEXPORT_STAR);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * SUITE declaration — do NOT register in test_main.c; the main workstream will
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1353,4 +1377,5 @@ SUITE(extraction_imports) {
 
     /* ES named-import member (call resolution spells calls through it) */
     RUN_TEST(es_named_import_member_survives_compaction);
+    RUN_TEST(es_reexport_names_and_star_survive_compaction);
 }

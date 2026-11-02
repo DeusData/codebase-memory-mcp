@@ -25,6 +25,7 @@ enum {
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/laravel_routing.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -137,6 +138,45 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
+
+    CBMLanguage lang = cbm_language_for_filename(rel_path);
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        const char **keys = NULL;
+        const char **owned_vals = NULL;
+        int count = 0;
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, rel_path, lang, result, &keys,
+                                 &owned_vals, &count);
+        if (count > 0 && keys && owned_vals) {
+            const char **borrowed_vals = calloc((size_t)count, sizeof(*borrowed_vals));
+            if (!borrowed_vals) {
+                cbm_pxc_free_import_map(keys, owned_vals, count);
+                return 0;
+            }
+            int kept = 0;
+            for (int i = 0; i < count; i++) {
+                const cbm_gbuf_node_t *node =
+                    owned_vals[i] ? cbm_gbuf_find_by_qn(ctx->gbuf, owned_vals[i]) : NULL;
+                if (node && node->qualified_name) {
+                    keys[kept] = keys[i];
+                    borrowed_vals[kept++] = node->qualified_name;
+                } else {
+                    free((void *)keys[i]);
+                }
+                free((void *)owned_vals[i]);
+            }
+            free((void *)owned_vals);
+            if (kept > 0 && borrowed_vals) {
+                *out_keys = keys;
+                *out_vals = borrowed_vals;
+                *out_count = kept;
+                return 0;
+            }
+            free((void *)keys);
+            free((void *)borrowed_vals);
+        } else {
+            cbm_pxc_free_import_map(keys, owned_vals, count);
+        }
+    }
 
     /* Fast path: build from cached extraction via the same resolver used for
      * IMPORTS edges. Do NOT use cbm_pipeline_fqn_module(module_path) — Python

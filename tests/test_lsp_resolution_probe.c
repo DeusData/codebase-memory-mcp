@@ -1315,16 +1315,21 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
          "    return weightKg * 2;\n"
          "  }\n"
          "}\n"},
+        {"apps/api/libs/shipping/src/domain/internal.service.ts",
+         "export function internalCall(): number { return 7; }\n"},
+        {"apps/api/libs/shipping/src/domain/public.ts",
+         "export { internalCall as publicCall } from './internal.service.js';\n"},
         {"apps/api/libs/shipping/src/index.ts",
          "export * from \"./domain/tracking\";\n"
          "export {\n"
          "  CarrierService,\n"
          "} from \"./domain/carrier.service\";\n"
+         "export { publicCall as apiCall } from './domain/public.js';\n"
          "export type { LabelPrintParams } from \"./application/service/label-print.service\";\n"},
         {"apps/api/libs/invoice/src/application/command/handler/ship-invoice.handler.ts",
          "import { LabelPrintService } from "
          "\"@acme/shipping/application/service/label-print.service\";\n"
-         "import { CarrierService, TrackingCodeService } from \"@acme/shipping\";\n"
+         "import { apiCall, CarrierService, TrackingCodeService } from \"@acme/shipping\";\n"
          "export class ShipInvoiceHandler {\n"
          "  constructor(\n"
          "    private readonly labelPrintService: LabelPrintService,\n"
@@ -1334,8 +1339,9 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
          "  execute(shipmentId: string): string {\n"
          "    const cost = this.carrierService.quote(3);\n"
          "    const code = this.trackingCodeService.generate(shipmentId);\n"
+         "    const renamed = apiCall();\n"
          "    const label = this.labelPrintService.printStream({ shipmentId });\n"
-         "    return `${label}:${code}:${cost}`;\n"
+         "    return `${label}:${code}:${cost}:${renamed}`;\n"
          "  }\n"
          "}\n"},
         {"apps/api/libs/invoice/src/application/service/label-preview.service.ts",
@@ -1360,16 +1366,21 @@ TEST(lrp_ts_barrel_reexport_member_calls) {
                                          "LabelPrintService.printWithStats");
     int b4 = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "ShipInvoiceHandler.execute",
                                          "TrackingCodeService.generate");
+    int renamed = lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS",
+                                              "ShipInvoiceHandler.execute",
+                                              "internal.service.internalCall");
     int self =
         lrp_exact_edge_by_qn_suffix(store, lp.project, "CALLS", "LabelPrintService.printStream",
                                     "LabelPrintService.printWithStats");
-    printf("  [ts/barrel] B1=%d B2=%d B3=%d B4=%d self=%d\n", b1, b2, b3, b4, self);
+    printf("  [ts/barrel] B1=%d B2=%d B3=%d B4=%d renamed=%d self=%d\n", b1, b2, b3, b4,
+           renamed, self);
     lrp_cleanup(&lp, store);
 
     ASSERT_EQ(b1, 1);
     ASSERT_EQ(b2, 1);
     ASSERT_EQ(b3, 1);
     ASSERT_EQ(b4, 1);
+    ASSERT_EQ(renamed, 1);
     ASSERT_EQ(self, 1);
     PASS();
 }
