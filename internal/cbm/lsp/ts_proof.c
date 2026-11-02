@@ -3,6 +3,7 @@
 #include "../helpers.h"
 #include "../resolve/binding.h"
 #include "../resolve/policy.h"
+#include "../resolve/syntax_index.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

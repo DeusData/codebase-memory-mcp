@@ -4,6 +4,7 @@
 #include "../resolve/policy.h"
 #include "../resolve/symbols.h"
 #include "foundation/hash_table.h"
+#include "../resolve/syntax_index.h"
 #include <stdlib.h>
 #include <string.h>
 

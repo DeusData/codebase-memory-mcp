@@ -5681,8 +5681,12 @@ void cbm_run_kotlin_lsp_cross_with_result(CBMArena *arena, const char *source, i
         kotlin_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_KT_USE_UNKNOWN);
     }
 
+    /* A file that fails to parse can leave every declaration as one wide error node. */
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     kotlin_lsp_process_file(&ctx, root);
     cbm_kotlin_proof_resolve(arena, source, source_len, root, &reg, file, out);
+    cbm_syntax_index_end(&syntax);
     cbm_arena_destroy(&idx_arena);
     cbm_ht_free(type_short);
     cbm_ht_free(cross_field_map);

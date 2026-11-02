@@ -4202,7 +4202,7 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     }
 
     int count = 0;
-    TSNode prev = ts_node_prev_sibling(node);
+    TSNode prev = cbm_syntax_previous_child(node);
     while (!ts_node_is_null(prev)) {
         if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
             count++;
@@ -4213,7 +4213,7 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
              * is still seen. */
             break;
         }
-        prev = ts_node_prev_sibling(prev);
+        prev = cbm_syntax_previous_child(prev);
     }
 
     TSNode wrappers[MAX_ATTR_WRAPPERS];
@@ -4244,14 +4244,14 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     }
 
     int idx = 0;
-    prev = ts_node_prev_sibling(node);
+    prev = cbm_syntax_previous_child(node);
     while (!ts_node_is_null(prev) && idx < count) {
         if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
             result[idx++] = cbm_node_text(a, prev, source);
         } else if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
             break;
         }
-        prev = ts_node_prev_sibling(prev);
+        prev = cbm_syntax_previous_child(prev);
     }
     for (int w = 0; w < wn && mod_count > 0; w++) {
         idx = collect_modifier_decorators(a, wrappers[w], source, spec, result, idx, total);

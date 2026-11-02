@@ -236,6 +236,8 @@ bool cbm_rust_collect_source_facts(CBMArena *arena, const char *source, int leng
                           .source = source,
                           .length = (size_t)length,
                           .failed = ts_node_has_error(root)};
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     facts.primitive_domain = rsp_primitive_domain(&facts, root);
     TSTreeCursor cursor = ts_tree_cursor_new(root);
     if (!facts.failed && ts_tree_cursor_goto_first_child(&cursor))
@@ -250,6 +252,7 @@ bool cbm_rust_collect_source_facts(CBMArena *arena, const char *source, int leng
                 facts.failed = true;
         } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+    cbm_syntax_index_end(&syntax);
     ts_tree_delete(tree);
     if (facts.failed)
         return false;

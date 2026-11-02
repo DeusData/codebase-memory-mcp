@@ -241,9 +241,29 @@ static TSNode terminal_vhdl_identifier(TSNode node, int remaining_depth) {
 // callee when the call descriptor is created, so suppress only the exact
 // language-specific preceding occurrence. Do not generalize this to arbitrary
 // identifiers: a sibling selector/parenthesis group is the grammar contract.
-static bool is_forward_sibling_callee(CBMLanguage language, TSNode node) {
+static TSTreeCursor *reset_occurrence_cursor(WalkState *state, TSNode node);
+
+/* Asked of every Dart identifier. The plain call counts from the parent's first child,
+ * so a wide parent pays its width each time; the walk's cursor is already there. A
+ * sibling ending no later than the node is passed over, as the plain call passes it. */
+static TSNode walk_next_named_sibling(WalkState *state, TSNode node) {
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    if (!cursor) {
+        return ts_node_next_named_sibling(node);
+    }
+    uint32_t end = ts_node_end_byte(node);
+    while (ts_tree_cursor_goto_next_sibling(cursor)) {
+        TSNode next = ts_tree_cursor_current_node(cursor);
+        if (ts_node_end_byte(next) > end && ts_node_is_named(next)) {
+            return next;
+        }
+    }
+    return (TSNode){0};
+}
+
+static bool is_forward_sibling_callee(CBMLanguage language, TSNode node, WalkState *state) {
     if (language == CBM_LANG_DART && strcmp(ts_node_type(node), "identifier") == 0) {
-        TSNode next = ts_node_next_named_sibling(node);
+        TSNode next = walk_next_named_sibling(state, node);
         return !ts_node_is_null(next) && strcmp(ts_node_type(next), "selector") == 0;
     }
 
@@ -294,6 +314,21 @@ static TSTreeCursor *reset_occurrence_cursor(WalkState *state, TSNode node) {
     }
     ts_tree_cursor_reset_to(state->occurrence_cursor, state->current_cursor);
     return state->occurrence_cursor;
+}
+
+/* Grammars with few fields let a classifier climb to the root from every identifier,
+ * so nesting d levels deep costs d per identifier. A climb that reaches the root
+ * undecided settles every node on its way for all nodes below them: a level's answer
+ * depends only on the path through it, and a node with any extent lies in one child of
+ * its parent. The next climb stops where it meets that path: a node no deeper than the
+ * settled one and covering it is the settled one or above it. */
+static bool occurrence_climb_settled(const CBMOccurrenceClimb *climb, TSNode current,
+                                     uint32_t depth) {
+    return climb && depth <= climb->depth && node_contains(current, climb->node);
+}
+
+static CBMOccurrenceClimb *occurrence_climb_for(TSNode node, CBMOccurrenceClimb *climb) {
+    return ts_node_end_byte(node) > ts_node_start_byte(node) ? climb : NULL;
 }
 
 static bool occurrence_parent(TSTreeCursor *cursor, TSNode current, TSNode *parent,
@@ -1155,11 +1190,21 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
 
     TSNode current = node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    CBMOccurrenceClimb *climb = cursor ? occurrence_climb_for(node, &state->binding_climb) : NULL;
+    uint32_t depth = cursor ? state->walk_depth : 0;
+    TSNode first_parent = {0};
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
+        if (occurrence_climb_settled(climb, current, depth)) {
+            break;
+        }
         if (!occurrence_parent(cursor, current, &parent, &field)) {
             break;
+        }
+        depth--;
+        if (ts_node_is_null(first_parent)) {
+            first_parent = parent;
         }
         if (is_value_field(field)) {
             return false;
@@ -1209,6 +1254,9 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         }
         current = parent;
     }
+    if (climb && !ts_node_is_null(first_parent)) {
+        *climb = (CBMOccurrenceClimb){first_parent, state->walk_depth - 1};
+    }
     return false;
 }
 
@@ -1255,11 +1303,21 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
     const CBMOccurrenceSpec *occurrence = &occurrence_specs[ctx->language];
     TSNode current = node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    CBMOccurrenceClimb *climb = cursor ? occurrence_climb_for(node, &state->write_climb) : NULL;
+    uint32_t depth = cursor ? state->walk_depth : 0;
+    TSNode first_parent = {0};
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
+        if (occurrence_climb_settled(climb, current, depth)) {
+            break;
+        }
         if (!occurrence_parent(cursor, current, &parent, &field)) {
             break;
+        }
+        depth--;
+        if (ts_node_is_null(first_parent)) {
+            first_parent = parent;
         }
         if (is_value_field(field)) {
             return false;
@@ -1295,6 +1353,9 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
             return occurrence->first_named_child_is_write && named_child_contains(parent, 0, node);
         }
         current = parent;
+    }
+    if (climb && !ts_node_is_null(first_parent)) {
+        *climb = (CBMOccurrenceClimb){first_parent, state->walk_depth - 1};
     }
     return false;
 }
@@ -1393,12 +1454,19 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     if (!cursor)
         return is_call_argument_label(node);
+    CBMOccurrenceClimb *climb = occurrence_climb_for(node, &state->label_climb);
+    uint32_t depth = state->walk_depth;
+    TSNode first_parent = {0};
     TSNode current = node;
     while (!ts_node_is_null(current)) {
         TSNode parent;
         const char *field;
-        if (!occurrence_parent(cursor, current, &parent, &field))
-            return false;
+        if (occurrence_climb_settled(climb, current, depth) ||
+            !occurrence_parent(cursor, current, &parent, &field))
+            break;
+        depth--;
+        if (ts_node_is_null(first_parent))
+            first_parent = parent;
         const char *parent_kind = ts_node_type(parent);
         if (is_labeled_argument_kind(parent_kind)) {
             return field && (strcmp(field, "name") == 0 || strcmp(field, "label") == 0 ||
@@ -1408,6 +1476,8 @@ static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
             return false;
         current = parent;
     }
+    if (climb && !ts_node_is_null(first_parent))
+        *climb = (CBMOccurrenceClimb){first_parent, state->walk_depth - 1};
     return false;
 }
 
@@ -2870,7 +2940,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
     if (is_jsx_tag_name(ctx, node, state)) {
         return;
     }
-    if (is_forward_sibling_callee(ctx->language, node)) {
+    if (is_forward_sibling_callee(ctx->language, node, state)) {
         return;
     }
     if (is_call_argument_label_walk(node, state)) {
