@@ -1181,7 +1181,13 @@ const char *cbm_service_pattern_http_method(const char *callee_name) {
     for (int i = 0; method_suffixes[i].suffix != NULL; i++) {
         size_t slen = strlen(method_suffixes[i].suffix);
         size_t clen = strlen(callee_name);
-        if (clen >= slen && strcmp(callee_name + clen - slen, method_suffixes[i].suffix) == 0) {
+        /* A named import can retain only the verb as its call spelling.
+         * Classification already establishes the HTTP service domain; match
+         * the complete bare verb, never a trailing fragment of another name. */
+        bool bare = method_suffixes[i].suffix[0] == '.' && clen + 1 == slen &&
+                    strcmp(callee_name, method_suffixes[i].suffix + 1) == 0;
+        if (bare ||
+            (clen >= slen && strcmp(callee_name + clen - slen, method_suffixes[i].suffix) == 0)) {
             return method_suffixes[i].method;
         }
     }

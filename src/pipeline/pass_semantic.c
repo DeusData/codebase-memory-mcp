@@ -1,38 +1,53 @@
+#include "resolve/stats.h"
+#include "pipeline/import_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 /*
  * pass_semantic.c — Semantic edge passes: INHERITS, DECORATES, IMPLEMENTS.
  *
  * Operates on already-extracted nodes in the graph buffer:
  *   - INHERITS: Class/Interface → base class (from base_classes in extraction)
- *   - DECORATES: Function/Method → decorator function (from decorators in extraction)
- *   - IMPLEMENTS: Struct/Class → Interface (Go implicit + explicit base_classes + Rust impl)
+ *   - DECORATES: Function/Method → decorator function (from decorators in
+ * extraction)
+ *   - IMPLEMENTS: Struct/Class → Interface (Go implicit + explicit base_classes
+ * + Rust impl)
  *
- * These passes re-extract files to access base_classes, decorators, and impl_traits data
- * since that information is in CBMDefinition fields, not stored in node properties JSON.
+ * These passes re-extract files to access base_classes, decorators, and
+ * impl_traits data since that information is in CBMDefinition fields, not
+ * stored in node properties JSON.
  *
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
-#include "foundation/constants.h"
-#include "foundation/mem_core.h"
-#include "foundation/str_util.h" // cbm_json_escape
-#include "pipeline/pipeline.h"
-#include <stdint.h>
-#include "pipeline/pipeline_internal.h"
-#include "graph_buffer/graph_buffer.h"
-#include "foundation/log.h"
+#include "callable_sig.h"
+#include "helpers.h"
+#include "lang_specs.h"
+#include "lsp/c_proof.h"
+#include "lsp/cs_proof.h"
+#include "lsp/rust_proof.h"
+#include "lsp/kotlin_proof.h"
+#include "lsp/php_proof.h"
+#include "resolve/binding.h"
+#include "cbm.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include "foundation/limits.h"
-#include "cbm.h"
-#include "callable_sig.h"
+#include "foundation/log.h"
+#include "foundation/mem_core.h"
+#include "foundation/str_util.h" // cbm_json_escape
+#include "graph_buffer/graph_buffer.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
+#include <stdint.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
- * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
- * so base-class / same-module resolution keys against the directory-based
- * def-node QNs. */
+ * (Java/Go package). MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c) so base-class / same-module resolution keys against
+ * the directory-based def-node QNs. */
 static bool ps_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
@@ -70,6 +85,1163 @@ static char *read_file(const char *path, int *out_len) {
     return buf;
 }
 
+/* Structural class identity is separate from callable/member dispatch. Build
+ * these source facts once, then share immutable indexes with resolve workers.
+ * Unknown package membership never becomes absence evidence. */
+typedef struct {
+    CBMLanguage language;
+    const char *package;
+    CBMHashTable *imports;
+    bool has_imports;
+    CBMHashTable *php_names;
+    const char *php_include;
+    uint32_t php_include_end;
+    bool php_complete, php_inert, php_use_imports;
+    CBMHashTable *type_names, *rust_impls;
+    const char *include_module;
+    uint32_t include_end;
+    bool typed_complete;
+} semantic_source_t;
+
+typedef struct {
+    const cbm_gbuf_node_t *node;
+    semantic_source_t *source;
+    const char *base;
+    const char *package_base;
+    bool public_class;
+    bool ambiguous;
+    uint32_t php_start;
+    bool php_standalone;
+    uint32_t declaration_start;
+} semantic_class_t;
+
+struct cbm_semantic_bindings {
+    CBMArena arena;
+    CBMHashTable *files, *classes, *packages;
+    bool kotlin_complete, csharp_complete;
+};
+
+static bool semantic_is(TSNode node, const char *kind) {
+    return !ts_node_is_null(node) && !strcmp(ts_node_type(node), kind);
+}
+
+/* ts_node_named_child(node, i) walks from the first child on every call, so an
+ * index loop is quadratic in the sibling count; TypeScript's declaration files
+ * held this pass for over 11 minutes on one root. One cursor pass snapshots the
+ * children, and the loops keep their early returns. */
+static bool semantic_named_list(CBMArena *arena, TSNode node, TSNode **out, uint32_t *count) {
+    uint32_t expected = ts_node_is_null(node) ? 0 : ts_node_named_child_count(node);
+    *out = NULL;
+    *count = 0;
+    if (!expected)
+        return true;
+    TSNode *children = cbm_arena_alloc(arena, (size_t)expected * sizeof(*children));
+    if (!children)
+        return false;
+    uint32_t found = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && found < expected)
+                children[found++] = child;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, found);
+    *out = children;
+    *count = found;
+    return found == expected;
+}
+
+static TSNode semantic_child(TSNode node, const char *kind) {
+    TSNode found = {0};
+    if (ts_node_is_null(node))
+        return found;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (ts_node_is_named(child) && semantic_is(child, kind)) {
+                found = child;
+                break;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return found;
+}
+
+static bool semantic_ecma(CBMLanguage language) {
+    return language == CBM_LANG_TYPESCRIPT || language == CBM_LANG_TSX;
+}
+
+static bool semantic_simple_name(const char *name) {
+    if (!name || !name[0])
+        return false;
+    for (size_t i = 0; name[i]; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+              (i && c >= '0' && c <= '9')))
+            return false;
+    }
+    return true;
+}
+
+static bool semantic_put(CBMHashTable *table, const char *key, void *value) {
+    if (!key || !value)
+        return false;
+    cbm_ht_set(table, key, value);
+    return cbm_ht_get(table, key) == value;
+}
+
+static void semantic_source_free(const char *key, void *value, void *ud) {
+    (void)key;
+    (void)ud;
+    cbm_ht_free(((semantic_source_t *)value)->imports);
+    cbm_ht_free(((semantic_source_t *)value)->php_names);
+    cbm_ht_free(((semantic_source_t *)value)->type_names);
+    cbm_ht_free(((semantic_source_t *)value)->rust_impls);
+}
+
+void cbm_semantic_bindings_free(cbm_semantic_bindings_t *bindings) {
+    if (!bindings)
+        return;
+    if (bindings->files)
+        cbm_ht_foreach(bindings->files, semantic_source_free, NULL);
+    cbm_ht_free(bindings->files);
+    cbm_ht_free(bindings->classes);
+    cbm_ht_free(bindings->packages);
+    cbm_arena_destroy(&bindings->arena);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, bindings);
+}
+
+/* Keep exact AST heritage spelling; extractor names alone can strip generic
+ * or qualified syntax. Only a single bare superclass is admitted here. */
+static const char *semantic_bare_base(CBMArena *arena, TSNode node, const char *source,
+                                      CBMLanguage language) {
+    if (!ts_node_is_null(semantic_child(node, "type_parameters")))
+        return NULL;
+    TSNode base = {0};
+    if (semantic_ecma(language)) {
+        TSNode heritage = semantic_child(node, "class_heritage");
+        TSNode clause = semantic_child(heritage, "extends_clause");
+        if (ts_node_is_null(clause))
+            return NULL;
+        base = ts_node_child_by_field_name(clause, "value", 5);
+        if (!semantic_is(base, "identifier"))
+            return NULL;
+    } else {
+        for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (!semantic_is(child, "delegation_specifier"))
+                continue;
+            if (!ts_node_is_null(base) || ts_node_named_child_count(child) != 1)
+                return NULL;
+            TSNode type = ts_node_named_child(child, 0);
+            if (semantic_is(type, "constructor_invocation"))
+                type = ts_node_named_child(type, 0);
+            if (!semantic_is(type, "user_type") || ts_node_named_child_count(type) != 1)
+                return NULL;
+            base = ts_node_named_child(type, 0);
+            if (!semantic_is(base, "type_identifier"))
+                return NULL;
+        }
+    }
+    if (ts_node_is_null(base))
+        return NULL;
+    const char *name = cbm_node_text(arena, base, source);
+    return semantic_simple_name(name) ? name : NULL;
+}
+
+static bool semantic_package_name(cbm_semantic_bindings_t *bindings, const char *package,
+                                  const char *name, semantic_class_t *member) {
+    const char *key = cbm_arena_sprintf(&bindings->arena, "%s:%s", package, name);
+    if (!key)
+        return false;
+    semantic_class_t *prior = cbm_ht_get(bindings->packages, key);
+    if (prior) {
+        prior->ambiguous = true;
+        return true;
+    }
+    return semantic_put(bindings->packages, key, member);
+}
+
+static bool semantic_imports(cbm_semantic_bindings_t *bindings, cbm_pipeline_ctx_t *ctx,
+                             semantic_source_t *file, const cbm_file_info_t *info,
+                             const CBMFileResult *result,
+                             const cbm_resolve_binding_index_t *index) {
+    const char **keys = NULL, **values = NULL;
+    int count = 0;
+    if (cbm_pipeline_ecma_import_map(ctx, info->rel_path, result, false, &keys, &values, &count))
+        return false;
+    bool ok = true;
+    for (int i = 0; ok && i < count; i++) {
+        const char *key = cbm_arena_strdup(&bindings->arena, keys[i]);
+        const char *audited =
+            values[i] && cbm_resolve_binding_import(index, keys[i]) ? values[i] : "";
+        char *value = cbm_arena_strdup(&bindings->arena, audited);
+        ok = semantic_put(file->imports, key, value);
+    }
+    cbm_pxc_free_import_map(keys, values, count);
+    return ok;
+}
+
+static bool semantic_class_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_ctx_t *ctx,
+                                 semantic_source_t *file, const cbm_file_info_t *info,
+                                 const CBMFileResult *result, const char *source, int length,
+                                 TSNode root, const cbm_resolve_binding_index_t *index,
+                                 CBMArena *temporary) {
+    TSNode *roots;
+    uint32_t children;
+    if (!semantic_named_list(temporary, root, &roots, &children) || children > INT32_MAX)
+        return false;
+    CBMLSPDef *facts = cbm_arena_calloc(temporary, (size_t)children * sizeof(*facts));
+    semantic_class_t **classes = cbm_arena_calloc(temporary, (size_t)children * sizeof(*classes));
+    if (children && (!facts || !classes))
+        return false;
+    int count = 0;
+    for (uint32_t i = 0; i < children; i++) {
+        TSNode node = roots[i];
+        if (semantic_ecma(info->language) && semantic_is(node, "export_statement"))
+            node = ts_node_child_by_field_name(node, "declaration", 11);
+        bool class_node =
+            semantic_is(node, "class_declaration") ||
+            (semantic_ecma(info->language) && semantic_is(node, "abstract_class_declaration"));
+        if (!class_node) {
+            if (info->language != CBM_LANG_KOTLIN)
+                continue;
+            if (semantic_is(node, "package_header") || semantic_is(node, "import_list") ||
+                semantic_is(node, "line_comment") || semantic_is(node, "multiline_comment"))
+                continue;
+            /* Functions are harmless to the census only when their exact
+             * spelling is retained as a competing package binding. Other
+             * declaration forms keep the package domain open for now. */
+            if (!semantic_is(node, "function_declaration")) {
+                bindings->kotlin_complete = false;
+                continue;
+            }
+            TSNode name_node = semantic_child(node, "simple_identifier");
+            const char *name = ts_node_is_null(name_node)
+                                   ? NULL
+                                   : cbm_node_text(&bindings->arena, name_node, source);
+            semantic_class_t *blocked = cbm_arena_calloc(&bindings->arena, sizeof(*blocked));
+            if (!name || !blocked)
+                return false;
+            if (!semantic_simple_name(name))
+                bindings->kotlin_complete = false;
+            if (!semantic_package_name(bindings, file->package, name, blocked))
+                return false;
+            continue;
+        }
+        TSNode name_node = info->language == CBM_LANG_KOTLIN
+                               ? semantic_child(node, "type_identifier")
+                               : ts_node_child_by_field_name(node, "name", 4);
+        const char *name =
+            ts_node_is_null(name_node) ? NULL : cbm_node_text(&bindings->arena, name_node, source);
+        if (!name)
+            return false;
+        const char *qn = cbm_fqn_compute(&bindings->arena, ctx->project_name, info->rel_path, name);
+        semantic_class_t *entry = cbm_arena_calloc(&bindings->arena, sizeof(*entry));
+        if (!qn || !entry)
+            return false;
+        entry->source = file;
+        entry->base = semantic_bare_base(&bindings->arena, node, source, info->language);
+        const cbm_gbuf_node_t *graph = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+        uint32_t line = ts_node_start_point(node).row + 1;
+        if (graph && graph->label && !strcmp(graph->label, "Class") && graph->file_path &&
+            !strcmp(graph->file_path, info->rel_path) && graph->start_line == (int)line)
+            entry->node = graph;
+        semantic_class_t *prior = cbm_ht_get(bindings->classes, qn);
+        if (prior)
+            prior->ambiguous = true;
+        else if (!semantic_put(bindings->classes, qn, entry))
+            return false;
+        if (info->language == CBM_LANG_KOTLIN) {
+            if (!semantic_simple_name(name))
+                bindings->kotlin_complete = false;
+            if (entry->base) {
+                entry->package_base =
+                    cbm_arena_sprintf(&bindings->arena, "%s:%s", file->package, entry->base);
+                if (!entry->package_base)
+                    return false;
+            }
+            if (!semantic_package_name(bindings, file->package, name, entry))
+                return false;
+            const char *prefix = file->package[0] ? file->package : result->module_qn;
+            facts[count] = (CBMLSPDef){
+                .qualified_name = cbm_arena_sprintf(&bindings->arena, "%s.%s", prefix, name),
+                .short_name = name,
+                .source_start_line = line};
+            if (!facts[count].qualified_name)
+                return false;
+            classes[count++] = entry;
+        } else {
+            unsigned kind = cbm_resolve_binding_export_kind(index, qn);
+            entry->public_class = (kind & (CBM_RESOLVE_EXPORT_VALUE | CBM_RESOLVE_EXPORT_TYPE)) ==
+                                  (CBM_RESOLVE_EXPORT_VALUE | CBM_RESOLVE_EXPORT_TYPE);
+        }
+    }
+    if (info->language != CBM_LANG_KOTLIN)
+        return true;
+    if (!cbm_kotlin_collect_source_facts(temporary, source, length, result->module_qn, facts,
+                                         count)) {
+        bindings->kotlin_complete = false;
+        return true;
+    }
+    for (int i = 0; i < count; i++) {
+        uint32_t required =
+            CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC | CBM_SOURCE_DECL_TOP_LEVEL;
+        classes[i]->public_class = (facts[i].source_flags & required) == required &&
+                                   facts[i].namespace_name &&
+                                   !strcmp(facts[i].namespace_name, file->package);
+    }
+    return true;
+}
+
+static const char *semantic_php_lower(CBMArena *arena, const char *name) {
+    if (!semantic_simple_name(name))
+        return NULL;
+    char *lower = cbm_arena_strdup(arena, name);
+    if (lower)
+        for (char *p = lower; *p; p++)
+            if (*p >= 'A' && *p <= 'Z')
+                *p = (char)(*p - 'A' + 'a');
+    return lower;
+}
+
+/* This first include bridge deliberately admits one direct, unconditional
+ * include. Its target must contain only global class declarations. It does
+ * not evaluate PHP, compose include chains, or assume runtime include_path. */
+static bool semantic_php_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_ctx_t *ctx,
+                               semantic_source_t *file, const cbm_file_info_t *info,
+                               const CBMFileResult *result, const char *source, int length,
+                               TSNode root, CBMArena *temporary) {
+    TSNode *roots;
+    uint32_t children;
+    if (!semantic_named_list(temporary, root, &roots, &children) || children > INT32_MAX)
+        return false;
+    CBMLSPDef *facts = cbm_arena_calloc(temporary, (size_t)children * sizeof(*facts));
+    semantic_class_t **classes = cbm_arena_calloc(temporary, (size_t)children * sizeof(*classes));
+    if (children && (!facts || !classes))
+        return false;
+    file->php_names = cbm_ht_create(0);
+    if (!file->php_names)
+        return false;
+    file->php_complete = true;
+    file->php_inert = true;
+    int count = 0, includes = 0;
+    for (uint32_t i = 0; i < children; i++) {
+        TSNode node = roots[i];
+        if (semantic_is(node, "php_tag") || semantic_is(node, "comment"))
+            continue;
+        if (semantic_is(node, "expression_statement")) {
+            file->php_inert = false;
+            TSNode value = ts_node_named_child(node, 0);
+            if (ts_node_named_child_count(node) != 1 ||
+                !semantic_is(value, "require_once_expression"))
+                file->php_complete = false;
+            includes++;
+            file->php_include_end = ts_node_end_byte(node);
+            continue;
+        }
+        if (semantic_is(node, "namespace_use_declaration"))
+            file->php_use_imports = true;
+        if (!semantic_is(node, "class_declaration")) {
+            file->php_complete = file->php_inert = false;
+            continue;
+        }
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        const char *name =
+            ts_node_is_null(name_node) ? NULL : cbm_node_text(&bindings->arena, name_node, source);
+        const char *lower = semantic_php_lower(&bindings->arena, name);
+        if (!lower) {
+            file->php_complete = false;
+            continue;
+        }
+        const char *qn = cbm_fqn_compute(&bindings->arena, ctx->project_name, info->rel_path, name);
+        semantic_class_t *entry = cbm_arena_calloc(&bindings->arena, sizeof(*entry));
+        if (!qn || !entry)
+            return false;
+        entry->source = file;
+        entry->php_start = ts_node_start_byte(node);
+        TSNode base = semantic_child(node, "base_clause");
+        TSNode base_name = ts_node_is_null(base) ? (TSNode){0} : ts_node_named_child(base, 0);
+        if (!ts_node_is_null(base) && ts_node_named_child_count(base) == 1 &&
+            semantic_is(base_name, "name")) {
+            entry->base = cbm_node_text(&bindings->arena, base_name, source);
+            entry->package_base = semantic_php_lower(&bindings->arena, entry->base);
+        }
+        entry->php_standalone = ts_node_is_null(base);
+        for (uint32_t j = 0; j < ts_node_named_child_count(node); j++) {
+            TSNode child = ts_node_named_child(node, j);
+            if (!semantic_is(child, "name") && !semantic_is(child, "declaration_list") &&
+                !semantic_is(child, "base_clause"))
+                entry->php_standalone = false;
+        }
+        TSNode body = ts_node_child_by_field_name(node, "body", 4);
+        TSNode *members;
+        uint32_t member_count;
+        if (!semantic_named_list(temporary, body, &members, &member_count))
+            return false;
+        for (uint32_t j = 0; j < member_count; j++) {
+            TSNode member = members[j];
+            if (semantic_is(member, "comment"))
+                continue;
+            if (!semantic_is(member, "method_declaration") ||
+                ts_node_is_null(ts_node_child_by_field_name(member, "body", 4)))
+                entry->php_standalone = false;
+        }
+        if (!entry->php_standalone)
+            file->php_inert = false;
+        const cbm_gbuf_node_t *graph = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+        uint32_t line = ts_node_start_point(node).row + 1;
+        if (graph && graph->label && !strcmp(graph->label, "Class") && graph->file_path &&
+            !strcmp(graph->file_path, info->rel_path) && graph->start_line == (int)line)
+            entry->node = graph;
+        semantic_class_t *prior = cbm_ht_get(bindings->classes, qn);
+        if (prior)
+            prior->ambiguous = true;
+        else if (!semantic_put(bindings->classes, qn, entry))
+            return false;
+        prior = cbm_ht_get(file->php_names, lower);
+        if (prior)
+            prior->ambiguous = true;
+        else if (!semantic_put(file->php_names, lower, entry))
+            return false;
+        facts[count] = (CBMLSPDef){.qualified_name = qn,
+                                   .graph_qualified_name = qn,
+                                   .short_name = name,
+                                   .source_start_line = line};
+        classes[count++] = entry;
+    }
+    if (includes > 1)
+        file->php_complete = false;
+    if (includes == 1) {
+        if (result->imports.count != 1 ||
+            result->imports.items[0].kind != CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH) {
+            file->php_complete = false;
+        } else {
+            cbm_php_vendor_names_t imported = {0};
+            cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, info->rel_path,
+                                                result, &imported);
+            const char *const *targets =
+                imported.targets ? imported.targets : imported.proven_targets;
+            const cbm_gbuf_node_t *target =
+                targets && targets[0] ? cbm_gbuf_find_by_qn(ctx->gbuf, targets[0]) : NULL;
+            /* A saved graph import is a consistency check, never the path
+             * authority: derive the same target from the admitted AST anchor. */
+            const char *slash = strrchr(info->rel_path, '/');
+            const char *directory = slash ? cbm_arena_strndup(temporary, info->rel_path,
+                                                              (size_t)(slash - info->rel_path))
+                                          : "";
+            enum { PHP_SOURCE_PATH_CAPACITY = 4096 };
+            char path[PHP_SOURCE_PATH_CAPACITY];
+            if (directory &&
+                cbm_repo_rel_join(directory, result->imports.items[0].module_path, path,
+                                  sizeof(path)) &&
+                target && target->label && !strcmp(target->label, "File") && target->file_path &&
+                !strcmp(path, target->file_path))
+                file->php_include = cbm_arena_strdup(&bindings->arena, path);
+            cbm_pipeline_php_vendor_names_free(&imported);
+            if (!file->php_include)
+                file->php_complete = false;
+        }
+    }
+    if (!cbm_php_collect_source_facts(temporary, source, length, result->module_qn, facts, count)) {
+        file->php_complete = false;
+        return true;
+    }
+    for (int i = 0; i < count; i++) {
+        uint32_t required = CBM_SOURCE_DECL_KNOWN | CBM_SOURCE_DECL_PUBLIC |
+                            CBM_SOURCE_DECL_TOP_LEVEL | CBM_SOURCE_CLASS_DOMAIN_COMPLETE;
+        classes[i]->public_class = (facts[i].source_flags & required) == required;
+        if (!classes[i]->public_class || classes[i]->ambiguous)
+            file->php_complete = false;
+    }
+    return true;
+}
+
+/* The following adapters certify declaration identity only. They deliberately
+ * do not supply member dispatch or broaden the callable proof registries. */
+typedef struct {
+    cbm_semantic_bindings_t *bindings;
+    cbm_pipeline_ctx_t *ctx;
+    semantic_source_t *file;
+    const cbm_file_info_t *info;
+    const CBMFileResult *result;
+    const char *source;
+    CBMLSPDef *facts;
+    semantic_class_t **entries;
+    int count, capacity;
+    CBMArena *temporary;
+} semantic_types_t;
+
+static bool semantic_typed_language(CBMLanguage language) {
+    return language == CBM_LANG_CSHARP || language == CBM_LANG_CPP || language == CBM_LANG_RUST;
+}
+
+static bool semantic_comment(TSNode node) {
+    return semantic_is(node, "comment") || semantic_is(node, "line_comment") ||
+           semantic_is(node, "block_comment");
+}
+
+/* Check the complete raw tree, including method bodies. A conditional or macro
+ * must not disappear merely because the declaration census skips its subtree. */
+static bool semantic_unconditional(TSNode root, CBMLanguage language) {
+    TSTreeCursor cursor = ts_tree_cursor_new(root);
+    bool ok = true;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        if ((!strncmp(kind, "preproc_", 8) &&
+             !(language == CBM_LANG_CPP && semantic_is(node, "preproc_include") &&
+               ts_node_eq(ts_node_parent(node), root))) ||
+            (language == CBM_LANG_RUST &&
+             (semantic_is(node, "attribute_item") || semantic_is(node, "inner_attribute_item") ||
+              semantic_is(node, "macro_invocation")))) {
+            ok = false;
+            break;
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor))
+            continue;
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor))
+                goto done;
+        }
+    }
+done:
+    ts_tree_cursor_delete(&cursor);
+    return ok;
+}
+
+static bool semantic_named_children(TSNode node, const char *const *allowed) {
+    if (ts_node_is_null(node))
+        return false;
+    bool all = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(child))
+                continue;
+            bool found = semantic_comment(child);
+            for (int j = 0; !found && allowed[j]; j++)
+                found = semantic_is(child, allowed[j]);
+            all = found;
+        } while (all && ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return all;
+}
+
+static const char *semantic_typed_base(CBMArena *arena, TSNode node, const char *source,
+                                       CBMLanguage language) {
+    TSNode clause =
+        semantic_child(node, language == CBM_LANG_CPP ? "base_class_clause" : "base_list");
+    if (ts_node_is_null(clause))
+        return NULL;
+    TSNode base = {0};
+    for (uint32_t i = 0; i < ts_node_named_child_count(clause); i++) {
+        TSNode child = ts_node_named_child(clause, i);
+        if (language == CBM_LANG_CPP && semantic_is(child, "access_specifier"))
+            continue;
+        if (!ts_node_is_null(base) ||
+            !semantic_is(child, language == CBM_LANG_CPP ? "type_identifier" : "identifier"))
+            return NULL;
+        base = child;
+    }
+    const char *name = ts_node_is_null(base) ? NULL : cbm_node_text(arena, base, source);
+    return semantic_simple_name(name) ? name : NULL;
+}
+
+static bool semantic_type_add(semantic_types_t *types, TSNode node, const char *label,
+                              const char *package) {
+    CBMArena *arena = &types->bindings->arena;
+    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    const char *name =
+        ts_node_is_null(name_node) ? NULL : cbm_node_text(arena, name_node, types->source);
+    if (!semantic_simple_name(name) || types->count >= types->capacity) {
+        types->file->typed_complete = false;
+        return true;
+    }
+    semantic_class_t *entry = cbm_arena_calloc(arena, sizeof(*entry));
+    const char *qn = cbm_arena_sprintf(arena, "%s.%s", types->result->module_qn, name);
+    if (!entry || !qn)
+        return false;
+    entry->source = types->file;
+    entry->base = semantic_typed_base(arena, node, types->source, types->info->language);
+    entry->declaration_start = ts_node_start_byte(node);
+    const cbm_gbuf_node_t *graph = cbm_gbuf_find_by_qn(types->ctx->gbuf, qn);
+    uint32_t line = ts_node_start_point(node).row + 1;
+    if (graph && graph->label && !strcmp(graph->label, label) && graph->file_path &&
+        !strcmp(graph->file_path, types->info->rel_path) && graph->start_line == (int)line)
+        entry->node = graph;
+    else
+        types->file->typed_complete = false;
+    semantic_class_t *prior = cbm_ht_get(types->bindings->classes, qn);
+    if (prior) {
+        prior->ambiguous = true;
+        entry->ambiguous = true;
+    } else if (!semantic_put(types->bindings->classes, qn, entry))
+        return false;
+    prior = cbm_ht_get(types->file->type_names, name);
+    if (prior) {
+        prior->ambiguous = true;
+        entry->ambiguous = true;
+    } else if (!semantic_put(types->file->type_names, name, entry))
+        return false;
+    if (types->info->language == CBM_LANG_CSHARP) {
+        const char *domain = cbm_arena_sprintf(arena, "cs:%s", package);
+        const char *member = domain ? cbm_arena_sprintf(arena, "%s:%s", domain, name) : NULL;
+        if (!member)
+            return false;
+        if (cbm_ht_has(types->bindings->packages, member))
+            entry->ambiguous = true;
+        if (!domain || !semantic_package_name(types->bindings, domain, name, entry))
+            return false;
+        if (entry->base)
+            entry->package_base = cbm_arena_sprintf(arena, "%s:%s", domain, entry->base);
+    } else if (types->info->language == CBM_LANG_CPP && entry->base && types->file->include_module)
+        entry->package_base =
+            cbm_arena_sprintf(arena, "%s.%s", types->file->include_module, entry->base);
+    types->facts[types->count] = (CBMLSPDef){.qualified_name = qn,
+                                             .graph_qualified_name = qn,
+                                             .short_name = name,
+                                             .source_start_line = line};
+    types->entries[types->count++] = entry;
+    if (types->info->language == CBM_LANG_RUST && !strcmp(label, "Interface")) {
+        TSNode visibility = semantic_child(node, "visibility_modifier");
+        const char *text =
+            ts_node_is_null(visibility) ? NULL : cbm_node_text(arena, visibility, types->source);
+        entry->public_class = text && !strcmp(text, "pub");
+    }
+    return true;
+}
+
+static bool semantic_cs_types(semantic_types_t *types, TSNode root, const char *package,
+                              unsigned depth) {
+    if (depth > 64) {
+        types->file->typed_complete = false;
+        return true;
+    }
+    TSNode *roots;
+    uint32_t roots_count;
+    if (!semantic_named_list(types->temporary, root, &roots, &roots_count))
+        return false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
+        if (semantic_comment(node))
+            continue;
+        if (semantic_is(node, "namespace_declaration") ||
+            semantic_is(node, "file_scoped_namespace_declaration")) {
+            TSNode name = ts_node_child_by_field_name(node, "name", 4);
+            const char *text = ts_node_is_null(name)
+                                   ? NULL
+                                   : cbm_node_text(&types->bindings->arena, name, types->source);
+            const char *nested = text ? cbm_arena_sprintf(&types->bindings->arena, "%s%s%s",
+                                                          package, package[0] ? "." : "", text)
+                                      : NULL;
+            if (!nested)
+                return false;
+            if (semantic_is(node, "file_scoped_namespace_declaration"))
+                package = nested;
+            else if (!semantic_cs_types(types, ts_node_child_by_field_name(node, "body", 4), nested,
+                                        depth + 1))
+                return false;
+            continue;
+        }
+        static const char *const header[] = {"modifier", "identifier", "base_list",
+                                             "declaration_list", NULL};
+        static const char *const body[] = {"method_declaration", NULL};
+        if (!semantic_is(node, "class_declaration") || !semantic_named_children(node, header) ||
+            !semantic_named_children(ts_node_child_by_field_name(node, "body", 4), body)) {
+            types->file->typed_complete = false;
+            continue;
+        }
+        /* Partial and special class forms need their own assembly/type rules. */
+        for (uint32_t m = 0; m < ts_node_named_child_count(node); m++) {
+            TSNode modifier = ts_node_named_child(node, m);
+            if (!semantic_is(modifier, "modifier"))
+                continue;
+            const char *text = cbm_node_text(&types->bindings->arena, modifier, types->source);
+            if (!text ||
+                (strcmp(text, "public") && strcmp(text, "internal") && strcmp(text, "abstract")))
+                types->file->typed_complete = false;
+        }
+        if (!semantic_type_add(types, node, "Class", package))
+            return false;
+    }
+    return true;
+}
+
+static bool semantic_typed_imports(semantic_types_t *types) {
+    const char **keys = NULL, **values = NULL;
+    int count = 0;
+    int status = types->info->language == CBM_LANG_RUST
+                     ? cbm_pipeline_rust_import_map(types->ctx->gbuf, types->ctx->project_name,
+                                                    types->info->rel_path, types->result, &keys,
+                                                    &values, &count)
+                     : cbm_pipeline_c_include_map(types->ctx->gbuf, types->ctx->project_name,
+                                                  types->info->rel_path, types->result, &keys,
+                                                  &values, &count);
+    bool ok = status == 0;
+    for (int i = 0; ok && i < count; i++) {
+        const char *key = cbm_arena_strdup(&types->bindings->arena, keys[i]);
+        const char *value = cbm_arena_strdup(&types->bindings->arena, values[i]);
+        ok = key && value && semantic_put(types->file->imports, key, (void *)value);
+    }
+    cbm_pxc_free_import_map(keys, values, count);
+    return ok;
+}
+
+static bool semantic_cpp_types(semantic_types_t *types, TSNode root) {
+    CBMFileResult configuration = {0};
+    if (!cbm_result_capture_raw_source(&configuration, "", 0, CBM_LANG_CPP, NULL, NULL) ||
+        strcmp(configuration.source_configuration_id, types->result->source_configuration_id)) {
+        types->file->typed_complete = false;
+        return true;
+    }
+    if (!semantic_typed_imports(types))
+        return false;
+    int includes = 0;
+    TSNode *roots;
+    uint32_t roots_count;
+    if (!semantic_named_list(types->temporary, root, &roots, &roots_count))
+        return false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
+        if (!semantic_is(node, "preproc_include"))
+            continue;
+        TSNode path = ts_node_child_by_field_name(node, "path", 4);
+        const char *text = ts_node_is_null(path)
+                               ? NULL
+                               : cbm_node_text(&types->bindings->arena, path, types->source);
+        size_t size = text ? strlen(text) : 0;
+        if (++includes != 1 || !semantic_is(path, "string_literal") || size < 3 || text[0] != '"' ||
+            text[size - 1] != '"' || strchr(text, '\\')) {
+            types->file->typed_complete = false;
+            continue;
+        }
+        const char *name = cbm_arena_strndup(&types->bindings->arena, text + 1, size - 2);
+        const char *module = name ? cbm_ht_get(types->file->imports, name) : NULL;
+        if (!module || !module[0])
+            types->file->typed_complete = false;
+        else
+            types->file->include_module = module;
+        types->file->include_end = ts_node_end_byte(node);
+    }
+    if (includes != types->result->imports.count)
+        types->file->typed_complete = false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
+        if (semantic_comment(node) || semantic_is(node, "preproc_include"))
+            continue;
+        static const char *const header[] = {"type_identifier", "base_class_clause",
+                                             "field_declaration_list", NULL};
+        static const char *const body[] = {"function_definition", "access_specifier", NULL};
+        if ((!semantic_is(node, "class_specifier") && !semantic_is(node, "struct_specifier")) ||
+            ts_node_is_null(ts_node_child_by_field_name(node, "body", 4)) ||
+            !semantic_named_children(node, header) ||
+            !semantic_named_children(ts_node_child_by_field_name(node, "body", 4), body)) {
+            types->file->typed_complete = false;
+            continue;
+        }
+        if (!semantic_type_add(types, node, "Class", ""))
+            return false;
+    }
+    return true;
+}
+
+static bool semantic_rust_impl(semantic_types_t *types, TSNode node) {
+    TSNode trait = ts_node_child_by_field_name(node, "trait", 5);
+    if (ts_node_is_null(trait))
+        return true;
+    TSNode type = ts_node_child_by_field_name(node, "type", 4);
+    static const char *const header[] = {"type_identifier", "declaration_list", NULL};
+    static const char *const body[] = {"function_item", NULL};
+    if (!semantic_is(trait, "type_identifier") || !semantic_is(type, "type_identifier") ||
+        !semantic_named_children(node, header) ||
+        !semantic_named_children(ts_node_child_by_field_name(node, "body", 4), body)) {
+        types->file->typed_complete = false;
+        return true;
+    }
+    /* `unsafe impl` and negative impls require distinct language contracts. */
+    for (uint32_t i = 0; i < ts_node_child_count(node); i++) {
+        TSNode child = ts_node_child(node, i);
+        if (semantic_is(child, "unsafe") || semantic_is(child, "!")) {
+            types->file->typed_complete = false;
+            return true;
+        }
+    }
+    const char *trait_name = cbm_node_text(&types->bindings->arena, trait, types->source);
+    const char *struct_name = cbm_node_text(&types->bindings->arena, type, types->source);
+    if (!semantic_simple_name(trait_name) || !semantic_simple_name(struct_name))
+        return true;
+    const char *key = cbm_arena_sprintf(&types->bindings->arena, "%s:%s", struct_name, trait_name);
+    if (!key)
+        return false;
+    const char *target = cbm_ht_has(types->file->rust_impls, key) ? "" : trait_name;
+    return semantic_put(types->file->rust_impls, key, (void *)target);
+}
+
+static bool semantic_rust_types(semantic_types_t *types, TSNode root) {
+    if (!semantic_typed_imports(types))
+        return false;
+    TSNode *roots;
+    uint32_t roots_count;
+    if (!semantic_named_list(types->temporary, root, &roots, &roots_count))
+        return false;
+    for (uint32_t i = 0; i < roots_count; i++) {
+        TSNode node = roots[i];
+        if (semantic_comment(node) || semantic_is(node, "function_item") ||
+            semantic_is(node, "use_declaration"))
+            continue;
+        if (semantic_is(node, "impl_item")) {
+            if (!semantic_rust_impl(types, node))
+                return false;
+            continue;
+        }
+        if (semantic_is(node, "mod_item") &&
+            ts_node_is_null(ts_node_child_by_field_name(node, "body", 4)))
+            continue;
+        if (semantic_is(node, "struct_item")) {
+            if (!semantic_type_add(types, node, "Struct", ""))
+                return false;
+            continue;
+        }
+        static const char *const header[] = {"visibility_modifier", "type_identifier",
+                                             "declaration_list", NULL};
+        static const char *const body[] = {"function_signature_item", NULL};
+        if (!semantic_is(node, "trait_item") || !semantic_named_children(node, header) ||
+            !semantic_named_children(ts_node_child_by_field_name(node, "body", 4), body)) {
+            types->file->typed_complete = false;
+            continue;
+        }
+        if (!semantic_type_add(types, node, "Interface", ""))
+            return false;
+    }
+    return true;
+}
+
+static bool semantic_typed_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_ctx_t *ctx,
+                                 semantic_source_t *file, const cbm_file_info_t *info,
+                                 const CBMFileResult *result, const char *source, int length,
+                                 TSNode root, CBMArena *temporary) {
+    file->type_names = cbm_ht_create(0);
+    file->rust_impls = cbm_ht_create(0);
+    if (!file->type_names || !file->rust_impls || result->defs.count < 0)
+        return false;
+    file->typed_complete = semantic_unconditional(root, info->language);
+    semantic_types_t types = {.bindings = bindings,
+                              .ctx = ctx,
+                              .file = file,
+                              .info = info,
+                              .result = result,
+                              .source = source,
+                              .capacity = result->defs.count,
+                              .temporary = temporary};
+    types.facts = cbm_arena_calloc(temporary, (size_t)types.capacity * sizeof(*types.facts));
+    types.entries = cbm_arena_calloc(temporary, (size_t)types.capacity * sizeof(*types.entries));
+    if (types.capacity && (!types.facts || !types.entries))
+        return false;
+    bool ok = true;
+    if (file->typed_complete) {
+        if (info->language == CBM_LANG_CSHARP)
+            ok = semantic_cs_types(&types, root, "", 0);
+        else if (info->language == CBM_LANG_CPP)
+            ok = semantic_cpp_types(&types, root);
+        else
+            ok = semantic_rust_types(&types, root);
+    }
+    if (!ok)
+        return false;
+    bool audited = info->language == CBM_LANG_CSHARP
+                       ? cbm_cs_collect_source_facts(temporary, source, length, result->module_qn,
+                                                     types.facts, types.count)
+                   : info->language == CBM_LANG_CPP
+                       ? cbm_c_collect_source_facts(temporary, source, length, result->module_qn,
+                                                    types.facts, types.count)
+                       : cbm_rust_collect_source_facts(temporary, source, length, result->module_qn,
+                                                       types.facts, types.count);
+    file->typed_complete &= audited;
+    for (int i = 0; i < types.count; i++) {
+        semantic_class_t *entry = types.entries[i];
+        if (info->language == CBM_LANG_RUST && entry->node &&
+            !strcmp(entry->node->label, "Interface"))
+            continue; /* The exact trait AST above supplies its declaration fact. */
+        if (!(types.facts[i].source_flags & CBM_SOURCE_DECL_KNOWN))
+            file->typed_complete = false;
+        entry->public_class =
+            info->language == CBM_LANG_CPP
+                ? (types.facts[i].source_flags & CBM_SOURCE_CLASS_DOMAIN_COMPLETE) != 0
+                : (types.facts[i].source_flags & CBM_SOURCE_DECL_PUBLIC) != 0;
+    }
+    if (info->language == CBM_LANG_CSHARP && !file->typed_complete)
+        bindings->csharp_complete = false;
+    return true;
+}
+
+static bool semantic_source_facts(cbm_semantic_bindings_t *bindings, cbm_pipeline_ctx_t *ctx,
+                                  semantic_source_t *file, const cbm_file_info_t *info,
+                                  CBMFileResult *result) {
+    int length = result && result->source ? result->source_len : 0;
+    char *owned = result && !result->source ? read_file(info->path, &length) : NULL;
+    const char *source = result && result->source ? result->source : owned;
+    TSTree *owned_tree = NULL;
+    bool ok = true;
+    if (!result || result->has_error || result->parse_incomplete || result->parse_unusable ||
+        result->walk_truncated || result->lsp_skipped || !source || length <= 0 ||
+        !cbm_result_source_matches(result, source, (size_t)length, CBM_SOURCE_ORIGIN_RAW)) {
+        if (info->language == CBM_LANG_KOTLIN)
+            bindings->kotlin_complete = false;
+        if (info->language == CBM_LANG_CSHARP)
+            bindings->csharp_complete = false;
+        goto done;
+    }
+    const TSTree *tree = result->cached_tree;
+    if (!tree) {
+        TSParser *parser = ts_parser_new();
+        if (parser && ts_parser_set_language(parser, cbm_ts_language(info->language)))
+            owned_tree = cbm_parse_source(parser, source, (uint32_t)length, (TSParseOptions){0});
+        if (parser)
+            ts_parser_delete(parser);
+        tree = owned_tree;
+    }
+    if (!tree || ts_node_has_error(ts_tree_root_node(tree)) ||
+        ts_node_end_byte(ts_tree_root_node(tree)) != (uint32_t)length) {
+        if (info->language == CBM_LANG_KOTLIN)
+            bindings->kotlin_complete = false;
+        if (info->language == CBM_LANG_CSHARP)
+            bindings->csharp_complete = false;
+        goto done;
+    }
+    CBMFileResult view = *result;
+    view.cached_tree = (TSTree *)tree;
+    view.cached_lang = info->language;
+    CBMArena temporary;
+    cbm_arena_init(&temporary);
+    cbm_resolve_binding_index_t *index = NULL;
+    TSNode root = ts_tree_root_node(tree);
+    file->has_imports = result->imports.count != 0;
+    if (semantic_ecma(info->language)) {
+        index =
+            cbm_resolve_binding_build(&temporary, &view, info->language, source, (size_t)length);
+        ok = index && semantic_imports(bindings, ctx, file, info, result, index);
+    } else if (info->language == CBM_LANG_KOTLIN) {
+        TSNode header = semantic_child(root, "package_header");
+        TSNode name = semantic_child(header, "identifier");
+        file->package = ts_node_is_null(header) ? ""
+                        : ts_node_is_null(name) ? NULL
+                                                : cbm_node_text(&bindings->arena, name, source);
+        if (!file->package)
+            ok = false;
+    }
+    if (ok && semantic_typed_language(info->language))
+        ok = semantic_typed_facts(bindings, ctx, file, info, result, source, length, root,
+                                  &temporary);
+    else if (ok && info->language == CBM_LANG_PHP)
+        ok =
+            semantic_php_facts(bindings, ctx, file, info, result, source, length, root, &temporary);
+    else if (ok)
+        ok = semantic_class_facts(bindings, ctx, file, info, result, source, length, root, index,
+                                  &temporary);
+    cbm_arena_destroy(&temporary);
+done:
+    if (owned_tree)
+        ts_tree_delete(owned_tree);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, owned);
+    return ok;
+}
+
+static void semantic_check_domain(const cbm_gbuf_node_t *node, void *userdata) {
+    cbm_semantic_bindings_t *bindings = userdata;
+    if (node->label && !strcmp(node->label, "File") &&
+        (!node->file_path || !cbm_ht_has(bindings->files, node->file_path))) {
+        bindings->kotlin_complete = false;
+        bindings->csharp_complete = false;
+    }
+}
+
+cbm_semantic_bindings_t *cbm_semantic_bindings_build(cbm_pipeline_ctx_t *ctx,
+                                                     const cbm_file_info_t *files, int count,
+                                                     CBMFileResult **cache) {
+    if (!ctx || count < 0 || (count && !files))
+        return NULL;
+    bool have_census = false, relevant = false;
+    for (int i = 0; i < count; i++) {
+        have_census |= files[i].language == CBM_LANG_KOTLIN || files[i].language == CBM_LANG_CSHARP;
+        relevant |= files[i].language == CBM_LANG_KOTLIN || files[i].language == CBM_LANG_PHP ||
+                    semantic_ecma(files[i].language) || semantic_typed_language(files[i].language);
+    }
+    cbm_semantic_bindings_t *bindings = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*bindings));
+    if (!bindings)
+        return NULL;
+    cbm_arena_init(&bindings->arena);
+    bindings->files = cbm_ht_create(0);
+    bindings->classes = cbm_ht_create(0);
+    bindings->packages = cbm_ht_create(0);
+    bindings->kotlin_complete = true;
+    bindings->csharp_complete = true;
+    if (!bindings->files || !bindings->classes || !bindings->packages)
+        goto failed;
+    if (!relevant)
+        return bindings;
+    for (int i = 0; i < count; i++) {
+        if (!have_census && files[i].language != CBM_LANG_PHP &&
+            !semantic_ecma(files[i].language) && !semantic_typed_language(files[i].language))
+            continue;
+        semantic_source_t *file = cbm_arena_calloc(&bindings->arena, sizeof(*file));
+        const char *key = cbm_arena_strdup(&bindings->arena, files[i].rel_path);
+        if (!file || !key || cbm_ht_has(bindings->files, key))
+            goto failed;
+        file->language = files[i].language;
+        if (!semantic_put(bindings->files, key, file))
+            goto failed;
+        if (file->language != CBM_LANG_KOTLIN && file->language != CBM_LANG_PHP &&
+            !semantic_ecma(file->language) && !semantic_typed_language(file->language))
+            continue;
+        file->imports = cbm_ht_create(0);
+        if (!file->imports)
+            goto failed;
+        bool loaded = false;
+        CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+        bool ok = semantic_source_facts(bindings, ctx, file, &files[i], result);
+        cbm_pipeline_result_release(result, loaded);
+        if (!ok)
+            goto failed;
+    }
+    if (have_census)
+        cbm_gbuf_foreach_node(ctx->gbuf, semantic_check_domain, bindings);
+    return bindings;
+failed:
+    cbm_semantic_bindings_free(bindings);
+    return NULL;
+}
+
+const char *cbm_semantic_class_base(const cbm_semantic_bindings_t *bindings,
+                                    const CBMDefinition *definition, const char *base,
+                                    const cbm_gbuf_node_t *candidate) {
+    /* Existing same-file resolution and non-class relations retain their
+     * established path. Every new cross-file Class target needs this audit. */
+    if (!bindings || !definition->qualified_name)
+        return NULL;
+    const semantic_source_t *declaration_source =
+        definition->file_path ? cbm_ht_get(bindings->files, definition->file_path) : NULL;
+    if (candidate && candidate->label && strcmp(candidate->label, "Class") &&
+        (!declaration_source || declaration_source->language != CBM_LANG_CPP))
+        return candidate->qualified_name;
+    const semantic_class_t *owner = cbm_ht_get(bindings->classes, definition->qualified_name);
+    if (declaration_source && declaration_source->language == CBM_LANG_PHP &&
+        (!owner || !semantic_simple_name(base)))
+        return candidate ? candidate->qualified_name : NULL;
+    if (!semantic_simple_name(base))
+        return NULL;
+    if (candidate && candidate->file_path && definition->file_path &&
+        !strcmp(candidate->file_path, definition->file_path) &&
+        (!owner || !semantic_ecma(owner->source->language) ||
+         !cbm_ht_has(owner->source->imports, base)))
+        return candidate->qualified_name;
+    /* Existing exact class-use bindings retain their established path.
+     * Only the new direct include path consumes the stricter runtime census. */
+    if (candidate && owner && owner->source->language == CBM_LANG_PHP &&
+        owner->source->php_use_imports)
+        return candidate->qualified_name;
+    if (!owner || !owner->node || owner->ambiguous || !owner->base || strcmp(owner->base, base))
+        return NULL;
+    const semantic_class_t *target = NULL;
+    if (owner->source->language == CBM_LANG_CSHARP) {
+        if (!bindings->csharp_complete || !owner->source->typed_complete)
+            return NULL;
+        target = owner->package_base ? cbm_ht_get(bindings->packages, owner->package_base) : NULL;
+        if (!target || !target->source->typed_complete)
+            return NULL;
+        if (target->source == owner->source && !target->ambiguous && target->node)
+            return target->node->qualified_name;
+    } else if (owner->source->language == CBM_LANG_CPP) {
+        if (!owner->source->typed_complete)
+            return NULL;
+        target = cbm_ht_get(owner->source->type_names, base);
+        if (target) {
+            if (target->declaration_start >= owner->declaration_start)
+                return NULL;
+        } else {
+            if (!owner->source->include_module ||
+                owner->source->include_end > owner->declaration_start)
+                return NULL;
+            target =
+                owner->package_base ? cbm_ht_get(bindings->classes, owner->package_base) : NULL;
+            if (!target || target->source->has_imports)
+                return NULL;
+        }
+        if (!target || target->source->language != CBM_LANG_CPP || !target->source->typed_complete)
+            return NULL;
+    } else if (semantic_ecma(owner->source->language)) {
+        const char *qn = cbm_ht_get(owner->source->imports, base);
+        target = qn ? cbm_ht_get(bindings->classes, qn) : NULL;
+    } else if (owner->source->language == CBM_LANG_PHP) {
+        const semantic_source_t *source = owner->source;
+        if (!source->php_complete || !source->php_include ||
+            owner->php_start < source->php_include_end || !owner->package_base ||
+            cbm_ht_has(source->php_names, owner->package_base))
+            return NULL;
+        const semantic_source_t *included = cbm_ht_get(bindings->files, source->php_include);
+        if (!included || included->language != CBM_LANG_PHP || !included->php_complete ||
+            !included->php_inert || !included->php_names)
+            return NULL;
+        target = cbm_ht_get(included->php_names, owner->package_base);
+        if (!target || !target->php_standalone)
+            return NULL;
+    } else if (owner->source->language == CBM_LANG_KOTLIN && bindings->kotlin_complete &&
+               !owner->source->has_imports) {
+        target = owner->package_base ? cbm_ht_get(bindings->packages, owner->package_base) : NULL;
+    }
+    return target && !target->ambiguous && target->public_class && target->node
+               ? target->node->qualified_name
+               : NULL;
+}
+
+/* The impl occurrence and both declarations must belong to the same audited
+ * snapshot. Imports already encode crate/module membership, not graph tails. */
+bool cbm_semantic_rust_implementation(const cbm_semantic_bindings_t *bindings, const char *rel,
+                                      const CBMImplTrait *implementation, const char **struct_qn,
+                                      const char **trait_qn) {
+    *struct_qn = NULL;
+    *trait_qn = NULL;
+    if (!bindings || !rel || !implementation ||
+        !semantic_simple_name(implementation->struct_name) ||
+        !semantic_simple_name(implementation->trait_name))
+        return false;
+    const semantic_source_t *file = cbm_ht_get(bindings->files, rel);
+    if (!file || file->language != CBM_LANG_RUST || !file->typed_complete)
+        return false;
+    char key[1024];
+    int size = snprintf(key, sizeof(key), "%s:%s", implementation->struct_name,
+                        implementation->trait_name);
+    if (size <= 0 || (size_t)size >= sizeof(key))
+        return false;
+    const char *proven = cbm_ht_get(file->rust_impls, key);
+    if (!proven || !proven[0])
+        return false;
+    const semantic_class_t *owner = cbm_ht_get(file->type_names, implementation->struct_name);
+    const semantic_class_t *target = cbm_ht_get(file->type_names, implementation->trait_name);
+    const char *imported = cbm_ht_get(file->imports, implementation->trait_name);
+    if (target && imported)
+        return false;
+    if (!target && imported && imported[0])
+        target = cbm_ht_get(bindings->classes, imported);
+    if (!owner || owner->ambiguous || !owner->node || strcmp(owner->node->label, "Struct") ||
+        !implementation->struct_qn ||
+        strcmp(owner->node->qualified_name, implementation->struct_qn) || !target ||
+        target->ambiguous || !target->node || strcmp(target->node->label, "Interface") ||
+        !target->source->typed_complete || (target->source != file && !target->public_class) ||
+        cbm_ht_has(file->imports, implementation->struct_name))
+        return false;
+    *struct_qn = owner->node->qualified_name;
+    *trait_qn = target->node->qualified_name;
+    return true;
+}
+
 static const char *itoa_log(int val) {
     enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
     static CBM_TLS char bufs[RING_BUF_COUNT][CBM_SZ_32];
@@ -80,10 +1252,32 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Build per-file import map from cached extraction result or graph buffer edges. */
+/* Build per-file import map from cached extraction result or graph buffer
+ * edges. */
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
-                            const char ***out_vals, int *out_count) {
+                            const char ***out_vals, int *out_count, CBMLanguage lang) {
+    if (semantic_ecma(lang)) {
+        int rc = cbm_pipeline_ecma_import_map(ctx, rel_path, result, false, out_keys, out_vals,
+                                              out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
+    if (lang == CBM_LANG_PHP) {
+        int rc = cbm_pipeline_php_import_map(ctx->gbuf, ctx->project_name, rel_path, result,
+                                             out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
+    if (lang == CBM_LANG_PYTHON) {
+        int rc = cbm_pipeline_python_import_map(ctx->gbuf, ctx->project_name, rel_path, result,
+                                                true, out_keys, out_vals, out_count);
+        if (rc != 0)
+            atomic_store(&ctx->resolver_failed, true);
+        return rc;
+    }
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -167,7 +1361,11 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     return 0;
 }
 
-static void free_import_map(const char **keys, const char **vals, int count) {
+static void free_import_map(const char **keys, const char **vals, int count, CBMLanguage lang) {
+    if (lang == CBM_LANG_PYTHON || lang == CBM_LANG_PHP || semantic_ecma(lang)) {
+        cbm_pxc_free_import_map(keys, vals, count);
+        return;
+    }
     if (keys) {
         for (int i = 0; i < count; i++) {
             cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)keys[i]);
@@ -179,7 +1377,8 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
-/* Resolve a class/type name through the registry. Returns borrowed QN or NULL. */
+/* Resolve a class/type name through the registry. Returns borrowed QN or NULL.
+ */
 static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
                                     const char *module_qn, const char **imp_keys,
                                     const char **imp_vals, int imp_count, CBMLanguage lang) {
@@ -254,7 +1453,8 @@ typedef struct {
     int64_t id;
 } go_imethod_t;
 
-/* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE edges. */
+/* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE
+ * edges. */
 static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *cls,
                                      const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
                                      int im_count) {
@@ -427,8 +1627,9 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
     }
 
     /* Find candidate concrete types. In Go the type that satisfies an interface
-     * is a struct (now labelled "Struct") or a named type (labelled "Class"); both
-     * sets are checked. Each call returns a borrowed internal array (no free). */
+     * is a struct (now labelled "Struct") or a named type (labelled "Class");
+     * both sets are checked. Each call returns a borrowed internal array (no
+     * free). */
     const cbm_gbuf_node_t **classes = NULL;
     int class_count = 0;
     cbm_gbuf_find_by_label(ctx->gbuf, "Class", &classes, &class_count);
@@ -622,11 +1823,11 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     }
 }
 
-static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
-                                  const cbm_file_info_t *fi, const CBMFileResult *result,
-                                  const char *module_qn, const char **imp_keys,
-                                  const char **imp_vals, int imp_count, int *inherits_count,
-                                  int *decorates_count, CBMLanguage lang,
+static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const cbm_semantic_bindings_t *bindings,
+                                  const CBMDefinition *def, const cbm_file_info_t *fi,
+                                  const CBMFileResult *result, const char *module_qn,
+                                  const char **imp_keys, const char **imp_vals, int imp_count,
+                                  int *inherits_count, int *decorates_count, CBMLanguage lang,
                                   const cbm_php_vendor_names_t *php_vendor) {
     if (!def->qualified_name) {
         return;
@@ -650,6 +1851,12 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             if (!base_qn) {
                 base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn, imp_keys,
                                            imp_vals, imp_count, lang);
+                if ((semantic_ecma(lang) || lang == CBM_LANG_KOTLIN || lang == CBM_LANG_PHP ||
+                     lang == CBM_LANG_CSHARP || lang == CBM_LANG_CPP) &&
+                    def->label && !strcmp(def->label, "Class"))
+                    base_qn = cbm_semantic_class_base(
+                        bindings, def, def->base_classes[b],
+                        base_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, base_qn) : NULL);
                 if (!base_qn || cbm_python_external_base_contradicts(
                                     fi->language, &result->imports, def->base_classes[b], base_qn,
                                     ctx->gbuf, ctx->project_name, fi->rel_path)) {
@@ -671,6 +1878,19 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             }
         }
     }
+    /* Bases only the shared resolver can follow: reexports and star imports. */
+    for (size_t b = 0; lang == CBM_LANG_PYTHON; b++) {
+        const char *base_qn =
+            cbm_shared_resolver_python_base(ctx->shared_resolver, def->qualified_name, b);
+        if (!base_qn)
+            break;
+        const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
+        if (base_node && node->id != base_node->id) {
+            cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id,
+                                 cbm_semantic_base_edge_type(base_node), "{}");
+            (*inherits_count)++;
+        }
+    }
     if (def->decorators) {
         for (int dc = 0; def->decorators[dc]; dc++) {
             resolve_decorator(ctx, node, def->decorators[dc], module_qn, imp_keys, imp_vals,
@@ -679,7 +1899,8 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
     }
 }
 
-/* Get extraction result from cache or re-extract. Sets *owned=true if caller must free. */
+/* Get extraction result from cache or re-extract. Sets *owned=true if caller
+ * must free. */
 static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
                                          const cbm_file_info_t *fi, bool *owned) {
     *owned = false;
@@ -709,25 +1930,14 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
 }
 
 /* Resolve Rust impl traits for one file's extraction results. */
-static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                               const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count) {
+static int resolve_impl_traits(cbm_pipeline_ctx_t *ctx, const cbm_semantic_bindings_t *bindings,
+                               const CBMFileResult *result, const char *rel) {
     int count = 0;
     for (int t = 0; t < result->impl_traits.count; t++) {
-        CBMImplTrait *it = &result->impl_traits.items[t];
-        if (!it->trait_name || !it->struct_name) {
+        const char *trait_qn = NULL, *struct_qn = NULL;
+        if (!cbm_semantic_rust_implementation(bindings, rel, &result->impl_traits.items[t],
+                                              &struct_qn, &trait_qn))
             continue;
-        }
-        const char *trait_qn = resolve_as_class(ctx->registry, it->trait_name, module_qn, imp_keys,
-                                                imp_vals, imp_count, CBM_LANG_RUST);
-        if (!trait_qn) {
-            continue;
-        }
-        const char *struct_qn = resolve_as_class(ctx->registry, it->struct_name, module_qn,
-                                                 imp_keys, imp_vals, imp_count, CBM_LANG_RUST);
-        if (!struct_qn) {
-            continue;
-        }
         const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(ctx->gbuf, trait_qn);
         const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(ctx->gbuf, struct_qn);
         if (tn && sn && tn->id != sn->id) {
@@ -746,9 +1956,14 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     int decorates_count = 0;
     int implements_count = 0;
     int errors = 0;
+    cbm_semantic_bindings_t *bindings =
+        cbm_semantic_bindings_build(ctx, files, file_count, ctx->result_cache);
+    if (!bindings)
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
+            cbm_semantic_bindings_free(bindings);
             return CBM_NOT_FOUND;
         }
 
@@ -758,6 +1973,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         CBMFileResult *result = sem_get_or_extract(ctx, i, &files[i], &result_owned);
         if (!result) {
             if (atomic_load(&ctx->test_declarations_failed)) {
+                cbm_semantic_bindings_free(bindings);
                 return CBM_PIPELINE_ABORT_PRESERVE_DB;
             }
             errors++;
@@ -768,6 +1984,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
             if (result_owned) {
                 cbm_free_result(result);
             }
+            cbm_semantic_bindings_free(bindings);
             return CBM_PIPELINE_ABORT_PRESERVE_DB;
         }
 
@@ -775,7 +1992,7 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count, files[i].language);
         cbm_php_vendor_names_t php_vendor;
         cbm_pipeline_php_vendor_names_build(ctx->gbuf, ctx->project_name, rel, result, &php_vendor);
 
@@ -784,22 +2001,23 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
-            sem_process_def_edges(ctx, &result->defs.items[d], &files[i], result, module_qn,
-                                  imp_keys, imp_vals, imp_count, &inherits_count, &decorates_count,
-                                  files[i].language, &php_vendor);
+            sem_process_def_edges(ctx, bindings, &result->defs.items[d], &files[i], result,
+                                  module_qn, imp_keys, imp_vals, imp_count, &inherits_count,
+                                  &decorates_count, files[i].language, &php_vendor);
         }
 
         /* ── IMPLEMENTS from impl_traits (Rust) ─────────────────── */
-        implements_count +=
-            resolve_impl_traits(ctx, result, module_qn, imp_keys, imp_vals, imp_count);
+        implements_count += resolve_impl_traits(ctx, bindings, result, files[i].rel_path);
 
         free(module_qn);
         cbm_pipeline_php_vendor_names_free(&php_vendor);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free_import_map(imp_keys, imp_vals, imp_count, files[i].language);
         if (result_owned) {
             cbm_free_result(result);
         }
     }
+
+    cbm_semantic_bindings_free(bindings);
 
     /* ── Go-style implicit interface satisfaction ──────────────── */
     int go_impl = cbm_pipeline_implements_go(ctx);

@@ -42,6 +42,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "resolver_quality.h"
 #include "cbm.h"
 #include "service_patterns.h"
 #include <mcp/mcp.h>
@@ -71,7 +72,8 @@ typedef struct {
 
 static void et_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\') *p = '/';
+        if (*p == '\\')
+            *p = '/';
     }
 }
 
@@ -79,7 +81,8 @@ static void et_to_fwd_slashes(char *p) {
 static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_et_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir))
+        return NULL;
     et_to_fwd_slashes(lp->tmpdir);
 
     for (int i = 0; i < nfiles; i++) {
@@ -92,16 +95,19 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
             *slash = '/';
         }
         FILE *f = fopen(path, "wb");
-        if (!f) return NULL;
+        if (!f)
+            return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
 
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
+    if (!lp->project)
+        return NULL;
 
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+    if (!home)
+        home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
@@ -109,26 +115,34 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
     unlink(lp->dbpath);
 
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv) return NULL;
+    if (!lp->srv)
+        return NULL;
 
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp) free(resp);
+    if (resp)
+        free(resp);
 
     return cbm_store_open_path(lp->dbpath);
 }
 
 static void et_cleanup(EtProj *lp, cbm_store_t *store) {
-    if (store) cbm_store_close(store);
-    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
-    free(lp->project); lp->project = NULL;
+    if (store)
+        cbm_store_close(store);
+    if (lp->srv) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+    }
+    free(lp->project);
+    lp->project = NULL;
     th_rmtree(lp->tmpdir);
     unlink(lp->dbpath);
     char wal[600], shm[600];
     snprintf(wal, sizeof(wal), "%s-wal", lp->dbpath);
     snprintf(shm, sizeof(shm), "%s-shm", lp->dbpath);
-    unlink(wal); unlink(shm);
+    unlink(wal);
+    unlink(shm);
 }
 
 /* Assert edge_type count >= floor; dump diagnostic on failure. */
@@ -153,8 +167,8 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
  * parallel pads the fixture past MIN_FILES_FOR_PARALLEL so the parallel
  * resolver mints the routes; must_qn (optional) is a Route qualified_name that
  * must exist -- the identity cross-repo HTTP matching joins on. */
-static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes,
-                                bool parallel, const char *must_qn) {
+static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes, bool parallel,
+                                const char *must_qn) {
     EtProj lp;
     cbm_store_t *store =
         parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
@@ -234,11 +248,12 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
     static char pad_body[ET_PARALLEL_PAD][64];
     EtFile files[ET_PAD_MAX] = {0};
     int n = 0;
-    for (int i = 0; i < n_mean; i++) files[n++] = meaningful[i];
+    for (int i = 0; i < n_mean; i++)
+        files[n++] = meaningful[i];
     for (int i = 0; i < ET_PARALLEL_PAD; i++) {
         snprintf(pad_name[i], sizeof(pad_name[i]), "pad/pad_%02d.py", i);
         snprintf(pad_body[i], sizeof(pad_body[i]), "def pad_%02d():\n    return %d\n", i, i);
-        files[n].name    = pad_name[i];
+        files[n].name = pad_name[i];
         files[n].content = pad_body[i];
         n++;
     }
@@ -404,11 +419,31 @@ static int et_calls_to_name_parallel(const EtFile *meaningful, int n_mean, const
     return hits;
 }
 
+static bool et_jsx_quality(const EtFile *files, int count, const RQ_Source *sources,
+                           size_t source_count, const RQ_Expected *expected, size_t expected_count,
+                           const RQ_Forbidden *forbidden, size_t forbidden_count, size_t required,
+                           const char *name) {
+    bool ok = true;
+    for (int parallel = 0; parallel < 2; parallel++) {
+        EtProj project;
+        cbm_store_t *store = parallel ? et_index_parallel(&project, files, count)
+                                      : et_index_files(&project, files, count);
+        RQ_Report report = {0};
+        char suite[128];
+        snprintf(suite, sizeof(suite), "%s/%s", name, parallel ? "parallel" : "sequential");
+        bool checked = store && rq_check_project_declarations(
+                                    store, project.project, suite, sources, source_count, expected,
+                                    expected_count, forbidden, forbidden_count, &report, stderr);
+        ok = checked && report.genuine == expected_count && report.found == required &&
+             report.missing == expected_count - required && ok;
+        et_cleanup(&project, store);
+    }
+    return ok;
+}
 TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
     static const EtFile f[] = {
-        {"tsconfig.json",
-         "{ \"compilerOptions\": { \"baseUrl\": \".\", "
-         "\"paths\": { \"@/*\": [\"./src/*\"] } } }\n"},
+        {"tsconfig.json", "{ \"compilerOptions\": { \"baseUrl\": \".\", "
+                          "\"paths\": { \"@/*\": [\"./src/*\"] } } }\n"},
         {"src/components/ui/kpi-card.tsx",
          "export function KpiCard({ label }: { label: string }) {\n"
          "  return <div>{label}</div>;\n}\n"},
@@ -418,6 +453,34 @@ TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
         {"src/app/dashboard-b.tsx",
          "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
          "export function DashboardB() {\n  return <KpiCard label=\"b\" />;\n}\n"}};
+    /* Configuration is written as context, but has no indexed parser snapshot. */
+    const RQ_Source sources[] = {{.path = f[1].name, .text = f[1].content},
+                                 {.path = f[2].name, .text = f[2].content},
+                                 {.path = f[3].name, .text = f[3].content}};
+    const RQ_Expected expected[] = {
+        {.case_id = "dashboard-a-exact-component",
+         .site = {.file = "src/app/dashboard-a.tsx",
+                  .caller = "DashboardA",
+                  .needle = "<KpiCard label=\"a\" />"},
+         .relation = "CALLS",
+         .target = {.file = "src/components/ui/kpi-card.tsx",
+                    .suffix = "KpiCard",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function KpiCard({ label }: { label: string }) {"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "dashboard-b-exact-component",
+         .site = {.file = "src/app/dashboard-b.tsx",
+                  .caller = "DashboardB",
+                  .needle = "<KpiCard label=\"b\" />"},
+         .relation = "CALLS",
+         .target = {.file = "src/components/ui/kpi-card.tsx",
+                    .suffix = "KpiCard",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function KpiCard({ label }: { label: string }) {"},
+         .mode = RQ_REQUIRED}};
+    ASSERT_TRUE(et_jsx_quality(f, 4, sources, 3, expected, 2, NULL, 0, 2, "jsx_alias_1085"));
     /* RED before the fix: 0 (parallel drops alias-JSX). GREEN: exactly one
      * deduplicated edge from each dashboard render. */
     int hits = et_calls_to_name_parallel(f, 4, "KpiCard");
@@ -428,6 +491,164 @@ TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
                 hits);
     }
     ASSERT_EQ(hits, 2);
+    PASS();
+}
+
+/* Whole-tag sites retain exact source bindings; namesakes and mutable/local
+ * shadows never borrow the imported component's declaration identity. */
+TEST(calls_jsx_named_components_require_exact_binding) {
+    static const EtFile files[] = {
+        {"component.tsx", "export function Widget({ label }: { label: string }) {\n"
+                          "  return <span>{label}</span>;\n}\n"},
+        {"decoy.tsx", "export function Widget() { return <span />; }\n"},
+        {"hidden.tsx", "function Hidden() { return <span />; }\nexport const marker = 1;\n"},
+        {"positive.tsx", "import { Widget as Renamed } from './component';\n"
+                         "export function ImportedView() { return <Renamed label=\"ok\" />; }\n"},
+        {"local.tsx", "export function LocalWidget() { return <span />; }\n"
+                      "export function LocalView() { return <LocalWidget></LocalWidget>; }\n"
+                      "export function exactTarget() { return 7; }\n"
+                      "export function exactCaller() { return exactTarget(); }\n"},
+        {"parameter.tsx",
+         "import { Widget } from './component';\n"
+         "export function ParameterView(Widget: any) { return <Widget label=\"p\" />; }\n"},
+        {"shadow.tsx", "import { Widget } from './component';\n"
+                       "export function ShadowView(props: any) {\n"
+                       "  const Widget = props.widget;\n  return <Widget label=\"s\" />;\n}\n"},
+        {"conflict.tsx",
+         "import { Widget } from './component';\nimport { Widget } from './decoy';\n"
+         "export function ConflictView() { return <Widget label=\"c\" />; }\n"},
+        {"private.tsx", "import { Hidden } from './hidden';\n"
+                        "export function PrivateView() { return <Hidden />; }\n"},
+        {"intrinsic.tsx", "import { Widget as widget } from './component';\n"
+                          "export function IntrinsicView() { return <widget label=\"i\" />; }\n"},
+        {"missing.tsx", "import { Widget } from '@missing/component';\n"
+                        "export function MissingView() { return <Widget label=\"m\" />; }\n"},
+        {"member.tsx", "import * as UI from './component';\n"
+                       "export function MemberView() { return <UI.Widget label=\"q\" />; }\n"},
+        {"namespace.tsx", "export function NamespaceView() { return <svg:Widget />; }\n"}};
+    RQ_Source sources[13];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+        sources[i] = (RQ_Source){.path = files[i].name, .text = files[i].content};
+    const RQ_Expected expected[] = {
+        {.case_id = "imported-renamed-component",
+         .site = {.file = "positive.tsx",
+                  .caller = "ImportedView",
+                  .needle = "<Renamed label=\"ok\" />"},
+         .relation = "CALLS",
+         .target = {.file = "component.tsx",
+                    .suffix = "component.Widget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function Widget({ label }: { label: string }) {"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "local-opening-tag-component",
+         .site = {.file = "local.tsx", .caller = "LocalView", .needle = "<LocalWidget>"},
+         .relation = "CALLS",
+         .target = {.file = "local.tsx",
+                    .suffix = "local.LocalWidget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function LocalWidget() { return <span />; }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "ordinary-call-preserved",
+         .site = {.file = "local.tsx",
+                  .caller = "exactCaller",
+                  .needle = "exactTarget()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "local.tsx",
+                    .suffix = "local.exactTarget",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "export function exactTarget() { return 7; }"},
+         .mode = RQ_REQUIRED},
+        /* `<UI.Widget />` reads that member of the namespace, whatever rendering it
+         * still takes to prove the invocation below. */
+        {.case_id = "member-component-value-usage",
+         .site = {.file = "member.tsx", .caller = "MemberView", .needle = "Widget"},
+         .relation = "USAGE",
+         .target = {.file = "component.tsx",
+                    .suffix = "component.Widget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function Widget({ label }: { label: string }) {"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "member-component-quality-gap",
+         .site = {.file = "member.tsx",
+                  .caller = "MemberView",
+                  .needle = "<UI.Widget label=\"q\" />"},
+         .relation = "CALLS",
+         .target = {.file = "component.tsx",
+                    .suffix = "component.Widget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function Widget({ label }: { label: string }) {"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "jsx-namespace-member-binding-proof",
+         .why = "The explicit namespace import and named export identify Widget, but this bridge "
+                "proves only simple identifier JSX names. Member lookup requires a separate audit.",
+         .tried = "Preserved the namespace member shape beside required imported/local simple "
+                  "components and an unrelated namesake; both pipeline drivers use the exact "
+                  "source-site oracle. No namespace member is admitted by this bounded bridge."}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "unrelated-namesake",
+         .site = {.file = "positive.tsx",
+                  .caller = "ImportedView",
+                  .needle = "<Renamed label=\"ok\" />"},
+         .relation = "CALLS",
+         .target = {.file = "decoy.tsx",
+                    .suffix = "decoy.Widget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function Widget() { return <span />; }"}},
+        {.case_id = "parameter-shadow",
+         .site = {.file = "parameter.tsx",
+                  .caller = "ParameterView",
+                  .needle = "<Widget label=\"p\" />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "local-value-shadow",
+         .site = {.file = "shadow.tsx", .caller = "ShadowView", .needle = "<Widget label=\"s\" />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "conflicting-imports",
+         .site = {.file = "conflict.tsx",
+                  .caller = "ConflictView",
+                  .needle = "<Widget label=\"c\" />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "unexported-component",
+         .site = {.file = "private.tsx", .caller = "PrivateView", .needle = "<Hidden />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "lowercase-intrinsic",
+         .site = {.file = "intrinsic.tsx",
+                  .caller = "IntrinsicView",
+                  .needle = "<widget label=\"i\" />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "missing-alias-root",
+         .site = {.file = "missing.tsx",
+                  .caller = "MissingView",
+                  .needle = "<Widget label=\"m\" />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "namespace-syntax",
+         .site = {.file = "namespace.tsx", .caller = "NamespaceView", .needle = "<svg:Widget />"},
+         .relation = "CALLS",
+         .any_target = true},
+        {.case_id = "member-unrelated-namesake",
+         .site = {.file = "member.tsx",
+                  .caller = "MemberView",
+                  .needle = "<UI.Widget label=\"q\" />"},
+         .relation = "CALLS",
+         .target = {.file = "decoy.tsx",
+                    .suffix = "decoy.Widget",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function Widget() { return <span />; }"}}};
+    ASSERT_TRUE(
+        et_jsx_quality(files, 13, sources, 13, expected, 5, forbidden, 9, 4, "jsx_exact_binding"));
     PASS();
 }
 
@@ -448,10 +669,10 @@ TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
  * Included here as baseline sanity guard for this file. */
 TEST(handles_flask_python) {
     static const EtFile f[] = {
-        {"app.py",
-         "from flask import Flask\n\napp = Flask(__name__)\n\n\n"
-         "@app.route(\"/items\")\ndef list_items():\n    return {\"items\": []}\n\n\n"
-         "@app.route(\"/items/<int:item_id>\")\ndef get_item(item_id):\n    return {\"id\": item_id}\n"}};
+        {"app.py", "from flask import Flask\n\napp = Flask(__name__)\n\n\n"
+                   "@app.route(\"/items\")\ndef list_items():\n    return {\"items\": []}\n\n\n"
+                   "@app.route(\"/items/<int:item_id>\")\ndef get_item(item_id):\n    return "
+                   "{\"id\": item_id}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -472,14 +693,13 @@ TEST(handles_fastapi_python) {
  * Phase 2a emitted 0 Route/HANDLES edges (this asserts >=1 → RED without the
  * fix, GREEN with it). Direction-agnostic count via cbm_store_count_edges_by_type. */
 TEST(handles_drf_action_python) {
-    static const EtFile f[] = {
-        {"viewsets.py",
-         "from rest_framework.decorators import action\n"
-         "from rest_framework.viewsets import ViewSet\n\n"
-         "class CustomerTaskViewSet(ViewSet):\n"
-         "    @action(detail=True, methods=[\"post\"])\n"
-         "    def approve_draft_with_charge(self, request, pk=None):\n"
-         "        pass\n"}};
+    static const EtFile f[] = {{"viewsets.py",
+                                "from rest_framework.decorators import action\n"
+                                "from rest_framework.viewsets import ViewSet\n\n"
+                                "class CustomerTaskViewSet(ViewSet):\n"
+                                "    @action(detail=True, methods=[\"post\"])\n"
+                                "    def approve_draft_with_charge(self, request, pk=None):\n"
+                                "        pass\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -496,12 +716,11 @@ TEST(handles_express_ts) {
         {"express/router.ts",
          "export function expressGet(p: string, h: any): any { return h; }\n"
          "export function expressPost(p: string, h: any): any { return h; }\n"},
-        {"users.ts",
-         "import { expressGet, expressPost } from './express/router';\n\n"
-         "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
-         "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
-         "expressGet('/users', listUsers);\n"
-         "expressPost('/users', createUser);\n"}};
+        {"users.ts", "import { expressGet, expressPost } from './express/router';\n\n"
+                     "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
+                     "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
+                     "expressGet('/users', listUsers);\n"
+                     "expressPost('/users', createUser);\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -525,23 +744,21 @@ TEST(handles_fastify_js) {
 
 /* Go net/http + gin — local gin.Engine wrapper whose QN contains "gin." */
 TEST(handles_gin_go) {
-    static const EtFile f[] = {
-        {"gin/engine.go",
-         "package gin\n\n"
-         "type Engine struct{}\n\n"
-         "func Default() *Engine {\n    return &Engine{}\n}\n\n"
-         "func (e *Engine) GET(path string, handler interface{}) {}\n"
-         "func (e *Engine) POST(path string, handler interface{}) {}\n"},
-        {"main.go",
-         "package main\n\n"
-         "import \"gin\"\n\n"
-         "func listOrders(w interface{}, r interface{}) {}\n\n"
-         "func createOrder(w interface{}, r interface{}) {}\n\n"
-         "func main() {\n"
-         "    r := gin.Default()\n"
-         "    r.GET(\"/orders\", listOrders)\n"
-         "    r.POST(\"/orders\", createOrder)\n"
-         "}\n"}};
+    static const EtFile f[] = {{"gin/engine.go",
+                                "package gin\n\n"
+                                "type Engine struct{}\n\n"
+                                "func Default() *Engine {\n    return &Engine{}\n}\n\n"
+                                "func (e *Engine) GET(path string, handler interface{}) {}\n"
+                                "func (e *Engine) POST(path string, handler interface{}) {}\n"},
+                               {"main.go", "package main\n\n"
+                                           "import \"gin\"\n\n"
+                                           "func listOrders(w interface{}, r interface{}) {}\n\n"
+                                           "func createOrder(w interface{}, r interface{}) {}\n\n"
+                                           "func main() {\n"
+                                           "    r := gin.Default()\n"
+                                           "    r.GET(\"/orders\", listOrders)\n"
+                                           "    r.POST(\"/orders\", createOrder)\n"
+                                           "}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -556,39 +773,43 @@ TEST(handles_gin_go) {
  * leaves the route unprefixed (never guessed). Exact Route set on BOTH the
  * sequential and the parallel pipeline. */
 static const EtFile et_fiber_groups_issue686[] = {
-    {"main.go",
-     "package main\n\n"
-     "import \"github.com/gofiber/fiber/v2\"\n\n"
-     "func health(c *fiber.Ctx) error { return nil }\n"
-     "func getUser(c *fiber.Ctx) error { return nil }\n"
-     "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
-     "func listOrders(c *fiber.Ctx) error { return nil }\n"
-     "func ping(c *fiber.Ctx) error { return nil }\n"
-     "func report(c *fiber.Ctx) error { return nil }\n"
-     "func dyn(c *fiber.Ctx) error { return nil }\n\n"
-     "func main() {\n"
-     "    app := fiber.New()\n"
-     "    app.Get(\"/health\", health)\n"
-     "    api := app.Group(\"/api\")\n"
-     "    v1 := api.Group(\"/v1\", authMiddleware)\n"
-     "    v1.Get(\"/users/:id\", getUser)\n"
-     "    admin := app.Group(\"/admin\")\n"
-     "    admin.Post(\"/customers/:id\", updateCustomer)\n"
-     "    grp := api.Group(\"/shop\")\n"
-     "    grp.Get(\"/orders\", listOrders)\n"
-     "    grp = app.Group(\"/internal\")\n"
-     "    grp.Get(\"/ping\", ping)\n"
-     "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
-     "    prefix := \"/p\"\n"
-     "    dg := app.Group(prefix)\n"
-     "    dg.Get(\"/dyn\", dyn)\n"
-     "    app.Listen(\":3000\")\n"
-     "}\n\n"
-     "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+    {"main.go", "package main\n\n"
+                "import \"github.com/gofiber/fiber/v2\"\n\n"
+                "func health(c *fiber.Ctx) error { return nil }\n"
+                "func getUser(c *fiber.Ctx) error { return nil }\n"
+                "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+                "func listOrders(c *fiber.Ctx) error { return nil }\n"
+                "func ping(c *fiber.Ctx) error { return nil }\n"
+                "func report(c *fiber.Ctx) error { return nil }\n"
+                "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+                "func main() {\n"
+                "    app := fiber.New()\n"
+                "    app.Get(\"/health\", health)\n"
+                "    api := app.Group(\"/api\")\n"
+                "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+                "    v1.Get(\"/users/:id\", getUser)\n"
+                "    admin := app.Group(\"/admin\")\n"
+                "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+                "    grp := api.Group(\"/shop\")\n"
+                "    grp.Get(\"/orders\", listOrders)\n"
+                "    grp = app.Group(\"/internal\")\n"
+                "    grp.Get(\"/ping\", ping)\n"
+                "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+                "    prefix := \"/p\"\n"
+                "    dg := app.Group(prefix)\n"
+                "    dg.Get(\"/dyn\", dyn)\n"
+                "    app.Listen(\":3000\")\n"
+                "}\n\n"
+                "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
 
-static const char *et_fiber_groups_issue686_routes[] = {
-    "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
-    "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
+static const char *et_fiber_groups_issue686_routes[] = {"/health",
+                                                        "/api/v1/users/:id",
+                                                        "/admin/customers/:id",
+                                                        "/api/shop/orders",
+                                                        "/internal/ping",
+                                                        "/reports/daily",
+                                                        "/dyn",
+                                                        NULL};
 
 TEST(handles_fiber_group_prefix_sequential_issue686) {
     ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
@@ -605,20 +826,18 @@ TEST(handles_fiber_group_prefix_parallel_issue686) {
 /* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
  * idiomatic brace block. */
 TEST(handles_gin_group_prefix_issue686) {
-    static const EtFile f[] = {
-        {"main.go",
-         "package main\n\n"
-         "import \"github.com/gin-gonic/gin\"\n\n"
-         "func listOrders(c *gin.Context) {}\n"
-         "func createOrder(c *gin.Context) {}\n\n"
-         "func main() {\n"
-         "    r := gin.Default()\n"
-         "    v1 := r.Group(\"/v1\")\n"
-         "    {\n"
-         "        v1.GET(\"/orders\", listOrders)\n"
-         "        v1.POST(\"/orders\", createOrder)\n"
-         "    }\n"
-         "}\n"}};
+    static const EtFile f[] = {{"main.go", "package main\n\n"
+                                           "import \"github.com/gin-gonic/gin\"\n\n"
+                                           "func listOrders(c *gin.Context) {}\n"
+                                           "func createOrder(c *gin.Context) {}\n\n"
+                                           "func main() {\n"
+                                           "    r := gin.Default()\n"
+                                           "    v1 := r.Group(\"/v1\")\n"
+                                           "    {\n"
+                                           "        v1.GET(\"/orders\", listOrders)\n"
+                                           "        v1.POST(\"/orders\", createOrder)\n"
+                                           "    }\n"
+                                           "}\n"}};
     static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -630,18 +849,17 @@ TEST(handles_gin_group_prefix_issue686) {
  * ("/api/orders"). */
 TEST(handles_spring_java) {
     static const char *routes[] = {"/api/orders", "/api/orders/{id}", NULL};
-    static const EtFile f[] = {
-        {"OrderController.java",
-         "package com.example;\n\n"
-         "import org.springframework.web.bind.annotation.RequestMapping;\n"
-         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
-         "    @GetMapping(\"/orders\")\n"
-         "    public String listOrders() {\n"
-         "        return \"orders\";\n    }\n\n"
-         "    @GetMapping(\"/orders/{id}\")\n"
-         "    public String getOrder(int id) {\n"
-         "        return \"order:\" + id;\n    }\n}\n"}};
+    static const EtFile f[] = {{"OrderController.java",
+                                "package com.example;\n\n"
+                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+                                "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+                                "    @GetMapping(\"/orders\")\n"
+                                "    public String listOrders() {\n"
+                                "        return \"orders\";\n    }\n\n"
+                                "    @GetMapping(\"/orders/{id}\")\n"
+                                "    public String getOrder(int id) {\n"
+                                "        return \"order:\" + id;\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -655,18 +873,17 @@ TEST(handles_spring_java) {
  * @RequestMapping still produces one route on its own. */
 TEST(handles_spring_java_path_attribute_fourth) {
     static const char *routes[] = {"/api/orders", NULL};
-    static const EtFile f[] = {
-        {"OrderController.java",
-         "package com.example;\n\n"
-         "import org.springframework.web.bind.annotation.RequestMapping;\n"
-         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
-         "    @GetMapping(name = \"listOrders\",\n"
-         "                produces = \"application/json\",\n"
-         "                consumes = \"application/json\",\n"
-         "                path = \"/orders\")\n"
-         "    public String listOrders() {\n"
-         "        return \"orders\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"OrderController.java",
+                                "package com.example;\n\n"
+                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+                                "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+                                "    @GetMapping(name = \"listOrders\",\n"
+                                "                produces = \"application/json\",\n"
+                                "                consumes = \"application/json\",\n"
+                                "                path = \"/orders\")\n"
+                                "    public String listOrders() {\n"
+                                "        return \"orders\";\n    }\n}\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -699,19 +916,18 @@ TEST(handles_spring_kotlin) {
  * only the exact Route-name set catches that through the emission dedup. */
 TEST(handles_jaxrs_java) {
     static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
-    static const EtFile f[] = {
-        {"WidgetResource.java",
-         "package com.example;\n\n"
-         "import jakarta.ws.rs.GET;\n"
-         "import jakarta.ws.rs.Path;\n\n"
-         "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
-         "    @GET\n"
-         "    public String list() {\n"
-         "        return \"widgets\";\n    }\n\n"
-         "    @GET\n"
-         "    @Path(\"/count\")\n"
-         "    public String count() {\n"
-         "        return \"42\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"WidgetResource.java",
+                                "package com.example;\n\n"
+                                "import jakarta.ws.rs.GET;\n"
+                                "import jakarta.ws.rs.Path;\n\n"
+                                "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
+                                "    @GET\n"
+                                "    public String list() {\n"
+                                "        return \"widgets\";\n    }\n\n"
+                                "    @GET\n"
+                                "    @Path(\"/count\")\n"
+                                "    public String count() {\n"
+                                "        return \"42\";\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -722,19 +938,18 @@ TEST(handles_jaxrs_java) {
  * produce the same rooted Route set as the fixture above. */
 TEST(handles_jaxrs_java_relative_path) {
     static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
-    static const EtFile f[] = {
-        {"WidgetResource.java",
-         "package com.example;\n\n"
-         "import jakarta.ws.rs.GET;\n"
-         "import jakarta.ws.rs.Path;\n\n"
-         "@Path(\"api/v1/widgets\")\npublic class WidgetResource {\n"
-         "    @GET\n"
-         "    public String list() {\n"
-         "        return \"widgets\";\n    }\n\n"
-         "    @GET\n"
-         "    @Path(\"count\")\n"
-         "    public String count() {\n"
-         "        return \"42\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"WidgetResource.java",
+                                "package com.example;\n\n"
+                                "import jakarta.ws.rs.GET;\n"
+                                "import jakarta.ws.rs.Path;\n\n"
+                                "@Path(\"api/v1/widgets\")\npublic class WidgetResource {\n"
+                                "    @GET\n"
+                                "    public String list() {\n"
+                                "        return \"widgets\";\n    }\n\n"
+                                "    @GET\n"
+                                "    @Path(\"count\")\n"
+                                "    public String count() {\n"
+                                "        return \"42\";\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -746,15 +961,14 @@ TEST(handles_jaxrs_java_relative_path) {
  * Route node appears. */
 TEST(handles_spring_java_relative_string_not_route) {
     static const char *routes[] = {"/", NULL};
-    static const EtFile f[] = {
-        {"OrderController.java",
-         "package com.example;\n\n"
-         "import org.springframework.web.bind.annotation.RequestMapping;\n"
-         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-         "@RequestMapping(\"api\")\npublic class OrderController {\n"
-         "    @GetMapping(\"orders\")\n"
-         "    public String listOrders() {\n"
-         "        return \"orders\";\n    }\n}\n"}};
+    static const EtFile f[] = {{"OrderController.java",
+                                "package com.example;\n\n"
+                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+                                "@RequestMapping(\"api\")\npublic class OrderController {\n"
+                                "    @GetMapping(\"orders\")\n"
+                                "    public String listOrders() {\n"
+                                "        return \"orders\";\n    }\n}\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -766,49 +980,372 @@ TEST(handles_spring_java_relative_string_not_route) {
 TEST(handles_jaxrs_scala) {
     static const char *routes[] = {"/billingAccount", "/billingAccount/{id}",
                                    "/billingAccount/{id}/attachment/{attachmentId}/content", NULL};
-    static const EtFile f[] = {
-        {"BillingAccountApiController.scala",
-         "package com.example\n\n"
-         "import jakarta.ws.rs.{GET, POST, Path}\n\n"
-         "@Path(\"/billingAccount\")\nclass BillingAccountApiController {\n"
-         "  @POST\n  @Path(\"\")\n"
-         "  def createBillingAccount(): String = \"created\"\n\n"
-         "  @GET\n  @Path(\"{id}\")\n"
-         "  def retrieveBillingAccount(): String = \"account\"\n\n"
-         "  @GET\n  @Path(\"{id}/attachment/{attachmentId}/content\")\n"
-         "  def retrieveAttachment(): String = \"attachment\"\n}\n"}};
+    static const EtFile f[] = {{"BillingAccountApiController.scala",
+                                "package com.example\n\n"
+                                "import jakarta.ws.rs.{GET, POST, Path}\n\n"
+                                "@Path(\"/billingAccount\")\nclass BillingAccountApiController {\n"
+                                "  @POST\n  @Path(\"\")\n"
+                                "  def createBillingAccount(): String = \"created\"\n\n"
+                                "  @GET\n  @Path(\"{id}\")\n"
+                                "  def retrieveBillingAccount(): String = \"account\"\n\n"
+                                "  @GET\n  @Path(\"{id}/attachment/{attachmentId}/content\")\n"
+                                "  def retrieveAttachment(): String = \"attachment\"\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 3));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
-/* ASP.NET Minimal API (C#) — route registration via static MapGet/MapPost calls
- * with identifier handlers, under a Microsoft/AspNetCore path so the resolved
- * callee QN carries the "MapGet"/"Microsoft.AspNetCore" route-reg substrings.
- * REAL BUG (CONFIRMED: still HANDLES=0 after this idiomatic, substring-correct
- * fixture).  C# static calls resolve (S4 passes) and the substring is present,
- * yet no Route/HANDLES is emitted — the C# route-registration path is not wired:
- * the resolved C# static-invocation either is not run through
- * cbm_service_pattern_match as ROUTE_REG or the handler-arg (an identifier
- * method group) is not captured by extract_handler_arg for C#. */
+/* Service relations have their own exact route/source oracle: they are not
+ * among the shared resolver's seven admitted relations. Named downstream gaps
+ * must be promoted when recovered; an unexpected service target is a bug. */
+typedef struct {
+    const char *case_id;
+    RQ_Site site;
+    RQ_Target source;
+    const char *relation, *route, *route_qn, *property, *value;
+    bool required;
+    const char *gap_id, *why, *tried;
+} EtServiceGolden;
+
+static bool et_service_declaration(cbm_store_t *store, const char *project,
+                                   const RQ_Source *sources, size_t source_count,
+                                   const RQ_Target *target) {
+    if (!rq_target_anchor(target, sources, source_count))
+        return false;
+    sqlite3_stmt *query = NULL;
+    const char *sql = "SELECT file_path,qualified_name,name,label,start_line,end_line FROM nodes "
+                      "WHERE project=?1 AND file_path=?2";
+    bool ok = sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) == SQLITE_OK &&
+              sqlite3_bind_text(query, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+              sqlite3_bind_text(query, 2, target->file, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    int matches = 0, step = SQLITE_ERROR;
+    if (ok)
+        while ((step = sqlite3_step(query)) == SQLITE_ROW)
+            if (rq_target(target, (const char *)sqlite3_column_text(query, 0),
+                          (const char *)sqlite3_column_text(query, 1),
+                          (const char *)sqlite3_column_text(query, 2),
+                          (const char *)sqlite3_column_text(query, 3), sqlite3_column_int(query, 4),
+                          sqlite3_column_int(query, 5)))
+                matches++;
+    ok = ok && step == SQLITE_DONE && matches == 1;
+    if (query)
+        sqlite3_finalize(query);
+    if (!ok)
+        fprintf(stderr, "[SERVICE-DECLARATION] missing/ambiguous %s:%s at %d\n", target->file,
+                target->suffix, target->declaration_line);
+    return ok;
+}
+
+static bool et_service_goldens(cbm_store_t *store, const char *project, const char *suite,
+                               const RQ_Source *sources, size_t source_count,
+                               const EtServiceGolden *want, size_t count) {
+    if (!store || count > ET_ROUTE_ASSERT_MAX)
+        return false;
+    bool ok = true;
+    unsigned found[ET_ROUTE_ASSERT_MAX] = {0};
+    for (size_t i = 0; i < count; i++) {
+        RQ_State anchor = {.site = &want[i].site};
+        ok = rq_anchor(&anchor, sources, source_count) &&
+             et_service_declaration(store, project, sources, source_count, &want[i].source) &&
+             (want[i].required ||
+              (rq_text(want[i].gap_id) && rq_text(want[i].why) && rq_text(want[i].tried))) &&
+             ok;
+    }
+    sqlite3_stmt *query = NULL;
+    const char *sql =
+        "SELECT s.file_path,s.qualified_name,s.name,s.label,s.start_line,s.end_line,"
+        "e.type,t.label,t.name,t.qualified_name,"
+        "COALESCE(json_extract(e.properties,'$.method'),json_extract(t.properties,'$.method')),"
+        "COALESCE(json_extract(e.properties,'$.broker'),json_extract(t.properties,'$.broker')) "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.project=?1 AND e.type IN ('HANDLES','HTTP_CALLS','ASYNC_CALLS')";
+    bool queried =
+        sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(query, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    size_t wrong = 0;
+    int step = SQLITE_ERROR;
+    if (queried)
+        while ((step = sqlite3_step(query)) == SQLITE_ROW) {
+            size_t matches = 0;
+            for (size_t i = 0; i < count; i++) {
+                const EtServiceGolden *g = want + i;
+                int property = !strcmp(g->property, "method") ? 10 : 11;
+                if (rq_target(&g->source, (const char *)sqlite3_column_text(query, 0),
+                              (const char *)sqlite3_column_text(query, 1),
+                              (const char *)sqlite3_column_text(query, 2),
+                              (const char *)sqlite3_column_text(query, 3),
+                              sqlite3_column_int(query, 4), sqlite3_column_int(query, 5)) &&
+                    rq_equal((const char *)sqlite3_column_text(query, 6), g->relation) &&
+                    rq_equal((const char *)sqlite3_column_text(query, 7), "Route") &&
+                    rq_equal((const char *)sqlite3_column_text(query, 8), g->route) &&
+                    rq_equal((const char *)sqlite3_column_text(query, 9), g->route_qn) &&
+                    rq_equal((const char *)sqlite3_column_text(query, property), g->value)) {
+                    found[i]++;
+                    matches++;
+                }
+            }
+            if (matches != 1)
+                wrong++;
+        }
+    ok = queried && step == SQLITE_DONE && !wrong && ok;
+    if (query)
+        sqlite3_finalize(query);
+    size_t hits = 0, missing = 0, recovered = 0, required_missing = 0;
+    for (size_t i = 0; i < count; i++) {
+        hits += found[i] != 0;
+        missing += found[i] == 0;
+        recovered += found[i] && !want[i].required;
+        required_missing += !found[i] && want[i].required;
+        ok = found[i] == (want[i].required ? 1u : 0u) && ok;
+        if (!found[i])
+            fprintf(stderr, "[SERVICE-QUALITY-MISS] %s %s %s\n", suite, want[i].case_id,
+                    want[i].required ? "required" : want[i].gap_id);
+    }
+    fprintf(stderr,
+            "[SERVICE-QUALITY] %s genuine=%zu found=%zu missing=%zu wrong=%zu "
+            "required_missing=%zu recovered_gaps=%zu\n",
+            suite, count, hits, missing, wrong, required_missing, recovered);
+    return ok;
+}
+
+static bool et_service_quality(const EtFile *files, int count, int config_count,
+                               const RQ_Expected *expected, size_t expected_count,
+                               const RQ_Forbidden *forbidden, size_t forbidden_count,
+                               const EtServiceGolden *service, size_t service_count,
+                               const RQ_Target *survive, size_t survive_count, const char *suite,
+                               bool stall) {
+    if (count < 1 || count > 16 || config_count < 0 || config_count >= count)
+        return false;
+    RQ_Source sources[16];
+    size_t source_count = (size_t)(count - config_count);
+    for (size_t i = 0; i < source_count; i++)
+        sources[i] = (RQ_Source){.path = files[i].name, .text = files[i].content};
+    bool ok = true;
+    for (int driver = 0; driver < 2; driver++) {
+        EtProj project;
+        /* Both celery/app.py and celery/quality_control.py are stalled. The
+         * required importer call depends on the latter; original class/method
+         * declarations must survive independently. Reset before any assertion. */
+        if (stall)
+            cbm_setenv("CBM_TEST_WALL_STALL_ON", "celery/", 1);
+        cbm_store_t *store = driver ? et_index_parallel(&project, files, count)
+                                    : et_index_files(&project, files, count);
+        if (stall)
+            cbm_unsetenv("CBM_TEST_WALL_STALL_ON");
+        char label[128];
+        snprintf(label, sizeof(label), "%s/%s", suite, driver ? "parallel" : "sequential");
+        RQ_Report report = {0};
+        bool calls = store && rq_check_project_declarations(
+                                  store, project.project, label, sources, source_count, expected,
+                                  expected_count, forbidden, forbidden_count, &report, stderr);
+        ok = calls && report.genuine == expected_count &&
+             report.found + report.missing == expected_count && ok;
+        bool services = store && et_service_goldens(store, project.project, label, sources,
+                                                    source_count, service, service_count);
+        ok = services && ok;
+        for (size_t i = 0; store && i < survive_count; i++)
+            ok = et_service_declaration(store, project.project, sources, source_count,
+                                        survive + i) &&
+                 ok;
+        et_cleanup(&project, store);
+    }
+    return ok;
+}
+
+/* The original minimal-API delegate registrations remain exact named gaps.
+ * An explicit project supplies one assembly; attribute routing is independently
+ * required and never substitutes for either original method-group target. */
 TEST(handles_aspnet_csharp) {
     static const EtFile f[] = {
-        {"Microsoft/AspNetCore/Builder.cs",
-         "namespace Microsoft.AspNetCore {\n"
-         "    class WebApp {\n"
-         "        public static string MapGet(string path, System.Func<string> handler) { return handler(); }\n"
-         "        public static string MapPost(string path, System.Func<string> handler) { return handler(); }\n"
-         "    }\n}\n"},
-        {"Program.cs",
-         "using Microsoft.AspNetCore;\n\n"
-         "namespace App {\n"
-         "    class Program {\n"
-         "        static void Main() {\n"
-         "            WebApp.MapGet(\"/products\", GetProducts);\n"
-         "            WebApp.MapPost(\"/products\", CreateProduct);\n        }\n"
-         "        static string GetProducts() { return \"[]\"; }\n"
-         "        static string CreateProduct() { return \"{}\" ; }\n    }\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+        {"Microsoft/AspNetCore/Builder.cs", "namespace Microsoft.AspNetCore {\n"
+                                            "    class WebApp {\n"
+                                            "        public static string MapGet(string path, "
+                                            "System.Func<string> handler) { return handler(); }\n"
+                                            "        public static string MapPost(string path, "
+                                            "System.Func<string> handler) { return handler(); }\n"
+                                            "    }\n}\n"},
+        {"Program.cs", "using Microsoft.AspNetCore;\n\n"
+                       "namespace App {\n"
+                       "    class Program {\n"
+                       "        static void Main() {\n"
+                       "            WebApp.MapGet(\"/products\", GetProducts);\n"
+                       "            WebApp.MapPost(\"/products\", CreateProduct);\n        }\n"
+                       "        static string GetProducts() { return \"[]\"; }\n"
+                       "        static string CreateProduct() { return \"{}\" ; }\n    }\n}\n"}};
+
+    const EtFile files[] = {
+        f[0],
+        f[1],
+        {"quality/control.mjs",
+         "export function target() { return 7; }\nexport function caller() { return target(); }\n"},
+        {"quality/Controller.cs",
+         "using Microsoft.AspNetCore.Mvc;\nnamespace Quality {\n    [ApiController]\n    public "
+         "class QualityController : ControllerBase {\n        [HttpGet(\"/quality/handlers\")]\n   "
+         "     public string Ready() { return \"ok\"; }\n    }\n}\n"},
+        {"quality/Foreign.cs",
+         "namespace Foreign {\n    public class WebApp {\n        public static string "
+         "MapGet(string path, System.Func<string> handler) { return handler(); }\n        public "
+         "static string MapPost(string path, System.Func<string> handler) { return handler(); }\n  "
+         "  }\n    public class Handlers {\n        public static string GetProducts() { return "
+         "\"foreign\"; }\n        public static string CreateProduct() { return \"foreign\"; }\n   "
+         " }\n}\n"},
+        {"quality.csproj",
+         "<Project Sdk=\"Microsoft.NET.Sdk.Web\">\n  "
+         "<PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>\n</Project>\n"}};
+    const RQ_Expected expected[] = {
+        {.case_id = "aspnet-map-get",
+         .site = {.file = "Program.cs",
+                  .caller = "Program.Main",
+                  .needle = "WebApp.MapGet(\"/products\", GetProducts)"},
+         .relation = "CALLS",
+         .target = {.file = "Microsoft/AspNetCore/Builder.cs",
+                    .suffix = "WebApp.MapGet",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text = "        public static string MapGet(string path, "
+                                        "System.Func<string> handler) { return handler(); }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "aspnet-handler-get",
+         .site = {.file = "Program.cs", .caller = "Program.Main", .needle = "GetProducts"},
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "Program.cs",
+                    .suffix = "Program.GetProducts",
+                    .label = "Method",
+                    .declaration_line = 9,
+                    .declaration_text = "        static string GetProducts() { return \"[]\"; }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "aspnet-map-post",
+         .site = {.file = "Program.cs",
+                  .caller = "Program.Main",
+                  .needle = "WebApp.MapPost(\"/products\", CreateProduct)"},
+         .relation = "CALLS",
+         .target = {.file = "Microsoft/AspNetCore/Builder.cs",
+                    .suffix = "WebApp.MapPost",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "        public static string MapPost(string path, "
+                                        "System.Func<string> handler) { return handler(); }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "aspnet-handler-post",
+         .site = {.file = "Program.cs", .caller = "Program.Main", .needle = "CreateProduct"},
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "Program.cs",
+                    .suffix = "Program.CreateProduct",
+                    .label = "Method",
+                    .declaration_line = 10,
+                    .declaration_text =
+                        "        static string CreateProduct() { return \"{}\" ; }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "required-exact-call",
+         .site = {.file = "quality/control.mjs",
+                  .caller = "caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "quality/control.mjs",
+                    .suffix = "target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 7; }"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "aspnet-foreign-map-get",
+         .site = {.file = "Program.cs",
+                  .caller = "Program.Main",
+                  .needle = "WebApp.MapGet(\"/products\", GetProducts)"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Foreign.cs",
+                    .suffix = "WebApp.MapGet",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text = "        public static string MapGet(string path, "
+                                        "System.Func<string> handler) { return handler(); }"}},
+        {.case_id = "aspnet-foreign-handler-get",
+         .site = {.file = "Program.cs", .caller = "Program.Main", .needle = "GetProducts"},
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "quality/Foreign.cs",
+                    .suffix = "Handlers.GetProducts",
+                    .label = "Method",
+                    .declaration_line = 7,
+                    .declaration_text =
+                        "        public static string GetProducts() { return \"foreign\"; }"}},
+        {.case_id = "aspnet-foreign-map-post",
+         .site = {.file = "Program.cs",
+                  .caller = "Program.Main",
+                  .needle = "WebApp.MapPost(\"/products\", CreateProduct)"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Foreign.cs",
+                    .suffix = "WebApp.MapPost",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "        public static string MapPost(string path, "
+                                        "System.Func<string> handler) { return handler(); }"}},
+        {.case_id = "aspnet-foreign-handler-post",
+         .site = {.file = "Program.cs", .caller = "Program.Main", .needle = "CreateProduct"},
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "quality/Foreign.cs",
+                    .suffix = "Handlers.CreateProduct",
+                    .label = "Method",
+                    .declaration_line = 8,
+                    .declaration_text =
+                        "        public static string CreateProduct() { return \"foreign\"; }"}}};
+    const EtServiceGolden service[] = {
+        {.case_id = "aspnet-handler-route-get",
+         .site = {.file = "Program.cs",
+                  .caller = "Program.Main",
+                  .needle = "WebApp.MapGet(\"/products\", GetProducts)"},
+         .source = {.file = "Program.cs",
+                    .suffix = "Program.GetProducts",
+                    .label = "Method",
+                    .declaration_line = 9,
+                    .declaration_text = "        static string GetProducts() { return \"[]\"; }"},
+         .relation = "HANDLES",
+         .route = "/products",
+         .route_qn = "__route__GET__/products",
+         .property = "method",
+         .value = "GET",
+         .required = false,
+         .gap_id = "aspnet-method-group-route",
+         .why = "The route registration cannot borrow an unproved containing-class method group.",
+         .tried = "Call binding prerequisites audited in current source; exact downstream route "
+                  "and handler identity retained separately from the seven-relation oracle."},
+        {.case_id = "aspnet-handler-route-post",
+         .site = {.file = "Program.cs",
+                  .caller = "Program.Main",
+                  .needle = "WebApp.MapPost(\"/products\", CreateProduct)"},
+         .source = {.file = "Program.cs",
+                    .suffix = "Program.CreateProduct",
+                    .label = "Method",
+                    .declaration_line = 10,
+                    .declaration_text =
+                        "        static string CreateProduct() { return \"{}\" ; }"},
+         .relation = "HANDLES",
+         .route = "/products",
+         .route_qn = "__route__POST__/products",
+         .property = "method",
+         .value = "POST",
+         .required = false,
+         .gap_id = "aspnet-method-group-route",
+         .why = "The route registration cannot borrow an unproved containing-class method group.",
+         .tried = "Call binding prerequisites audited in current source; exact downstream route "
+                  "and handler identity retained separately from the seven-relation oracle."},
+        {.case_id = "required-attribute-handler",
+         .site = {.file = "quality/Controller.cs",
+                  .caller = "QualityController.Ready",
+                  .needle = "[HttpGet(\"/quality/handlers\")]"},
+         .source = {.file = "quality/Controller.cs",
+                    .suffix = "QualityController.Ready",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text = "        public string Ready() { return \"ok\"; }"},
+         .relation = "HANDLES",
+         .route = "/quality/handlers",
+         .route_qn = "__route__GET__/quality/handlers",
+         .property = "method",
+         .value = "GET",
+         .required = true}};
+    ASSERT_TRUE(et_service_quality(files, 6, 1, expected, 5, forbidden, 4, service, 3, NULL, 0,
+                                   "handles_aspnet_csharp", false));
     PASS();
 }
 
@@ -946,12 +1483,11 @@ TEST(handles_laravel_php) {
          "class Route {\n"
          "    public static function get($path, $handler) { return $handler; }\n"
          "    public static function post($path, $handler) { return $handler; }\n}\n"},
-        {"routes/web.php",
-         "<?php\nuse Laravel\\Route;\n\n"
-         "function showUsers() { return ['users' => []]; }\n"
-         "function storeUser() { return ['stored' => true]; }\n\n"
-         "Route::get('/users', 'showUsers');\n"
-         "Route::post('/users', 'storeUser');\n"}};
+        {"routes/web.php", "<?php\nuse Laravel\\Route;\n\n"
+                           "function showUsers() { return ['users' => []]; }\n"
+                           "function storeUser() { return ['stored' => true]; }\n\n"
+                           "Route::get('/users', 'showUsers');\n"
+                           "Route::post('/users', 'storeUser');\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -967,20 +1503,19 @@ TEST(handles_laravel_php) {
 TEST(handles_laravel_facade_routes_issue952) {
     static const char *routes[] = {"/api/welcome", "/users/me", "/users/login",
                                    "/companies/tenants/list", NULL};
-    static const EtFile f[] = {
-        {"routes/api.php",
-         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
-         "Route::get('/api/welcome', WelcomeController::class);\n"
-         "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
-         "->group(function (): void {\n"
-         "    Route::get('/me', GetCurrentUserController::class);\n"
-         "    Route::post('/login', LoginUserController::class);\n"
-         "});\n"
-         "Route::prefix('companies')->group(function (): void {\n"
-         "    Route::prefix('tenants')->group(function (): void {\n"
-         "        Route::get('/list', ListTenantsController::class);\n"
-         "    });\n"
-         "});\n"}};
+    static const EtFile f[] = {{"routes/api.php",
+                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+                                "Route::get('/api/welcome', WelcomeController::class);\n"
+                                "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
+                                "->group(function (): void {\n"
+                                "    Route::get('/me', GetCurrentUserController::class);\n"
+                                "    Route::post('/login', LoginUserController::class);\n"
+                                "});\n"
+                                "Route::prefix('companies')->group(function (): void {\n"
+                                "    Route::prefix('tenants')->group(function (): void {\n"
+                                "        Route::get('/list', ListTenantsController::class);\n"
+                                "    });\n"
+                                "});\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -991,13 +1526,12 @@ TEST(handles_laravel_facade_routes_issue952) {
  * slash. */
 TEST(handles_laravel_facade_no_junk_routes_issue952) {
     static const char *routes[] = {"/real", NULL};
-    static const EtFile f[] = {
-        {"routes/api.php",
-         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-         "use Illuminate\\Support\\Facades\\Cache;\n\n"
-         "Route::get('/real', RealController::class);\n"
-         "$v = Cache::get('users.count');\n"
-         "$w = Cache::get('/leading/slash/key');\n"}};
+    static const EtFile f[] = {{"routes/api.php",
+                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                                "use Illuminate\\Support\\Facades\\Cache;\n\n"
+                                "Route::get('/real', RealController::class);\n"
+                                "$v = Cache::get('users.count');\n"
+                                "$w = Cache::get('/leading/slash/key');\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -1008,13 +1542,13 @@ TEST(handles_laravel_facade_no_junk_routes_issue952) {
  * so per-file extraction alone minted `/users/me` where the runtime route is
  * `/api/users/me`, and cross-repo HTTP matching (which joins on the Route
  * qualified_name) never linked real callers. */
-#define ET_L11_BOOTSTRAP_HEAD                                                                      \
-    "<?php\n\nuse Illuminate\\Foundation\\Application;\n\n"                                        \
-    "return Application::configure(basePath: dirname(__DIR__))\n"                                  \
+#define ET_L11_BOOTSTRAP_HEAD                                     \
+    "<?php\n\nuse Illuminate\\Foundation\\Application;\n\n"       \
+    "return Application::configure(basePath: dirname(__DIR__))\n" \
     "    ->withRouting(\n"
-#define ET_L11_BOOTSTRAP_TAIL                                                                      \
-    "    )\n"                                                                                      \
-    "    ->withMiddleware(function ($middleware) {\n        //\n    })\n"                          \
+#define ET_L11_BOOTSTRAP_TAIL                                             \
+    "    )\n"                                                             \
+    "    ->withMiddleware(function ($middleware) {\n        //\n    })\n" \
     "    ->create();\n"
 
 static const char ET_L11_API_ROUTES[] =
@@ -1024,19 +1558,19 @@ static const char ET_L11_API_ROUTES[] =
     "});\n"
     "Route::post('/orders', [OrderController::class, 'store']);\n";
 
-static const char ET_L11_WEB_ROUTES[] = "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
-                                        "Route::get('/dashboard', [HomeController::class, 'index']);\n";
+static const char ET_L11_WEB_ROUTES[] =
+    "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+    "Route::get('/dashboard', [HomeController::class, 'index']);\n";
 
 /* Default convention: `api:` given, no `apiPrefix:` -> '/api'. */
 TEST(routes_laravel_withrouting_api_default_prefix_issue1146) {
     static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
-    static const EtFile f[] = {
-        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
-         "        web: __DIR__.'/../routes/web.php',\n"
-         "        api: __DIR__.'/../routes/api.php',\n"
-         "        commands: __DIR__.'/../routes/console.php',\n"
-         "        health: '/up',\n" ET_L11_BOOTSTRAP_TAIL},
-        {"routes/api.php", ET_L11_API_ROUTES}};
+    static const EtFile f[] = {{"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+                                "        web: __DIR__.'/../routes/web.php',\n"
+                                "        api: __DIR__.'/../routes/api.php',\n"
+                                "        commands: __DIR__.'/../routes/console.php',\n"
+                                "        health: '/up',\n" ET_L11_BOOTSTRAP_TAIL},
+                               {"routes/api.php", ET_L11_API_ROUTES}};
     ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, false, "__route__GET__/api/users/me"));
     PASS();
 }
@@ -1044,8 +1578,7 @@ TEST(routes_laravel_withrouting_api_default_prefix_issue1146) {
 /* Explicit `apiPrefix:` (multi-segment, array form of `api:`) replaces the
  * default for every mounted file. */
 TEST(routes_laravel_withrouting_api_custom_prefix_issue1146) {
-    static const char *routes[] = {"/v1/api/users/me", "/v1/api/orders", "/v1/api/partners",
-                                   NULL};
+    static const char *routes[] = {"/v1/api/users/me", "/v1/api/orders", "/v1/api/partners", NULL};
     static const EtFile f[] = {
         {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
          "        api: [__DIR__.'/../routes/api.php', __DIR__.'/../routes/partner.php'],\n"
@@ -1152,10 +1685,10 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
     }
     cbm_edge_t *edges = NULL;
     int n = 0;
-    int ok = store != NULL &&
-             cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) ==
-                 CBM_STORE_OK &&
-             n == wanted;
+    int ok =
+        store != NULL &&
+        cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n) == CBM_STORE_OK &&
+        n == wanted;
     for (int i = 0; store && i < n; i++) {
         cbm_node_t src = {0};
         cbm_node_t tgt = {0};
@@ -1175,8 +1708,10 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
                     have_src && src.qualified_name ? src.qualified_name : "<?>",
                     have_tgt && tgt.name ? tgt.name : "<?>");
         }
-        if (have_src) cbm_node_free_fields(&src);
-        if (have_tgt) cbm_node_free_fields(&tgt);
+        if (have_src)
+            cbm_node_free_fields(&src);
+        if (have_tgt)
+            cbm_node_free_fields(&tgt);
     }
     for (int wi = 0; wi < wanted; wi++) {
         if (!found[wi]) {
@@ -1199,7 +1734,8 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
         fprintf(stderr, "  [ET-HANDLES] FAIL (%s path) expected=%d actual=%d\n",
                 parallel ? "parallel" : "sequential", wanted, n);
     }
-    if (edges) cbm_store_free_edges(edges, n);
+    if (edges)
+        cbm_store_free_edges(edges, n);
     et_cleanup(&lp, store);
     return ok;
 }
@@ -1216,8 +1752,8 @@ typedef struct {
     const char *handler_tail;
 } EtFlow;
 
-static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow *want,
-                           int wanted, int *found) {
+static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow *want, int wanted,
+                           int *found) {
     cbm_node_t src = {0};
     cbm_node_t tgt = {0};
     int have_src = cbm_store_find_node_by_id(store, e->source_id, &src) == CBM_STORE_OK;
@@ -1235,8 +1771,10 @@ static int et_flow_matches(cbm_store_t *store, const cbm_edge_t *e, const EtFlow
                 have_src && src.qualified_name ? src.qualified_name : "<?>",
                 have_tgt && tgt.qualified_name ? tgt.qualified_name : "<?>");
     }
-    if (have_src) cbm_node_free_fields(&src);
-    if (have_tgt) cbm_node_free_fields(&tgt);
+    if (have_src)
+        cbm_node_free_fields(&src);
+    if (have_tgt)
+        cbm_node_free_fields(&tgt);
     return matched;
 }
 
@@ -1252,10 +1790,10 @@ static int et_data_flows_exact(const EtFile *files, int nfiles, const EtFlow *wa
     }
     cbm_edge_t *edges = NULL;
     int n = 0;
-    int ok = store != NULL &&
-             cbm_store_find_edges_by_type(store, lp.project, "DATA_FLOWS", &edges, &n) ==
-                 CBM_STORE_OK &&
-             n == wanted;
+    int ok =
+        store != NULL &&
+        cbm_store_find_edges_by_type(store, lp.project, "DATA_FLOWS", &edges, &n) == CBM_STORE_OK &&
+        n == wanted;
     for (int i = 0; store && i < n; i++) {
         if (!et_flow_matches(store, &edges[i], want, wanted, found)) {
             ok = 0;
@@ -1287,7 +1825,8 @@ static int et_data_flows_exact(const EtFile *files, int nfiles, const EtFlow *wa
         fprintf(stderr, "  [ET-FLOWS] FAIL (%s path) expected=%d actual=%d\n",
                 parallel ? "parallel" : "sequential", wanted, n);
     }
-    if (edges) cbm_store_free_edges(edges, n);
+    if (edges)
+        cbm_store_free_edges(edges, n);
     et_cleanup(&lp, store);
     return ok;
 }
@@ -1482,8 +2021,8 @@ static const EtFile et_laravel_psr4_absent_extra[] = {
 
 enum { ET_LARAVEL_PSR4_ABSENT_EXTRA = 3 };
 
-static const char *const et_laravel_psr4_absent_routes[] = {
-    "__route__GET__/blog/missing", "__route__GET__/blog/archive", NULL};
+static const char *const et_laravel_psr4_absent_routes[] = {"__route__GET__/blog/missing",
+                                                            "__route__GET__/blog/archive", NULL};
 
 static int et_laravel_psr4_absent(int parallel) {
     EtFile f[ET_LARAVEL_CLASS_FILES + ET_LARAVEL_PSR4_ABSENT_EXTRA];
@@ -1639,23 +2178,22 @@ TEST(routes_laravel_slashless_no_guessed_handlers_issue1146) {
  * test client call — stays what it is and mints no Route. */
 TEST(routes_laravel_slashless_no_junk_issue1146) {
     static const char *want[] = {"GET /real", NULL};
-    static const EtFile f[] = {
-        {"routes/web.php",
-         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-         "use Illuminate\\Support\\Facades\\Cache;\n\n"
-         "Route::get('real', 'RealController@show');\n\n"
-         "class UsersController {\n"
-         "    public function index($request) {\n"
-         "        $name = $request->get('name');\n"
-         "        $q = $request->query->get('q');\n"
-         "        $v = Cache::get('users.count');\n"
-         "        $c = config('app.name');\n"
-         "        $k = collect(['a' => 1])->get('a');\n"
-         "        $s = session()->get('key');\n"
-         "        $r = $this->router->get('status');\n"
-         "        $p = $this->post('login', []);\n"
-         "        return $this->get('users');\n"
-         "    }\n}\n"}};
+    static const EtFile f[] = {{"routes/web.php",
+                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                                "use Illuminate\\Support\\Facades\\Cache;\n\n"
+                                "Route::get('real', 'RealController@show');\n\n"
+                                "class UsersController {\n"
+                                "    public function index($request) {\n"
+                                "        $name = $request->get('name');\n"
+                                "        $q = $request->query->get('q');\n"
+                                "        $v = Cache::get('users.count');\n"
+                                "        $c = config('app.name');\n"
+                                "        $k = collect(['a' => 1])->get('a');\n"
+                                "        $s = session()->get('key');\n"
+                                "        $r = $this->router->get('status');\n"
+                                "        $p = $this->post('login', []);\n"
+                                "        return $this->get('users');\n"
+                                "    }\n}\n"}};
     ASSERT_TRUE(et_route_set_exact(f, 1, want, 0));
     PASS();
 }
@@ -1666,18 +2204,16 @@ TEST(routes_laravel_slashless_no_junk_issue1146) {
  * carries the "ActionDispatch" route-registration substring → ROUTE_REG → HANDLES. */
 TEST(handles_rails_ruby) {
     static const EtFile f[] = {
-        {"ActionDispatch/Routing.rb",
-         "module ActionDispatch\n  module Routing\n"
-         "    class Mapper\n"
-         "      def get(path, handler); end\n"
-         "      def post(path, handler); end\n"
-         "    end\n  end\nend\n"},
-        {"config/routes.rb",
-         "require_relative '../ActionDispatch/Routing'\n\n"
-         "mapper = ActionDispatch::Routing::Mapper.new\n\n"
-         "def list_items; end\ndef create_item; end\n\n"
-         "mapper.get '/items', list_items\n"
-         "mapper.post '/items', create_item\n"}};
+        {"ActionDispatch/Routing.rb", "module ActionDispatch\n  module Routing\n"
+                                      "    class Mapper\n"
+                                      "      def get(path, handler); end\n"
+                                      "      def post(path, handler); end\n"
+                                      "    end\n  end\nend\n"},
+        {"config/routes.rb", "require_relative '../ActionDispatch/Routing'\n\n"
+                             "mapper = ActionDispatch::Routing::Mapper.new\n\n"
+                             "def list_items; end\ndef create_item; end\n\n"
+                             "mapper.get '/items', list_items\n"
+                             "mapper.post '/items', create_item\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -1688,16 +2224,15 @@ TEST(handles_rails_ruby) {
  * cross-file `actix_web::get` would NOT (Rust lsp_cross unwired + '::' path not
  * resolved by the generic resolver). */
 TEST(handles_actix_rust) {
-    static const EtFile f[] = {
-        {"actix_web_app.rs",
-         "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
-         "    format!(\"{}\", path)\n}\n\n"
-         "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
-         "    format!(\"{}\", path)\n}\n\n"
-         "fn list_widgets() {}\nfn create_widget() {}\n\n"
-         "fn main() {\n"
-         "    actix_web_get(\"/widgets\", list_widgets);\n"
-         "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
+    static const EtFile f[] = {{"actix_web_app.rs",
+                                "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
+                                "    format!(\"{}\", path)\n}\n\n"
+                                "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
+                                "    format!(\"{}\", path)\n}\n\n"
+                                "fn list_widgets() {}\nfn create_widget() {}\n\n"
+                                "fn main() {\n"
+                                "    actix_web_get(\"/widgets\", list_widgets);\n"
+                                "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -1731,17 +2266,15 @@ TEST(http_calls_fetch_js) {
 /* axios (TypeScript) — "axios" substring in QN */
 TEST(http_calls_axios_ts) {
     static const EtFile f[] = {
-        {"axios.ts",
-         "export function axiosGet(url: string): Promise<any> {\n"
-         "    return Promise.resolve({ data: {} });\n}\n\n"
-         "export function axiosPost(url: string, data: any): Promise<any> {\n"
-         "    return Promise.resolve({ data });\n}\n"},
-        {"client.ts",
-         "import { axiosGet, axiosPost } from './axios';\n\n"
-         "export async function getOrders(): Promise<any> {\n"
-         "    return axiosGet('/api/orders');\n}\n\n"
-         "export async function submitOrder(payload: any): Promise<any> {\n"
-         "    return axiosPost('/api/orders', payload);\n}\n"}};
+        {"axios.ts", "export function axiosGet(url: string): Promise<any> {\n"
+                     "    return Promise.resolve({ data: {} });\n}\n\n"
+                     "export function axiosPost(url: string, data: any): Promise<any> {\n"
+                     "    return Promise.resolve({ data });\n}\n"},
+        {"client.ts", "import { axiosGet, axiosPost } from './axios';\n\n"
+                      "export async function getOrders(): Promise<any> {\n"
+                      "    return axiosGet('/api/orders');\n}\n\n"
+                      "export async function submitOrder(payload: any): Promise<any> {\n"
+                      "    return axiosPost('/api/orders', payload);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
 }
@@ -1773,13 +2306,12 @@ TEST(http_calls_nethttp_go) {
          "package resty\n\n"
          "func Get(url string) (interface{}, error) { return nil, nil }\n"
          "func Post(url string, body interface{}) (interface{}, error) { return nil, nil }\n"},
-        {"catalog/service.go",
-         "package catalog\n\n"
-         "import \"resty\"\n\n"
-         "func ListProducts() (interface{}, error) {\n"
-         "    return resty.Get(\"/api/products\")\n}\n\n"
-         "func CreateProduct(body interface{}) (interface{}, error) {\n"
-         "    return resty.Post(\"/api/products\", body)\n}\n"}};
+        {"catalog/service.go", "package catalog\n\n"
+                               "import \"resty\"\n\n"
+                               "func ListProducts() (interface{}, error) {\n"
+                               "    return resty.Get(\"/api/products\")\n}\n\n"
+                               "func CreateProduct(body interface{}) (interface{}, error) {\n"
+                               "    return resty.Post(\"/api/products\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
 }
@@ -1791,7 +2323,8 @@ TEST(http_calls_resttemplate_java) {
          "package http;\n\n"
          "public class RestTemplate {\n"
          "    public Object getForObject(String url, Class<?> responseType) { return null; }\n"
-         "    public Object postForObject(String url, Object req, Class<?> responseType) { return null; }\n"
+         "    public Object postForObject(String url, Object req, Class<?> responseType) { return "
+         "null; }\n"
          "}\n"},
         {"OrderClient.java",
          "package client;\n\n"
@@ -1802,7 +2335,125 @@ TEST(http_calls_resttemplate_java) {
          "        return rest.getForObject(\"/api/orders\", Object.class);\n    }\n\n"
          "    public Object placeOrder(Object req) {\n"
          "        return rest.postForObject(\"/api/orders\", req, Object.class);\n    }\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
+
+    const EtFile files[] = {
+        f[0],
+        f[1],
+        {"quality/axios.mjs", "export function get(value) { return value; }\n"},
+        {"quality/service.mjs", "import { get } from './axios.mjs';\nexport function request() { "
+                                "return get('/quality-http'); }\n"},
+        {"quality/Foreign.java",
+         "package foreign;\npublic class RestTemplate {\n    public Object getForObject(String "
+         "url, Class<?> responseType) { return null; }\n    public Object postForObject(String "
+         "url, Object req, Class<?> responseType) { return null; }\n}\n"}};
+    const RQ_Expected expected[] = {
+        {.case_id = "resttemplate-fetchOrders",
+         .site = {.file = "OrderClient.java",
+                  .caller = "OrderClient.fetchOrders",
+                  .needle = "rest.getForObject(\"/api/orders\", Object.class)"},
+         .relation = "CALLS",
+         .target = {.file = "RestTemplate.java",
+                    .suffix = "RestTemplate.getForObject",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "    public Object getForObject(String url, Class<?> "
+                                        "responseType) { return null; }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "resttemplate-placeOrder",
+         .site = {.file = "OrderClient.java",
+                  .caller = "OrderClient.placeOrder",
+                  .needle = "rest.postForObject(\"/api/orders\", req, Object.class)"},
+         .relation = "CALLS",
+         .target = {.file = "RestTemplate.java",
+                    .suffix = "RestTemplate.postForObject",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text = "    public Object postForObject(String url, Object req, "
+                                        "Class<?> responseType) { return null; }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "required-service-call",
+         .site = {.file = "quality/service.mjs",
+                  .caller = "request",
+                  .needle = "get('/quality-http')"},
+         .relation = "CALLS",
+         .target = {.file = "quality/axios.mjs",
+                    .suffix = "get",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function get(value) { return value; }"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "resttemplate-foreign-fetchOrders",
+         .site = {.file = "OrderClient.java",
+                  .caller = "OrderClient.fetchOrders",
+                  .needle = "rest.getForObject(\"/api/orders\", Object.class)"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Foreign.java",
+                    .suffix = "RestTemplate.getForObject",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text = "    public Object getForObject(String url, Class<?> "
+                                        "responseType) { return null; }"}},
+        {.case_id = "resttemplate-foreign-placeOrder",
+         .site = {.file = "OrderClient.java",
+                  .caller = "OrderClient.placeOrder",
+                  .needle = "rest.postForObject(\"/api/orders\", req, Object.class)"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Foreign.java",
+                    .suffix = "RestTemplate.postForObject",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "    public Object postForObject(String url, Object req, "
+                                        "Class<?> responseType) { return null; }"}}};
+    const EtServiceGolden service[] = {
+        {.case_id = "resttemplate-route-fetchOrders",
+         .site = {.file = "OrderClient.java",
+                  .caller = "OrderClient.fetchOrders",
+                  .needle = "rest.getForObject(\"/api/orders\", Object.class)"},
+         .source = {.file = "OrderClient.java",
+                    .suffix = "OrderClient.fetchOrders",
+                    .label = "Method",
+                    .declaration_line = 8,
+                    .declaration_text = "    public Object fetchOrders() {"},
+         .relation = "HTTP_CALLS",
+         .route = "/api/orders",
+         .route_qn = "__route__GET__/api/orders",
+         .property = "method",
+         .value = "GET",
+         .required = true},
+        {.case_id = "resttemplate-route-placeOrder",
+         .site = {.file = "OrderClient.java",
+                  .caller = "OrderClient.placeOrder",
+                  .needle = "rest.postForObject(\"/api/orders\", req, Object.class)"},
+         .source = {.file = "OrderClient.java",
+                    .suffix = "OrderClient.placeOrder",
+                    .label = "Method",
+                    .declaration_line = 12,
+                    .declaration_text = "    public Object placeOrder(Object req) {"},
+         .relation = "HTTP_CALLS",
+         .route = "/api/orders",
+         .route_qn = "__route__POST__/api/orders",
+         .property = "method",
+         .value = "POST",
+         .required = true},
+        {.case_id = "required-service-route",
+         .site = {.file = "quality/service.mjs",
+                  .caller = "request",
+                  .needle = "get('/quality-http')"},
+         .source = {.file = "quality/service.mjs",
+                    .suffix = "request",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "export function request() { return get('/quality-http'); }"},
+         .relation = "HTTP_CALLS",
+         .route = "/quality-http",
+         .route_qn = "__route__GET__/quality-http",
+         .property = "method",
+         .value = "GET",
+         .required = true}};
+    ASSERT_TRUE(et_service_quality(files, 5, 0, expected, 3, forbidden, 2, service, 3, NULL, 0,
+                                   "http_calls_resttemplate_java", false));
     PASS();
 }
 
@@ -1826,7 +2477,8 @@ TEST(http_calls_restsharp_csharp) {
          "namespace Services {\n"
          "    class ProductService {\n"
          "        public string GetProducts() { return RestClient.Get(\"/products\"); }\n"
-         "        public string AddProduct(object p) { return RestClient.Post(\"/products\", p); }\n"
+         "        public string AddProduct(object p) { return RestClient.Post(\"/products\", p); "
+         "}\n"
          "    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
@@ -1835,10 +2487,9 @@ TEST(http_calls_restsharp_csharp) {
 /* HTTParty (Ruby) — "HTTParty" substring in resolved QN */
 TEST(http_calls_httparty_ruby) {
     static const EtFile f[] = {
-        {"HTTParty.rb",
-         "module HTTParty\n"
-         "  def self.get(url, opts = {}); end\n"
-         "  def self.post(url, opts = {}); end\nend\n"},
+        {"HTTParty.rb", "module HTTParty\n"
+                        "  def self.get(url, opts = {}); end\n"
+                        "  def self.post(url, opts = {}); end\nend\n"},
         {"user_client.rb",
          "require_relative 'HTTParty'\n\n"
          "def fetch_users\n  HTTParty.get('/api/users')\nend\n\n"
@@ -1847,15 +2498,8 @@ TEST(http_calls_httparty_ruby) {
     PASS();
 }
 
-/* Guzzle (PHP) — Client injected via a type-hinted constructor param (proven
- * php/S8 field-type-hint shape).
- * REAL BUG (CONFIRMED: still HTTP_CALLS=0).  PHP DOES resolve the Guzzle method
- * call (cf. test_php_lsp.c:phplsp_edge_guzzle_chain, which passes resolving
- * "Client.get"), but the PHP lsp resolver emits the SHORT resolved QN
- * "Client.get" — it drops the namespace/path, so cbm_service_pattern_match never
- * sees the "Guzzle"/"GuzzleHttp" substring and the call is classified as a plain
- * CALLS instead of HTTP_CALLS.  Fix = use the full namespaced QN (or match on the
- * class's declaring namespace) when classifying PHP service calls. */
+/* Property injection and typed/default arguments are separate quality gaps
+ * from the required simple typed receiver with fixed untyped arguments. */
 TEST(http_calls_guzzle_php) {
     static const EtFile f[] = {
         {"GuzzleHttp/Client.php",
@@ -1871,7 +2515,150 @@ TEST(http_calls_guzzle_php) {
          "    public function getOrders(): string { return $this->client->get('/orders'); }\n"
          "    public function createOrder(array $data): string {\n"
          "        return $this->client->post('/orders', ['json' => $data]);\n    }\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
+
+    const EtFile files[] = {
+        f[0],
+        f[1],
+        {"GuzzleHttp/ProofClient.php", "<?php\nnamespace GuzzleHttp;\nclass ProofClient {\n    "
+                                       "public function get($uri) { return $uri; }\n}\n"},
+        {"Quality/Caller.php",
+         "<?php\nnamespace Quality;\nuse GuzzleHttp\\ProofClient;\nfunction request(ProofClient "
+         "$client) { return $client->get('/quality-guzzle'); }\n"},
+        {"Quality/Foreign.php", "<?php\nnamespace Foreign;\nclass Client {\n    public function "
+                                "get(string $uri): string { return ''; }\n    public function "
+                                "post(string $uri, array $opts = []): string { return ''; }\n}\n"},
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"GuzzleHttp\\\\\":\"GuzzleHttp/"
+                          "\",\"Quality\\\\\":\"Quality/\"},\"classmap\":[\"Services/\"]}}\n"}};
+    const RQ_Expected expected[] = {
+        {.case_id = "guzzle-getOrders",
+         .site = {.file = "Services/OrderService.php",
+                  .caller = "OrderService.getOrders",
+                  .needle = "$this->client->get('/orders')"},
+         .relation = "CALLS",
+         .target = {.file = "GuzzleHttp/Client.php",
+                    .suffix = "Client.get",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text =
+                        "    public function get(string $uri): string { return ''; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "php-property-flow-typed-default-args",
+         .why = "Constructor-injected property flow and typed/default argument applicability are "
+                "not certified by the simple typed-parameter receiver bridge.",
+         .tried =
+             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
+             "fixture and required independent control retained. No permissive namesake fallback."},
+        {.case_id = "guzzle-createOrder",
+         .site = {.file = "Services/OrderService.php",
+                  .caller = "OrderService.createOrder",
+                  .needle = "$this->client->post('/orders', ['json' => $data])"},
+         .relation = "CALLS",
+         .target =
+             {.file = "GuzzleHttp/Client.php",
+              .suffix = "Client.post",
+              .label = "Method",
+              .declaration_line = 6,
+              .declaration_text =
+                  "    public function post(string $uri, array $opts = []): string { return ''; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "php-property-flow-typed-default-args",
+         .why = "Constructor-injected property flow and typed/default argument applicability are "
+                "not certified by the simple typed-parameter receiver bridge.",
+         .tried =
+             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
+             "fixture and required independent control retained. No permissive namesake fallback."},
+        {.case_id = "required-guzzle-simple-receiver",
+         .site = {.file = "Quality/Caller.php",
+                  .caller = "request",
+                  .needle = "$client->get('/quality-guzzle')"},
+         .relation = "CALLS",
+         .target = {.file = "GuzzleHttp/ProofClient.php",
+                    .suffix = "ProofClient.get",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text = "    public function get($uri) { return $uri; }"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "guzzle-foreign-getOrders",
+         .site = {.file = "Services/OrderService.php",
+                  .caller = "OrderService.getOrders",
+                  .needle = "$this->client->get('/orders')"},
+         .relation = "CALLS",
+         .target = {.file = "Quality/Foreign.php",
+                    .suffix = "Client.get",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text =
+                        "    public function get(string $uri): string { return ''; }"}},
+        {.case_id = "guzzle-foreign-createOrder",
+         .site = {.file = "Services/OrderService.php",
+                  .caller = "OrderService.createOrder",
+                  .needle = "$this->client->post('/orders', ['json' => $data])"},
+         .relation = "CALLS",
+         .target = {.file = "Quality/Foreign.php",
+                    .suffix = "Client.post",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text = "    public function post(string $uri, array $opts = []): "
+                                        "string { return ''; }"}}};
+    const EtServiceGolden service[] = {
+        {.case_id = "guzzle-route-getOrders",
+         .site = {.file = "Services/OrderService.php",
+                  .caller = "OrderService.getOrders",
+                  .needle = "$this->client->get('/orders')"},
+         .source = {.file = "Services/OrderService.php",
+                    .suffix = "OrderService.getOrders",
+                    .label = "Method",
+                    .declaration_line = 9,
+                    .declaration_text = "    public function getOrders(): string { return "
+                                        "$this->client->get('/orders'); }"},
+         .relation = "HTTP_CALLS",
+         .route = "/orders",
+         .route_qn = "__route__GET__/orders",
+         .property = "method",
+         .value = "GET",
+         .required = false,
+         .gap_id = "guzzle-property-service",
+         .why = "The original property receiver cannot borrow the simple-parameter receiver proof.",
+         .tried = "Call binding prerequisites audited in current source; exact downstream route "
+                  "and handler identity retained separately from the seven-relation oracle."},
+        {.case_id = "guzzle-route-createOrder",
+         .site = {.file = "Services/OrderService.php",
+                  .caller = "OrderService.createOrder",
+                  .needle = "$this->client->post('/orders', ['json' => $data])"},
+         .source = {.file = "Services/OrderService.php",
+                    .suffix = "OrderService.createOrder",
+                    .label = "Method",
+                    .declaration_line = 10,
+                    .declaration_text = "    public function createOrder(array $data): string {"},
+         .relation = "HTTP_CALLS",
+         .route = "/orders",
+         .route_qn = "__route__POST__/orders",
+         .property = "method",
+         .value = "POST",
+         .required = false,
+         .gap_id = "guzzle-property-service",
+         .why = "The original property receiver cannot borrow the simple-parameter receiver proof.",
+         .tried = "Call binding prerequisites audited in current source; exact downstream route "
+                  "and handler identity retained separately from the seven-relation oracle."},
+        {.case_id = "required-guzzle-classification",
+         .site = {.file = "Quality/Caller.php",
+                  .caller = "request",
+                  .needle = "$client->get('/quality-guzzle')"},
+         .source = {.file = "Quality/Caller.php",
+                    .suffix = "request",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "function request(ProofClient $client) { return "
+                                        "$client->get('/quality-guzzle'); }"},
+         .relation = "HTTP_CALLS",
+         .route = "/quality-guzzle",
+         .route_qn = "__route__GET__/quality-guzzle",
+         .property = "method",
+         .value = "GET",
+         .required = true}};
+    ASSERT_TRUE(et_service_quality(files, 6, 1, expected, 3, forbidden, 2, service, 3, NULL, 0,
+                                   "http_calls_guzzle_php", false));
     PASS();
 }
 
@@ -1884,7 +2671,8 @@ TEST(http_calls_reqwest_rust) {
     static const EtFile f[] = {
         {"reqwest_api.rs",
          "pub fn reqwest_get(url: &str) -> String {\n    url.to_string()\n}\n\n"
-         "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, body)\n}\n\n"
+         "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, "
+         "body)\n}\n\n"
          "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
          "pub fn push_item(body: &str) -> String {\n    reqwest_post(\"/api/items\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 1));
@@ -1906,27 +2694,162 @@ TEST(async_calls_celery_python) {
          "    def task(self):\n        def decorator(fn): return fn\n        return decorator\n\n"
          "    def send_task(self, name, args=None): return (name, args)\n\n"
          "app = Celery()\n"},
-        {"tasks/order_tasks.py",
-         "from celery.app import app\n\n\n"
-         "def dispatch_order_created(order_id):\n"
-         "    return app.send_task('order_created', args=[order_id])\n\n\n"
-         "def dispatch_order_shipped(order_id):\n"
-         "    return app.send_task('order_shipped', args=[order_id])\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
+        {"tasks/order_tasks.py", "from celery.app import app\n\n\n"
+                                 "def dispatch_order_created(order_id):\n"
+                                 "    return app.send_task('order_created', args=[order_id])\n\n\n"
+                                 "def dispatch_order_shipped(order_id):\n"
+                                 "    return app.send_task('order_shipped', args=[order_id])\n"}};
+
+    const EtFile files[] = {
+        f[0],
+        f[1],
+        {"celery/quality_control.py", "def publish(topic):\n    return topic\n"},
+        {"quality_client.py", "from celery.quality_control import publish\n\ndef "
+                              "invoke_control():\n    return publish('quality-control')\n"},
+        {"quality_decoy.py",
+         "class Celery:\n    def send_task(self, name, args=None): return (name, args)\n"},
+        {"celery/__init__.py", "\"\"\"Local task fixture package.\"\"\"\n"}};
+    const RQ_Expected expected[] = {
+        {.case_id = "celery-order_created",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_created",
+                  .needle = "app.send_task('order_created', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "celery/app.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "celery-order_shipped",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_shipped",
+                  .needle = "app.send_task('order_shipped', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "celery/app.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "required-celery-free-function",
+         .site = {.file = "quality_client.py",
+                  .caller = "invoke_control",
+                  .needle = "publish('quality-control')"},
+         .relation = "CALLS",
+         .target = {.file = "celery/quality_control.py",
+                    .suffix = "publish",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "def publish(topic):"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "celery-foreign-order_created",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_created",
+                  .needle = "app.send_task('order_created', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "quality_decoy.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"}},
+        {.case_id = "celery-foreign-order_shipped",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_shipped",
+                  .needle = "app.send_task('order_shipped', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "quality_decoy.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"}}};
+    const EtServiceGolden service[] = {
+        {.case_id = "celery-topic-order_created",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_created",
+                  .needle = "app.send_task('order_created', args=[order_id])"},
+         .source = {.file = "tasks/order_tasks.py",
+                    .suffix = "dispatch_order_created",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "def dispatch_order_created(order_id):"},
+         .relation = "ASYNC_CALLS",
+         .route = "order_created",
+         .route_qn = "__route__celery__order_created",
+         .property = "broker",
+         .value = "celery",
+         .required = false,
+         .gap_id = "celery-imported-instance-service",
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
+        {.case_id = "celery-topic-order_shipped",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_shipped",
+                  .needle = "app.send_task('order_shipped', args=[order_id])"},
+         .source = {.file = "tasks/order_tasks.py",
+                    .suffix = "dispatch_order_shipped",
+                    .label = "Function",
+                    .declaration_line = 8,
+                    .declaration_text = "def dispatch_order_shipped(order_id):"},
+         .relation = "ASYNC_CALLS",
+         .route = "order_shipped",
+         .route_qn = "__route__celery__order_shipped",
+         .property = "broker",
+         .value = "celery",
+         .required = false,
+         .gap_id = "celery-imported-instance-service",
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
+        {.case_id = "required-celery-classification",
+         .site = {.file = "quality_client.py",
+                  .caller = "invoke_control",
+                  .needle = "publish('quality-control')"},
+         .source = {.file = "quality_client.py",
+                    .suffix = "invoke_control",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "def invoke_control():"},
+         .relation = "ASYNC_CALLS",
+         .route = "quality-control",
+         .route_qn = "__route__celery__quality-control",
+         .property = "broker",
+         .value = "celery",
+         .required = true}};
+    const RQ_Target survive[] = {
+        {.file = "celery/app.py",
+         .suffix = "Celery",
+         .label = "Class",
+         .declaration_line = 1,
+         .declaration_text = "class Celery:"},
+        {.file = "celery/app.py",
+         .suffix = "Celery.send_task",
+         .label = "Method",
+         .declaration_line = 6,
+         .declaration_text = "    def send_task(self, name, args=None): return (name, args)"}};
+    ASSERT_TRUE(et_service_quality(files, 6, 0, expected, 3, forbidden, 2, service, 3, survive, 2,
+                                   "async_calls_celery_python", false));
     PASS();
 }
 
-/* RED-repro: a wall-clock / scheduling artifact must NOT drop a parseable
- * file's defs. The CBM_TEST_WALL_STALL_ON seam forces the parse-timeout callback
- * to read the WALL clock as (budget + 1 s) ahead while CPU time is untouched —
- * emulating a worker descheduled under CI contention. celery/app.py DEFINES
- * Celery.send_task; under the old wall-only 5 s budget that file is abandoned
- * with zero defs, the "celery" QN the caller resolves against vanishes, and the
- * ASYNC_CALLS edge count drops to 0 (the intermittent async_calls_celery_python
- * failure). With the CPU-time budget the parse still completes (CPU under budget,
- * wall under the generous ceiling) and the edge survives. Deterministic: the
- * seam is a fixed offset, never real timing. Binds only under CBM_ENABLE_TEST_SEAMS
- * (always set for the test-runner); a no-seam build exercises the plain edge. */
+/* WHY: scheduling delay must not drop parseable declarations. The deterministic
+ * wall-offset seam now covers celery/app.py and celery/quality_control.py; the
+ * required imported publish call depends on the latter, while exact original
+ * Celery/send_task declarations must also survive. Tried: member calls alone
+ * conflate parse survival with unsupported imported-instance/keyword binding.
+ * The original two task calls remain independently counted quality gaps.
+ * No real delay or probability is involved; CBM_ENABLE_TEST_SEAMS is required
+ * to bind the CPU-budget regression, as in the original test-runner contract. */
 TEST(async_calls_celery_wall_stall_seam) {
     static const EtFile f[] = {
         {"celery/app.py",
@@ -1934,25 +2857,159 @@ TEST(async_calls_celery_wall_stall_seam) {
          "    def task(self):\n        def decorator(fn): return fn\n        return decorator\n\n"
          "    def send_task(self, name, args=None): return (name, args)\n\n"
          "app = Celery()\n"},
-        {"tasks/order_tasks.py",
-         "from celery.app import app\n\n\n"
-         "def dispatch_order_created(order_id):\n"
-         "    return app.send_task('order_created', args=[order_id])\n\n\n"
-         "def dispatch_order_shipped(order_id):\n"
-         "    return app.send_task('order_shipped', args=[order_id])\n"}};
-    cbm_setenv("CBM_TEST_WALL_STALL_ON", "celery/app.py", 1);
-    int ok = et_edge_present(f, 2, "ASYNC_CALLS", 1);
-    cbm_unsetenv("CBM_TEST_WALL_STALL_ON");
-    ASSERT_TRUE(ok);
+        {"tasks/order_tasks.py", "from celery.app import app\n\n\n"
+                                 "def dispatch_order_created(order_id):\n"
+                                 "    return app.send_task('order_created', args=[order_id])\n\n\n"
+                                 "def dispatch_order_shipped(order_id):\n"
+                                 "    return app.send_task('order_shipped', args=[order_id])\n"}};
+
+    const EtFile files[] = {
+        f[0],
+        f[1],
+        {"celery/quality_control.py", "def publish(topic):\n    return topic\n"},
+        {"quality_client.py", "from celery.quality_control import publish\n\ndef "
+                              "invoke_control():\n    return publish('quality-control')\n"},
+        {"quality_decoy.py",
+         "class Celery:\n    def send_task(self, name, args=None): return (name, args)\n"},
+        {"celery/__init__.py", "\"\"\"Local task fixture package.\"\"\"\n"}};
+    const RQ_Expected expected[] = {
+        {.case_id = "celery-order_created",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_created",
+                  .needle = "app.send_task('order_created', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "celery/app.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "celery-order_shipped",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_shipped",
+                  .needle = "app.send_task('order_shipped', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "celery/app.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "required-stalled-module-call",
+         .site = {.file = "quality_client.py",
+                  .caller = "invoke_control",
+                  .needle = "publish('quality-control')"},
+         .relation = "CALLS",
+         .target = {.file = "celery/quality_control.py",
+                    .suffix = "publish",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "def publish(topic):"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "celery-foreign-order_created",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_created",
+                  .needle = "app.send_task('order_created', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "quality_decoy.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"}},
+        {.case_id = "celery-foreign-order_shipped",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_shipped",
+                  .needle = "app.send_task('order_shipped', args=[order_id])"},
+         .relation = "CALLS",
+         .target = {.file = "quality_decoy.py",
+                    .suffix = "Celery.send_task",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "    def send_task(self, name, args=None): return (name, args)"}}};
+    const EtServiceGolden service[] = {
+        {.case_id = "celery-topic-order_created",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_created",
+                  .needle = "app.send_task('order_created', args=[order_id])"},
+         .source = {.file = "tasks/order_tasks.py",
+                    .suffix = "dispatch_order_created",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "def dispatch_order_created(order_id):"},
+         .relation = "ASYNC_CALLS",
+         .route = "order_created",
+         .route_qn = "__route__celery__order_created",
+         .property = "broker",
+         .value = "celery",
+         .required = false,
+         .gap_id = "celery-imported-instance-service",
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
+        {.case_id = "celery-topic-order_shipped",
+         .site = {.file = "tasks/order_tasks.py",
+                  .caller = "dispatch_order_shipped",
+                  .needle = "app.send_task('order_shipped', args=[order_id])"},
+         .source = {.file = "tasks/order_tasks.py",
+                    .suffix = "dispatch_order_shipped",
+                    .label = "Function",
+                    .declaration_line = 8,
+                    .declaration_text = "def dispatch_order_shipped(order_id):"},
+         .relation = "ASYNC_CALLS",
+         .route = "order_shipped",
+         .route_qn = "__route__celery__order_shipped",
+         .property = "broker",
+         .value = "celery",
+         .required = false,
+         .gap_id = "celery-imported-instance-service",
+         .why = "The literal topic is known and CALLS reaches send_task, but service classification "
+                "reads the pipeline's own call result, which lacks the shared resolver's Python "
+                "member proof.",
+         .tried = "Call binding proved in current source; exact downstream route and handler "
+                  "identity retained separately from the seven-relation oracle."},
+        {.case_id = "required-celery-classification",
+         .site = {.file = "quality_client.py",
+                  .caller = "invoke_control",
+                  .needle = "publish('quality-control')"},
+         .source = {.file = "quality_client.py",
+                    .suffix = "invoke_control",
+                    .label = "Function",
+                    .declaration_line = 3,
+                    .declaration_text = "def invoke_control():"},
+         .relation = "ASYNC_CALLS",
+         .route = "quality-control",
+         .route_qn = "__route__celery__quality-control",
+         .property = "broker",
+         .value = "celery",
+         .required = true}};
+    const RQ_Target survive[] = {
+        {.file = "celery/app.py",
+         .suffix = "Celery",
+         .label = "Class",
+         .declaration_line = 1,
+         .declaration_text = "class Celery:"},
+        {.file = "celery/app.py",
+         .suffix = "Celery.send_task",
+         .label = "Method",
+         .declaration_line = 6,
+         .declaration_text = "    def send_task(self, name, args=None): return (name, args)"}};
+    ASSERT_TRUE(et_service_quality(files, 6, 0, expected, 3, forbidden, 2, service, 3, survive, 2,
+                                   "async_calls_celery_wall_stall_seam", true));
     PASS();
 }
 
 /* Sidekiq (Ruby) — "Sidekiq" substring in resolved QN */
 TEST(async_calls_sidekiq_ruby) {
     static const EtFile f[] = {
-        {"Sidekiq/Worker.rb",
-         "module Sidekiq\n  module Worker\n"
-         "    def self.perform_async(*args); end\n  end\nend\n"},
+        {"Sidekiq/Worker.rb", "module Sidekiq\n  module Worker\n"
+                              "    def self.perform_async(*args); end\n  end\nend\n"},
         {"workers/notification_worker.rb",
          "require_relative '../Sidekiq/Worker'\n\n"
          "class NotificationWorker\n"
@@ -1970,26 +3027,135 @@ TEST(async_calls_kafkajs_ts) {
     static const EtFile f[] = {
         {"kafkajs/producer.ts",
          "export function kafkajsProduce(topic: string, message: any): void {}\n"},
-        {"events/order_events.ts",
-         "import { kafkajsProduce } from '../kafkajs/producer';\n\n"
-         "export function emitOrderCreated(orderId: string): void {\n"
-         "    kafkajsProduce('order-created', { orderId });\n}\n\n"
-         "export function emitOrderCancelled(orderId: string): void {\n"
-         "    kafkajsProduce('order-cancelled', { orderId });\n}\n"}};
+        {"events/order_events.ts", "import { kafkajsProduce } from '../kafkajs/producer';\n\n"
+                                   "export function emitOrderCreated(orderId: string): void {\n"
+                                   "    kafkajsProduce('order-created', { orderId });\n}\n\n"
+                                   "export function emitOrderCancelled(orderId: string): void {\n"
+                                   "    kafkajsProduce('order-cancelled', { orderId });\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
     PASS();
 }
 
-/* AWS SQS (Go) — "aws-sdk-go/service/sqs" substring in resolved QN.
- * REAL BUG (two compounding causes, cannot be exercised by a local fixture):
- *  1) service_patterns.c async_libraries lists the Go SQS id with SLASHES
- *     ("aws-sdk-go/service/sqs"), but cbm_fqn_compute (internal/cbm/helpers.c)
- *     converts path slashes to '.', so a resolved local QN is
- *     "...aws-sdk-go.service.sqs..." and strstr never matches the slash form.
- *  2) emit_http_async_edge (pass_calls.c) requires a URL/topic STRING arg;
- *     SendMessage(&SendMessageInput{...}) passes a struct, no string → the call
- *     degrades to a plain CALLS edge.  No dot-form Go SQS id exists, so the
- *     SQS/Go async pattern is unreachable here. */
+/* The original folder layout alone does not establish Go module membership.
+ * Retain it as an unconfigured negative, then supply the two explicit module
+ * manifests without changing either original source file. */
+static bool et_sqs_configured(const EtFile *original, bool configured, bool parallel) {
+    static const EtFile extras[] = {
+        {"quality_control.mjs", "export function exact_target() { return 7; }\n"
+                                "export function exact_caller() { return exact_target(); }\n"},
+        {"other/decoy.go", "package other\n\ntype SQS struct{}\n"
+                           "func New() *SQS { return &SQS{} }\n"
+                           "func (s *SQS) SendMessage() {}\n"},
+        {"go.mod", "module example.com/application\n\ngo 1.22\n\n"
+                   "require aws-sdk-go v0.0.0\nreplace aws-sdk-go => ./aws-sdk-go\n"},
+        {"aws-sdk-go/go.mod", "module aws-sdk-go\n\ngo 1.22\n"}};
+    EtFile files[6] = {original[0], original[1], extras[0], extras[1], extras[2], extras[3]};
+    RQ_Source sources[4];
+    for (size_t i = 0; i < 4; i++)
+        sources[i] = (RQ_Source){.path = files[i].name, .text = files[i].content};
+    static const RQ_Expected expected[] = {
+        {.case_id = "required-control",
+         .site = {.file = "quality_control.mjs",
+                  .caller = "exact_caller",
+                  .needle = "exact_target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "quality_control.mjs",
+                    .suffix = "exact_target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function exact_target() { return 7; }"}},
+        {.case_id = "configured-sqs-constructor-factory",
+         .site = {.file = "queue/dispatcher.go",
+                  .caller = "DispatchOrderEvent",
+                  .needle = "sqs.New()"},
+         .relation = "CALLS",
+         .target = {.file = "aws-sdk-go/service/sqs/api.go",
+                    .suffix = "New",
+                    .label = "Function",
+                    .declaration_line = 6,
+                    .declaration_text = "func New() *SQS { return &SQS{} }"}},
+        {.case_id = "configured-sqs-returned-receiver",
+         .site = {.file = "queue/dispatcher.go",
+                  .caller = "DispatchOrderEvent",
+                  .needle = "client.SendMessage(&sqs.SendMessageInput{\n"
+                            "        QueueUrl:    queueUrl,\n"
+                            "        MessageBody: body,\n    })"},
+         .relation = "CALLS",
+         .target = {
+             .file = "aws-sdk-go/service/sqs/api.go",
+             .suffix = "SQS.SendMessage",
+             .label = "Method",
+             .declaration_line = 8,
+             .declaration_text =
+                 "func (s *SQS) SendMessage(input *SendMessageInput) error { return nil }"}}};
+    RQ_Forbidden forbidden[2] = {
+        {.case_id = "factory-no-folder-guess",
+         .site = expected[1].site,
+         .relation = "CALLS",
+         .target = {.file = "other/decoy.go",
+                    .suffix = "New",
+                    .label = "Function",
+                    .declaration_line = 4,
+                    .declaration_text = "func New() *SQS { return &SQS{} }"}},
+        {.case_id = "method-no-namesake-guess",
+         .site = expected[2].site,
+         .relation = "CALLS",
+         .target = {.file = "other/decoy.go",
+                    .suffix = "SQS.SendMessage",
+                    .label = "Method",
+                    .declaration_line = 5,
+                    .declaration_text = "func (s *SQS) SendMessage() {}"}}};
+    if (!configured)
+        forbidden[0].any_target = forbidden[1].any_target = true;
+    EtProj project;
+    cbm_store_t *store = parallel ? et_index_parallel(&project, files, configured ? 6 : 4)
+                                  : et_index_files(&project, files, configured ? 6 : 4);
+    RQ_Report report = {0};
+    bool ok =
+        store && rq_check_project_declarations(
+                     store, project.project, configured ? "sqs-configured" : "sqs-unconfigured",
+                     sources, 4, expected, configured ? 3 : 1, forbidden, 2, &report, stderr);
+    ok = ok && report.genuine == (configured ? 3 : 1) && report.found == report.genuine &&
+         report.missing == 0 && report.wrong == 0;
+    /* queueUrl is the existing symbolic-expression route contract, not a
+     * claim that its runtime queue address is known. Check the exact source,
+     * broker and route identity independently from the callable oracle. */
+    sqlite3_stmt *query = NULL;
+    const char *sql =
+        "SELECT s.file_path,s.name,t.label,t.name,t.qualified_name,"
+        "json_extract(e.properties,'$.broker'),json_extract(e.properties,'$.url_path') "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.project=?1 AND e.type='ASYNC_CALLS'";
+    bool queried =
+        store && sqlite3_prepare_v2(cbm_store_get_db(store), sql, -1, &query, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(query, 1, project.project, -1, SQLITE_TRANSIENT) == SQLITE_OK;
+    int count = 0, step = SQLITE_ERROR;
+    if (queried)
+        while ((step = sqlite3_step(query)) == SQLITE_ROW) {
+            count++;
+            const char *values[] = {"queue/dispatcher.go",
+                                    "DispatchOrderEvent",
+                                    "Route",
+                                    "queueUrl",
+                                    "__route__sqs__queueUrl",
+                                    "sqs",
+                                    "queueUrl"};
+            for (int i = 0; i < 7; i++) {
+                const char *value = (const char *)sqlite3_column_text(query, i);
+                ok = value && !strcmp(value, values[i]) && ok;
+            }
+        }
+    ok = ok && queried && step == SQLITE_DONE && count == (configured ? 1 : 0);
+    if (query)
+        sqlite3_finalize(query);
+    if (!ok)
+        fprintf(stderr, "[SQS] configured=%d parallel=%d async=%d genuine=%zu found=%zu\n",
+                configured, parallel, count, report.genuine, report.found);
+    et_cleanup(&project, store);
+    return ok;
+}
+
 TEST(async_calls_sqs_go) {
     static const EtFile f[] = {
         {"aws-sdk-go/service/sqs/api.go",
@@ -1998,33 +3164,228 @@ TEST(async_calls_sqs_go) {
          "type SQS struct{}\n\n"
          "func New() *SQS { return &SQS{} }\n\n"
          "func (s *SQS) SendMessage(input *SendMessageInput) error { return nil }\n"},
-        {"queue/dispatcher.go",
-         "package queue\n\n"
-         "import \"aws-sdk-go/service/sqs\"\n\n"
-         "func DispatchOrderEvent(queueUrl, body string) error {\n"
-         "    client := sqs.New()\n"
-         "    return client.SendMessage(&sqs.SendMessageInput{\n"
-         "        QueueUrl:    queueUrl,\n"
-         "        MessageBody: body,\n    })\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
+        {"queue/dispatcher.go", "package queue\n\n"
+                                "import \"aws-sdk-go/service/sqs\"\n\n"
+                                "func DispatchOrderEvent(queueUrl, body string) error {\n"
+                                "    client := sqs.New()\n"
+                                "    return client.SendMessage(&sqs.SendMessageInput{\n"
+                                "        QueueUrl:    queueUrl,\n"
+                                "        MessageBody: body,\n    })\n}\n"}};
+    for (int parallel = 0; parallel < 2; parallel++) {
+        ASSERT_TRUE(et_sqs_configured(f, false, parallel != 0));
+        ASSERT_TRUE(et_sqs_configured(f, true, parallel != 0));
+    }
     PASS();
 }
 
 /* BullMQ (JavaScript) — "bullmq" substring in resolved QN */
 TEST(async_calls_bullmq_js) {
     static const EtFile f[] = {
-        {"bullmq/queue.js",
-         "class bullmqQueue {\n"
-         "    add(jobName, data) { return { jobName, data }; }\n}\n\n"
-         "module.exports = { bullmqQueue };\n"},
-        {"jobs/mailer.js",
-         "const { bullmqQueue } = require('./bullmq/queue');\n\n"
-         "const mailQueue = new bullmqQueue();\n\n"
-         "function scheduleWelcomeEmail(userId) {\n"
-         "    return mailQueue.add('welcome-email', { userId });\n}\n\n"
-         "function schedulePasswordReset(userId) {\n"
-         "    return mailQueue.add('password-reset', { userId });\n}\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
+        {"bullmq/queue.js", "class bullmqQueue {\n"
+                            "    add(jobName, data) { return { jobName, data }; }\n}\n\n"
+                            "module.exports = { bullmqQueue };\n"},
+        {"jobs/mailer.js", "const { bullmqQueue } = require('./bullmq/queue');\n\n"
+                           "const mailQueue = new bullmqQueue();\n\n"
+                           "function scheduleWelcomeEmail(userId) {\n"
+                           "    return mailQueue.add('welcome-email', { userId });\n}\n\n"
+                           "function schedulePasswordReset(userId) {\n"
+                           "    return mailQueue.add('password-reset', { userId });\n}\n"}};
+
+    const EtFile files[] = {
+        f[0],
+        f[1],
+        {"quality/bullmq.mjs", "export function publish(value) { return value; }\n"},
+        {"quality/service.mjs", "import { publish } from './bullmq.mjs';\nexport function "
+                                "request() { return publish('quality-bullmq'); }\n"},
+        {"quality/Foreign.js", "class bullmqQueue {\n    add(jobName, data) { return { jobName, "
+                               "data }; }\n}\nmodule.exports = { bullmqQueue };\n"}};
+    const RQ_Expected expected[] = {
+        {.case_id = "bullmq-valid-welcome-email",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "scheduleWelcomeEmail",
+                  .needle = "mailQueue.add('welcome-email', { userId })"},
+         .relation = "CALLS",
+         .target = {.file = "bullmq/queue.js",
+                    .suffix = "bullmqQueue.add",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text = "    add(jobName, data) { return { jobName, data }; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "javascript-commonjs-instance-export",
+         .why = "Destructured require, CommonJS exported constructor identity and JavaScript "
+                "new-expression receiver flow lack complete proof.",
+         .tried =
+             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
+             "fixture and required independent control retained. No permissive namesake fallback."},
+        {.case_id = "bullmq-valid-password-reset",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "schedulePasswordReset",
+                  .needle = "mailQueue.add('password-reset', { userId })"},
+         .relation = "CALLS",
+         .target = {.file = "bullmq/queue.js",
+                    .suffix = "bullmqQueue.add",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text = "    add(jobName, data) { return { jobName, data }; }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "javascript-commonjs-instance-export",
+         .why = "Destructured require, CommonJS exported constructor identity and JavaScript "
+                "new-expression receiver flow lack complete proof.",
+         .tried =
+             "Exact source audit: the complete binding/proof prerequisite is unsupported; original "
+             "fixture and required independent control retained. No permissive namesake fallback."},
+        {.case_id = "required-service-call",
+         .site = {.file = "quality/service.mjs",
+                  .caller = "request",
+                  .needle = "publish('quality-bullmq')"},
+         .relation = "CALLS",
+         .target = {.file = "quality/bullmq.mjs",
+                    .suffix = "publish",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function publish(value) { return value; }"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "bullmq-foreign-welcome-email",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "scheduleWelcomeEmail",
+                  .needle = "mailQueue.add('welcome-email', { userId })"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Foreign.js",
+                    .suffix = "bullmqQueue.add",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text = "    add(jobName, data) { return { jobName, data }; }"}},
+        {.case_id = "bullmq-foreign-password-reset",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "schedulePasswordReset",
+                  .needle = "mailQueue.add('password-reset', { userId })"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Foreign.js",
+                    .suffix = "bullmqQueue.add",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text = "    add(jobName, data) { return { jobName, data }; }"}}};
+    const EtServiceGolden service[] = {
+        {.case_id = "bullmq-topic-welcome-email",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "scheduleWelcomeEmail",
+                  .needle = "mailQueue.add('welcome-email', { userId })"},
+         .source = {.file = "jobs/mailer.js",
+                    .suffix = "scheduleWelcomeEmail",
+                    .label = "Function",
+                    .declaration_line = 5,
+                    .declaration_text = "function scheduleWelcomeEmail(userId) {"},
+         .relation = "ASYNC_CALLS",
+         .route = "welcome-email",
+         .route_qn = "__route__bullmq__welcome-email",
+         .property = "broker",
+         .value = "bullmq",
+         .required = false,
+         .gap_id = "bullmq-commonjs-instance-service",
+         .why = "The corrected ../ module path is exact; CommonJS constructor/receiver authority "
+                "is not yet supported.",
+         .tried = "Call binding prerequisites audited in current source; exact downstream route "
+                  "and handler identity retained separately from the seven-relation oracle."},
+        {.case_id = "bullmq-topic-password-reset",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "schedulePasswordReset",
+                  .needle = "mailQueue.add('password-reset', { userId })"},
+         .source = {.file = "jobs/mailer.js",
+                    .suffix = "schedulePasswordReset",
+                    .label = "Function",
+                    .declaration_line = 9,
+                    .declaration_text = "function schedulePasswordReset(userId) {"},
+         .relation = "ASYNC_CALLS",
+         .route = "password-reset",
+         .route_qn = "__route__bullmq__password-reset",
+         .property = "broker",
+         .value = "bullmq",
+         .required = false,
+         .gap_id = "bullmq-commonjs-instance-service",
+         .why = "The corrected ../ module path is exact; CommonJS constructor/receiver authority "
+                "is not yet supported.",
+         .tried = "Call binding prerequisites audited in current source; exact downstream route "
+                  "and handler identity retained separately from the seven-relation oracle."},
+        {.case_id = "required-service-route",
+         .site = {.file = "quality/service.mjs",
+                  .caller = "request",
+                  .needle = "publish('quality-bullmq')"},
+         .source = {.file = "quality/service.mjs",
+                    .suffix = "request",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "export function request() { return publish('quality-bullmq'); }"},
+         .relation = "ASYNC_CALLS",
+         .route = "quality-bullmq",
+         .route_qn = "__route__bullmq__quality-bullmq",
+         .property = "broker",
+         .value = "bullmq",
+         .required = true}};
+    const RQ_Forbidden invalid[] = {
+        {.case_id = "bullmq-invalid-path-welcome-email",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "scheduleWelcomeEmail",
+                  .needle = "mailQueue.add('welcome-email', { userId })"},
+         .relation = "CALLS",
+         .target = {.file = "bullmq/queue.js",
+                    .suffix = "bullmqQueue.add",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text = "    add(jobName, data) { return { jobName, data }; }"},
+         .any_target = true},
+        {.case_id = "bullmq-invalid-path-password-reset",
+         .site = {.file = "jobs/mailer.js",
+                  .caller = "schedulePasswordReset",
+                  .needle = "mailQueue.add('password-reset', { userId })"},
+         .relation = "CALLS",
+         .target = {.file = "bullmq/queue.js",
+                    .suffix = "bullmqQueue.add",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text = "    add(jobName, data) { return { jobName, data }; }"},
+         .any_target = true}};
+    const RQ_Expected control[] = {
+        {.case_id = "required-service-call",
+         .site = {.file = "quality/service.mjs",
+                  .caller = "request",
+                  .needle = "publish('quality-bullmq')"},
+         .relation = "CALLS",
+         .target = {.file = "quality/bullmq.mjs",
+                    .suffix = "publish",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function publish(value) { return value; }"},
+         .mode = RQ_REQUIRED}};
+    const EtServiceGolden control_service[] = {
+        {.case_id = "required-service-route",
+         .site = {.file = "quality/service.mjs",
+                  .caller = "request",
+                  .needle = "publish('quality-bullmq')"},
+         .source = {.file = "quality/service.mjs",
+                    .suffix = "request",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "export function request() { return publish('quality-bullmq'); }"},
+         .relation = "ASYNC_CALLS",
+         .route = "quality-bullmq",
+         .route_qn = "__route__bullmq__quality-bullmq",
+         .property = "broker",
+         .value = "bullmq",
+         .required = true}};
+    ASSERT_TRUE(et_service_quality(files, 5, 0, control, 1, invalid, 2, control_service, 1, NULL, 0,
+                                   "bullmq-invalid-path", false));
+    EtFile corrected[5];
+    memcpy(corrected, files, sizeof(corrected));
+    corrected[1].content =
+        "const { bullmqQueue } = require('../bullmq/queue');\n\nconst mailQueue = new "
+        "bullmqQueue();\n\nfunction scheduleWelcomeEmail(userId) {\n    return "
+        "mailQueue.add('welcome-email', { userId });\n}\n\nfunction schedulePasswordReset(userId) "
+        "{\n    return mailQueue.add('password-reset', { userId });\n}\n";
+    ASSERT_TRUE(et_service_quality(corrected, 5, 0, expected, 3, forbidden, 2, service, 3, NULL, 0,
+                                   "bullmq-valid-path", false));
     PASS();
 }
 
@@ -2080,14 +3441,13 @@ TEST(throws_java) {
  * the THROWS edge resolution never gets a usable exception name. */
 TEST(throws_kotlin) {
     static const EtFile meaningful[] = {
-        {"Service.kt",
-         "class NotFoundException(msg: String) : Exception(msg)\n\n"
-         "fun findItem(id: Int): String {\n"
-         "    if (id < 0) throw NotFoundException(\"item not found: $id\")\n"
-         "    return \"item:$id\"\n}\n\n"
-         "fun getCategory(name: String): String {\n"
-         "    if (name.isEmpty()) throw NotFoundException(\"category missing\")\n"
-         "    return name\n}\n"}};
+        {"Service.kt", "class NotFoundException(msg: String) : Exception(msg)\n\n"
+                       "fun findItem(id: Int): String {\n"
+                       "    if (id < 0) throw NotFoundException(\"item not found: $id\")\n"
+                       "    return \"item:$id\"\n}\n\n"
+                       "fun getCategory(name: String): String {\n"
+                       "    if (name.isEmpty()) throw NotFoundException(\"category missing\")\n"
+                       "    return name\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2103,17 +3463,16 @@ TEST(throws_kotlin) {
 /* Python — `raise ValidationException(...)` — checked (no Error/Panic) */
 TEST(throws_python) {
     static const EtFile meaningful[] = {
-        {"validate.py",
-         "class ValidationException(Exception):\n"
-         "    pass\n\n\n"
-         "def validate_email(email):\n"
-         "    if '@' not in email:\n"
-         "        raise ValidationException('invalid email: ' + email)\n"
-         "    return email\n\n\n"
-         "def validate_age(age):\n"
-         "    if age < 0:\n"
-         "        raise ValidationException('age must be non-negative')\n"
-         "    return age\n"}};
+        {"validate.py", "class ValidationException(Exception):\n"
+                        "    pass\n\n\n"
+                        "def validate_email(email):\n"
+                        "    if '@' not in email:\n"
+                        "        raise ValidationException('invalid email: ' + email)\n"
+                        "    return email\n\n\n"
+                        "def validate_age(age):\n"
+                        "    if age < 0:\n"
+                        "        raise ValidationException('age must be non-negative')\n"
+                        "    return age\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2129,17 +3488,15 @@ TEST(throws_python) {
 /* TypeScript — `throw new HttpException(...)` — checked (no Error/Panic) */
 TEST(throws_typescript) {
     static const EtFile meaningful[] = {
-        {"exceptions.ts",
-         "export class HttpException {\n"
-         "    constructor(public status: number, public message: string) {}\n}\n"},
-        {"controller.ts",
-         "import { HttpException } from './exceptions';\n\n"
-         "export function getUser(id: number): string {\n"
-         "    if (id <= 0) throw new HttpException(404, 'User not found');\n"
-         "    return `user:${id}`;\n}\n\n"
-         "export function updateUser(id: number, name: string): string {\n"
-         "    if (!name) throw new HttpException(400, 'Name required');\n"
-         "    return `updated:${id}`;\n}\n"}};
+        {"exceptions.ts", "export class HttpException {\n"
+                          "    constructor(public status: number, public message: string) {}\n}\n"},
+        {"controller.ts", "import { HttpException } from './exceptions';\n\n"
+                          "export function getUser(id: number): string {\n"
+                          "    if (id <= 0) throw new HttpException(404, 'User not found');\n"
+                          "    return `user:${id}`;\n}\n\n"
+                          "export function updateUser(id: number, name: string): string {\n"
+                          "    if (!name) throw new HttpException(400, 'Name required');\n"
+                          "    return `updated:${id}`;\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2208,14 +3565,13 @@ TEST(throws_php) {
 /* Scala — `throw new RecordException(...)` — checked */
 TEST(throws_scala) {
     static const EtFile meaningful[] = {
-        {"Records.scala",
-         "class RecordException(msg: String) extends Exception(msg)\n\n"
-         "def parseRecord(raw: String): String = {\n"
-         "    if (raw.isEmpty) throw new RecordException(\"empty record\")\n"
-         "    raw.trim\n}\n\n"
-         "def validateRecord(raw: String): Boolean = {\n"
-         "    if (raw.length < 2) throw new RecordException(\"too short\")\n"
-         "    true\n}\n"}};
+        {"Records.scala", "class RecordException(msg: String) extends Exception(msg)\n\n"
+                          "def parseRecord(raw: String): String = {\n"
+                          "    if (raw.isEmpty) throw new RecordException(\"empty record\")\n"
+                          "    raw.trim\n}\n\n"
+                          "def validateRecord(raw: String): Boolean = {\n"
+                          "    if (raw.length < 2) throw new RecordException(\"too short\")\n"
+                          "    true\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2235,17 +3591,16 @@ TEST(throws_scala) {
 
 /* Python — `raise ValueError(...)` — runtime exception */
 TEST(raises_python) {
-    static const EtFile meaningful[] = {
-        {"parser.py",
-         "class ValueError(Exception):\n    pass\n\n\n"
-         "def parse_int(s):\n"
-         "    if not s.isdigit():\n"
-         "        raise ValueError('not a digit: ' + s)\n"
-         "    return int(s)\n\n\n"
-         "def parse_float(s):\n"
-         "    try:\n        return float(s)\n"
-         "    except Exception:\n"
-         "        raise ValueError('not a float: ' + s)\n"}};
+    static const EtFile meaningful[] = {{"parser.py",
+                                         "class ValueError(Exception):\n    pass\n\n\n"
+                                         "def parse_int(s):\n"
+                                         "    if not s.isdigit():\n"
+                                         "        raise ValueError('not a digit: ' + s)\n"
+                                         "    return int(s)\n\n\n"
+                                         "def parse_float(s):\n"
+                                         "    try:\n        return float(s)\n"
+                                         "    except Exception:\n"
+                                         "        raise ValueError('not a float: ' + s)\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2261,17 +3616,15 @@ TEST(raises_python) {
 /* TypeScript — `throw new TypeError(...)` — runtime exception */
 TEST(raises_typescript) {
     static const EtFile meaningful[] = {
-        {"validators.ts",
-         "export class TypeError {\n"
-         "    constructor(public message: string) {}\n}\n"},
-        {"parser.ts",
-         "import { TypeError } from './validators';\n\n"
-         "export function parseNumber(val: unknown): number {\n"
-         "    if (typeof val !== 'number') throw new TypeError('not a number');\n"
-         "    return val as number;\n}\n\n"
-         "export function parseString(val: unknown): string {\n"
-         "    if (typeof val !== 'string') throw new TypeError('not a string');\n"
-         "    return val as string;\n}\n"}};
+        {"validators.ts", "export class TypeError {\n"
+                          "    constructor(public message: string) {}\n}\n"},
+        {"parser.ts", "import { TypeError } from './validators';\n\n"
+                      "export function parseNumber(val: unknown): number {\n"
+                      "    if (typeof val !== 'number') throw new TypeError('not a number');\n"
+                      "    return val as number;\n}\n\n"
+                      "export function parseString(val: unknown): string {\n"
+                      "    if (typeof val !== 'string') throw new TypeError('not a string');\n"
+                      "    return val as string;\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2291,14 +3644,13 @@ TEST(raises_typescript) {
  * exception identifier from a Kotlin throw_expression→call_expression. */
 TEST(raises_kotlin) {
     static const EtFile meaningful[] = {
-        {"Errors.kt",
-         "class IllegalArgumentError(msg: String) : RuntimeException(msg)\n\n"
-         "fun requirePositive(n: Int): Int {\n"
-         "    if (n <= 0) throw IllegalArgumentError(\"expected positive, got $n\")\n"
-         "    return n\n}\n\n"
-         "fun requireNonEmpty(s: String): String {\n"
-         "    if (s.isEmpty()) throw IllegalArgumentError(\"string is empty\")\n"
-         "    return s\n}\n"}};
+        {"Errors.kt", "class IllegalArgumentError(msg: String) : RuntimeException(msg)\n\n"
+                      "fun requirePositive(n: Int): Int {\n"
+                      "    if (n <= 0) throw IllegalArgumentError(\"expected positive, got $n\")\n"
+                      "    return n\n}\n\n"
+                      "fun requireNonEmpty(s: String): String {\n"
+                      "    if (s.isEmpty()) throw IllegalArgumentError(\"string is empty\")\n"
+                      "    return s\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -2379,119 +3731,299 @@ TEST(raises_php) {
  *    defs so rw resolution can find them.  The fixtures correctly write to
  *    module-level vars / fields that DO become nodes; the gap is registration. */
 
-/* Python — simple module-level variable assignment */
+/* A bare assignment in a Python function binds a local name. The module
+ * variable is a forbidden WRITES target until an explicit global declaration
+ * changes the binding. Keep both sides in an independent source oracle. */
 TEST(writes_python) {
-    static const EtFile meaningful[] = {
-        {"state.py",
-         "registry = {}\n\n\n"
-         "def register(key, value):\n"
-         "    registry = {key: value}\n"
-         "    return registry\n\n\n"
-         "def clear_registry():\n"
-         "    registry = {}\n"}};
+    static const char source[] = "registry = {}\n"
+                                 "def register(key, value):\n"
+                                 "    registry = {key: value}\n"
+                                 "    return registry\n"
+                                 "def clear_registry():\n"
+                                 "    registry = {}\n";
+    static const EtFile files[] = {{"state.py", source}};
+    static const RQ_Source sources[] = {{.path = "state.py", .text = source}};
+    static const RQ_Forbidden forbidden[] = {{.case_id = "function_assignment_is_local",
+                                              .site = {.file = "state.py",
+                                                       .caller = "state.register",
+                                                       .needle = "registry",
+                                                       .occurrence_index = 1},
+                                              .relation = "WRITES",
+                                              .target = {.file = "state.py",
+                                                         .suffix = "state.registry",
+                                                         .label = "Variable",
+                                                         .declaration_line = 1,
+                                                         .declaration_text = "registry = {}"}},
+                                             {.case_id = "second_function_assignment_is_local",
+                                              .site = {.file = "state.py",
+                                                       .caller = "state.clear_registry",
+                                                       .needle = "registry",
+                                                       .occurrence_index = 4},
+                                              .relation = "WRITES",
+                                              .target = {.file = "state.py",
+                                                         .suffix = "state.registry",
+                                                         .label = "Variable",
+                                                         .declaration_line = 1,
+                                                         .declaration_text = "registry = {}"}}};
     EtProj lp;
-    cbm_store_t *store =
-        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
-    int writes = store ? cbm_store_count_edges_by_type(store, lp.project, "WRITES") : -1;
-    if (writes < 1) {
-        fprintf(stderr, "  [ET-WRITES] Python: WRITES=%d\n", writes);
-    }
+    cbm_store_t *store = et_index_parallel(&lp, files, 1);
+    RQ_Report report;
+    bool ok = rq_check(store, lp.project, "python_local_write_binding", sources, 1, NULL, 0,
+                       forbidden, 2, &report, stderr);
     et_cleanup(&lp, store);
-    ASSERT_TRUE(writes >= 1);
+    ASSERT(ok);
+    ASSERT_EQ(report.wrong, 0);
     PASS();
+}
+
+TEST(writes_python_explicit_global_missing_is_quality) {
+    static const char source[] = "registry = {}\n"
+                                 "def register(key, value):\n"
+                                 "    global registry\n"
+                                 "    registry = {key: value}\n"
+                                 "def clear_registry():\n"
+                                 "    global registry\n"
+                                 "    registry = {}\n";
+    static const EtFile files[] = {{"state.py", source}};
+    static const RQ_Source sources[] = {{.path = "state.py", .text = source}};
+    static const RQ_Expected expected[] = {
+        {.case_id = "explicit_global_assignment",
+         .site = {.file = "state.py",
+                  .caller = "state.register",
+                  .needle = "registry",
+                  .occurrence_index = 2},
+         .relation = "WRITES",
+         .target = {.file = "state.py",
+                    .suffix = "state.registry",
+                    .label = "Variable",
+                    .declaration_line = 1,
+                    .declaration_text = "registry = {}"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "python_global_write_binding",
+         .why = "Explicit global binding is not implemented by the audited binding adapter.",
+         .tried = "Literal module declaration and explicit global assignment; no dynamic namespace "
+                  "access."},
+        {.case_id = "explicit_global_reset",
+         .site = {.file = "state.py",
+                  .caller = "state.clear_registry",
+                  .needle = "registry",
+                  .occurrence_index = 5},
+         .relation = "WRITES",
+         .target = {.file = "state.py",
+                    .suffix = "state.registry",
+                    .label = "Variable",
+                    .declaration_line = 1,
+                    .declaration_text = "registry = {}"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "python_global_write_binding",
+         .why = "Explicit global binding is not implemented by the audited binding adapter.",
+         .tried = "Literal empty-dictionary reset under an explicit global declaration."}};
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, files, 1);
+    RQ_Report report;
+    bool ok = rq_check(store, lp.project, "python_global_write_quality", sources, 1, expected, 2,
+                       NULL, 0, &report, stderr);
+    et_cleanup(&lp, store);
+    ASSERT(ok);
+    ASSERT_EQ(report.genuine, 2);
+    ASSERT_EQ(report.missing, 2);
+    ASSERT_EQ(report.wrong, 0);
+    PASS();
+}
+
+/* The selected reset/set occurrence is an exact write obligation. Other
+ * callers remain outside this bounded oracle. A supported call and a foreign
+ * same-named declaration guard against an empty or guessed graph. */
+static bool et_write_quality(const EtFile *original, int count, const EtFile *decoy,
+                             const RQ_Expected *gap, const RQ_Target *wrong_target,
+                             const char *suite) {
+    if (count < 1 || count > 13)
+        return false;
+    EtFile files[16];
+    RQ_Source sources[16];
+    memcpy(files, original, (size_t)count * sizeof(*files));
+    files[count++] = *decoy;
+    files[count++] = (EtFile){
+        "quality_control.js",
+        "export function target() { return 1; }\nexport function caller() { return target(); }\n"};
+    for (int i = 0; i < count; i++)
+        sources[i] = (RQ_Source){.path = files[i].name, .text = files[i].content};
+    const RQ_Expected expected[] = {
+        *gap,
+        {.case_id = "required-exact-call-control",
+         .site = {.file = "quality_control.js",
+                  .caller = "quality_control.caller",
+                  .needle = "target()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "quality_control.js",
+                    .suffix = "quality_control.target",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "export function target() { return 1; }"},
+         .mode = RQ_REQUIRED}};
+    const RQ_Forbidden forbidden = {.case_id = "foreign-write-target",
+                                    .site = gap->site,
+                                    .relation = "WRITES",
+                                    .target = *wrong_target};
+    for (int driver = 0; driver < 2; driver++) {
+        EtProj lp;
+        cbm_store_t *store =
+            driver ? et_index_parallel(&lp, files, count) : et_index_files(&lp, files, count);
+        if (!store) {
+            et_cleanup(&lp, store);
+            return false;
+        }
+        RQ_Report report;
+        bool ok = rq_check_project_declarations(store, lp.project, suite, sources, (size_t)count,
+                                                expected, 2, &forbidden, 1, &report, stderr);
+        et_cleanup(&lp, store);
+        size_t found = gap->mode == RQ_REQUIRED ? 2 : 1;
+        if (!ok || report.genuine != 2 || report.found != found || report.missing != 2 - found)
+            return false;
+    }
+    return true;
 }
 
 /* Go — short_var_declaration and assignment_statement */
 TEST(writes_go) {
-    static const EtFile meaningful[] = {
-        {"cache.go",
-         "package cache\n\n"
-         "var store map[string]string\n\n"
-         "func Set(key, value string) {\n"
-         "    store = make(map[string]string)\n"
-         "    store[key] = value\n}\n\n"
-         "func Reset() {\n"
-         "    store = nil\n}\n"}};
-    EtProj lp;
-    cbm_store_t *store =
-        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
-    int writes = store ? cbm_store_count_edges_by_type(store, lp.project, "WRITES") : -1;
-    if (writes < 1) {
-        fprintf(stderr, "  [ET-WRITES] Go: WRITES=%d\n", writes);
-    }
-    et_cleanup(&lp, store);
-    ASSERT_TRUE(writes >= 1);
+    static const EtFile meaningful[] = {{"cache.go", "package cache\n\n"
+                                                     "var store map[string]string\n\n"
+                                                     "func Set(key, value string) {\n"
+                                                     "    store = make(map[string]string)\n"
+                                                     "    store[key] = value\n}\n\n"
+                                                     "func Reset() {\n"
+                                                     "    store = nil\n}\n"}};
+    const EtFile decoy = {"decoy/cache.go", "package foreign\nvar store map[string]string\n"};
+    /* Reset assigns the declared package variable directly; it has no local shadow. A Go
+     * package's identity is its directory, so this root file's names carry no "cache" part. */
+    const RQ_Expected gap = {.case_id = "writes_go-exact-declaration-write",
+                             .site = {.file = "cache.go",
+                                      .caller = "Reset",
+                                      .needle = "store",
+                                      .occurrence_index = 3},
+                             .relation = "WRITES",
+                             .target = {.file = "cache.go",
+                                        .suffix = "store",
+                                        .label = "Variable",
+                                        .declaration_line = 3,
+                                        .declaration_text = "var store map[string]string"},
+                             .mode = RQ_REQUIRED};
+    const RQ_Target wrong = {.file = "decoy/cache.go",
+                             .suffix = "decoy.store",
+                             .label = "Variable",
+                             .declaration_line = 2,
+                             .declaration_text = "var store map[string]string"};
+    ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_go"));
     PASS();
 }
 
 /* Java — field assignment inside a method */
 TEST(writes_java) {
     static const EtFile meaningful[] = {
-        {"Counter.java",
-         "package app;\n\n"
-         "class Counter {\n"
-         "    private int count = 0;\n\n"
-         "    public void increment() {\n"
-         "        count = count + 1;\n    }\n\n"
-         "    public void reset() {\n"
-         "        count = 0;\n    }\n\n"
-         "    public int get() {\n        return count;\n    }\n}\n"}};
-    EtProj lp;
-    cbm_store_t *store =
-        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
-    int writes = store ? cbm_store_count_edges_by_type(store, lp.project, "WRITES") : -1;
-    if (writes < 1) {
-        fprintf(stderr, "  [ET-WRITES] Java: WRITES=%d\n", writes);
-    }
-    et_cleanup(&lp, store);
-    ASSERT_TRUE(writes >= 1);
+        {"Counter.java", "package app;\n\n"
+                         "class Counter {\n"
+                         "    private int count = 0;\n\n"
+                         "    public void increment() {\n"
+                         "        count = count + 1;\n    }\n\n"
+                         "    public void reset() {\n"
+                         "        count = 0;\n    }\n\n"
+                         "    public int get() {\n        return count;\n    }\n}\n"}};
+    const EtFile decoy = {"Other.java", "package app;\nclass Other { int count = 7; }\n"};
+    const RQ_Expected gap = {
+        .case_id = "writes_java-exact-declaration-write",
+        .site = {.file = "Counter.java",
+                 .caller = "Counter.reset",
+                 .needle = "count",
+                 .occurrence_index = 3},
+        .relation = "WRITES",
+        .target = {.file = "Counter.java",
+                   .suffix = "Counter.count",
+                   .label = "Field",
+                   .declaration_line = 4,
+                   .declaration_text = "    private int count = 0;"},
+        .mode = RQ_REQUIRED};
+    const RQ_Target wrong = {.file = "Other.java",
+                             .suffix = "Other.count",
+                             .label = "Field",
+                             .declaration_line = 2,
+                             .declaration_text = "class Other { int count = 7; }"};
+    ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_java"));
     PASS();
 }
 
 /* Rust — local variable assignment (assignment_expression) */
 TEST(writes_rust) {
-    static const EtFile meaningful[] = {
-        {"accumulator.rs",
-         "pub struct Accumulator {\n    pub total: i64,\n}\n\n"
-         "impl Accumulator {\n"
-         "    pub fn add(&mut self, n: i64) {\n"
-         "        let total = self.total + n;\n"
-         "        self.total = total;\n    }\n\n"
-         "    pub fn clear(&mut self) {\n"
-         "        self.total = 0;\n    }\n}\n"}};
-    EtProj lp;
-    cbm_store_t *store =
-        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
-    int writes = store ? cbm_store_count_edges_by_type(store, lp.project, "WRITES") : -1;
-    if (writes < 1) {
-        fprintf(stderr, "  [ET-WRITES] Rust: WRITES=%d\n", writes);
-    }
-    et_cleanup(&lp, store);
-    ASSERT_TRUE(writes >= 1);
+    static const EtFile meaningful[] = {{"accumulator.rs",
+                                         "pub struct Accumulator {\n    pub total: i64,\n}\n\n"
+                                         "impl Accumulator {\n"
+                                         "    pub fn add(&mut self, n: i64) {\n"
+                                         "        let total = self.total + n;\n"
+                                         "        self.total = total;\n    }\n\n"
+                                         "    pub fn clear(&mut self) {\n"
+                                         "        self.total = 0;\n    }\n}\n"}};
+    const EtFile decoy = {"decoy.rs", "pub struct Other {\n    pub total: i64,\n}\n"};
+    const RQ_Expected gap = {
+        .case_id = "writes_rust-exact-declaration-write",
+        .site = {.file = "accumulator.rs",
+                 .caller = "Accumulator.clear",
+                 .needle = "total",
+                 .occurrence_index = 5},
+        .relation = "WRITES",
+        .target = {.file = "accumulator.rs",
+                   .suffix = "Accumulator.total",
+                   .label = "Field",
+                   .declaration_line = 2,
+                   .declaration_text = "    pub total: i64,"},
+        .mode = RQ_REQUIRED,
+        .gap_id = "rust-declared-self-field-write",
+        .why =
+            "clear assigns the field of its explicit &mut self receiver in impl Accumulator. The "
+            "unrelated Other field is not its owner. The receiver type names the owner.",
+        .tried = "The original source is unchanged. This exact assignment is measured in both "
+                 "pipeline paths alongside a required supported call and a forbidden foreign "
+                 "target; no edge-count substitute can satisfy it."};
+    const RQ_Target wrong = {.file = "decoy.rs",
+                             .suffix = "Other.total",
+                             .label = "Field",
+                             .declaration_line = 2,
+                             .declaration_text = "    pub total: i64,"};
+    ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_rust"));
     PASS();
 }
 
 /* C# — property assignment inside methods */
 TEST(writes_csharp) {
-    static const EtFile meaningful[] = {
-        {"Config.cs",
-         "namespace App {\n"
-         "    class Config {\n"
-         "        public string Host = \"localhost\";\n"
-         "        public int Port = 8080;\n\n"
-         "        public void SetHost(string host) {\n"
-         "            Host = host;\n        }\n\n"
-         "        public void SetPort(int port) {\n"
-         "            Port = port;\n        }\n    }\n}\n"}};
-    EtProj lp;
-    cbm_store_t *store =
-        et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
-    int writes = store ? cbm_store_count_edges_by_type(store, lp.project, "WRITES") : -1;
-    if (writes < 1) {
-        fprintf(stderr, "  [ET-WRITES] C#: WRITES=%d\n", writes);
-    }
-    et_cleanup(&lp, store);
-    ASSERT_TRUE(writes >= 1);
+    static const EtFile meaningful[] = {{"Config.cs",
+                                         "namespace App {\n"
+                                         "    class Config {\n"
+                                         "        public string Host = \"localhost\";\n"
+                                         "        public int Port = 8080;\n\n"
+                                         "        public void SetHost(string host) {\n"
+                                         "            Host = host;\n        }\n\n"
+                                         "        public void SetPort(int port) {\n"
+                                         "            Port = port;\n        }\n    }\n}\n"}};
+    const EtFile decoy = {"Other.cs",
+                          "namespace App {\n    class Other { public int Port = 7; }\n}\n"};
+    const RQ_Expected gap = {
+        .case_id = "writes_csharp-exact-declaration-write",
+        .site = {.file = "Config.cs",
+                 .caller = "Config.SetPort",
+                 .needle = "Port",
+                 .occurrence_index = 2},
+        .relation = "WRITES",
+        .target = {.file = "Config.cs",
+                   .suffix = "Config.Port",
+                   .label = "Field",
+                   .declaration_line = 4,
+                   .declaration_text = "        public int Port = 8080;"},
+        .mode = RQ_REQUIRED};
+    const RQ_Target wrong = {.file = "Other.cs",
+                             .suffix = "Other.Port",
+                             .label = "Field",
+                             .declaration_line = 2,
+                             .declaration_text = "    class Other { public int Port = 7; }"};
+    ASSERT_TRUE(et_write_quality(meaningful, 1, &decoy, &gap, &wrong, "writes_csharp"));
     PASS();
 }
 
@@ -2514,12 +4046,11 @@ TEST(writes_csharp) {
  * the receiver type's QN for Go methods. */
 TEST(defines_method_go) {
     static const EtFile f[] = {
-        {"service.go",
-         "package svc\n\n"
-         "type OrderService struct {\n    db interface{}\n}\n\n"
-         "func (s *OrderService) Create(name string) string {\n    return name\n}\n\n"
-         "func (s *OrderService) Delete(id int) bool {\n    return id > 0\n}\n\n"
-         "func (s *OrderService) List() []string {\n    return nil\n}\n"}};
+        {"service.go", "package svc\n\n"
+                       "type OrderService struct {\n    db interface{}\n}\n\n"
+                       "func (s *OrderService) Create(name string) string {\n    return name\n}\n\n"
+                       "func (s *OrderService) Delete(id int) bool {\n    return id > 0\n}\n\n"
+                       "func (s *OrderService) List() []string {\n    return nil\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -2541,66 +4072,61 @@ TEST(defines_method_rust) {
 
 /* Java — class with instance and static methods */
 TEST(defines_method_java) {
-    static const EtFile f[] = {
-        {"Account.java",
-         "package bank;\n\n"
-         "public class Account {\n"
-         "    private double balance;\n\n"
-         "    public Account(double initial) { this.balance = initial; }\n\n"
-         "    public void deposit(double amount) { balance += amount; }\n"
-         "    public boolean withdraw(double amount) {\n"
-         "        if (amount > balance) return false;\n"
-         "        balance -= amount;\n        return true;\n    }\n"
-         "    public double getBalance() { return balance; }\n}\n"}};
+    static const EtFile f[] = {{"Account.java",
+                                "package bank;\n\n"
+                                "public class Account {\n"
+                                "    private double balance;\n\n"
+                                "    public Account(double initial) { this.balance = initial; }\n\n"
+                                "    public void deposit(double amount) { balance += amount; }\n"
+                                "    public boolean withdraw(double amount) {\n"
+                                "        if (amount > balance) return false;\n"
+                                "        balance -= amount;\n        return true;\n    }\n"
+                                "    public double getBalance() { return balance; }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* C# — class with multiple methods */
 TEST(defines_method_csharp) {
-    static const EtFile f[] = {
-        {"Queue.cs",
-         "using System.Collections.Generic;\n\n"
-         "namespace Collections {\n"
-         "    public class Queue<T> {\n"
-         "        private List<T> items = new List<T>();\n\n"
-         "        public void Enqueue(T item) { items.Add(item); }\n"
-         "        public T Dequeue() {\n"
-         "            T item = items[0];\n"
-         "            items.RemoveAt(0);\n"
-         "            return item;\n        }\n"
-         "        public int Count() { return items.Count; }\n    }\n}\n"}};
+    static const EtFile f[] = {{"Queue.cs",
+                                "using System.Collections.Generic;\n\n"
+                                "namespace Collections {\n"
+                                "    public class Queue<T> {\n"
+                                "        private List<T> items = new List<T>();\n\n"
+                                "        public void Enqueue(T item) { items.Add(item); }\n"
+                                "        public T Dequeue() {\n"
+                                "            T item = items[0];\n"
+                                "            items.RemoveAt(0);\n"
+                                "            return item;\n        }\n"
+                                "        public int Count() { return items.Count; }\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* PHP — class with methods */
 TEST(defines_method_php) {
-    static const EtFile f[] = {
-        {"Cart.php",
-         "<?php\n\n"
-         "class Cart {\n"
-         "    private array $items = [];\n\n"
-         "    public function add(string $sku, int $qty): void {\n"
-         "        $this->items[$sku] = $qty;\n    }\n\n"
-         "    public function remove(string $sku): void {\n"
-         "        unset($this->items[$sku]);\n    }\n\n"
-         "    public function total(): int {\n"
-         "        return array_sum($this->items);\n    }\n}\n"}};
+    static const EtFile f[] = {{"Cart.php",
+                                "<?php\n\n"
+                                "class Cart {\n"
+                                "    private array $items = [];\n\n"
+                                "    public function add(string $sku, int $qty): void {\n"
+                                "        $this->items[$sku] = $qty;\n    }\n\n"
+                                "    public function remove(string $sku): void {\n"
+                                "        unset($this->items[$sku]);\n    }\n\n"
+                                "    public function total(): int {\n"
+                                "        return array_sum($this->items);\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* Ruby — class with instance methods */
 TEST(defines_method_ruby) {
-    static const EtFile f[] = {
-        {"stack.rb",
-         "class Stack\n"
-         "  def initialize\n    @items = []\n  end\n\n"
-         "  def push(item)\n    @items.push(item)\n  end\n\n"
-         "  def pop\n    @items.pop\n  end\n\n"
-         "  def peek\n    @items.last\n  end\n\n"
-         "  def empty?\n    @items.empty?\n  end\nend\n"}};
+    static const EtFile f[] = {{"stack.rb", "class Stack\n"
+                                            "  def initialize\n    @items = []\n  end\n\n"
+                                            "  def push(item)\n    @items.push(item)\n  end\n\n"
+                                            "  def pop\n    @items.pop\n  end\n\n"
+                                            "  def peek\n    @items.last\n  end\n\n"
+                                            "  def empty?\n    @items.empty?\n  end\nend\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -2608,13 +4134,12 @@ TEST(defines_method_ruby) {
 /* Kotlin — class with methods */
 TEST(defines_method_kotlin) {
     static const EtFile f[] = {
-        {"Wallet.kt",
-         "class Wallet(private var balance: Double) {\n"
-         "    fun deposit(amount: Double) {\n        balance += amount\n    }\n\n"
-         "    fun withdraw(amount: Double): Boolean {\n"
-         "        if (amount > balance) return false\n"
-         "        balance -= amount\n        return true\n    }\n\n"
-         "    fun getBalance(): Double = balance\n}\n"}};
+        {"Wallet.kt", "class Wallet(private var balance: Double) {\n"
+                      "    fun deposit(amount: Double) {\n        balance += amount\n    }\n\n"
+                      "    fun withdraw(amount: Double): Boolean {\n"
+                      "        if (amount > balance) return false\n"
+                      "        balance -= amount\n        return true\n    }\n\n"
+                      "    fun getBalance(): Double = balance\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -2622,13 +4147,15 @@ TEST(defines_method_kotlin) {
 /* TypeScript — class with methods and constructor */
 TEST(defines_method_typescript) {
     static const EtFile f[] = {
-        {"Logger.ts",
-         "export class Logger {\n"
-         "    private prefix: string;\n\n"
-         "    constructor(prefix: string) {\n        this.prefix = prefix;\n    }\n\n"
-         "    info(msg: string): void {\n        console.log(`[${this.prefix}] INFO: ${msg}`);\n    }\n\n"
-         "    warn(msg: string): void {\n        console.warn(`[${this.prefix}] WARN: ${msg}`);\n    }\n\n"
-         "    error(msg: string): void {\n        console.error(`[${this.prefix}] ERR: ${msg}`);\n    }\n}\n"}};
+        {"Logger.ts", "export class Logger {\n"
+                      "    private prefix: string;\n\n"
+                      "    constructor(prefix: string) {\n        this.prefix = prefix;\n    }\n\n"
+                      "    info(msg: string): void {\n        console.log(`[${this.prefix}] INFO: "
+                      "${msg}`);\n    }\n\n"
+                      "    warn(msg: string): void {\n        console.warn(`[${this.prefix}] WARN: "
+                      "${msg}`);\n    }\n\n"
+                      "    error(msg: string): void {\n        console.error(`[${this.prefix}] "
+                      "ERR: ${msg}`);\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -2662,29 +4189,28 @@ TEST(defines_method_scala) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(override_go_interface) {
-    static const EtFile meaningful[] = {
-        {"shapes.go",
-         "package shapes\n\n"
-         "type Shape interface {\n"
-         "    Area() float64\n    Perimeter() float64\n}\n\n"
-         "type Circle struct {\n    Radius float64\n}\n\n"
-         "func (c *Circle) Area() float64 {\n"
-         "    return 3.14159 * c.Radius * c.Radius\n}\n\n"
-         "func (c *Circle) Perimeter() float64 {\n"
-         "    return 2.0 * 3.14159 * c.Radius\n}\n\n"
-         "type Rectangle struct {\n    Width, Height float64\n}\n\n"
-         "func (r *Rectangle) Area() float64 {\n"
-         "    return r.Width * r.Height\n}\n\n"
-         "func (r *Rectangle) Perimeter() float64 {\n"
-         "    return 2.0 * (r.Width + r.Height)\n}\n"}};
+    static const EtFile meaningful[] = {{"shapes.go",
+                                         "package shapes\n\n"
+                                         "type Shape interface {\n"
+                                         "    Area() float64\n    Perimeter() float64\n}\n\n"
+                                         "type Circle struct {\n    Radius float64\n}\n\n"
+                                         "func (c *Circle) Area() float64 {\n"
+                                         "    return 3.14159 * c.Radius * c.Radius\n}\n\n"
+                                         "func (c *Circle) Perimeter() float64 {\n"
+                                         "    return 2.0 * 3.14159 * c.Radius\n}\n\n"
+                                         "type Rectangle struct {\n    Width, Height float64\n}\n\n"
+                                         "func (r *Rectangle) Area() float64 {\n"
+                                         "    return r.Width * r.Height\n}\n\n"
+                                         "func (r *Rectangle) Perimeter() float64 {\n"
+                                         "    return 2.0 * (r.Width + r.Height)\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
     int override_edges = store ? cbm_store_count_edges_by_type(store, lp.project, "OVERRIDE") : -1;
-    int implements     = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS") : -1;
+    int implements = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS") : -1;
     if (override_edges < 1 || implements < 1) {
-        fprintf(stderr, "  [ET-OVERRIDE] Go: OVERRIDE=%d IMPLEMENTS=%d\n",
-                override_edges, implements);
+        fprintf(stderr, "  [ET-OVERRIDE] Go: OVERRIDE=%d IMPLEMENTS=%d\n", override_edges,
+                implements);
     }
     et_cleanup(&lp, store);
     /* Both IMPLEMENTS (struct→interface) and OVERRIDE (method→interface-method) expected. */
@@ -2778,18 +4304,16 @@ static int et_xlang_routes(const EtFile *files, int nfiles, bool parallel, const
  * definitions. Controls: POST is unchanged, and a bare PHP `get('/x')` (no
  * route-registration callee) stays dropped — no Route, no CALLS into JS. */
 static const EtFile et_xlang_laravel[] = {
-    {"app/Http/Controllers/LeadController.php",
-     "<?php\nnamespace App\\Http\\Controllers;\n\n"
-     "class LeadController\n{\n"
-     "    public function index() { return []; }\n"
-     "    public function store() { return []; }\n}\n"},
-    {"routes/web.php",
-     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-     "use App\\Http\\Controllers\\LeadController;\n\n"
-     "Route::get('/leads', [LeadController::class, 'index']);\n"
-     "Route::post('/leads/store', [LeadController::class, 'store']);\n"
-     "$router->get('/reports', [LeadController::class, 'index']);\n\n"
-     "function report_file() { return get('/files/report'); }\n"},
+    {"app/Http/Controllers/LeadController.php", "<?php\nnamespace App\\Http\\Controllers;\n\n"
+                                                "class LeadController\n{\n"
+                                                "    public function index() { return []; }\n"
+                                                "    public function store() { return []; }\n}\n"},
+    {"routes/web.php", "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+                       "use App\\Http\\Controllers\\LeadController;\n\n"
+                       "Route::get('/leads', [LeadController::class, 'index']);\n"
+                       "Route::post('/leads/store', [LeadController::class, 'store']);\n"
+                       "$router->get('/reports', [LeadController::class, 'index']);\n\n"
+                       "function report_file() { return get('/files/report'); }\n"},
     {"resources/js/http.js", "export function get(url) {\n  return url;\n}\n"},
     {"resources/js/store.js", "export class Store {\n  get(key) {\n    return key;\n  }\n}\n"},
 };
@@ -2804,8 +4328,8 @@ TEST(routes_laravel_get_survives_xlang_guard) {
 
 TEST(routes_laravel_get_survives_xlang_guard_parallel) {
     ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
-                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
-                                true, et_xlang_laravel_routes));
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])), true,
+                                et_xlang_laravel_routes));
     PASS();
 }
 
@@ -2813,16 +4337,15 @@ TEST(routes_laravel_get_survives_xlang_guard_parallel) {
  * unchanged; a member `memo.get(key)` (route suffix, no path) and a bare
  * `get('/cache/key')` stay dropped — no Route, no CALLS into Python. */
 static const EtFile et_xlang_express[] = {
-    {"web/server.js",
-     "const express = require('express');\n"
-     "const { health } = require('./handlers');\n\n"
-     "const app = express();\n\n"
-     "app.get('/health', health);\n"
-     "app.post('/items', health);\n\n"
-     "function readCache(memo, key) {\n"
-     "  return memo.get(key) || get('/cache/key');\n"
-     "}\n"
-     "module.exports = { readCache };\n"},
+    {"web/server.js", "const express = require('express');\n"
+                      "const { health } = require('./handlers');\n\n"
+                      "const app = express();\n\n"
+                      "app.get('/health', health);\n"
+                      "app.post('/items', health);\n\n"
+                      "function readCache(memo, key) {\n"
+                      "  return memo.get(key) || get('/cache/key');\n"
+                      "}\n"
+                      "module.exports = { readCache };\n"},
     {"web/handlers.js",
      "function health(req, res) {\n  return res;\n}\nmodule.exports = { health };\n"},
     {"tools/cache.py", "def get(key):\n    return key\n"},
@@ -2839,8 +4362,8 @@ TEST(routes_express_get_survives_xlang_guard) {
 
 TEST(routes_express_get_survives_xlang_guard_parallel) {
     ASSERT_TRUE(et_xlang_routes(et_xlang_express,
-                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
-                                true, et_xlang_express_routes));
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])), true,
+                                et_xlang_express_routes));
     PASS();
 }
 
@@ -2851,6 +4374,7 @@ TEST(routes_express_get_survives_xlang_guard_parallel) {
 SUITE(edge_types_probe) {
     /* HANDLES — route→handler across web frameworks */
     RUN_TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085);
+    RUN_TEST(calls_jsx_named_components_require_exact_binding);
     RUN_TEST(graphql_route_keyed_by_operation_name_issue598);
     RUN_TEST(graphql_operation_identity_parser_issue598);
     RUN_TEST(handles_flask_python);
@@ -2936,6 +4460,7 @@ SUITE(edge_types_probe) {
 
     /* WRITES — variable assignment (5 languages, parallel path) */
     RUN_TEST(writes_python);
+    RUN_TEST(writes_python_explicit_global_missing_is_quality);
     RUN_TEST(writes_go);
     RUN_TEST(writes_java);
     RUN_TEST(writes_rust);

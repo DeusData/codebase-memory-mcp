@@ -381,7 +381,9 @@ static char *extract_fp_callee(CBMArena *a, TSNode node, const char *source, con
             strcmp(ck, "constructor") == 0 || strcmp(ck, "value_path") == 0 ||
             /* PureScript: exp_apply's function head is an `exp_name` whose
              * text is the (possibly qualified) function name. */
-            strcmp(ck, "exp_name") == 0) {
+            strcmp(ck, "exp_name") == 0 ||
+            /* Haskell `Cfg.load x`: the qualified name is the call's head. */
+            strcmp(ck, "qualified") == 0) {
             return cbm_node_text(a, callee, source);
         }
         if (!fp_is_apply_kind(ck)) {
@@ -3453,6 +3455,14 @@ static void extract_kotlin_operator_call(CBMExtractCtx *ctx, TSNode node, const 
         if (ts_node_named_child_count(node) < 1 || kotlin_index_is_write_lhs(node))
             return;
         op_method = "get";
+    } else if (strcmp(kind, "infix_expression") == 0) {
+        /* `a f b` calls f: left operand, the function's identifier, right operand. */
+        if (ts_node_named_child_count(node) != 3)
+            return;
+        TSNode function = ts_node_named_child(node, 1);
+        if (strcmp(ts_node_type(function), "simple_identifier") != 0)
+            return;
+        op_method = cbm_node_text(ctx->arena, function, ctx->source);
     } else {
         return;
     }
@@ -4389,13 +4399,26 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     return selection;
 }
 
-static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx,
+static bool primary_callee_name_is_allowed(const CBMExtractCtx *ctx, TSNode site,
                                            const CBMPrimaryCalleeSelection *callee) {
     if (!callee->name || !callee->name[0]) {
         return false;
     }
     if (!cbm_is_keyword(callee->name, ctx->language) ||
         cbm_is_resolvable_builtin(callee->name, ctx->language)) {
+        return true;
+    }
+    /* `Foo->new` names a method in a grammar-proven role. A generic keyword list
+     * must not erase the most common method call in Perl. */
+    if (ctx->language == CBM_LANG_PERL && !strcmp(ts_node_type(site), "method_call_expression")) {
+        return true;
+    }
+    /* Contextual words such as get/set are legal ECMAScript identifiers in
+     * this grammar-proven invocation role. Retain the raw occurrence; exact
+     * source binding, including shadowing, still decides whether it emits. */
+    if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
+        !ts_node_is_null(callee->expr) && strcmp(ts_node_type(callee->expr), "identifier") == 0) {
         return true;
     }
     /* CSS function names occupy a grammar-proven callable role. Generic keyword
@@ -4511,7 +4534,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         CBMPrimaryCalleeSelection callee = select_primary_callee(ctx, node, state);
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
-        if (primary_callee_name_is_allowed(ctx, &callee)) {
+        if (primary_callee_name_is_allowed(ctx, node, &callee)) {
             CBMCall call = {0};
             call.callee_name = callee.name;
             call.enclosing_func_qn = state->enclosing_func_qn;
@@ -4520,6 +4543,14 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
             call.site_end_byte = ts_node_end_byte(node);
+            /* Dart represents the argument selector separately from its
+             * preceding callable. The occurrence spans both source nodes. */
+            if (ctx->language == CBM_LANG_DART && !strcmp(ts_node_type(node), "selector") &&
+                !ts_node_is_null(callee.expr) &&
+                ts_node_start_byte(callee.expr) < call.site_start_byte) {
+                call.site_start_byte = ts_node_start_byte(callee.expr);
+                call.start_line = (int)ts_node_start_point(callee.expr).row + TS_LINE_OFFSET;
+            }
             // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
             // generic short-name resolver cannot place a method without a known
             // receiver type, so the call-resolution pass suppresses those edges.

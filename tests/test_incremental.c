@@ -13,6 +13,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "resolver_quality.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -214,6 +215,372 @@ static int count_by_label(const char *label) {
     return total;
 }
 
+/* Source-authored FastAPI 0.99.1 oracle, commit
+ * dd4e78ca7b09abdf0d4646fe4697316c021a8b2e. The 42 package sources close the
+ * project-declaration target domain for five selected callers. External
+ * starlette/builtin calls and unproved attribute dispatch are outside this
+ * bounded denominator; every target at each exact golden site is checked.
+ * Hashes come from pinned source bytes, never from graph/resolver output. */
+static const struct {
+    const char *path, *sha256;
+    size_t length;
+} fastapi_oracle_files[] = {
+    {"fastapi/__init__.py", "577e4449e044c32d4bb7a0b0c3de88babdbe1c659c2a90b117908a3e3116db2f",
+     1080},
+    {"fastapi/applications.py", "c55f7982c32c9ceaac7b35e70440692fd61bee9af0774b3d73e6def049846b8c",
+     40588},
+    {"fastapi/background.py", "1ed379fe9249ace75a9526ee19230a2403cd59453987bad8fc15d7b9bbbbf884",
+     76},
+    {"fastapi/concurrency.py", "87b661646f1c122571e9a9f5b71701d912a98d6ebfc661f0168f44def5223100",
+     1468},
+    {"fastapi/datastructures.py",
+     "a16eb1b94d02fac0706dcc9723e32504ed2d492e0148f07695851ad720b0f3e0", 1905},
+    {"fastapi/dependencies/__init__.py",
+     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0},
+    {"fastapi/dependencies/models.py",
+     "ccd6e2a31202b8e79bfbd0030d5438e61507382d0f06d3d511f554ddfd65fe77", 2494},
+    {"fastapi/dependencies/utils.py",
+     "8439f5533ea0fc2892ad08a4c00f16ad8b3fbc7f8e839906d9ad6a14573a6690", 30908},
+    {"fastapi/encoders.py", "56c144ff9c4ebfd739dfea9cb694d07f8c6cb1cac986665925d89fd7ed564e3b",
+     5976},
+    {"fastapi/exception_handlers.py",
+     "301ac8380fae8232438af222e2b4ac50905d4ec8eeccdefaab8ca1d2ad4238ac", 1332},
+    {"fastapi/exceptions.py", "ad838d21966108f602ac0f174cd310d3b195b0605237b2e2a522eca0507724c9",
+     1205},
+    {"fastapi/logger.py", "23d34d8b7a2ff0072a6ec6c2f709755fe85d22d2a062dd974ebc757fdf59a65e", 54},
+    {"fastapi/middleware/__init__.py",
+     "a100f188555c7357d825438816fa619caee94d3e6492d99f2f7d905e9045befa", 58},
+    {"fastapi/middleware/asyncexitstack.py",
+     "2ef332548d5076658d5983d9ab1dbde5515abecb147d5a54b289cf3ac316cf51", 1035},
+    {"fastapi/middleware/cors.py",
+     "ca7c2359066873fbdb873677fd95dc7a8692aec9471473dda0ce76ad7af45945", 79},
+    {"fastapi/middleware/gzip.py",
+     "c4ce4f72c1fc425022999c38543bdc9939ea41a9ac95386c7dedc254ddafa1ad", 79},
+    {"fastapi/middleware/httpsredirect.py",
+     "acbf1e5cc9e62e28f05641fbff8d34cc7ae2d407a47de05de83eaab3c8b1f79d", 115},
+    {"fastapi/middleware/trustedhost.py",
+     "784e57191c466bb739ccf9cc2431a9dc1c5a2f6e64e625509619eff8f9343ecb", 109},
+    {"fastapi/middleware/wsgi.py",
+     "67751efbbc278b895464cbc7dc6f5e93ffda72061d26cb5b9e9657fc74006e86", 79},
+    {"fastapi/openapi/__init__.py",
+     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0},
+    {"fastapi/openapi/constants.py",
+     "996c58063103e8f53eb50f57db6ed092ad92b16d9cbfe0b58d814ab7adf1c44b", 107},
+    {"fastapi/openapi/docs.py", "1db3fbebebb8038e41acbe168cb321037301548f71331ed788cc83452fd93b41",
+     6532},
+    {"fastapi/openapi/models.py",
+     "7dfe5fc4d12185fec68794883a456e22b2defa05520e9a3d768562e7a072a288", 14941},
+    {"fastapi/openapi/utils.py", "25633c029676223ea6ed549a94aaf35363187cd418fa7ae98b616e9dabac84cf",
+     19576},
+    {"fastapi/param_functions.py",
+     "2cecdbb58d1eaa68af18cffe320cef4280998a6d1631034eeb4243172422dc3a", 8981},
+    {"fastapi/params.py", "9262e9cd867bb9823f8c6c5926d82d3cfad5d67e276d0404ca478b0324f21b8f",
+     13207},
+    {"fastapi/requests.py", "cdac9ea4a15c89e9c1965bf7b27996236d06934a073552d4e030e1a9705be0b5",
+     142},
+    {"fastapi/responses.py", "a27f797b809f491c8dcfb3048ea16ecec3fe796f241d64f1125fd9f95cdbee50",
+     1242},
+    {"fastapi/routing.py", "10d2f730db12aa5aa8e48a3b0068f483bade5f9f4f85fc0846c7d04c4b132217",
+     56490},
+    {"fastapi/security/__init__.py",
+     "6cef29366c6a5515d48df97698e2a25592e7d05a4143ad555185639a9a676c9c", 881},
+    {"fastapi/security/api_key.py",
+     "f769316638fd3ae22f4025292ecccff6a9482d1831ea10a1d71f9b65d8664035", 2939},
+    {"fastapi/security/base.py", "765e29bdb0be4718df6d680fb4259df0c554fbb081d92676dab2435d50973ba7",
+     141},
+    {"fastapi/security/http.py", "55b4e6d64eade848c90270a7615aae48e9922bb7c04dd29182ad3e4e00bb1674",
+     5964},
+    {"fastapi/security/oauth2.py",
+     "2340f24471267e7fd4a7cbe9625dc7f04574753765e53d52de26fc12d46a7cc2", 8360},
+    {"fastapi/security/open_id_connect_url.py",
+     "18a2bce20e8e65b385084649c9ddbba468e9682946c5e66b60e7a6533ca17db5", 1141},
+    {"fastapi/security/utils.py",
+     "6ddf13d1833b5100f90132ae72bd5b36d02fcff637fff755340bf951e6e23ef7", 293},
+    {"fastapi/staticfiles.py", "8a2ac622ddec758d90657777ea28ecdc28fe4f416e18575addc77dd2433d224c",
+     69},
+    {"fastapi/templating.py", "e33b2e4d681c8dc11a8a7309140956ebe827b259ba020392d528a20d67e64319",
+     76},
+    {"fastapi/testclient.py", "9c1bda0265fae9895d45e24d6573ce935b1fba8d90ea1b3c6cebc86827a9e8b4",
+     66},
+    {"fastapi/types.py", "afa3278131f391938ff65cd781dba37bdc9e65ee44227580cc22ee44996122e1", 118},
+    {"fastapi/utils.py", "44e7e4c61e9eac6fe11a4993346138803dfa0ff759df74798cbf063a3cc718f3", 7652},
+    {"fastapi/websockets.py", "e35f6e9dc60e6c42991b461cad7b1c7d04182d25a8135d23ab154c7ad19d47df",
+     222},
+};
+
+static const RQ_Expected fastapi_call_obligations[] = {
+    {.case_id = "oauth2-password-parser",
+     .site = {.file = "fastapi/security/oauth2.py",
+              .caller = "fastapi.security.oauth2.OAuth2PasswordBearer.__call__",
+              .start_byte = 6276,
+              .end_byte = 6321},
+     .relation = "CALLS",
+     .target = {.file = "fastapi/security/utils.py",
+                .suffix = "fastapi.security.utils.get_authorization_scheme_param",
+                .label = "Function",
+                .declaration_line = 4,
+                .declaration_text = "def get_authorization_scheme_param("},
+     .mode = RQ_REQUIRED},
+    {.case_id = "oauth2-password-exception",
+     .site = {.file = "fastapi/security/oauth2.py",
+              .caller = "fastapi.security.oauth2.OAuth2PasswordBearer.__call__",
+              .start_byte = 6436,
+              .end_byte = 6631},
+     .relation = "CALLS",
+     .target = {.file = "fastapi/exceptions.py",
+                .suffix = "fastapi.exceptions.HTTPException",
+                .label = "Class",
+                .declaration_line = 9,
+                .declaration_text = "class HTTPException(StarletteHTTPException):"},
+     .mode = RQ_REQUIRED},
+    {.case_id = "oauth2-code-parser",
+     .site = {.file = "fastapi/security/oauth2.py",
+              .caller = "fastapi.security.oauth2.OAuth2AuthorizationCodeBearer.__call__",
+              .start_byte = 7752,
+              .end_byte = 7797},
+     .relation = "CALLS",
+     .target = {.file = "fastapi/security/utils.py",
+                .suffix = "fastapi.security.utils.get_authorization_scheme_param",
+                .label = "Function",
+                .declaration_line = 4,
+                .declaration_text = "def get_authorization_scheme_param("},
+     .mode = RQ_REQUIRED},
+    {.case_id = "oauth2-code-exception",
+     .site = {.file = "fastapi/security/oauth2.py",
+              .caller = "fastapi.security.oauth2.OAuth2AuthorizationCodeBearer.__call__",
+              .start_byte = 7912,
+              .end_byte = 8107},
+     .relation = "CALLS",
+     .target = {.file = "fastapi/exceptions.py",
+                .suffix = "fastapi.exceptions.HTTPException",
+                .label = "Class",
+                .declaration_line = 9,
+                .declaration_text = "class HTTPException(StarletteHTTPException):"},
+     .mode = RQ_REQUIRED},
+    {.case_id = "handler-body-status",
+     .site = {.file = "fastapi/exception_handlers.py",
+              .caller = "fastapi.exception_handlers.http_exception_handler",
+              .start_byte = 599,
+              .end_byte = 647},
+     .relation = "CALLS",
+     .target =
+         {.file = "fastapi/utils.py",
+          .suffix = "fastapi.utils.is_body_allowed_for_status_code",
+          .label = "Function",
+          .declaration_line = 36,
+          .declaration_text =
+              "def is_body_allowed_for_status_code(status_code: Union[int, str, None]) -> bool:"},
+     .mode = RQ_REQUIRED},
+    {.case_id = "handler-validation-encoder",
+     .site = {.file = "fastapi/exception_handlers.py",
+              .caller = "fastapi.exception_handlers.request_validation_exception_handler",
+              .start_byte = 1049,
+              .end_byte = 1079},
+     .relation = "CALLS",
+     .target = {.file = "fastapi/encoders.py",
+                .suffix = "fastapi.encoders.jsonable_encoder",
+                .label = "Function",
+                .declaration_line = 29,
+                .declaration_text = "def jsonable_encoder("},
+     .mode = RQ_REQUIRED},
+    {.case_id = "handler-websocket-encoder",
+     .site = {.file = "fastapi/exception_handlers.py",
+              .caller = "fastapi.exception_handlers.websocket_request_validation_exception_handler",
+              .start_byte = 1295,
+              .end_byte = 1325},
+     .relation = "CALLS",
+     .target = {.file = "fastapi/encoders.py",
+                .suffix = "fastapi.encoders.jsonable_encoder",
+                .label = "Function",
+                .declaration_line = 29,
+                .declaration_text = "def jsonable_encoder("},
+     .mode = RQ_REQUIRED},
+};
+
+/* Read bytes without executing/importing the external fixture. CRLF checkouts
+ * are accepted only when canonical LF bytes match the same pinned hash. The
+ * actual raw bytes remain the snapshot input, including an empty __init__.py. */
+static char *fastapi_oracle_read(size_t index) {
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s", g_repodir, fastapi_oracle_files[index].path);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return NULL;
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return NULL;
+    bool ok = fseek(file, 0, SEEK_END) == 0;
+    long length = ok ? ftell(file) : -1;
+    ok = length >= 0 && length <= 2 * 1024 * 1024 && fseek(file, 0, SEEK_SET) == 0;
+    char *raw = ok ? calloc((size_t)length + 1, 1) : NULL;
+    ok = raw && fread(raw, 1, (size_t)length, file) == (size_t)length && !ferror(file);
+    ok = fclose(file) == 0 && ok;
+    if (!ok || strlen(raw) != (size_t)length) {
+        free(raw);
+        return NULL;
+    }
+    char *canonical = malloc((size_t)length + 1);
+    if (!canonical) {
+        free(raw);
+        return NULL;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < (size_t)length; i++) {
+        if (raw[i] == '\r' && i + 1 < (size_t)length && raw[i + 1] == '\n')
+            continue;
+        canonical[count++] = raw[i];
+    }
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(canonical, count, digest);
+    free(canonical);
+    if (count != fastapi_oracle_files[index].length ||
+        strcmp(digest, fastapi_oracle_files[index].sha256)) {
+        fprintf(stderr, "[RQ] PINNED_SOURCE_MISMATCH file=%s\n", fastapi_oracle_files[index].path);
+        free(raw);
+        return NULL;
+    }
+    return raw;
+}
+
+/* Translate only newline encoding, after pinned content validation. This is
+ * independent of emitted occurrence spans and preserves exact raw evidence. */
+static uint32_t fastapi_raw_offset(const char *source, uint32_t canonical) {
+    uint32_t offset = 0, count = 0;
+    while (source[offset] && count < canonical) {
+        if (!(source[offset] == '\r' && source[offset + 1] == '\n'))
+            count++;
+        offset++;
+    }
+    return count == canonical ? offset : UINT32_MAX;
+}
+
+/* RQ checks the full declaration line, including CR in a CRLF checkout.
+ * Verify its independently authored canonical bytes before copying the raw
+ * line; never obtain a target anchor from a graph node or emitted record. */
+static char *fastapi_raw_declaration(const RQ_Target *target, const RQ_Source *sources,
+                                     size_t count) {
+    const char *line = rq_source(sources, count, target->file);
+    if (!line || target->declaration_line <= 0)
+        return NULL;
+    for (int i = 1; i < target->declaration_line; i++) {
+        line = strchr(line, '\n');
+        if (!line)
+            return NULL;
+        line++;
+    }
+    size_t length = strcspn(line, "\n");
+    size_t canonical = length - (length && line[length - 1] == '\r');
+    if (strlen(target->declaration_text) != canonical ||
+        memcmp(line, target->declaration_text, canonical))
+        return NULL;
+    char *raw = malloc(length + 1);
+    if (raw) {
+        memcpy(raw, line, length);
+        raw[length] = '\0';
+    }
+    return raw;
+}
+
+static bool fastapi_call_quality(void) {
+    RQ_Source sources[sizeof(fastapi_oracle_files) / sizeof(fastapi_oracle_files[0])] = {0};
+    RQ_Expected expected[sizeof(fastapi_call_obligations) / sizeof(fastapi_call_obligations[0])];
+    memcpy(expected, fastapi_call_obligations, sizeof(expected));
+    char *declarations[sizeof(expected) / sizeof(expected[0])] = {0};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
+        sources[i].path = fastapi_oracle_files[i].path;
+        sources[i].text = fastapi_oracle_read(i);
+        ok = sources[i].text != NULL && ok;
+    }
+    for (size_t i = 0; ok && i < sizeof(expected) / sizeof(expected[0]); i++) {
+        const char *source =
+            rq_source(sources, sizeof(sources) / sizeof(sources[0]), expected[i].site.file);
+        if (!source) {
+            ok = false;
+            break;
+        }
+        expected[i].site.start_byte = fastapi_raw_offset(source, expected[i].site.start_byte);
+        expected[i].site.end_byte = fastapi_raw_offset(source, expected[i].site.end_byte);
+        declarations[i] = fastapi_raw_declaration(&expected[i].target, sources,
+                                                  sizeof(sources) / sizeof(sources[0]));
+        expected[i].target.declaration_text = declarations[i];
+        ok = expected[i].site.start_byte != UINT32_MAX && expected[i].site.end_byte != UINT32_MAX &&
+             declarations[i] != NULL;
+    }
+    cbm_store_t *store = ok ? open_store() : NULL;
+    RQ_Report report = {0};
+    ok = store &&
+         rq_check_project_declarations(store, g_project, "fastapi-pinned-calls", sources,
+                                       sizeof(sources) / sizeof(sources[0]), expected,
+                                       sizeof(expected) / sizeof(expected[0]), NULL, 0, &report,
+                                       stderr) &&
+         report.genuine == 7 && report.found == 7 && report.missing == 0;
+    if (store)
+        cbm_store_close(store);
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++)
+        free(declarations[i]);
+    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++)
+        free((char *)sources[i].text);
+    return ok;
+}
+
+/* This consumer checks a physical File import, not a symbol-call occurrence.
+ * Python import occurrences carry the exact clause span. Require exact endpoints,
+ * current generation, pinned source snapshots and agreement between row and edge. */
+static bool fastapi_physical_import(void) {
+    static const char *const paths[] = {"fastapi/security/oauth2.py", "fastapi/security/utils.py"};
+    RQ_Source sources[2] = {0};
+    bool ok = true;
+    for (size_t i = 0; i < 2; i++) {
+        sources[i].path = paths[i];
+        for (size_t j = 0; j < sizeof(fastapi_oracle_files) / sizeof(fastapi_oracle_files[0]); j++)
+            if (!strcmp(paths[i], fastapi_oracle_files[j].path))
+                sources[i].text = fastapi_oracle_read(j);
+        ok = sources[i].text != NULL && ok;
+    }
+    cbm_store_t *store = ok ? open_store() : NULL;
+    sqlite3 *db = store ? cbm_store_get_db(store) : NULL;
+    ok = db && rq_generation(db, g_project) && rq_snapshot(db, g_project, &sources[0]) &&
+         rq_snapshot(db, g_project, &sources[1]);
+    char from[1024], to[1024];
+    int nf = snprintf(from, sizeof(from), "%s.fastapi.security.oauth2.py.__file__", g_project);
+    int nt = snprintf(to, sizeof(to), "%s.fastapi.security.utils.py.__file__", g_project);
+    ok = ok && nf > 0 && (size_t)nf < sizeof(from) && nt > 0 && (size_t)nt < sizeof(to);
+    /* The occurrence's span is the imported name's clause in the audited source. */
+    static const char statement[] = "from fastapi.security.utils import ";
+    static const char clause[] = "get_authorization_scheme_param";
+    const char *line = ok ? strstr(sources[0].text, statement) : NULL;
+    int64_t clause_start = line ? (int64_t)(line - sources[0].text) + (int64_t)strlen(statement) : 0;
+    ok = ok && line != NULL;
+    const char *sql = "SELECT COUNT(*) FROM resolver_occurrences r "
+                      "JOIN nodes s ON s.project=r.project AND s.qualified_name=r.scope "
+                      "JOIN nodes t ON t.project=r.project AND t.qualified_name=r.target "
+                      "WHERE r.project=?1 AND r.file_path=?2 AND r.scope=?3 AND r.target=?4 "
+                      "AND r.relation='IMPORTS' AND r.emitted=1 AND r.rules_version=?5 "
+                      "AND r.source_origin=?6 AND r.start_byte=?8 AND r.end_byte=?9 "
+                      "AND s.label='File' AND s.file_path=?2 AND t.label='File' AND t.file_path=?7 "
+                      "AND (SELECT COUNT(*) FROM edges e WHERE e.project=r.project "
+                      "AND e.source_id=s.id AND e.target_id=t.id AND e.type='IMPORTS')=1";
+    sqlite3_stmt *stmt = NULL;
+    ok = ok && sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 1, g_project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 2, paths[0], -1, SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 3, from, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 4, to, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+         sqlite3_bind_int(stmt, 5, CBM_RESOLVER_RULES_VERSION) == SQLITE_OK &&
+         sqlite3_bind_int(stmt, 6, CBM_SOURCE_ORIGIN_RAW) == SQLITE_OK &&
+         sqlite3_bind_text(stmt, 7, paths[1], -1, SQLITE_STATIC) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 8, clause_start) == SQLITE_OK &&
+         sqlite3_bind_int64(stmt, 9, clause_start + (int64_t)strlen(clause)) == SQLITE_OK &&
+         sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) == 1 &&
+         sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    if (store)
+        cbm_store_close(store);
+    for (size_t i = 0; i < 2; i++)
+        free((char *)sources[i].text);
+    return ok;
+}
+
 /* ── Setup / Teardown ─────────────────────────────────────────────── */
 
 static int incremental_setup(void) {
@@ -340,7 +707,7 @@ TEST(incr_full_index) {
      * Thresholds set for sparse checkout (smaller graph). */
     ASSERT_GT(g_full_nodes, 2000);
     ASSERT_GT(g_full_edges, 500);
-    ASSERT_GT(g_full_calls, 200);
+    ASSERT(fastapi_call_quality());
     ASSERT_GT(g_full_imports, 50);
 
     /* Performance: full index — warn if slow, don't block */
@@ -430,8 +797,8 @@ TEST(incr_full_edge_types) {
     ASSERT_GT(defines, 0);
     ASSERT_GT(contains, 0);
 
-    /* CALLS should be the most common edge type */
-    ASSERT_GT(calls, imports);
+    /* Different semantic relations have no justified count ordering. */
+    ASSERT(fastapi_physical_import());
 
     printf("    [edges] CALLS=%d IMPORTS=%d DEFINES=%d CONTAINS_FILE=%d\n", calls, imports, defines,
            contains);
@@ -567,12 +934,51 @@ static void purge_log_sink(const char *line) {
  * most 20 progress lines however many files, ending at files_done ==
  * files_total. */
 TEST(incr_purge_reports_bounded_progress_issue1300) {
-    char *resp = index_repo();
-    ASSERT(resp != NULL);
-    free(resp);
-    reformat_files("fastapi", 30);
-    /* The loop instrumented for #1300 sits on the legacy partial route (the
-     * production closure route purges in SQL and logs delta.snapshot_purge). */
+    /* Author more than the progress bound explicitly. FastAPI has only 20
+     * immediate .py children, so reformat_files("fastapi", 30) never exercises
+     * the bounded large-purge case. Keep this fixture independent of that tree. */
+    enum { CHANGED_FILES = 40, DELETED_FILES = 1 };
+    const char *temporary = th_mktempdir("cbm_purge_progress");
+    ASSERT_NOT_NULL(temporary);
+    char root[512], repo[600], database[600], path[768];
+    snprintf(root, sizeof(root), "%s", temporary);
+    snprintf(repo, sizeof(repo), "%s/repo", root);
+    snprintf(database, sizeof(database), "%s/index.db", root);
+    ASSERT(cbm_mkdir_p(repo, 0755));
+    for (int i = 0; i < CHANGED_FILES + DELETED_FILES; i++) {
+        snprintf(path, sizeof(path), "%s/unit_%02d.py", repo, i);
+        ASSERT_EQ(th_write_file(path, "def work():\n    return 1\n"), 0);
+    }
+    cbm_pipeline_t *initial = cbm_pipeline_new(repo, database, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(initial));
+    cbm_pipeline_free(initial);
+    cbm_store_t *store = cbm_store_open_path_query(database);
+    ASSERT_NOT_NULL(store);
+    unsigned char before_digest[32];
+    char before_generation[CBM_GRAPH_COMPARE_GENERATION_SIZE];
+    ASSERT_EQ(cbm_store_graph_content_digest(store, project, before_digest), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(store, before_generation, sizeof(before_generation)),
+              CBM_STORE_OK);
+    cbm_file_hash_t original_hash = {0};
+    ASSERT_EQ(cbm_store_get_file_hash(store, project, "unit_00.py", &original_hash), CBM_STORE_OK);
+    char before_hash[65];
+    snprintf(before_hash, sizeof(before_hash), "%s", original_hash.sha256);
+    cbm_store_clear_file_hash(&original_hash);
+    cbm_store_close(store);
+    static const char CHANGED_SOURCE[] = "def changed_work():\n    return 1\n# changed input\n";
+    for (int i = 0; i < CHANGED_FILES; i++) {
+        snprintf(path, sizeof(path), "%s/unit_%02d.py", repo, i);
+        ASSERT_EQ(th_write_file(path, CHANGED_SOURCE), 0);
+    }
+    snprintf(path, sizeof(path), "%s/unit_%02d.py", repo, CHANGED_FILES);
+    ASSERT_EQ(unlink(path), 0);
+    /* The instrumented purge loop remains on the test-only legacy route.
+     * This fixture contains no controlled resolver occurrences, so its complete
+     * replacement graph can publish. The test checks the actual purge and its
+     * bounded progress, independently of resolver-generation rejection tests. */
     cbm_pipeline_incremental_test_force_legacy_partial_once();
 
     CBMLogLevel saved_level = cbm_log_get_level();
@@ -582,14 +988,63 @@ TEST(incr_purge_reports_bounded_progress_issue1300) {
     g_purge_log[0] = '\0';
     g_purge_progress_lines = 0;
     cbm_log_set_sink_ex(purge_log_sink, CBM_LOG_SINK_TEE);
-    resp = index_repo();
+    cbm_pipeline_t *attempt = cbm_pipeline_new(repo, database, CBM_MODE_FULL);
+    int attempt_rc = attempt ? cbm_pipeline_run(attempt) : CBM_NOT_FOUND;
+    cbm_incremental_route_t attempt_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(attempt);
     cbm_log_set_sink(NULL);
     cbm_log_set_level(saved_level);
     cbm_log_set_format(saved_format);
-    ASSERT(resp != NULL);
-    ASSERT(strstr(resp, "indexed") != NULL);
-    free(resp);
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(attempt_rc, 0);
+    ASSERT_EQ(attempt_route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+
+    store = cbm_store_open_path_query(database);
+    ASSERT_NOT_NULL(store);
+    unsigned char after_digest[32];
+    char after_generation[CBM_GRAPH_COMPARE_GENERATION_SIZE];
+    ASSERT_EQ(cbm_store_graph_content_digest(store, project, after_digest), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(store, after_generation, sizeof(after_generation)),
+              CBM_STORE_OK);
+    bool changed_files_current = true;
+    for (int i = 0; i < CHANGED_FILES; i++) {
+        char relative[32];
+        snprintf(relative, sizeof(relative), "unit_%02d.py", i);
+        cbm_file_hash_t hash = {0};
+        int hash_rc = cbm_store_get_file_hash(store, project, relative, &hash);
+        changed_files_current &= hash_rc == CBM_STORE_OK && hash.sha256 &&
+                                 strcmp(hash.sha256, before_hash) != 0 &&
+                                 hash.size == (int64_t)(sizeof(CHANGED_SOURCE) - 1);
+        cbm_store_clear_file_hash(&hash);
+        cbm_node_t *nodes = NULL;
+        int count = 0, functions = 0;
+        changed_files_current &=
+            cbm_store_find_nodes_by_file(store, project, relative, &nodes, &count) == CBM_STORE_OK;
+        for (int n = 0; n < count; n++) {
+            if (strcmp(nodes[n].label, "Function") == 0) {
+                functions++;
+                changed_files_current &= strcmp(nodes[n].name, "changed_work") == 0;
+            }
+        }
+        changed_files_current &= functions == 1;
+        cbm_store_free_nodes(nodes, count);
+    }
+    char deleted_relative[32];
+    snprintf(deleted_relative, sizeof(deleted_relative), "unit_%02d.py", CHANGED_FILES);
+    cbm_node_t *deleted_nodes = NULL;
+    int deleted_nodes_count = 0;
+    int deleted_nodes_rc = cbm_store_find_nodes_by_file(store, project, deleted_relative,
+                                                        &deleted_nodes, &deleted_nodes_count);
+    cbm_store_free_nodes(deleted_nodes, deleted_nodes_count);
+    cbm_file_hash_t deleted_hash = {0};
+    int deleted_hash_rc = cbm_store_get_file_hash(store, project, deleted_relative, &deleted_hash);
+    cbm_store_clear_file_hash(&deleted_hash);
+    cbm_store_close(store);
+    ASSERT(memcmp(before_digest, after_digest, sizeof(before_digest)) != 0);
+    ASSERT(strcmp(before_generation, after_generation) != 0);
+    ASSERT(changed_files_current);
+    ASSERT_EQ(deleted_nodes_rc, CBM_STORE_OK);
+    ASSERT_EQ(deleted_nodes_count, 0);
+    ASSERT_EQ(deleted_hash_rc, CBM_STORE_NOT_FOUND);
 
     const char *start = strstr(g_purge_log, "msg=incremental.purge.start");
     ASSERT(start != NULL);
@@ -600,6 +1055,8 @@ TEST(incr_purge_reports_bounded_progress_issue1300) {
     ASSERT(changed_at != NULL && deleted_at != NULL);
     changed = atoi(changed_at + strlen("changed="));
     deleted = atoi(deleted_at + strlen("deleted="));
+    ASSERT_EQ(changed, CHANGED_FILES);
+    ASSERT_EQ(deleted, DELETED_FILES);
     int total = changed + deleted;
     ASSERT_GT(total, 20); /* enough files that one line per file would exceed the bound */
     ASSERT_GT(g_purge_progress_lines, 0);
@@ -609,6 +1066,8 @@ TEST(incr_purge_reports_bounded_progress_issue1300) {
     (void)snprintf(last, sizeof(last), "files_done=%d files_total=%d", total, total);
     ASSERT(strstr(g_purge_log, last) != NULL);
     ASSERT(strstr(g_purge_log, "msg=incremental.purge elapsed_ms=") != NULL);
+
+    th_cleanup(root);
     PASS();
 }
 
@@ -1382,11 +1841,14 @@ TEST(tool_sg_min_degree) {
     double ms;
     char *r = call_tool_timed("search_graph", &ms,
                               "{\"project\":\"%s\",\"label\":\"Function\","
-                              "\"min_degree\":10}",
+                              "\"qn_pattern\":\"[.]fastapi[.]security[.]utils[.]"
+                              "get_authorization_scheme_param$\","
+                              "\"relationship\":\"CALLS\",\"min_degree\":2}",
                               g_project);
     TOOL_OK(r, ms);
-    int total = count_in_response(r, "total");
-    ASSERT_GT(total, 0);
+    /* The two required OAuth2 callers independently establish this bound. */
+    ASSERT_EQ(count_in_response(r, "total"), 1);
+    ASSERT(strstr(r, "fastapi.security.utils.get_authorization_scheme_param") != NULL);
     free(r);
     PASS();
 }
@@ -2621,14 +3083,19 @@ TEST(tool_trace_deep) {
 /* ── search_graph: remaining relationship values ───────────────── */
 
 TEST(tool_sg_rel_imports) {
+    ASSERT(fastapi_physical_import());
+    /* relationship requires an actual import edge. Degree counts semantic
+     * relations only, so min_degree would incorrectly exclude this File.
+     * tool_sg_min_degree independently checks the semantic degree contract. */
     double ms;
     char *r = call_tool_timed("search_graph", &ms,
-                              "{\"project\":\"%s\",\"label\":\"Module\","
-                              "\"relationship\":\"IMPORTS\",\"min_degree\":1}",
+                              "{\"project\":\"%s\",\"label\":\"File\","
+                              "\"qn_pattern\":\"[.]fastapi[.]security[.]oauth2[.]py[.]__file__$\","
+                              "\"relationship\":\"IMPORTS\"}",
                               g_project);
     TOOL_OK(r, ms);
-    int t = count_in_response(r, "total");
-    ASSERT_GT(t, 0);
+    ASSERT_EQ(count_in_response(r, "total"), 1);
+    ASSERT(strstr(r, "fastapi.security.oauth2.py.__file__") != NULL);
     free(r);
     PASS();
 }

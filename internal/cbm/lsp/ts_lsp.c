@@ -26,7 +26,10 @@
  *   - eval_depth caps at TS_LSP_MAX_EVAL_DEPTH to defend against pathological recursion.
  */
 
+#include "proof_bridge.h"
 #include "ts_lsp.h"
+#include "ts_proof.h"
+#include "../resolve/policy.h"
 #include "../../../src/foundation/platform.h"
 #include "../helpers.h"
 #include "../../../src/foundation/log.h"
@@ -2943,6 +2946,22 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
             if (!base || (base->kind != CBM_TYPE_NAMED && base->kind != CBM_TYPE_TEMPLATE)) {
                 continue;
             }
+            cbm_resolve_method_result_t proven =
+                cbm_ts_proof_method(ctx, object, method_name, property);
+            proven.result =
+                cbm_lsp_proof_occurrence(&ctx->proven_types, proven.result, property,
+                                         ctx->enclosing_func_qn, method_name, "CALL_REFERENCE");
+            if (cbm_resolve_admit(&proven.result)) {
+                int before = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
+                ts_emit_resolved_reference(ctx, proven.result.target,
+                                           "lsp_ts_declared_method_reference", 1.0f, property);
+                if (ctx->resolved_calls && ctx->resolved_calls->count == before + 1) {
+                    CBMResolvedCall *row =
+                        &ctx->resolved_calls->items[ctx->resolved_calls->count - 1];
+                    row->evidence = cbm_lsp_proof_evidence(proven.result);
+                }
+                continue;
+            }
             const CBMRegisteredFunc *target = lookup_method(ctx, receiver, method_name);
             if (target && target->qualified_name) {
                 ts_emit_resolved_reference(ctx, target->qualified_name,
@@ -3029,7 +3048,24 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                         }
                     }
                 }
-                // Type-based dispatch.
+                cbm_resolve_method_result_t proven =
+                    cbm_ts_proof_method(ctx, obj, mname, call_node);
+                proven.result =
+                    cbm_lsp_proof_occurrence(&ctx->proven_types, proven.result, call_node,
+                                             ctx->enclosing_func_qn, node_text(ctx, fn), "CALLS");
+                if (cbm_resolve_admit(&proven.result)) {
+                    int before = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
+                    ts_emit_resolved_call_at(ctx, proven.result.target, "lsp_ts_declared_method",
+                                             1.0f, call_node);
+                    if (ctx->resolved_calls && ctx->resolved_calls->count == before + 1) {
+                        CBMResolvedCall *row =
+                            &ctx->resolved_calls->items[ctx->resolved_calls->count - 1];
+                        row->evidence = cbm_lsp_proof_evidence(proven.result);
+                    }
+                    return;
+                }
+                // Type-based dispatch remains inference input; without a proof
+                // its result cannot pass the shared graph admission policy.
                 const CBMType *recv = ts_eval_expr_type(ctx, obj);
                 const CBMRegisteredFunc *f = ts_lookup_method_for_call(ctx, recv, mname, args);
 
@@ -3077,8 +3113,10 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
                                              call_node);
                     return;
                 }
-                // Fall through to qualified_name fallback.
-                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, member);
+                // Fall through to qualified_name fallback. The diagnostic joins its
+                // call site by spelling, so an alias reports the name the file wrote;
+                // an exported name here would outlive the edge a later proof admits.
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, name);
                 ts_emit_unresolved_call_at(ctx, qn, "import_symbol_not_in_registry", call_node);
                 return;
             }
@@ -3086,6 +3124,9 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
         ts_emit_unresolved_call_at(ctx, name, "func_not_in_registry", call_node);
     }
 }
+
+static const char *ts_nested_function_qn(TSLSPContext *ctx, TSNode node);
+static void process_class_field(TSLSPContext *ctx, TSNode field, const char *class_qn);
 
 // Process an arrow_function or function_expression as a callback whose param types are
 // contextually typed by the enclosing call (e.g. `arr.map(x => x.length)` — `x` should
@@ -3747,10 +3788,15 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     if (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "method_definition") == 0 ||
         strcmp(kind, "function_expression") == 0 || strcmp(kind, "arrow_function") == 0 ||
         strcmp(kind, "method_signature") == 0) {
-        // Nested functions just get a fresh scope; top-level / class-method walks own
-        // their enclosing_func_qn via process_function_body.
+        // Nested functions get a fresh scope. A named one is the caller of what its
+        // body calls, under the identity extraction gave it; top-level and class-method
+        // walks own their enclosing_func_qn via process_function_body.
         CBMScope *saved = ctx->current_scope;
+        const char *saved_func = ctx->enclosing_func_qn;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        const char *nested_qn = ts_nested_function_qn(ctx, node);
+        if (nested_qn)
+            ctx->enclosing_func_qn = nested_qn;
         TSNode params =
             ts_node_child_by_field_name(node, "parameters", TS_LSP_FIELD_LEN("parameters"));
         if (!ts_node_is_null(params)) {
@@ -3766,6 +3812,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             process_node(ctx, body);
         }
         ctx->current_scope = saved;
+        ctx->enclosing_func_qn = saved_func;
         return;
     }
 
@@ -3791,7 +3838,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
 
     // Class / interface declarations are walked by the registry pass; here we just dive
     // into method_definition bodies for inner call resolution.
-    if (strcmp(kind, "class_declaration") == 0) {
+    if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "abstract_class_declaration") == 0) {
         // Find the class name to set enclosing_class_qn for methods.
         TSNode name = ts_node_child_by_field_name(node, "name", TS_LSP_FIELD_LEN("name"));
         const char *class_qn = NULL;
@@ -3805,6 +3852,10 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             uint32_t nc = ts_node_named_child_count(body);
             for (uint32_t i = 0; i < nc; i++) {
                 TSNode m = ts_node_named_child(body, i);
+                if (node_kind_is(m, "public_field_definition")) {
+                    process_class_field(ctx, m, class_qn);
+                    continue;
+                }
                 if (!node_kind_is(m, "method_definition"))
                     continue;
                 TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
@@ -3833,6 +3884,54 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         }
         ts_tree_cursor_delete(&cursor);
     }
+}
+
+/* The QN extraction minted for this nested function: flat under the module, or
+ * under the enclosing class. The caller of an occurrence must name that same node. */
+static const char *ts_nested_function_qn(TSLSPContext *ctx, TSNode node) {
+    if (cbm_js_function_inside_class_member(node))
+        return NULL;
+    TSNode name = cbm_resolve_func_name_in_source(node, CBM_LANG_TYPESCRIPT, ctx->source);
+    char *text = ts_node_is_null(name) ? NULL : node_text(ctx, name);
+    if (!text || !text[0])
+        return NULL;
+    const char *owner = ctx->enclosing_class_qn ? ctx->enclosing_class_qn : ctx->module_qn;
+    return owner ? cbm_arena_sprintf(ctx->arena, "%s.%s", owner, text) : NULL;
+}
+
+static void process_function_body(TSLSPContext *ctx, TSNode func_node, const char *func_qn,
+                                  const char *class_qn);
+
+/* A class field's initializer runs with `this` as the new instance. Its calls have
+ * the field's own arrow as caller, or else the enclosing declaration's. */
+static void process_class_field(TSLSPContext *ctx, TSNode field, const char *class_qn) {
+    TSNode value = ts_node_child_by_field_name(field, "value", TS_LSP_FIELD_LEN("value"));
+    if (ts_node_is_null(value))
+        return;
+    uint32_t count = ts_node_child_count(field);
+    for (uint32_t i = 0; i < count; i++)
+        if (node_kind_is(ts_node_child(field, i), "static"))
+            return;
+    const char *saved_class = ctx->enclosing_class_qn;
+    ctx->enclosing_class_qn = class_qn;
+    if (node_kind_is(value, "arrow_function") || node_kind_is(value, "function_expression")) {
+        const char *qn = ts_nested_function_qn(ctx, value);
+        if (qn) {
+            process_function_body(ctx, value, qn, class_qn);
+            ctx->enclosing_class_qn = saved_class;
+            return;
+        }
+    }
+    CBMScope *saved = ctx->current_scope;
+    const char *saved_func = ctx->enclosing_func_qn;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+    if (!ctx->enclosing_func_qn)
+        ctx->enclosing_func_qn = ctx->module_qn;
+    cbm_scope_bind(ctx->current_scope, "this", cbm_type_named(ctx->arena, class_qn));
+    process_node(ctx, value);
+    ctx->current_scope = saved;
+    ctx->enclosing_func_qn = saved_func;
+    ctx->enclosing_class_qn = saved_class;
 }
 
 static void process_function_body(TSLSPContext *ctx, TSNode func_node, const char *func_qn,
@@ -3934,6 +4033,7 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
         return;
     if (ctx->dts_mode)
         return;
+    cbm_ts_proof_prepare(ctx, root);
 
     // Collect top-level children once (O(n)); both passes reuse the array.
     // See collect_children: indexing ts_node_child(root,i) here would be O(n²).
@@ -3965,17 +4065,25 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                 continue;
             const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fn);
             process_function_body(ctx, child, fqn, NULL);
-        } else if (strcmp(kind, "class_declaration") == 0 || strcmp(kind, "internal_module") == 0) {
+        } else if (strcmp(kind, "class_declaration") == 0 ||
+                   strcmp(kind, "abstract_class_declaration") == 0 ||
+                   strcmp(kind, "internal_module") == 0) {
             process_node(ctx, child);
         } else if (strcmp(kind, "expression_statement") == 0) {
             /* tree-sitter-typescript wraps a namespace declaration in an
-             * expression_statement. Unwrap only that declaration shape;
-             * ordinary top-level expressions are not owned by a function. */
+             * expression_statement. Anything else belongs to the module, and that
+             * is where a test file's `describe(() => ...)` bodies live. */
             uint32_t count = ts_node_named_child_count(child);
             for (uint32_t j = 0; j < count; j++) {
                 TSNode inner = ts_node_named_child(child, j);
-                if (node_kind_is(inner, "internal_module"))
+                if (node_kind_is(inner, "internal_module")) {
                     process_node(ctx, inner);
+                } else {
+                    const char *saved_func = ctx->enclosing_func_qn;
+                    ctx->enclosing_func_qn = ctx->module_qn;
+                    process_node(ctx, inner);
+                    ctx->enclosing_func_qn = saved_func;
+                }
             }
         } else if (strcmp(kind, "export_statement") == 0) {
             // Walk the wrapped declaration.
@@ -3999,6 +4107,7 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                            strcmp(ik, "variable_declaration") == 0) {
                     process_top_level_variable_arrows(ctx, inner);
                 } else if (strcmp(ik, "class_declaration") == 0 ||
+                           strcmp(ik, "abstract_class_declaration") == 0 ||
                            strcmp(ik, "internal_module") == 0) {
                     process_node(ctx, inner);
                 }
@@ -4031,6 +4140,9 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->jsx_mode = jsx_mode;
     ctx->dts_mode = dts_mode;
     ctx->current_scope = arena ? cbm_scope_push(arena, NULL) : NULL;
+    cbm_resolve_types_init(&ctx->proven_types, arena, 0);
+    (void)cbm_lsp_proof_standalone_context(&ctx->proven_types, source, source_len, module_qn,
+                                           CBM_SOURCE_ORIGIN_RAW);
 
     const char *debug_env = getenv("CBM_LSP_DEBUG");
     ctx->debug = (debug_env && debug_env[0]);
@@ -4756,6 +4868,8 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->name;
+            rt.project_source = true;
+            rt.declaration_identity = cbm_arena_sprintf(arena, "local:%s:%d", module_qn, i);
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             // base_classes → embedded_types (extends/implements).
             if (d->base_classes) {
@@ -4814,6 +4928,8 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->name;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.declaration_identity = cbm_arena_sprintf(arena, "local:%s:%d", module_qn, i);
             rf.min_params = -1;
 
             // Build return type list.
@@ -6046,12 +6162,16 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_ts_stdlib_register(&reg, arena);
+    reg.index_first_registered = true;
     register_file_defs(arena, &reg, result, result->module_qn);
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,
                 dts_mode, &result->resolved_calls);
     ctx.usages = &result->usages;
+    cbm_resolve_proof_source_t proof_source =
+        cbm_result_proof_source(result, CBM_SOURCE_ORIGIN_RAW, result->module_qn);
+    (void)cbm_lsp_proof_context(&ctx.proven_types, &proof_source, result->module_qn);
 
     // Add imports early so type-resolution passes can rewrite NAMED references that
     // refer to imported symbols. ts_parse_type_node consults these via
@@ -6068,6 +6188,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     refine_ast_signatures(&ctx, root, &reg);
     apply_jsdoc_signatures(&ctx, root, &reg);
     infer_implicit_returns(&ctx, root, &reg);
+    cbm_registry_finalize(&reg);
 
     ts_lsp_process_file(&ctx, root);
 }
@@ -6090,6 +6211,9 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
+            rt.project_source = true;
+            rt.export_binding_proven = d->export_binding_proven;
+            rt.declaration_identity = d->declaration_identity;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             if (d->embedded_types && d->embedded_types[0]) {
                 int n = 1;
@@ -6185,6 +6309,9 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.declaration_identity = d->declaration_identity;
+            rf.sig = d->sig;
             rf.min_params = -1;
             const CBMType **rets = NULL;
             if (d->return_types && d->return_types[0]) {
@@ -6262,6 +6389,16 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         int def_count, const char **import_names,
                                         const char **import_qns, int import_count,
                                         TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_ts_lsp_cross_with_registry_with_source(
+        arena, source, source_len, module_qn, js_mode, jsx_mode, dts_mode, reg, defs, def_count,
+        import_names, import_qns, import_count, cached_tree, out, NULL);
+}
+
+void cbm_run_ts_lsp_cross_with_registry_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMTypeRegistry *reg, CBMLSPDef *defs, int def_count,
+    const char **import_names, const char **import_qns, int import_count, TSTree *cached_tree,
+    CBMResolvedCallArray *out, const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !out || !reg)
         return;
 
@@ -6310,6 +6447,8 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn, js_mode, jsx_mode, dts_mode,
                 out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
     ctx.cross_file_mode = true;
     for (int i = 0; i < import_count; i++) {
         if (import_names && import_qns && import_names[i] && import_qns[i]) {
@@ -6322,6 +6461,7 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     refine_ast_signatures(&ctx, root, &overlay);
     apply_jsdoc_signatures(&ctx, root, &overlay);
     infer_implicit_returns(&ctx, root, &overlay);
+    cbm_registry_finalize(&overlay);
 
     ts_lsp_process_file(&ctx, root);
 
@@ -6334,6 +6474,18 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           CBMLSPDef *defs, int def_count, const char **import_names,
                           const char **import_qns, int import_count, TSTree *cached_tree,
                           CBMResolvedCallArray *out) {
+    cbm_run_ts_lsp_cross_with_source(arena, source, source_len, module_qn, js_mode, jsx_mode,
+                                     dts_mode, defs, def_count, import_names, import_qns,
+                                     import_count, cached_tree, out, NULL);
+}
+
+void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, bool js_mode, bool jsx_mode,
+                                      bool dts_mode, CBMLSPDef *defs, int def_count,
+                                      const char **import_names, const char **import_qns,
+                                      int import_count, TSTree *cached_tree,
+                                      CBMResolvedCallArray *out,
+                                      const cbm_resolve_proof_source_t *source_context) {
     if (!arena || !out)
         return;
 
@@ -6354,6 +6506,9 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
+            rt.project_source = true;
+            rt.export_binding_proven = d->export_binding_proven;
+            rt.declaration_identity = d->declaration_identity;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             // Embedded types (extends list) — pipe-separated.
             if (d->embedded_types && d->embedded_types[0]) {
@@ -6453,6 +6608,9 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.declaration_identity = d->declaration_identity;
+            rf.sig = d->sig;
             rf.min_params = -1;
             // Return types from pipe-separated return_types text.
             const CBMType **rets = NULL;
@@ -6524,6 +6682,8 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, js_mode, jsx_mode, dts_mode, out);
+    if (source_context)
+        (void)cbm_lsp_proof_context(&ctx.proven_types, source_context, module_qn);
     ctx.cross_file_mode = true;
 
     // Add imports early so type passes can resolve imported types.
@@ -6538,6 +6698,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
     refine_ast_signatures(&ctx, root, &reg);
     apply_jsdoc_signatures(&ctx, root, &reg);
     infer_implicit_returns(&ctx, root, &reg);
+    cbm_registry_finalize(&reg);
 
     ts_lsp_process_file(&ctx, root);
 

@@ -568,29 +568,39 @@ TEST(index_parse_partial_reported) {
     cbm_store_close(store);
     store = NULL;
 
-    /* An incremental run that changes only a clean neighbor has no new parser
-     * errors, but its response must still describe the persisted current
-     * coverage state for the untouched partial file. */
+    /* Changing a clean neighbor rebuilds the resolver generation and reparses
+     * the still-partial file. Both the current coverage report and the new
+     * run's logfile must retain that independently observed parser gap. */
     struct timespec delay = {.tv_sec = 0, .tv_nsec = INCR_FIX_SLEEP_NS};
     nanosleep(&delay, NULL);
     ri_write_text(lp.tmpdir, "good.py", "def alpha():\n    return 2\n");
     char iargs[700];
     snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
+    char rebuild_logpath[700];
+    snprintf(rebuild_logpath, sizeof(rebuild_logpath), "%s/coverage-rebuild.log", lp.tmpdir);
+    cbm_setenv("CBM_INDEX_LOG", rebuild_logpath, 1);
     char *iresp = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
+    cbm_unsetenv("CBM_INDEX_LOG");
     ASSERT_NOT_NULL(iresp);
     yyjson_doc *idoc = yyjson_read(iresp, strlen(iresp), 0);
     ASSERT_NOT_NULL(idoc);
     yyjson_val *isc = yyjson_obj_get(yyjson_doc_get_root(idoc), "structuredContent");
     ASSERT_NOT_NULL(isc);
-    ASSERT_GTE(yyjson_get_int(yyjson_obj_get(isc, "parse_partial_count")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(isc, "parse_partial_count")), 1);
     yyjson_val *ipp = yyjson_obj_get(isc, "parse_partial");
     ASSERT_NOT_NULL(ipp);
     char *ipp_json = yyjson_val_write(ipp, 0, NULL);
     ASSERT_NOT_NULL(ipp_json);
     ASSERT_NOT_NULL(strstr(ipp_json, "split.c"));
     free(ipp_json);
-    /* The coverage is persisted state, but the logfile remains per-run. */
-    ASSERT_NULL(yyjson_obj_get(isc, "logfile"));
+    const char *rebuild_logfile = yyjson_get_str(yyjson_obj_get(isc, "logfile"));
+    ASSERT_NOT_NULL(rebuild_logfile);
+    ASSERT_STR_EQ(rebuild_logfile, rebuild_logpath);
+    char *rebuild_logtext = ri_slurp(rebuild_logfile);
+    ASSERT_NOT_NULL(rebuild_logtext);
+    ASSERT_NOT_NULL(strstr(rebuild_logtext, "parse_partial"));
+    ASSERT_NOT_NULL(strstr(rebuild_logtext, "split.c"));
+    free(rebuild_logtext);
     yyjson_doc_free(idoc);
     free(iresp);
 
@@ -730,10 +740,25 @@ TEST(index_parse_partial_clears_on_fix) {
 
     /* Flagged after the first (full) index. */
     char qargs[900];
-    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\",\"diagnostics\":\"full\"}", lp.project);
+    snprintf(qargs, sizeof(qargs),
+             "{\"project\":\"%s\",\"diagnostics\":\"full\",\"format\":\"json\"}", lp.project);
     char *cov1 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(cov1);
-    ASSERT_NOT_NULL(strstr(cov1, "flaky.c"));
+    yyjson_doc *before_doc = yyjson_read(cov1, strlen(cov1), 0);
+    ASSERT_NOT_NULL(before_doc);
+    yyjson_val *before = yyjson_obj_get(yyjson_doc_get_root(before_doc), "structuredContent");
+    ASSERT_NOT_NULL(before);
+    yyjson_val *before_partial = yyjson_obj_get(before, "parse_partial");
+    ASSERT_NOT_NULL(before_partial);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(before_partial, "count")), 1);
+    yyjson_val *before_files = yyjson_obj_get(before_partial, "files");
+    ASSERT_TRUE(yyjson_is_arr(before_files));
+    ASSERT_EQ(yyjson_arr_size(before_files), 1);
+    const char *partial_path =
+        yyjson_get_str(yyjson_obj_get(yyjson_arr_get_first(before_files), "path"));
+    ASSERT_NOT_NULL(partial_path);
+    ASSERT_NOT_NULL(strstr(partial_path, "flaky.c"));
+    yyjson_doc_free(before_doc);
     free(cov1);
 
     /* Fix the file; ensure a newer mtime so change detection can't miss it. */
@@ -745,7 +770,7 @@ TEST(index_parse_partial_clears_on_fix) {
                   "    return x + 1;\n"
                   "}\n");
 
-    /* Re-index WITHOUT deleting the DB → routes through the incremental path. */
+    /* Re-index without deleting the DB: changed inputs rebuild the generation. */
     char iargs[700];
     snprintf(iargs, sizeof(iargs), "{\"repo_path\":\"%s\"}", lp.tmpdir);
     char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
@@ -754,13 +779,43 @@ TEST(index_parse_partial_clears_on_fix) {
 
     char *cov2 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(cov2);
-    ASSERT_NULL(strstr(cov2, "flaky.c"));
+    yyjson_doc *after_doc = yyjson_read(cov2, strlen(cov2), 0);
+    ASSERT_NOT_NULL(after_doc);
+    yyjson_val *after = yyjson_obj_get(yyjson_doc_get_root(after_doc), "structuredContent");
+    ASSERT_NOT_NULL(after);
+    yyjson_val *after_partial = yyjson_obj_get(after, "parse_partial");
+    yyjson_val *after_unusable = yyjson_obj_get(after, "parse_unusable");
+    ASSERT_NOT_NULL(after_partial);
+    ASSERT_NOT_NULL(after_unusable);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(after_partial, "count")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(after_unusable, "count")), 0);
+    yyjson_val *after_files = yyjson_obj_get(after_partial, "files");
+    ASSERT_TRUE(yyjson_is_arr(after_files));
+    ASSERT_EQ(yyjson_arr_size(after_files), 0);
+    /* Resolver misses are a separate diagnostic domain and may legitimately
+     * name flaky.c after its parser gap is fixed. Keep that report available. */
+    yyjson_val *resolver = yyjson_obj_get(after, "resolver");
+    ASSERT_NOT_NULL(resolver);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(resolver, "status")), "available");
+    ASSERT_TRUE(yyjson_is_arr(yyjson_obj_get(resolver, "samples")));
+    yyjson_doc_free(after_doc);
     free(cov2);
 
     store = cbm_store_open_path(lp.dbpath);
     if (!store) {
         FAIL("store did not reopen");
     }
+    cbm_coverage_row_t *rows = NULL;
+    int row_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(store, lp.project, &rows, &row_count), CBM_STORE_OK);
+    for (int i = 0; i < row_count; i++) {
+        if (rows[i].rel_path && strstr(rows[i].rel_path, "flaky.c")) {
+            ASSERT_NOT_NULL(rows[i].kind);
+            ASSERT_NEQ(strcmp(rows[i].kind, "parse_partial"), 0);
+            ASSERT_NEQ(strcmp(rows[i].kind, "parse_unusable"), 0);
+        }
+    }
+    cbm_store_free_coverage(rows, row_count);
     rh_cleanup(&lp, store);
     PASS();
 }

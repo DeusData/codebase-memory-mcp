@@ -148,6 +148,14 @@ static int run_import_case(const import_case_t *tc) {
                tc->label, r->imports.count, tc->min_count);
         fail = 1;
     }
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->source_origin != CBM_SOURCE_ORIGIN_RAW ||
+            imp->site_end_byte <= imp->site_start_byte || imp->site_end_byte > strlen(tc->src)) {
+            printf("  FAIL [%s]: import %d lacks an exact source occurrence\n", tc->label, i);
+            fail = 1;
+        }
+    }
     for (int e = 0; tc->expected[e] != NULL; e++) {
         if (!imp_has(r, tc->expected[e])) {
             printf("  FAIL [%s]: no import with module_path containing \"%s\" "
@@ -495,15 +503,9 @@ TEST(javascript_import_table) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Rust — parse_rust_imports (text-based: strips "use "/";" from whole node).
- *
- * EXPECTED: basic and namespaced forms GREEN; grouped/braced forms may be RED
- * because the whole `use std::io::{self, Write};` text becomes the module_path,
- * so has_import("std::io") would still match as a substring — likely GREEN even
- * for grouped. The alias form `use X as Y;` leaves "std::collections::HashMap as H"
- * as module_path — has_import("std::collections::HashMap") would still match.
- * So most forms should be GREEN at extraction.  Graph-level zero edges are
- * downstream.
+ * Rust — parse_rust_imports: one import per use-tree leaf, each with its whole
+ * path. `use std::io::{self, Write};` is "std::io" and "std::io::Write", and an
+ * alias changes the local name, never the path.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static const import_case_t rust_cases[] = {
@@ -1314,10 +1316,68 @@ TEST(es_named_import_member_survives_compaction) {
  * SUITE declaration — do NOT register in test_main.c; the main workstream will
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+TEST(import_repeated_aliases_preserve_distinct_source_occurrences) {
+    const char *source = "import library\nimport library\n"
+                         "import library as first, library as second\n"
+                         "import missing\n";
+    const char *anchors[] = {"library", "library", "library as first", "library as second",
+                             "missing"};
+    CBMFileResult *result = do_extract(source, CBM_LANG_PYTHON, "main.py");
+    ASSERT_NOT_NULL(result);
+    int count = result->imports.count;
+    bool exact = count == 5;
+    const char *cursor = source;
+    for (int i = 0; exact && i < count; i++) {
+        const char *site = strstr(cursor, anchors[i]);
+        const CBMImport *imp = &result->imports.items[i];
+        exact = site && imp->site_start_byte == (uint32_t)(site - source) &&
+                imp->site_end_byte == (uint32_t)(site - source + strlen(anchors[i])) &&
+                imp->source_origin == CBM_SOURCE_ORIGIN_RAW;
+        if (site)
+            cursor = site + strlen(anchors[i]);
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(count, 5);
+    ASSERT(exact);
+    PASS();
+}
+
+TEST(kustomize_imports_preserve_exact_source_occurrences) {
+    const char *source = "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                         "kind: Kustomization\nresources:\n  - resource.yaml\n"
+                         "patches:\n  - path: patch.yaml\n"
+                         "helmCharts:\n  - name: example\n    valuesFile: values.yaml\n";
+    const char *paths[] = {"resource.yaml", "patch.yaml", "values.yaml"};
+    CBMFileResult *result = do_extract(source, CBM_LANG_KUSTOMIZE, "kustomization.yaml");
+    ASSERT_NOT_NULL(result);
+    int count = result->imports.count;
+    bool exact = count == 3;
+    for (int p = 0; p < 3; p++) {
+        const char *site = strstr(source, paths[p]);
+        int matches = 0;
+        for (int i = 0; i < count; i++) {
+            const CBMImport *imp = &result->imports.items[i];
+            if (!imp->module_path || strcmp(imp->module_path, paths[p]) != 0)
+                continue;
+            matches++;
+            exact = exact && imp->site_start_byte == (uint32_t)(site - source) &&
+                    imp->site_end_byte == (uint32_t)(site - source + strlen(paths[p])) &&
+                    imp->source_origin == CBM_SOURCE_ORIGIN_RAW;
+        }
+        exact = exact && matches == 1;
+    }
+    cbm_free_result(result);
+    ASSERT_EQ(count, 3);
+    ASSERT(exact);
+    PASS();
+}
+
 SUITE(extraction_imports) {
     cbm_init();
 
     /* Working languages — all expected GREEN (regression guards) */
+    RUN_TEST(kustomize_imports_preserve_exact_source_occurrences);
+    RUN_TEST(import_repeated_aliases_preserve_distinct_source_occurrences);
     RUN_TEST(go_import_table);
     RUN_TEST(python_import_table);
     RUN_TEST(typescript_import_table);

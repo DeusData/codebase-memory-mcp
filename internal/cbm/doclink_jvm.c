@@ -56,10 +56,10 @@
  * when that definition is the one the graph keeps for the qualified name
  * inside this file. Both are read off the extractor's own definitions (same
  * start line, name and kind), so this file models neither the qualified-name
- * scheme nor its collisions: Kotlin flattens nested types and puts class
- * properties at module level, Java names a field after its whole declarator
- * (`MAX = 10`), overloads share one name, and whatever the scheme does next is
- * followed without a change here.
+ * scheme nor its collisions: a Kotlin nested type and a member function of one
+ * name share one, Java names a field after its whole declarator (`MAX = 10`),
+ * overloads share one name, and whatever the scheme does next is followed
+ * without a change here.
  * pnames (the parameter names of a callable, the primary-constructor
  * parameters of a Kotlin class) and all line numbers serve the file's own
  * references only: the persisted form drops them.
@@ -2697,15 +2697,22 @@ static char jv_kotlin_type_kind(const jv_scan_t *s, TSNode decl, TSNode body) {
     return 'c';
 }
 
+#define JV_KOTLIN_COMPANION "Companion"
+
 static void jv_kotlin_type(jv_scan_t *s, TSNode decl, const jv_frame_t *outer, int depth) {
     TSNode body = jv_kotlin_body(decl);
     char kind = jv_kotlin_type_kind(s, decl, body);
     TSNode name_node = jv_child(decl, "type_identifier");
     const char *raw = NULL;
     size_t raw_len = 0;
-    const char *name = (kind == 'C' && ts_node_is_null(name_node))
-                           ? "Companion"
-                           : jv_name_of(s, name_node, &raw, &raw_len);
+    const char *name = NULL;
+    if (kind == 'C' && ts_node_is_null(name_node)) {
+        /* no name token, but the extractor names its definition the same way */
+        name = raw = JV_KOTLIN_COMPANION;
+        raw_len = sizeof(JV_KOTLIN_COMPANION) - SKIP_ONE;
+    } else {
+        name = jv_name_of(s, name_node, &raw, &raw_len);
+    }
     if (!name) {
         return;
     }

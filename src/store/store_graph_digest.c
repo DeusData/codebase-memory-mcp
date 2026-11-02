@@ -1,5 +1,6 @@
 /* Canonical stored-content digest. This module establishes no provenance. */
 #include "store/store_graph_digest.h"
+#include "store/store_resolver_evidence.h"
 
 #include "foundation/sha256.h"
 
@@ -16,11 +17,12 @@ enum {
     GD_ALLOW_INTEGER = 1 << GD_INTEGER,
     GD_ALLOW_TEXT = 1 << GD_TEXT,
     GD_ALLOW_BLOB = 1 << GD_BLOB,
-    GD_TABLE_COUNT = 10,
-    GD_MAX_COLUMNS = 10,
+    GD_TABLE_COUNT = 18,
+    GD_MAX_COLUMNS = 20,
     GD_COVERAGE_META = 7,
     GD_STORE_META = 8,
     GD_UNRESOLVED_CANDIDATES = 9,
+    GD_RESOLVER_FIRST = 10,
     GD_SCHEMA_DECLARED_TYPE = 2,
     GD_SCHEMA_PRIMARY_KEY = 5,
     GD_SCHEMA_HIDDEN = 6,
@@ -101,7 +103,70 @@ static const gd_column_t gd_unresolved_candidates[] = {{"project", GD_T, 0, 1},
                                                        {"rel_path", GD_T, 0, 3},
                                                        {"kind", GD_T, 0, 0}};
 
-/* These descriptors and SQL strings are immutable; all other state is local. */
+static const gd_column_t gd_resolver_occurrences[] = {
+    {"project", GD_T, 0, 1},       {"ordinal", GD_I, 0, 2},
+    {"file_path", GD_T, 0, 0},     {"scope", GD_T, 0, 0},
+    {"relation", GD_T, 0, 0},      {"spelling", GD_T, 0, 0},
+    {"start_byte", GD_I, 0, 0},    {"end_byte", GD_I, 0, 0},
+    {"source_origin", GD_I, 0, 0}, {"binding", GD_I, 0, 0},
+    {"domain", GD_I, 0, 0},        {"analysis", GD_I, 0, 0},
+    {"rule", GD_I, 0, 0},          {"facts", GD_I, 0, 0},
+    {"target", GD_T, 0, 0},        {"candidate_count", GD_I, 0, 0},
+    {"reason", GD_T, 0, 0},        {"emitted", GD_I, 0, 0},
+    {"rules_version", GD_I, 0, 0}, {"properties_json", GD_T, 0, 0},
+};
+static const gd_column_t gd_resolver_generations[] = {
+    {"project", GD_T, 0, 1},
+    {"rules_version", GD_I, 0, 0},
+};
+static const gd_column_t gd_resolver_facts[] = {
+    {"project", GD_T, 0, 1},     {"id", GD_I, 0, 2},     {"kind", GD_I, 0, 0},
+    {"source_file", GD_T, 0, 0}, {"digest", GD_T, 0, 0}, {"payload", GD_T, 0, 0},
+};
+static const gd_column_t gd_resolver_supports[] = {
+    {"project", GD_T, 0, 1},
+    {"fact", GD_I, 0, 2},
+    {"ordinal", GD_I, 0, 3},
+    {"premise", GD_I, 0, 0},
+};
+static const gd_column_t gd_resolver_lookups[] = {
+    {"project", GD_T, 0, 1}, {"fact", GD_I, 0, 2},   {"domain", GD_T, 0, 0},
+    {"key", GD_T, 0, 0},     {"status", GD_T, 0, 0},
+};
+static const gd_column_t gd_resolver_occurrence_evidence[] = {
+    {"project", GD_T, 0, 1},
+    {"ordinal", GD_I, 0, 2},
+    {"content_identity", GD_T, 0, 0},
+    {"configuration_identity", GD_T, 0, 0},
+    {"proof", GD_I, 0, 0},
+    {"source_binding_proof", GD_I, 0, 0},
+};
+static const gd_column_t gd_resolver_file_summaries[] = {
+    {"project", GD_T, 0, 1},
+    {"file_path", GD_T, 0, 2},
+    {"module", GD_T, 0, 0},
+    {"language", GD_I, 0, 0},
+    {"raw_content_identity", GD_T, 0, 0},
+    {"preprocessed_content_identity", GD_T, 0, 0},
+    {"configuration_identity", GD_T, 0, 0},
+    {"raw_length", GD_I, 0, 0},
+    {"preprocessed_length", GD_I, 0, 0},
+    {"extracted_summary", GD_T, 0, 0},
+    {"derived_summary", GD_T, 0, 0},
+    {"complete", GD_I, 0, 0},
+};
+static const gd_column_t gd_resolver_derived_bindings[] = {
+    {"project", GD_T, 0, 1}, {"file_path", GD_T, 0, 2}, {"key", GD_T, 0, 3},
+    {"kind", GD_I, 0, 4},    {"module", GD_I, 0, 0},    {"closed", GD_I, 0, 0},
+    {"binding", GD_I, 0, 0}, {"domain", GD_I, 0, 0},    {"analysis", GD_I, 0, 0},
+    {"target", GD_T, 0, 0},  {"proof", GD_I, 0, 0},     {"payload_json", GD_T, 0, 0},
+};
+
+/* These descriptors and SQL strings are immutable; all other state is local.
+ * A resolver query orders by the column itself: a text column compares by its bytes,
+ * exactly as CAST(... AS BLOB) does, but the planner can only walk an index for the
+ * plain column. A cast sorts every row in memory, which on the largest repositories
+ * is tens of gigabytes of reconstructed text. */
 static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
     {"projects", gd_projects, GD_COLUMNS(gd_projects), "PRAGMA main.table_xinfo('projects');",
      "SELECT name,indexed_at,root_path FROM main.projects ORDER BY CAST(name AS BLOB) ASC;"},
@@ -139,10 +204,55 @@ static const gd_table_t gd_tables[GD_TABLE_COUNT] = {
      "PRAGMA main.table_xinfo('index_unresolved_candidates');",
      "SELECT project,candidate,rel_path,kind FROM main.index_unresolved_candidates "
      "ORDER BY CAST(project AS BLOB) ASC,CAST(candidate AS BLOB) ASC,"
-     "CAST(rel_path AS BLOB) ASC,CAST(kind AS BLOB) ASC;"}};
+     "CAST(rel_path AS BLOB) ASC,CAST(kind AS BLOB) ASC;"},
+    {"resolver_occurrences", gd_resolver_occurrences, GD_COLUMNS(gd_resolver_occurrences),
+     "PRAGMA main.table_xinfo('resolver_occurrences');",
+     "SELECT "
+     "project,ordinal,file_path,scope,relation,spelling,start_byte,end_byte,source_origin,binding,"
+     "domain,analysis,rule,facts,target,candidate_count,reason,emitted,rules_version,properties_"
+     "json FROM main.resolver_occurrences "
+     "ORDER BY project ASC,ordinal ASC;"},
+    {"resolver_generations", gd_resolver_generations, GD_COLUMNS(gd_resolver_generations),
+     "PRAGMA main.table_xinfo('resolver_generations');",
+     "SELECT project,rules_version FROM main.resolver_generations "
+     "ORDER BY CAST(project AS BLOB) ASC;"},
+    {"resolver_facts", gd_resolver_facts, GD_COLUMNS(gd_resolver_facts),
+     "PRAGMA main.table_xinfo('resolver_facts');",
+     "SELECT project,id,kind,source_file,digest,payload FROM main.resolver_facts "
+     "ORDER BY project ASC,id ASC;"},
+    {"resolver_supports", gd_resolver_supports, GD_COLUMNS(gd_resolver_supports),
+     "PRAGMA main.table_xinfo('resolver_supports');",
+     "SELECT project,fact,ordinal,premise FROM main.resolver_supports "
+     "ORDER BY project ASC,fact ASC,ordinal ASC;"},
+    {"resolver_lookups", gd_resolver_lookups, GD_COLUMNS(gd_resolver_lookups),
+     "PRAGMA main.table_xinfo('resolver_lookups');",
+     "SELECT project,fact,domain,key,status FROM main.resolver_lookups "
+     "ORDER BY project ASC,fact ASC;"},
+    {"resolver_occurrence_evidence", gd_resolver_occurrence_evidence,
+     GD_COLUMNS(gd_resolver_occurrence_evidence),
+     "PRAGMA main.table_xinfo('resolver_occurrence_evidence');",
+     "SELECT project,ordinal,content_identity,configuration_identity,proof,source_binding_proof "
+     "FROM main.resolver_occurrence_evidence "
+     "ORDER BY project ASC,ordinal ASC;"},
+    {"resolver_file_summaries", gd_resolver_file_summaries, GD_COLUMNS(gd_resolver_file_summaries),
+     "PRAGMA main.table_xinfo('resolver_file_summaries');",
+     "SELECT "
+     "project,file_path,module,language,raw_content_identity,preprocessed_content_identity,"
+     "configuration_identity,raw_length,preprocessed_length,extracted_summary,derived_summary,"
+     "complete FROM main.resolver_file_summaries "
+     "ORDER BY CAST(project AS BLOB) ASC,CAST(file_path AS BLOB) ASC;"},
+    {"resolver_derived_bindings", gd_resolver_derived_bindings,
+     GD_COLUMNS(gd_resolver_derived_bindings),
+     "PRAGMA main.table_xinfo('resolver_derived_bindings');",
+     "SELECT "
+     "project,file_path,key,kind,module,closed,binding,domain,analysis,target,proof,payload_json "
+     "FROM "
+     "main.resolver_derived_bindings "
+     "ORDER BY CAST(project AS BLOB) ASC,CAST(file_path AS BLOB) ASC,CAST(key AS BLOB) ASC,kind "
+     "ASC;"}};
 
-/* Preserve the legacy canonical stream; newer metadata binds the independent
- * capture completeness column as well. Both schemas are checked exactly. */
+/* Legacy metadata retains its nine-column shape; newer metadata binds the
+ * independent capture completeness column. Both schemas are checked exactly. */
 static const gd_table_t gd_coverage_meta_current = {
     "index_coverage_meta", gd_index_coverage_meta, GD_COLUMNS(gd_index_coverage_meta),
     "PRAGMA main.table_xinfo('index_coverage_meta');",
@@ -168,6 +278,7 @@ typedef struct {
     bool have_uid;
     bool have_counter;
     bool have_unresolved_completeness;
+    bool is_view[GD_TABLE_COUNT];
 } gd_context_t;
 
 static const gd_table_t *gd_table(const gd_context_t *g, int index) {
@@ -409,11 +520,15 @@ static bool gd_table_kinds(gd_context_t *g, bool present[GD_TABLE_COUNT]) {
         }
         int index = gd_table_index(name);
         if (index >= 0) {
+            /* The resolver's logical tables may be views over its compact rows.
+             * The digest binds what they read back, whichever way it is stored. */
+            bool is_view = index >= GD_RESOLVER_FIRST && gd_text_eq(type, "view");
             if (present[index] || !gd_text_eq(name, gd_tables[index].name) ||
-                !gd_text_eq(type, "table")) {
+                (!is_view && !gd_text_eq(type, "table"))) {
                 return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
             }
             present[index] = true;
+            g->is_view[index] = is_view;
         }
     }
     if (rc != SQLITE_DONE || !gd_finalize(g)) {
@@ -421,6 +536,13 @@ static bool gd_table_kinds(gd_context_t *g, bool present[GD_TABLE_COUNT]) {
     }
     for (int i = 0; i < GD_STORE_META; i++) {
         if (!present[i]) {
+            return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+        }
+    }
+    /* Resolver publication creates the whole schema atomically. Legacy stores
+     * may omit it entirely; a partial generation cannot be certified. */
+    for (int i = GD_RESOLVER_FIRST + 1; i < GD_TABLE_COUNT; i++) {
+        if (present[i] != present[GD_RESOLVER_FIRST]) {
             return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
         }
     }
@@ -439,14 +561,17 @@ static bool gd_table_kinds(gd_context_t *g, bool present[GD_TABLE_COUNT]) {
     return rc == SQLITE_DONE && gd_finalize(g);
 }
 
-static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected) {
+static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected, bool is_view) {
+    /* A view declares no key or column type of its own; the compact table
+     * underneath it holds the key, and each value's type is still checked. */
     if (sqlite3_column_type(g->stmt, GD_SCHEMA_PRIMARY_KEY) != SQLITE_INTEGER ||
         sqlite3_column_type(g->stmt, GD_SCHEMA_HIDDEN) != SQLITE_INTEGER ||
-        sqlite3_column_int64(g->stmt, GD_SCHEMA_PRIMARY_KEY) != expected->primary_key ||
+        (!is_view &&
+         sqlite3_column_int64(g->stmt, GD_SCHEMA_PRIMARY_KEY) != expected->primary_key) ||
         sqlite3_column_int64(g->stmt, GD_SCHEMA_HIDDEN) != expected->kind) {
         return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
     }
-    if (expected->primary_key && expected->types == GD_ALLOW_INTEGER) {
+    if (!is_view && expected->primary_key && expected->types == GD_ALLOW_INTEGER) {
         gd_text_t declared_type;
         if (!gd_read_text(g, GD_SCHEMA_DECLARED_TYPE, &declared_type)) {
             return false;
@@ -458,7 +583,7 @@ static bool gd_column_schema(gd_context_t *g, const gd_column_t *expected) {
     return true;
 }
 
-static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
+static bool gd_columns(gd_context_t *g, const gd_table_t *table, bool is_view) {
     bool seen[GD_MAX_COLUMNS] = {false};
     bool coverage_meta = table == &gd_tables[GD_COVERAGE_META];
     int allowed_columns =
@@ -484,7 +609,7 @@ static bool gd_columns(gd_context_t *g, const gd_table_t *table) {
             }
         }
         if (column < 0 || seen[column] || count == allowed_columns ||
-            !gd_column_schema(g, &table->columns[column])) {
+            !gd_column_schema(g, &table->columns[column], is_view)) {
             return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
         }
         seen[column] = true;
@@ -533,7 +658,7 @@ static bool gd_validate_schema(gd_context_t *g, bool present[GD_TABLE_COUNT],
         return false;
     }
     for (int i = 0; i < GD_TABLE_COUNT; i++) {
-        if (present[i] && !gd_columns(g, &gd_tables[i])) {
+        if (present[i] && !gd_columns(g, &gd_tables[i], g->is_view[i])) {
             return false;
         }
     }
@@ -570,7 +695,12 @@ static bool gd_table_header(gd_context_t *g, int index, bool present) {
     if (!gd_read_text(g, 0, &name) || !gd_read_text(g, 1, &type) || !gd_read_text(g, 2, &sql)) {
         return false;
     }
-    if (!gd_text_eq(name, table->name) || !gd_text_eq(type, "table")) {
+    if (!gd_text_eq(name, table->name) || !gd_text_eq(type, g->is_view[index] ? "view" : "table")) {
+        return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
+    }
+    /* A view is only accepted as the writer's own: a look-alike over other rows
+     * would otherwise be certified as this generation's resolver data. */
+    if (g->is_view[index] && !cbm_store_resolver_view_definition_current((const char *)sql.data)) {
         return gd_fail(g, CBM_STORE_GRAPH_DIGEST_SCHEMA);
     }
     if (!gd_value(g, GD_TEXT, sql.data, sql.length)) {
@@ -706,8 +836,8 @@ static bool gd_table_rows(gd_context_t *g, int index, bool present) {
 
 static bool gd_stream_tables(gd_context_t *g, const bool present[GD_TABLE_COUNT]) {
     for (int i = 0; i < GD_TABLE_COUNT; i++) {
-        /* A store without the candidate table streams the same tables as
-         * version 1; only the version word differs. */
+        /* Candidate absence retains the version-2 omission rule. Resolver
+         * absence is framed explicitly by the remaining descriptors. */
         if (i == GD_UNRESOLVED_CANDIDATES && !present[i]) {
             continue;
         }

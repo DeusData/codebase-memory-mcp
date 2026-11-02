@@ -1099,8 +1099,12 @@ TEST(parallel_extract_without_source_retention) {
         .retain_total_budget_bytes = 0,
         .retain_per_file_max_bytes = 0,
     };
+    CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
     int rc = cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, 2,
                                      &extract_opts);
+    cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+    cbm_pipeline_set_pkgmap(saved_pkgmap);
     ASSERT_EQ(rc, 0);
 
     int defs_seen = 0;
@@ -1170,8 +1174,12 @@ TEST(parallel_extract_tiny_source_retention_budget) {
         .retain_total_budget_bytes = retain_total_budget_bytes,
         .retain_per_file_max_bytes = 100U * 1024U * 1024U,
     };
+    CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
     int rc = cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, 2,
                                      &extract_opts);
+    cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+    cbm_pipeline_set_pkgmap(saved_pkgmap);
     ASSERT_EQ(rc, 0);
 
     int retained_count = 0;
@@ -1238,7 +1246,11 @@ TEST(parallel_extract_with_slab) {
     CBMFileResult **result_cache = calloc(file_count, sizeof(CBMFileResult *));
     ASSERT_NOT_NULL(result_cache);
 
+    CBMHashTable *saved_pkgmap = cbm_pipeline_get_pkgmap();
+    cbm_pipeline_set_pkgmap(NULL);
     int rc = cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, 2);
+    cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+    cbm_pipeline_set_pkgmap(saved_pkgmap);
     ASSERT_EQ(rc, 0);
 
     int cached_count = 0;

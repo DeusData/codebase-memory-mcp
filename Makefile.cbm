@@ -137,9 +137,10 @@ KOTLIN_DEDUP_TEST_DEFINE = -DCBM_KOTLIN_DEDUP_TEST_API=1
 CALL_REFERENCE_LOOKUP_TEST_DEFINE = -DCBM_CALL_REFERENCE_LOOKUP_TEST_API=1
 INCREMENTAL_TEST_DEFINE = -DCBM_INCREMENTAL_TEST_API=1
 COVERAGE_MARKER_TEST_DEFINE = -DCBM_COVERAGE_MARKER_TEST_API=1
+MEM_CORE_TEST_DEFINE = -DCBM_MEM_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) \
 	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
-	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
+	$(INCREMENTAL_TEST_DEFINE) $(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) $(TEST_COVERAGE_DEFINE) \
 	-g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS)
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE) $(TEST_COVERAGE_FLAGS) \
 	$(CXX_STDLIB_FLAGS)
@@ -159,7 +160,7 @@ TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
 # macro of ours.
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(KOTLIN_DEDUP_TEST_DEFINE) \
 	$(CALL_REFERENCE_LOOKUP_TEST_DEFINE) $(INCREMENTAL_TEST_DEFINE) \
-	$(COVERAGE_MARKER_TEST_DEFINE) \
+	$(COVERAGE_MARKER_TEST_DEFINE) $(MEM_CORE_TEST_DEFINE) \
 	-DCBM_SANITIZED_BUILD=1 -g -O1 $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -DCBM_SANITIZED_BUILD=1 -g -O1 \
                 $(TSAN_SANITIZE)
@@ -347,6 +348,7 @@ FOUNDATION_SRCS = \
     src/foundation/str_intern.c \
     src/foundation/log.c \
     src/foundation/str_util.c \
+    src/foundation/json_writer.c \
     src/foundation/workspace.c \
     src/foundation/platform.c \
     src/foundation/path_syntax_internal.c \
@@ -439,7 +441,8 @@ LSP_SRCS = $(CBM_DIR)/lsp_all.c
 # Makefile does not use compiler auto-dependency (-MMD) generation.
 LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
                  $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
-                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
+                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h \
+                            $(CBM_DIR)/resolve/*.h)
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
@@ -467,7 +470,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 
 # Store module (new)
-STORE_SRCS = src/store/store.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
+STORE_SRCS = src/store/store.c src/store/store_resolver.c src/store/store_resolver_evidence.c src/store/graph_mem.c src/store/architecture_projection.c src/store/store_impact.c src/store/store_graph_digest.c src/store/store_content_digest.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -519,12 +522,51 @@ PIPELINE_SRCS = \
     src/pipeline/path_alias.c \
     src/pipeline/laravel_routing.c \
     src/pipeline/registry.c \
+    internal/cbm/resolve/capabilities.c \
+    internal/cbm/resolve/proof.c \
+    internal/cbm/resolve/lookup.c \
+    internal/cbm/resolve/solver.c \
+    internal/cbm/lsp/go_stabilize.c \
+    internal/cbm/resolve/stats.c \
+    internal/cbm/resolve/snapshot.c \
+    internal/cbm/resolve/policy.c \
+    internal/cbm/resolve/types.c \
+    internal/cbm/resolve/binding.c \
+    internal/cbm/resolve/py_members.c \
+    internal/cbm/resolve/rust_names.c \
+    internal/cbm/resolve/rust_flow.c \
+    internal/cbm/resolve/source_adapter.c \
+    internal/cbm/resolve/adapter_php.c \
+    internal/cbm/resolve/adapter_elixir.c \
+    internal/cbm/resolve/adapter_erlang.c \
+    internal/cbm/resolve/adapter_perl.c \
+    internal/cbm/resolve/adapter_ruby.c \
+    internal/cbm/resolve/adapter_zig.c \
+    internal/cbm/resolve/adapter_haskell.c \
+    internal/cbm/resolve/adapter_ocaml.c \
+    internal/cbm/resolve/adapter_dart.c \
+    internal/cbm/resolve/adapter_swift.c \
+    internal/cbm/resolve/adapter_scala.c \
+    internal/cbm/resolve/symbols.c \
+    internal/cbm/lsp/ts_proof.c \
+    internal/cbm/lsp/php_proof.c \
+    internal/cbm/lsp/kotlin_proof.c \
+    internal/cbm/lsp/cs_proof.c \
+    internal/cbm/lsp/oo_core.c \
+    internal/cbm/lsp/oo_java.c \
+    internal/cbm/lsp/oo_kotlin.c \
+    internal/cbm/lsp/oo_csharp.c \
+    internal/cbm/lsp/rust_proof.c \
+    internal/cbm/lsp/py_proof.c \
+    internal/cbm/lsp/c_proof.c \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/worker_pool.c \
     src/pipeline/pass_parallel.c \
     src/pipeline/pass_definitions.c \
     src/pipeline/pass_calls.c \
+    src/pipeline/pass_resolver.c \
+    src/pipeline/resolver_ecma.c \
     src/pipeline/pass_spawns.c \
     src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_usages.c \
@@ -758,7 +800,7 @@ EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
 # Vendored trees are deliberately excluded — they are pinned, they carry their
 # own explicit dep lists (LSP_UNITY_DEPS, TS_RUNTIME_DEPS), and globbing tens of
 # thousands of grammar headers would cost more than it protects.
-PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h tests/*.h \
+PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h $(CBM_DIR)/resolve/*.h tests/*.h \
                tests/repro/*.h)
 
 # ── Test sources ─────────────────────────────────────────────────
@@ -865,7 +907,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = tests/test_resolver_source_langs.c tests/test_resolver_oo.c tests/test_resolver_import_authority.c tests/test_resolver_k8s.c tests/test_resolver_variants.c tests/test_resolver_infra.c tests/test_resolver_lookup.c tests/test_resolver_proof_ownership.c tests/test_resolver_generation.c tests/test_resolver_proof.c tests/test_resolver_solver.c tests/test_resolver_stabilization.c tests/test_resolver_quality.c tests/test_resolver_capabilities.c tests/test_resolver_rust.c tests/test_resolver_py_types.c tests/test_resolver_cs.c tests/test_resolver_kotlin.c tests/test_resolver_php.c tests/test_resolver_python.c tests/test_resolver_diagnostics.c tests/test_resolver_java.c tests/test_resolver_binding_generic.c tests/test_resolver_c.c tests/test_resolver_binding_js.c tests/test_resolver_ts.c tests/test_resolver_symbols.c tests/test_resolver_go.c tests/test_resolver_integration.c tests/test_resolver_pipeline.c tests/test_resolver_binding.c tests/test_resolver_contract.c tests/test_resolver_types.c tests/test_registry.c tests/test_pipeline.c tests/test_pipeline_conventions.c tests/test_pipeline_frozen.c tests/test_importance.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_doclinks.c tests/test_doc_mentions.c tests/test_doc_links_md.c tests/test_doc_links_pdf.c tests/test_doc_links_rst.c tests/test_doc_links_adoc.c tests/test_doc_mentions_go.c tests/test_doc_mentions_jvm.c tests/test_doc_mentions_rs.c tests/test_doc_mentions_perl.c tests/test_doc_mentions_ts.c tests/test_doc_mentions_php.c tests/test_doc_mentions_c.c tests/test_diagrams.c tests/test_openapi.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 

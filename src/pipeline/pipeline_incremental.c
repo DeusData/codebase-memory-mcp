@@ -1,3 +1,4 @@
+#include "store/store_resolver.h"
 /*
  * pipeline_incremental.c — Disk-based incremental re-indexing.
  *
@@ -20,6 +21,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pass_lsp_cross.h"
 #include "sqlite3.h"
 #include "yyjson/yyjson.h"
+#include "pipeline/resolver_ecma.h"
 #include "pipeline/pipeline_internal.h"
 #include "helpers.h" /* cbm_fqn_module */
 #include "pipeline/doc_links.h"
@@ -237,6 +239,100 @@ static int semantic_manifest_hash_file_ex(const char *abs_path, char out[CBM_SHA
     return CBM_NOT_FOUND;
 }
 
+/* Probe every project-relative component without following symlinks. A missing
+ * parent proves absence; permission, encoding and other lookup failures do not. */
+static int semantic_input_probe(char *path, size_t root_length) {
+    cbm_path_info_t info;
+    char separator = path[root_length];
+    path[root_length] = '\0';
+    int status = cbm_path_info_utf8(path, &info);
+    path[root_length] = separator;
+    if (status != CBM_PATH_INFO_OK || !info.is_directory || info.is_symlink)
+        return CBM_PATH_INFO_UNAVAILABLE;
+    for (char *p = path + root_length + 1;; p++) {
+        if (*p && *p != '/')
+            continue;
+        char saved = *p;
+        *p = '\0';
+        status = cbm_path_info_utf8(path, &info);
+        *p = saved;
+        if (status == CBM_PATH_INFO_ABSENT)
+            return status;
+        if (status != CBM_PATH_INFO_OK || info.is_symlink ||
+            (saved ? !info.is_directory : !info.is_regular))
+            return CBM_PATH_INFO_UNAVAILABLE;
+        if (!saved)
+            return CBM_PATH_INFO_OK;
+    }
+}
+
+static bool semantic_input_relative(const char *relative) {
+    if (!relative || !relative[0] || relative[0] == '/')
+        return false;
+    const char *segment = relative;
+    for (const char *p = relative;; p++) {
+        if (*p == '\\' || *p == ':' || (*p && (unsigned char)*p < 32) || *p == 127)
+            return false;
+        if (*p && *p != '/')
+            continue;
+        size_t length = (size_t)(p - segment);
+        if (!length || (length == 1 && segment[0] == '.') ||
+            (length == 2 && segment[0] == '.' && segment[1] == '.') || segment[length - 1] == '.' ||
+            segment[length - 1] == ' ')
+            return false;
+        if (!*p)
+            return true;
+        segment = p + 1;
+    }
+}
+
+static bool semantic_input_read(const char *repo, const char *relative,
+                                cbm_gbuf_captured_input_t *input, cbm_pipeline_t *frozen) {
+    if (!repo || !repo[0] || !input || !semantic_input_relative(relative))
+        return false;
+    size_t root_length = strlen(repo), relative_length = strlen(relative);
+    if (root_length > SIZE_MAX - relative_length - 2)
+        return false;
+    size_t length = root_length + relative_length + 2;
+    char *path = cbm_alloc(CBM_MEM_CLASS_OTHER, length);
+    if (!path)
+        return false;
+    memcpy(path, repo, root_length);
+    path[root_length] = '/';
+    memcpy(path + root_length + 1, relative, relative_length + 1);
+    *input = (cbm_gbuf_captured_input_t){.relative_path = (char *)relative};
+    int state = semantic_input_probe(path, root_length);
+    bool ok = state == CBM_PATH_INFO_ABSENT;
+    if (state == CBM_PATH_INFO_OK) {
+        int64_t mtime = 0, bytes = 0;
+        ok = semantic_manifest_hash_file_ex(path, input->content_identity, &mtime, &bytes,
+                                            frozen) == 0 &&
+             bytes >= 0 && semantic_input_probe(path, root_length) == CBM_PATH_INFO_OK;
+        if (ok) {
+            input->present = true;
+            input->byte_length = (uint64_t)bytes;
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, path);
+    return ok;
+}
+
+bool cbm_pipeline_captured_inputs_match(cbm_pipeline_t *p, const cbm_gbuf_captured_input_t *inputs,
+                                        size_t count) {
+    if (!p || (count && !inputs))
+        return false;
+    const char *repo = cbm_pipeline_repo_path(p);
+    for (size_t i = 0; i < count; i++) {
+        cbm_gbuf_captured_input_t fresh;
+        if (cbm_pipeline_frozen_checkpoint(p) ||
+            !semantic_input_read(repo, inputs[i].relative_path, &fresh, p) ||
+            fresh.present != inputs[i].present || fresh.byte_length != inputs[i].byte_length ||
+            strcmp(fresh.content_identity, inputs[i].content_identity))
+            return false;
+    }
+    return true;
+}
+
 static int semantic_manifest_hash_file(const char *path, char out[CBM_SHA256_HEX_LEN + 1],
                                        int64_t *mtime, int64_t *size) {
     return semantic_manifest_hash_file_ex(path, out, mtime, size, NULL);
@@ -296,6 +392,62 @@ static int semantic_manifest_add_digest(semantic_manifest_builder_t *builder, co
         .mtime_ns = mtime_ns,
         .size = size,
     };
+    return 0;
+}
+
+/* Compose interpolation reads the default .env next to each Compose source,
+ * even when discovery ignores that file. Persist a namespaced state digest for
+ * every such directory, including confirmed absence, so later no-op checks and
+ * incremental planning cannot reuse a graph after an ignored input changes.
+ * Neither the manifest nor the capture catalog stores environment values. */
+static int semantic_manifest_compose_inputs(semantic_manifest_builder_t *builder,
+                                            const char *project, const char *repo,
+                                            const cbm_file_info_t *files, int count) {
+    static const char prefix[] = CBM_SEMANTIC_INPUT_PREFIX "compose-dotenv/";
+    static const char domain[] = "cbm-compose-dotenv-state-sha256-v1";
+    for (int i = 0; i < count; i++) {
+        const char *rel = files[i].rel_path;
+        if (!rel || files[i].language != CBM_LANG_YAML || !cbm_build_path(rel))
+            continue;
+        const char *slash = strrchr(rel, '/');
+        const char *base = slash ? slash + 1 : rel;
+        if (!strncmp(base, "skaffold", strlen("skaffold")))
+            continue;
+        size_t directory = slash ? (size_t)(slash + 1 - rel) : 0;
+        if (directory > SIZE_MAX - sizeof(prefix) - sizeof(".env"))
+            return CBM_NOT_FOUND;
+        size_t size = sizeof(prefix) - 1 + directory + sizeof(".env");
+        char *key = cbm_alloc(CBM_MEM_CLASS_OTHER, size);
+        if (!key)
+            return CBM_NOT_FOUND;
+        memcpy(key, prefix, sizeof(prefix) - 1);
+        char *env = key + sizeof(prefix) - 1;
+        memcpy(env, rel, directory);
+        memcpy(env + directory, ".env", sizeof(".env"));
+        int rc = 0;
+        if (!cbm_ht_has(builder->seen_paths, key)) {
+            cbm_gbuf_captured_input_t input;
+            if (!semantic_input_read(repo, env, &input, builder->frozen)) {
+                rc = CBM_NOT_FOUND;
+            } else {
+                cbm_sha256_ctx hash;
+                cbm_sha256_init(&hash);
+                cbm_sha256_update(&hash, domain, sizeof(domain));
+                unsigned char state[9] = {input.present ? 1 : 0};
+                for (size_t b = 0; b < 8; b++)
+                    state[b + 1] = (unsigned char)(input.byte_length >> (b * 8));
+                cbm_sha256_update(&hash, state, sizeof(state));
+                cbm_sha256_update(&hash, input.content_identity,
+                                  strlen(input.content_identity) + 1);
+                char digest[CBM_SHA256_HEX_LEN + 1];
+                semantic_manifest_finish_digest(&hash, digest);
+                rc = semantic_manifest_add_digest(builder, project, key, digest, 0, 0);
+            }
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        if (rc != 0)
+            return rc;
+    }
     return 0;
 }
 
@@ -597,6 +749,8 @@ int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *pr
     cbm_log_info("pass.timing", "pass", "semantic_manifest_hash", "files", itoa_buf(file_count),
                  "workers", itoa_buf(hash_workers), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_hash)));
+    if (rc == 0)
+        rc = semantic_manifest_compose_inputs(&builder, project, repo_path, files, file_count);
     if (rc == 0) {
         rc = semantic_manifest_walk_controls(&builder, project, repo_path, "", 0, excluded_dirs,
                                              excluded_count);
@@ -767,6 +921,9 @@ int cbm_pipeline_build_frozen_manifest(cbm_pipeline_t *p, const cbm_file_info_t 
             rc = semantic_manifest_add(&builder, cbm_pipeline_project_name(p), files[i].rel_path,
                                        files[i].path);
     }
+    if (rc == 0)
+        rc = semantic_manifest_compose_inputs(&builder, cbm_pipeline_project_name(p),
+                                              cbm_pipeline_repo_path(p), files, file_count);
     if (rc == 0)
         rc = semantic_manifest_walk_controls(&builder, cbm_pipeline_project_name(p),
                                              cbm_pipeline_repo_path(p), "", 0, excluded,
@@ -2092,6 +2249,8 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
          * the same origin-aware cross pass as a full sequential run. */
         if (rc == 0 && atomic_load(&ctx->test_definition_owners_seen)) {
             rc = cbm_pipeline_pass_lsp_cross(ctx, changed_files, ci, cache);
+            cbm_ecma_surfaces_free(ctx->ecma_surfaces);
+            ctx->ecma_surfaces = NULL;
         }
         if (rc == 0) {
             rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
@@ -3956,8 +4115,16 @@ static bool incr_doc_links_current(cbm_store_t *store, const char *project) {
     return current;
 }
 
+/* Rules and required resolver metadata can change independently of source.
+ * The generation receipt is invalidated by row writes and checked together
+ * with the required schema, without scanning resolver output on every no-op. */
+static bool incr_resolver_current(cbm_store_t *store, const char *project) {
+    bool present = false;
+    return cbm_store_resolver_current(store, project, &present) == CBM_STORE_OK && present;
+}
+
 /* The exact no-op test: the stored generation's metadata is current for this
- * mode, its doc-link layer is usable, and its recorded semantic manifest
+ * mode and resolver rules, its doc-link layer is usable, and its recorded semantic manifest
  * equals the baseline byte for byte. Read-only. The two out flags report the
  * halves the staged route also needs for its own routing. */
 static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const char *project,
@@ -3967,7 +4134,8 @@ static bool incr_generation_exact(cbm_pipeline_t *p, cbm_store_t *store, const c
     cbm_coverage_meta_t meta = {0};
     int meta_rc = cbm_store_coverage_meta_get(store, project, &meta);
     const char *mode_name = incr_mode_name(cbm_pipeline_get_mode(p));
-    bool metadata_current = incremental_metadata_current(meta_rc, &meta, mode_name);
+    bool metadata_current = incremental_metadata_current(meta_rc, &meta, mode_name) &&
+                            incr_resolver_current(store, project);
     /* A generation whose doc-link layer is missing or failed is not
      * current even with identical inputs: index_status tells the user to
      * re-run, and the re-run has to rebuild. */
@@ -4069,13 +4237,22 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_log_info("incremental.noop", "reason", "semantic_manifest_equal");
             return 0;
         }
-        if (force_full_on_mismatch) {
+        bool resolver_requires_full = false;
+        if (cbm_store_resolver_requires_full(store, project, &resolver_requires_full) !=
+            CBM_STORE_OK) {
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+            return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        }
+        if (force_full_on_mismatch || resolver_requires_full) {
             cbm_store_free_file_hashes(stored, stored_count);
             cbm_store_close(store);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
             incr_test_set_last_route(CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 #endif
-            cbm_log_info("incremental.force_full", "reason", "mode_downgrade_changed");
+            cbm_log_info("incremental.force_full", "reason",
+                         resolver_requires_full ? "resolver_negative_dependencies"
+                                                : "mode_downgrade_changed");
             return CBM_PIPELINE_FORCE_FULL_REINDEX;
         }
         /* Manifest delta. Closure repair recomputes exactly the changed

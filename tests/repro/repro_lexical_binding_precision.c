@@ -409,13 +409,18 @@ TEST(repro_python_method_default_uses_class_namespace) {
     CBMFileResult *result = lb_extract(source, CBM_LANG_PYTHON, "method_default_class_scope.py");
     ASSERT_NOT_NULL(result);
     ASSERT_FALSE(result->has_error || result->parse_incomplete);
-    LBBindingSite usage = lb_binding_site(result, "method", "handler", site);
+    ASSERT_NOT_NULL(result->module_qn);
+    /* The class statement executes in the module; the not-yet-called method
+     * cannot own this occurrence even though its class namespace binds it. */
+    LBBindingSite usage = lb_binding_site(result, result->module_qn, "handler", site);
+    LBBindingSite wrong_owner = lb_binding_site(result, "method", "handler", site);
     cbm_free_result(result);
 
     ASSERT_EQ(usage.count, 1);
     ASSERT_EQ(usage.value_count, 1);
     ASSERT_EQ(usage.blocked_count, 1);
     ASSERT_EQ(usage.local_shadow_count, 1);
+    ASSERT_EQ(wrong_owner.count, 0);
     PASS();
 }
 
@@ -923,13 +928,15 @@ TEST(repro_python_default_expression_uses_enclosing_namespace) {
     CBMFileResult *result = lb_extract(source, CBM_LANG_PYTHON, "default_scope.py");
     ASSERT_NOT_NULL(result);
     ASSERT_FALSE(result->has_error || result->parse_incomplete);
-    LBBindingSite usage = lb_binding_site(result, "nested", "handler", site);
+    LBBindingSite usage = lb_binding_site(result, "outer", "handler", site);
+    LBBindingSite wrong_owner = lb_binding_site(result, "nested", "handler", site);
     cbm_free_result(result);
 
     ASSERT_EQ(usage.count, 1);
     ASSERT_EQ(usage.value_count, 1);
     ASSERT_EQ(usage.blocked_count, 0);
     ASSERT_EQ(usage.local_shadow_count, 0);
+    ASSERT_EQ(wrong_owner.count, 0);
     PASS();
 }
 

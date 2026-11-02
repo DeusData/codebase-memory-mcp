@@ -92,6 +92,7 @@ static void py_memo_test_stage(PyLSPContext *ctx, const char *stage) {
 }
 
 void cbm_py_lsp_record_failure(CBMFileResult *result, CBMLSPStatus status) {
+    result->lsp_failed = true;
     result->has_error = true;
     result->lsp_skipped = true;
     /* Static lifetime also works when the result arena cannot allocate. */
@@ -6224,6 +6225,11 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name; /* borrowed — d outlives this call */
             rt.short_name = d->short_name;
+            rt.project_source = true;
+            rt.export_binding_proven = d->export_binding_proven;
+            rt.source_flags = d->source_flags;
+            rt.declaration_identity = d->declaration_identity;
+            rt.graph_qualified_name = d->graph_qualified_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0 ||
                               strcmp(d->label, "Protocol") == 0;
             rt.embedded_types = py_split_pipe(arena, d->embedded_types);
@@ -6254,6 +6260,11 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name; /* borrowed */
             rf.short_name = d->short_name;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.source_flags = d->source_flags;
+            rf.declaration_identity = d->declaration_identity;
+            rf.graph_qualified_name = d->graph_qualified_name;
+            rf.sig = d->sig;
             py_register_func_decorators(&rf, d->decorators);
 
             // Build FUNC type from "|"-separated return types.

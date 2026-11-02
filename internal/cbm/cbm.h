@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "arena.h"
+#include "resolve/model.h"
 #include "tree_sitter/api.h"
 
 /* Field lookups by NAME resolve the name with a linear strncmp scan over the
@@ -353,8 +354,9 @@ typedef struct {
 #define CBM_MACRO_QN_SUFFIX "#macro"
 
 /* Byte offsets are meaningful only within the source buffer that produced
- * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
- * buffers can contain unrelated occurrences at the same numeric span. */
+ * them. PREPROCESSED covers transformed coordinates, including generated UDL
+ * from Studio Export XML. Composite results with distinct generated buffers
+ * have no single transformed identity and cannot attest a mapped occurrence. */
 typedef enum {
     CBM_SOURCE_ORIGIN_RAW = 0,
     CBM_SOURCE_ORIGIN_PREPROCESSED,
@@ -398,13 +400,22 @@ typedef struct {
                                      // guard's unique-name exemption. Default false.
 } CBMCall;
 
-// What an import statement names, when the syntax says so. Only PHP's
-// `use function` / `use const` set a non-default kind today: they name a
-// namespace MEMBER, so they must never be mapped to a class file (#1186).
+// What an import statement names, when the syntax says so. PHP namespace
+// members, C include delimiters, and Rust module declarations carry distinct
+// evidence and must not be conflated with a default module/class binding.
 typedef enum {
-    CBM_IMPORT_KIND_DEFAULT = 0, // module / class / namespace (language default)
-    CBM_IMPORT_KIND_FUNCTION,    // PHP `use function A\b`
-    CBM_IMPORT_KIND_CONST,       // PHP `use const A\B`
+    CBM_IMPORT_KIND_DEFAULT = 0,           // module / class / namespace (language default)
+    CBM_IMPORT_KIND_FUNCTION,              // PHP `use function A\b`
+    CBM_IMPORT_KIND_CONST,                 // PHP `use const A\B`
+    CBM_IMPORT_KIND_INCLUDE_QUOTED,        // C-family include relative to the importing file
+    CBM_IMPORT_KIND_INCLUDE_SYSTEM,        // C-family include requiring configured search roots
+    CBM_IMPORT_KIND_MODULE_DECLARATION,    // Rust `mod name;` file membership
+    CBM_IMPORT_KIND_PYTHON_MODULE_ROOT,    // `import a.b`: binds root a
+    CBM_IMPORT_KIND_PYTHON_MODULE_ALIAS,   // `import a.b as x`: binds module a.b
+    CBM_IMPORT_KIND_PYTHON_FROM,           // `from a import b`: binds member/submodule b
+    CBM_IMPORT_KIND_LITERAL_RELATIVE_PATH, // audited complete literal, relative to source file
+    CBM_IMPORT_KIND_PHP_INCLUDE_UNPROVEN,  // runtime include lookup has no captured path authority
+    CBM_IMPORT_KIND_DART_PACKAGE_URI,      // audited complete Dart `package:` literal
 } CBMImportKind;
 
 typedef struct {
@@ -416,6 +427,9 @@ typedef struct {
     bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
                              // binds the name for annotations, never at runtime (#1277)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
+    /* Exact parsed import clause/path in the original source. Zero spans retain
+     * an extraction-quality gap and can never authorize a dependency edge. */
+    uint32_t site_start_byte, site_end_byte, source_origin;
 } CBMImport;
 
 /* True when an import binds its local name at runtime. A Python import under
@@ -540,11 +554,19 @@ typedef struct {
     bool is_member_access;         // var_name is the field half of a selector/member LHS
                                    // (`t.err = x` → "err"); the receiver is stripped here,
                                    // so this is the only record of selector shape (#1962)
+    uint32_t site_start_byte;      // exact written identifier, not the containing assignment
+    uint32_t site_end_byte;
+    CBMSourceOrigin source_origin;
 } CBMReadWrite;
 
 typedef struct {
     const char *type_name;         // referenced type/class name
     const char *enclosing_func_qn; // QN of enclosing function
+    uint32_t site_start_byte;      // annotation syntax in source_origin's buffer
+    uint32_t site_end_byte;
+    uint32_t lexical_scope_id; // extraction-local; zero means unavailable
+    CBMSourceOrigin source_origin;
+    bool site_is_exact; // span is precisely type_name, not a stripped wrapper
 } CBMTypeRef;
 
 typedef struct {
@@ -552,10 +574,23 @@ typedef struct {
     const char *enclosing_func_qn; // QN of enclosing function
 } CBMEnvAccess;
 
+typedef enum {
+    CBM_TYPE_ASSIGN_UNSPECIFIED = 0,
+    CBM_TYPE_ASSIGN_CONSTRUCTOR_SYNTAX, // new/object/composite/struct expression; still unresolved
+    CBM_TYPE_ASSIGN_NAMING_HINT,        // Foo() or New...Client/Stub; never type proof
+} CBMTypeAssignKind;
+
 typedef struct {
     const char *var_name;          // variable being assigned
     const char *type_name;         // class/type name of RHS constructor
     const char *enclosing_func_qn; // QN of enclosing function
+    uint32_t site_start_byte;      // LHS binding syntax, not a binding identity by itself
+    uint32_t site_end_byte;
+    uint32_t value_start_byte; // RHS expression for a language adapter to resolve
+    uint32_t value_end_byte;
+    uint32_t lexical_scope_id; // extraction-local; zero means unavailable
+    CBMSourceOrigin source_origin;
+    CBMTypeAssignKind kind;
 } CBMTypeAssign;
 
 // String reference: URL, config key, or async target found in source.
@@ -623,10 +658,14 @@ typedef struct {
 typedef enum {
     CBM_RESOLVED_INVOCATION = 0,
     CBM_RESOLVED_CALL_REFERENCE,
-    /* C-family member access `a.b` / `a->b`: callee_qn is the Field `b` of the
-     * type of `a`. One row per (caller, field), not per occurrence, and no site
-     * span: the join is by enclosing function and member name. */
+    /* C-family member access at the exact field-identifier occurrence.
+     * Field ownership alone never identifies a function-pointer call target. */
     CBM_RESOLVED_FIELD_REFERENCE,
+    /* A source annotation or explicit type name bound to its declaration. */
+    CBM_RESOLVED_TYPE_REFERENCE,
+    /* Exact source value binding, with no assertion of callable identity.
+     * A Function/Method graph label does not upgrade this proof to a call. */
+    CBM_RESOLVED_VALUE_REFERENCE,
 } CBMResolvedKind;
 
 // LSP-resolved invocation/reference: high-confidence type-aware resolution.
@@ -644,6 +683,7 @@ typedef struct {
      * appended to callee_qn when the edge is written; NULL = none (always,
      * until a language enables its callable_identity mode). */
     const char *callee_sig;
+    cbm_resolve_evidence_t evidence; // zero means the adapter supplied no binding proof
 } CBMResolvedCall;
 
 typedef struct {
@@ -770,7 +810,12 @@ typedef enum {
     CBM_K8S_FACT_SOURCE,
     CBM_K8S_FACT_IMAGE,
     CBM_K8S_FACT_ENV,
-    CBM_K8S_FACT_PATCH
+    CBM_K8S_FACT_PATCH,
+    /* Raw declaration/document census and flat Kustomize configuration inputs. */
+    CBM_K8S_FACT_DECLARATION,
+    CBM_K8S_FACT_FILE,
+    CBM_K8S_FACT_CONFIGURATION,
+    CBM_K8S_FACT_MEMBER
 } CBMK8sFactKind;
 typedef struct {
     CBMK8sFactKind fact;
@@ -790,8 +835,11 @@ typedef struct {
     const char *url;      /* DEPLOY (kustomize): the chart repository */
     const char *release;  /* DEPLOY (kustomize): the release name */
     int line;
-    int start_line; /* IMAGE: the container mapping's first line */
-    int end_line;   /* IMAGE: its last line */
+    int start_line;           /* IMAGE: the container mapping's first line */
+    int end_line;             /* IMAGE: its last line */
+    uint32_t site_start_byte; /* exact raw scalar syntax, including quotes */
+    uint32_t site_end_byte;
+    bool proof_supported; /* validated literal syntax and unique mapping keys */
 } CBMK8sFact;
 
 typedef struct {
@@ -860,6 +908,16 @@ typedef struct {
     bool failed;
 } CBMDocLinkArray;
 
+/* Frozen at the extraction-to-resolver handoff. Cross-LSP failures belong
+ * to the later semantic analysis and must not rewrite extraction quality. */
+typedef struct {
+    bool captured;
+    bool has_error;
+    bool parse_unusable;
+    bool parse_incomplete;
+    bool walk_truncated;
+} CBMResolverExtractionState;
+
 // Full extraction result for one file.
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
@@ -927,6 +985,10 @@ typedef struct CBMFileResult {
      * unified-extractor defs stay). Set by cbm_extract_file_ex, honoured by
      * cbm_pxc_dispatch_file -- one site for every language. */
     bool lsp_skipped;
+    /* Explicit evaluator failure, unlike lsp_skipped's budget-only skips.
+     * has_error remains set so semantic proof consumers still abstain. */
+    bool lsp_failed;
+    CBMResolverExtractionState resolver_extraction_state;
     /* The unified walk stopped at its CPU budget: defs/calls/usages found up
      * to that point are kept, the rest of the file is not walked. Implies
      * lsp_skipped. */
@@ -947,6 +1009,13 @@ typedef struct CBMFileResult {
     // file (defs/calls already extracted are unaffected).
     const char *source;
     int source_len;
+    /* Captured at extraction, before either source buffer can be released.
+     * Origins never borrow each other's coordinates or content identity. */
+    const char *source_project;
+    const char *source_file;
+    char source_content_id[2][65];
+    uint64_t source_content_length[2];
+    char source_configuration_id[65];
 
     // Composite extraction results (currently ObjectScript Studio Export)
     // retain their per-unit results so shallow-copied carrier strings remain
@@ -1097,6 +1166,9 @@ typedef struct {
      * The core never reads, interprets or frees it. It is the only place for
      * such state: a static or thread-local cache is not. */
     void *doclink_state;
+    /* C#: the parse of the file itself when `root` reads it through a view that hid a branch of
+     * a conditional (cbm_parse_source_repairing_ex); null otherwise. Alive for this call only. */
+    TSNode unrepaired_root;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1208,11 +1280,39 @@ void cbm_result_compact_release_thread(void);
 TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
                          TSParseOptions opts);
 
+/* cbm_parse_source, then for a C# file the grammar could not read, a parse of a
+ * same-length view of it. Offsets and lines are the source's own. */
+TSTree *cbm_parse_source_repairing(TSParser *parser, CBMLanguage language, const char *source,
+                                   uint32_t source_len, TSParseOptions opts);
+/* As above. When the view that was used hid a branch of a conditional, *unrepaired receives the
+ * parse of the file itself, for a reader that must see what the view left out; the caller deletes
+ * it. Otherwise *unrepaired is left alone. */
+TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, const char *source,
+                                      uint32_t source_len, TSParseOptions opts,
+                                      TSTree **unrepaired);
+/* As above for C-family source. A word that can only be an attribute macro is left out
+ * of the parse, so `class LLVM_ABI StringRef {` reads as the class. Offsets and positions
+ * stay those of the real file. Every C-family whole-file parse goes through here, so the
+ * extraction and the semantic passes read one tree shape. */
+TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
+                           TSParseOptions opts);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file tree-sitter parse budget in microseconds of the
 // calling thread's CPU time, with a wall-clock backstop of
 // CBM_PARSE_WALL_CEILING_FACTOR x the budget (0 = no budget).
+/* Capture an uninitialized result's physical source identity and transform
+ * configuration. Does not retain bytes, parse, map spans or authorize edges.
+ * An existing raw identity cannot be replaced through this initializer. */
+bool cbm_result_capture_raw_source(CBMFileResult *result, const char *source, int source_len,
+                                   CBMLanguage language, const char **extra_defines,
+                                   const char **include_paths);
+/* Compare supplied bytes to the immutable analyzed snapshot, never to a
+ * freshly reconstructed identity. Missing identities fail closed. */
+bool cbm_result_source_matches(const CBMFileResult *result, const char *source, size_t length,
+                               CBMSourceOrigin origin);
+
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL
@@ -1386,6 +1486,9 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // contains a dbt builtin call. Defined in extract_dbt.c.
 void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
+/* Owned inner tree for one fully audited Vue/Svelte inline script. Absolute
+ * source coordinates are preserved; NULL means the host domain is unproved. */
+TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TSRange *range);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);

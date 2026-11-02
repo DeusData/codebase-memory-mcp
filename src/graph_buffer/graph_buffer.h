@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include "resolve/record.h"
+#include "resolve/imports.h"
+#include "foundation/sha256.h"
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -19,6 +22,61 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 /* Forward declare store for dump path */
 typedef struct cbm_store cbm_store_t;
+
+/* Resolution diagnostics are separate from endpoint-deduplicated graph edges.
+ * Each worker records into its own buffer; merge copies and interns strings. */
+bool cbm_gbuf_record_resolution(cbm_gbuf_t *gb, const cbm_resolve_record_t *record);
+/* Make room for rows about to be merged, at their exact number. A doubling array
+ * ends up to twice its contents and briefly holds both generations while the
+ * largest allocation of the resolve phase is copied. */
+bool cbm_gbuf_reserve_resolutions(cbm_gbuf_t *gb, size_t additional);
+size_t cbm_gbuf_resolution_count(const cbm_gbuf_t *gb);
+const cbm_resolve_record_t *cbm_gbuf_resolutions(const cbm_gbuf_t *gb, size_t *count);
+bool cbm_gbuf_resolutions_complete(const cbm_gbuf_t *gb);
+/* Analysis/publication failure prevents sealing this generation. */
+void cbm_gbuf_fail_resolutions(cbm_gbuf_t *gb);
+/* Deterministic proof clone/intern work, including repeated existing facts. */
+uint64_t cbm_gbuf_resolution_proof_work(const cbm_gbuf_t *gb);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Spend proof work up front, so a test reaches a large project's position without
+ * having to build one. */
+void cbm_gbuf_test_add_resolution_proof_work(cbm_gbuf_t *gb, uint64_t work);
+#endif
+/* Begin/end bound memo lifetime to immutable source arenas (one file or merged
+ * worker buffer). Borrowed shared roots are sealed together before teardown. */
+bool cbm_gbuf_resolution_begin(cbm_gbuf_t *gb);
+void cbm_gbuf_resolution_end(cbm_gbuf_t *gb);
+bool cbm_gbuf_resolutions_own_shared(cbm_gbuf_t *gb);
+bool cbm_gbuf_record_resolver_file(cbm_gbuf_t *gb, const cbm_resolve_file_t *file);
+const cbm_resolve_file_t *cbm_gbuf_resolver_files(const cbm_gbuf_t *gb, size_t *count);
+bool cbm_gbuf_record_resolver_summary(cbm_gbuf_t *gb, const cbm_resolve_summary_t *summary);
+const cbm_resolve_summary_t *cbm_gbuf_resolver_summaries(const cbm_gbuf_t *gb, size_t *count);
+
+/* Resolver-owned immutable import facts, indexed by source file. These are
+ * semantic inputs independent of graph nodes, edges and their JSON properties.
+ * A replacement invalidates the preceding snapshot before it is constructed. */
+void cbm_gbuf_forget_imports(cbm_gbuf_t *gb, const char *file);
+bool cbm_gbuf_capture_imports(cbm_gbuf_t *gb, const cbm_resolve_import_snapshot_t *snapshot);
+const cbm_resolve_import_snapshot_t *cbm_gbuf_imports(const cbm_gbuf_t *gb, const char *file);
+
+/* Supplemental semantic inputs retain only presence, exact byte length and
+ * SHA-256 of the analyzed buffer. Paths must be canonical project-relative
+ * paths. A confirmed absent input has length zero and no digest. Registration
+ * is single-writer like the rest of the graph buffer; worker merges preserve
+ * inputs and fail closed on conflicting snapshots or allocation failure. */
+typedef struct {
+    char *relative_path;
+    bool present;
+    uint64_t byte_length;
+    char content_identity[CBM_SHA256_HEX_LEN + 1];
+} cbm_gbuf_captured_input_t;
+bool cbm_gbuf_capture_input(cbm_gbuf_t *gb, const char *relative_path, bool present,
+                            uint64_t byte_length, const char *content_identity);
+/* Transfer metadata ownership before the graph buffer is released. Registration
+ * after a successful take is an error. The caller releases it with free below. */
+bool cbm_gbuf_take_captured_inputs(cbm_gbuf_t *gb, cbm_gbuf_captured_input_t **inputs,
+                                   size_t *count);
+void cbm_gbuf_free_captured_inputs(cbm_gbuf_captured_input_t *inputs, size_t count);
 
 /* ── Node / Edge structs (owned by the buffer) ───────────────────── */
 

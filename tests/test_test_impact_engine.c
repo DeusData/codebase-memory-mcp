@@ -15,6 +15,10 @@
 #include "foundation/platform.h"
 #include "foundation/subprocess.h"
 #include "mcp/test_impact_engine.h"
+#include "mcp/test_impact_engine_internal.h"
+#include "foundation/mem_core.h"
+#include "store/store_resolver.h"
+#include <sqlite3.h>
 
 #include <limits.h>
 #include <stdio.h>
@@ -1240,7 +1244,412 @@ TEST(test_impact_engine_spawning_tests_follow_main) {
     PASS();
 }
 
+/* Consumer fixtures deliberately contain no CALLS edges for their withheld
+ * calls. Persisted misses are selection uncertainty, never graph evidence. */
+typedef struct {
+    te_ctx_t c;
+    char diagnostic[512];
+} tie_miss_fixture_t;
+
+static bool tie_miss_open(tie_miss_fixture_t *f, const char *const *files, int count) {
+    memset(f, 0, sizeof(*f));
+    cbm_arena_init(&f->c.arena);
+    f->c.diagnostic = f->diagnostic;
+    f->c.diagnostic_len = sizeof(f->diagnostic);
+    f->c.store = cbm_store_open_memory();
+    f->c.source = cbm_ti_source_new();
+    f->c.model = cbm_test_model_new(cbm_test_conventions_cbm());
+    const char *config_dir = th_mktempdir("cbm-ti-miss-config");
+    if (!config_dir)
+        return false;
+    /* Optional absence is represented by a loaded config object. A NULL
+     * config is an initialization failure, not the built-in policy. */
+    f->c.config = cbm_test_config_load(TH_PATH(config_dir, "absent.json"), true);
+    int config_cleanup = th_rmtree(config_dir);
+    f->c.policy = cbm_test_policy_new(f->c.config);
+    if (config_cleanup != 0)
+        return false;
+    if (!f->c.store || !f->c.source || !f->c.model || !f->c.policy ||
+        cbm_store_upsert_project(f->c.store, "test-impact", "/tmp/test-impact") != CBM_STORE_OK)
+        return false;
+    f->c.graph = cbm_ti_graph_new(f->c.store, "test-impact");
+    if (!f->c.graph)
+        return false;
+    for (int i = 0; i < count; i++) {
+        const char *path = files[2 * i], *source = files[2 * i + 1];
+        if (!cbm_ti_source_add(f->c.source, path, source, strlen(source)) ||
+            (strncmp(path, "tests/", 6) == 0 &&
+             !cbm_test_model_add_source(f->c.model, path, source, strlen(source))))
+            return false;
+    }
+    return cbm_ti_source_finish(f->c.source) && cbm_test_model_finish(f->c.model);
+}
+
+static const char *tie_miss_qn(tie_miss_fixture_t *f, const char *file, const char *name) {
+    char qn[512];
+    int n = snprintf(qn, sizeof(qn), "test-impact.%s.%s", file, name);
+    return n > 0 && (size_t)n < sizeof(qn) ? cbm_arena_strdup(&f->c.arena, qn) : NULL;
+}
+
+static int64_t tie_miss_node(tie_miss_fixture_t *f, const char *file, const char *name,
+                             const char *label, int first, int last) {
+    cbm_node_t node = {.project = "test-impact",
+                       .label = label,
+                       .name = name,
+                       .qualified_name = tie_miss_qn(f, file, name),
+                       .file_path = file,
+                       .start_line = first,
+                       .end_line = last};
+    return node.qualified_name ? cbm_store_upsert_node(f->c.store, &node) : -1;
+}
+
+static cbm_resolve_record_t tie_miss_row(tie_miss_fixture_t *f, const char *file, const char *owner,
+                                         const char *spelling) {
+    return (cbm_resolve_record_t){.file_path = file,
+                                  .scope = tie_miss_qn(f, file, owner),
+                                  .relation = "CALLS",
+                                  .spelling = spelling,
+                                  .start_byte = 1,
+                                  .end_byte = 2,
+                                  .source_origin = CBM_SOURCE_ORIGIN_RAW,
+                                  .result = {.binding = CBM_RESOLVE_BINDING_UNRESOLVED,
+                                             .analysis = CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+                                             .reason = "consumer-fixture-withheld-call"}};
+}
+
+static bool tie_miss_seed(tie_miss_fixture_t *f, const char *path, int line) {
+    static const char *const added[] = {"return changed_value;"};
+    cbm_diff_hunk_t hunk = {.start = line, .count = 1, .added = added, .added_count = 1};
+    cbm_ti_change_t change = {.path = path,
+                              .whole_file = line == 0,
+                              .hunks = line ? &hunk : NULL,
+                              .hunk_count = line ? 1 : 0};
+    cbm_ti_seed_input_t input = {.changes = &change,
+                                 .change_count = 1,
+                                 .model = f->c.model,
+                                 .source = f->c.source,
+                                 .graph = f->c.graph};
+    return cbm_ti_seed(&input, &f->c.seeds) == CBM_TI_SEED_OK &&
+           cbm_store_read_scope_open(f->c.store, NULL, NULL, &f->c.scope) == CBM_STORE_OK;
+}
+
+static bool tie_miss_selected(const tie_miss_fixture_t *f, const char *name) {
+    for (int i = 0; i < f->c.reach_count; i++)
+        if (strcmp(f->c.reach[i].test, name) == 0 && f->c.reach[i].reached)
+            return true;
+    return false;
+}
+
+static bool tie_miss_fallback(const tie_miss_fixture_t *f, cbm_test_result_fallback_t code) {
+    for (int i = 0; i < f->c.fallback_count; i++)
+        if (f->c.fallbacks[i] == code)
+            return true;
+    return false;
+}
+
+static void tie_miss_close(tie_miss_fixture_t *f) {
+    if (f->c.scope)
+        (void)cbm_store_read_scope_close(f->c.scope);
+    cbm_ti_seeds_free(f->c.seeds);
+    cbm_test_policy_free(f->c.policy);
+    cbm_test_config_free(f->c.config);
+    cbm_test_model_free(f->c.model);
+    cbm_ti_source_free(f->c.source);
+    cbm_ti_graph_free(f->c.graph);
+    if (f->c.store)
+        cbm_store_close(f->c.store);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, f->c.fallbacks);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, f->c.triggers);
+    cbm_arena_destroy(&f->c.arena);
+}
+
+static const char tie_miss_cases[] =
+    "TEST(owner) {\n    return target();\n}\n"
+    "TEST(decoy) {\n    return 0;\n}\n"
+    "SUITE(alpha) {\n    RUN_TEST(owner);\n    RUN_TEST(decoy);\n}\n";
+static const char tie_miss_runner[] =
+    "int main(void) {\n    RUN_SELECTED_SUITE(alpha);\n    return 0;\n}\n";
+
+static bool tie_miss_basic(tie_miss_fixture_t *f) {
+    const char *const files[] = {"src/lib.c",          "int target(void) { return 1; }\n",
+                                 "tests/test_cases.c", tie_miss_cases,
+                                 "tests/test_main.c",  tie_miss_runner};
+    return tie_miss_open(f, files, 3) &&
+           tie_miss_node(f, "src/lib.c", "target", "Function", 1, 1) > 0 &&
+           tie_miss_node(f, "tests/test_cases.c", "owner", "Function", 1, 3) > 0 &&
+           tie_miss_node(f, "tests/test_cases.c", "decoy", "Function", 4, 6) > 0 &&
+           tie_miss_node(f, "tests/test_cases.c", "alpha", "Function", 7, 10) > 0 &&
+           tie_miss_node(f, "tests/test_main.c", "main", "Function", 1, 4) > 0;
+}
+
+TEST(test_impact_engine_resolver_miss_selects_exact_owner_without_an_edge) {
+    for (int origin = 0; origin < 2; origin++) {
+        tie_miss_fixture_t f;
+        ASSERT_TRUE(tie_miss_basic(&f));
+        cbm_resolve_record_t row = tie_miss_row(&f, "tests/test_cases.c", "owner", "target");
+        if (origin) {
+            /* Expanded bytes are deliberately outside the raw file. Scope,
+             * never a raw interpretation of expanded offsets, identifies owner. */
+            row.source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+            row.start_byte = 40000;
+            row.end_byte = 40006;
+        }
+        ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", &row, 1), CBM_STORE_OK);
+        ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));
+        ASSERT_TRUE(te_reach(&f.c));
+        ASSERT_TRUE(tie_miss_selected(&f, "owner"));
+        ASSERT_FALSE(tie_miss_selected(&f, "decoy"));
+        ASSERT_FALSE(tie_miss_fallback(&f, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED));
+        ASSERT_EQ(cbm_store_count_edges_by_type(f.c.store, "test-impact", "CALLS"), 0);
+        tie_miss_close(&f);
+    }
+    PASS();
+}
+
+TEST(test_impact_engine_resolver_miss_unknown_owner_uses_its_whole_file) {
+    tie_miss_fixture_t f;
+    ASSERT_TRUE(tie_miss_basic(&f));
+    cbm_resolve_record_t row = tie_miss_row(&f, "tests/test_cases.c", "missing_owner", "target");
+    /* A real QN from another file must not masquerade as the owner. */
+    row.scope = tie_miss_qn(&f, "src/lib.c", "target");
+    ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", &row, 1), CBM_STORE_OK);
+    ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));
+    ASSERT_TRUE(te_reach(&f.c));
+    ASSERT_TRUE(tie_miss_selected(&f, "owner"));
+    ASSERT_TRUE(tie_miss_selected(&f, "decoy"));
+    ASSERT_EQ(cbm_store_count_edges_by_type(f.c.store, "test-impact", "CALLS"), 0);
+    tie_miss_close(&f);
+    PASS();
+}
+
+TEST(test_impact_engine_resolver_miss_ignores_unwalked_relations) {
+    tie_miss_fixture_t f;
+    ASSERT_TRUE(tie_miss_basic(&f));
+    cbm_resolve_record_t row = tie_miss_row(&f, "tests/test_cases.c", "owner", "target");
+    row.relation = "IMPORTS";
+    ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", &row, 1), CBM_STORE_OK);
+    ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));
+    ASSERT_TRUE(te_reach(&f.c));
+    ASSERT_FALSE(tie_miss_selected(&f, "owner"));
+    ASSERT_FALSE(tie_miss_selected(&f, "decoy"));
+    tie_miss_close(&f);
+    PASS();
+}
+
+TEST(test_impact_engine_resolver_miss_preserves_runner_sink_namesakes) {
+    for (int include_function = 0; include_function < 2; include_function++) {
+        const char *const files[] = {
+            "src/lib.c",          "struct Shape { int alpha; };\nint alpha(void) { return 1; }\n",
+            "tests/test_cases.c", tie_miss_cases,
+            "tests/test_main.c",  tie_miss_runner};
+        tie_miss_fixture_t f;
+        ASSERT_TRUE(tie_miss_open(&f, files, 3));
+        ASSERT_TRUE(tie_miss_node(&f, "src/lib.c", "alpha", "Field", 1, 1) > 0);
+        /* Use a distinct exact QN for the namesake while retaining its short name. */
+        cbm_node_t fn = {.project = "test-impact",
+                         .name = "alpha",
+                         .label = "Function",
+                         .qualified_name = "test-impact.src.other.alpha",
+                         .file_path = "src/lib.c",
+                         .start_line = 2,
+                         .end_line = 2};
+        ASSERT_TRUE(cbm_store_upsert_node(f.c.store, &fn) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "owner", "Function", 1, 3) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "decoy", "Function", 4, 6) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "alpha", "Function", 7, 10) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_main.c", "main", "Function", 1, 4) > 0);
+        cbm_resolve_record_t row = tie_miss_row(&f, "tests/test_main.c", "main", "alpha");
+        ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", &row, 1), CBM_STORE_OK);
+        ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", include_function ? 0 : 1));
+        ASSERT_TRUE(te_reach(&f.c));
+        ASSERT_EQ(tie_miss_fallback(&f, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED),
+                  include_function != 0);
+        if (include_function)
+            ASSERT_NOT_NULL(strstr(f.diagnostic, "main -> other.alpha"));
+        tie_miss_close(&f);
+    }
+    PASS();
+}
+
+TEST(test_impact_engine_resolver_misses_feed_role_and_spawn_fixpoints) {
+    for (int spawn = 0; spawn < 2; spawn++) {
+        static const char runner[] =
+            "int role_probe(void) { return target(); }\n"
+            "TF_ROLE(EARLY, \"--probe\", role_probe)\n"
+            "int main(void) {\n    RUN_SELECTED_SUITE(alpha);\n    return role_probe();\n}\n";
+        static const char cases[] =
+            "int start_probe(void) { const char *role = \"--probe\"; return 0; }\n"
+            "TEST(owner) {\n    return start_probe();\n}\n"
+            "TEST(decoy) {\n    return 0;\n}\n"
+            "SUITE(alpha) {\n    RUN_TEST(owner);\n    RUN_TEST(decoy);\n}\n";
+        const char *const files[] = {"src/lib.c",          "int target(void) { return 1; }\n",
+                                     "src/main.c",         "int main(void) { return target(); }\n",
+                                     "tests/test_cases.c", cases,
+                                     "tests/test_main.c",  runner};
+        tie_miss_fixture_t f;
+        ASSERT_TRUE(tie_miss_open(&f, files, 4));
+        ASSERT_TRUE(tie_miss_node(&f, "src/lib.c", "target", "Function", 1, 1) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "src/main.c", "main", "Function", 1, 1) > 0);
+        int64_t handler = tie_miss_node(&f, "tests/test_main.c", "role_probe", "Function", 1, 1);
+        ASSERT_TRUE(handler > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_main.c", "main", "Function", 3, 6) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "start_probe", "Function", 1, 1) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "owner", "Function", 2, 4) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "decoy", "Function", 5, 7) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", "alpha", "Function", 8, 11) > 0);
+        if (spawn) {
+            int64_t process = tie_miss_node(&f, "tests/test_main.c", "child", "Process", 1, 1);
+            ASSERT_TRUE(process > 0);
+            cbm_edge_t edge = {.project = "test-impact",
+                               .source_id = handler,
+                               .target_id = process,
+                               .type = "SPAWNS"};
+            ASSERT_TRUE(cbm_store_insert_edge(f.c.store, &edge) > 0);
+        }
+        cbm_resolve_record_t rows[] = {
+            tie_miss_row(&f, spawn ? "src/main.c" : "tests/test_main.c",
+                         spawn ? "main" : "role_probe", "target"),
+            tie_miss_row(&f, "tests/test_cases.c", "owner", "start_probe"),
+            tie_miss_row(&f, "tests/test_main.c", "main", "role_probe")};
+        ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", rows, 3), CBM_STORE_OK);
+        ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));
+        ASSERT_TRUE(te_reach(&f.c));
+        ASSERT_TRUE(tie_miss_selected(&f, "owner"));
+        ASSERT_FALSE(tie_miss_selected(&f, "decoy"));
+        ASSERT_FALSE(tie_miss_fallback(&f, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED));
+        ASSERT_EQ(cbm_store_count_edges_by_type(f.c.store, "test-impact", "CALLS"), 0);
+        tie_miss_close(&f);
+    }
+    PASS();
+}
+
+static int tie_miss_deny_read(void *unused, int action, const char *table, const char *column,
+                              const char *database, const char *trigger) {
+    (void)unused;
+    (void)column;
+    (void)database;
+    (void)trigger;
+    return action == SQLITE_READ && table && strcmp(table, "resolver_occurrences") == 0
+               ? SQLITE_DENY
+               : SQLITE_OK;
+}
+
+TEST(test_impact_engine_resolver_metadata_failures_are_uncertainty) {
+    for (int mode = 0; mode < 3; mode++) {
+        tie_miss_fixture_t f;
+        ASSERT_TRUE(tie_miss_basic(&f));
+        if (mode) {
+            cbm_resolve_record_t row = tie_miss_row(&f, "tests/test_cases.c", "owner", "target");
+            ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", &row, 1), CBM_STORE_OK);
+        }
+        if (mode == 1) {
+            /* SQLite accepts a nonintegral REAL in this INTEGER column.
+             * Summary counts one abstention, but the exact emitted=0 visitor
+             * returns none: this cannot be accepted as a complete empty load. */
+            ASSERT_EQ(sqlite3_exec(cbm_store_get_db(f.c.store),
+                                   "UPDATE resolver_occurrence_rows SET emitted=0.5", NULL, NULL,
+                                   NULL),
+                      SQLITE_OK);
+        }
+        ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));
+        if (mode == 2)
+            sqlite3_set_authorizer(cbm_store_get_db(f.c.store), tie_miss_deny_read, NULL);
+        ASSERT_FALSE(te_reach(&f.c));
+        if (mode == 2)
+            sqlite3_set_authorizer(cbm_store_get_db(f.c.store), NULL, NULL);
+        ASSERT_FALSE(f.c.static_complete);
+        ASSERT_TRUE(tie_miss_fallback(&f, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE));
+        tie_miss_close(&f);
+    }
+    PASS();
+}
+
+typedef struct {
+    int visits;
+    int steps;
+} tie_miss_sql_t;
+static int tie_miss_sql_profile(unsigned event, void *context, void *statement, void *elapsed) {
+    (void)elapsed;
+    if (event == SQLITE_TRACE_PROFILE) {
+        const char *sql = sqlite3_sql(statement);
+        if (sql && strstr(sql, "WHERE project=?1 AND emitted=0 ORDER BY")) {
+            tie_miss_sql_t *counter = context;
+            counter->visits++;
+            counter->steps += sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 0);
+        }
+    }
+    return 0;
+}
+
+TEST(test_impact_engine_resolver_miss_chain_load_is_linear_and_once) {
+    int steps[2] = {0};
+    for (int scale = 0; scale < 2; scale++) {
+        int count = 16 << scale;
+        char source[8192];
+        size_t used = 0;
+        for (int i = 0; i < count; i++) {
+            int n = snprintf(source + used, sizeof(source) - used,
+                             "int helper%d(void) { return %s%d(); }\n", i, i ? "helper" : "target",
+                             i ? i - 1 : 0);
+            ASSERT_TRUE(n > 0 && (size_t)n < sizeof(source) - used);
+            used += (size_t)n;
+        }
+        int n = snprintf(source + used, sizeof(source) - used,
+                         "TEST(owner) {\n    return helper%d();\n}\n"
+                         "SUITE(alpha) {\n    RUN_TEST(owner);\n}\n",
+                         count - 1);
+        ASSERT_TRUE(n > 0 && (size_t)n < sizeof(source) - used);
+        const char *const files[] = {"src/lib.c",          "int target0(void) { return 1; }\n",
+                                     "tests/test_cases.c", source,
+                                     "tests/test_main.c",  tie_miss_runner};
+        tie_miss_fixture_t f;
+        ASSERT_TRUE(tie_miss_open(&f, files, 3));
+        ASSERT_TRUE(tie_miss_node(&f, "src/lib.c", "target0", "Function", 1, 1) > 0);
+        cbm_resolve_record_t rows[33];
+        for (int i = 0; i <= count; i++) {
+            char name[40], target[40];
+            if (i == count)
+                snprintf(name, sizeof(name), "owner");
+            else
+                snprintf(name, sizeof(name), "helper%d", i);
+            snprintf(target, sizeof(target), i ? "helper%d" : "target%d", i ? i - 1 : 0);
+            ASSERT_TRUE(tie_miss_node(&f, "tests/test_cases.c", name, "Function", i + 1,
+                                      i == count ? i + 3 : i + 1) > 0);
+            rows[i] =
+                tie_miss_row(&f, "tests/test_cases.c", name, cbm_arena_strdup(&f.c.arena, target));
+        }
+        ASSERT_TRUE(
+            tie_miss_node(&f, "tests/test_cases.c", "alpha", "Function", count + 4, count + 6) > 0);
+        ASSERT_TRUE(tie_miss_node(&f, "tests/test_main.c", "main", "Function", 1, 4) > 0);
+        ASSERT_EQ(cbm_store_resolver_replace(f.c.store, "test-impact", rows, (size_t)count + 1),
+                  CBM_STORE_OK);
+        ASSERT_TRUE(tie_miss_seed(&f, "src/lib.c", 0));
+        tie_miss_sql_t counter = {0};
+        sqlite3_trace_v2(cbm_store_get_db(f.c.store), SQLITE_TRACE_PROFILE, tie_miss_sql_profile,
+                         &counter);
+        ASSERT_TRUE(te_reach(&f.c));
+        sqlite3_trace_v2(cbm_store_get_db(f.c.store), 0, NULL, NULL);
+        ASSERT_TRUE(tie_miss_selected(&f, "owner"));
+        ASSERT_EQ(counter.visits, 1);
+        ASSERT_TRUE(counter.steps > 0);
+        steps[scale] = counter.steps;
+        ASSERT_EQ(cbm_store_count_edges_by_type(f.c.store, "test-impact", "CALLS"), 0);
+        tie_miss_close(&f);
+    }
+    ASSERT_TRUE(steps[1] > steps[0]);
+    ASSERT_TRUE(steps[1] < 3 * steps[0]); /* deterministic VM work, never elapsed time */
+    PASS();
+}
+
 SUITE(test_impact_engine) {
+    RUN_TEST(test_impact_engine_resolver_miss_selects_exact_owner_without_an_edge);
+    RUN_TEST(test_impact_engine_resolver_miss_unknown_owner_uses_its_whole_file);
+    RUN_TEST(test_impact_engine_resolver_miss_ignores_unwalked_relations);
+    RUN_TEST(test_impact_engine_resolver_miss_preserves_runner_sink_namesakes);
+    RUN_TEST(test_impact_engine_resolver_misses_feed_role_and_spawn_fixpoints);
+    RUN_TEST(test_impact_engine_resolver_metadata_failures_are_uncertainty);
+    RUN_TEST(test_impact_engine_resolver_miss_chain_load_is_linear_and_once);
+
     RUN_TEST(test_impact_engine_variant_tests_are_one_test);
     RUN_TEST(test_impact_engine_platform_variants_reach_each_others_callers);
     RUN_TEST(test_impact_engine_spawning_tests_follow_main);

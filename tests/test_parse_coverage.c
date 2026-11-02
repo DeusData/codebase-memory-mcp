@@ -846,14 +846,14 @@ TEST(c_thread_local_grammar_limit_is_pinned_issue963) {
     ASSERT_TRUE(has_def(ok, "f"));
     cbm_free_result(ok);
 
-    /* The pointer form: the same masking, the same honest answer now. */
+    /* The pointer form is read since the parse leaves out a word that can only be an
+     * attribute macro: `p` reaches the graph, so nothing is left to flag. */
     CBMFileResult *ptr = do_extract("static _Thread_local int *p;\n"
                                     "void f(void) { p = 0; }\n",
                                     CBM_LANG_C, "tls_ptr.c");
     ASSERT_NOT_NULL(ptr);
-    ASSERT_TRUE(ptr->parse_incomplete);
-    ASSERT_NOT_NULL(ptr->error_ranges);
-    ASSERT_STR_EQ("1-1", ptr->error_ranges);
+    ASSERT_FALSE(ptr->parse_incomplete);
+    ASSERT_TRUE(has_def(ptr, "p"));
     ASSERT_TRUE(has_def(ptr, "f"));
     cbm_free_result(ptr);
 

@@ -10,6 +10,7 @@
  *
  * Depends on: extraction layer (cbm.h), graph_buffer, pipeline internals
  */
+#include "pipeline/import_resolve.h"
 #include "foundation/constants.h"
 
 enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD_ESC_SPACE = 2 };
@@ -66,10 +67,12 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         *out_size = size;
     }
 
-    if (size <= 0) {
+    /* A zero-byte source is a complete, captured file, not a missing result.
+     * Empty package files must remain in resolver generation summaries. */
+    if (size < 0) {
         (void)fclose(f);
         if (out_status) {
-            *out_status = CBM_READ_EMPTY;
+            *out_status = CBM_READ_OPEN_FAIL;
         }
         return NULL;
     }
@@ -661,36 +664,7 @@ int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
  * logic in pass_parallel.c register_and_link_def — keep the two in sync. */
 static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                         const char *rel, CBMHashTable *namespace_map) {
-    int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!source_node) {
-        free(file_qn);
-        return 0;
-    }
-    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
-        count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
-                                                     namespace_map);
-    } else {
-        for (int j = 0; j < result->imports.count; j++) {
-            const CBMImport *imp = &result->imports.items[j];
-            if (!imp->module_path) {
-                continue;
-            }
-            const cbm_gbuf_node_t *target =
-                cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-            if (target && target->id != source_node->id) {
-                char esc_ln[CBM_SZ_128];
-                cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-                char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-                count++;
-            }
-        }
-    }
-    free(file_qn);
-    return count;
+    return cbm_pipeline_create_import_edges(ctx, result, rel, namespace_map);
 }
 
 static bool objectscript_export_append_strings(CBMArena *arena, const char ***dst,
@@ -859,6 +833,28 @@ void cbm_pipeline_set_objectscript_export_extractor_for_tests(
     objectscript_export_test_extractor = extractor;
 }
 
+/* Per-class UDL offsets are not coordinates in the physical XML file.
+ * Keep copied carriers for quality accounting, but provide neither a shared
+ * transformed identity nor stale semantic proof from one generated unit.
+ * CBMImport has no coordinates; its text remains unproved by the XML binding
+ * index. The owned child results and their individual snapshots stay intact. */
+static void objectscript_export_mark_transformed(CBMFileResult *aggregate) {
+    for (int i = 0; i < aggregate->calls.count; i++)
+        aggregate->calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->usages.count; i++)
+        aggregate->usages.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->rw.count; i++)
+        aggregate->rw.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->type_refs.count; i++)
+        aggregate->type_refs.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->type_assigns.count; i++)
+        aggregate->type_assigns.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+    for (int i = 0; i < aggregate->resolved_calls.count; i++) {
+        aggregate->resolved_calls.items[i].source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+        aggregate->resolved_calls.items[i].evidence = (cbm_resolve_evidence_t){0};
+    }
+}
+
 CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     const char *source, int source_len, const char *project_name, const char *rel_path,
     const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table,
@@ -891,6 +887,20 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
         return NULL;
     }
     aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
+    if (!cbm_result_capture_raw_source(aggregate, source, source_len, CBM_LANG_OBJECTSCRIPT_EXPORT,
+                                       NULL, NULL)) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
+    aggregate->source_project =
+        project_name ? cbm_arena_strdup(&aggregate->arena, project_name) : NULL;
+    aggregate->source_file = rel_path ? cbm_arena_strdup(&aggregate->arena, rel_path) : NULL;
+    if ((project_name && !aggregate->source_project) || (rel_path && !aggregate->source_file)) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&export_arena);
+        return NULL;
+    }
 
     cbm_objectscript_export_extractor_t extract = objectscript_export_test_extractor
                                                       ? objectscript_export_test_extractor
@@ -944,6 +954,7 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export_with_timeout(
     }
 
     aggregate->imports_count = aggregate->imports.count;
+    objectscript_export_mark_transformed(aggregate);
     cbm_arena_destroy(&export_arena);
     return aggregate;
 }
@@ -1187,6 +1198,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         CBMHashTable *namespace_map =
             cbm_pipeline_namespace_map_build(ctx->project_name, local_cache, rels, file_count);
         free(rels);
+        /* Build complete language import domains before any dependency or
+         * symbol binding is projected. Partial context cannot lend proof. */
+        if (namespace_map)
+            (void)cbm_pipeline_import_context_build(ctx, files, file_count, local_cache,
+                                                    namespace_map);
         for (int i = 0; i < file_count; i++) {
             if (cbm_pipeline_check_cancel(ctx)) {
                 break;

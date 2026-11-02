@@ -142,14 +142,17 @@ static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
 // Resolve an assignment LHS node to the bare name being written.  Handles
 // common wrappers so WRITES resolve for more languages than a raw identifier:
 //   - expression_list (Go `x = ...` desugars left to expression_list[x])
-//   - index/subscript (`cache[k] = v` → write the base var `cache`)
+//   - index/subscript (`cache[k] = v` → write the base var `cache`; in Go it stores
+//     through the operand's map or slice, so the variable is read, never rebound)
 //   - field/member/selector access (`self.total = ...`, `obj.Field = ...` →
 //     write the trailing field name `total`/`Field`)
 // Returns NULL if no simple write target can be determined.
 // Sets *is_member_out when the written name is the field half of a
 // member/selector LHS — the receiver is stripped from the returned name, so
 // this out-param is the only surviving record of the selector shape (#1962).
-static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_member_out) {
+static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_member_out,
+                                    TSNode *site_out) {
+    *site_out = (TSNode){0};
     // Unwrap a single-element expression_list (Go).
     if (strcmp(ts_node_type(left), "expression_list") == 0) {
         if (ts_node_named_child_count(left) != 1) {
@@ -159,10 +162,14 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
     }
     const char *lk = ts_node_type(left);
     if (strcmp(lk, "identifier") == 0 || strcmp(lk, "simple_identifier") == 0) {
+        *site_out = left;
         return cbm_node_text(ctx->arena, left, ctx->source);
     }
     // Indexed write: write the base operand's identifier (`cache[k]` → cache).
     if (strcmp(lk, "index_expression") == 0 || strcmp(lk, "subscript_expression") == 0) {
+        if (ctx->language == CBM_LANG_GO) {
+            return NULL;
+        }
         TSNode base = ts_node_child_by_field_name(left, TS_FIELD("operand"));
         if (ts_node_is_null(base)) {
             base = ts_node_child_by_field_name(left, TS_FIELD("object"));
@@ -173,6 +180,7 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
         if (!ts_node_is_null(base)) {
             const char *bk = ts_node_type(base);
             if (strcmp(bk, "identifier") == 0 || strcmp(bk, "simple_identifier") == 0) {
+                *site_out = base;
                 return cbm_node_text(ctx->arena, base, ctx->source);
             }
         }
@@ -190,6 +198,7 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
             if (is_member_out) {
                 *is_member_out = true;
             }
+            *site_out = fld;
             return cbm_node_text(ctx->arena, fld, ctx->source);
         }
         return NULL;
@@ -204,12 +213,26 @@ static char *resolve_lhs_write_name(CBMExtractCtx *ctx, TSNode left, bool *is_me
 // may sit on either side of the operator token, so scan named children for the
 // first identifier / member-style operand.  Returns a null node when no simple
 // target is found.
-static TSNode resolve_write_lhs_node(TSNode node) {
+static TSNode resolve_write_lhs_node(CBMLanguage language, TSNode node) {
+    /* Python annotations without a value do not write the target. Keep this
+     * guard shared by the iterative and unified extraction paths. */
+    if (language == CBM_LANG_PYTHON && !strcmp(ts_node_type(node), "assignment") &&
+        !ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("type"))) &&
+        ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("right"))))
+        return (TSNode){0};
     TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
     if (!ts_node_is_null(left)) {
         return left;
     }
     const char *nk = ts_node_type(node);
+    /* Kotlin `a.b = c` writes b and reads a: the last navigation names the target. */
+    if (language == CBM_LANG_KOTLIN && strcmp(nk, "directly_assignable_expression") == 0) {
+        uint32_t parts = ts_node_named_child_count(node);
+        TSNode last = parts ? ts_node_named_child(node, parts - 1) : (TSNode){0};
+        if (!ts_node_is_null(last) && strcmp(ts_node_type(last), "navigation_suffix") == 0) {
+            return cbm_find_child_by_kind(last, "simple_identifier");
+        }
+    }
     if (strcmp(nk, "postfix_unary_expression") == 0 || strcmp(nk, "prefix_unary_expression") == 0 ||
         strcmp(nk, "update_expression") == 0) {
         // Only ++/-- mutate their operand. Other unary postfix/prefix forms
@@ -253,18 +276,26 @@ static TSNode resolve_write_lhs_node(TSNode node) {
 
 // Try to emit a write for an assignment node.
 static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
-    TSNode left = resolve_write_lhs_node(node);
+    TSNode left = resolve_write_lhs_node(ctx->language, node);
     if (ts_node_is_null(left)) {
         return;
     }
     bool is_member = false;
-    char *name = resolve_lhs_write_name(ctx, left, &is_member);
+    TSNode site = {0};
+    char *name = resolve_lhs_write_name(ctx, left, &is_member, &site);
+    if (ctx->language == CBM_LANG_KOTLIN && !ts_node_is_null(site)) {
+        TSNode parent = ts_node_parent(site);
+        is_member = is_member || (!ts_node_is_null(parent) &&
+                                  strcmp(ts_node_type(parent), "navigation_suffix") == 0);
+    }
     if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-        CBMReadWrite rw;
+        CBMReadWrite rw = {0};
         rw.var_name = name;
         rw.is_write = true;
         rw.enclosing_func_qn = func_qn;
         rw.is_member_access = is_member;
+        rw.site_start_byte = ts_node_start_byte(site);
+        rw.site_end_byte = ts_node_end_byte(site);
         cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
     }
 }
@@ -334,17 +365,20 @@ void handle_readwrites(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
     }
 
     if (cbm_kind_in_set(node, spec->assignment_node_types)) {
-        TSNode left = resolve_write_lhs_node(node);
+        TSNode left = resolve_write_lhs_node(ctx->language, node);
 
         if (!ts_node_is_null(left)) {
             bool is_member = false;
-            char *name = resolve_lhs_write_name(ctx, left, &is_member);
+            TSNode site = {0};
+            char *name = resolve_lhs_write_name(ctx, left, &is_member, &site);
             if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-                CBMReadWrite rw;
+                CBMReadWrite rw = {0};
                 rw.var_name = name;
                 rw.is_write = true;
                 rw.enclosing_func_qn = state->enclosing_func_qn;
                 rw.is_member_access = is_member;
+                rw.site_start_byte = ts_node_start_byte(site);
+                rw.site_end_byte = ts_node_end_byte(site);
                 cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
             }
         }

@@ -405,6 +405,9 @@ static void rr_destroy(void *index) {
 /* The documentation set a document belongs to: the nearest conf.py at or
  * above its directory; NULL for none. */
 static const rr_conf_t *rr_conf_for(const rr_index_t *x, const char *doc) {
+    if (x->nconfs == 0) {
+        return NULL;
+    }
     char dir[RR_PATH_CAP];
     const char *b = rr_base(doc);
     size_t dl = b > doc ? (size_t)(b - doc - SKIP_ONE) : 0;

@@ -1282,15 +1282,14 @@ TEST(pdf_links_incremental) {
     th_write_file(TH_PATH(repo, "app/models.py"), "class User:\n"
                                                   "    def save(self):\n"
                                                   "        return 1\n");
-    ASSERT_EQ(dm_step(repo, db, full_db, "code body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-              0);
-    /* the document changes while the Go file does not: its method binds
-     * through the owner a proxy carries */
+    ASSERT_EQ(dm_step(repo, db, full_db, "code body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
+    /* The document changes while the Go file does not: its method keeps
+     * the same exact owner through the generation rebuild. */
     char path[1024];
     snprintf(path, sizeof(path), "%s/docs/design.pdf", repo);
     const char *pages[2] = {DESIGN_P1, "Now only server.Handler.Serve and pkg/server/new.go."};
     tp_write_pdf(path, pages, 2);
-    ASSERT_EQ(dm_step(repo, db, full_db, "document edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, db, full_db, "document edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     /* the missing file appears: the row becomes an edge, as in a full index */
     th_write_file(TH_PATH(repo, "pkg/server/gone.go"), "package server\n"
                                                        "\n"

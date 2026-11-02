@@ -13,6 +13,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/mem_core.h"
 #include "store/store_impact.h"
+#include "store/store_resolver.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -776,6 +777,352 @@ static bool te_parse_gaps(te_ctx_t *c, cbm_impact_walk_t *walk) {
     return ok;
 }
 
+/* ── Resolver abstentions ──────────────────────────────────────────
+ * Withheld semantic edges are uncertainty for test selection, not proof of
+ * no dependency. Match their source spelling conservatively, just like parse
+ * gaps, without inserting an edge or claiming that a target was resolved.
+ * The candidate's pinned read and graph digest bind this persisted generation.
+ * Spans are deliberately unused: preprocessed coordinates are never raw lines.
+ */
+enum { TE_MISS_NORMAL = 1, TE_MISS_ROLE = 2, TE_MISS_MAIN = 4 };
+typedef struct {
+    int64_t id;
+    unsigned category;
+    bool queued;
+} te_miss_owner_t;
+typedef struct {
+    const char *path;
+    te_miss_owner_t *owners;
+    int count;
+    unsigned fallback_fired;
+} te_miss_file_t;
+typedef struct {
+    const char *file, *scope, *relation, *spelling;
+    te_miss_file_t *source;
+    te_miss_owner_t *owner;
+    unsigned fired;
+} te_miss_t;
+typedef struct te_miss_link {
+    te_miss_t *miss;
+    struct te_miss_link *next;
+} te_miss_link_t;
+typedef struct {
+    te_miss_link_t *links;
+    unsigned witnessed;
+} te_miss_token_t;
+typedef struct {
+    te_ctx_t *ctx;
+    te_miss_t *rows;
+    size_t count, capacity;
+    int observed;
+    CBMHashTable *tokens, *files, *owners, *sinks, *roles, *mains, *parents, *suite_names;
+} te_misses_t;
+
+static bool te_miss_failure(te_ctx_t *c, const char *why) {
+    (void)te_fallback(c, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE, why);
+    return false;
+}
+
+static const char *te_miss_id_key(int64_t id, char key[32]) {
+    snprintf(key, 32, "%lld", (long long)id);
+    return key;
+}
+
+static bool te_miss_has_id(const CBMHashTable *set, int64_t id) {
+    char key[32];
+    return cbm_ht_get(set, te_miss_id_key(id, key)) != NULL;
+}
+
+static bool te_miss_add_id(te_ctx_t *c, CBMHashTable *set, int64_t id, void *value) {
+    char key[32];
+    const char *owned = cbm_arena_strdup(&c->arena, te_miss_id_key(id, key));
+    if (!owned)
+        return te_oom(c);
+    cbm_ht_set(set, owned, value);
+    return cbm_ht_get(set, owned) == value || te_oom(c);
+}
+
+/* Copy all rows before validating the returned denominator or filtering. The
+ * store visitor's strings are borrowed only for this callback invocation. */
+static bool te_miss_copy(const cbm_resolve_record_t *row, void *context) {
+    te_misses_t *m = context;
+    if (!row || m->count >= m->capacity)
+        return false;
+    te_miss_t *out = &m->rows[m->count];
+    out->file = cbm_arena_strdup(&m->ctx->arena, row->file_path ? row->file_path : "");
+    out->scope = cbm_arena_strdup(&m->ctx->arena, row->scope ? row->scope : "");
+    out->relation = cbm_arena_strdup(&m->ctx->arena, row->relation ? row->relation : "");
+    out->spelling = cbm_arena_strdup(&m->ctx->arena, row->spelling ? row->spelling : "");
+    if (!out->file || !out->scope || !out->relation || !out->spelling)
+        return te_oom(m->ctx);
+    m->count++;
+    return cbm_store_read_scope_check(m->ctx->scope) == CBM_STORE_OK;
+}
+
+static bool te_miss_walked(const char *relation) {
+    for (size_t i = 0; i < sizeof(te_walk_types) / sizeof(te_walk_types[0]); i++)
+        if (strcmp(relation, te_walk_types[i]) == 0)
+            return true;
+    return false;
+}
+
+static bool te_miss_sets(te_ctx_t *c, te_misses_t *m, const te_sinks_t *sinks) {
+    m->tokens = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->files = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->owners = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->sinks = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->roles = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->mains = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->parents = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    m->suite_names = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    if (!m->tokens || !m->files || !m->owners || !m->sinks || !m->roles || !m->mains ||
+        !m->parents || !m->suite_names)
+        return te_oom(c);
+    int runner_count = 0;
+    const cbm_test_runner_suite_t *runner = cbm_test_model_runner_suites(c->model, &runner_count);
+    for (int i = 0; i < runner_count; i++) {
+        cbm_ht_set(m->suite_names, runner[i].name, (void *)1);
+        if (!cbm_ht_get(m->suite_names, runner[i].name))
+            return te_oom(c);
+    }
+    for (int i = 0; i < sinks->sinks.count; i++)
+        if (!te_miss_add_id(c, m->sinks, sinks->sinks.items[i], (void *)1))
+            return false;
+    for (int i = 0; i < sinks->role_count; i++)
+        if (!te_miss_add_id(c, m->roles, sinks->roles[i].id, (void *)1))
+            return false;
+    for (int i = 0; i < sinks->runner_main.count; i++)
+        if (!te_miss_add_id(c, m->mains, sinks->runner_main.items[i], (void *)1))
+            return false;
+    return true;
+}
+
+static char *te_miss_owner_key(te_ctx_t *c, const char *file, const char *scope) {
+    size_t a = strlen(file), b = strlen(scope);
+    if (a > SIZE_MAX - b || a + b > SIZE_MAX - 32) {
+        (void)te_oom(c);
+        return NULL;
+    }
+    char *key = cbm_arena_alloc(&c->arena, a + b + 32);
+    if (key)
+        snprintf(key, a + b + 32, "%zu:%s%s", a, file, scope);
+    else
+        (void)te_oom(c);
+    return key;
+}
+
+/* Each relevant file's definitions are indexed once. An owner must match both
+ * the full qualified name and its exact source file; no suffix/name join. */
+static te_miss_file_t *te_miss_file(te_ctx_t *c, te_misses_t *m, const char *path) {
+    te_miss_file_t *file = cbm_ht_get(m->files, path);
+    if (file)
+        return file;
+    bool ok = true;
+    int count = 0;
+    const cbm_ti_node_t *nodes = cbm_ti_graph_file(c->graph, path, &count, &ok);
+    if (!ok) {
+        (void)te_miss_failure(c, "resolver-miss owners could not be read");
+        return NULL;
+    }
+    file = cbm_arena_calloc(&c->arena, sizeof(*file));
+    if (file)
+        file->owners =
+            cbm_arena_calloc(&c->arena, (size_t)(count ? count : 1) * sizeof(*file->owners));
+    if (!file || !file->owners) {
+        (void)te_oom(c);
+        return NULL;
+    }
+    file->path = path;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].variant_span)
+            continue;
+        te_miss_owner_t *owner = &file->owners[file->count++];
+        owner->id = nodes[i].id;
+        owner->category = te_miss_has_id(m->mains, owner->id)   ? TE_MISS_MAIN
+                          : te_miss_has_id(m->roles, owner->id) ? TE_MISS_ROLE
+                                                                : TE_MISS_NORMAL;
+        /* Store an exact file-qualified key as well as the graph QN, so even
+         * malformed duplicate scope metadata cannot select another file. */
+        char *key = te_miss_owner_key(c, path, nodes[i].qualified_name);
+        if (!key) {
+            (void)te_oom(c);
+            return NULL;
+        }
+        cbm_ht_set(m->owners, key, owner);
+        if (cbm_ht_get(m->owners, key) != owner) {
+            (void)te_oom(c);
+            return NULL;
+        }
+    }
+    cbm_ht_set(m->files, path, file);
+    if (cbm_ht_get(m->files, path) != file) {
+        (void)te_oom(c);
+        return NULL;
+    }
+    return file;
+}
+
+static bool te_miss_tokens(te_ctx_t *c, te_misses_t *m, te_miss_t *row) {
+    const char *p = row->spelling;
+    bool found = false;
+    while (*p) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_')) {
+            p++;
+            continue;
+        }
+        const char *start = p++;
+        while (te_ident_char(*p))
+            p++;
+        size_t length = (size_t)(p - start);
+        char *word = cbm_arena_alloc(&c->arena, length + 1);
+        te_miss_link_t *link = cbm_arena_alloc(&c->arena, sizeof(*link));
+        if (!word || !link)
+            return te_oom(c);
+        memcpy(word, start, length);
+        word[length] = '\0';
+        te_miss_token_t *token = cbm_ht_get(m->tokens, word);
+        if (!token) {
+            token = cbm_arena_calloc(&c->arena, sizeof(*token));
+            if (!token)
+                return te_oom(c);
+            cbm_ht_set(m->tokens, word, token);
+            if (cbm_ht_get(m->tokens, word) != token)
+                return te_oom(c);
+        }
+        *link = (te_miss_link_t){.miss = row, .next = token->links};
+        token->links = link;
+        found = true;
+    }
+    return found || te_miss_failure(c, "a resolver miss has no usable source spelling");
+}
+
+static bool te_load_misses(te_ctx_t *c, const te_sinks_t *sinks, te_misses_t *m) {
+    m->ctx = c;
+    cbm_resolve_counts_t counts;
+    bool present = false;
+    if (cbm_store_read_scope_check(c->scope) != CBM_STORE_OK ||
+        cbm_store_resolver_summary(c->store, "test-impact", &counts, &present) != CBM_STORE_OK ||
+        !present || counts.emitted > counts.occurrences)
+        return te_miss_failure(c, "the candidate's resolver generation is unavailable");
+    m->capacity = counts.occurrences - counts.emitted;
+    if (m->capacity > SIZE_MAX / sizeof(*m->rows))
+        return te_oom(c);
+    m->rows = cbm_arena_calloc(&c->arena, (m->capacity ? m->capacity : 1) * sizeof(*m->rows));
+    if (!m->rows)
+        return te_oom(c);
+    size_t returned = 0;
+    if (cbm_store_resolver_visit_misses(c->store, "test-impact", 0, m->capacity, te_miss_copy, m,
+                                        &returned) != CBM_STORE_OK ||
+        returned != m->capacity || m->count != m->capacity ||
+        cbm_store_read_scope_check(c->scope) != CBM_STORE_OK)
+        return te_miss_failure(c, "the candidate's resolver misses could not be read completely");
+    if (!te_miss_sets(c, m, sinks))
+        return false;
+    for (size_t i = 0; i < m->count; i++) {
+        te_miss_t *row = &m->rows[i];
+        if (!te_miss_walked(row->relation) || cbm_ti_source_find(c->source, row->file) < 0)
+            continue;
+        row->source = te_miss_file(c, m, row->file);
+        if (!row->source)
+            return false;
+        char *key = te_miss_owner_key(c, row->file, row->scope);
+        if (!key)
+            return te_oom(c);
+        row->owner = cbm_ht_get(m->owners, key);
+        if (!te_miss_tokens(c, m, row))
+            return false;
+    }
+    return true;
+}
+
+static bool te_miss_seed_owner(te_ctx_t *c, te_misses_t *m, cbm_impact_walk_t *walk,
+                               te_miss_owner_t *owner, int64_t via, te_ids_t *seeds) {
+    if (owner->queued || cbm_impact_walk_reached(walk, owner->id))
+        return true;
+    owner->queued = true;
+    /* Keep the conservative witness for every seed, including intermediate
+     * helpers. The graph walk has no edge for these source-use steps. */
+    int64_t *parent = cbm_arena_alloc(&c->arena, sizeof(*parent));
+    if (!parent)
+        return te_oom(c);
+    *parent = via;
+    if (!te_miss_add_id(c, m->parents, owner->id, parent))
+        return false;
+    return te_ids_push(c, seeds, owner->id);
+}
+
+/* Do not cross a normal walk sink. The existing role lift additionally walks
+ * CALLS between role handlers. The runner's suite-named Field exemption is
+ * per reached target, so a distinct legitimate namesake can still fire. */
+static unsigned te_miss_witness(const te_misses_t *m, const cbm_impact_hit_t *hit,
+                                const char *name) {
+    if (te_miss_has_id(m->sinks, hit->id))
+        return te_miss_has_id(m->roles, hit->id) ? 4u : 0u;
+    return hit->label && strcmp(hit->label, "Field") == 0 && cbm_ht_get(m->suite_names, name) ? 2u
+                                                                                              : 1u;
+}
+
+static bool te_miss_fire(te_ctx_t *c, te_misses_t *m, cbm_impact_walk_t *walk, te_miss_t *row,
+                         unsigned witness, int64_t via, te_ids_t *seeds) {
+    unsigned allowed = witness == 1   ? TE_MISS_NORMAL | TE_MISS_ROLE | TE_MISS_MAIN
+                       : witness == 2 ? TE_MISS_NORMAL | TE_MISS_ROLE
+                       : strcmp(row->relation, "CALLS") == 0 ? TE_MISS_ROLE
+                                                             : 0;
+    unsigned fresh = allowed & ~row->fired;
+    row->fired |= allowed;
+    if (!fresh)
+        return true;
+    if (row->owner)
+        return !(fresh & row->owner->category) ||
+               te_miss_seed_owner(c, m, walk, row->owner, via, seeds);
+    if (!row->source->count)
+        return te_miss_failure(c, "a reached resolver miss has no representable source owner");
+    fresh &= ~row->source->fallback_fired;
+    row->source->fallback_fired |= fresh;
+    for (int i = 0; fresh && i < row->source->count; i++)
+        if ((fresh & row->source->owners[i].category) &&
+            !te_miss_seed_owner(c, m, walk, &row->source->owners[i], via, seeds))
+            return false;
+    return true;
+}
+
+static bool te_resolver_misses(te_ctx_t *c, cbm_impact_walk_t *walk, te_misses_t *m) {
+    int count = cbm_impact_walk_count(walk);
+    const cbm_impact_hit_t *hits = cbm_impact_walk_hits(walk);
+    te_ids_t seeds = {0};
+    bool ok = true;
+    /* Later walk runs append strictly later hops; old hit order is stable.
+     * Each newly reached name is processed once. A token bucket is revisited
+     * only for a new admissibility class, never once per fixpoint depth. */
+    for (int i = m->observed; ok && i < count; i++) {
+        const char *qn = hits[i].qualified_name;
+        const char *name = qn ? strrchr(qn, '.') : NULL;
+        name = name ? name + 1 : qn;
+        te_miss_token_t *token = name ? cbm_ht_get(m->tokens, name) : NULL;
+        if (!token)
+            continue;
+        unsigned witness = te_miss_witness(m, &hits[i], name);
+        if (!witness || (token->witnessed & witness))
+            continue;
+        token->witnessed |= witness;
+        for (te_miss_link_t *link = token->links; ok && link; link = link->next)
+            ok = te_miss_fire(c, m, walk, link->miss, witness, hits[i].id, &seeds);
+    }
+    m->observed = count;
+    if (ok && seeds.count && cbm_impact_walk_run(walk, seeds.items, seeds.count) != CBM_STORE_OK)
+        ok = te_miss_failure(c, "the conservative resolver-miss walk failed");
+    cbm_free(CBM_MEM_CLASS_EXTRACT, seeds.items);
+    return ok;
+}
+
+static void te_misses_free(te_misses_t *m) {
+    CBMHashTable *tables[] = {m->tokens, m->files, m->owners,  m->sinks,
+                              m->roles,  m->mains, m->parents, m->suite_names};
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
+        if (tables[i])
+            cbm_ht_free(tables[i]);
+}
+
 /* ── Reach rows and triggers ─────────────────────────────────────── */
 
 static bool te_trigger(te_ctx_t *c, const char *suite, bool reached, bool changed, bool rule);
@@ -978,41 +1325,59 @@ static bool te_header_triggers(te_ctx_t *c) {
  * the tests (the product's entry), every Process node joins the walk as a
  * further seed, and SPAWNS, walked from the process to whoever starts it,
  * carries the reach to the tests that spawn. More, never fewer. */
-static bool te_spawn_lift(te_ctx_t *c, cbm_impact_walk_t *walk) {
+typedef struct {
+    bool loaded, fired;
+    int observed;
+    CBMHashTable *mains;
+} te_spawn_state_t;
+
+static bool te_spawn_mains(te_ctx_t *c, te_spawn_state_t *state) {
+    state->mains = cbm_ht_create_in(CBM_MEM_CLASS_EXTRACT, 0);
+    if (!state->mains)
+        return te_oom(c);
     cbm_node_t *mains = NULL;
-    int main_count = 0;
-    if (cbm_store_find_nodes_by_name(c->store, "test-impact", "main", &mains, &main_count) !=
-        CBM_STORE_OK) {
-        return te_fallback(c, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE, "graph read failed") &&
-               false;
-    }
-    bool product_main = false;
-    for (int i = 0; i < main_count && !product_main; i++) {
-        product_main = mains[i].label && strcmp(mains[i].label, "Function") == 0 &&
-                       mains[i].file_path && !te_test_file(c, mains[i].file_path) &&
-                       cbm_impact_walk_reached(walk, mains[i].id);
-    }
-    cbm_store_free_nodes(mains, main_count);
-    if (!product_main) {
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(c->store, "test-impact", "main", &mains, &count) !=
+        CBM_STORE_OK)
+        return te_miss_failure(c, "graph read failed");
+    bool ok = true;
+    for (int i = 0; ok && i < count; i++)
+        if (mains[i].label && strcmp(mains[i].label, "Function") == 0 && mains[i].file_path &&
+            !te_test_file(c, mains[i].file_path))
+            ok = te_miss_add_id(c, state->mains, mains[i].id, (void *)1);
+    cbm_store_free_nodes(mains, count);
+    state->loaded = ok;
+    return ok;
+}
+
+/* Product-main discovery is cached and newly reached hits are consumed once.
+ * Every Process joins the walk at most once, even when later role/miss lifts
+ * first reach the product after an earlier spawn pass found nothing. */
+static bool te_spawn_lift(te_ctx_t *c, cbm_impact_walk_t *walk, te_spawn_state_t *state) {
+    if (state->fired)
         return true;
-    }
+    if (!state->loaded && !te_spawn_mains(c, state))
+        return false;
+    int count = cbm_impact_walk_count(walk);
+    const cbm_impact_hit_t *hits = cbm_impact_walk_hits(walk);
+    for (int i = state->observed; !state->fired && i < count; i++)
+        state->fired = te_miss_has_id(state->mains, hits[i].id);
+    state->observed = count;
+    if (!state->fired)
+        return true;
     cbm_node_t *processes = NULL;
     int process_count = 0;
     if (cbm_store_find_nodes_by_label(c->store, "test-impact", "Process", &processes,
-                                      &process_count) != CBM_STORE_OK) {
-        return te_fallback(c, CBM_TEST_RESULT_FALLBACK_GRAPH_UNAVAILABLE, "graph read failed") &&
-               false;
-    }
+                                      &process_count) != CBM_STORE_OK)
+        return te_miss_failure(c, "graph read failed");
     te_ids_t seeds = {0};
     bool ok = true;
-    for (int i = 0; ok && i < process_count; i++) {
+    for (int i = 0; ok && i < process_count; i++)
         ok = te_ids_push(c, &seeds, processes[i].id);
-    }
     cbm_store_free_nodes(processes, process_count);
-    if (ok && seeds.count && cbm_impact_walk_run(walk, seeds.items, seeds.count) != CBM_STORE_OK) {
+    if (ok && seeds.count && cbm_impact_walk_run(walk, seeds.items, seeds.count) != CBM_STORE_OK)
         ok = te_fallback(c, CBM_TEST_RESULT_FALLBACK_ENGINE_SATURATED, "the impact walk failed") &&
              false;
-    }
     cbm_free(CBM_MEM_CLASS_EXTRACT, seeds.items);
     return ok;
 }
@@ -1127,11 +1492,12 @@ static const char *te_short_qn(const char *qn) {
     return start;
 }
 
-/* prefix + the call chain the walk took from the changed code to `id`, in call
+/* prefix + the dependency path used for test selection, in call
  * order (`id` first: "test_main.main -> a.b -> ... -> changed.fn"), cut short
- * with "..." when it does not fit. */
-static void te_call_chain(const cbm_impact_walk_t *walk, int64_t id, const char *prefix, char *out,
-                          size_t cap) {
+ * with "..." when it does not fit. Return whether it includes resolver misses. */
+static bool te_call_chain(const cbm_impact_walk_t *walk, const te_misses_t *misses, int64_t id,
+                          const char *prefix, char *out, size_t cap) {
+    bool conservative = false;
     int used = snprintf(out, cap, "%s", prefix);
     for (int step = 0; id && used >= 0 && (size_t)used < cap && step < 64; step++) {
         const cbm_impact_hit_t *hit = cbm_impact_walk_hit(walk, id);
@@ -1144,11 +1510,20 @@ static void te_call_chain(const cbm_impact_walk_t *walk, int64_t id, const char 
             if (cap > 4) {
                 memcpy(out + cap - 4, "...", 4);
             }
-            return;
+            return conservative;
         }
         used += n;
         id = hit->via_id;
+        if (!id) {
+            char key[32];
+            const int64_t *parent = cbm_ht_get(misses->parents, te_miss_id_key(hit->id, key));
+            if (parent) {
+                id = *parent;
+                conservative = true;
+            }
+        }
     }
+    return conservative;
 }
 
 /* Whether the walk reaches the runner's main through code that can run, and
@@ -1160,7 +1535,7 @@ static void te_call_chain(const cbm_impact_walk_t *walk, int64_t id, const char 
  * Nor is an edge into a sink (a role handler main calls, a suite, a test):
  * the walk selects whoever runs it and never expands it. */
 static bool te_main_reached(te_ctx_t *c, const cbm_impact_walk_t *walk, const te_sinks_t *sinks,
-                            int64_t main_id, int64_t *way_in) {
+                            const te_misses_t *misses, int64_t main_id, int64_t *way_in) {
     *way_in = 0;
     const cbm_impact_hit_t *self = cbm_impact_walk_hit(walk, main_id);
     if (!self) {
@@ -1172,7 +1547,11 @@ static bool te_main_reached(te_ctx_t *c, const cbm_impact_walk_t *walk, const te
         edge_step = edge_step || strcmp(self->via_edge, te_walk_types[t]) == 0;
     }
     if (!edge_step) {
-        *way_in = main_id;
+        char key[32];
+        const int64_t *parent = cbm_ht_get(misses->parents, te_miss_id_key(main_id, key));
+        /* A miss lift is not a direct change to main. Its source-name
+         * witness was admitted using the same sink/Field exclusions. */
+        *way_in = parent ? *parent : main_id;
         return true;
     }
     cbm_edge_t *edges = NULL;
@@ -1199,15 +1578,17 @@ static bool te_main_reached(te_ctx_t *c, const cbm_impact_walk_t *walk, const te
     return true;
 }
 
-/* Role lifts and parse gaps feed each other: a gap that a lift's walk names
- * can reach a further handler, and a lift can reach a further gap. Both run
- * until the walk stops growing (it only grows, so this ends). */
+/* Role lifts, parse gaps and persisted misses feed each other. After the
+ * runner veto, product spawning participates in the same monotone fixpoint.
+ * Miss indexes, fired state and observed hit positions survive every round. */
 static bool te_lift_fixpoint(te_ctx_t *c, cbm_impact_walk_t *walk, te_sinks_t *sinks,
-                             bool *fixture_cases) {
+                             bool *fixture_cases, te_misses_t *misses, te_spawn_state_t *spawn) {
     bool ok = true;
     for (int before = -1; ok && cbm_impact_walk_count(walk) != before;) {
         before = cbm_impact_walk_count(walk);
-        ok = te_parse_gaps(c, walk) && te_role_lift(c, walk, sinks, fixture_cases);
+        ok = te_parse_gaps(c, walk) && te_resolver_misses(c, walk, misses) &&
+             te_role_lift(c, walk, sinks, fixture_cases) &&
+             (!spawn || te_spawn_lift(c, walk, spawn));
     }
     return ok;
 }
@@ -1217,13 +1598,15 @@ bool te_reach(te_ctx_t *c) {
     int extra_count = 0;
     bool *fixture_cases = NULL;
     te_sinks_t sinks = {0};
+    te_misses_t misses = {0};
+    te_spawn_state_t spawn = {0};
     cbm_impact_walk_t *walk = NULL;
     bool ok = te_fixtures(c, &extra, &extra_count, &fixture_cases) && te_collect_sinks(c, &sinks) &&
-              te_walk(c, &sinks, extra, extra_count, &walk) &&
-              te_lift_fixpoint(c, walk, &sinks, fixture_cases);
+              te_walk(c, &sinks, extra, extra_count, &walk) && te_load_misses(c, &sinks, &misses) &&
+              te_lift_fixpoint(c, walk, &sinks, fixture_cases, &misses, NULL);
     for (int i = 0; ok && i < sinks.runner_main.count; i++) {
         int64_t way_in = 0;
-        ok = te_main_reached(c, walk, &sinks, sinks.runner_main.items[i], &way_in);
+        ok = te_main_reached(c, walk, &sinks, &misses, sinks.runner_main.items[i], &way_in);
         if (ok && way_in) {
             const cbm_impact_hit_t *m = cbm_impact_walk_hit(walk, sinks.runner_main.items[i]);
             const char *main_name =
@@ -1239,7 +1622,17 @@ bool te_reach(te_ctx_t *c) {
             } else if ((size_t)used >= sizeof(note)) {
                 used = (int)sizeof(note) - 1; /* a truncated prefix: no room for the chain */
             }
-            te_call_chain(walk, way_in, "", note + used, sizeof(note) - (size_t)used);
+            bool conservative =
+                te_call_chain(walk, &misses, way_in, "", note + used, sizeof(note) - (size_t)used);
+            char key[32];
+            conservative =
+                conservative ||
+                cbm_ht_get(misses.parents, te_miss_id_key(sinks.runner_main.items[i], key));
+            if (conservative) {
+                size_t length = strlen(note);
+                snprintf(note + length, sizeof(note) - length,
+                         " (includes unresolved source uses)");
+            }
             ok = te_fallback(c, CBM_TEST_RESULT_FALLBACK_RUNNER_REACHED, note);
             break;
         }
@@ -1248,11 +1641,14 @@ bool te_reach(te_ctx_t *c) {
      * and reaching its main through that is no change to the runner. What the
      * spawn lift reaches is lifted like the rest: a handler that starts the
      * product is first reached here. */
-    ok = ok && te_spawn_lift(c, walk) && te_lift_fixpoint(c, walk, &sinks, fixture_cases);
+    ok = ok && te_lift_fixpoint(c, walk, &sinks, fixture_cases, &misses, &spawn);
     ok = ok && te_reach_rows(c, walk, fixture_cases) && te_suite_triggers(c, walk) &&
          te_rule_triggers(c) && te_header_triggers(c);
     c->static_complete = ok;
     cbm_impact_walk_close(walk);
+    te_misses_free(&misses);
+    if (spawn.mains)
+        cbm_ht_free(spawn.mains);
     cbm_free(CBM_MEM_CLASS_EXTRACT, extra);
     cbm_free(CBM_MEM_CLASS_EXTRACT, sinks.sinks.items);
     cbm_free(CBM_MEM_CLASS_EXTRACT, sinks.runner_main.items);

@@ -1883,45 +1883,42 @@ TEST(doc_mentions_go_incremental_equals_full) {
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.V.Name"), "");
     ASSERT_STR_EQ(go_reason(inc_db, "b/c.go", "Target"), "");
 
-    /* a doc-comment edit re-extracts the file alone */
+    /* A doc-comment edit rebuilds the resolver generation. */
     go_w(repo, "a/a.go", GO_INC_A_DOC_EDIT);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_STR_EQ(go_tier(inc_db, "a.Use", "b.T"), "exact");
 
     /* a body edit in a file other files' references point into: its scope is
      * unchanged, and the edges into it stand */
     go_w(repo, "b/b.go", GO_INC_B_BODY);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "target body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-        0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "target body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_STR_EQ(go_tier(inc_db, "a.Use", "b.Target"), "exact");
 
-    /* a file's imports are its own business: an import edit repairs the file */
+    /* The import changes this file's bindings within the rebuilt generation. */
     go_w(repo, "a/other.go", GO_INC_OTHER_IMPORT);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "import added", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-              0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "import added", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_STR_EQ(go_tier(inc_db, "a.Other", "b.Target"), "exact");
 
     /* a reference added to the package comment: an edge from the File node */
     go_w(repo, "a/doc.go", GO_INC_DOC_EDIT);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "package comment", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "package comment", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_STR_EQ(go_tier(inc_db, "a.doc.go.__file__", "a.Use"), "unique");
     ASSERT_STR_EQ(go_tier(inc_db, "a.doc.go.__file__", "a.Local"), "unique");
 
     /* a removed function: the files with an edge into the changed file
      * re-resolve */
     go_w(repo, "b/b.go", GO_INC_B_NO_GONE);
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "function removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-        0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "function removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.Gone"), "missing");
 
     /* a method goes: links to it break, and another receiver's method of
      * the same name, in another file, is untouched */
     go_w(repo, "b/b.go", GO_INC_B_NO_M);
     ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "name keeper removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
+        dm_step(repo, inc_db, full_db, "name keeper removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
         0);
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.T.M"), "missing");
     ASSERT_STR_EQ(go_tier(inc_db, "b.U.M", "b.Target"), "unique");
@@ -1930,10 +1927,10 @@ TEST(doc_mentions_go_incremental_equals_full) {
     /* declaration order no longer decides anything: swapping two methods of
      * the same name keeps both nodes and both links */
     go_w(repo, "b/d.go", GO_INC_D_SWAPPED);
-    /* and the scope blob does not change (no method w moves), so the step
-     * is an ordinary closure repair, no longer a forced full rebuild */
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "methods swapped", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    /* The scope blob is unchanged (no method w moves), but an edited
+     * resolver generation still requires a full rebuild. */
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "methods swapped", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.W.Name"), "");
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.V.Name"), "");
     ASSERT_STR_EQ(go_tier(inc_db, "a.Use", "b.W.Name"), "exact");

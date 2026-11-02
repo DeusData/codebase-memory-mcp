@@ -16155,6 +16155,80 @@ TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences) {
     PASS();
 }
 
+TEST(clsp_c_proved_callable_join_requires_matching_proof_and_occurrence) {
+    static const char source[] = "static int target(void) { return 1; }\n"
+                                 "int probe(void) { int (*fp)(void) = target; return fp(); }\n";
+    CBMFileResult *result = extract_c(source);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *call = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *candidate = &result->calls.items[i];
+        if (candidate->source_origin == CBM_SOURCE_ORIGIN_RAW && candidate->callee_name &&
+            strcmp(candidate->callee_name, "fp") == 0) {
+            call = candidate;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(call);
+    const CBMResolvedCall *proved = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *candidate = &result->resolved_calls.items[i];
+        if (candidate->reason && !strcmp(candidate->reason, "fp") &&
+            candidate->evidence.rule == CBM_RESOLVE_RULE_CALLABLE_BINDING &&
+            cbm_pipeline_invocation_site_rank(candidate, call) == 2) {
+            proved = candidate;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(proved);
+    ASSERT_NOT_NULL(proved->evidence.proof);
+    CBMResolvedCall row = *proved;
+    CBMResolvedCallArray rows = {.items = &row, .count = 1};
+    row.strategy = "diagnostic-label-does-not-authorize";
+    ASSERT(cbm_pipeline_find_lsp_resolution(&rows, call, false) == &row);
+    cbm_resolve_proof_t incomplete = *proved->evidence.proof;
+    incomplete.value.outcome.analysis = CBM_RESOLVE_ANALYSIS_LIMITED;
+    for (int variant = 0; variant < 10; variant++) {
+        row = *proved;
+        row.strategy = "lsp_proven_callable";
+        switch (variant) {
+        case 0:
+            row.evidence = (cbm_resolve_evidence_t){0};
+            break;
+        case 1:
+            row.evidence.proof = NULL;
+            break;
+        case 2:
+            row.evidence.facts &= ~CBM_RESOLVE_FACT_CALLABLE_TYPED;
+            break;
+        case 3:
+            row.evidence.analysis = CBM_RESOLVE_ANALYSIS_LIMITED;
+            break;
+        case 4:
+            row.reason = "other.fp";
+            break;
+        case 5:
+            row.source_origin = CBM_SOURCE_ORIGIN_PREPROCESSED;
+            break;
+        case 6:
+            row.site_end_byte++;
+            break;
+        case 7:
+            row.callee_qn = "test.main.other";
+            break;
+        case 8:
+            row.evidence.rule = CBM_RESOLVE_RULE_SCOPE_BINDING;
+            break;
+        case 9:
+            row.evidence.proof = &incomplete;
+            break;
+        }
+        ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&rows, call, false));
+    }
+    cbm_free_result(result);
+    PASS();
+}
+
 TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target) {
     static const char source[] = "static int alpha_target(void) { return 1; }\n"
                                  "static int bravo_target(void) { return 2; }\n"
@@ -16284,15 +16358,14 @@ static int assert_cpp_family_preprocessed_collision_isolated(CBMLanguage languag
      * below, raw alpha.render and the macro-hidden expanded bravo.render both
      * land at numeric span 162:180, even though those offsets refer to
      * different source texts. */
-    static const char source[] =
-        "struct Alpha { int render(){return 1;} };\n"
-        "struct Bravo { int render(){return 2;} };\n"
-        "int occurrence_probe(){\n"
-        " Alpha alpha; Bravo bravo;\n"
-        " /*xxxxxxxxxxxxxxxxxxxxx*/ alpha . render ( );\n"
-        "#define HIDDEN_RENDER(x) x.render()\n"
-        " return HIDDEN_RENDER(bravo);\n"
-        "}\n";
+    static const char source[] = "struct Alpha { int render(){return 1;} };\n"
+                                 "struct Bravo { int render(){return 2;} };\n"
+                                 "int occurrence_probe(){\n"
+                                 " Alpha alpha; Bravo bravo;\n"
+                                 " /*xxxxxxxxxxxxxxxxxxxxx*/ alpha . render ( );\n"
+                                 "#define HIDDEN_RENDER(x) x.render()\n"
+                                 " return HIDDEN_RENDER(bravo);\n"
+                                 "}\n";
     const uint32_t collision_start = 162;
     const uint32_t collision_end = 180;
     ASSERT_EQ((uint32_t)(strstr(source, "alpha . render ( )") - source), collision_start);
@@ -16359,15 +16432,14 @@ TEST(clsp_c_preprocessed_coordinate_collision_isolated) {
     /* The raw fp call and macro-hidden expanded fp call both occupy 180:186
      * (comment payload sized against the preprocessed buffer's spacing), but
      * data flow resolves them to different targets. */
-    static const char source[] =
-        "static int alpha_target(void){return 1;}\n"
-        "static int bravo_target(void){return 2;}\n"
-        "int occurrence_probe(void){\n"
-        " int (*fp)(void) = alpha_target;\n"
-        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ fp ( );\n"
-        "#define HIDDEN_FP_CALL() (fp = bravo_target, fp())\n"
-        " return HIDDEN_FP_CALL();\n"
-        "}\n";
+    static const char source[] = "static int alpha_target(void){return 1;}\n"
+                                 "static int bravo_target(void){return 2;}\n"
+                                 "int occurrence_probe(void){\n"
+                                 " int (*fp)(void) = alpha_target;\n"
+                                 " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ fp ( );\n"
+                                 "#define HIDDEN_FP_CALL() (fp = bravo_target, fp())\n"
+                                 " return HIDDEN_FP_CALL();\n"
+                                 "}\n";
     const uint32_t collision_start = 180;
     const uint32_t collision_end = 186;
     const char *raw_probe = strstr(source, "occurrence_probe");
@@ -17086,6 +17158,7 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_issue1527_long_binary_chain_is_not_nesting);
     RUN_TEST(clsp_issue1527_long_receiver_chain_is_not_nesting);
     RUN_TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences);
+    RUN_TEST(clsp_c_proved_callable_join_requires_matching_proof_and_occurrence);
     RUN_TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target);
     RUN_TEST(clsp_cpp_repeated_same_leaf_calls_join_exact_occurrences);
     RUN_TEST(clsp_cuda_repeated_same_leaf_calls_join_exact_occurrences);

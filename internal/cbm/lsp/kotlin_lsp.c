@@ -35,6 +35,7 @@
  */
 
 #include "kotlin_lsp.h"
+#include "kotlin_proof.h"
 #include "../helpers.h"
 /* CBMHashTable — cross-registry field bucketing. Relative path: the LSP
  * amalgamation compiles with -Iinternal/cbm only, not -Isrc. */
@@ -638,34 +639,24 @@ static void kt_inject_delegate_call(KotlinLSPContext *ctx, const char *callee_qn
     cbm_calls_push(ctx->synthetic_calls, ctx->arena, call);
 }
 
-static void kt_retarget_callable_carrier(KotlinLSPContext *ctx, TSNode site,
-                                         const char *source_name, const char *target_qn) {
-    if (!ctx || !ctx->synthetic_calls || ts_node_is_null(site) || !source_name || !target_qn ||
-        !ctx->enclosing_func_qn) {
+/* A callable value changes the target, not the authored callee spelling.
+ * Preserve that spelling so the source occurrence can join its independent
+ * semantic proof. Only the exact caller and byte interval may acquire this
+ * guard; a nearby call or a same-named function is a different occurrence. */
+static void kt_require_callable_carrier_proof(KotlinLSPContext *ctx, TSNode site,
+                                              const char *source_name) {
+    if (!ctx || !ctx->synthetic_calls || ts_node_is_null(site) || !source_name ||
+        !ctx->enclosing_func_qn)
         return;
-    }
-    const char *target_name = kt_short(target_qn);
     uint32_t start = ts_node_start_byte(site);
     uint32_t end = ts_node_end_byte(site);
-    int line = (int)ts_node_start_point(site).row + 1;
-    const char *caller_leaf = kt_short(ctx->enclosing_func_qn);
     for (int i = 0; i < ctx->synthetic_calls->count; i++) {
         CBMCall *call = &ctx->synthetic_calls->items[i];
-        if (!call->callee_name || !call->enclosing_func_qn ||
-            strcmp(call->callee_name, source_name) != 0) {
-            continue;
-        }
-        const char *call_caller_leaf = kt_short(call->enclosing_func_qn);
-        if (strcmp(call->enclosing_func_qn, ctx->enclosing_func_qn) != 0 &&
-            (!caller_leaf || !call_caller_leaf || strcmp(call_caller_leaf, caller_leaf) != 0)) {
-            continue;
-        }
-        bool overlaps = call->site_end_byte > call->site_start_byte &&
-                        call->site_start_byte < end && call->site_end_byte > start;
-        if (!overlaps && call->start_line != line)
-            continue;
-        call->callee_name = cbm_arena_strdup(ctx->arena, target_name);
-        call->requires_lsp_resolution = true;
+        if (call->callee_name && call->enclosing_func_qn &&
+            !strcmp(call->callee_name, source_name) &&
+            !strcmp(call->enclosing_func_qn, ctx->enclosing_func_qn) &&
+            call->site_start_byte == start && call->site_end_byte == end)
+            call->requires_lsp_resolution = true;
     }
 }
 
@@ -3019,7 +3010,7 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
         if (target) {
             kt_emit_resolved_invocation_reason_at(ctx, target, "lsp_callable_alias", callee_text,
                                                   0.98f, call_node);
-            kt_retarget_callable_carrier(ctx, call_node, callee_text, target);
+            kt_require_callable_carrier_proof(ctx, call_node, callee_text);
             const CBMRegisteredFunc *rf =
                 ctx->registry ? cbm_registry_lookup_func(ctx->registry, target) : NULL;
             if (rf && rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
@@ -3297,8 +3288,7 @@ static const CBMType *kt_eval_navigation_expression_type_at(KotlinLSPContext *ct
             if (is_member) {
                 /* A member call on an `object`/`companion object` singleton is a
                  * static dispatch; on a regular class instance it is a method. */
-                const CBMRegisteredType *recv_rt =
-                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                const CBMRegisteredType *recv_rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
                 strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
             }
             /* A call through the lambda implicit parameter `it` (e.g. inside
@@ -5371,17 +5361,21 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
     if (!d->qualified_name || !d->short_name || !d->label) {
         return;
     }
-    if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0 ||
-        strcmp(d->label, "Enum") == 0 || strcmp(d->label, "Type") == 0) {
+    if (cbm_label_is_type_like(d->label)) {
         CBMRegisteredType rt;
         memset(&rt, 0, sizeof(rt));
         rt.qualified_name = d->qualified_name;
         rt.short_name = d->short_name;
+        rt.project_source = true;
+        rt.declaration_identity = d->declaration_identity;
+        rt.graph_qualified_name = d->graph_qualified_name;
+        rt.source_flags = d->source_flags;
+        if (d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL)
+            rt.namespace_qn = d->namespace_name;
         rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
         if (field_map) {
             const KtCrossFieldList *fl =
-                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map,
-                                                     d->qualified_name);
+                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map, d->qualified_name);
             if (fl && fl->count > 0) {
                 rt.field_names = fl->names;
                 rt.field_types = fl->types;
@@ -5421,12 +5415,63 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         memset(&rf, 0, sizeof(rf));
         rf.qualified_name = d->qualified_name;
         rf.short_name = d->short_name;
-        rf.min_params = -1;
+        rf.min_params =
+            (d->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) ? d->signature_param_count : -1;
+        rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+        rf.declaration_identity = d->declaration_identity;
+        rf.graph_qualified_name = d->graph_qualified_name;
+        rf.source_flags = d->source_flags;
+        rf.source_signature = d->source_signature;
+        rf.source_namespace = d->namespace_name;
+        rf.source_return_type = d->source_return_type;
+        rf.sig = d->sig;
         /* receiver_type distinguishes a top-level fun (NULL) from a method
          * (set) — the sole-definer fallback only matches top-level funs. */
         rf.receiver_type = d->receiver_type;
         rf.signature = kt_cross_func_sig_with_return(arena, d);
         cbm_registry_add_func(reg, rf);
+        /* Storage QNs include the file in the default package. Language
+         * lookup uses the declared package, while the target/occurrence
+         * identity remains the original materialized declaration. */
+        if ((d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) && d->namespace_name &&
+            !d->receiver_type) {
+            const char *semantic = d->namespace_name[0]
+                                       ? kt_join_dot(arena, d->namespace_name, d->short_name)
+                                       : d->short_name;
+            if (semantic && strcmp(semantic, rf.qualified_name)) {
+                rf.graph_qualified_name =
+                    d->graph_qualified_name
+                        ? d->graph_qualified_name
+                        : cbm_arena_sprintf(arena, "%s%s", d->qualified_name, d->sig ? d->sig : "");
+                rf.qualified_name = semantic;
+                cbm_registry_add_func(reg, rf);
+            }
+        }
+    } else if (strcmp(d->label, "Variable") == 0 || strcmp(d->label, "Constant") == 0) {
+        /* A property can be a callable value. Retain it as an unknown
+         * competitor so name lookup cannot silently skip that branch. */
+        CBMRegisteredFunc blocker = {.qualified_name = d->qualified_name,
+                                     .short_name = d->short_name,
+                                     .receiver_type = d->receiver_type,
+                                     .min_params = -1,
+                                     .flags = CBM_FUNC_FLAG_PROJECT_SOURCE,
+                                     .declaration_identity = d->declaration_identity,
+                                     .graph_qualified_name = d->graph_qualified_name,
+                                     .source_flags = d->source_flags,
+                                     .source_namespace = d->namespace_name};
+        cbm_registry_add_func(reg, blocker);
+        if ((d->source_flags & CBM_SOURCE_DECL_TOP_LEVEL) && d->namespace_name &&
+            !d->receiver_type) {
+            const char *semantic = d->namespace_name[0]
+                                       ? kt_join_dot(arena, d->namespace_name, d->short_name)
+                                       : d->short_name;
+            if (semantic && strcmp(semantic, blocker.qualified_name)) {
+                blocker.graph_qualified_name =
+                    d->graph_qualified_name ? d->graph_qualified_name : d->qualified_name;
+                blocker.qualified_name = semantic;
+                cbm_registry_add_func(reg, blocker);
+            }
+        }
     }
 }
 
@@ -5503,10 +5548,11 @@ void cbm_kotlin_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const C
     }
 }
 
-void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                              const char *module_qn, CBMLSPDef *defs, int def_count,
-                              const char **import_names, const char **import_qns, int import_count,
-                              TSTree *cached_tree, CBMResolvedCallArray *out) {
+void cbm_run_kotlin_lsp_cross_with_result(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          CBMResolvedCallArray *out, const CBMFileResult *file) {
     if (!arena || !source) {
         return;
     }
@@ -5621,6 +5667,7 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     }
 
     kotlin_lsp_process_file(&ctx, root);
+    cbm_kotlin_proof_resolve(arena, source, source_len, root, &reg, file, out);
     cbm_arena_destroy(&idx_arena);
     cbm_ht_free(type_short);
     cbm_ht_free(cross_field_map);
@@ -5628,4 +5675,13 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     if (owns_tree) {
         ts_tree_delete(tree);
     }
+}
+
+void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                              const char *module_qn, CBMLSPDef *defs, int def_count,
+                              const char **import_names, const char **import_qns, int import_count,
+                              TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_kotlin_lsp_cross_with_result(arena, source, source_len, module_qn, defs, def_count,
+                                         import_names, import_qns, import_count, cached_tree, out,
+                                         NULL);
 }

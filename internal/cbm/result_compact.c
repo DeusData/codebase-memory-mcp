@@ -24,6 +24,7 @@
 #include "foundation/constants.h"
 #include "foundation/mem_core.h"
 #include "result_spill.h" /* cbm_result_relocate */
+#include "resolve/proof.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -39,6 +40,12 @@ typedef struct {
     uint64_t hash;
     size_t len; /* strlen(src) */
 } cr_slot_t;
+
+typedef struct {
+    const cbm_resolve_proof_t *source;
+    cbm_resolve_proof_t *destination;
+    bool complete;
+} cr_proof_slot_t;
 
 typedef struct {
     cr_phase_t phase;
@@ -60,6 +67,8 @@ typedef struct {
     const char *old_base;
     size_t old_len;
     ptrdiff_t delta;
+    cr_proof_slot_t *proof_slots;
+    size_t proof_capacity, proof_count;
 } cr_ctx_t;
 
 static bool cr_in_old_block(const cr_ctx_t *c, const void *p) {
@@ -107,6 +116,8 @@ static cr_slot_t *cr_slot(cr_ctx_t *c, const char *s) {
 /* A raw allocation of `bytes` in the new arena: MEASURE books it, COPY makes
  * it. Zero bytes is no allocation (the arena returns NULL for it too). */
 static void *cr_alloc(cr_ctx_t *c, size_t bytes) {
+    if (c->failed)
+        return NULL;
     if (bytes == 0) {
         return NULL;
     }
@@ -126,6 +137,8 @@ static void *cr_alloc(cr_ctx_t *c, size_t bytes) {
 
 /* A string field: interned by content. COPY rewrites the field. */
 static void cr_str(cr_ctx_t *c, const char **field) {
+    if (c->failed)
+        return;
     const char *s = *field;
     if (!s) {
         return;
@@ -169,6 +182,8 @@ static void cr_str(cr_ctx_t *c, const char **field) {
 
 /* A blob (fingerprint, retained source): copied verbatim. */
 static void cr_blob(cr_ctx_t *c, const void **field, size_t bytes) {
+    if (c->failed)
+        return;
     if (!*field || bytes == 0) {
         return;
     }
@@ -192,6 +207,8 @@ static void cr_blob(cr_ctx_t *c, const void **field, size_t bytes) {
 
 /* A record array: copied at exact count, then the caller walks its fields. */
 static void cr_array(cr_ctx_t *c, void **items, int count, size_t elem) {
+    if (c->failed)
+        return;
     if (!*items || count <= 0) {
         if (c->phase == CR_COPY) {
             *items = NULL;
@@ -353,6 +370,156 @@ static void cr_walk_py_namespace(cr_ctx_t *c, CBMPyNamespaceFacts *facts) {
     }
 }
 
+enum { CR_PROOF_MAX_NODES = 65536, CR_PROOF_MAX_DEPTH = 256 };
+
+static void cr_proofs_clear(cr_ctx_t *c) {
+    cbm_free(CBM_MEM_CLASS_EXTRACT, c->proof_slots);
+    c->proof_slots = NULL;
+    c->proof_capacity = c->proof_count = 0;
+}
+static void cr_proofs_rewind(cr_ctx_t *c) {
+    if (c->proof_slots)
+        memset(c->proof_slots, 0, c->proof_capacity * sizeof(*c->proof_slots));
+    c->proof_count = 0;
+}
+static size_t cr_proof_hash(const cbm_resolve_proof_t *proof) {
+    uintptr_t value = (uintptr_t)proof >> 3;
+    return (size_t)(value ^ (value >> 17));
+}
+static cr_proof_slot_t *cr_proof_slot(cr_ctx_t *c, const cbm_resolve_proof_t *proof) {
+    size_t slot = cr_proof_hash(proof) & (c->proof_capacity - 1);
+    while (c->proof_slots[slot].source && c->proof_slots[slot].source != proof)
+        slot = (slot + 1) & (c->proof_capacity - 1);
+    return &c->proof_slots[slot];
+}
+static bool cr_proofs_grow(cr_ctx_t *c) {
+    if (c->proof_capacity && c->proof_count < c->proof_capacity / 2)
+        return true;
+    size_t capacity = c->proof_capacity ? c->proof_capacity * 2 : CR_MIN_TABLE;
+    if (capacity < c->proof_capacity || capacity > SIZE_MAX / sizeof(*c->proof_slots)) {
+        c->failed = true;
+        return false;
+    }
+    cr_proof_slot_t *slots = cbm_calloc(CBM_MEM_CLASS_EXTRACT, capacity * sizeof(*slots));
+    if (!slots) {
+        c->failed = true;
+        return false;
+    }
+    cr_proof_slot_t *old = c->proof_slots;
+    size_t old_capacity = c->proof_capacity;
+    c->proof_slots = slots;
+    c->proof_capacity = capacity;
+    for (size_t i = 0; i < old_capacity; i++)
+        if (old[i].source)
+            *cr_proof_slot(c, old[i].source) = old[i];
+    cbm_free(CBM_MEM_CLASS_EXTRACT, old);
+    return true;
+}
+static bool cr_proof_range(const cr_ctx_t *c, const void *pointer, size_t bytes) {
+    uintptr_t value = (uintptr_t)pointer, base = (uintptr_t)c->old_base;
+    return value >= base && value - base <= c->old_len && bytes <= c->old_len - (value - base);
+}
+static bool cr_proof_string(cr_ctx_t *c, const char **field) {
+    if (c->phase == CR_RELOCATE && *field) {
+        if (!cr_proof_range(c, *field, 1)) {
+            c->failed = true;
+            return false;
+        }
+        size_t remaining = c->old_len - ((uintptr_t)*field - (uintptr_t)c->old_base);
+        if (!memchr(*field + c->delta, 0, remaining)) {
+            c->failed = true;
+            return false;
+        }
+    }
+    return cr_py_string(c, field);
+}
+static bool cr_proof_strings(cr_ctx_t *c, cbm_resolve_proof_view_t *v) {
+    const char **fields[] = {&v->source.project,
+                             &v->source.file,
+                             &v->source.module,
+                             &v->source.scope,
+                             &v->source.content_identity,
+                             &v->source.configuration_identity,
+                             &v->key.lookup_domain,
+                             &v->key.lookup_key,
+                             &v->key.declaration_identity,
+                             &v->key.binding_identity,
+                             &v->key.type_identity,
+                             &v->key.detail,
+                             &v->outcome.target,
+                             &v->outcome.reason};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        if (!cr_proof_string(c, fields[i]))
+            return false;
+    return true;
+}
+
+/* One memo spans every result root in each pass. Only COPY/RELOCATE rewrite
+ * pointers; COUNT/MEASURE never touch immutable input nodes. Shared supports
+ * remain shared, and an incomplete traversal is never published. */
+static void cr_proof(cr_ctx_t *c, const cbm_resolve_proof_t **field, unsigned depth) {
+    const cbm_resolve_proof_t *source = *field;
+    if (!source || c->failed)
+        return;
+    if (depth > CR_PROOF_MAX_DEPTH || !cr_proofs_grow(c)) {
+        c->failed = true;
+        return;
+    }
+    cr_proof_slot_t *slot = cr_proof_slot(c, source);
+    if (slot->source) {
+        if (!slot->complete) {
+            c->failed = true; /* cyclic/in-progress support */
+            return;
+        }
+        if (c->phase == CR_COPY || c->phase == CR_RELOCATE)
+            *field = slot->destination;
+        return;
+    }
+    if (c->proof_count == CR_PROOF_MAX_NODES ||
+        (c->phase == CR_RELOCATE && !cr_proof_range(c, source, sizeof(*source)))) {
+        c->failed = true;
+        return;
+    }
+    slot->source = source;
+    c->proof_count++;
+    cbm_resolve_proof_t *node = (cbm_resolve_proof_t *)source;
+    if (!cr_py_size(c, sizeof(*source)))
+        return;
+    if (c->phase == CR_COPY) {
+        node = cr_alloc(c, sizeof(*node));
+        if (!node)
+            return;
+        *node = *source;
+        *field = node;
+    } else if (c->phase == CR_RELOCATE) {
+        node = (cbm_resolve_proof_t *)((char *)source + c->delta);
+        *field = node;
+    } else {
+        (void)cr_alloc(c, sizeof(*node));
+    }
+    slot->destination = node;
+    cbm_resolve_proof_view_t *v = &node->value;
+    if (!v->depth || v->depth > CR_PROOF_MAX_DEPTH || v->outcome.proof ||
+        v->premise_count > CR_PROOF_MAX_NODES || (v->premise_count && !v->premises) ||
+        (!v->premise_count && v->premises) || v->premise_count > SIZE_MAX / sizeof(*v->premises)) {
+        c->failed = true;
+        return;
+    }
+    size_t bytes = v->premise_count * sizeof(*v->premises);
+    if (!cr_py_size(c, bytes) ||
+        (c->phase == CR_RELOCATE && bytes && !cr_proof_range(c, v->premises, bytes))) {
+        c->failed = true;
+        return;
+    }
+    cr_blob(c, (const void **)&v->premises, bytes);
+    if (c->failed || !cr_proof_strings(c, v))
+        return;
+    const cbm_resolve_proof_t **premises = (const cbm_resolve_proof_t **)v->premises;
+    for (size_t i = 0; i < v->premise_count && !c->failed; i++)
+        cr_proof(c, &premises[i], depth + 1);
+    cr_proof_slot(c, source)->complete = !c->failed;
+}
+
 static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_array(c, (void **)&r->defs.items, r->defs.count, sizeof(CBMDefinition));
     for (int i = 0; i < r->defs.count && r->defs.items; i++) {
@@ -413,6 +580,8 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->resolved_calls.items[i].strategy);
         cr_str(c, &r->resolved_calls.items[i].reason);
         cr_str(c, &r->resolved_calls.items[i].callee_sig);
+        if (!c->failed)
+            cr_proof(c, &r->resolved_calls.items[i].evidence.proof, 1);
     }
     cr_array(c, (void **)&r->string_refs.items, r->string_refs.count, sizeof(CBMStringRef));
     for (int i = 0; i < r->string_refs.count && r->string_refs.items; i++) {
@@ -448,6 +617,8 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
         cr_str(c, &r->field_types.items[i].type_text);
     }
     cr_str(c, &r->module_qn);
+    cr_str(c, &r->source_project);
+    cr_str(c, &r->source_file);
     cr_str(c, &r->namespace_name);
     cr_list(c, &r->exports);
     cr_list(c, &r->constants);
@@ -466,10 +637,11 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     cr_walk_py_namespace(c, &r->py_namespace);
 }
 
-void cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base) {
-    if (!result || !old_base || !new_base || len == 0 || old_base == new_base) {
-        return;
-    }
+bool cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base) {
+    if (!result || !old_base || !new_base)
+        return false;
+    if (len == 0)
+        return result->resolved_calls.count == 0;
     cr_ctx_t c;
     memset(&c, 0, sizeof(c));
     c.phase = CR_RELOCATE;
@@ -477,6 +649,8 @@ void cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len
     c.old_len = len;
     c.delta = new_base - old_base;
     cr_walk(&c, result);
+    cr_proofs_clear(&c);
+    return !c.failed;
 }
 
 static size_t cr_pow2_at_least(size_t n) {
@@ -538,6 +712,7 @@ static bool cr_scratch_get(cr_ctx_t *c) {
 }
 
 static void cr_scratch_put(cr_ctx_t *c) {
+    cr_proofs_clear(c);
     if ((void *)c->slots != tl_cr_buf) {
         cbm_free(CBM_MEM_CLASS_EXTRACT, c->slots);
     }
@@ -560,16 +735,22 @@ void cbm_result_compact(CBMFileResult *result) {
     c.phase = CR_COUNT;
     cr_walk(&c, &tmp);
     /* Bound intern-table/replay sizing before the existing power-of-two step. */
-    if (c.failed || c.refs > (SIZE_MAX / (sizeof(cr_slot_t) * 8) - CR_MIN_TABLE))
-        return;
-
-    c.cap = cr_pow2_at_least(c.refs * CR_TABLE_LOAD + CR_MIN_TABLE);
-    if (c.cap > UINT32_MAX) /* replay entries store slot indexes in uint32_t */
-        return;
-    if (!cr_scratch_get(&c)) {
+    if (c.failed || c.refs > (SIZE_MAX / (sizeof(cr_slot_t) * 8) - CR_MIN_TABLE)) {
+        cr_proofs_clear(&c);
         return;
     }
 
+    c.cap = cr_pow2_at_least(c.refs * CR_TABLE_LOAD + CR_MIN_TABLE);
+    if (c.cap > UINT32_MAX) { /* replay entries store slot indexes in uint32_t */
+        cr_proofs_clear(&c);
+        return;
+    }
+    if (!cr_scratch_get(&c)) {
+        cr_proofs_clear(&c);
+        return;
+    }
+
+    cr_proofs_rewind(&c);
     c.phase = CR_MEASURE;
     cr_walk(&c, &tmp);
     if (c.failed) {
@@ -587,6 +768,7 @@ void cbm_result_compact(CBMFileResult *result) {
         return;
     }
 
+    cr_proofs_rewind(&c);
     c.phase = CR_COPY;
     c.dst = &fresh;
     cr_walk(&c, &tmp);

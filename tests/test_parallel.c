@@ -12,7 +12,11 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/shared_resolver.h"
+#include "pipeline/resolver_ecma.h"
+#include "resolve/rust_names.h"
 #include "pipeline/lsp_resolve.h"
+#include "lsp/oo_strict.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -198,12 +202,60 @@ static void harness_ctx_free_tables(cbm_pipeline_ctx_t *ctx) {
         free((void *)ctx->return_type_table);
         ctx->return_type_table = NULL;
     }
+    cbm_ecma_surfaces_free(ctx->ecma_surfaces);
+    ctx->ecma_surfaces = NULL;
+    cbm_rust_project_free(ctx->rust_project);
+    ctx->rust_project = NULL;
+}
+
+/* Mirror production occurrence capture while the extraction cache, cross
+ * registry and shared export proofs are still alive. The graph must own all
+ * borrowed proof roots before any of those arenas is released. */
+static bool harness_resolve_occurrences(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                        int file_count) {
+    if (!ctx->shared_resolver)
+        return false;
+    bool ok = true;
+    for (int i = 0; ok && i < file_count; i++) {
+        bool loaded = false;
+        CBMFileResult *result =
+            cbm_pipeline_result_acquire(ctx, ctx->result_cache, i, NULL, &loaded);
+        if (!result)
+            continue;
+        const char **keys = NULL, **values = NULL;
+        int imports = 0;
+        ok = cbm_pxc_build_import_map(ctx, files[i].rel_path, files[i].language, result, &keys,
+                                      &values, &imports) == 0;
+        cbm_resolver_file_t input = {.ctx = ctx,
+                                     .registry = ctx->registry,
+                                     .graph = ctx->gbuf,
+                                     .output = ctx->gbuf,
+                                     .result = result,
+                                     .rel_path = files[i].rel_path,
+                                     .module_qn = result->module_qn,
+                                     .language = files[i].language,
+                                     .import_keys = keys,
+                                     .import_values = values,
+                                     .import_count = imports};
+        if (ok)
+            ok = cbm_shared_resolver_file(ctx->shared_resolver, &input);
+        cbm_pxc_free_import_map(keys, values, imports);
+        cbm_pipeline_result_release(result, loaded);
+    }
+    return ok && !atomic_load(&ctx->resolver_failed) && cbm_gbuf_resolutions_own_shared(ctx->gbuf);
 }
 
 static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
                                   cbm_file_info_t *files, int file_count) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
     cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **cache = calloc((size_t)file_count, sizeof(*cache));
+    if (!gbuf || !reg || !cache) {
+        cbm_gbuf_free(gbuf);
+        cbm_registry_free(reg);
+        free(cache);
+        return NULL;
+    }
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
 
@@ -213,13 +265,32 @@ static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
         .gbuf = gbuf,
         .registry = reg,
         .cancelled = &cancelled,
+        .result_cache = cache,
     };
 
     cbm_init();
-    cbm_pipeline_pass_definitions(&ctx, files, file_count);
-    cbm_pipeline_pass_calls(&ctx, files, file_count);
-    cbm_pipeline_pass_usages(&ctx, files, file_count);
-    cbm_pipeline_pass_semantic(&ctx, files, file_count);
+    bool ok = cbm_pipeline_pass_definitions(&ctx, files, file_count) == 0 &&
+              cbm_shared_resolver_capture_sources(&ctx, files, file_count, cache);
+    if (ok) {
+        ctx.shared_resolver = cbm_shared_resolver_build(&ctx, files, file_count, cache);
+        ok = ctx.shared_resolver != NULL;
+    }
+    if (ok)
+        ok = cbm_pipeline_pass_calls(&ctx, files, file_count) == 0 &&
+             cbm_pipeline_pass_usages(&ctx, files, file_count) == 0 &&
+             cbm_pipeline_pass_semantic(&ctx, files, file_count) == 0 &&
+             harness_resolve_occurrences(&ctx, files, file_count) &&
+             cbm_shared_resolver_project(gbuf);
+    if (!ok || atomic_load(&ctx.test_declarations_failed)) {
+        cbm_gbuf_free(gbuf);
+        gbuf = NULL;
+    }
+    cbm_shared_resolver_free(ctx.shared_resolver);
+    ctx.shared_resolver = NULL;
+    for (int i = 0; i < file_count; i++)
+        cbm_free_result(cache[i]);
+    free(cache);
+    ctx.result_cache = NULL;
 
     harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
@@ -260,19 +331,38 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross_and_mutator(
     }
 
     cbm_init();
-    cbm_pipeline_pass_definitions(&ctx, files, file_count);
-    cbm_pipeline_pass_lsp_cross(&ctx, files, file_count, cache);
-    if (mutator) {
-        mutator(cache, file_count, mutator_ud);
+    bool ok = cbm_pipeline_pass_definitions(&ctx, files, file_count) == 0 &&
+              cbm_shared_resolver_capture_sources(&ctx, files, file_count, cache);
+    if (ok) {
+        int cross_status = cbm_pipeline_pass_lsp_cross(&ctx, files, file_count, cache);
+        ok = cross_status != CBM_PIPELINE_ABORT_PRESERVE_DB &&
+             !atomic_load(&ctx.test_declarations_failed);
     }
-    cbm_pipeline_pass_calls(&ctx, files, file_count);
-    cbm_pipeline_pass_usages(&ctx, files, file_count);
-    cbm_pipeline_pass_semantic(&ctx, files, file_count);
+    if (ok && mutator)
+        mutator(cache, file_count, mutator_ud);
+    if (ok) {
+        ctx.shared_resolver = cbm_shared_resolver_build(&ctx, files, file_count, cache);
+        ok = ctx.shared_resolver != NULL;
+    }
+    if (ok)
+        ok = cbm_pipeline_pass_calls(&ctx, files, file_count) == 0 &&
+             cbm_pipeline_pass_usages(&ctx, files, file_count) == 0 &&
+             cbm_pipeline_pass_semantic(&ctx, files, file_count) == 0 &&
+             harness_resolve_occurrences(&ctx, files, file_count) &&
+             cbm_shared_resolver_project(gbuf);
+    if (!ok || atomic_load(&ctx.test_declarations_failed)) {
+        cbm_gbuf_free(gbuf);
+        gbuf = NULL;
+    }
+    cbm_shared_resolver_free(ctx.shared_resolver);
+    ctx.shared_resolver = NULL;
 
     for (int i = 0; i < file_count; i++) {
         cbm_free_result(cache[i]);
     }
     free(cache);
+    ctx.result_cache = NULL;
+    harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
     /* The cross pass builds its shared registries in the caller-owned
      * ctx->seq_cross_arena precisely so they outlive pass_calls; production's
@@ -314,6 +404,13 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     parallel_result_mutator_fn mutator, void *mutator_ud, bool seed_structure) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
     cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **result_cache = calloc((size_t)file_count, sizeof(*result_cache));
+    if (!gbuf || !reg || !result_cache) {
+        cbm_gbuf_free(gbuf);
+        cbm_registry_free(reg);
+        free(result_cache);
+        return NULL;
+    }
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
 
@@ -324,6 +421,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         .registry = reg,
         .cancelled = &cancelled,
         .spill_allowed = g_harness_spill,
+        .result_cache = result_cache,
     };
 
     if (seed_structure) {
@@ -334,14 +432,14 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     int64_t gbuf_next = cbm_gbuf_next_id(gbuf);
     atomic_init(&shared_ids, gbuf_next);
 
-    CBMFileResult **result_cache = calloc((size_t)file_count, sizeof(CBMFileResult *));
-
     cbm_init();
+    int extract_status;
     if (extract_opts) {
-        cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, worker_count,
-                                extract_opts);
+        extract_status = cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids,
+                                                 worker_count, extract_opts);
     } else {
-        cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
+        extract_status =
+            cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
     }
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
     if (g_harness_spill) {
@@ -353,11 +451,14 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         }
     }
 
-    if (mutator) {
+    bool ok = extract_status == 0 &&
+              cbm_shared_resolver_capture_sources(&ctx, files, file_count, result_cache);
+    if (ok && mutator) {
         mutator(result_cache, file_count, mutator_ud);
     }
 
-    cbm_build_registry_from_cache(&ctx, files, file_count, result_cache);
+    if (ok)
+        ok = cbm_build_registry_from_cache(&ctx, files, file_count, result_cache) == 0;
     int64_t registry_next = cbm_gbuf_next_id(gbuf);
     if (registry_next > atomic_load(&shared_ids)) {
         atomic_store(&shared_ids, registry_next);
@@ -372,26 +473,57 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     CBMArena cross_arena;
     cbm_arena_init(&cross_arena);
     CBMLSPDef *all_defs =
-        def_modules ? cbm_pxc_collect_all_defs(&ctx, &cross_arena, result_cache, files, file_count,
-                                               ctx.project_name, def_modules, &def_count, NULL)
-                    : NULL;
+        ok && def_modules
+            ? cbm_pxc_collect_all_defs(&ctx, &cross_arena, result_cache, files, file_count,
+                                       ctx.project_name, def_modules, &def_count, NULL)
+            : NULL;
+    if (def_count < 0 || atomic_load(&ctx.test_declarations_failed))
+        ok = false;
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
-    /* C# has no per-file cross path (cbm_pxc_run_one has no C# case): production
-     * resolves it only through the Tier-2 registry, so a harness run that opts
-     * in builds that one registry exactly as run_parallel_pipeline does. */
+    /* Production supplies a shared C-family registry: a visible external
+     * prototype needs the complete linkage domain across translation units,
+     * which the fallback module/import filter cannot provide. Keep the existing
+     * C# registry opt-in for the harness contracts that exercise that path. */
     CBMCrossLspRegistries harness_registries = {0};
+    for (int i = 0; all_defs && i < file_count; i++) {
+        if (files[i].language == CBM_LANG_C || files[i].language == CBM_LANG_CPP ||
+            files[i].language == CBM_LANG_CUDA) {
+            harness_registries.c = cbm_c_build_cross_registry(&cross_arena, all_defs, def_count);
+            break;
+        }
+    }
     if (g_harness_cs_registry && all_defs) {
         harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
     }
-    cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
-                         def_count, def_modules, module_def_index,
-                         g_harness_cs_registry ? &harness_registries
-                                               : NULL /* tests use per-file path */);
+    /* Java, Kotlin and C# static selection needs the declaration index production
+     * builds beside the registries; without it this route could not bind them. */
+    if (all_defs) {
+        harness_registries.oo =
+            cbm_pxc_build_oo_index(&ctx, &cross_arena, result_cache, files, file_count);
+    }
+    if (ok) {
+        ctx.shared_resolver = cbm_shared_resolver_build(&ctx, files, file_count, result_cache);
+        ok = ctx.shared_resolver != NULL;
+    }
+    if (ok)
+        ok = cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count,
+                                  all_defs, def_count, def_modules, module_def_index,
+                                  &harness_registries) == 0;
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+    if (ok)
+        ok = !atomic_load(&ctx.resolver_failed) && !atomic_load(&ctx.test_declarations_failed) &&
+             cbm_gbuf_resolutions_own_shared(gbuf) && cbm_shared_resolver_project(gbuf);
+    if (!ok) {
+        cbm_gbuf_free(gbuf);
+        gbuf = NULL;
+    }
+    cbm_shared_resolver_free(ctx.shared_resolver);
+    ctx.shared_resolver = NULL;
 
     cbm_pxc_free_module_def_index(module_def_index);
+    cbm_oo_index_free(harness_registries.oo);
     free(all_defs);
     cbm_arena_destroy(&cross_arena);
     if (def_modules) {
@@ -405,6 +537,7 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
         if (result_cache[i])
             cbm_free_result(result_cache[i]);
     free(result_cache);
+    ctx.result_cache = NULL;
     cbm_pipeline_spill_close(&ctx);
 
     harness_ctx_free_tables(&ctx);
@@ -920,6 +1053,68 @@ TEST(parallel_empty_files) {
     PASS();
 }
 
+#include "resolver_quality.h"
+#include "store/store_resolver.h"
+
+/* Persist actual harness records through the production publication API.
+ * Expectations come only from fixture source; missing snapshots and
+ * unattested graph edges remain failures. */
+static bool parallel_quality_check_with_forbidden(cbm_gbuf_t *graph, const char *project,
+                                                  const char *suite, const RQ_Source *sources,
+                                                  size_t source_count, const RQ_Expected *expected,
+                                                  size_t expected_count,
+                                                  const RQ_Forbidden *forbidden,
+                                                  size_t forbidden_count, RQ_Report *report) {
+    cbm_store_t *store = cbm_store_open_memory();
+    size_t count = 0, file_count = 0, summary_count = 0;
+    const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graph, &count);
+    const cbm_resolve_file_t *files = cbm_gbuf_resolver_files(graph, &file_count);
+    const cbm_resolve_summary_t *summaries = cbm_gbuf_resolver_summaries(graph, &summary_count);
+    bool ok = store && cbm_gbuf_resolutions_complete(graph) &&
+              cbm_gbuf_flush_to_store(graph, store) == CBM_STORE_OK &&
+              cbm_store_resolver_replace_generation(store, project, rows, count, files, file_count,
+                                                    summaries, summary_count) == CBM_STORE_OK;
+    if (ok)
+        ok = rq_check(store, project, suite, sources, source_count, expected, expected_count,
+                      forbidden, forbidden_count, report, stderr);
+    if (store)
+        cbm_store_close(store);
+    return ok;
+}
+
+static bool parallel_quality_check(cbm_gbuf_t *graph, const char *project, const char *suite,
+                                   const RQ_Source *sources, size_t source_count,
+                                   const RQ_Expected *expected, size_t expected_count,
+                                   RQ_Report *report) {
+    return parallel_quality_check_with_forbidden(graph, project, suite, sources, source_count,
+                                                 expected, expected_count, NULL, 0, report);
+}
+
+/* Read only this test's authored fixture, for independent occurrence anchors. */
+static char *parallel_fixture_source(const char *path) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file)
+        return NULL;
+    if (fseek(file, 0, SEEK_END)) {
+        fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0 || size > 1024 * 1024 || fseek(file, 0, SEEK_SET)) {
+        fclose(file);
+        return NULL;
+    }
+    char *source = malloc((size_t)size + 1);
+    if (!source || fread(source, 1, (size_t)size, file) != (size_t)size) {
+        free(source);
+        fclose(file);
+        return NULL;
+    }
+    source[size] = 0;
+    fclose(file);
+    return source;
+}
+
 /* ── Regression: args JSON must not overflow the props buffer ──────── */
 
 /* A call with many long string arguments makes append_args_json()'s running
@@ -927,9 +1122,10 @@ TEST(parallel_empty_files) {
  * emit_normal_calls_edge(): format_call_arg() returns snprintf's UNtruncated
  * length, so pos += n could run past the buffer and the trailing
  * buf[pos]='\0' wrote out of bounds (stack-buffer-overflow; caught by the
- * stack canary as a SIGABRT on real repos). This indexes a fixture whose
- * single call carries enough long args to drive pos past 2 KB; under the
- * ASan test build a regression aborts here. */
+ * stack canary as a SIGABRT on real repos). Preserve the original sixty-arg
+ * pipeline fixture, then exercise the serializer with an additional source
+ * fixture whose eight captured arguments exceed 2 KB after formatting. The
+ * extraction cap must not make the ASan overflow regression vacuous. */
 TEST(parallel_args_json_no_overflow) {
     char dir[256];
     snprintf(dir, sizeof(dir), "/tmp/cbm_argov_XXXXXX");
@@ -942,8 +1138,8 @@ TEST(parallel_args_json_no_overflow) {
     fputs("function sink(...xs: string[]) { return xs; }\n", f);
     fputs("function caller() {\n  sink(\n", f);
     for (int i = 0; i < 60; i++) {
-        /* 100-char string literal per arg; 60 args => args JSON well past the
-         * 2 KB props buffer, forcing the pre-fix overshoot. */
+        /* Keep the original sixty 100-character literals. Extraction captures
+         * the first eight; the independent longer control below overflows. */
         fputs("    \"", f);
         for (int j = 0; j < 100; j++)
             fputc('a' + (i % 26), f);
@@ -960,7 +1156,126 @@ TEST(parallel_args_json_no_overflow) {
 
     cbm_gbuf_t *gbuf = run_parallel("argov-test", dir, files, file_count, 4);
     ASSERT_TRUE(gbuf != NULL);
-    ASSERT_GT(cbm_gbuf_edge_count(gbuf), 0);
+    char *source = parallel_fixture_source(path);
+    ASSERT_NOT_NULL(source);
+    const char *call = strstr(source, "  sink(");
+    ASSERT_NOT_NULL(call);
+    call += 2;
+    const char *end = strstr(call, "  );");
+    ASSERT_NOT_NULL(end);
+    RQ_Source input = {.path = "app.ts", .text = source};
+    RQ_Expected expected = {
+        .case_id = "wide-rest-argument-call",
+        .site = {.file = "app.ts",
+                 .caller = "app.caller",
+                 .start_byte = (uint32_t)(call - source),
+                 .end_byte = (uint32_t)(end + 3 - source)},
+        .relation = "CALLS",
+        .target = {.file = "app.ts",
+                   .suffix = "app.sink",
+                   .label = "Function",
+                   .declaration_line = 1,
+                   .declaration_text = "function sink(...xs: string[]) { return xs; }"}};
+    RQ_Report quality = {0};
+    ASSERT(parallel_quality_check(gbuf, "argov-test", "wide-call-arguments", &input, 1, &expected,
+                                  1, &quality));
+    ASSERT_EQ(quality.genuine, 1);
+    ASSERT_EQ(quality.missing, 0);
+    /* The original input's first eight 100-byte values fit. A second source
+     * fixture stays within CBM_MAX_CALL_ARGS while making each literal longer
+     * so the last JSON argument cannot fit. Neither control needs a speculative
+     * CALLS edge to reach the real production serializer. */
+    char long_source[CBM_SZ_4K];
+    int length = snprintf(long_source, sizeof(long_source),
+                          "function sink(...xs: string[]) { return xs; }\n"
+                          "function caller() {\n  sink(\n");
+    ASSERT_GT(length, 0);
+    ASSERT_LT((size_t)length, sizeof(long_source));
+    for (int i = 0; i < CBM_MAX_CALL_ARGS; i++) {
+        char literal[201];
+        memset(literal, 'a' + i % 26, sizeof(literal) - 1);
+        literal[sizeof(literal) - 1] = '\0';
+        int added = snprintf(long_source + length, sizeof(long_source) - (size_t)length,
+                             "    \"%s\"%s\n", literal, i + 1 < CBM_MAX_CALL_ARGS ? "," : "");
+        ASSERT_GT(added, 0);
+        ASSERT_LT((size_t)added, sizeof(long_source) - (size_t)length);
+        length += added;
+    }
+    int added = snprintf(long_source + length, sizeof(long_source) - (size_t)length, "  );\n}\n");
+    ASSERT_GT(added, 0);
+    ASSERT_LT((size_t)added, sizeof(long_source) - (size_t)length);
+
+    const char *serializer_sources[] = {source, long_source};
+    for (int control = 0; control < 2; control++) {
+        const char *text = serializer_sources[control];
+        const char *site = strstr(text, "  sink(");
+        ASSERT_NOT_NULL(site);
+        site += 2;
+        const char *site_end = strstr(site, "  );");
+        ASSERT_NOT_NULL(site_end);
+        CBMFileResult *extracted = cbm_extract_file(text, (int)strlen(text), CBM_LANG_TYPESCRIPT,
+                                                    "argov-test", "app.ts", 0, NULL, NULL);
+        ASSERT_NOT_NULL(extracted);
+        const CBMCall *wide_call = NULL;
+        for (int i = 0; i < extracted->calls.count; i++) {
+            const CBMCall *candidate = &extracted->calls.items[i];
+            if (candidate->site_start_byte == (uint32_t)(site - text) &&
+                candidate->site_end_byte == (uint32_t)(site_end + 3 - text) &&
+                candidate->callee_name && !strcmp(candidate->callee_name, "sink")) {
+                ASSERT_NULL(wide_call);
+                wide_call = candidate;
+            }
+        }
+        ASSERT_NOT_NULL(wide_call);
+        ASSERT_EQ(wide_call->arg_count, CBM_MAX_CALL_ARGS);
+        for (int i = 0; i < wide_call->arg_count; i++) {
+            ASSERT_NOT_NULL(wide_call->args[i].value);
+            ASSERT_EQ(strlen(wide_call->args[i].value), control ? 200 : 100);
+        }
+        char props[CBM_SZ_2K];
+        int prefix = snprintf(props, sizeof(props),
+                              "{\"callee\":\"sink\",\"confidence\":1.00,\"strategy\":\"exact\","
+                              "\"candidates\":1");
+        cbm_pipeline_close_call_props(props, prefix, wide_call, true);
+        ASSERT_GT(strlen(props), 1024);
+        ASSERT_LT(strlen(props), sizeof(props));
+        sqlite3 *json_db = NULL;
+        sqlite3_stmt *json = NULL;
+        ASSERT_EQ(sqlite3_open(":memory:", &json_db), SQLITE_OK);
+        ASSERT_EQ(sqlite3_prepare_v2(json_db,
+                                     "SELECT json_extract(value, '$.i'), "
+                                     "json_extract(value, '$.v') FROM json_each(?1, '$.args')",
+                                     -1, &json, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_text(json, 1, props, -1, SQLITE_STATIC), SQLITE_OK);
+        int retained = 0, step;
+        while ((step = sqlite3_step(json)) == SQLITE_ROW) {
+            ASSERT_EQ(sqlite3_column_int(json, 0), retained);
+            const char *value = (const char *)sqlite3_column_text(json, 1);
+            ASSERT_NOT_NULL(value);
+            size_t value_length = strlen(value);
+            if (control) {
+                ASSERT_GT(value_length, 100);
+                ASSERT_LTE(value_length, 200);
+            } else {
+                ASSERT_EQ(value_length, 100);
+            }
+            for (size_t i = 0; i < value_length; i++)
+                ASSERT_EQ(value[i], 'a' + retained % 26);
+            retained++;
+        }
+        ASSERT_EQ(step, SQLITE_DONE);
+        if (control) {
+            ASSERT_GT(retained, 0);
+            ASSERT_LT(retained, CBM_MAX_CALL_ARGS);
+        } else {
+            ASSERT_EQ(retained, CBM_MAX_CALL_ARGS);
+        }
+        sqlite3_finalize(json);
+        sqlite3_close(json_db);
+        cbm_free_result(extracted);
+    }
+    free(source);
 
     cbm_gbuf_free(gbuf);
     cbm_discover_free(files, file_count);
@@ -975,24 +1290,23 @@ TEST(parallel_args_json_no_overflow) {
  * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
  * ImageController actions, 2026-10-18). `small` has the same body and is the
  * control that the fixture produces all three at all. Both resolvers. */
-static const char f14_body[] =
-    "    total = 0\n"
-    "    for item in range(10):\n"
-    "        if item % 3 == 0:\n"
-    "            total += item * 2\n"
-    "        elif item % 5 == 1:\n"
-    "            total -= len(str(item))\n"
-    "        else:\n"
-    "            total ^= hash((item, total))\n"
-    "    values = [x * x for x in range(total % 7 + 3)]\n"
-    "    mapping = {str(k): v for k, v in enumerate(values)}\n"
-    "    while total > 100:\n"
-    "        total //= 3\n"
-    "    try:\n"
-    "        result = sorted(mapping.items(), key=lambda kv: kv[1])\n"
-    "    except ValueError as err:\n"
-    "        result = [(\"error\", str(err))]\n"
-    "    return result, total, mapping\n";
+static const char f14_body[] = "    total = 0\n"
+                               "    for item in range(10):\n"
+                               "        if item % 3 == 0:\n"
+                               "            total += item * 2\n"
+                               "        elif item % 5 == 1:\n"
+                               "            total -= len(str(item))\n"
+                               "        else:\n"
+                               "            total ^= hash((item, total))\n"
+                               "    values = [x * x for x in range(total % 7 + 3)]\n"
+                               "    mapping = {str(k): v for k, v in enumerate(values)}\n"
+                               "    while total > 100:\n"
+                               "        total //= 3\n"
+                               "    try:\n"
+                               "        result = sorted(mapping.items(), key=lambda kv: kv[1])\n"
+                               "    except ValueError as err:\n"
+                               "        result = [(\"error\", str(err))]\n"
+                               "    return result, total, mapping\n";
 
 static bool f14_props_have(const cbm_gbuf_t *gb, const char *project, const char *name,
                            const char *venue) {
@@ -1013,8 +1327,8 @@ TEST(parallel_wide_definition_keeps_fp_sp_bt_f14) {
     char params[CBM_SZ_4K];
     size_t pos = 0;
     for (int i = 0; i < 50; i++) {
-        pos += (size_t)snprintf(params + pos, sizeof(params) - pos, "%sp%02d: Dict[str, int] = None",
-                                i ? ", " : "", i);
+        pos += (size_t)snprintf(params + pos, sizeof(params) - pos,
+                                "%sp%02d: Dict[str, int] = None", i ? ", " : "", i);
     }
     char src[CBM_SZ_8K];
     snprintf(src, sizeof(src), "def small(a, b):\n%s\n\ndef wide(%s):\n%s", f14_body, params,
@@ -1276,13 +1590,13 @@ TEST(parallel_full_index_keeps_edge_ids_unique) {
     PASS();
 }
 
-/* The closure-repair route always runs the parallel phases; both of its
- * syncs go through the same helper. */
+/* An input change now rebuilds the resolver generation. Keep enough files to
+ * enter the parallel phases and require both ID syncs through the helper. */
 TEST(parallel_closure_repair_syncs_ids_through_the_helper) {
     char repo[256];
     snprintf(repo, sizeof(repo), "/tmp/cbm_par_ids_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(repo));
-    if (!write_id_fixture(repo, 3)) {
+    if (!write_id_fixture(repo, ID_FILES)) {
         th_rmtree(repo);
         FAIL("failed to write the edge-id fixture");
     }
@@ -1293,43 +1607,50 @@ TEST(parallel_closure_repair_syncs_ids_through_the_helper) {
     int first_rc = first ? cbm_pipeline_run(first) : CBM_NOT_FOUND;
     cbm_pipeline_free(first);
 
-    /* A body-only edit (no new names) routes to closure repair. */
+    /* A body-only edit still changes the semantic input generation. */
     char path[512];
     snprintf(path, sizeof(path), "%s/f01.go", repo);
     int write_rc =
         th_write_file(path, "package main\n\nfunc F01() int {\n\treturn F02() + 40 + 2\n}\n");
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
     id_sync_probe_t syncs = {.push = false};
+    edge_id_probe_t probe = {0};
     cbm_pipeline_set_id_sync_hook_for_tests(id_sync_hook, &syncs);
     cbm_pipeline_incremental_test_reset_faults();
     cbm_pipeline_t *second = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (second) {
+        cbm_pipeline_set_before_dump_hook_for_tests(second, probe_edge_ids, &probe);
+    }
     int second_rc = second ? cbm_pipeline_run(second) : CBM_NOT_FOUND;
     cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(second);
     cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
     th_rmtree(repo);
 
     ASSERT_EQ(first_rc, 0);
     ASSERT_EQ(write_rc, 0);
     ASSERT_EQ(second_rc, 0);
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(syncs.syncs, 2);
+    ASSERT_GT(probe.edges, ID_FILES);
+    ASSERT_EQ(probe.duplicates, 0);
     PASS();
 }
 
-/* ── Parallel-pipeline LSP-override regression ────────────────────── */
-/* Pin the wiring fix that unified pass_calls.c (sequential) and
- * pass_parallel.c (parallel) on cbm_pipeline_find_lsp_resolution +
- * CBM_LSP_CONFIDENCE_FLOOR (lsp_resolve.h). Before the unification, the
- * parallel path carried its own lsp_override_resolution_pp at floor 0.5
- * while the sequential path used find_lsp_resolution at floor 0.6, so a
- * project produced different CALLS edge attributions depending on which
- * pipeline mode kicked in. This test indexes a small Python repo via
- * the parallel pipeline and asserts at least one resulting CALLS edge
- * carries an "lsp_*" strategy — proof the parallel path consults
- * result->resolved_calls and emits LSP-attributed edges. */
+/* Legacy semantic results must reach the shared proof gate in both pipeline
+ * modes. The tests below require the exact source-proved receiver target and
+ * the public shared_resolver strategy, never a legacy confidence score. */
 
 typedef struct {
-    int lsp_strategy_count;
+    int proof_strategy_count;
     int total_calls;
 } lsp_edge_count_ctx_t;
 
@@ -1339,8 +1660,9 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
         return;
     }
     c->total_calls++;
-    if (edge->properties_json && strstr(edge->properties_json, "\"strategy\":\"lsp")) {
-        c->lsp_strategy_count++;
+    if (edge->properties_json &&
+        strstr(edge->properties_json, "\"strategy\":\"shared_resolver\"")) {
+        c->proof_strategy_count++;
     }
 }
 
@@ -1771,11 +2093,13 @@ TEST(parallel_lsp_index_distinct_exact_targets_fail_closed_in_graph) {
     ASSERT_NOT_NULL(find_unique_callable_node_by_tail(gbuf, "Beta.render"));
     const cbm_gbuf_edge_t *alpha = find_calls_edge_by_tails(gbuf, "Caller.run", "Alpha.render");
     const cbm_gbuf_edge_t *beta = find_calls_edge_by_tails(gbuf, "Caller.run", "Beta.render");
-    if (alpha || beta) {
+    if (!alpha || beta) {
         printf("  lsp exact ambiguity diagnostic: alpha=%s beta=%s\n", alpha ? "present" : "absent",
                beta ? "present" : "absent");
     }
-    ASSERT_NULL(alpha);
+    /* The injected row has no proof. The original source independently proves
+     * Alpha; an untrusted competing row must neither bind Beta nor veto Alpha. */
+    ASSERT_NOT_NULL(alpha);
     ASSERT_NULL(beta);
 
     cbm_gbuf_free(gbuf);
@@ -1907,7 +2231,7 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     const cbm_gbuf_edge_t *legacy_edge =
         find_calls_edge_by_tails(gbuf, "Caller.run", "Legacy.render");
     if (!probe.ambiguity.injected || !probe.legacy_injected || !probe.carrier_allows_fallback ||
-        !probe.shared_matcher_failed_closed || alpha_edges != 0 || beta_edges != 0 ||
+        !probe.shared_matcher_failed_closed || alpha_edges != 1 || beta_edges != 0 ||
         legacy_edges != 0) {
         printf("  exact ambiguity + legacy diagnostic: exact_ambiguity=%d legacy=%d "
                "fallback_allowed=%d shared_failed_closed=%d alpha=%d beta=%d legacy_edge=%d "
@@ -1924,26 +2248,9 @@ TEST(parallel_lsp_index_exact_ambiguity_does_not_fall_through_to_legacy) {
     ASSERT_TRUE(probe.legacy_injected);
     ASSERT_TRUE(probe.carrier_allows_fallback);
     ASSERT_TRUE(probe.shared_matcher_failed_closed);
-    /* alpha_edges is a SIDE EFFECT of this test, not its subject. The subject is
-     * beta_edges == 0 and legacy_edges == 0 below: an ambiguous exact LSP match
-     * must not fall through to the lower-ranked legacy semantic row. Both are
-     * unchanged, as are all four probe assertions above.
-     *
-     * It used to be 1 because this harness DELIBERATELY injects an ambiguous
-     * exact match and forces the shared matcher to fail closed, so
-     * `value.render()` drops past the LSP into the registry with THREE
-     * same-named candidates (Alpha/Beta/Legacy.render) and bound by
-     * suffix_match — MEASURED: strategy=suffix_match, cands=3, conf=0.5500.
-     * That is a 1-in-3 guess that happened to land on Alpha: exactly the weak
-     * member-call class the Python guard now suppresses (#1276), and the same
-     * accepted trade recorded on python/S6 in test_lsp_resolution_probe.c.
-     *
-     * NOT over-suppression: sibling tests in this suite index the same
-     * `value.render()` source and resolve it via lsp_method (cands=1,
-     * conf=0.9000), a strategy the guard keeps — they still assert 1. Only the
-     * sabotaged-LSP path degrades to a weak textual guess.
-     * Flips back to 1 once py_lsp_cross resolves the receiver on this path. */
-    ASSERT_EQ(alpha_edges, 0);
+    /* Legacy matcher ambiguity is still tested above. The shared source proof
+     * independently retains Alpha and rejects both unattested injected targets. */
+    ASSERT_EQ(alpha_edges, 1);
     ASSERT_EQ(beta_edges, 0);
     ASSERT_EQ(legacy_edges, 0);
     PASS();
@@ -2134,7 +2441,7 @@ TEST(parallel_lsp_exact_index_handles_repeated_synthetic_occurrences_without_lin
     for (int i = 0; i < OCCURRENCES; i++) {
         fprintf(file, "    value = left + right\n");
     }
-    fprintf(file, "    return value\n");
+    fprintf(file, "    return value\ndef stable(): return 7\ndef direct(): return stable()\n");
     fclose(file);
 
     cbm_file_info_t files[1] = {0};
@@ -2149,7 +2456,50 @@ TEST(parallel_lsp_exact_index_handles_repeated_synthetic_occurrences_without_lin
     ASSERT_NOT_NULL(gbuf);
     ASSERT_EQ(probe.carrier_count, OCCURRENCES);
     ASSERT_EQ(probe.exact_match_count, OCCURRENCES);
-    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.combine", "Number.__add__"));
+    char *source = parallel_fixture_source(path);
+    ASSERT_NOT_NULL(source);
+    RQ_Source input = {.path = "app.py", .text = source};
+    RQ_Expected expected[OCCURRENCES + 1] = {0};
+    char ids[OCCURRENCES][32];
+    for (int i = 0; i < OCCURRENCES; i++) {
+        snprintf(ids[i], sizeof(ids[i]), "python-add-%d", i);
+        expected[i] = (RQ_Expected){
+            .case_id = ids[i],
+            .site = {.file = "app.py",
+                     .caller = "app.combine",
+                     .needle = "left + right",
+                     .occurrence_index = (unsigned)i},
+            .relation = "CALLS",
+            .target = {.file = "app.py",
+                       .suffix = "app.Number.__add__",
+                       .label = "Method",
+                       .declaration_line = 2,
+                       .declaration_text = "    def __add__(self, other):"},
+            .mode = RQ_KNOWN_GAP,
+            .gap_id = "python-implicit-operator-dispatch",
+            .why = "Python implicit operator applicability is not certified by the proof bridge.",
+            .tried = "All 128 exact legacy carriers and matches remain asserted; each original "
+                     "operator occurrence is counted independently and a direct call is required."};
+    }
+    expected[OCCURRENCES] = (RQ_Expected){.case_id = "python-direct-control",
+                                          .site = {.file = "app.py",
+                                                   .caller = "app.direct",
+                                                   .needle = "stable()",
+                                                   .occurrence_index = 1},
+                                          .relation = "CALLS",
+                                          .target = {.file = "app.py",
+                                                     .suffix = "app.stable",
+                                                     .label = "Function",
+                                                     .declaration_line = OCCURRENCES + 7,
+                                                     .declaration_text = "def stable(): return 7"},
+                                          .mode = RQ_REQUIRED};
+    RQ_Report quality = {0};
+    ASSERT(parallel_quality_check(gbuf, "cbm_par_lsp_perf", "python-operator-scale", &input, 1,
+                                  expected, OCCURRENCES + 1, &quality));
+    ASSERT_EQ(quality.genuine, OCCURRENCES + 1);
+    ASSERT_EQ(quality.found, 1);
+    ASSERT_EQ(quality.missing, OCCURRENCES);
+    free(source);
     uint64_t fallback_rows = cbm_pp_lsp_linear_fallback_rows();
     if (fallback_rows != 0) {
         printf("  synthetic exact-index diagnostic: occurrences=%d linear_rows=%llu\n", OCCURRENCES,
@@ -2171,10 +2521,9 @@ typedef struct {
     int reference_count;
 } call_reference_scale_probe_t;
 
-/* Replace incidental extractor usages with a deterministic one-to-one set of
- * exact callable references. Every target is a real extracted Function node,
- * so the fused resolver must traverse its ordinary usage-materialization path
- * and emit 128 distinct CALL_REFERENCE edges. */
+/* Supply 128 real target names at fabricated off-source spans. The legacy
+ * site index must remain linear, but those rows cannot authorize edges. The
+ * test separately requires all 128 references from actual source arguments. */
 static void inject_call_reference_scale_rows(CBMFileResult **result_cache, int file_count,
                                              void *ud) {
     call_reference_scale_probe_t *probe = (call_reference_scale_probe_t *)ud;
@@ -2254,7 +2603,9 @@ TEST(parallel_call_reference_lookup_rows_grow_linearly) {
     for (int i = 0; i < CALL_REFERENCE_SCALE_OCCURRENCES; i++) {
         fprintf(file, "def scale_target_%03d():\n    return %d\n", i, i);
     }
-    fputs("def scale_caller():\n    return None\n", file);
+    fputs("def consume(callback): return None\ndef scale_caller():\n", file);
+    for (int i = 0; i < CALL_REFERENCE_SCALE_OCCURRENCES; i++)
+        fprintf(file, "    consume(scale_target_%03d)\n", i);
     fclose(file);
 
     cbm_file_info_t file_info = {0};
@@ -2269,6 +2620,25 @@ TEST(parallel_call_reference_lookup_rows_grow_linearly) {
         &probe, false);
     uint64_t rows_examined = cbm_pipeline_lsp_reference_lookup_test_rows_examined();
 
+    cbm_pipeline_lsp_reference_lookup_test_reset();
+    cbm_gbuf_t *source_graph = run_parallel("cbm_par_ref_scale", tmpdir, &file_info, 1, 1);
+    uint64_t source_rows_examined = cbm_pipeline_lsp_reference_lookup_test_rows_examined();
+    const cbm_gbuf_node_t *source_caller =
+        source_graph ? find_unique_callable_node_by_tail(source_graph, "app.scale_caller") : NULL;
+    const cbm_gbuf_edge_t **source_edges = NULL;
+    int source_count = 0;
+    int source_rc =
+        source_caller
+            ? cbm_gbuf_find_edges_by_source_type(source_graph, source_caller->id, "CALL_REFERENCE",
+                                                 &source_edges, &source_count)
+            : -1;
+    int source_targets = 0;
+    for (int i = 0; source_rc == 0 && i < source_count; i++) {
+        const cbm_gbuf_node_t *target =
+            cbm_gbuf_find_by_id(source_graph, source_edges[i]->target_id);
+        if (target && target->name && !strncmp(target->name, "scale_target_", 13))
+            source_targets++;
+    }
     const cbm_gbuf_node_t *caller =
         gbuf ? find_unique_callable_node_by_tail(gbuf, "app.scale_caller") : NULL;
     const cbm_gbuf_edge_t **edges = NULL;
@@ -2287,26 +2657,33 @@ TEST(parallel_call_reference_lookup_rows_grow_linearly) {
     }
 
     uint64_t linear_budget = (uint64_t)CALL_REFERENCE_SCALE_OCCURRENCES * 8U;
-    if (!probe.injected || lookup_rc != 0 || edge_count != CALL_REFERENCE_SCALE_OCCURRENCES ||
-        exact_target_edges != CALL_REFERENCE_SCALE_OCCURRENCES || rows_examined > linear_budget) {
+    if (!probe.injected || lookup_rc != 0 || edge_count != 0 || exact_target_edges != 0 ||
+        rows_examined > linear_budget) {
         printf("  call-reference lookup scale diagnostic: injected=%d references=%d "
                "edges=%d exact_targets=%d rows=%llu budget=%llu\n",
                probe.injected, probe.reference_count, edge_count, exact_target_edges,
                (unsigned long long)rows_examined, (unsigned long long)linear_budget);
     }
 
+    cbm_gbuf_free(source_graph);
     cbm_gbuf_free(gbuf);
     unlink(path);
     rmdir(tmpdir);
     ASSERT_TRUE(probe.injected);
     ASSERT_EQ(probe.reference_count, CALL_REFERENCE_SCALE_OCCURRENCES);
     ASSERT_EQ(lookup_rc, 0);
-    ASSERT_EQ(edge_count, CALL_REFERENCE_SCALE_OCCURRENCES);
-    ASSERT_EQ(exact_target_edges, CALL_REFERENCE_SCALE_OCCURRENCES);
+    /* Off-source synthetic spans have no occurrence proof. Real source
+     * arguments retain all 128 references through the same public pipeline. */
+    ASSERT_EQ(edge_count, 0);
+    ASSERT_EQ(exact_target_edges, 0);
+    ASSERT_EQ(source_rc, 0);
+    ASSERT_EQ(source_count, CALL_REFERENCE_SCALE_OCCURRENCES);
+    ASSERT_EQ(source_targets, CALL_REFERENCE_SCALE_OCCURRENCES);
     /* The current full scan examines N rows for every one of N usages:
      * 128*128 = 16,384. A site index should keep this below a small linear
      * allowance while retaining the exact target/ambiguity checks. */
     ASSERT_LTE(rows_examined, linear_budget);
+    ASSERT_LTE(source_rows_examined, linear_budget);
     PASS();
 }
 #endif
@@ -2363,6 +2740,31 @@ TEST(parallel_tsx_local_component_shadow_has_no_false_call) {
                parallel_wrong);
     }
 
+    char *source = parallel_fixture_source(path);
+    ASSERT_NOT_NULL(source);
+    RQ_Source input = {.path = "main.tsx", .text = source};
+    RQ_Expected expected = {
+        .case_id = "jsx-direct-component",
+        .site = {.file = "main.tsx",
+                 .caller = "main.Good",
+                 .needle = "<Card/>",
+                 .occurrence_index = 0},
+        .relation = "CALLS",
+        .target = {.file = "main.tsx",
+                   .suffix = "main.Card",
+                   .label = "Function",
+                   .declaration_line = 1,
+                   .declaration_text = "function Card(): JSX.Element { return <div/>; }"}};
+    RQ_Report quality[2] = {0};
+    ASSERT(parallel_quality_check(sequential, "cbm_tsx_shadow", "jsx-shadow-sequential", &input, 1,
+                                  &expected, 1, &quality[0]));
+    ASSERT(parallel_quality_check(parallel, "cbm_tsx_shadow", "jsx-shadow-parallel", &input, 1,
+                                  &expected, 1, &quality[1]));
+    ASSERT_EQ(quality[0].genuine, 1);
+    ASSERT_EQ(quality[1].genuine, 1);
+    ASSERT_EQ(quality[0].missing, 0);
+    ASSERT_EQ(quality[1].missing, 0);
+    free(source);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     unlink(path);
@@ -2416,9 +2818,9 @@ static void inject_exact_noncallable_reference(CBMFileResult **result_cache, int
         usage.enclosing_func_qn = caller_qn;
         usage.kind = CBM_USAGE_VALUE;
         usage.may_be_call_reference = true;
-        /* The raw-name path is deliberately unavailable. A resulting USAGE
-         * therefore proves that the exact semantic row was joined and then
-         * classified by the materialized target's non-callable label. */
+        /* The raw-name path is deliberately unavailable and this span is
+         * outside the source. Neither the target label nor the legacy strategy
+         * can turn an unattested row into a USAGE edge. */
         usage.semantic_reference_blocked = true;
         usage.site_start_byte = 40000U;
         usage.site_end_byte = 40000U + (uint32_t)strlen(usage.ref_name);
@@ -2486,6 +2888,21 @@ TEST(parallel_exact_semantic_noncallable_target_stays_usage) {
                                        "CALL_REFERENCE") ||
         has_edge_from_callable_to_node(parallel, "app.carrier", parallel_target, "CALLS");
 
+    cbm_gbuf_t *control[2] = {
+        run_sequential_with_lsp_cross_and_mutator("cbm_exact_noncallable", tmpdir, &file, 1, NULL,
+                                                  NULL, false),
+        run_parallel_with_extract_opts_and_mutator("cbm_exact_noncallable", tmpdir, &file, 1, 1,
+                                                   NULL, NULL, NULL, false)};
+    for (int i = 0; i < 2; i++) {
+        ASSERT_NOT_NULL(control[i]);
+        const cbm_gbuf_node_t *target = find_unique_node_by_name_label_qn_suffix(
+            control[i], "semanticValue", "Variable", "app.semanticValue");
+        ASSERT_NOT_NULL(target);
+        ASSERT_TRUE(has_edge_from_callable_to_node(control[i], "app.carrier", target, "USAGE"));
+        ASSERT_FALSE(
+            has_edge_from_callable_to_node(control[i], "app.carrier", target, "CALL_REFERENCE"));
+        cbm_gbuf_free(control[i]);
+    }
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     th_rmtree(tmpdir);
@@ -2493,8 +2910,8 @@ TEST(parallel_exact_semantic_noncallable_target_stays_usage) {
     ASSERT_TRUE(parallel_probe.injected);
     ASSERT_NOT_NULL(sequential_target);
     ASSERT_NOT_NULL(parallel_target);
-    ASSERT_TRUE(sequential_usage);
-    ASSERT_TRUE(parallel_usage);
+    ASSERT_FALSE(sequential_usage);
+    ASSERT_FALSE(parallel_usage);
     ASSERT_FALSE(sequential_promoted);
     ASSERT_FALSE(parallel_promoted);
     PASS();
@@ -2644,7 +3061,9 @@ enum {
 };
 
 typedef struct {
-    int edge_counts[2][TS_EXACT_EDGE_COUNT]; /* sequential, parallel */
+    int edge_counts[2][TS_EXACT_EDGE_COUNT];
+    bool quality_ok[2];
+    RQ_Report quality[2]; /* sequential, parallel */
 } ts_exact_parity_observation_t;
 
 static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage main_language,
@@ -2702,6 +3121,46 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
     files[2].rel_path = main_rel;
     files[2].language = main_language;
 
+    RQ_Source sources[] = {{.path = "a/types.ts", .text = type_source},
+                           {.path = "b/types.ts", .text = type_source},
+                           {.path = main_rel, .text = main_source}};
+    RQ_Expected expected[] = {
+        {.case_id = "imported-interface-annotation",
+         .site =
+             {.file = main_rel, .caller = "main.choose", .needle = "Config", .occurrence_index = 1},
+         .relation = "USES_TYPE",
+         .target = {.file = "a/types.ts",
+                    .suffix = "a.types.Config",
+                    .label = "Interface",
+                    .declaration_line = 1,
+                    .declaration_text = "export interface Config { enabled: boolean }"}},
+        {.case_id = "namespace-sibling-call",
+         .site = {.file = main_rel,
+                  .caller = "main.App.Utils.normalise",
+                  .needle = "clamp()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = main_rel,
+                    .suffix = "main.App.Utils.clamp",
+                    .label = "Function",
+                    .declaration_line = 5,
+                    .declaration_text = "    export function clamp(): number { return 1; }"}},
+        {.case_id = "namespace-constructor-call",
+         .site = {.file = main_rel,
+                  .caller = "main.App.Config.constructor",
+                  .needle = "Utils.normalise()"},
+         .relation = "CALLS",
+         .target = {.file = main_rel,
+                    .suffix = "main.App.Utils.normalise",
+                    .label = "Function",
+                    .declaration_line = 6,
+                    .declaration_text =
+                        "    export function normalise(): number { return clamp(); }"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "typescript-namespace-member-call-proof",
+         .why = "Nested namespace member lookup is not source-certified.",
+         .tried = "Retained the constructor and explicit Utils receiver; no bare-name fallback is "
+                  "admitted."}};
     cbm_gbuf_t *graphs[2] = {
         run_sequential_with_lsp_cross_and_mutator(project, tmpdir, files, 3, NULL, NULL, true),
         run_parallel_with_extract_opts_and_mutator(project, tmpdir, files, 3, 2, NULL, NULL, NULL,
@@ -2724,12 +3183,15 @@ static ts_exact_parity_observation_t run_ts_exact_parity_fixture(CBMLanguage mai
         const cbm_gbuf_node_t *constructor = find_unique_node_by_name_label_qn_suffix(
             graph, "constructor", "Method", "main.App.Config.constructor");
 
+        observation.quality_ok[route] = parallel_quality_check(
+            graph, project, route ? "ts-namespace-parallel" : "ts-namespace-sequential", sources, 3,
+            expected, 3, &observation.quality[route]);
         observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT] =
-            count_edges_between_nodes(graph, choose, selected, "USAGE");
+            count_edges_between_nodes(graph, choose, selected, "USES_TYPE");
         observation.edge_counts[route][TS_EXACT_DECOY_IMPORT] =
-            count_edges_between_nodes(graph, choose, decoy, "USAGE");
+            count_edges_between_nodes(graph, choose, decoy, "USES_TYPE");
         observation.edge_counts[route][TS_EXACT_LOCAL_CLASS] =
-            count_edges_between_nodes(graph, choose, local_class, "USAGE");
+            count_edges_between_nodes(graph, choose, local_class, "USES_TYPE");
         observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL] =
             count_edges_between_nodes(graph, normalise, clamp, "CALLS");
         observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL] =
@@ -2762,11 +3224,14 @@ TEST(parallel_typescript_import_namespace_exact_parity) {
         run_ts_exact_parity_fixture(CBM_LANG_TYPESCRIPT, "ts", "cbm_ts_exact_parity");
     print_ts_exact_parity_diagnostic("TypeScript", &observation);
     for (int route = 0; route < 2; route++) {
+        ASSERT_TRUE(observation.quality_ok[route]);
+        ASSERT_EQ(observation.quality[route].genuine, 3);
+        ASSERT_EQ(observation.quality[route].missing, 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_DECOY_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_LOCAL_CLASS], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 1);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 1);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 0);
     }
     PASS();
 }
@@ -2776,11 +3241,14 @@ TEST(parallel_tsx_import_namespace_exact_parity) {
         run_ts_exact_parity_fixture(CBM_LANG_TSX, "tsx", "cbm_tsx_exact_parity");
     print_ts_exact_parity_diagnostic("TSX", &observation);
     for (int route = 0; route < 2; route++) {
+        ASSERT_TRUE(observation.quality_ok[route]);
+        ASSERT_EQ(observation.quality[route].genuine, 3);
+        ASSERT_EQ(observation.quality[route].missing, 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_SELECTED_IMPORT], 1);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_DECOY_IMPORT], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_LOCAL_CLASS], 0);
         ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_INNER_CALL], 1);
-        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 1);
+        ASSERT_EQ(observation.edge_counts[route][TS_EXACT_NAMESPACE_CONSTRUCTOR_CALL], 0);
     }
     PASS();
 }
@@ -2988,10 +3456,80 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     const char *part_alpha = "cbm_cs_same_name.src.Parts.Thing.A.Thing.Alpha";
     const char *part_beta = "cbm_cs_same_name.src.Parts.Thing.B.Thing.Beta";
     const char *decoy_beta = "cbm_cs_same_name.src.Decoy.Worker.Worker.Beta";
+    RQ_Source sources[N_FILES];
+    for (int i = 0; i < N_FILES; i++)
+        sources[i] = (RQ_Source){.path = rels[i], .text = srcs[i]};
+    const struct {
+        int source, target;
+        const char *caller, *needle, *suffix, *declaration;
+        int line;
+    } cases[] = {{3, 2, "Handler.Handle", "UserIdentityInfo.ParseFromClaim(claim)", bo,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {4, 1, "PlatformHandler.Handle", "UserIdentityInfo.ParseFromClaim(claim)", pf,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {5, 2, "ClaimReader.Read", "UserIdentityInfo.ParseFromClaim(claim)", bo,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {6, 2, "Report.Build",
+                  "Contoso.Platform.BackOffice.Identity.UserIdentityInfo.ParseFromClaim(claim)", bo,
+                  "    public static UserIdentityInfo ParseFromClaim(string c)", 3},
+                 {8, 7, "Runner.Run", "w.Start()", ref_start,
+                  "    public class Worker { public void Start() { } }", 3},
+                 {11, 9, "PartUser.Use", "t.Alpha()", part_alpha,
+                  "public partial class Thing { public void Alpha() { } }", 2},
+                 {11, 10, "PartUser.Use", "t.Beta()", part_beta,
+                  "public partial class Thing { public void Beta() { } }", 2}};
+    enum { N_MEMBER_CALLS = 7, N_EXPECTED = 9 };
+    RQ_Expected expected[N_EXPECTED] = {0};
+    for (int i = 0; i < N_MEMBER_CALLS; i++)
+        expected[i] = (RQ_Expected){
+            .case_id = i == 6 ? "partial-beta" : cases[i].caller,
+            .site = {.file = rels[cases[i].source],
+                     .caller = cases[i].caller,
+                     .needle = cases[i].needle},
+            .relation = "CALLS",
+            .target = {.file = rels[cases[i].target],
+                       .suffix = cases[i].suffix,
+                       .label = "Method",
+                       .declaration_line = cases[i].line,
+                       .declaration_text = cases[i].declaration},
+            .mode = RQ_REQUIRED};
+    /* `using Contoso.Threading` and nothing nearer named Worker: the constructor
+     * call selects Contoso.Threading.Worker, the second namespace of Threading.cs,
+     * never the decoy Contoso.Decoy.Worker this file does not import. */
+    expected[N_MEMBER_CALLS] = (RQ_Expected){
+        .case_id = "Runner.Run-constructor",
+        .site = {.file = rels[8], .caller = "Runner.Run", .needle = "new Worker()"},
+        .relation = "CALLS",
+        .target = {.file = rels[7],
+                   .suffix = "cbm_cs_same_name.src.Ref.Threading.Worker",
+                   .label = "Class",
+                   .declaration_line = 3,
+                   .declaration_text = "    public class Worker { public void Start() { } }"},
+        .mode = RQ_REQUIRED};
+    expected[N_MEMBER_CALLS + 1] = (RQ_Expected){
+        .case_id = "PartUser.Use-partial-constructor",
+        .site = {.file = rels[11], .caller = "PartUser.Use", .needle = "new Thing()"},
+        .relation = "CALLS",
+        .target = {.file = rels[9],
+                   .declaration_line = 2,
+                   .declaration_text = "public partial class Thing { public void Alpha() { } }"},
+        .mode = RQ_KNOWN_GAP,
+        .gap_id = "csharp-partial-type-identity",
+        .why = "Each partial piece of Thing has a node of its own (its QN carries its file), so "
+               "no one class node is the type this constructor call selects.",
+        .tried = "The members bind to the piece that declares them. The type itself has no single "
+                 "identity to bind to, and choosing a piece would be a guess."};
+    RQ_Report quality[2] = {0};
     bool ok[2][N_CHECKS];
     bool all = true;
     for (int g = 0; g < 2; g++) {
         cbm_gbuf_t *gb = graphs[g];
+        ASSERT(parallel_quality_check(gb, project,
+                                      g ? "csharp-members-parallel" : "csharp-members-sequential",
+                                      sources, N_FILES, expected, N_EXPECTED, &quality[g]));
+        ASSERT_EQ(quality[g].genuine, N_EXPECTED);
+        ASSERT_EQ(quality[g].found, N_EXPECTED - 1);
+        ASSERT_EQ(quality[g].missing, 1);
         ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
         ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
         ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
@@ -3024,6 +3562,36 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
     th_rmtree(tmpdir);
     ASSERT_TRUE(all);
     PASS();
+}
+
+static const char PAR_C_TARGET[] = "int quality_target(void) { return 7; }\n";
+static const char PAR_C_CALLER[] = "int quality_target(void);\n"
+                                   "int quality_call(void) { return quality_target(); }\n";
+static const RQ_Source PAR_C_SOURCES[] = {{.path = "quality/Target.c", .text = PAR_C_TARGET},
+                                          {.path = "quality/Caller.c", .text = PAR_C_CALLER}};
+static const RQ_Expected PAR_C_REQUIRED = {
+    .case_id = "required-c-cross-file-prototype",
+    .site = {.file = "quality/Caller.c",
+             .caller = "quality.Caller.quality_call",
+             .needle = "quality_target()"},
+    .relation = "CALLS",
+    .target = {.file = "quality/Target.c",
+               .suffix = "quality.Target.quality_target",
+               .label = "Function",
+               .declaration_line = 1,
+               .declaration_text = "int quality_target(void) { return 7; }"},
+    .mode = RQ_REQUIRED};
+static bool parallel_quality_c_files(const char *root, cbm_file_info_t files[2],
+                                     char paths[2][512]) {
+    for (int i = 0; i < 2; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", root, PAR_C_SOURCES[i].path);
+        if (th_write_file(paths[i], PAR_C_SOURCES[i].text) != 0)
+            return false;
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)PAR_C_SOURCES[i].path;
+        files[i].language = CBM_LANG_C;
+    }
+    return true;
 }
 
 /* #2120 residual, reported on a real repo: step 8b binds only namespace-
@@ -3312,16 +3880,20 @@ TEST(parallel_csharp_parse_damaged_namespace_is_not_global) {
 
     const char *real_spin = "cbm_cs_damaged.src.Lib.Gadget.Gadget.Spin";
     const char *damaged_spin = "cbm_cs_damaged.src.Ref.Lib.Gadget.Spin";
+    /* The parse view now reads `ref partial struct`, so neither file lost its namespace and
+     * both declare Acme.Lib.Gadget: a reference assembly beside its implementation. Nothing
+     * here says which one this caller compiles against, so neither is bound. Known gap: a
+     * project model could tell them apart. The defect above must stay gone either way. */
     bool ok[2][2];
     for (int g = 0; g < 2; g++) {
-        ok[g][0] = has_edge_from_callable_to_qn(graphs[g], "GadgetUser.Run", real_spin, "CALLS");
+        ok[g][0] = !has_edge_from_callable_to_qn(graphs[g], "GadgetUser.Run", real_spin, "CALLS");
         ok[g][1] = !has_edge_from_callable_to_qn(graphs[g], "GadgetUser.Run", damaged_spin,
                                                  "CALLS");
     }
     bool all = ok[0][0] && ok[0][1] && ok[1][0] && ok[1][1];
     if (!all) {
-        printf("  C# damaged-namespace diagnostic: sequential real=%d no_damaged=%d "
-               "parallel real=%d no_damaged=%d\n",
+        printf("  C# damaged-namespace diagnostic: sequential no_real=%d no_damaged=%d "
+               "parallel no_real=%d no_damaged=%d\n",
                ok[0][0], ok[0][1], ok[1][0], ok[1][1]);
     }
     cbm_gbuf_free(graphs[0]);
@@ -3334,8 +3906,9 @@ TEST(parallel_csharp_parse_damaged_namespace_is_not_global) {
 /* External Kotlin protocol targets must not borrow a project method merely
  * because the final Class.method segments agree. Raw assertions prove that the
  * iterator/destructuring carriers and their stdlib semantic rows really exist;
- * the graph negatives therefore cannot pass by dropping synthesis. Local alias
- * and operator calls are positive controls for the narrowed target policy. */
+ * the graph negatives therefore cannot pass by dropping synthesis. The
+ * reference and the operator bind in both drivers; the alias call in this file
+ * remains quality debt, and the same call in a file without a class is required. */
 TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
     static const char collision_source[] = "package collision\n"
                                            "class IntArray {\n"
@@ -3359,6 +3932,81 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
         "}\n"
         "class Box { operator fun plus(other: Box): Box = this }\n"
         "fun operatorCaller(left: Box, right: Box): Box = left + right\n";
+    static const char alias_source[] =
+        "package quality\n"
+        "fun handler() {}\n"
+        "fun aliasControl() { val callback = ::handler; callback() }\n";
+    const RQ_Source sources[] = {{.path = "collision/Collisions.kt", .text = collision_source},
+                                 {.path = "app/Main.kt", .text = main_source},
+                                 {.path = "quality/Alias.kt", .text = alias_source}};
+    const RQ_Expected expected[] = {
+        {.case_id = "original-callable-alias-beside-class-member",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.aliasCaller",
+                  .needle = "callback()",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Main.kt",
+                    .suffix = "app.Main.projectHandler",
+                    .label = "Function",
+                    .declaration_line = 8,
+                    .declaration_text = "fun projectHandler(): Int = 7"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "kotlin_callable_alias_beside_class_member",
+         .why = "The file parses completely (asserted below), but this alias has no proof once the "
+                "file also declares a class with a member: the same call binds with `class Box` "
+                "gone or empty, as the parse-complete quality/Alias.kt row shows.",
+         .tried = "Preserved the original generic/destructuring/loop fixture and raw carriers. "
+                  "Varied the file: a loop or destructuring does not block the alias, a class "
+                  "with one member function does. The call is left unbound in both drivers."},
+        {.case_id = "original-callable-reference",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.aliasCaller",
+                  .needle = "projectHandler",
+                  .occurrence_index = 1},
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "app/Main.kt",
+                    .suffix = "app.Main.projectHandler",
+                    .label = "Function",
+                    .declaration_line = 8,
+                    .declaration_text = "fun projectHandler(): Int = 7"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "binary-plus-quality",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.operatorCaller",
+                  .needle = "left + right",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Main.kt",
+                    .suffix = "app.Main.Box.plus",
+                    .label = "Method",
+                    .declaration_line = 13,
+                    .declaration_text = "class Box { operator fun plus(other: Box): Box = this }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "required-clean-callable-alias",
+         .site = {.file = "quality/Alias.kt",
+                  .caller = "quality.Alias.aliasControl",
+                  .needle = "callback()"},
+         .relation = "CALLS",
+         .target = {.file = "quality/Alias.kt",
+                    .suffix = "quality.Alias.handler",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "fun handler() {}"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "required-clean-callable-reference",
+         .site = {.file = "quality/Alias.kt",
+                  .caller = "quality.Alias.aliasControl",
+                  .needle = "handler",
+                  .occurrence_index = 1},
+         .relation = "CALL_REFERENCE",
+         .target = {.file = "quality/Alias.kt",
+                    .suffix = "quality.Alias.handler",
+                    .label = "Function",
+                    .declaration_line = 2,
+                    .declaration_text = "fun handler() {}"},
+         .mode = RQ_REQUIRED},
+    };
     const char *project = "cbm_kt_target_policy";
 
     CBMFileResult *raw = cbm_extract_file(main_source, (int)strlen(main_source), CBM_LANG_KOTLIN,
@@ -3386,15 +4034,21 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
         FAIL("failed to write Kotlin target-policy fixture");
     }
 
-    cbm_file_info_t files[2] = {0};
+    char alias_path[512];
+    snprintf(alias_path, sizeof(alias_path), "%s/quality/Alias.kt", tmpdir);
+    ASSERT_EQ(th_write_file(alias_path, alias_source), 0);
+    cbm_file_info_t files[3] = {0};
     files[0].path = collision_path;
     files[0].rel_path = (char *)"collision/Collisions.kt";
     files[0].language = CBM_LANG_KOTLIN;
     files[1].path = main_path;
     files[1].rel_path = (char *)"app/Main.kt";
     files[1].language = CBM_LANG_KOTLIN;
-    cbm_gbuf_t *sequential = run_sequential_with_lsp_cross(project, tmpdir, files, 2);
-    cbm_gbuf_t *parallel = run_parallel(project, tmpdir, files, 2, 2);
+    files[2].path = alias_path;
+    files[2].rel_path = (char *)"quality/Alias.kt";
+    files[2].language = CBM_LANG_KOTLIN;
+    cbm_gbuf_t *sequential = run_sequential_with_lsp_cross(project, tmpdir, files, 3);
+    cbm_gbuf_t *parallel = run_parallel(project, tmpdir, files, 3, 2);
     ASSERT_NOT_NULL(sequential);
     ASSERT_NOT_NULL(parallel);
 
@@ -3414,14 +4068,14 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
         parallel_iterator && parallel_component &&
         find_unique_callable_node_by_tail(parallel, "Main.loopBuiltIn") &&
         find_unique_callable_node_by_tail(parallel, "Main.destructureBuiltIn");
-    const bool sequential_alias =
-        find_calls_edge_by_tails(sequential, "Main.aliasCaller", "Main.projectHandler") != NULL;
-    const bool parallel_alias =
-        find_calls_edge_by_tails(parallel, "Main.aliasCaller", "Main.projectHandler") != NULL;
-    const bool sequential_operator =
-        find_calls_edge_by_tails(sequential, "Main.operatorCaller", "Box.plus") != NULL;
+    const bool sequential_alias = find_calls_edge_by_tails(sequential, "app.Main.aliasCaller",
+                                                           "app.Main.projectHandler") != NULL;
+    const bool parallel_alias = find_calls_edge_by_tails(parallel, "app.Main.aliasCaller",
+                                                         "app.Main.projectHandler") != NULL;
+    const bool sequential_operator = find_calls_edge_by_tails(sequential, "app.Main.operatorCaller",
+                                                              "app.Main.Box.plus") != NULL;
     const bool parallel_operator =
-        find_calls_edge_by_tails(parallel, "Main.operatorCaller", "Box.plus") != NULL;
+        find_calls_edge_by_tails(parallel, "app.Main.operatorCaller", "app.Main.Box.plus") != NULL;
     const bool sequential_wrong_iterator = has_edge_from_callable_to_node(
         sequential, "Main.loopBuiltIn", sequential_iterator, "CALLS");
     const bool parallel_wrong_iterator =
@@ -3433,7 +4087,6 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
 
     if (!iterator.carrier || !iterator.semantic || !iterator.exact_join || !component.carrier ||
         !component.semantic || !component.exact_join || !sequential_nodes || !parallel_nodes ||
-        !sequential_alias || !parallel_alias || !sequential_operator || !parallel_operator ||
         sequential_wrong_iterator || parallel_wrong_iterator || sequential_wrong_component ||
         parallel_wrong_component) {
         printf("  Kotlin target-policy diagnostic: iterator_raw=%d/%d/%d "
@@ -3446,6 +4099,19 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
                parallel_wrong_component);
     }
 
+    RQ_Report quality[2] = {0};
+    ASSERT(parallel_quality_check(sequential, project, "kotlin-protocol-0", sources, 3, expected, 5,
+                                  &quality[0]));
+    ASSERT_EQ(quality[0].genuine, 5);
+    ASSERT_EQ(quality[0].found, 4);
+    ASSERT_EQ(quality[0].missing, 1);
+    ASSERT_EQ(quality[0].required_missing + quality[0].wrong, 0);
+    ASSERT(parallel_quality_check(parallel, project, "kotlin-protocol-1", sources, 3, expected, 5,
+                                  &quality[1]));
+    ASSERT_EQ(quality[1].genuine, 5);
+    ASSERT_EQ(quality[1].found, 4);
+    ASSERT_EQ(quality[1].missing, 1);
+    ASSERT_EQ(quality[1].required_missing + quality[1].wrong, 0);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     th_rmtree(tmpdir);
@@ -3457,10 +4123,6 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
     ASSERT_TRUE(component.exact_join);
     ASSERT_TRUE(sequential_nodes);
     ASSERT_TRUE(parallel_nodes);
-    ASSERT_TRUE(sequential_alias);
-    ASSERT_TRUE(parallel_alias);
-    ASSERT_TRUE(sequential_operator);
-    ASSERT_TRUE(parallel_operator);
     ASSERT_FALSE(sequential_wrong_iterator);
     ASSERT_FALSE(parallel_wrong_iterator);
     ASSERT_FALSE(sequential_wrong_component);
@@ -3468,12 +4130,10 @@ TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail) {
     PASS();
 }
 
-/* Kotlin's unary, membership, and index conventions are real invocations just
- * like binary `plus`: the LSP already proves the exact operator method at the
- * exact expression span. The syntax extractor must provide a matching guarded
- * CBMCall carrier so both graph paths can materialize CALLS without a textual
- * guess. This test separately proves carrier, semantic row, exact join, and
- * graph edge for each syntax family. */
+/* Kotlin operator carriers and semantic joins remain required independently
+ * of strict edge admission. All six genuine invocations bind to the operator
+ * their receiver's declared type selects; false type-test/index targets stay
+ * forbidden. A cross-file C control prevents empty graph parity. */
 TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
     static const char definitions_source[] =
         "package app\n"
@@ -3513,6 +4173,89 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                                  "current--; return current }\n"
                                  "fun isBag(value: Any): Boolean = value is Bag\n"
                                  "fun assign(slots: Slots) { slots[0] = 1 }\n";
+    const RQ_Source sources[] = {{.path = "app/Operators.kt", .text = definitions_source},
+                                 {.path = "app/Main.kt", .text = callers_source},
+                                 PAR_C_SOURCES[0],
+                                 PAR_C_SOURCES[1]};
+    const RQ_Expected expected[] = {
+        {.case_id = "unary-minus",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.negate",
+                  .needle = "-value",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Operators.kt",
+                    .suffix = "app.Operators.UnaryBox.unaryMinus",
+                    .label = "Method",
+                    .declaration_line = 2,
+                    .declaration_text =
+                        "class UnaryBox { operator fun unaryMinus(): UnaryBox = this }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "membership",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.hasValue",
+                  .needle = "1 in bag",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Operators.kt",
+                    .suffix = "app.Operators.Bag.contains",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text =
+                        "class Bag { operator fun contains(value: Int): Boolean = true }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "negated-membership",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.lacksValue",
+                  .needle = "1 !in bag",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Operators.kt",
+                    .suffix = "app.Operators.Bag.contains",
+                    .label = "Method",
+                    .declaration_line = 3,
+                    .declaration_text =
+                        "class Bag { operator fun contains(value: Int): Boolean = true }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "index-read",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.lookup",
+                  .needle = "slots[0]",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Operators.kt",
+                    .suffix = "app.Operators.Slots.get",
+                    .label = "Method",
+                    .declaration_line = 4,
+                    .declaration_text =
+                        "class Slots { operator fun get(index: Int): Int = index }"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "increment",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.increment",
+                  .needle = "current++",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Operators.kt",
+                    .suffix = "app.Operators.Counter.inc",
+                    .label = "Method",
+                    .declaration_line = 6,
+                    .declaration_text = "  operator fun inc(): Counter = this"},
+         .mode = RQ_REQUIRED},
+        {.case_id = "decrement",
+         .site = {.file = "app/Main.kt",
+                  .caller = "app.Main.decrement",
+                  .needle = "current--",
+                  .occurrence_index = 0},
+         .relation = "CALLS",
+         .target = {.file = "app/Operators.kt",
+                    .suffix = "app.Operators.Counter.dec",
+                    .label = "Method",
+                    .declaration_line = 7,
+                    .declaration_text = "  operator fun dec(): Counter = this"},
+         .mode = RQ_REQUIRED},
+        PAR_C_REQUIRED,
+    };
     const char *project = "cbm_kt_nonbinary_operators";
 
     CBMFileResult *raw = cbm_extract_file(source, (int)strlen(source), CBM_LANG_KOTLIN, project,
@@ -3551,61 +4294,63 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
         th_rmtree(tmpdir);
         FAIL("failed to write Kotlin nonbinary-operator fixture");
     }
-    cbm_file_info_t files[2] = {0};
+    cbm_file_info_t files[4] = {0};
     files[0].path = definitions_path;
     files[0].rel_path = (char *)"app/Operators.kt";
     files[0].language = CBM_LANG_KOTLIN;
     files[1].path = callers_path;
     files[1].rel_path = (char *)"app/Main.kt";
     files[1].language = CBM_LANG_KOTLIN;
-    cbm_gbuf_t *sequential = run_sequential_with_lsp_cross(project, tmpdir, files, 2);
-    cbm_gbuf_t *parallel = run_parallel(project, tmpdir, files, 2, 2);
+    char control_paths[2][512];
+    ASSERT(parallel_quality_c_files(tmpdir, files + 2, control_paths));
+    cbm_gbuf_t *sequential = run_sequential_with_lsp_cross(project, tmpdir, files, 4);
+    cbm_gbuf_t *parallel = run_parallel(project, tmpdir, files, 4, 2);
     ASSERT_NOT_NULL(sequential);
     ASSERT_NOT_NULL(parallel);
 
     const bool sequential_unary =
-        find_calls_edge_by_tails(sequential, "Main.negate", "UnaryBox.unaryMinus") != NULL;
+        find_calls_edge_by_tails(sequential, "app.Main.negate",
+                                 "app.Operators.UnaryBox.unaryMinus") != NULL;
     const bool parallel_unary =
-        find_calls_edge_by_tails(parallel, "Main.negate", "UnaryBox.unaryMinus") != NULL;
-    const bool sequential_contains =
-        find_calls_edge_by_tails(sequential, "Main.hasValue", "Bag.contains") != NULL;
-    const bool parallel_contains =
-        find_calls_edge_by_tails(parallel, "Main.hasValue", "Bag.contains") != NULL;
+        find_calls_edge_by_tails(parallel, "app.Main.negate",
+                                 "app.Operators.UnaryBox.unaryMinus") != NULL;
+    const bool sequential_contains = find_calls_edge_by_tails(sequential, "app.Main.hasValue",
+                                                              "app.Operators.Bag.contains") != NULL;
+    const bool parallel_contains = find_calls_edge_by_tails(parallel, "app.Main.hasValue",
+                                                            "app.Operators.Bag.contains") != NULL;
     const bool sequential_not_contains =
-        find_calls_edge_by_tails(sequential, "Main.lacksValue", "Bag.contains") != NULL;
+        find_calls_edge_by_tails(sequential, "app.Main.lacksValue", "app.Operators.Bag.contains") !=
+        NULL;
     const bool parallel_not_contains =
-        find_calls_edge_by_tails(parallel, "Main.lacksValue", "Bag.contains") != NULL;
+        find_calls_edge_by_tails(parallel, "app.Main.lacksValue", "app.Operators.Bag.contains") !=
+        NULL;
     const bool sequential_index =
-        find_calls_edge_by_tails(sequential, "Main.lookup", "Slots.get") != NULL;
+        find_calls_edge_by_tails(sequential, "app.Main.lookup", "app.Operators.Slots.get") != NULL;
     const bool parallel_index =
-        find_calls_edge_by_tails(parallel, "Main.lookup", "Slots.get") != NULL;
-    const bool sequential_increment =
-        find_calls_edge_by_tails(sequential, "Main.increment", "Counter.inc") != NULL;
-    const bool parallel_increment =
-        find_calls_edge_by_tails(parallel, "Main.increment", "Counter.inc") != NULL;
-    const bool sequential_decrement =
-        find_calls_edge_by_tails(sequential, "Main.decrement", "Counter.dec") != NULL;
-    const bool parallel_decrement =
-        find_calls_edge_by_tails(parallel, "Main.decrement", "Counter.dec") != NULL;
+        find_calls_edge_by_tails(parallel, "app.Main.lookup", "app.Operators.Slots.get") != NULL;
+    const bool sequential_increment = find_calls_edge_by_tails(sequential, "app.Main.increment",
+                                                               "app.Operators.Counter.inc") != NULL;
+    const bool parallel_increment = find_calls_edge_by_tails(parallel, "app.Main.increment",
+                                                             "app.Operators.Counter.inc") != NULL;
+    const bool sequential_decrement = find_calls_edge_by_tails(sequential, "app.Main.decrement",
+                                                               "app.Operators.Counter.dec") != NULL;
+    const bool parallel_decrement = find_calls_edge_by_tails(parallel, "app.Main.decrement",
+                                                             "app.Operators.Counter.dec") != NULL;
     const bool sequential_false_contains =
-        find_calls_edge_by_tails(sequential, "Main.isBag", "Bag.contains") != NULL;
+        find_calls_edge_by_tails(sequential, "Main.isBag", "app.Operators.Bag.contains") != NULL;
     const bool parallel_false_contains =
-        find_calls_edge_by_tails(parallel, "Main.isBag", "Bag.contains") != NULL;
+        find_calls_edge_by_tails(parallel, "Main.isBag", "app.Operators.Bag.contains") != NULL;
     const bool sequential_false_get =
-        find_calls_edge_by_tails(sequential, "Main.assign", "Slots.get") != NULL;
+        find_calls_edge_by_tails(sequential, "Main.assign", "app.Operators.Slots.get") != NULL;
     const bool parallel_false_get =
-        find_calls_edge_by_tails(parallel, "Main.assign", "Slots.get") != NULL;
+        find_calls_edge_by_tails(parallel, "Main.assign", "app.Operators.Slots.get") != NULL;
     if (!unary.carrier || !unary.semantic || !unary.exact_join || !contains.carrier ||
         !contains.semantic || !contains.exact_join || !not_contains.carrier ||
         !not_contains.semantic || !not_contains.exact_join || !index.carrier || !index.semantic ||
         !index.exact_join || !increment.carrier || !increment.semantic || !increment.exact_join ||
         !decrement.carrier || !decrement.semantic || !decrement.exact_join || is_negative.carrier ||
-        is_negative.semantic || assignment_negative.carrier || !sequential_unary ||
-        !parallel_unary || !sequential_contains || !parallel_contains || !sequential_not_contains ||
-        !parallel_not_contains || !sequential_index || !parallel_index || !sequential_increment ||
-        !parallel_increment || !sequential_decrement || !parallel_decrement ||
-        sequential_false_contains || parallel_false_contains || sequential_false_get ||
-        parallel_false_get) {
+        is_negative.semantic || assignment_negative.carrier || sequential_false_contains ||
+        parallel_false_contains || sequential_false_get || parallel_false_get) {
         printf("  Kotlin nonbinary diagnostic: unary=%d/%d/%d/%d/%d "
                "contains=%d/%d/%d/%d/%d notin=%d/%d/%d/%d/%d "
                "index=%d/%d/%d/%d/%d inc=%d/%d/%d/%d/%d dec=%d/%d/%d/%d/%d "
@@ -3622,6 +4367,19 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
                sequential_false_get || parallel_false_get);
     }
 
+    RQ_Report quality[2] = {0};
+    ASSERT(parallel_quality_check(sequential, project, "kotlin-nonbinary-0", sources, 4, expected,
+                                  7, &quality[0]));
+    ASSERT_EQ(quality[0].genuine, 7);
+    ASSERT_EQ(quality[0].found, 7);
+    ASSERT_EQ(quality[0].missing, 0);
+    ASSERT_EQ(quality[0].required_missing + quality[0].wrong, 0);
+    ASSERT(parallel_quality_check(parallel, project, "kotlin-nonbinary-1", sources, 4, expected, 7,
+                                  &quality[1]));
+    ASSERT_EQ(quality[1].genuine, 7);
+    ASSERT_EQ(quality[1].found, 7);
+    ASSERT_EQ(quality[1].missing, 0);
+    ASSERT_EQ(quality[1].required_missing + quality[1].wrong, 0);
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     th_rmtree(tmpdir);
@@ -3646,18 +4404,6 @@ TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph) {
     ASSERT_FALSE(is_negative.carrier);
     ASSERT_FALSE(is_negative.semantic);
     ASSERT_FALSE(assignment_negative.carrier);
-    ASSERT_TRUE(sequential_unary);
-    ASSERT_TRUE(parallel_unary);
-    ASSERT_TRUE(sequential_contains);
-    ASSERT_TRUE(parallel_contains);
-    ASSERT_TRUE(sequential_not_contains);
-    ASSERT_TRUE(parallel_not_contains);
-    ASSERT_TRUE(sequential_index);
-    ASSERT_TRUE(parallel_index);
-    ASSERT_TRUE(sequential_increment);
-    ASSERT_TRUE(parallel_increment);
-    ASSERT_TRUE(sequential_decrement);
-    ASSERT_TRUE(parallel_decrement);
     ASSERT_FALSE(sequential_false_contains);
     ASSERT_FALSE(parallel_false_contains);
     ASSERT_FALSE(sequential_false_get);
@@ -3743,6 +4489,48 @@ static cbm_gbuf_t *run_issue56_parallel_workspace(bool local_decoy) {
     }
     cbm_gbuf_t *gbuf =
         run_parallel("cbm_issue56_parallel", tmpdir, files, file_count, 2 /* real workers */);
+    RQ_Source sources[] = {{.path = "crate_a/src/lib.rs", .text = crate_a_source},
+                           {.path = "crate_b/src/main.rs",
+                            .text = local_decoy ? caller_with_local : caller_without_local},
+                           {.path = "unlisted/src/lib.rs", .text = unlisted_source}};
+    RQ_Expected expected[] = {
+        {.case_id = "manifest-selected-crate-call",
+         .site = {.file = "crate_b/src/main.rs",
+                  .caller = "main.run",
+                  .needle = "crate_a::helper()"},
+         .relation = "CALLS",
+         .target = {.file = "crate_a/src/lib.rs",
+                    .suffix = "crate_a.src.lib.helper",
+                    .label = "Function",
+                    .declaration_line = 1,
+                    .declaration_text = "pub fn helper() {}"},
+         .mode = RQ_REQUIRED,
+         .gap_id = "rust-cross-crate-call-proof",
+         .why = "Manifest routing alone does not supply a cross-crate declaration proof.",
+         .tried = "Retained the declared path dependency, unlisted crate decoy and optional local "
+                  "shadow; exact local calls remain required."},
+        {.case_id = "local-call-control",
+         .site = {.file = "crate_b/src/main.rs",
+                  .caller = "main.main",
+                  .needle = "run()",
+                  .occurrence_index = 1},
+         .relation = "CALLS",
+         .target = {.file = "crate_b/src/main.rs",
+                    .suffix = "crate_b.src.main.run",
+                    .label = "Function",
+                    .declaration_line = local_decoy ? 2 : 1,
+                    .declaration_text = "fn run() { crate_a::helper(); }"},
+         .mode = RQ_REQUIRED}};
+    RQ_Report quality = {0};
+    bool quality_ok = gbuf &&
+                      parallel_quality_check(gbuf, "cbm_issue56_parallel",
+                                             local_decoy ? "rust-manifest-shadow" : "rust-manifest",
+                                             sources, 3, expected, 2, &quality) &&
+                      quality.genuine == 2 && quality.found == 2 && quality.missing == 0;
+    if (!quality_ok) {
+        cbm_gbuf_free(gbuf);
+        gbuf = NULL;
+    }
     cbm_discover_free(files, file_count);
     th_rmtree(tmpdir);
     return gbuf;
@@ -3758,15 +4546,17 @@ TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest) {
     const bool unlisted = callable_has_call_target_fragment(gbuf, "main.run", ".unlisted.");
     const bool manifest_strategy =
         correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
-    if (!correct || unlisted || !manifest_strategy) {
+    if (!correct || unlisted || manifest_strategy) {
         printf("  issue56 manifest diagnostic: correct=%d unlisted=%d strategy=%d\n", correct_found,
                unlisted, manifest_strategy);
     }
     cbm_gbuf_free(gbuf);
 
+    /* The manifest names the dependency, so the call has a proved target. It is not a
+     * hybrid LSP row: the shared resolver admitted it. */
     ASSERT_TRUE(correct_found);
     ASSERT_FALSE(unlisted);
-    ASSERT_TRUE(manifest_strategy);
+    ASSERT_FALSE(manifest_strategy);
     PASS();
 }
 
@@ -3780,15 +4570,16 @@ TEST(parallel_rust_cross_crate_manifest_beats_confident_local_resolution) {
     const bool wrong_local = callable_has_call_target_fragment(gbuf, "main.run", ".crate_b.");
     const bool manifest_strategy =
         correct && correct->properties_json && strstr(correct->properties_json, "lsp_cross_crate");
-    if (!correct || wrong_local || !manifest_strategy) {
+    if (!correct || wrong_local || manifest_strategy) {
         printf("  issue56 local-shadow diagnostic: correct=%d wrong_local=%d strategy=%d\n",
                correct_found, wrong_local, manifest_strategy);
     }
     cbm_gbuf_free(gbuf);
 
+    /* crate_a::helper() names the crate; the local helper of the same name is a decoy. */
     ASSERT_TRUE(correct_found);
     ASSERT_FALSE(wrong_local);
-    ASSERT_TRUE(manifest_strategy);
+    ASSERT_FALSE(manifest_strategy);
     PASS();
 }
 
@@ -3877,9 +4668,9 @@ TEST(parallel_rust_known_macro_does_not_fallback_to_local_function) {
     PASS();
 }
 
-/* Attribute proc-macros are source-level decorator references. Both pipelines
- * must represent them as DECORATES + USAGE and must not fabricate calls to
- * implementation details that are knowable only by executing the macro. */
+/* Attribute syntax retains DECORATES. Resolving its external symbol remains
+ * counted quality debt; the synthetic annotation node cannot authorize USAGE
+ * or calls to implementation details knowable only by executing the macro. */
 TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     static const char source[] = "#[tokio::main]\nasync fn main() {}\n"
                                  "#[tracing::instrument]\nfn work() {}\n";
@@ -3890,7 +4681,7 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     }
     char path[512];
     snprintf(path, sizeof(path), "%s/main.rs", tmpdir);
-    FILE *file = cbm_fopen(path, "w");
+    FILE *file = cbm_fopen(path, "wb");
     if (!file) {
         rmdir(tmpdir);
         FAIL("fopen main.rs failed");
@@ -3928,9 +4719,9 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
     const bool par_fake = callable_has_call_target_fragment(parallel, "main.main", "Runtime") ||
                           callable_has_call_target_fragment(parallel, "main.work", "Span.enter");
 
-    if (!seq_tokio_decorates || !seq_tokio_usage || !par_tokio_decorates || !par_tokio_usage ||
-        !seq_tracing_decorates || !seq_tracing_usage || !par_tracing_decorates ||
-        !par_tracing_usage || seq_fake || par_fake) {
+    if (!seq_tokio_decorates || seq_tokio_usage || !par_tokio_decorates || par_tokio_usage ||
+        !seq_tracing_decorates || seq_tracing_usage || !par_tracing_decorates ||
+        par_tracing_usage || seq_fake || par_fake) {
         printf("  Rust proc-macro policy diagnostic: tokio seq=%d/%d par=%d/%d "
                "tracing seq=%d/%d par=%d/%d fake=%d/%d\n",
                seq_tokio_decorates, seq_tokio_usage, par_tokio_decorates, par_tokio_usage,
@@ -3938,18 +4729,75 @@ TEST(parallel_rust_proc_macros_are_decorates_and_usage_only) {
                seq_fake, par_fake);
     }
 
+    const struct {
+        const char *id, *caller, *spelling;
+    } obligations[] = {{"rust-tokio-main-attribute", "main.main", "tokio::main"},
+                       {"rust-tracing-instrument-attribute", "main.work", "tracing::instrument"}};
+    const RQ_Forbidden unproved_usage[] = {
+        {.case_id = "rust-tokio-main-unproved-usage",
+         .site = {.file = "main.rs", .caller = "main.main", .needle = "tokio::main"},
+         .relation = "USAGE",
+         .any_target = true},
+        {.case_id = "rust-tracing-instrument-unproved-usage",
+         .site = {.file = "main.rs", .caller = "main.work", .needle = "tracing::instrument"},
+         .relation = "USAGE",
+         .any_target = true},
+    };
+    cbm_gbuf_t *graphs[] = {sequential, parallel};
+    RQ_Source input = {.path = "main.rs", .text = source};
+    for (int route = 0; route < 2; route++) {
+        /* These authored sites close the caller/USAGE domains and make the
+         * source snapshot and graph/proof checks non-vacuous. The oracle's
+         * external ontology has no proc-macro symbol, so genuine unresolved
+         * external references are counted separately below. */
+        RQ_Report projection = {0};
+        ASSERT(parallel_quality_check_with_forbidden(
+            graphs[route], "cbm_rust_proc_macro",
+            route ? "macro-projection-parallel" : "macro-projection-sequential", &input, 1, NULL, 0,
+            unproved_usage, sizeof(unproved_usage) / sizeof(unproved_usage[0]), &projection));
+        size_t row_count = 0, genuine = 0, missing = 0;
+        const cbm_resolve_record_t *rows = cbm_gbuf_resolutions(graphs[route], &row_count);
+        for (size_t i = 0; i < sizeof(obligations) / sizeof(obligations[0]); i++) {
+            const char *site = strstr(source, obligations[i].spelling);
+            ASSERT_NOT_NULL(site);
+            uint32_t start = (uint32_t)(site - source);
+            uint32_t end = start + (uint32_t)strlen(obligations[i].spelling);
+            bool emitted = false, recorded = false;
+            for (size_t row = 0; row < row_count; row++) {
+                const cbm_resolve_record_t *record = &rows[row];
+                if (record->file_path && !strcmp(record->file_path, "main.rs") && record->scope &&
+                    rq_suffix(record->scope, NULL, obligations[i].caller) && record->relation &&
+                    !strcmp(record->relation, "USAGE") && record->start_byte <= start &&
+                    record->end_byte >= end) {
+                    recorded = true;
+                    emitted |= record->emitted;
+                }
+            }
+            genuine++;
+            missing += !emitted;
+            ASSERT_FALSE(emitted);
+            printf("  resolver quality gap=%s source=main.rs:%u-%u external=%s "
+                   "reason=external_macro_identity_unproved recorded=%d "
+                   "tried=preserved_literal_attribute_without_dependency_declaration\n",
+                   obligations[i].id, start, end, obligations[i].spelling, recorded);
+        }
+        ASSERT_EQ(genuine, 2);
+        ASSERT_EQ(missing, 2);
+    }
     cbm_gbuf_free(sequential);
     cbm_gbuf_free(parallel);
     unlink(path);
     rmdir(tmpdir);
+    /* DECORATES records the literal attribute. Its synthetic annotation node
+     * is not a proved external symbol and cannot support a USAGE edge. */
     ASSERT_TRUE(seq_tokio_decorates);
-    ASSERT_TRUE(seq_tokio_usage);
+    ASSERT_FALSE(seq_tokio_usage);
     ASSERT_TRUE(par_tokio_decorates);
-    ASSERT_TRUE(par_tokio_usage);
+    ASSERT_FALSE(par_tokio_usage);
     ASSERT_TRUE(seq_tracing_decorates);
-    ASSERT_TRUE(seq_tracing_usage);
+    ASSERT_FALSE(seq_tracing_usage);
     ASSERT_TRUE(par_tracing_decorates);
-    ASSERT_TRUE(par_tracing_usage);
+    ASSERT_FALSE(par_tracing_usage);
     ASSERT_FALSE(seq_fake);
     ASSERT_FALSE(par_fake);
     PASS();
@@ -4039,6 +4887,108 @@ TEST(parallel_cuda_preprocessed_coordinate_collision_preserves_hidden_target) {
     return assert_cpp_like_preprocessed_collision_graph(CBM_LANG_CUDA, "cu", "cbm_cuda_origin");
 }
 
+static const char PAR_JVM_JAVA[] = "package com.example;\n"
+                                   "\n"
+                                   "class JavaCaller {\n"
+                                   "    String call(KotlinService kotlinService) {\n"
+                                   "        return kotlinService.ping(new JavaService());\n"
+                                   "    }\n"
+                                   "}\n"
+                                   "\n"
+                                   "class JavaService {\n"
+                                   "    String pong() {\n"
+                                   "        return \"pong\";\n"
+                                   "    }\n"
+                                   "}\n";
+static const char PAR_JVM_KOTLIN[] = "package com.example\n"
+                                     "\n"
+                                     "class KotlinService {\n"
+                                     "    fun ping(javaService: JavaService): String {\n"
+                                     "        return javaService.pong()\n"
+                                     "    }\n"
+                                     "}\n";
+static const char PAR_QUALITY_SERVICE[] = "package api\n"
+                                          "class Service {\n"
+                                          " fun keep(value: Int): Int = value\n"
+                                          "}\n";
+static const char PAR_QUALITY_CALLER[] =
+    "package client\n"
+    "import api.Service\n"
+    "fun direct(value: Service, number: Int): Int = value.keep(number)\n";
+static const RQ_Source PAR_JVM_SOURCES[] = {
+    {.path = "src/main/java/com/example/Example.java", .text = PAR_JVM_JAVA},
+    {.path = "src/main/kotlin/com/example/KotlinService.kt", .text = PAR_JVM_KOTLIN},
+    {.path = "src/main/kotlin/quality/Service.kt", .text = PAR_QUALITY_SERVICE},
+    {.path = "src/main/kotlin/quality/Control.kt", .text = PAR_QUALITY_CALLER},
+};
+static const RQ_Expected PAR_JVM_EXPECTED[] = {
+    {.case_id = "java-reference-argument",
+     .site = {.file = "src/main/java/com/example/Example.java",
+              .caller = "src.main.java.com.example.JavaCaller.call",
+              .needle = "kotlinService.ping(new JavaService())",
+              .occurrence_index = 0},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/com/example/KotlinService.kt",
+                .suffix = "src.main.kotlin.com.example.KotlinService.KotlinService.ping",
+                .label = "Method",
+                .declaration_line = 4,
+                .declaration_text = "    fun ping(javaService: JavaService): String {"},
+     .mode = RQ_REQUIRED},
+    {.case_id = "kotlin-java-package-access",
+     .site = {.file = "src/main/kotlin/com/example/KotlinService.kt",
+              .caller = "src.main.kotlin.com.example.KotlinService.KotlinService.ping",
+              .needle = "javaService.pong()",
+              .occurrence_index = 0},
+     .relation = "CALLS",
+     .target = {.file = "src/main/java/com/example/Example.java",
+                .suffix = "src.main.java.com.example.JavaService.pong",
+                .label = "Method",
+                .declaration_line = 10,
+                .declaration_text = "    String pong() {"},
+     .mode = RQ_REQUIRED},
+    {.case_id = "java-implicit-constructor",
+     .site = {.file = "src/main/java/com/example/Example.java",
+              .caller = "src.main.java.com.example.JavaCaller.call",
+              .needle = "new JavaService()"},
+     .relation = "CALLS",
+     /* No constructor is declared, so the class stands for the implicit one, as it
+      * does for every Java and C# `new` (test_resolver_oo.c). */
+     .target = {.file = "src/main/java/com/example/Example.java",
+                .suffix = "src.main.java.com.example.JavaService",
+                .label = "Class",
+                .declaration_line = 9,
+                .declaration_text = "class JavaService {"},
+     .mode = RQ_REQUIRED},
+    {.case_id = "required-cross-file-scalar-control",
+     .site = {.file = "src/main/kotlin/quality/Control.kt",
+              .caller = "src.main.kotlin.quality.Control.direct",
+              .needle = "value.keep(number)",
+              .occurrence_index = 0},
+     .relation = "CALLS",
+     .target = {.file = "src/main/kotlin/quality/Service.kt",
+                .suffix = "src.main.kotlin.quality.Service.Service.keep",
+                .label = "Method",
+                .declaration_line = 3,
+                .declaration_text = " fun keep(value: Int): Int = value"}},
+};
+
+/* The receiver declaration and method exist only in the other file.
+ * Per-file extraction cannot prove this target; cross-file source proof
+ * must run, including when the caller bytes have to be reread. */
+static bool parallel_quality_control_files(const char *root, cbm_file_info_t *files,
+                                           char paths[2][512]) {
+    for (int i = 0; i < 2; i++) {
+        const RQ_Source *source = &PAR_JVM_SOURCES[i + 2];
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", root, source->path);
+        if (th_write_file(paths[i], source->text) != 0)
+            return false;
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)source->path;
+        files[i].language = CBM_LANG_KOTLIN;
+    }
+    return true;
+}
+
 TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_jvm_XXXXXX");
@@ -4051,23 +5001,11 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     char jdir[512];
     snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
     cbm_mkdir_p(jdir, 0755);
-    FILE *jf = cbm_fopen(jpath, "w");
+    FILE *jf = cbm_fopen(jpath, "wb");
     if (!jf) {
         FAIL("fopen example.java failed");
     }
-    fprintf(jf, "package com.example;\n"
-                "\n"
-                "class JavaCaller {\n"
-                "    String call(KotlinService kotlinService) {\n"
-                "        return kotlinService.ping(new JavaService());\n"
-                "    }\n"
-                "}\n"
-                "\n"
-                "class JavaService {\n"
-                "    String pong() {\n"
-                "        return \"pong\";\n"
-                "    }\n"
-                "}\n");
+    fputs(PAR_JVM_JAVA, jf);
     fclose(jf);
 
     char kpath[512];
@@ -4075,50 +5013,38 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     char kdir[512];
     snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
     cbm_mkdir_p(kdir, 0755);
-    FILE *kf = cbm_fopen(kpath, "w");
+    FILE *kf = cbm_fopen(kpath, "wb");
     if (!kf) {
         unlink(jpath);
         rmdir(tmpdir);
         FAIL("fopen example.kt failed");
     }
-    fprintf(kf, "package com.example\n"
-                "\n"
-                "class KotlinService {\n"
-                "    fun ping(javaService: JavaService): String {\n"
-                "        return javaService.pong()\n"
-                "    }\n"
-                "}\n");
+    fputs(PAR_JVM_KOTLIN, kf);
     fclose(kf);
 
-    cbm_file_info_t files[2] = {0};
+    cbm_file_info_t files[4] = {0};
     files[0].path = jpath;
     files[0].rel_path = (char *)"src/main/java/com/example/Example.java";
     files[0].language = CBM_LANG_JAVA;
     files[1].path = kpath;
     files[1].rel_path = (char *)"src/main/kotlin/com/example/KotlinService.kt";
     files[1].language = CBM_LANG_KOTLIN;
+    char control_paths[2][512];
+    ASSERT(parallel_quality_control_files(tmpdir, files + 2, control_paths));
 
-    cbm_gbuf_t *gbuf = run_parallel("com", tmpdir, files, 2, 2);
+    cbm_gbuf_t *gbuf = run_parallel("com", tmpdir, files, 4, 2);
     ASSERT_NOT_NULL(gbuf);
 
-    const cbm_gbuf_edge_t *java_to_kotlin =
-        find_calls_edge_by_tails(gbuf, "JavaCaller.call", "KotlinService.ping");
-    const cbm_gbuf_edge_t *kotlin_to_java =
-        find_calls_edge_by_tails(gbuf, "KotlinService.ping", "JavaService.pong");
-
-    ASSERT_NOT_NULL(java_to_kotlin);
-    ASSERT_NOT_NULL(kotlin_to_java);
-    ASSERT_NOT_NULL(java_to_kotlin->properties_json);
-    ASSERT_NOT_NULL(kotlin_to_java->properties_json);
-    ASSERT_NOT_NULL(strstr(java_to_kotlin->properties_json, "\"strategy\":\"lsp"));
-    ASSERT_NOT_NULL(strstr(kotlin_to_java->properties_json, "\"strategy\":\"lsp"));
-    ASSERT_TRUE(strstr(java_to_kotlin->properties_json, "\"strategy\":\"callee_suffix\"") == NULL);
-    ASSERT_TRUE(strstr(kotlin_to_java->properties_json, "\"strategy\":\"callee_suffix\"") == NULL);
+    RQ_Report quality = {0};
+    ASSERT(parallel_quality_check(gbuf, "com", "jvm-cross-file", PAR_JVM_SOURCES, 4,
+                                  PAR_JVM_EXPECTED, 4, &quality));
+    ASSERT_EQ(quality.genuine, 4);
+    ASSERT_EQ(quality.found, 4);
+    ASSERT_EQ(quality.missing, 0);
+    ASSERT_EQ(quality.required_missing + quality.wrong, 0);
 
     cbm_gbuf_free(gbuf);
-    unlink(kpath);
-    unlink(jpath);
-    rmdir(tmpdir);
+    th_rmtree(tmpdir);
     PASS();
 }
 
@@ -4156,31 +5082,11 @@ TEST(parallel_rust_external_target_contract) {
     PASS();
 }
 
-/* Gate guard for the JVM-only unique-tail fallbacks (lsp_resolve.h).
- *
- * The tail fallbacks join LSP overrides across QN drift by unique
- * "Class.method" leaf. That is only sound where class-per-file package
- * semantics hold (Java/Kotlin); in any other language a single
- * wrong-module coincidence would fabricate a CALLS edge, so
- * cbm_pipeline_lsp_allow_tail_match must keep the fallbacks OFF there.
- *
- * NOTE: a natural end-to-end non-JVM coincidence fixture is impractical:
- * reaching the fallbacks requires the LSP and the textual extraction to
- * disagree on QN prefixes, which path-derived single-root languages do
- * not produce in a small fixture (that drift is precisely the JVM
- * mixed-source-root symptom the fallback exists for). So this test
- * exercises the gated branches directly: the SAME wrong-module
- * coincidence must resolve with the gate open (JVM) and must NOT with
- * the gate closed. If the gate were removed — fallbacks made
- * unconditional again — the gate-closed assertions below would fail. */
-TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
-    /* Policy: exactly the JVM languages. */
-    ASSERT_TRUE(cbm_pipeline_lsp_allow_tail_match(CBM_LANG_JAVA));
-    ASSERT_TRUE(cbm_pipeline_lsp_allow_tail_match(CBM_LANG_KOTLIN));
-    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_PYTHON));
-    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_GO));
-    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_TYPESCRIPT));
-    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_CPP));
+/* A class/method suffix never establishes declaration or caller identity.
+ * Even the legacy opt-in argument must not recover a coincidental JVM tail. */
+TEST(parallel_lsp_tail_match_fallbacks_disabled_for_all_languages) {
+    for (int language = 0; language < CBM_LANG_COUNT; language++)
+        ASSERT_FALSE(cbm_pipeline_lsp_allow_tail_match((CBMLanguage)language));
 
     /* Wrong-module coincidence: the resolved entry's caller shares only
      * the "Service.handle" tail with the textual call's enclosing
@@ -4201,14 +5107,10 @@ TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
     call.callee_name = "helper.run";
 
     ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&arr, &call, false) == NULL);
-    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&arr, &call, true) == &rc_item);
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&arr, &call, true));
 
-    /* Kotlin top-level functions have one more legitimate QN drift: the graph
-     * owner is file-shaped (`...Main.operatorCaller`) while the semantic owner
-     * is package-shaped (`app.operatorCaller`). An exact source occurrence and
-     * equal caller leaf may reconcile that JVM-only drift; the non-JVM policy
-     * remains closed, a different caller leaf remains closed, and distinct
-     * semantic targets at the same occurrence remain ambiguous. */
+    /* Equal byte coordinates and a caller leaf still do not connect a package
+     * declaration to a file declaration. This needs an explicit identity map. */
     CBMResolvedCall top_level_rows[2] = {0};
     top_level_rows[0].caller_qn = "app.operatorCaller";
     top_level_rows[0].callee_qn = "app.Box.plus";
@@ -4230,8 +5132,7 @@ TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
     top_level_call.source_origin = CBM_SOURCE_ORIGIN_RAW;
     top_level_call.requires_lsp_resolution = true;
     ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&top_level_arr, &top_level_call, false) == NULL);
-    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&top_level_arr, &top_level_call, true) ==
-                &top_level_rows[0]);
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&top_level_arr, &top_level_call, true));
 
     top_level_call.enclosing_func_qn = "proj.app.Main.differentCaller";
     ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&top_level_arr, &top_level_call, true) == NULL);
@@ -4252,8 +5153,11 @@ TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
     ASSERT_TRUE(cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", false) == NULL);
     const cbm_gbuf_node_t *jvm_hit =
         cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", true);
-    ASSERT_NOT_NULL(jvm_hit);
-    ASSERT_TRUE(strcmp(jvm_hit->qualified_name, "proj.zeta.Helper.run") == 0);
+    ASSERT_NULL(jvm_hit);
+    const cbm_gbuf_node_t *exact =
+        cbm_pipeline_lsp_target_node(tgbuf, "proj", "proj.zeta.Helper.run", true);
+    ASSERT_NOT_NULL(exact);
+    ASSERT_EQ(exact->id, nid);
     /* A synthetic external protocol target has no source-level evidence for
      * that Class.method-tail equivalence.  Its strict lookup must therefore
      * remain exact and fail closed on the same coincidence. */
@@ -4306,13 +5210,10 @@ TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
 
     /* Sanity: extraction produced at least one call edge. */
     ASSERT_GT(c.total_calls, 0);
-    /* The parallel pipeline must surface at least one LSP-attributed
-     * CALLS edge. This proves the unified cbm_pipeline_find_lsp_resolution
-     * (shared with pass_calls.c at floor 0.6) is actually consulted in
-     * the parallel pipeline, and that the resulting edge is emitted with
-     * the LSP strategy intact rather than overwritten by the registry
-     * fallback. */
-    ASSERT_GT(c.lsp_strategy_count, 0);
+    /* The exact receiver target and public proof-backed provenance survive
+     * projection; legacy lsp_* labels no longer authorize graph edges. */
+    ASSERT_GT(c.proof_strategy_count, 0);
+    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.main", "Greeter.hello"));
 
     cbm_gbuf_free(gbuf);
 
@@ -4357,11 +5258,23 @@ static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char
     }
 
     cbm_init();
-    cbm_pipeline_pass_definitions(&ctx, files, file_count);
-    cbm_pipeline_pass_lsp_cross(&ctx, files, file_count, cache);
-    cbm_pipeline_pass_calls(&ctx, files, file_count);
-    cbm_pipeline_pass_usages(&ctx, files, file_count);
-    cbm_pipeline_pass_semantic(&ctx, files, file_count);
+    bool ok = cbm_pipeline_pass_definitions(&ctx, files, file_count) == 0 &&
+              cbm_shared_resolver_capture_sources(&ctx, files, file_count, cache);
+    if (ok) {
+        int cross_status = cbm_pipeline_pass_lsp_cross(&ctx, files, file_count, cache);
+        ok = cross_status != CBM_PIPELINE_ABORT_PRESERVE_DB &&
+             !atomic_load(&ctx.test_declarations_failed);
+    }
+    if (ok) {
+        ctx.shared_resolver = cbm_shared_resolver_build(&ctx, files, file_count, cache);
+        ok = ctx.shared_resolver != NULL;
+    }
+    if (ok)
+        ok = cbm_pipeline_pass_calls(&ctx, files, file_count) == 0 &&
+             cbm_pipeline_pass_usages(&ctx, files, file_count) == 0 &&
+             cbm_pipeline_pass_semantic(&ctx, files, file_count) == 0 &&
+             harness_resolve_occurrences(&ctx, files, file_count) &&
+             cbm_shared_resolver_project(gbuf);
 
     /* CBM_GO_FIELD_DIAG dump. NOTE: resolved-call records may borrow QN
      * strings across file results (cross-file resolution in pass_lsp_cross),
@@ -4400,10 +5313,17 @@ static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char
             }
         }
     }
+    if (!ok || atomic_load(&ctx.test_declarations_failed)) {
+        cbm_gbuf_free(gbuf);
+        gbuf = NULL;
+    }
+    cbm_shared_resolver_free(ctx.shared_resolver);
+    ctx.shared_resolver = NULL;
     for (int i = 0; i < file_count; i++) {
         cbm_free_result(cache[i]);
     }
     free(cache);
+    ctx.result_cache = NULL;
     harness_ctx_free_tables(&ctx);
     cbm_registry_free(reg);
     if (ctx.seq_cross_arena_live) {
@@ -4420,12 +5340,65 @@ static cbm_gbuf_t *run_go_field_chain_sequential(const char *project, const char
     return gbuf;
 }
 
-/* Cross-package field chains (h.S.Ping()) resolve end to end through the
- * shared prebuilt Go registry. Regression for the field_defs fold: Go struct
- * fields are extracted as flat "Field" definitions that pxc_map_label drops,
- * so structs registered with zero fields and field chains never resolved.
- * Mirrors the real-world handler shape — an app package holds an aliased
- * cross-package field ("S *s.Svc") and app.Call calls through it. */
+static const char PAR_GO_SERVICE[] = "package service\n"
+                                     "\n"
+                                     "import (\n"
+                                     "    \"context\"\n"
+                                     "    pb \"acme-sdk/apis/order\"\n"
+                                     ")\n"
+                                     "\n"
+                                     "type OrderService struct{}\n"
+                                     "\n"
+                                     "func (s *OrderService) PlaceOrder(ctx context.Context, req "
+                                     "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
+                                     "    return nil, nil\n"
+                                     "}\n"
+                                     "\n"
+                                     "func (s *OrderService) ListOrders(ctx context.Context, req "
+                                     "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
+                                     "    return nil, nil\n"
+                                     "}\n";
+static const char PAR_GO_HANDLER[] = "package handler\n"
+                                     "\n"
+                                     "import (\n"
+                                     "    \"context\"\n"
+                                     "\n"
+                                     "    pb \"acme-sdk/apis/order\"\n"
+                                     "\n"
+                                     "    \"acme-order/internal/service\"\n"
+                                     ")\n"
+                                     "\n"
+                                     "type OrderHandler struct {\n"
+                                     "    pb.UnimplementedOrderServer\n"
+                                     "    cartSvc      *service.CartService\n"
+                                     "    userSvc      *service.UserService\n"
+                                     "    orderSvc     *service.OrderService\n"
+                                     "    inventorySvc *service.InventoryService\n"
+                                     "    paymentSvc   *service.PaymentService\n"
+                                     "    shipmentSvc  *service.ShipmentService\n"
+                                     "    couponSvc    *service.CouponService\n"
+                                     "    searchSvc    *service.SearchService\n"
+                                     "}\n"
+                                     "\n"
+                                     "func (h *OrderHandler) ListOrders(ctx context.Context, req "
+                                     "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
+                                     "    return h.orderSvc.ListOrders(ctx, req)\n"
+                                     "}\n"
+                                     "\n"
+                                     "func (h *OrderHandler) PlaceOrder(ctx context.Context, req "
+                                     "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
+                                     "    return h.orderSvc.PlaceOrder(ctx, req)\n"
+                                     "}\n"
+                                     "\n"
+                                     "func (h *OrderHandler) UpdateCart(ctx context.Context, req "
+                                     "*pb.UpdateCartReq) (*pb.UpdateCartRsp, error) {\n"
+                                     "    return h.cartSvc.UpdateCart(ctx, req)\n"
+                                     "}\n";
+
+/* Preserve the original cross-package field-chain fixture as counted quality
+ * debt: its module root and external protobuf types are not certified. Both
+ * declared OrderService calls remain in the denominator, and an independent
+ * C prototype/definition call must resolve through this same cross harness. */
 TEST(parallel_go_cross_package_field_chain_resolves) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_gofold_XXXXXX");
@@ -4437,65 +5410,13 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
     char app_path[512];
     snprintf(svc_path, sizeof(svc_path), "%s/acme-order/internal/service/order_service.go", tmpdir);
     snprintf(app_path, sizeof(app_path), "%s/acme-order/internal/handler/order_handler.go", tmpdir);
-    if (th_write_file(svc_path, "package service\n"
-                                "\n"
-                                "import (\n"
-                                "    \"context\"\n"
-                                "    pb \"acme-sdk/apis/order\"\n"
-                                ")\n"
-                                "\n"
-                                "type OrderService struct{}\n"
-                                "\n"
-                                "func (s *OrderService) PlaceOrder(ctx context.Context, req "
-                                "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
-                                "    return nil, nil\n"
-                                "}\n"
-                                "\n"
-                                "func (s *OrderService) ListOrders(ctx context.Context, req "
-                                "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
-                                "    return nil, nil\n"
-                                "}\n") != 0 ||
-        th_write_file(app_path, "package handler\n"
-                                "\n"
-                                "import (\n"
-                                "    \"context\"\n"
-                                "\n"
-                                "    pb \"acme-sdk/apis/order\"\n"
-                                "\n"
-                                "    \"acme-order/internal/service\"\n"
-                                ")\n"
-                                "\n"
-                                "type OrderHandler struct {\n"
-                                "    pb.UnimplementedOrderServer\n"
-                                "    cartSvc      *service.CartService\n"
-                                "    userSvc      *service.UserService\n"
-                                "    orderSvc     *service.OrderService\n"
-                                "    inventorySvc *service.InventoryService\n"
-                                "    paymentSvc   *service.PaymentService\n"
-                                "    shipmentSvc  *service.ShipmentService\n"
-                                "    couponSvc    *service.CouponService\n"
-                                "    searchSvc    *service.SearchService\n"
-                                "}\n"
-                                "\n"
-                                "func (h *OrderHandler) ListOrders(ctx context.Context, req "
-                                "*pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {\n"
-                                "    return h.orderSvc.ListOrders(ctx, req)\n"
-                                "}\n"
-                                "\n"
-                                "func (h *OrderHandler) PlaceOrder(ctx context.Context, req "
-                                "*pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {\n"
-                                "    return h.orderSvc.PlaceOrder(ctx, req)\n"
-                                "}\n"
-                                "\n"
-                                "func (h *OrderHandler) UpdateCart(ctx context.Context, req "
-                                "*pb.UpdateCartReq) (*pb.UpdateCartRsp, error) {\n"
-                                "    return h.cartSvc.UpdateCart(ctx, req)\n"
-                                "}\n") != 0) {
+    if (th_write_file(svc_path, PAR_GO_SERVICE) != 0 ||
+        th_write_file(app_path, PAR_GO_HANDLER) != 0) {
         th_rmtree(tmpdir);
         FAIL("write fixture failed");
     }
 
-    cbm_file_info_t files[2] = {0};
+    cbm_file_info_t files[4] = {0};
     files[0].path = svc_path;
     files[0].rel_path = (char *)"acme-order/internal/service/order_service.go";
     files[0].language = CBM_LANG_GO;
@@ -4503,7 +5424,54 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
     files[1].rel_path = (char *)"acme-order/internal/handler/order_handler.go";
     files[1].language = CBM_LANG_GO;
 
-    cbm_gbuf_t *gbuf = run_go_field_chain_sequential("go_field_fold", tmpdir, files, 2);
+    char control_paths[2][512];
+    ASSERT(parallel_quality_c_files(tmpdir, files + 2, control_paths));
+    const RQ_Source sources[] = {
+        {.path = "acme-order/internal/service/order_service.go", .text = PAR_GO_SERVICE},
+        {.path = "acme-order/internal/handler/order_handler.go", .text = PAR_GO_HANDLER},
+        PAR_C_SOURCES[0],
+        PAR_C_SOURCES[1]};
+    const RQ_Expected expected[] = {
+        {.case_id = "go-field-chain-ListOrders",
+         .site = {.file = "acme-order/internal/handler/order_handler.go",
+                  .caller = "acme-order.internal.handler.OrderHandler.ListOrders",
+                  .needle = "h.orderSvc.ListOrders(ctx, req)"},
+         .relation = "CALLS",
+         .target = {.file = "acme-order/internal/service/order_service.go",
+                    .suffix = "acme-order.internal.service.OrderService.ListOrders",
+                    .label = "Method",
+                    .declaration_line = 14,
+                    .declaration_text = "func (s *OrderService) ListOrders(ctx context.Context, "
+                                        "req *pb.ListOrdersReq) (*pb.ListOrdersRsp, error) {"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "go_field_chain_module_and_external_type_scope_unproven",
+         .why = "The fixture has no go.mod and its external pb types and several receiver fields "
+                "lack complete declarations.",
+         .tried = "Retained all original fields, imports, and both real OrderService calls. No "
+                  "module root or external type identity is guessed; a separate cross-file C call "
+                  "remains required."},
+        {.case_id = "go-field-chain-PlaceOrder",
+         .site = {.file = "acme-order/internal/handler/order_handler.go",
+                  .caller = "acme-order.internal.handler.OrderHandler.PlaceOrder",
+                  .needle = "h.orderSvc.PlaceOrder(ctx, req)"},
+         .relation = "CALLS",
+         .target = {.file = "acme-order/internal/service/order_service.go",
+                    .suffix = "acme-order.internal.service.OrderService.PlaceOrder",
+                    .label = "Method",
+                    .declaration_line = 10,
+                    .declaration_text = "func (s *OrderService) PlaceOrder(ctx context.Context, "
+                                        "req *pb.PlaceOrderReq) (*pb.PlaceOrderRsp, error) {"},
+         .mode = RQ_KNOWN_GAP,
+         .gap_id = "go_field_chain_module_and_external_type_scope_unproven",
+         .why = "The fixture has no go.mod and its external pb types and several receiver fields "
+                "lack complete declarations.",
+         .tried = "Retained all original fields, imports, and both real OrderService calls. No "
+                  "module root or external type identity is guessed; a separate cross-file C call "
+                  "remains required."},
+        PAR_C_REQUIRED};
+    /* UpdateCart has no declared target in these original sources and is
+     * outside this oracle's two explicitly covered handler CALLS domains. */
+    cbm_gbuf_t *gbuf = run_go_field_chain_sequential("go_field_fold", tmpdir, files, 4);
     ASSERT_NOT_NULL(gbuf);
 
     /* Since #1909, Go method QNs are receiver-qualified on both endpoints. */
@@ -4549,11 +5517,15 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
             }
         }
     }
+    RQ_Report quality = {0};
+    ASSERT(parallel_quality_check(gbuf, "go_field_fold", "go-field-chain-quality", sources, 4,
+                                  expected, 3, &quality));
+    ASSERT_EQ(quality.genuine, 3);
+    ASSERT_EQ(quality.found, 1);
+    ASSERT_EQ(quality.missing, 2);
     cbm_gbuf_free(gbuf);
     th_rmtree(tmpdir);
 
-    ASSERT_TRUE(found);
-    ASSERT_TRUE(dispatch);
     PASS();
 }
 
@@ -4617,12 +5589,9 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     cbm_gbuf_foreach_edge(gbuf, count_lsp_call_edges, &c);
 
     ASSERT_GT(c.total_calls, 0);
-    /* The cross-file LSP override must produce at least one lsp_*
-     * CALLS edge. Without the project-prefix fallback in
-     * cbm_pipeline_lsp_target_node this assertion would fail because the
-     * raw module-path callee_qn doesn't match the project-qualified
-     * gbuf node QN. */
-    ASSERT_GT(c.lsp_strategy_count, 0);
+    /* Require the actual cross-file receiver target after strict projection. */
+    ASSERT_GT(c.proof_strategy_count, 0);
+    ASSERT_NOT_NULL(find_calls_edge_by_tails(gbuf, "app.main", "Greeter.hello"));
 
     cbm_gbuf_free(gbuf);
 
@@ -4632,29 +5601,33 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
-/* RED/GREEN A — the graph-quality guarantee behind the low-RAM retention cap.
- *
- * The fused cross-file LSP step re-parses each file's source to resolve calls
- * whose receiver type lives in ANOTHER file (the per-file pass cannot). When
- * the retention cap drops a file's source, that resolution MUST still happen
- * via a bounded on-demand re-read; otherwise the cross-file CALLS edge is LOST.
- *
- * Fixture: a Java<->Kotlin pair with genuinely cross-language calls that only
- * the cross-file LSP resolves — JavaCaller.call -> KotlinService.ping (Java ->
- * Kotlin) and KotlinService.ping -> JavaService.pong (Kotlin -> Java). These
- * carry the "lsp" strategy and do NOT exist without the cross-file source,
- * unlike same-file or import-local Python calls which the per-file pass already
- * resolves (so counting lsp edges on those cannot detect the fallback).
- *
- * Three scenarios asserted GREEN with the re-read fallback in place:
- *   1. CONTROL   — default retention: both cross-file edges present. Proves the
- *                  fixture genuinely produces them (non-vacuity guard).
- *   2. NO-RETAIN — retain_sources=false: nothing retained -> edges survive only
- *                  via the re-read fallback.
- *   3. OVER-CAP  — per-file cap = 1 byte: every file dropped by the SIZE cap ->
- *                  edges survive only via the re-read fallback.
- * On main (no fallback) scenarios 2 and 3 LOSE both edges = RED; scenario 1
- * stays present = the non-vacuity control. */
+/* Retention parity has one required source-dependent Kotlin cross-file
+ * control in every mode. The original Java/Kotlin pair remains byte-identical
+ * and contributes three explicit quality misses per mode: the two original
+ * method calls and nested implicit constructor need strict identities/proofs.
+ * Empty graphs cannot satisfy the required control or the projection oracle. */
+typedef struct {
+    bool retain_expected, caller_seen, retention_matches, pre_cross_unproven;
+} parallel_quality_retention_probe_t;
+static void parallel_quality_probe_retention(CBMFileResult **cache, int count, void *ud) {
+    parallel_quality_retention_probe_t *probe = ud;
+    if (count != 4 || !cache[3])
+        return;
+    const CBMFileResult *caller = cache[3];
+    probe->caller_seen = true;
+    probe->retention_matches =
+        (caller->source != NULL && caller->source_len > 0) == probe->retain_expected;
+    probe->pre_cross_unproven = true;
+    const char *site = strstr(PAR_QUALITY_CALLER, "value.keep(number)");
+    uint32_t start = (uint32_t)(site - PAR_QUALITY_CALLER);
+    for (int i = 0; i < caller->resolved_calls.count; i++) {
+        const CBMResolvedCall *row = &caller->resolved_calls.items[i];
+        if (row->kind == CBM_RESOLVED_INVOCATION && row->site_start_byte == start &&
+            row->site_end_byte == start + strlen("value.keep(number)") && row->evidence.proof)
+            probe->pre_cross_unproven = false;
+    }
+}
+
 TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_xf_reread_XXXXXX");
@@ -4667,23 +5640,11 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     char jdir[512];
     snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
     cbm_mkdir_p(jdir, 0755);
-    FILE *jf = fopen(jpath, "w");
+    FILE *jf = cbm_fopen(jpath, "wb");
     if (!jf) {
         FAIL("fopen Example.java failed");
     }
-    fprintf(jf, "package com.example;\n"
-                "\n"
-                "class JavaCaller {\n"
-                "    String call(KotlinService kotlinService) {\n"
-                "        return kotlinService.ping(new JavaService());\n"
-                "    }\n"
-                "}\n"
-                "\n"
-                "class JavaService {\n"
-                "    String pong() {\n"
-                "        return \"pong\";\n"
-                "    }\n"
-                "}\n");
+    fputs(PAR_JVM_JAVA, jf);
     fclose(jf);
 
     char kpath[512];
@@ -4691,26 +5652,22 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     char kdir[512];
     snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
     cbm_mkdir_p(kdir, 0755);
-    FILE *kf = fopen(kpath, "w");
+    FILE *kf = cbm_fopen(kpath, "wb");
     if (!kf) {
         FAIL("fopen KotlinService.kt failed");
     }
-    fprintf(kf, "package com.example\n"
-                "\n"
-                "class KotlinService {\n"
-                "    fun ping(javaService: JavaService): String {\n"
-                "        return javaService.pong()\n"
-                "    }\n"
-                "}\n");
+    fputs(PAR_JVM_KOTLIN, kf);
     fclose(kf);
 
-    cbm_file_info_t files[2] = {0};
+    cbm_file_info_t files[4] = {0};
     files[0].path = jpath;
     files[0].rel_path = (char *)"src/main/java/com/example/Example.java";
     files[0].language = CBM_LANG_JAVA;
     files[1].path = kpath;
     files[1].rel_path = (char *)"src/main/kotlin/com/example/KotlinService.kt";
     files[1].language = CBM_LANG_KOTLIN;
+    char control_paths[2][512];
+    ASSERT(parallel_quality_control_files(tmpdir, files + 2, control_paths));
 
     /* CONTROL (retained) + two drop scenarios that reach the cross-file edge
      * only via the on-demand re-read: NO-RETAIN disables retention entirely;
@@ -4727,26 +5684,23 @@ TEST(parallel_cross_file_reread_preserves_unretained_edges) {
     const cbm_parallel_extract_opts_t *scenarios[3] = {NULL, &no_retain, &over_cap};
 
     for (int s = 0; s < 3; s++) {
-        cbm_gbuf_t *gbuf = run_parallel_with_extract_opts("com", tmpdir, files, 2, 2, scenarios[s]);
+        parallel_quality_retention_probe_t probe = {.retain_expected = s == 0};
+        cbm_gbuf_t *gbuf = run_parallel_with_extract_opts_and_mutator(
+            "com", tmpdir, files, 4, 2, scenarios[s], parallel_quality_probe_retention, &probe,
+            false);
         ASSERT_NOT_NULL(gbuf);
+        ASSERT(probe.caller_seen);
+        ASSERT(probe.retention_matches);
+        ASSERT(probe.pre_cross_unproven);
 
-        const cbm_gbuf_edge_t *java_to_kotlin =
-            find_calls_edge_by_tails(gbuf, "JavaCaller.call", "KotlinService.ping");
-        const cbm_gbuf_edge_t *kotlin_to_java =
-            find_calls_edge_by_tails(gbuf, "KotlinService.ping", "JavaService.pong");
-
-        /* Both cross-file (Java↔Kotlin) CALLS edges must be present in EVERY
-         * scenario. In the drop scenarios (s=1,2) the caller's source is NOT
-         * retained, so these edges exist ONLY because resolve_worker re-reads
-         * the source on demand. Without that fallback (main) they are LOST. */
-        ASSERT_NOT_NULL(java_to_kotlin);
-        ASSERT_NOT_NULL(kotlin_to_java);
-        /* And they must come from the source-dependent cross-file LSP, not a
-         * source-free suffix heuristic — proving the re-read actually ran. */
-        ASSERT_NOT_NULL(java_to_kotlin->properties_json);
-        ASSERT_NOT_NULL(strstr(java_to_kotlin->properties_json, "\"strategy\":\"lsp"));
-        ASSERT_NOT_NULL(kotlin_to_java->properties_json);
-        ASSERT_NOT_NULL(strstr(kotlin_to_java->properties_json, "\"strategy\":\"lsp"));
+        RQ_Report quality = {0};
+        const char *names[] = {"jvm-reread-retained", "jvm-reread-disabled", "jvm-reread-capped"};
+        ASSERT(parallel_quality_check(gbuf, "com", names[s], PAR_JVM_SOURCES, 4, PAR_JVM_EXPECTED,
+                                      4, &quality));
+        ASSERT_EQ(quality.genuine, 4);
+        ASSERT_EQ(quality.found, 4);
+        ASSERT_EQ(quality.missing, 0);
+        ASSERT_EQ(quality.required_missing + quality.wrong, 0);
 
         cbm_gbuf_free(gbuf);
     }
@@ -4978,7 +5932,7 @@ TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist) 
     PASS();
 }
 
-TEST(lsp_resolve_jvm_package_alias_of_materialized_target_is_not_ambiguous) {
+TEST(lsp_resolve_jvm_unproved_package_alias_cannot_merge_targets) {
     const char *project = "proj";
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, "/tmp");
     ASSERT_NOT_NULL(gbuf);
@@ -5001,7 +5955,9 @@ TEST(lsp_resolve_jvm_package_alias_of_materialized_target_is_not_ambiguous) {
     const CBMResolvedCall *hit =
         cbm_pipeline_find_lsp_resolution_in_graph(&arr, &call, true, gbuf, project);
     cbm_gbuf_free(gbuf);
-    ASSERT_NOT_NULL(hit);
+    /* The fixture supplies no mapping from demo.Util to this graph declaration.
+     * A shared tail cannot merge the two different semantic target identities. */
+    ASSERT_NULL(hit);
     PASS();
 }
 
@@ -5124,7 +6080,7 @@ static CBMResolvedCall make_tail_rc(const char *callee, float confidence, uint32
     return resolved;
 }
 
-TEST(lsp_tail_exact_site_beats_legacy_regardless_of_order) {
+TEST(lsp_tail_occurrence_cannot_replace_exact_caller_identity) {
     CBMCall call = make_tail_call(500, 512);
     CBMResolvedCall exact = make_tail_rc("com.example.Alpha.run", 0.80f, 500, 512);
     CBMResolvedCall legacy = make_tail_rc("com.example.Beta.run", 0.99f, 0, 0);
@@ -5133,18 +6089,23 @@ TEST(lsp_tail_exact_site_beats_legacy_regardless_of_order) {
     CBMResolvedCallArray first = {exact_first, 2, 2};
     CBMResolvedCallArray second = {legacy_first, 2, 2};
 
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&first, &call, true));
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&second, &call, true));
+    call.enclosing_func_qn = exact.caller_qn;
     ASSERT(cbm_pipeline_find_lsp_resolution(&first, &call, true) == &exact_first[0]);
     ASSERT(cbm_pipeline_find_lsp_resolution(&second, &call, true) == &legacy_first[1]);
     PASS();
 }
 
-TEST(lsp_tail_duplicate_exact_rows_same_target_are_not_ambiguous) {
+TEST(lsp_tail_duplicate_exact_rows_require_exact_caller) {
     CBMCall call = make_tail_call(600, 612);
     CBMResolvedCall low = make_tail_rc("com.example.Helper.run", 0.75f, 600, 612);
     CBMResolvedCall high = make_tail_rc("com.example.Helper.run", 0.90f, 600, 612);
     CBMResolvedCall items[] = {low, high};
     CBMResolvedCallArray arr = {items, 2, 2};
 
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&arr, &call, true));
+    call.enclosing_func_qn = low.caller_qn;
     ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &call, true) == &items[1]);
     PASS();
 }
@@ -5160,13 +6121,15 @@ TEST(lsp_tail_distinct_exact_targets_are_ambiguous) {
     PASS();
 }
 
-TEST(lsp_tail_duplicate_legacy_rows_same_target_are_not_ambiguous) {
+TEST(lsp_tail_duplicate_legacy_rows_require_exact_caller) {
     CBMCall call = make_tail_call(800, 812);
     CBMResolvedCall low = make_tail_rc("com.example.Helper.run", 0.75f, 0, 0);
     CBMResolvedCall high = make_tail_rc("com.example.Helper.run", 0.90f, 0, 0);
     CBMResolvedCall items[] = {low, high};
     CBMResolvedCallArray arr = {items, 2, 2};
 
+    ASSERT_NULL(cbm_pipeline_find_lsp_resolution(&arr, &call, true));
+    call.enclosing_func_qn = low.caller_qn;
     ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &call, true) == &items[1]);
     PASS();
 }
@@ -5276,12 +6239,8 @@ TEST(lsp_reference_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist
     PASS();
 }
 
-/* A JVM tail lookup may recover one materialized graph node when package- and
- * path-shaped QNs drift, but it must not erase semantic disagreement between
- * two resolver rows. `pkg1.Service.handler` and `pkg2.Service.handler` are
- * distinct source targets even when each independently falls back to the same
- * unique `Service.handler` graph node. Collapsing them would let row order or
- * confidence fabricate an exact CALL_REFERENCE instead of failing closed. */
+/* Distinct semantic packages remain distinct even when an unrelated graph
+ * declaration has the same class/member suffix. No legacy flag reopens it. */
 TEST(lsp_reference_jvm_distinct_packages_do_not_collapse_via_tail_node) {
     const char *project = "proj";
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, "/tmp");
@@ -5304,15 +6263,18 @@ TEST(lsp_reference_jvm_distinct_packages_do_not_collapse_via_tail_node) {
         cbm_pipeline_lsp_target_node(gbuf, project, pkg1.callee_qn, true);
     const cbm_gbuf_node_t *pkg2_tail =
         cbm_pipeline_lsp_target_node(gbuf, project, pkg2.callee_qn, true);
-    bool same_tail_node = pkg1_tail && pkg2_tail && pkg1_tail->id == materialized_id &&
-                          pkg2_tail->id == materialized_id;
+    const cbm_gbuf_node_t *exact =
+        cbm_pipeline_lsp_target_node(gbuf, project, "proj.generated.Service.handler", true);
+    bool exact_node = exact && exact->id == materialized_id;
+    bool no_tail_node = !pkg1_tail && !pkg2_tail;
     const CBMResolvedCall *first_hit =
         cbm_pipeline_find_lsp_reference_in_graph(&first, &usage, true, gbuf, project);
     const CBMResolvedCall *second_hit =
         cbm_pipeline_find_lsp_reference_in_graph(&second, &usage, true, gbuf, project);
     cbm_gbuf_free(gbuf);
 
-    ASSERT_TRUE(same_tail_node);
+    ASSERT_TRUE(exact_node);
+    ASSERT_TRUE(no_tail_node);
     ASSERT_NULL(first_hit);
     ASSERT_NULL(second_hit);
     PASS();
@@ -5338,7 +6300,7 @@ TEST(lsp_reference_distinct_exact_targets_are_order_invariant) {
     PASS();
 }
 
-TEST(lsp_reference_duplicate_tail_rows_same_target_are_not_ambiguous) {
+TEST(lsp_reference_duplicate_tail_rows_require_exact_caller) {
     CBMUsage usage = make_reference_usage("proj.raw.Service.handle", "handler", 1200, 1207);
     CBMResolvedCall low =
         make_reference_rc("com.generated.Service.handle", "com.Target.handler", 0.75f, 1200, 1207);
@@ -5347,6 +6309,8 @@ TEST(lsp_reference_duplicate_tail_rows_same_target_are_not_ambiguous) {
     CBMResolvedCall items[] = {low, high};
     CBMResolvedCallArray arr = {items, 2, 2};
 
+    ASSERT_NULL(cbm_pipeline_find_lsp_reference(&arr, &usage, true));
+    usage.enclosing_func_qn = low.caller_qn;
     ASSERT(cbm_pipeline_find_lsp_reference(&arr, &usage, true) == &items[1]);
     PASS();
 }
@@ -5670,8 +6634,7 @@ TEST(parallel_php_vendor_types_never_bind_by_name_issue1186) {
  * calls fell to name-only strategies (the #1186 "useful calls at 0.38"). The
  * decoy App\Other\Svc shares the short name and the method, so a name-only
  * match cannot tell the two apart. Controls: the vendor-typed receiver
- * (`Client $c`) must stay unresolved, and the same-file calls keep their LSP
- * strategies. */
+ * (`Client $c`) must stay unresolved, and the same-file calls bind. */
 static const struct {
     const char *rel;
     const char *src;
@@ -5734,8 +6697,10 @@ static void php_xfile_count_edge(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
-/* 1 when every cross-file receiver resolved through the PHP LSP, the decoy and
- * the vendor receiver drew nothing, and the same-file controls held. */
+/* One unresolved vendor import voids no other import: each project receiver
+ * binds to the class its own `use` names, and the decoy that shares a short
+ * name and a method gets nothing. Proof, not a strategy label, admits the edge,
+ * so no edge carries an LSP strategy. */
 static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
     static const char *const foo = "lib/Http/Foo.php";
     struct {
@@ -5744,11 +6709,11 @@ static int php_xfile_graph_ok(const cbm_gbuf_t *gbuf, const char *driver) {
         int want_total;
         int want_lsp;
     } checks[] = {
-        {"lib/Services/Svc.php", ".Svc.go", 1, 1}, /* $this->svc->go(), not $c->go() */
+        {"lib/Services/Svc.php", ".Svc.go", 1, 0}, /* $this->svc->go(), not $c->go() */
         {"lib/Other/Svc.php", ".Svc.go", 0, 0},    /* decoy: same short name + method */
-        {"lib/Repo/Repo.php", ".Repo.find", 1, 1}, /* aliased import */
-        {foo, ".Foo.local", 1, 1},                 /* same-file control */
-        {foo, ".Local.ping", 1, 1},                /* same-file control */
+        {"lib/Repo/Repo.php", ".Repo.find", 1, 0}, /* aliased import */
+        {foo, ".Foo.local", 1, 0},                 /* same-file control */
+        {foo, ".Local.ping", 1, 0},                /* same-file control */
     };
     int ok = 1;
     for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); i++) {
@@ -5804,12 +6769,63 @@ static int php_xfile_run(const char *extra_use) {
         "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, NULL, NULL, true);
     cbm_gbuf_t *par = run_parallel_with_extract_opts_and_mutator(
         "cbm_par_phpxfile", tmpdir, files, PHP_XFILE_FILE_COUNT, 2, NULL, NULL, NULL, true);
+    RQ_Source sources[PHP_XFILE_FILE_COUNT] = {0};
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++)
+        sources[i] = (RQ_Source){.path = k_php_xfile_files[i].rel,
+                                 .text = parallel_fixture_source(paths[i])};
+    const struct {
+        const char *id, *needle, *suffix, *decl;
+        int target, line;
+    } cases[] = {{"php-promoted-property", "$this->svc->go()", "lib.Services.Svc.Svc.go",
+                  "    public function go() { return 1; }", 0, 5},
+                 {"php-imported-receiver", "$r->find()", "lib.Repo.Repo.Repo.find",
+                  "    public function find() { return 3; }", 2, 5},
+                 {"php-local-private", "$this->local()", "lib.Http.Foo.Foo.local",
+                  "    private function local() { return 4; }", 3, 17},
+                 {"php-constructed-receiver", "(new Local())->ping()", "lib.Http.Foo.Local.ping",
+                  "    public function ping() { return 5; }", 3, 21}};
+    RQ_Expected expected[4] = {0};
+    for (int i = 0; i < 4; i++)
+        expected[i] = (RQ_Expected){
+            .case_id = cases[i].id,
+            .site = {.file = "lib/Http/Foo.php",
+                     .caller = "lib.Http.Foo.Foo.run",
+                     .needle = cases[i].needle},
+            .relation = "CALLS",
+            .target = {.file = k_php_xfile_files[cases[i].target].rel,
+                       .suffix = cases[i].suffix,
+                       .label = "Method",
+                       .declaration_line =
+                           cases[i].line + (extra_use && cases[i].target == 3 ? 1 : 0),
+                       .declaration_text = cases[i].decl},
+            .mode = RQ_REQUIRED};
+    /* The vendor receiver has no project declaration: Svc::go is its decoy. */
+    const RQ_Forbidden forbidden[] = {
+        {.case_id = "php-vendor-receiver-stays-unresolved",
+         .site = {.file = "lib/Http/Foo.php",
+                  .caller = "lib.Http.Foo.Foo.run",
+                  .needle = "$c->go()"},
+         .relation = "CALLS",
+         .any_target = true}};
+    RQ_Report quality[2] = {0};
+    bool quality_ok =
+        seq && par &&
+        parallel_quality_check_with_forbidden(seq, "cbm_par_phpxfile", "php-receiver-sequential",
+                                              sources, PHP_XFILE_FILE_COUNT, expected, 4, forbidden,
+                                              1, &quality[0]) &&
+        parallel_quality_check_with_forbidden(par, "cbm_par_phpxfile", "php-receiver-parallel",
+                                              sources, PHP_XFILE_FILE_COUNT, expected, 4, forbidden,
+                                              1, &quality[1]) &&
+        quality[0].genuine == 4 && quality[0].found == 4 && quality[0].missing == 0 &&
+        quality[1].genuine == 4 && quality[1].found == 4 && quality[1].missing == 0;
+    for (int i = 0; i < PHP_XFILE_FILE_COUNT; i++)
+        free((void *)sources[i].text);
     int seq_ok = seq ? php_xfile_graph_ok(seq, "sequential") : 0;
     int par_ok = par ? php_xfile_graph_ok(par, "parallel") : 0;
     cbm_gbuf_free(seq);
     cbm_gbuf_free(par);
     th_rmtree(tmpdir);
-    return seq_ok && par_ok;
+    return quality_ok && seq_ok && par_ok;
 }
 
 TEST(parallel_php_lsp_types_imported_project_receivers_issue1186) {
@@ -5825,7 +6841,6 @@ TEST(parallel_php_lsp_types_imported_project_receivers_unknown_bindings_issue118
     ASSERT_EQ(php_xfile_run("use Exception;\n"), 1);
     PASS();
 }
-
 
 /* A fresh PHP external row replaces stale evidence for its exact occurrence,
  * including an older external row, without clearing a real project invocation
@@ -5950,23 +6965,23 @@ SUITE(parallel) {
     RUN_TEST(lsp_resolve_distinct_exact_caller_site_targets_are_ambiguous);
     RUN_TEST(lsp_resolve_project_prefixed_duplicate_is_not_ambiguous);
     RUN_TEST(lsp_resolve_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist);
-    RUN_TEST(lsp_resolve_jvm_package_alias_of_materialized_target_is_not_ambiguous);
+    RUN_TEST(lsp_resolve_jvm_unproved_package_alias_cannot_merge_targets);
     RUN_TEST(lsp_resolve_jvm_two_tail_only_packages_stay_ambiguous);
     RUN_TEST(lsp_resolve_exact_site_beats_higher_confidence_legacy_record);
     RUN_TEST(lsp_resolve_exact_site_beats_equal_confidence_legacy_record);
     RUN_TEST(lsp_resolve_malformed_span_is_not_legacy_compatible);
     RUN_TEST(lsp_resolve_below_floor_exact_does_not_block_legacy);
-    RUN_TEST(lsp_tail_exact_site_beats_legacy_regardless_of_order);
-    RUN_TEST(lsp_tail_duplicate_exact_rows_same_target_are_not_ambiguous);
+    RUN_TEST(lsp_tail_occurrence_cannot_replace_exact_caller_identity);
+    RUN_TEST(lsp_tail_duplicate_exact_rows_require_exact_caller);
     RUN_TEST(lsp_tail_distinct_exact_targets_are_ambiguous);
-    RUN_TEST(lsp_tail_duplicate_legacy_rows_same_target_are_not_ambiguous);
+    RUN_TEST(lsp_tail_duplicate_legacy_rows_require_exact_caller);
     RUN_TEST(lsp_tail_distinct_legacy_targets_are_ambiguous);
     RUN_TEST(lsp_reference_duplicate_exact_rows_same_target_are_not_ambiguous);
     RUN_TEST(lsp_reference_project_prefixed_duplicate_is_not_ambiguous);
     RUN_TEST(lsp_reference_project_prefix_spellings_stay_ambiguous_when_both_nodes_exist);
     RUN_TEST(lsp_reference_jvm_distinct_packages_do_not_collapse_via_tail_node);
     RUN_TEST(lsp_reference_distinct_exact_targets_are_order_invariant);
-    RUN_TEST(lsp_reference_duplicate_tail_rows_same_target_are_not_ambiguous);
+    RUN_TEST(lsp_reference_duplicate_tail_rows_require_exact_caller);
     RUN_TEST(lsp_reference_distinct_tail_targets_are_ambiguous);
     RUN_TEST(lsp_target_node_supports_long_prefixed_qualified_name);
     RUN_TEST(grpc_service_name_preserves_service_suffix_issue294);
@@ -6015,7 +7030,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_rust_external_target_contract);
-    RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
+    RUN_TEST(parallel_lsp_tail_match_fallbacks_disabled_for_all_languages);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
     RUN_TEST(parallel_defines_method_parity);

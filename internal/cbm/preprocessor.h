@@ -17,11 +17,23 @@
 extern "C" {
 #endif
 
+typedef enum {
+    CBM_PREPROCESS_PROOF_GUESSED_CONFIG = 1u << 0,
+    CBM_PREPROCESS_PROOF_DIAGNOSTIC = 1u << 1,
+    CBM_PREPROCESS_PROOF_HEADER_DEPENDENCY = 1u << 2,
+    CBM_PREPROCESS_PROOF_UNSUPPORTED_SYNTAX = 1u << 3
+} CBMPreprocessProofIssue;
+
 typedef struct {
     char *source;
     uint32_t *original_line_by_expanded_line; // 1-based; 0 means directive/unmapped.
     uint8_t *belongs_to_main_file;            // 1-based; true only for the original input file.
     int expanded_line_count;
+    /* Expansion is useful for extraction even when its assumptions cannot
+     * authorize a relationship. Zero means a diagnostic-free source-local
+     * transform using only explicit configuration and supported directives;
+     * headers still require a retained dependency certificate. */
+    uint32_t proof_issues;
 } CBMPreprocessedSource;
 
 // Collect conventional export-macro-shaped identifiers (ALL_CAPS ending in

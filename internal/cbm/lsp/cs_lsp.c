@@ -40,6 +40,7 @@
  */
 
 #include "cs_lsp.h"
+#include "cs_proof.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
 #include <ctype.h>
@@ -3847,6 +3848,10 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
+            rt.project_source = true;
+            rt.source_flags = d->source_flags;
+            rt.declaration_identity = d->declaration_identity;
+            rt.graph_qualified_name = d->graph_qualified_name;
             rt.namespace_qn = cs_top_level_namespace(d->qualified_name, d->short_name,
                                                      d->def_module_qn, d->namespace_name);
             rt.is_interface = d->is_interface || (strcmp(d->label, "Interface") == 0);
@@ -3883,7 +3888,14 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             memset(&rf, 0, sizeof(rf));
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
-            rf.min_params = -1;
+            rf.min_params =
+                (d->source_flags & CBM_SOURCE_DECL_FIXED_ARITY) ? d->signature_param_count : -1;
+            rf.flags |= CBM_FUNC_FLAG_PROJECT_SOURCE;
+            rf.source_flags = d->source_flags;
+            rf.source_signature = d->source_signature;
+            rf.declaration_identity = d->declaration_identity;
+            rf.graph_qualified_name = d->graph_qualified_name;
+            rf.sig = d->sig;
             if (strcmp(d->label, "Method") == 0 && d->receiver_type) {
                 rf.receiver_type = d->receiver_type;
             }
@@ -3964,10 +3976,11 @@ CBMTypeRegistry *cbm_cs_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     return reg;
 }
 
-void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
-                                        const char *module_qn, CBMTypeRegistry *reg,
-                                        const char **using_targets, int using_count,
-                                        TSTree *cached_tree, CBMResolvedCallArray *out) {
+void cbm_run_cs_lsp_cross_with_result(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, CBMTypeRegistry *reg,
+                                      const char **using_targets, int using_count,
+                                      TSTree *cached_tree, CBMResolvedCallArray *out,
+                                      const CBMFileResult *file) {
     if (!source || !arena || !out || !reg)
         return;
 
@@ -3996,6 +4009,7 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         }
     }
     cs_lsp_process_file(&ctx, root);
+    cbm_cs_proof_resolve(arena, source, source_len, root, reg, file, out);
 
     if (owns)
         ts_tree_delete(tree);
@@ -4059,4 +4073,12 @@ void cbm_batch_cs_lsp_cross(CBMArena *arena, CBMBatchCSLSPFile *files, int file_
         cbm_run_cs_lsp_cross(arena, f->source, f->source_len, f->module_qn, f->defs, f->def_count,
                              f->using_targets, f->using_count, f->cached_tree, &out[i]);
     }
+}
+
+void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                        const char *module_qn, CBMTypeRegistry *reg,
+                                        const char **using_targets, int using_count,
+                                        TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_cs_lsp_cross_with_result(arena, source, source_len, module_qn, reg, using_targets,
+                                     using_count, cached_tree, out, NULL);
 }

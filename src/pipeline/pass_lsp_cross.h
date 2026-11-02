@@ -37,6 +37,7 @@
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
+#include "lsp/oo_strict.h"
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 
@@ -74,21 +75,22 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
 
 /* Build the local-name -> semantic import-QN map consumed by cross-file LSPs.
  * Both sequential and parallel drivers use this exact helper so import
- * metadata cannot diverge between pipelines. Values are owned by the returned
+ * metadata cannot diverge between pipelines. The immutable context preserves
+ * path aliases from the admitted configuration. Values are owned by the returned
  * map (not borrowed from gbuf); release both arrays with
  * cbm_pxc_free_import_map(). A complete PHP binding snapshot also permits an
  * allocated empty map. This compatibility projection alone never proves
  * vendor absence: consumers require cbm_pipeline_php_vendor_names_build's
  * separate typed evidence, including completion and full import identities. */
-int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
+int cbm_pxc_build_import_map(const cbm_pipeline_ctx_t *ctx, const char *rel_path, CBMLanguage lang,
+                             const CBMFileResult *result, const char ***out_keys,
                              const char ***out_vals, int *out_count);
 /* As cbm_pxc_build_import_map (which is include_type_only = false, the CALLS
  * map), but with include_type_only also binding annotation-only imports
  * (Python `if TYPE_CHECKING:`), for the consumers that resolve annotations:
  * the Python LSP and the cross-file base/field-type resolution (#1277). */
-int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name,
-                                const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
+int cbm_pxc_build_import_map_ex(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                CBMLanguage lang, const CBMFileResult *result,
                                 bool include_type_only, const char ***out_keys,
                                 const char ***out_vals, int *out_count);
 /* True when the file records an annotation-only import (the LSP map then
@@ -150,9 +152,18 @@ typedef struct {
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
     CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    /* Java, Kotlin and C#: declaration index for strict static selection. */
+    struct cbm_oo_index *oo;
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
+
+/* Harvest the strict Java/Kotlin/C# declaration index over every file of the
+ * generation. NULL when the project has none of those files. The arena must
+ * outlive the resolve; release the index's tables with cbm_oo_index_free. */
+struct cbm_oo_index *cbm_pxc_build_oo_index(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                            CBMFileResult **cache, const cbm_file_info_t *files,
+                                            int file_count);
 
 /* Return the appropriate pre-built registry for a language, or NULL
  * if none was built (or language has no cross-LSP entrypoint). */
@@ -224,6 +235,10 @@ void cbm_pxc_run_one_with_php_bindings(CBMLanguage lang, CBMFileResult *r, const
                                        CBMLSPDef *defs, int def_count, const char **imp_names,
                                        const char **imp_qns, int imp_count,
                                        const CBMPHPImportBindings *bindings);
+void cbm_pxc_run_one_with_imports(CBMLanguage, CBMFileResult *, const char *, int, const char *,
+                                  const char *, CBMLSPDef *, int, const char **, const char **, int,
+                                  const CBMPHPImportBindings *,
+                                  const cbm_resolve_import_snapshot_t *);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
@@ -252,5 +267,18 @@ void cbm_pxc_dispatch_file_with_php_bindings(
     const char **imp_keys, const char **imp_vals, int imp_count,
     CBMTypeRegistry *(*rust_shared_get)(void *), void *rust_shared_ctx,
     const CBMPHPImportBindings *bindings);
+void cbm_pxc_dispatch_file_with_imports(CBMLanguage, CBMFileResult *, const char *, int,
+                                        const char *, const char *, const CBMCrossLspRegistries *,
+                                        const CBMModuleDefIndex *, CBMLSPDef *, int, const char **,
+                                        const char **, int, CBMTypeRegistry *(*)(void *), void *,
+                                        const CBMPHPImportBindings *,
+                                        const cbm_resolve_import_snapshot_t *);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Exercise the production append/supersede ownership boundary with exact
+ * synthetic proof DAGs; no parser or allocation timing is involved. */
+void cbm_pxc_append_resolutions_for_test(CBMArena *arena, CBMResolvedCallArray *destination,
+                                         const CBMResolvedCallArray *source);
+#endif
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

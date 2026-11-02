@@ -1263,6 +1263,10 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
         if (is_value_field(field)) {
             return false;
         }
+        /* `cache[key] = v` reads cache and key; only the element is stored. */
+        if (ctx->language == CBM_LANG_GO && strcmp(ts_node_type(parent), "index_expression") == 0) {
+            return false;
+        }
         bool assignment =
             (spec->assignment_node_types && cbm_kind_in_set(parent, spec->assignment_node_types)) ||
             kind_in_exact_set(ts_node_type(parent), occurrence->write_nodes);
@@ -1288,6 +1292,44 @@ static bool is_write_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
                 return true;
             }
             return occurrence->first_named_child_is_write && named_child_contains(parent, 0, node);
+        }
+        current = parent;
+    }
+    return false;
+}
+
+/* One token, one role. type_refs carries a Go parameter, result, var or conversion type
+ * as USES_TYPE at this exact span, so it is no USAGE. A composite literal builds a value
+ * of its type. A receiver has no USES_TYPE occurrence, and USES_TYPE reads a qualified
+ * type's whole spelling, not its member token, so those stay USAGE. */
+static bool is_go_annotation_type(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if (ctx->language != CBM_LANG_GO || strcmp(ts_node_type(node), "type_identifier") != 0) {
+        return false;
+    }
+    TSNode current = node;
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    while (!ts_node_is_null(current)) {
+        TSNode parent;
+        const char *field;
+        if (!occurrence_parent(cursor, current, &parent, &field)) {
+            return false;
+        }
+        const char *kind = ts_node_type(parent);
+        if (strcmp(kind, "qualified_type") == 0 || (field && strcmp(field, "receiver") == 0)) {
+            return false;
+        }
+        if (field && (strcmp(field, "parameters") == 0 || strcmp(field, "result") == 0) &&
+            (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "method_declaration") == 0 ||
+             strcmp(kind, "method_elem") == 0)) {
+            return true;
+        }
+        if (field && strcmp(field, "type") == 0) {
+            if (strcmp(kind, "var_spec") == 0 || strcmp(kind, "type_conversion_expression") == 0) {
+                return true;
+            }
+            if (strcmp(kind, "composite_literal") == 0) {
+                return false;
+            }
         }
         current = parent;
     }
@@ -1326,6 +1368,24 @@ static bool is_call_argument_label(TSNode node) {
         current = parent;
     }
     return false;
+}
+
+/* An opening JSX tag owns one invocation; its name and matching closing
+ * name are syntax, not independent value occurrences. Attribute expressions
+ * and children remain ordinary references. Use the existing walk cursor so
+ * deeply nested JSX does not introduce root-to-parent searches. */
+static bool is_jsx_tag_name(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if ((ctx->language != CBM_LANG_JAVASCRIPT && ctx->language != CBM_LANG_TSX) ||
+        strcmp(ts_node_type(node), "identifier") != 0)
+        return false;
+    TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
+    TSNode parent;
+    const char *field;
+    if (!occurrence_parent(cursor, node, &parent, &field) || !field || strcmp(field, "name"))
+        return false;
+    const char *kind = ts_node_type(parent);
+    return !strcmp(kind, "jsx_opening_element") || !strcmp(kind, "jsx_self_closing_element") ||
+           !strcmp(kind, "jsx_closing_element");
 }
 
 static bool is_call_argument_label_walk(TSNode node, WalkState *state) {
@@ -1612,12 +1672,62 @@ static TSNode paren_wrapped_direct_argument_site(TSNode node, TSNode parent, TST
     return is_direct_argument_value_walk(site, state) ? site : (TSNode){0};
 }
 
+/* A direct Go assignment value is a syntactic candidate, never a target proof.
+ * Keep the terminal identifier's carrier span in lockstep with go_emit_proven;
+ * selectors/parentheses establish context without widening that occurrence. */
+static bool go_assignment_value_leaf(TSNode node, TSTreeCursor *cursor) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "identifier") && strcmp(kind, "field_identifier"))
+        return false;
+    TSNode current = node, parent;
+    const char *field;
+    if (!cursor)
+        usage_slow_parent_fallback_test_note();
+    if (!occurrence_parent(cursor, current, &parent, &field))
+        return false;
+    if (!strcmp(kind, "field_identifier")) {
+        TSNode member = ts_node_child_by_field_name(parent, TS_FIELD("field"));
+        if (strcmp(ts_node_type(parent), "selector_expression") || ts_node_is_null(member) ||
+            !ts_node_eq(member, node))
+            return false;
+        current = parent;
+        if (!occurrence_parent(cursor, current, &parent, &field))
+            return false;
+    }
+    for (unsigned depth = 0; !strcmp(ts_node_type(parent), "parenthesized_expression"); depth++) {
+        if (depth == 32 || ts_node_named_child_count(parent) != 1 ||
+            !ts_node_eq(ts_node_named_child(parent, 0), current))
+            return false;
+        current = parent;
+        if (!occurrence_parent(cursor, current, &parent, &field))
+            return false;
+    }
+    if (!strcmp(ts_node_type(parent), "expression_list")) {
+        current = parent;
+        if (!occurrence_parent(cursor, current, &parent, &field))
+            return false;
+    }
+    const char *parent_kind = ts_node_type(parent);
+    const char *value_field = !strcmp(parent_kind, "short_var_declaration") ||
+                                      !strcmp(parent_kind, "assignment_statement")
+                                  ? "right"
+                              : !strcmp(parent_kind, "var_spec") ? "value"
+                                                                 : NULL;
+    TSNode value = value_field ? ts_node_child_by_field_name(parent, value_field,
+                                                             (uint32_t)strlen(value_field))
+                               : (TSNode){0};
+    return !ts_node_is_null(value) && ts_node_eq(value, current);
+}
+
 static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, const char *name,
                                             WalkState *state) {
     if (!ctx || !name || !language_may_stamp_exact_callable_value_candidate(ctx->language)) {
         return (TSNode){0};
     }
     const char *kind = ts_node_type(node);
+    if (ctx->language == CBM_LANG_GO &&
+        go_assignment_value_leaf(node, reset_occurrence_cursor(state, node)))
+        return node;
     TSTreeCursor *cursor = reset_occurrence_cursor(state, node);
     TSNode parent = {0};
     const char *parent_field = NULL;
@@ -1672,6 +1782,15 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
     }
     if (strcmp(kind, "identifier") != 0 && strcmp(kind, "simple_identifier") != 0) {
         return (TSNode){0};
+    }
+    /* Receiverless ::name remains an explicit callable-reference candidate
+     * inside nested control bodies, where it need not be the walk's current
+     * callee. Keep the identifier span; only semantic proof may upgrade it. */
+    if (ctx->language == CBM_LANG_KOTLIN && !ts_node_is_null(parent) &&
+        strcmp(ts_node_type(parent), "callable_reference") == 0 &&
+        ts_node_named_child_count(parent) == 1 &&
+        ts_node_eq(ts_node_named_child(parent, 0), node)) {
+        return node;
     }
     /* Kotlin: a navigation member read (`obj.member`, and `value::member`,
      * which the vendored grammar also parses as navigation) is a candidate at
@@ -2588,14 +2707,14 @@ static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     if (!is_reference_node(node, ctx->language)) {
         return;
     }
-    if (is_call_argument_label(node)) {
+    if (is_jsx_tag_name(ctx, node, NULL) || is_call_argument_label(node)) {
         return;
     }
     if (inside_call || inside_import) {
         return;
     }
     if (is_binding_occurrence(ctx, node, spec, NULL) ||
-        is_write_occurrence(ctx, node, spec, NULL)) {
+        is_write_occurrence(ctx, node, spec, NULL) || is_go_annotation_type(ctx, node, NULL)) {
         return;
     }
     char *name = reference_name(ctx, node);
@@ -2747,6 +2866,9 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         }
         return;
     }
+    if (is_jsx_tag_name(ctx, node, state)) {
+        return;
+    }
     if (is_forward_sibling_callee(ctx->language, node)) {
         return;
     }
@@ -2774,7 +2896,7 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         }
         return;
     }
-    if (!reference_node) {
+    if (!reference_node || is_go_annotation_type(ctx, node, state)) {
         return;
     }
     if (is_write_occurrence(ctx, node, spec, state)) {

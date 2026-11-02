@@ -11,6 +11,7 @@ static void check_owned(const void *block, const char *op);
 #include "foundation/constants.h"
 #include "foundation/log.h"
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -281,7 +282,37 @@ void *cbm_calloc(cbm_mem_class_t cls, size_t bytes) {
     return block;
 }
 
+#if defined(CBM_MEM_TEST_API) && CBM_MEM_TEST_API
+
+static _Thread_local bool tl_test_realloc_armed;
+static _Thread_local bool tl_test_realloc_fired;
+static _Thread_local cbm_mem_class_t tl_test_realloc_class;
+
+void cbm_mem_test_fail_next_realloc(cbm_mem_class_t cls) {
+    tl_test_realloc_class = cls;
+    tl_test_realloc_fired = false;
+    tl_test_realloc_armed = true;
+}
+
+bool cbm_mem_test_reset_realloc_failure(void) {
+    bool fired = tl_test_realloc_fired;
+    tl_test_realloc_armed = false;
+    tl_test_realloc_fired = false;
+    return fired;
+}
+#endif
+
 void *cbm_realloc(cbm_mem_class_t cls, void *block, size_t bytes) {
+#if defined(CBM_MEM_TEST_API) && CBM_MEM_TEST_API
+    /* Intercept before realloc(NULL) delegates to cbm_alloc. No ownership or
+     * accounting state has changed when this one requested allocation fails. */
+    if (tl_test_realloc_armed && cls == tl_test_realloc_class) {
+        tl_test_realloc_armed = false;
+        tl_test_realloc_fired = true;
+        errno = ENOMEM;
+        return NULL;
+    }
+#endif
     if (!block) {
         return cbm_alloc(cls, bytes);
     }
@@ -439,7 +470,9 @@ int cbm_mem_class_report_json(char *out, size_t size) {
 
 void cbm_mem_class_log(const char *tag) {
     cbm_mem_class_flush_thread();
-    char report[CBM_SZ_1K];
+    /* Every class active needs about 2 KB, and a report that does not fit logs
+     * nothing: the table vanished from each phase after the third of a large index. */
+    char report[CBM_SZ_4K];
     if (cbm_mem_class_report_json(report, sizeof(report)) <= 0) {
         return;
     }

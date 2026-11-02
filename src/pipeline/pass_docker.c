@@ -53,9 +53,12 @@
 #include "cbm.h"
 #include "helpers.h"
 #include "lang_specs.h"
+#include "resolve/policy.h"
+#include "resolve/snapshot.h"
 #include "yyjson/yyjson.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -1784,27 +1787,63 @@ static void dk_file_build(dk_t *d, TSNode root) {
 
 static char *dk_read(const char *path, size_t *len) {
     FILE *f = cbm_fopen(path, "rb");
-    if (!f) {
+    if (!f)
+        return NULL;
+    bool ok = fseek(f, 0, SEEK_END) == 0;
+    long size = ok ? ftell(f) : -1;
+    ok = ok && size >= 0 && size <= cbm_max_file_bytes() && fseek(f, 0, SEEK_SET) == 0;
+    enum { DK_TS_PAD = 16 };
+    char *buf = ok && (uint64_t)size <= SIZE_MAX - DK_TS_PAD
+                    ? cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + DK_TS_PAD)
+                    : NULL;
+    size_t got = buf ? fread(buf, SKIP_ONE, (size_t)size, f) : 0;
+    ok = buf && got == (size_t)size && !ferror(f) && fgetc(f) == EOF && !ferror(f);
+    if (fclose(f) != 0)
+        ok = false;
+    if (!ok) {
+        cbm_free(CBM_MEM_CLASS_OTHER, buf);
         return NULL;
     }
-    (void)fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > cbm_max_file_bytes()) {
-        (void)fclose(f);
-        return NULL;
-    }
-    enum { DK_TS_PAD = 16 }; /* tree-sitter's lexer reads past the end */
-    char *buf = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)size + DK_TS_PAD);
-    if (!buf) {
-        (void)fclose(f);
-        return NULL;
-    }
-    size_t got = fread(buf, SKIP_ONE, (size_t)size, f);
-    (void)fclose(f);
     memset(buf + got, 0, DK_TS_PAD);
     *len = got;
     return buf;
+}
+
+typedef struct {
+    char *bytes;
+    size_t length;
+    bool present;
+    char identity[65];
+} dk_input_t;
+
+/* Capture the exact buffer parsed, including an empty file or confirmed
+ * absence. Unavailable, symlinked, partial and concurrently replaced inputs
+ * fail publication rather than masquerading as an absent environment. */
+static bool dk_read_input(cbm_pipeline_ctx_t *ctx, const char *rel, bool optional,
+                          dk_input_t *input) {
+    *input = (dk_input_t){0};
+    char path[CBM_SZ_4K];
+    int n = snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
+    if (n < 0 || (size_t)n >= sizeof(path))
+        return false;
+    cbm_path_info_t before, after;
+    int status = cbm_path_info_utf8(path, &before);
+    if (status == CBM_PATH_INFO_ABSENT)
+        return optional && cbm_gbuf_capture_input(ctx->gbuf, rel, false, 0, NULL);
+    if (status != CBM_PATH_INFO_OK || !before.is_regular || before.is_symlink)
+        return false;
+    input->bytes = dk_read(path, &input->length);
+    if (!input->bytes || cbm_path_info_utf8(path, &after) != CBM_PATH_INFO_OK ||
+        !after.is_regular || after.is_symlink || before.size != after.size ||
+        before.mtime_ns != after.mtime_ns || (uint64_t)after.size != input->length ||
+        memchr(input->bytes, '\0', input->length)) {
+        cbm_free(CBM_MEM_CLASS_OTHER, input->bytes);
+        input->bytes = NULL;
+        return false;
+    }
+    input->present = true;
+    cbm_sha256_hex(input->bytes, input->length, input->identity);
+    return cbm_gbuf_capture_input(ctx->gbuf, rel, true, input->length, input->identity);
 }
 
 /* Does the line [b, e) hold a parser directive `# escape=...`? */
@@ -1910,6 +1949,13 @@ typedef struct {
     int64_t file_node;
     int pass; /* 0: make the service nodes, 1: their edges */
     int edges;
+    const char *source;
+    size_t source_length;
+    const char *content_identity;
+    const char *configuration_identity;
+    const char *environment_path;
+    const dk_input_t *environment;
+    cbm_resolve_proof_pool_t *proofs;
 } dk_compose_t;
 
 static const char *dk_compose_qn(const dk_compose_t *c, const char *name) {
@@ -1944,6 +1990,118 @@ static void dk_compose_connects(dk_compose_t *c, const cbm_compose_service_t *s,
     }
 }
 
+/* The literal reference denotes the repository Image abstraction documented
+ * by cbm_pipeline_image_node; tag/digest remain in properties. Build-tag
+ * similarity supplies no authority to replace that repository endpoint. */
+static int64_t dk_compose_repository(dk_compose_t *c, const char *image) {
+    char repo[CBM_SZ_512], registry[CBM_SZ_512];
+    if (!image || strlen(image) >= sizeof(repo) || !cbm_image_ref_valid(image) ||
+        !dk_normalize(image, repo, sizeof(repo), registry, sizeof(registry)))
+        return 0;
+    /* Docker Hub normalization may add library/. Check the complete canonical
+     * repository length before the existing fixed-buffer constructor. */
+    const char *slash = strchr(image, '/');
+    size_t first = slash ? (size_t)(slash - image) : 0;
+    bool hub = slash &&
+               ((first == strlen("docker.io") && !strncmp(image, "docker.io", first)) ||
+                (first == strlen("index.docker.io") && !strncmp(image, "index.docker.io", first)) ||
+                (first == strlen("registry-1.docker.io") &&
+                 !strncmp(image, "registry-1.docker.io", first)));
+    if (hub) {
+        const char *rest = slash + 1;
+        size_t length = strcspn(rest, "@:");
+        size_t prefix = strlen("docker.io/") + (memchr(rest, '/', length) ? 0 : strlen("library/"));
+        if (length >= sizeof(repo) - prefix)
+            return 0;
+    }
+    return cbm_pipeline_image_node(c->ctx, image);
+}
+
+static bool dk_compose_record(dk_compose_t *c, const cbm_compose_service_t *s, int64_t self,
+                              int64_t target, const char *properties) {
+    const cbm_gbuf_node_t *owner = cbm_gbuf_find_by_id(c->ctx->gbuf, self);
+    const cbm_gbuf_node_t *image = target > 0 ? cbm_gbuf_find_by_id(c->ctx->gbuf, target) : NULL;
+    if (!owner || !owner->qualified_name || !s->image_spelling)
+        return false;
+    bool exact = s->image_complete && image && image->label && !strcmp(image->label, "Image") &&
+                 owner->file_path && !strcmp(owner->file_path, c->file) &&
+                 s->image_end_byte > s->image_start_byte && s->image_end_byte <= c->source_length &&
+                 strlen(s->image_spelling) == s->image_end_byte - s->image_start_byte &&
+                 !memcmp(c->source + s->image_start_byte, s->image_spelling,
+                         s->image_end_byte - s->image_start_byte);
+    cbm_resolve_proof_source_t source = {.project = c->ctx->project_name,
+                                         .file = c->file,
+                                         .module = c->base,
+                                         .scope = owner->qualified_name,
+                                         .content_identity = c->content_identity,
+                                         .configuration_identity = c->configuration_identity,
+                                         .source_origin = CBM_SOURCE_ORIGIN_RAW};
+    cbm_resolve_proof_key_t key = {.lookup_domain = owner->qualified_name,
+                                   .lookup_key = s->image_spelling,
+                                   .binding_identity = image ? image->qualified_name : "",
+                                   .detail = "USAGE",
+                                   .start_byte = s->image_start_byte,
+                                   .end_byte = s->image_end_byte,
+                                   .origin = CBM_SOURCE_ORIGIN_RAW,
+                                   .lookup_closed = exact};
+    cbm_resolve_result_t result = {
+        .binding = exact ? CBM_RESOLVE_BINDING_UNIQUE : CBM_RESOLVE_BINDING_UNRESOLVED,
+        .domain = exact ? CBM_RESOLVE_DOMAIN_PROJECT : CBM_RESOLVE_DOMAIN_UNKNOWN,
+        .analysis = exact ? CBM_RESOLVE_ANALYSIS_COMPLETE : CBM_RESOLVE_ANALYSIS_UNSUPPORTED,
+        .rule = CBM_RESOLVE_RULE_LANGUAGE_BINDING,
+        .facts = exact ? CBM_RESOLVE_FACT_EXACT_TARGET | CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                             CBM_RESOLVE_FACT_LANGUAGE_BOUND | CBM_RESOLVE_FACT_OCCURRENCE_EXACT
+                       : 0,
+        .target = image ? image->qualified_name : "",
+        .candidate_count = exact ? 1 : 0,
+        .reason = exact ? "compose_repository_reference" : "compose_image_input_unsupported"};
+    cbm_resolve_result_t parsed = {.analysis = result.analysis,
+                                   .facts = exact ? CBM_RESOLVE_FACT_OCCURRENCE_EXACT : 0,
+                                   .reason = "compose_image_scalar"};
+    cbm_resolve_proof_key_t environment = key;
+    environment.lookup_domain = c->environment_path;
+    environment.lookup_key = c->environment->present ? "present" : "absent";
+    environment.type_identity = c->environment->identity;
+    environment.detail = "compose_repository_environment_snapshot";
+    environment.flags = c->environment->present;
+    cbm_resolve_result_t captured = {.analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                     .reason = "captured_input_validated_at_publication"};
+    const cbm_resolve_proof_t *premises[] = {
+        cbm_resolve_proof_leaf(c->proofs, CBM_PROOF_SOURCE_FACT, &source, &key, &parsed),
+        cbm_resolve_proof_leaf(c->proofs, CBM_PROOF_ADAPTER_DOMAIN, &source, &environment,
+                               &captured),
+        cbm_resolve_proof_leaf(c->proofs, CBM_PROOF_ADAPTER_DOMAIN, &source, &key, &result)};
+    const cbm_resolve_proof_t *semantic = cbm_resolve_proof_derive(
+        c->proofs, CBM_PROOF_NAMED_JOIN, &source, &key, &result, premises, 3, true);
+    result.proof = semantic ? cbm_resolve_proof_derive(c->proofs, CBM_PROOF_OCCURRENCE_BINDING,
+                                                       &source, &key, &result, &semantic, 1, true)
+                            : NULL;
+    if (!result.proof)
+        return false;
+    cbm_resolve_record_t row = {.file_path = c->file,
+                                .scope = owner->qualified_name,
+                                .relation = "USAGE",
+                                .spelling = s->image_spelling,
+                                .start_byte = s->image_start_byte,
+                                .end_byte = s->image_end_byte,
+                                .source_origin = CBM_SOURCE_ORIGIN_RAW,
+                                .result = result,
+                                .content_identity = c->content_identity,
+                                .configuration_identity = c->configuration_identity,
+                                .properties_json = properties};
+    row.emitted = cbm_resolve_record_admit(&row);
+    if (exact && !row.emitted)
+        return false;
+    if (!cbm_gbuf_record_resolution(c->ctx->gbuf, &row))
+        return false;
+    if (row.emitted) {
+        if (!cbm_gbuf_insert_edge(c->ctx->gbuf, self, target, "USAGE", properties))
+            return false;
+        c->edges++;
+    }
+    return true;
+}
+
 /* A compose service: a Resource {ecosystem:compose, kind:Service} the file
  * DEFINES; it DEPENDS_ON the services it depends on / links, USAGE
  * {ref:image} its image, DEPENDS_ON {via:build} the Dockerfile it builds and
@@ -1951,36 +2109,27 @@ static void dk_compose_connects(dk_compose_t *c, const cbm_compose_service_t *s,
 /* The image a service runs: USAGE {ref: image, image[, default_of]} -- the
  * variables whose inline default named it. When the project's .env replaced
  * a default, the edge carries {override_of, override_source: ".env"}, and
- * the image the defaults alone name is kept: on the same Image as
- * `default_image`, else its own USAGE {ref: image_default, default_of}, a
- * reference the service does not run. */
+ * the unselected inline default remains `default_image` metadata. One
+ * configured scalar has one selected binding; the inactive alternative does
+ * not receive a second USAGE occurrence. */
 static void dk_compose_image(dk_compose_t *c, const cbm_compose_service_t *s, int64_t self) {
-    int64_t img = cbm_pipeline_image_node(c->ctx, s->image);
-    int64_t dimg = s->default_image ? cbm_pipeline_image_node(c->ctx, s->default_image) : 0;
+    int64_t img = s->image_complete ? dk_compose_repository(c, s->image) : 0;
     char esc[CBM_SZ_1K];
     char desc[CBM_SZ_1K];
-    cbm_json_escape(esc, (int)sizeof(esc), s->image);
+    cbm_json_escape(esc, (int)sizeof(esc), s->image ? s->image : "");
     cbm_json_escape(desc, (int)sizeof(desc), s->default_image ? s->default_image : "");
-    const char *props =
-        cbm_arena_sprintf(c->a, "{\"ref\":\"image\",\"image\":\"%s\"%s%s%s%s%s%s%s}", esc,
-                          s->image_default_of ? ",\"default_of\":" : "",
-                          s->image_default_of ? s->image_default_of : "",
-                          s->image_override_of ? ",\"override_of\":" : "",
-                          s->image_override_of ? s->image_override_of : "",
-                          s->image_override_of ? ",\"override_source\":\".env\"" : "",
-                          dimg > 0 && dimg == img ? ",\"default_image\":\"" : "",
-                          dimg > 0 && dimg == img ? cbm_arena_sprintf(c->a, "%s\"", desc) : "");
-    if (props) {
-        dk_compose_edge(c, self, img, "USAGE", props);
-    }
-    if (dimg > 0 && dimg != img && s->image_override_of) {
-        const char *dprops = cbm_arena_sprintf(
-            c->a, "{\"ref\":\"image_default\",\"image\":\"%s\",\"default_of\":%s}", desc,
-            s->image_override_of);
-        if (dprops) {
-            dk_compose_edge(c, self, dimg, "USAGE", dprops);
-        }
-    }
+    const char *props = cbm_arena_sprintf(
+        c->a,
+        "{\"ref\":\"image\",\"strategy\":\"compose_repository\",\"image\":\"%s\"%s%s%s%s%s%s%s}",
+        esc, s->image_default_of ? ",\"default_of\":" : "",
+        s->image_default_of ? s->image_default_of : "",
+        s->image_override_of ? ",\"override_of\":" : "",
+        s->image_override_of ? s->image_override_of : "",
+        s->image_override_of ? ",\"override_source\":\".env\"" : "",
+        s->default_image ? ",\"default_image\":\"" : "",
+        s->default_image ? cbm_arena_sprintf(c->a, "%s\"", desc) : "");
+    if (!props || !dk_compose_record(c, s, self, img, props))
+        atomic_store(&c->ctx->resolver_failed, true);
 }
 
 static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
@@ -2018,7 +2167,7 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
         dk_compose_edge(c, self->id, dep ? dep->id : 0, "DEPENDS_ON", "{\"via\":\"depends_on\"}");
     }
     dk_compose_connects(c, s, self->id);
-    if (s->image) {
+    if (s->image_spelling) {
         dk_compose_image(c, s, self->id);
     }
     if (s->dockerfile) {
@@ -2031,58 +2180,102 @@ static void dk_compose_service(const cbm_compose_service_t *s, void *ud) {
     }
 }
 
-/* The .env of the directory of `rel` under the repository, NULL when none. */
-static char *dk_read_dotenv(const cbm_pipeline_ctx_t *ctx, const char *rel) {
-    if (!ctx->repo_path) {
+/* Discovery's configured language wins over a compose-looking filename.
+ * Existing captured summaries also cover unchanged incremental inputs. */
+static CBMHashTable *dk_build_languages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *inputs,
+                                        int input_count) {
+    CBMHashTable *languages = cbm_ht_create(0);
+    if (!languages)
         return NULL;
+    size_t count = 0;
+    const cbm_resolve_file_t *summaries = cbm_gbuf_resolver_files(ctx->gbuf, &count);
+    for (size_t i = 0; i < count; i++) {
+        if (!summaries[i].file_path)
+            continue;
+        void *language = (void *)(uintptr_t)(summaries[i].language + 1);
+        cbm_ht_set(languages, summaries[i].file_path, language);
+        if (cbm_ht_get(languages, summaries[i].file_path) != language) {
+            cbm_ht_free(languages);
+            return NULL;
+        }
     }
-    const char *slash = strrchr(rel, '/');
-    char path[CBM_SZ_4K];
-    snprintf(path, sizeof(path), "%s/%.*s%s.env", ctx->repo_path, slash ? (int)(slash - rel) : 0,
-             rel, slash ? "/" : "");
-    size_t len = 0;
-    return dk_read(path, &len);
+    for (int i = 0; i < input_count; i++) {
+        if (!inputs[i].rel_path)
+            continue;
+        void *language = (void *)(uintptr_t)((uint32_t)inputs[i].language + 1);
+        cbm_ht_set(languages, inputs[i].rel_path, language);
+        if (cbm_ht_get(languages, inputs[i].rel_path) != language) {
+            cbm_ht_free(languages);
+            return NULL;
+        }
+    }
+    return languages;
 }
 
-/* Every build configuration of the repository -- read from disk through the
- * File nodes, so an incremental run (which recomputes these edges whole)
- * sees the unchanged ones too. */
-static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a) {
+/* Build inputs are analyzed from these exact captured buffers. The normal
+ * YAML transform identity remains unchanged; .env is a separately validated
+ * dependency, never a second file summary or raw persisted environment. */
+static int dk_link_builds(cbm_pipeline_ctx_t *ctx, CBMArena *a, const cbm_file_info_t *inputs,
+                          int input_count) {
     const cbm_gbuf_node_t **files = NULL;
     int n = 0;
-    if (!ctx->repo_path || cbm_gbuf_find_by_label(ctx->gbuf, "File", &files, &n) != 0) {
+    if (!ctx->repo_path || cbm_gbuf_find_by_label(ctx->gbuf, "File", &files, &n) != 0)
+        return 0;
+    CBMHashTable *languages = dk_build_languages(ctx, inputs, input_count);
+    if (!languages) {
+        atomic_store(&ctx->resolver_failed, true);
         return 0;
     }
     dk_builds_t b = {.ctx = ctx, .a = a};
+    cbm_resolve_proof_pool_t proofs;
+    cbm_resolve_proof_pool_init(&proofs, a, 0, 0, 0);
     for (int i = 0; i < n; i++) {
         const char *rel = files[i]->file_path;
-        if (!rel || !cbm_build_path(rel)) {
+        if (!rel || !cbm_build_path(rel))
+            continue;
+        dk_input_t source = {0}, environment = {0};
+        const char *slash = strrchr(rel, '/');
+        const char *basename = slash ? slash + 1 : rel;
+        bool compose = strncmp(basename, "skaffold", strlen("skaffold")) != 0;
+        uintptr_t configured = (uintptr_t)cbm_ht_get(languages, rel);
+        if (compose && configured && configured != (uintptr_t)CBM_LANG_YAML + 1)
+            continue; /* unsupported adapter language, not a stale YAML proof */
+        const char *env_path =
+            slash ? cbm_arena_sprintf(a, "%.*s/.env", (int)(slash - rel), rel) : ".env";
+        bool captured = env_path && dk_read_input(ctx, rel, false, &source) &&
+                        (!compose || dk_read_input(ctx, env_path, true, &environment));
+        CBMFileResult identity = {0};
+        captured = captured && source.length <= INT_MAX &&
+                   cbm_result_capture_raw_source(&identity, source.bytes, (int)source.length,
+                                                 CBM_LANG_YAML, NULL, NULL);
+        if (!captured) {
+            atomic_store(&ctx->resolver_failed, true);
+            cbm_free(CBM_MEM_CLASS_OTHER, source.bytes);
+            cbm_free(CBM_MEM_CLASS_OTHER, environment.bytes);
             continue;
         }
-        char path[CBM_SZ_4K];
-        snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, rel);
-        size_t len = 0;
-        char *src = dk_read(path, &len);
-        if (!src) {
-            continue;
-        }
-        char *dotenv = dk_read_dotenv(ctx, rel);
         b.file = rel;
-        cbm_build_sites(a, rel, src, len, dotenv, dk_build_site, &b);
+        cbm_build_sites(a, rel, source.bytes, source.length, environment.bytes, dk_build_site, &b);
         dk_compose_t cs = {.ctx = ctx,
                            .a = a,
                            .file = rel,
                            .base = cbm_fqn_compute(a, ctx->project_name, rel, NULL),
-                           .file_node = files[i]->id};
-        for (cs.pass = 0; cs.base && cs.pass < PAIR_LEN; cs.pass++) {
-            cbm_compose_services(a, rel, src, len, dotenv, dk_compose_service, &cs);
-        }
+                           .file_node = files[i]->id,
+                           .source = source.bytes,
+                           .source_length = source.length,
+                           .content_identity = identity.source_content_id[CBM_SOURCE_ORIGIN_RAW],
+                           .configuration_identity = identity.source_configuration_id,
+                           .environment_path = env_path,
+                           .environment = &environment,
+                           .proofs = &proofs};
+        for (cs.pass = 0; cs.base && cs.pass < PAIR_LEN; cs.pass++)
+            cbm_compose_services(a, rel, source.bytes, source.length, environment.bytes,
+                                 dk_compose_service, &cs);
         b.edges += cs.edges;
-        if (dotenv) {
-            cbm_free(CBM_MEM_CLASS_OTHER, dotenv);
-        }
-        cbm_free(CBM_MEM_CLASS_OTHER, src);
+        cbm_free(CBM_MEM_CLASS_OTHER, environment.bytes);
+        cbm_free(CBM_MEM_CLASS_OTHER, source.bytes);
     }
+    cbm_ht_free(languages);
     return b.edges;
 }
 
@@ -2417,6 +2610,9 @@ static void dk_hub_push(CBMArena *a, dk_hub_edges_t *l, const cbm_gbuf_edge_t *e
  * USAGE {ref:image}, or DEPENDS_ON {via:from|copy-from}? */
 static bool dk_hub_ref(const char *type, const char *p) {
     char v[CBM_SZ_32];
+    if (strcmp(type, "USAGE") == 0 && dk_prop(p, "strategy", v, sizeof(v)) &&
+        strcmp(v, "compose_repository") == 0)
+        return false; /* strict repository identity, never inferred tag-component identity */
     if (strcmp(type, "USAGE") == 0 || strcmp(type, "DEPLOYS") == 0) {
         return dk_prop(p, "ref", v, sizeof(v)) && strcmp(v, "image") == 0;
     }
@@ -2833,7 +3029,7 @@ void cbm_pipeline_pass_docker(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fi
     if (ix.dirs) {
         cbm_ht_free(ix.dirs);
     }
-    edges += dk_link_builds(ctx, &arena);
+    edges += dk_link_builds(ctx, &arena, files, file_count);
     edges += dk_link_build_args(ctx, &arena);
     edges += dk_image_hubs(ctx, &arena);
     cbm_arena_destroy(&arena);

@@ -5,6 +5,7 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
+#include "../resolve/types.h"
 #include "go_lsp.h" // for CBMLSPDef, CBMResolvedCallArray (shared cross-language)
 
 // TSLSPContext holds state for TypeScript / JavaScript / JSX / TSX expression type
@@ -64,8 +65,8 @@ typedef struct {
     bool jsx_mode;
     bool dts_mode;
     bool cross_file_mode; // project-wide registry is available for exact reference proof
-    bool strict; // tsconfig "strict": true → fewer implicit-any fallbacks
-    bool debug;  // CBM_LSP_DEBUG env
+    bool strict;          // tsconfig "strict": true → fewer implicit-any fallbacks
+    bool debug;           // CBM_LSP_DEBUG env
 
     // Recursion guard for ts_eval_expr_type (mirrors c_lsp).
     int eval_depth;
@@ -73,6 +74,9 @@ typedef struct {
     // first completed eval; see TsEvalMemo in ts_lsp.c). Kills the exponential
     // re-evaluation of shared subexpressions under overload resolution.
     struct TsEvalMemo *eval_memo;
+    /* Source binding audit and evidence on the existing lexical type map. */
+    struct CBMTSProofAudit *proof_audit;
+    CBMResolveTypeMap proven_types;
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -180,5 +184,19 @@ typedef struct {
 // Project-scope declaration merging happens here (per plan §17 finding #4).
 void cbm_batch_ts_lsp_cross(CBMArena *arena, CBMBatchTSLSPFile *files, int file_count,
                             CBMResolvedCallArray *out);
+
+void cbm_run_ts_lsp_cross_with_registry_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, bool js_mode,
+    bool jsx_mode, bool dts_mode, CBMTypeRegistry *reg, CBMLSPDef *defs, int def_count,
+    const char **import_names, const char **import_qns, int import_count, TSTree *cached_tree,
+    CBMResolvedCallArray *out, const cbm_resolve_proof_source_t *source_context);
+
+void cbm_run_ts_lsp_cross_with_source(CBMArena *arena, const char *source, int source_len,
+                                      const char *module_qn, bool js_mode, bool jsx_mode,
+                                      bool dts_mode, CBMLSPDef *defs, int def_count,
+                                      const char **import_names, const char **import_qns,
+                                      int import_count, TSTree *cached_tree,
+                                      CBMResolvedCallArray *out,
+                                      const cbm_resolve_proof_source_t *source_context);
 
 #endif // CBM_LSP_TS_LSP_H

@@ -23,7 +23,38 @@ typedef enum {
      * Ordinary call resolution keeps its historical language-specific choice,
      * but a function value cannot name one materialized definition exactly. */
     CBM_FUNC_FLAG_AMBIGUOUS_BINDING = 1 << 10,
+    /* Set only by source-definition registrars; a mixed registry also holds
+     * external standard-library seeds, so membership alone is not ownership. */
+    CBM_FUNC_FLAG_PROJECT_SOURCE = 1 << 11,
 } CBMFuncFlags;
+
+/* Actual source modifiers; zero means uncollected/unknown. Language adapters
+ * establish defaults and lookup-domain completeness from parsed declarations. */
+enum {
+    CBM_SOURCE_DECL_KNOWN = 1u << 0,
+    CBM_SOURCE_DECL_PUBLIC = 1u << 1,
+    CBM_SOURCE_DECL_PRIVATE = 1u << 2,
+    CBM_SOURCE_DECL_PROTECTED = 1u << 3,
+    CBM_SOURCE_DECL_PACKAGE = 1u << 4,
+    CBM_SOURCE_DECL_STATIC = 1u << 5,
+    CBM_SOURCE_CLASS_DOMAIN_COMPLETE = 1u << 6,
+    CBM_SOURCE_DECL_FIXED_ARITY = 1u << 7,
+    CBM_SOURCE_DECL_TOP_LEVEL = 1u << 8,
+    CBM_SOURCE_CLASS_ZERO_ARGUMENT_CONSTRUCTOR = 1u << 9,
+    /* Complete source member-binding domain, including shadowing/effects.
+     * This does not establish the callable identity of any member value. */
+    CBM_SOURCE_CLASS_VALUE_DOMAIN_COMPLETE = 1u << 10,
+    CBM_SOURCE_FUNCTION_DEFINITION = 1u << 11,
+    CBM_SOURCE_DECL_EXTERN_C = 1u << 12,
+    /* Audited fixed parameters with no type, reference, default or unpacking.
+     * PHP may apply them to exact positional values without coercion rules. */
+    CBM_SOURCE_DECL_UNTYPED_VALUE_PARAMETERS = 1u << 13,
+    /* C family: inside a preprocessor branch, so it exists in some configurations. */
+    CBM_SOURCE_DECL_CONDITIONAL = 1u << 14,
+    /* Every name the class body declares is recorded. Unlike DOMAIN_COMPLETE this says
+     * nothing about base classes, which a lookup searches itself. */
+    CBM_SOURCE_CLASS_BODY_COMPLETE = 1u << 15
+};
 
 // Registered function/method with full type signature.
 typedef struct {
@@ -43,6 +74,20 @@ typedef struct {
     /* Callable identity (#2061): this overload's signature suffix; its graph
      * QN is qualified_name + sig. NULL = none (always, until enabled). */
     const char *sig;
+    /* Opaque identity of the original source declaration within this resolver
+     * generation. Overlay copies retain it; separately extracted declarations
+     * never share it merely because their qualified names match. */
+    const char *declaration_identity;
+    const char *graph_qualified_name; /* original canonical source graph identity, if different */
+    uint32_t source_flags;
+    const CBMType *source_return_type; /* Borrowed immutable source annotation. */
+    /* Audited syntax facts, separate from heuristic/materialized signatures.
+     * Unqualified source names retain their spelling until the language
+     * adapter proves the declaration's type-name lookup domain. */
+    const CBMType *source_signature;
+    int source_arity;           /* C family: fixed parameter count + 1; 0 when not fixed. */
+    const char *source_file_qn; /* C family: the File that holds this declaration. */
+    const char *source_namespace;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.
@@ -73,6 +118,13 @@ typedef struct {
     // so this is the only way to bind a short name through `using` directives and
     // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
     const char *namespace_qn;
+    /* Source facts used by proof adapters; synthetic/stdlib types remain zero. */
+    bool project_source;
+    bool export_binding_proven;
+    const char *declaration_identity;
+    const char *graph_qualified_name; /* original canonical source graph identity, if different */
+    const char *source_file_qn;       /* C family: the File that holds this declaration */
+    uint32_t source_flags;
 } CBMRegisteredType;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.
@@ -94,6 +146,12 @@ typedef struct {
     const char *qualified_name;
     int type_index;
 } CBMRegistryTypeQNEntry;
+
+typedef struct {
+    const char *namespace_qn;
+    const char *short_name;
+    int type_index;
+} CBMRegistryNamespaceTypeEntry;
 
 // Cross-file type/function registry.
 typedef struct CBMTypeRegistry {
@@ -178,6 +236,12 @@ typedef struct CBMTypeRegistry {
     CBMRegistryQNEntry *func_qn_sorted;
     int func_qn_sorted_count;
     int func_qn_sorted_upto;
+    /* Exact declared namespace + short-name index. NULL namespaces are not
+     * mapped; an empty namespace is an explicitly proved default namespace. */
+    CBMRegistryNamespaceTypeEntry *namespace_types;
+    int namespace_type_count;
+    int namespace_type_upto;
+
     CBMRegistryTypeQNEntry *type_qn_sorted;
     int type_qn_sorted_count;
     int type_qn_sorted_upto;
@@ -194,7 +258,44 @@ typedef struct CBMTypeRegistry {
     const char **export_keys;
     const char **export_targets;
     int export_count;
+
+    /* C family: what each file declares for its includers (see c_proof.h). */
+    const struct CBMCDeclIndex *c_decls;
 } CBMTypeRegistry;
+
+/* Read-only iterator over every exact namespace/name candidate in every
+ * finalized fallback link. No overlay preference or duplicate coalescence.
+ * Consume to exhaustion and check complete before claiming uniqueness.
+ * Appended/unindexed tails and finite-work exhaustion make complete false.
+ * The language adapter owns the completeness of declared namespace metadata. */
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const char *namespace_qn;
+    const char *name;
+    int position;
+    unsigned links;
+    uint64_t visits;
+    bool complete;
+    bool open;
+} CBMNamespaceTypeIter;
+void cbm_registry_types_in_namespace(const CBMTypeRegistry *reg, const char *namespace_qn,
+                                     const char *name, CBMNamespaceTypeIter *out);
+const CBMRegisteredType *cbm_namespace_type_next(CBMNamespaceTypeIter *it,
+                                                 const CBMTypeRegistry **owner);
+
+/* Exact type-QN candidates from all immutable finalized links. Consume the
+ * complete iterator before accepting uniqueness; unindexed tails fail closed. */
+typedef struct {
+    const CBMTypeRegistry *reg;
+    const char *qualified_name;
+    int position;
+    unsigned links;
+    uint64_t visits;
+    bool complete, open;
+} CBMTypeQNIter;
+void cbm_registry_types_with_qn(const CBMTypeRegistry *reg, const char *qualified_name,
+                                CBMTypeQNIter *out);
+const CBMRegisteredType *cbm_type_qn_next(CBMTypeQNIter *it, const CBMTypeRegistry **owner);
 
 // Initialize a registry.
 void cbm_registry_init(CBMTypeRegistry *reg, CBMArena *arena);

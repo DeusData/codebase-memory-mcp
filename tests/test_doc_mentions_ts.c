@@ -165,7 +165,7 @@ static void ts_write_repo(const char *repo) {
                   "}\n");
     /* a script: no import, no export, so its names are global */
     th_write_file(TH_PATH(repo, "src/global.js"), "function legacyGlobal() {}\n");
-    /* a tsconfig path alias and a workspace package */
+    /* a tsconfig path alias and an undeclared named package */
     th_write_file(TH_PATH(repo, "tsconfig.json"),
                   "{ \"compilerOptions\": { \"paths\": { \"@lib/*\": [\"src/lib/*\"] } } }\n");
     th_write_file(TH_PATH(repo, "src/lib/aliased.ts"), "export function aliased() {}\n");
@@ -259,9 +259,13 @@ TEST(doc_mentions_ts_resolution) {
     ASSERT_TRUE(ts_edge(db, w, "src.widget.Space.Inner.deep"));
     /* a class member without a node of its own */
     ASSERT_TRUE(ts_row(db, "Helper#missingMember", "graph_gap"));
-    /* a tsconfig path alias; a workspace package's entry module */
+    /* A tsconfig alias binds; a package name without workspace ownership does not. */
     ASSERT_TRUE(ts_edge(db, w, "src.lib.aliased.aliased"));
-    ASSERT_TRUE(ts_edge(db, w, "packages.util.src.utilFn"));
+    ASSERT_TRUE(ts_row(db, "utilFn", "external"));
+    char absent_props[512];
+    int absent_count = 0;
+    dm_edge(db, w, "packages.util.src.utilFn", absent_props, sizeof(absent_props), &absent_count);
+    ASSERT_EQ(absent_count, 0);
     /* a declaration of an index file (its QN has no `index`) */
     ASSERT_TRUE(ts_edge(db, w, "src.barrel.inBarrel"));
     /* this. is the container's; a namespace's own names first */
@@ -272,6 +276,87 @@ TEST(doc_mentions_ts_resolution) {
     char reason[64];
     dm_row(db, "src/closure.ts", "helperInside", reason, sizeof(reason), NULL, 0);
     ASSERT_STR_EQ(reason, "graph_gap");
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* These are separate declared-workspace fixtures: the historical resolution
+ * fixture above deliberately retains its undeclared package byte-for-byte. */
+static void ts_workspace_padding(const char *repo) {
+    for (int i = 0; i < 55; i++) {
+        char relative[64];
+        snprintf(relative, sizeof(relative), "padding/file%02d.ts", i);
+        th_write_file(TH_PATH(repo, relative), "export const padding = 1;\n");
+    }
+}
+
+TEST(doc_mentions_ts_workspace_package_scope) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlts_pkg_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512], parallel[512], sequential[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(parallel, sizeof(parallel), "%s/parallel.db", tmp);
+    snprintf(sequential, sizeof(sequential), "%s/sequential.db", tmp);
+    th_write_file(TH_PATH(repo, "package.json"),
+                  "{\"private\":true,\"workspaces\":[\"packages/*\"]}\n");
+    th_write_file(TH_PATH(repo, "packages/util/package.json"),
+                  "{\"name\":\"@acme/util\",\"main\":\"src/index.ts\"}\n");
+    th_write_file(TH_PATH(repo, "packages/util/src/index.ts"), "export function utilFn() {}\n");
+    th_write_file(TH_PATH(repo, "src/use.ts"), "import { utilFn } from '@acme/util';\n"
+                                               "/** See {@link utilFn}. */\nexport class Use {}\n");
+    /* A nearer dependency can bind a different installation. It cannot borrow
+     * the root's same-named workspace solely because that source is indexed. */
+    th_write_file(TH_PATH(repo, "packages/client/package.json"),
+                  "{\"name\":\"client\",\"dependencies\":{\"@acme/util\":\"npm:other@1.0.0\"}}\n");
+    th_write_file(TH_PATH(repo, "packages/client/use.ts"),
+                  "import { utilFn } from '@acme/util';\n"
+                  "/** See {@link utilFn}. */\nexport class Blocked {}\n");
+    ts_workspace_padding(repo);
+    ASSERT_EQ(dm_workers_agree(repo, parallel, sequential), 0);
+    const char *databases[] = {parallel, sequential};
+    for (size_t i = 0; i < sizeof(databases) / sizeof(databases[0]); i++) {
+        ASSERT_TRUE(ts_edge(databases[i], "src.use.Use", "packages.util.src.utilFn"));
+        ASSERT_EQ(dm_mentions_from(databases[i], "packages.client.use.Blocked"), 0);
+        char reason[64];
+        dm_row(databases[i], "packages/client/use.ts", "utilFn", reason, sizeof(reason), NULL, 0);
+        ASSERT_STR_EQ(reason, "external");
+    }
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(doc_mentions_ts_workspace_package_name_collision) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dlts_pkgdup_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char repo[512], parallel[512], sequential[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(parallel, sizeof(parallel), "%s/parallel.db", tmp);
+    snprintf(sequential, sizeof(sequential), "%s/sequential.db", tmp);
+    th_write_file(TH_PATH(repo, "package.json"),
+                  "{\"private\":true,\"workspaces\":[\"packages/*\"]}\n");
+    th_write_file(TH_PATH(repo, "packages/one/package.json"),
+                  "{\"name\":\"@acme/util\",\"main\":\"index.ts\"}\n");
+    th_write_file(TH_PATH(repo, "packages/two/package.json"),
+                  "{\"name\":\"@acme/util\",\"main\":\"index.ts\"}\n");
+    th_write_file(TH_PATH(repo, "packages/one/index.ts"), "export function utilFn() {}\n");
+    th_write_file(TH_PATH(repo, "packages/two/index.ts"), "export function utilFn() {}\n");
+    th_write_file(TH_PATH(repo, "src/helper.ts"), "export function local() {}\n");
+    th_write_file(TH_PATH(repo, "src/use.ts"),
+                  "import { utilFn } from '@acme/util';\n"
+                  "import { local } from './helper';\n"
+                  "/** See {@link utilFn} and {@link local}. */\nexport class Use {}\n");
+    ts_workspace_padding(repo);
+    ASSERT_EQ(dm_workers_agree(repo, parallel, sequential), 0);
+    const char *databases[] = {parallel, sequential};
+    for (size_t i = 0; i < sizeof(databases) / sizeof(databases[0]); i++) {
+        ASSERT_TRUE(ts_edge(databases[i], "src.use.Use", "src.helper.local"));
+        ASSERT_EQ(dm_mentions_from(databases[i], "src.use.Use"), 1);
+        char reason[64];
+        dm_row(databases[i], "src/use.ts", "utilFn", reason, sizeof(reason), NULL, 0);
+        ASSERT_STR_EQ(reason, "external");
+    }
     th_cleanup(tmp);
     PASS();
 }
@@ -295,16 +380,16 @@ TEST(doc_mentions_ts_incremental_equals_full) {
     ASSERT_EQ(dm_index(repo, inc_db, NULL), 0);
     ASSERT_TRUE(ts_edge(inc_db, "src.use.use", "src.lib.a"));
 
-    /* a doc edit: the file is repaired alone */
+    /* A doc edit rebuilds the resolver generation. */
     th_write_file(TH_PATH(repo, "src/use.ts"), "import { a } from \"./lib\";\n"
                                                "/** Uses {@link a}, and {@link Nope}. */\n"
                                                "export function use() {}\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
 
     /* a body edit in the target file: its scope is unchanged */
     th_write_file(TH_PATH(repo, "src/lib.ts"),
                   "export function a() { return 1; }\nexport function b() {}\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(ts_edge(inc_db, "src.use.use", "src.lib.a"));
 
     /* an export goes: the declaration's record changes, a full run */
@@ -355,6 +440,8 @@ SUITE(doc_mentions_ts) {
     RUN_TEST(doc_mentions_ts_tokens);
     RUN_TEST(doc_mentions_ts_scope_blob);
     RUN_TEST(doc_mentions_ts_resolution);
+    RUN_TEST(doc_mentions_ts_workspace_package_scope);
+    RUN_TEST(doc_mentions_ts_workspace_package_name_collision);
     RUN_TEST(doc_mentions_ts_incremental_equals_full);
     RUN_TEST(doc_mentions_ts_workers_agree);
 }

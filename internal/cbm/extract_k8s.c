@@ -15,6 +15,7 @@
 #include "helpers.h"
 #include "tree_sitter/api.h"
 #include "foundation/constants.h"
+#include "foundation/hash_table.h"
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -97,6 +98,8 @@ static TSNode flow_node_value(TSNode node) {
 // wrap (the tree-sitter YAML grammar often wraps scalars in flow_node).
 // Returns NULL for non-scalar node types.
 static const char *get_scalar_text(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node))
+        return NULL;
     enum { MAX_UNWRAP = 4 };
     for (int depth = 0; depth < MAX_UNWRAP; depth++) {
         const char *type = ts_node_type(node);
@@ -125,6 +128,55 @@ static const char *get_scalar_text(CBMArena *a, TSNode node, const char *source)
         break;
     }
     return NULL;
+}
+
+/* The precise reference adapter supports only ordinary YAML strings. Tags,
+ * aliases, escaped quotes and typed plain scalars need additional semantics;
+ * their extraction remains visible but supplies no binding authority. */
+static bool k8s_proof_scalar(TSNode node, const char *source) {
+    for (int depth = 0; depth < 4 && !ts_node_is_null(node); depth++) {
+        const char *kind = ts_node_type(node);
+        if (!strcmp(kind, "flow_node") || !strcmp(kind, "block_node")) {
+            if (ts_node_named_child_count(node) != 1)
+                return false;
+            node = ts_node_named_child(node, 0);
+            continue;
+        }
+        if (!strcmp(kind, "plain_scalar")) {
+            TSNode value = ts_node_named_child(node, 0);
+            return !ts_node_is_null(value) && !strcmp(ts_node_type(value), "string_scalar") &&
+                   !ts_node_has_error(node);
+        }
+        if (strcmp(kind, "single_quote_scalar") && strcmp(kind, "double_quote_scalar"))
+            return false;
+        uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+        if (end <= start + 1 || ts_node_has_error(node))
+            return false;
+        for (uint32_t i = start + 1; i + 1 < end; i++)
+            if (source[i] == '\\' || source[i] == source[start] || source[i] == '\n' ||
+                source[i] == '\r')
+                return false;
+        return true;
+    }
+    return false;
+}
+
+static void k8s_fact_site(CBMK8sFact *fact, TSNode node, const char *source) {
+    if (ts_node_is_null(node))
+        return;
+    fact->site_start_byte = ts_node_start_byte(node);
+    fact->site_end_byte = ts_node_end_byte(node);
+    fact->proof_supported = k8s_proof_scalar(node, source);
+}
+
+static void k8s_import_push(CBMExtractCtx *ctx, TSNode node, CBMImport import) {
+    import.source_origin = CBM_SOURCE_ORIGIN_RAW;
+    uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+    if (!ts_node_is_null(node) && end > start && end <= ctx->source_len) {
+        import.site_start_byte = start;
+        import.site_end_byte = end;
+    }
+    cbm_imports_push(&ctx->result->imports, ctx->arena, import);
 }
 
 // Return true if the key text of a block_mapping_pair matches one of the
@@ -161,7 +213,7 @@ static void emit_kustomize_sequence(CBMExtractCtx *ctx, TSNode seq_node, const c
                 .local_name = cbm_arena_strdup(a, key_name),
                 .module_path = cbm_arena_strdup(a, scalar),
             };
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            k8s_import_push(ctx, val, imp);
         }
     }
 }
@@ -403,6 +455,7 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
             continue;
         }
         const char *path = NULL;
+        TSNode path_node = {0};
         const char *inline_text = NULL;
         kust_target_t t = {0};
         bool has_target = false;
@@ -419,6 +472,7 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
             }
             if (strcmp(key, "path") == 0) {
                 path = get_scalar_text(a, v, ctx->source);
+                path_node = v;
             } else if (strcmp(key, "patch") == 0) {
                 inline_text = kust_inline_text(ctx, v);
             } else if (strcmp(key, "target") == 0 &&
@@ -430,7 +484,7 @@ static void emit_kustomize_patches(CBMExtractCtx *ctx, TSNode seq) {
         if (path && path[0]) {
             CBMImport imp = {.local_name = cbm_arena_strdup(a, "patches"),
                              .module_path = cbm_arena_strdup(a, path)};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            k8s_import_push(ctx, path_node, imp);
         }
         CBMK8sFact base = {.fact = CBM_K8S_FACT_PATCH,
                            .def_index = -1,
@@ -471,6 +525,7 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
         if (ts_node_is_null(map)) {
             continue;
         }
+        TSNode path_node = {0};
         CBMK8sFact f = {.fact = CBM_K8S_FACT_DEPLOY,
                         .def_index = -1,
                         .via = "kustomize",
@@ -501,6 +556,7 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
                 f.ns = val;
             } else if (strcmp(key, "valuesFile") == 0) {
                 f.path = val;
+                path_node = v;
             }
         }
         if (!f.name) {
@@ -509,7 +565,7 @@ static void emit_kustomize_charts(CBMExtractCtx *ctx, TSNode seq) {
         if (f.path) {
             CBMImport imp = {.local_name = cbm_arena_strdup(a, "valuesFile"),
                              .module_path = cbm_arena_strdup(a, f.path)};
-            cbm_imports_push(&ctx->result->imports, a, imp);
+            k8s_import_push(ctx, path_node, imp);
         }
         cbm_k8sfact_push(&ctx->result->k8s_facts, a, f);
     }
@@ -585,7 +641,122 @@ static void emit_kustomize_kind_def(CBMExtractCtx *ctx, TSNode mapping) {
     }
 }
 
+/* A closed raw build has exactly one mapping, only resource-list and type
+ * keys, and literal local file members. Every other Kustomize feature remains
+ * visible to extraction but cannot supply object-reference authority. */
+static bool kustomize_proof_members(CBMExtractCtx *ctx, TSNode value) {
+    for (int depth = 0; depth < 4 && !ts_node_is_null(value); depth++) {
+        const char *type = ts_node_type(value);
+        if (strcmp(type, "flow_node") && strcmp(type, "block_node"))
+            break;
+        if (ts_node_named_child_count(value) != 1)
+            return false;
+        value = ts_node_named_child(value, 0);
+    }
+    if (ts_node_is_null(value))
+        return false;
+    bool block = !strcmp(ts_node_type(value), "block_sequence");
+    if (!block && strcmp(ts_node_type(value), "flow_sequence"))
+        return false;
+    bool complete = !ts_node_has_error(value);
+    k8s_kids_t items = k8s_kids(value);
+    TSNode item;
+    while (k8s_kid(&items, true, &item)) {
+        if (!strcmp(ts_node_type(item), "comment"))
+            continue;
+        TSNode scalar =
+            block ? (!strcmp(ts_node_type(item), "block_sequence_item") ? first_content_child(item)
+                                                                        : (TSNode){0})
+                  : item;
+        const char *path = get_scalar_text(ctx->arena, scalar, ctx->source);
+        CBMK8sFact fact = {.fact = CBM_K8S_FACT_MEMBER, .def_index = -1, .name = path};
+        k8s_fact_site(&fact, scalar, ctx->source);
+        complete &= fact.proof_supported && path && path[0];
+        cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, fact);
+    }
+    return complete;
+}
+
+static void kustomize_proof_facts(CBMExtractCtx *ctx) {
+    int documents = 0;
+    bool complete = !ts_node_has_error(ctx->root);
+    bool memberships = complete;
+    int first = ctx->result->k8s_facts.count;
+    k8s_kids_t docs = k8s_kids(ctx->root);
+    TSNode doc;
+    while (k8s_kid(&docs, true, &doc)) {
+        if (strcmp(ts_node_type(doc), "document"))
+            continue;
+        documents++;
+        TSNode mapping = unwrap_block_mapping(doc);
+        CBMHashTable *keys = cbm_ht_create(0);
+        bool mapping_known = !ts_node_is_null(mapping) && keys != NULL;
+        complete &= mapping_known;
+        memberships &= mapping_known;
+        bool resources = false;
+        k8s_kids_t pairs = k8s_kids(mapping);
+        TSNode pair;
+        while (k8s_kid(&pairs, true, &pair)) {
+            if (!strcmp(ts_node_type(pair), "comment"))
+                continue;
+            if (strcmp(ts_node_type(pair), "block_mapping_pair")) {
+                complete = memberships = false;
+                continue;
+            }
+            TSNode key = ts_node_named_child(pair, 0);
+            const char *name = k8s_proof_scalar(key, ctx->source)
+                                   ? get_scalar_text(ctx->arena, key, ctx->source)
+                                   : NULL;
+            if (!name || !keys) {
+                complete = memberships = false;
+                continue;
+            }
+            if (cbm_ht_get(keys, name))
+                complete = false;
+            cbm_ht_set(keys, name, (void *)(uintptr_t)1);
+            if (!cbm_ht_get(keys, name))
+                complete = memberships = false;
+            TSNode value = unwrap_pair_value(pair);
+            if (!strcmp(name, "resources")) {
+                resources = true;
+                bool enumerated = kustomize_proof_members(ctx, value);
+                complete &= enumerated;
+                memberships &= enumerated;
+            } else if (!strcmp(name, "apiVersion") || !strcmp(name, "kind")) {
+                const char *text = get_scalar_text(ctx->arena, value, ctx->source);
+                const char *expected =
+                    !strcmp(name, "kind") ? "Kustomization" : "kustomize.config.k8s.io/v1beta1";
+                complete &= k8s_proof_scalar(value, ctx->source) && text && !strcmp(text, expected);
+            } else {
+                complete = false;
+                /* These transforms change existing members but cannot conceal
+                 * another resource list. Unknown keys/composition may do so. */
+                if (strcmp(name, "namePrefix") && strcmp(name, "nameSuffix") &&
+                    strcmp(name, "namespace"))
+                    memberships = false;
+            }
+        }
+        complete &= resources;
+        memberships &= resources;
+        if (keys)
+            cbm_ht_free(keys);
+    }
+    complete &= documents == 1;
+    memberships &= documents == 1;
+    CBMK8sFact config = {.fact = CBM_K8S_FACT_CONFIGURATION,
+                         .def_index = -1,
+                         .via = memberships ? "resource_membership_complete"
+                                            : "resource_membership_unknown",
+                         .site_start_byte = ts_node_start_byte(ctx->root),
+                         .site_end_byte = ts_node_end_byte(ctx->root),
+                         .proof_supported = complete};
+    cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, config);
+    for (int i = first; i < ctx->result->k8s_facts.count; i++)
+        ctx->result->k8s_facts.items[i].proof_supported &= complete;
+}
+
 static void extract_kustomize(CBMExtractCtx *ctx) {
+    kustomize_proof_facts(ctx);
     k8s_kids_t docs = k8s_kids(ctx->root);
     TSNode stream_child;
     while (k8s_kid(&docs, false, &stream_child)) {
@@ -1082,6 +1253,7 @@ typedef struct {
     const char *deploy_ns; // a deploying object's target namespace
     const char *hr_chart;  // a HelmRelease's spec.chart.spec.chart
     const char *hr_source; // ... and its sourceRef kind
+    bool complete;         // duplicate/unsupported mapping keys invalidate this document
 } k8s_walk_t;
 
 // Is the document of a source kind in group list `groups`?
@@ -1132,7 +1304,7 @@ static void k8s_deploy_leaf(k8s_walk_t *w, const char *path, const char *value) 
 }
 
 static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const char *name,
-                         const char *via, const char *edge) {
+                         const char *via, const char *edge, TSNode site) {
     if (!kind || !kind[0] || !name || !name[0] || strstr(name, "{{") || strstr(kind, "{{")) {
         return;
     }
@@ -1145,6 +1317,9 @@ static void k8s_emit_ref(k8s_walk_t *w, const char *kind, const char *ns, const 
                     .name = cbm_arena_strdup(a, name),
                     .via = via,
                     .edge = edge};
+    k8s_fact_site(&f, site, w->ctx->source);
+    f.proof_supported &= !strchr(kind, '<') && !strchr(kind, '$') &&
+                         (!ns || (!strchr(ns, '<') && !strchr(ns, '$') && !strstr(ns, "{{")));
     cbm_k8sfact_push(&w->ctx->result->k8s_facts, a, f);
 }
 
@@ -1154,14 +1329,17 @@ static bool k8s_image_literal(const char *value) {
 }
 
 // A scalar at `path`: a leaf reference, or a CRD's group / kind.
-static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
+static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value, TSNode site) {
+    if (k8s_source_is(w, "|core|", "|ServiceAccount|") && !strcmp(path, "imagePullSecrets[].name"))
+        k8s_emit_ref(w, "Secret", NULL, value, "imagePullSecrets", "USAGE", site);
     const char *pod = k8s_pod_prefix(w->kind);
     size_t pl = strlen(pod);
     if (pl && strncmp(path, pod, pl) == 0 && path[pl] == '.') {
         const char *rel = path + pl + SKIP_ONE;
         for (size_t i = 0; i < sizeof(k8s_pod_refs) / sizeof(k8s_pod_refs[0]); i++) {
             if (strcmp(rel, k8s_pod_refs[i].path) == 0) {
-                k8s_emit_ref(w, k8s_pod_refs[i].kind, NULL, value, k8s_pod_refs[i].via, "USAGE");
+                k8s_emit_ref(w, k8s_pod_refs[i].kind, NULL, value, k8s_pod_refs[i].via, "USAGE",
+                             site);
             }
         }
         static const char *const holders[] = {"containers[].", "initContainers[].",
@@ -1175,7 +1353,7 @@ static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
                  i++) {
                 if (strcmp(rel + hl, k8s_container_refs[i].path) == 0) {
                     k8s_emit_ref(w, k8s_container_refs[i].kind, NULL, value,
-                                 k8s_container_refs[i].via, "USAGE");
+                                 k8s_container_refs[i].via, "USAGE", site);
                 }
             }
         }
@@ -1183,13 +1361,13 @@ static void k8s_leaf(k8s_walk_t *w, const char *path, const char *value) {
     for (size_t i = 0; i < sizeof(k8s_object_refs) / sizeof(k8s_object_refs[0]); i++) {
         const k8s_object_ref_t *r = &k8s_object_refs[i];
         if (k8s_kind_in(r->kinds, w->kind) && strcmp(path, r->path) == 0) {
-            k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge);
+            k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge, site);
         }
     }
     for (size_t i = 0; i < sizeof(k8s_crd_leaf_refs) / sizeof(k8s_crd_leaf_refs[0]); i++) {
         const k8s_crd_leaf_ref_t *r = &k8s_crd_leaf_refs[i];
         if (k8s_source_is(w, r->groups, r->kinds) && k8s_path_match(r->path, path)) {
-            k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge);
+            k8s_emit_ref(w, r->kind, NULL, value, r->via, r->edge, site);
         }
     }
     k8s_deploy_leaf(w, path, value);
@@ -1395,7 +1573,7 @@ static void k8s_mapping_ref(k8s_walk_t *w, TSNode mapping, const char *kind, con
         }
     }
     k8s_emit_ref(w, kind, k8s_field(w, mapping, "namespace"), k8s_field(w, mapping, "name"), via,
-                 edge);
+                 edge, k8s_child(w, mapping, "name"));
 }
 
 // Where an env[] item's value comes from: "value", or its valueFrom kind
@@ -1499,6 +1677,7 @@ static void k8s_container(k8s_walk_t *w, const char *path, TSNode container) {
                             ts_node_is_null(iv) ? 0 : (int)ts_node_start_point(iv).row + SKIP_ONE,
                         .start_line = (int)ts_node_start_point(container).row + SKIP_ONE,
                         .end_line = (int)ts_node_end_point(container).row + SKIP_ONE};
+        k8s_fact_site(&f, iv, w->ctx->source);
         cbm_k8sfact_push(&w->ctx->result->k8s_facts, w->ctx->arena, f);
     }
     k8s_iter_t env = k8s_iter(k8s_child(w, container, "env"));
@@ -1544,6 +1723,32 @@ static void k8s_mapping(k8s_walk_t *w, const char *path, TSNode mapping) {
     }
 }
 
+static bool k8s_mapping_keys_complete(k8s_walk_t *w, TSNode node) {
+    CBMHashTable *keys = cbm_ht_create(0);
+    if (!keys)
+        return false;
+    bool complete = !ts_node_has_error(node);
+    k8s_kids_t pairs = k8s_kids(node);
+    TSNode pair;
+    while (k8s_kid(&pairs, true, &pair)) {
+        if (!k8s_is_pair(pair))
+            continue;
+        TSNode key = ts_node_named_child(pair, 0);
+        const char *name = k8s_proof_scalar(key, w->ctx->source)
+                               ? get_scalar_text(w->ctx->arena, key, w->ctx->source)
+                               : NULL;
+        if (!name || !strcmp(name, "<<") || cbm_ht_get(keys, name)) {
+            complete = false;
+            continue;
+        }
+        cbm_ht_set(keys, name, (void *)(uintptr_t)1);
+        if (!cbm_ht_get(keys, name))
+            complete = false;
+    }
+    cbm_ht_free(keys);
+    return complete;
+}
+
 // Walk `node` (reached at `path`) for references.
 static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t cap) {
     node = k8s_unwrap(node);
@@ -1552,6 +1757,7 @@ static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t 
     }
     const char *type = ts_node_type(node);
     if (k8s_is_mapping(node)) {
+        w->complete &= k8s_mapping_keys_complete(w, node);
         k8s_mapping(w, path, node);
         k8s_kids_t pairs = k8s_kids(node);
         TSNode pair;
@@ -1573,7 +1779,7 @@ static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t 
                                      ? NULL
                                      : get_scalar_text(w->ctx->arena, inner, w->ctx->source);
             if (scalar) {
-                k8s_leaf(w, path, scalar);
+                k8s_leaf(w, path, scalar, inner);
             } else if (!ts_node_is_null(value)) {
                 k8s_walk(w, value, path, len + (size_t)add, cap);
             }
@@ -1601,13 +1807,72 @@ static void k8s_walk(k8s_walk_t *w, TSNode node, char *path, size_t len, size_t 
     }
 }
 
+/* Kubernetes names and namespaces use DNS-subdomain characters. This
+ * bounded adapter rejects placeholders and overlong/truncated identities. */
+static bool k8s_raw_name(const char *name) {
+    if (!name || !name[0] || strlen(name) > 253)
+        return false;
+    size_t label = 0;
+    unsigned char previous = 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        bool alphanumeric = (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9');
+        if (*p == '.') {
+            if (!label || previous == '-')
+                return false;
+            label = 0;
+        } else if ((!alphanumeric && *p != '-') || (!label && !alphanumeric) || ++label > 63) {
+            return false;
+        }
+        previous = *p;
+    }
+    return label && previous != '-';
+}
+
 // The references, deploys and CRD declaration of document def `def_index`.
 static void k8s_emit_facts(CBMExtractCtx *ctx, TSNode mapping, const char *group, const char *kind,
                            int def_index) {
-    k8s_walk_t w = {.ctx = ctx, .group = group, .kind = kind, .def_index = def_index};
+    k8s_walk_t w = {
+        .ctx = ctx, .group = group, .kind = kind, .def_index = def_index, .complete = true};
     char path[CBM_SZ_512] = "";
     int first = ctx->result->k8s_facts.count;
     k8s_walk(&w, mapping, path, 0, sizeof(path));
+    TSNode metadata = k8s_child(&w, mapping, "metadata");
+    TSNode namespace = k8s_child(&w, metadata, "namespace");
+    w.complete &= k8s_proof_scalar(k8s_child(&w, mapping, "apiVersion"), ctx->source) &&
+                  k8s_proof_scalar(k8s_child(&w, mapping, "kind"), ctx->source) &&
+                  k8s_proof_scalar(k8s_child(&w, metadata, "name"), ctx->source) &&
+                  (ts_node_is_null(namespace) || k8s_proof_scalar(namespace, ctx->source));
+    TSNode name_node = k8s_child(&w, metadata, "name");
+    const char *name = get_scalar_text(ctx->arena, name_node, ctx->source);
+    const char *ns =
+        ts_node_is_null(namespace) ? NULL : get_scalar_text(ctx->arena, namespace, ctx->source);
+    const char *api =
+        get_scalar_text(ctx->arena, k8s_child(&w, mapping, "apiVersion"), ctx->source);
+    const char *raw_kind = get_scalar_text(ctx->arena, k8s_child(&w, mapping, "kind"), ctx->source);
+    const char *api_slash = api ? strchr(api, '/') : NULL;
+    bool api_supported =
+        api && strlen(api) < K8S_BUF_SIZE &&
+        (!strcmp(api, "v1") ||
+         (strcmp(group, "core") && api_slash && api_slash != api && api_slash[1] == 'v' &&
+          !strchr(api_slash + 1, '/') && k8s_raw_name(group) && k8s_raw_name(api_slash + 1)));
+    w.complete &= k8s_raw_name(name) && api_supported && raw_kind &&
+                  strlen(raw_kind) < K8S_BUF_SIZE && !strcmp(raw_kind, kind) &&
+                  (!ns || (k8s_raw_name(ns) && strlen(ns) <= 63 && !strchr(ns, '.')));
+    CBMK8sFact declaration = {.fact = CBM_K8S_FACT_DECLARATION,
+                              .def_index = def_index,
+                              .kind = kind,
+                              .group = group,
+                              .version = api,
+                              .name = name,
+                              .ns = ns,
+                              .site_start_byte = ts_node_start_byte(mapping),
+                              .site_end_byte = ts_node_end_byte(mapping),
+                              .proof_supported = w.complete};
+    declaration.kind = cbm_arena_strdup(ctx->arena, kind);
+    declaration.group = cbm_arena_strdup(ctx->arena, group);
+    cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, declaration);
+    for (int i = first; i < ctx->result->k8s_facts.count; i++)
+        ctx->result->k8s_facts.items[i].proof_supported &= w.complete;
     /* a HelmRelease deploys its chart: a path of a Git/Bucket source, else
      * a chart name of a Helm repository (kind: the source kind) */
     if (w.hr_chart) {
@@ -1690,6 +1955,9 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         return;
     }
 
+    bool complete = !ts_node_has_error(ctx->root);
+    int documents = 0;
+    int first = ctx->result->k8s_facts.count;
     k8s_kids_t docs = k8s_kids(ctx->root);
     TSNode stream_child;
     while (k8s_kid(&docs, false, &stream_child)) {
@@ -1697,8 +1965,10 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
             continue;
         }
 
+        documents++;
         TSNode mapping = unwrap_block_mapping(stream_child);
         if (ts_node_is_null(mapping)) {
+            complete = false;
             continue;
         }
 
@@ -1709,6 +1979,7 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         // Skip malformed manifests (no kind or no metadata.name), and a
         // templated kind (a skeleton's symbolic `<...>`): unidentifiable.
         if (id.kind[0] == '\0' || id.name[0] == '\0' || id.kind[0] == '<') {
+            complete = false;
             continue;
         }
         // A templated namespace (`<.Release.Namespace>`) is the deploy's.
@@ -1753,6 +2024,22 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         cbm_defs_push(&ctx->result->defs, a, def);
         k8s_emit_facts(ctx, mapping, group, id.kind, ctx->result->defs.count - SKIP_ONE);
     }
+    int declarations = 0;
+    for (int i = first; i < ctx->result->k8s_facts.count; i++) {
+        const CBMK8sFact *fact = &ctx->result->k8s_facts.items[i];
+        if (fact->fact == CBM_K8S_FACT_DECLARATION) {
+            declarations++;
+            size_t kind_length = strlen(fact->kind);
+            bool list = kind_length >= 4 && !strcmp(fact->kind + kind_length - 4, "List");
+            complete &= fact->proof_supported && !list;
+        }
+    }
+    CBMK8sFact file = {.fact = CBM_K8S_FACT_FILE,
+                       .def_index = -1,
+                       .site_start_byte = ts_node_start_byte(ctx->root),
+                       .site_end_byte = ts_node_end_byte(ctx->root),
+                       .proof_supported = complete && documents > 0 && documents == declarations};
+    cbm_k8sfact_push(&ctx->result->k8s_facts, ctx->arena, file);
 }
 
 // ---------------------------------------------------------------------------

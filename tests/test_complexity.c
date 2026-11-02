@@ -45,6 +45,7 @@
 
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_thread.h"
 #include "../src/foundation/log.h"
 #include "../src/foundation/profile.h"
 #include "cbm.h"
@@ -56,6 +57,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
+#include "resolve/stats.h"
 #include "yyjson/yyjson.h"
 
 #include <stdatomic.h>
@@ -128,14 +130,21 @@ static void cx_emit_java(FILE *f, int m, int j) {
 static void cx_emit_python(FILE *f, int m, int j) {
     (void)m;
     if (j > 0) {
-        fprintf(f, "import f%d\n\n", j - 1);
+        fprintf(f, "from .f%d import val%d\n\n", j - 1, j - 1);
     }
     fprintf(f, "def val%d(x):\n    return x + %d\n\n", j, j);
     if (j > 0) {
-        fprintf(f, "def chain%d():\n    return f%d.val%d(1) + val%d(2)\n", j, j - 1, j - 1, j);
+        fprintf(f, "def chain%d():\n    return val%d(1) + val%d(2)\n", j, j - 1, j);
     } else {
         fprintf(f, "def chain0():\n    return val0(2)\n");
     }
+    /* Unknown call effects must invalidate a real receiver binding. The two
+     * member occurrences exercise both positive proof and stale-type refusal. */
+    fprintf(f,
+            "\nclass Box%d:\n    def value(self):\n        return %d\n\n"
+            "def mutate%d(effect):\n    obj = Box%d()\n    obj.value()\n"
+            "    effect()\n    obj.value()\n",
+            j, j, j, j);
 }
 
 static void cx_emit_go(FILE *f, int m, int j) {
@@ -339,6 +348,26 @@ static int cx_build_bigpkg(const char *root, int k) {
         fprintf(f, "}\n");
         fclose(f);
     }
+    /* One growing Python package exercises export/type propagation and
+     * invalidation alongside the JVM namespace registry. Each import has a
+     * bounded direct predecessor, so adding files must not scan the package. */
+    snprintf(dir, sizeof(dir), "%s/resolverpkg", root);
+    if (th_mkdir_p(dir) != 0)
+        return -1;
+    snprintf(path, sizeof(path), "%s/__init__.py", dir);
+    FILE *package = cbm_fopen(path, "wb");
+    if (!package || fclose(package) != 0)
+        return -1;
+    for (int j = 0; j < files; j++) {
+        snprintf(path, sizeof(path), "%s/f%d.py", dir, j);
+        FILE *f = cbm_fopen(path, "wb");
+        if (!f)
+            return -1;
+        cx_emit_python(f, 0, j);
+        bool failed = ferror(f) != 0;
+        if (fclose(f) != 0 || failed)
+            return -1;
+    }
     return 0;
 }
 
@@ -473,6 +502,7 @@ typedef struct {
     int pyrange_controls;
     int errors;
     double wall_s;
+    cbm_resolve_stats_snapshot_t resolver;
 } CxMetrics;
 
 /* Count the intended corpus, then prove each use() kept its exact local LSP
@@ -500,12 +530,14 @@ static bool cx_pyext_control(cbm_store_t *store, const char *project, const cbm_
         for (int i = 0; i < count; i++) {
             if (edges[i].target_id != target.id || !edges[i].properties_json)
                 continue;
-            /* an LSP resolution records an lsp_* strategy (lsp_direct here) */
+            /* Every admitted semantic edge carries the shared resolver proof rule. */
             yyjson_doc *doc =
                 yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0);
             const char *strategy =
                 doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
-            found = found || (strategy && strncmp(strategy, "lsp_", 4) == 0);
+            found = found ||
+                    (strategy && !strcmp(strategy, "shared_resolver") &&
+                     yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "resolver_rule")) > 0);
             yyjson_doc_free(doc);
         }
     }
@@ -612,10 +644,11 @@ static bool cx_pyrange_exact_control(cbm_store_t *store, const char *project,
             edges[i].properties_json
                 ? yyjson_read(edges[i].properties_json, strlen(edges[i].properties_json), 0)
                 : NULL;
-        /* an LSP resolution records an lsp_* strategy */
+        /* Every admitted semantic edge carries the shared resolver proof rule. */
         const char *strategy =
             doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "strategy")) : NULL;
-        if (strategy && strncmp(strategy, "lsp_", 4) == 0)
+        if (strategy && !strcmp(strategy, "shared_resolver") &&
+            yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(doc), "resolver_rule")) > 0)
             exact++;
         yyjson_doc_free(doc);
     }
@@ -740,6 +773,7 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out, bool py
         return -1;
     }
     int rc = cbm_pipeline_run(p);
+    out->resolver = cbm_pipeline_resolver_stats(p);
     out->wall_s = cx_now_s() - t0;
     cbm_pipeline_get_file_errors(p, NULL, &out->errors);
     cbm_log_set_sink(NULL);
@@ -874,7 +908,89 @@ static int cx_measure_pair(void) {
     return 0;
 }
 
+static bool cx_resolver_linear(const CxMetrics *a, const CxMetrics *b) {
+    bool ok = true;
+    for (unsigned i = 0; i < CBM_RESOLVE_STAT_COUNT; i++) {
+        /* Only languages with root-level semantic facts walk syntax here; the
+         * flat-file test below gates this counter with a corpus that does. */
+        if (i == CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS)
+            continue;
+        uint64_t first = a->resolver.values[i], second = b->resolver.values[i];
+        double ratio = cx_ratio((double)second, (double)first);
+        printf("    resolver_%s %llu -> %llu (ratio %.2f)\n",
+               cbm_resolve_stat_name((cbm_resolve_stat_t)i), (unsigned long long)first,
+               (unsigned long long)second, ratio);
+        /* Every category is exercised by source, including unknown-call
+         * invalidations. Removing a hook cannot produce a vacuous green. */
+        ok = ok && first > 0 && second > 0 && ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI;
+    }
+    return ok;
+}
+
+typedef struct {
+    _Atomic unsigned ready;
+    _Atomic bool release;
+} CxResolverGate;
+
+typedef struct {
+    cbm_resolve_stats_t stats;
+    uint64_t amount;
+    CxResolverGate *gate;
+} CxResolverThread;
+
+static void *cx_resolver_count_thread(void *opaque) {
+    CxResolverThread *thread = opaque;
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&thread->stats);
+    atomic_fetch_add_explicit(&thread->gate->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(&thread->gate->release, memory_order_acquire)) {
+        /* Both sinks must be installed before either thread records work. */
+    }
+    for (uint64_t i = 0; i < thread->amount; i++)
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    cbm_resolve_stats_bind(previous);
+    return NULL;
+}
+
 /* ── Tests ───────────────────────────────────────────────────────────── */
+
+TEST(complexity_resolver_counters_are_run_scoped) {
+    cbm_resolve_stats_t owner = {0}, nested = {0};
+    CxResolverGate gate = {0};
+    CxResolverThread first = {.amount = 1000, .gate = &gate};
+    CxResolverThread second = {.amount = 2000, .gate = &gate};
+    cbm_thread_t a, b;
+    cbm_resolve_stats_t *previous = cbm_resolve_stats_bind(&owner);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 3);
+    cbm_resolve_stats_t *outer = cbm_resolve_stats_bind(&nested);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 11);
+    cbm_resolve_stats_bind(outer);
+    int created_a = cbm_thread_create(&a, 0, cx_resolver_count_thread, &first);
+    int created_b = cbm_thread_create(&b, 0, cx_resolver_count_thread, &second);
+    unsigned created = (unsigned)(created_a == 0) + (unsigned)(created_b == 0);
+    while (atomic_load_explicit(&gate.ready, memory_order_acquire) < created) {
+        /* A held gate makes isolation deterministic, independent of scheduling. */
+    }
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 4);
+    atomic_store_explicit(&gate.release, true, memory_order_release);
+    int joined_a = created_a == 0 ? cbm_thread_join(&a) : -1;
+    int joined_b = created_b == 0 ? cbm_thread_join(&b) : -1;
+    cbm_resolve_stats_bind(previous);
+    ASSERT_EQ(created_a, 0);
+    ASSERT_EQ(created_b, 0);
+    ASSERT_EQ(joined_a, 0);
+    ASSERT_EQ(joined_b, 0);
+    ASSERT_EQ(cbm_resolve_stats_snapshot(&owner).values[CBM_RESOLVE_STAT_LOOKUP_PROBES], 7);
+    ASSERT_EQ(cbm_resolve_stats_snapshot(&nested).values[CBM_RESOLVE_STAT_LOOKUP_PROBES], 11);
+    ASSERT_EQ(cbm_resolve_stats_snapshot(&first.stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES],
+              1000);
+    ASSERT_EQ(cbm_resolve_stats_snapshot(&second.stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES],
+              2000);
+    cbm_resolve_stats_reset(&first.stats);
+    ASSERT_EQ(cbm_resolve_stats_snapshot(&first.stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES], 0);
+    ASSERT_EQ(cbm_resolve_stats_snapshot(&second.stats).values[CBM_RESOLVE_STAT_LOOKUP_PROBES],
+              2000);
+    PASS();
+}
 
 /* The flagship gate. Independent module copies ⇒ every extensive quantity must
  * scale linearly in the copy count. A files×corpus coupling shows up as a
@@ -885,6 +1001,7 @@ TEST(complexity_replicated_modules_scale_linearly) {
     }
     const CxMetrics *a = &g_cx_base;
     const CxMetrics *b = &g_cx_doubled;
+    ASSERT_TRUE(cx_resolver_linear(a, b));
 
     /* Sanity: the corpus is real. */
     ASSERT_GT(a->nodes, 50);
@@ -1030,6 +1147,7 @@ TEST(complexity_shared_package_growth_stays_linear) {
     }
     const CxMetrics *a = &g_cx_big_base;
     const CxMetrics *b = &g_cx_big_doubled;
+    ASSERT_TRUE(cx_resolver_linear(a, b));
 
     double node_r = cx_ratio(b->nodes, a->nodes);
     double edge_r = cx_ratio(b->edges, a->edges);
@@ -1157,12 +1275,17 @@ TEST(complexity_throughput_report_written) {
                 "    {\"k\": %d, \"nodes\": %d, \"edges\": %d, \"wall_s\": %.3f,\n"
                 "     \"nodes_per_s\": %.0f, \"edges_per_s\": %.0f,\n"
                 "     \"perfile_defs\": %llu, \"tail_candidates\": %llu, \"fallback_rows\": "
-                "%llu}%s\n",
+                "%llu, \"resolver\": {",
                 i == 0 ? CX_K_BASE : CX_K_BASE * 2, m->nodes, m->edges, m->wall_s,
                 m->wall_s > 0 ? (double)m->nodes / m->wall_s : 0.0,
                 m->wall_s > 0 ? (double)m->edges / m->wall_s : 0.0,
                 (unsigned long long)m->perfile_defs, (unsigned long long)m->tail_candidates,
-                (unsigned long long)m->fallback_rows, i == 0 ? "," : "");
+                (unsigned long long)m->fallback_rows);
+        for (unsigned event = 0; event < CBM_RESOLVE_STAT_COUNT; event++)
+            fprintf(f, "%s\"%s\": %llu", event ? ", " : "",
+                    cbm_resolve_stat_name((cbm_resolve_stat_t)event),
+                    (unsigned long long)m->resolver.values[event]);
+        fprintf(f, "}}%s\n", i == 0 ? "," : "");
     }
     fprintf(f, "  ],\n");
     fprintf(f, "  \"languages\": [\n");
@@ -1387,7 +1510,45 @@ TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work) {
     PASS();
 }
 
+/* One file whose top level grows, not more files. TypeScript's declaration
+ * baselines held the semantic pass for over 11 minutes on one such root, because
+ * fetching a child by index walks from the first child: the steps to enumerate
+ * n children were n*n/2. Doubling the file must only double them. */
+enum { CX_FLAT_CLASSES_PER_K = 500 };
+
+static int cx_build_flat_ts(const char *root, int k) {
+    char path[1200];
+    int pn = snprintf(path, sizeof(path), "%s/flat.ts", root);
+    if (pn < 0 || (size_t)pn >= sizeof(path))
+        return -1;
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    bool written = true;
+    for (int i = 0; written && i < k * CX_FLAT_CLASSES_PER_K; i++)
+        written = fprintf(f, "export class Flat%d {}\n", i) >= 0;
+    return fclose(f) == 0 && written ? 0 : -1;
+}
+
+TEST(complexity_flat_file_syntax_walk_is_linear) {
+    CxMetrics a = {0}, b = {0};
+    ASSERT_EQ(cx_measure(cx_build_flat_ts, "cbm_cxflat_a", "cbm_cxflat_b", &a, &b), 0);
+    uint64_t first = a.resolver.values[CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS];
+    uint64_t second = b.resolver.values[CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS];
+    double ratio = cx_ratio((double)second, (double)first);
+    printf("    syntax_child_steps %llu -> %llu (ratio %.2f, linear ~2, quadratic ~4)\n",
+           (unsigned long long)first, (unsigned long long)second, ratio);
+    /* Non-vacuous: every class at the root was reached in both runs. */
+    ASSERT_GTE(first, (uint64_t)(CX_K_BASE * CX_FLAT_CLASSES_PER_K));
+    ASSERT_GTE(second, (uint64_t)(2 * CX_K_BASE * CX_FLAT_CLASSES_PER_K));
+    ASSERT_GTE(a.nodes, CX_K_BASE * CX_FLAT_CLASSES_PER_K);
+    ASSERT_TRUE(ratio >= CX_RATIO_LO && ratio <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_flat_file_syntax_walk_is_linear);
+    RUN_TEST(complexity_resolver_counters_are_run_scoped);
     RUN_TEST(complexity_py_module_ranges_preserve_calls_with_bounded_work);
     RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);

@@ -259,7 +259,9 @@ bool cbm_result_spill_park(cbm_result_spill_t *sp, int writer, int slot, CBMFile
      * that and stays in memory. A retained parse tree is a re-parse cache,
      * not data: it is dropped with the in-memory result below. */
     if (result->arena.nblocks != 1 || result->owned_result_count != 0 ||
-        !cbm_py_namespace_facts_valid(&result->py_namespace)) {
+        !cbm_py_namespace_facts_valid(&result->py_namespace) ||
+        !cbm_result_relocate(result, result->arena.blocks[0], result->arena.used,
+                             result->arena.blocks[0])) {
         return false;
     }
     /* The disk ceiling. Refusing a park leaves the result in memory, which is
@@ -355,9 +357,9 @@ CBMFileResult *cbm_result_spill_load(const cbm_result_spill_t *sp, int slot) {
         }
         return NULL;
     }
-    cbm_result_relocate(r, (const char *)(uintptr_t)hdr.old_base, (size_t)hdr.block_len,
-                        r->arena.blocks[0]);
-    if (!cbm_py_namespace_facts_valid(&r->py_namespace)) {
+    if (!cbm_result_relocate(r, (const char *)(uintptr_t)hdr.old_base, (size_t)hdr.block_len,
+                             r->arena.blocks[0]) ||
+        !cbm_py_namespace_facts_valid(&r->py_namespace)) {
         cbm_free_result(r);
         return NULL;
     }

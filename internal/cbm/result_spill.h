@@ -70,8 +70,10 @@ void cbm_result_spill_close(cbm_result_spill_t *sp);
 
 /* Relocation primitive used by the loader: every pointer inside `result`
  * that points into [old_base, old_base + len) is shifted to the block now at
- * `new_base`. Exposed for tests. */
-void cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base);
+ * `new_base`. False means allocation failure or invalid proof ownership; the
+ * partially relocated result must be discarded. Equal bases validate proof
+ * ownership without moving pointers. Exposed for tests. */
+bool cbm_result_relocate(CBMFileResult *result, const char *old_base, size_t len, char *new_base);
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* Test builds only: open's free-space reading (and so its low-disk refusal and

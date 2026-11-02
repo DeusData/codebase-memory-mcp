@@ -5,7 +5,8 @@
 #include "scope.h"
 #include "type_registry.h"
 #include "../cbm.h"
-#include "go_lsp.h"  /* CBMLSPDef reused across languages */
+#include "../resolve/imports.h"
+#include "go_lsp.h" /* CBMLSPDef reused across languages */
 
 /* Per-file typed import evidence. NULL targets means unknown; otherwise
  * targets has one slot per represented import, NULL only for a binding whose
@@ -14,6 +15,12 @@
 typedef struct {
     const CBMImportArray *imports;
     const char **targets;
+    /* Independently validated positive bindings from a fresh partial snapshot.
+     * NULL slots carry no absence/external proof. Owned separately from targets. */
+    const char **proven_targets;
+    /* Immutable normalized facts own the actual import proof predecessors.
+     * Borrowed for the resolution phase; projection properties are unrelated. */
+    const cbm_resolve_import_snapshot_t *facts;
 } CBMPHPImportBindings;
 
 /* PHPLSPContext — per-file state for PHP type-aware call resolution.
@@ -33,7 +40,7 @@ typedef struct {
      * use_kinds[i] selects whether the local maps a class, function, or const. */
     const char **use_local_names;
     const char **use_target_qns;
-    enum { CBM_PHP_USE_CLASS = 0, CBM_PHP_USE_FUNCTION, CBM_PHP_USE_CONST } *use_kinds;
+    enum { CBM_PHP_USE_CLASS = 0, CBM_PHP_USE_FUNCTION, CBM_PHP_USE_CONST } * use_kinds;
     int use_count;
     int use_cap;
 
@@ -46,7 +53,7 @@ typedef struct {
 
     /* Current function/method/class context. */
     const char *enclosing_func_qn;
-    const char *enclosing_class_qn; /* NULL outside class body */
+    const char *enclosing_class_qn;  /* NULL outside class body */
     const char *enclosing_parent_qn; /* parent class QN (for parent::), or NULL */
     const char *module_qn;
 
@@ -58,7 +65,7 @@ typedef struct {
      * type aliases like `@phpstan-type UserId int|string` and references
      * to `UserId` in @var/@param/@return all resolve to the aliased type.
      */
-    const char **phpstan_alias_names;  /* arena-allocated, NULL-terminated */
+    const char **phpstan_alias_names; /* arena-allocated, NULL-terminated */
     const CBMType **phpstan_alias_types;
     int phpstan_alias_count;
     int phpstan_alias_cap;
@@ -107,12 +114,12 @@ const char *php_resolve_class_name(PHPLSPContext *ctx, const char *name);
 
 /* Look up a method on a class, walking parent chain (registry-based). */
 const CBMRegisteredFunc *php_lookup_method(PHPLSPContext *ctx, const char *class_qn,
-                                            const char *method_name);
+                                           const char *method_name);
 
 /* Entry point: build registry from file defs + stdlib + composer (if present),
  * then run resolution. Called from cbm_extract_file(). */
 void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                    TSNode root);
+                     TSNode root);
 
 /* Register PHP stdlib + curated framework types into a registry. */
 void cbm_php_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
@@ -128,14 +135,11 @@ void cbm_php_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 void cbm_php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
                                const CBMLSPDef *defs, int def_count);
 
-void cbm_run_php_lsp_cross(
-    CBMArena *arena,
-    const char *source, int source_len,
-    const char *module_qn,
-    CBMLSPDef *defs, int def_count,
-    const char **import_names, const char **import_qns, int import_count,
-    TSTree *cached_tree,           /* NULL = parse internally */
-    CBMResolvedCallArray *out);
+void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                           const char *module_qn, CBMLSPDef *defs, int def_count,
+                           const char **import_names, const char **import_qns, int import_count,
+                           TSTree *cached_tree, /* NULL = parse internally */
+                           CBMResolvedCallArray *out);
 
 /* Complete typed bindings enable external receiver evidence. */
 void cbm_run_php_lsp_cross_with_bindings(CBMArena *arena, const char *source, int source_len,
@@ -153,19 +157,23 @@ typedef struct {
     const char *source;
     int source_len;
     const char *module_qn;
-    TSTree *cached_tree;            /* NULL = parse internally */
-    CBMLSPDef *defs;                /* combined file-local + cross-file defs */
+    TSTree *cached_tree; /* NULL = parse internally */
+    CBMLSPDef *defs;     /* combined file-local + cross-file defs */
     int def_count;
-    const char **import_names;      /* parallel arrays, import_count long */
+    const char **import_names; /* parallel arrays, import_count long */
     const char **import_qns;
     int import_count;
 } CBMBatchPHPLSPFile;
 
 /* Process multiple PHP files' cross-file LSP in one call. out must point to
  * file_count pre-zeroed CBMResolvedCallArray structs. */
-void cbm_batch_php_lsp_cross(
-    CBMArena *arena,
-    CBMBatchPHPLSPFile *files, int file_count,
-    CBMResolvedCallArray *out);
+void cbm_batch_php_lsp_cross(CBMArena *arena, CBMBatchPHPLSPFile *files, int file_count,
+                             CBMResolvedCallArray *out);
+
+void cbm_run_php_lsp_cross_with_bindings_with_source(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn, CBMLSPDef *defs,
+    int def_count, const char **import_names, const char **import_qns, int import_count,
+    TSTree *cached_tree, CBMResolvedCallArray *out, const CBMPHPImportBindings *bindings,
+    const cbm_resolve_proof_source_t *source_context);
 
 #endif /* CBM_LSP_PHP_LSP_H */

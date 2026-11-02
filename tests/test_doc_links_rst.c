@@ -463,16 +463,16 @@ TEST(rst_links_incremental) {
                                                 "\n"
                                                 "def top():\n"
                                                 "    return 1\n");
-    ASSERT_EQ(dm_step(repo, db, full_db, "lines moved", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, db, full_db, "lines moved", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_FALSE(rst_edge(db, "docs.api.Code", "pkg.base.Model.save", "\"target_lines\":[2,3]"));
-    /* the document changes alone: it re-resolves through the stored re-exports */
+    /* The document changes alone: the rebuilt index keeps the same re-exports. */
     th_write_file(TH_PATH(repo, "docs/api.rst"), "Models\n"
                                                  "======\n"
                                                  "\n"
                                                  ".. module:: pkg\n"
                                                  "\n"
                                                  "Only :class:`Model` and :func:`aid`.\n");
-    ASSERT_EQ(dm_step(repo, db, full_db, "document edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, db, full_db, "document edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(rst_edge(db, "docs.api.Models", "pkg.base.Model", NULL));
     /* the package re-exports another Model: the unchanged document follows */
     th_write_file(TH_PATH(repo, "pkg/__init__.py"), "from .other import Model\n"

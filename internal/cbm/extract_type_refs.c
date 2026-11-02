@@ -103,7 +103,8 @@ static const char *extract_type_text(CBMArena *a, TSNode node, const char *sourc
 }
 
 // Add a type reference for a function.
-static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn) {
+static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn,
+                         TSNode site) {
     if (!type_name || !type_name[0]) {
         return;
     }
@@ -115,10 +116,93 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
         return;
     }
 
-    CBMTypeRef tr;
+    CBMTypeRef tr = {0};
     tr.type_name = type_name;
     tr.enclosing_func_qn = func_qn;
+    tr.site_start_byte = ts_node_start_byte(site);
+    tr.site_end_byte = ts_node_end_byte(site);
+    size_t length = strlen(type_name);
+    tr.site_is_exact = tr.site_end_byte > tr.site_start_byte &&
+                       tr.site_end_byte <= (uint32_t)ctx->source_len &&
+                       length == tr.site_end_byte - tr.site_start_byte &&
+                       memcmp(ctx->source + tr.site_start_byte, type_name, length) == 0;
     cbm_typerefs_push(&ctx->result->type_refs, ctx->arena, tr);
+}
+
+static bool ts_family(CBMLanguage language) {
+    return language == CBM_LANG_TYPESCRIPT || language == CBM_LANG_TSX ||
+           language == CBM_LANG_ARKTS;
+}
+
+/* A TypeScript annotation names its types inside `: T`, `T[]`, `readonly T`,
+ * `(T)` and `A | B`; generic arguments are found where the walk visits them.
+ * Each reference is the exact type name occurrence, never the wrapper's text. */
+static void add_ts_annotation_refs(CBMExtractCtx *ctx, TSNode node, const char *func_qn,
+                                   unsigned depth) {
+    enum { MAX_TS_ANNOTATION_DEPTH = 16 };
+    if (ts_node_is_null(node) || depth > MAX_TS_ANNOTATION_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "nested_type_identifier") == 0) {
+        add_type_ref(ctx, cbm_node_text(ctx->arena, node, ctx->source), func_qn, node);
+    } else if (strcmp(kind, "generic_type") == 0) {
+        add_ts_annotation_refs(ctx, ts_node_child_by_field_name(node, TS_FIELD("name")), func_qn,
+                               depth + 1);
+    } else if (strcmp(kind, "type_annotation") == 0 || strcmp(kind, "array_type") == 0 ||
+               strcmp(kind, "readonly_type") == 0 || strcmp(kind, "parenthesized_type") == 0 ||
+               strcmp(kind, "union_type") == 0 || strcmp(kind, "intersection_type") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            add_ts_annotation_refs(ctx, ts_node_named_child(node, i), func_qn, depth + 1);
+        }
+    }
+}
+
+/* Go spells wrappers around a name (`[]*v1.Pod`, `map[string]T`, `Box[T]`). Each named type
+ * inside is its own exact occurrence, where the wrapped text would match no site. */
+static void add_go_type_refs(CBMExtractCtx *ctx, TSNode node, const char *func_qn, unsigned depth) {
+    enum { MAX_GO_TYPE_DEPTH = 32 };
+    if (ts_node_is_null(node) || depth >= MAX_GO_TYPE_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "qualified_type") == 0) {
+        add_type_ref(ctx, cbm_node_text(ctx->arena, node, ctx->source), func_qn, node);
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        add_go_type_refs(ctx, ts_node_named_child(node, i), func_qn, depth + 1);
+    }
+}
+
+// Rust: one reference per named type in an annotation, each on its own exact token.
+// `index: &Index` uses Index; `-> Result<Option<Foo>>` uses Result, Option and Foo.
+static void add_rust_type_refs(CBMExtractCtx *ctx, TSNode node, const char *func_qn, int depth) {
+    enum { MAX_TYPE_DEPTH = 32 };
+    if (ts_node_is_null(node) || depth > MAX_TYPE_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "type_identifier") == 0 || strcmp(kind, "scoped_type_identifier") == 0) {
+        const char *text = cbm_node_text(ctx->arena, node, ctx->source);
+        // `Vec<_>` asks the compiler to infer; the placeholder names no type.
+        if (text && strcmp(text, "_") != 0) {
+            add_type_ref(ctx, text, func_qn, node);
+        }
+        return;
+    }
+    if (strcmp(kind, "type_binding") == 0) {
+        // `Item = T`: Item names a member of the bound trait, not a type in scope.
+        add_rust_type_refs(ctx, ts_node_child_by_field_name(node, TS_FIELD("type")), func_qn,
+                           depth + 1);
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        add_rust_type_refs(ctx, ts_node_named_child(node, i), func_qn, depth + 1);
+    }
 }
 
 // Extract parameter types from a parameters/formal_parameters node.
@@ -127,10 +211,21 @@ static void extract_param_type_refs(CBMExtractCtx *ctx, TSNode params, const cha
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(params, i);
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        if (!ts_node_is_null(type_node)) {
-            const char *tname = extract_type_text(ctx->arena, type_node, ctx->source);
-            add_type_ref(ctx, tname, func_qn);
+        if (ts_node_is_null(type_node)) {
+            continue;
         }
+        if (ts_family(ctx->language)) {
+            add_ts_annotation_refs(ctx, type_node, func_qn, 0);
+        } else if (ctx->language == CBM_LANG_GO) {
+            add_go_type_refs(ctx, type_node, func_qn, 0);
+            continue;
+        }
+        if (ctx->language == CBM_LANG_RUST) {
+            add_rust_type_refs(ctx, type_node, func_qn, 0);
+            continue;
+        }
+        const char *tname = extract_type_text(ctx->arena, type_node, ctx->source);
+        add_type_ref(ctx, tname, func_qn, type_node);
     }
 }
 
@@ -139,9 +234,21 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
     const char *fields[] = {"result", "return_type", "type", NULL};
     for (const char **f = fields; *f; f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
+        if (!ts_node_is_null(rt) && ts_family(ctx->language)) {
+            add_ts_annotation_refs(ctx, rt, func_qn, 0);
+            break;
+        }
+        if (!ts_node_is_null(rt) && ctx->language == CBM_LANG_RUST) {
+            add_rust_type_refs(ctx, rt, func_qn, 0);
+            break;
+        }
         if (!ts_node_is_null(rt)) {
+            if (ctx->language == CBM_LANG_GO) {
+                add_go_type_refs(ctx, rt, func_qn, 0);
+                break;
+            }
             const char *tname = extract_type_text(ctx->arena, rt, ctx->source);
-            add_type_ref(ctx, tname, func_qn);
+            add_type_ref(ctx, tname, func_qn, rt);
             break;
         }
     }
@@ -150,8 +257,17 @@ static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const
 // Extract type ref from a node whose "type" field contains the type.
 static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
     TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
-    if (!ts_node_is_null(type_node)) {
-        add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn);
+    if (!ts_node_is_null(type_node) && ts_family(ctx->language)) {
+        add_ts_annotation_refs(ctx, type_node, func_qn, 0);
+    } else if (!ts_node_is_null(type_node) && ctx->language == CBM_LANG_RUST) {
+        add_rust_type_refs(ctx, type_node, func_qn, 0);
+    } else if (!ts_node_is_null(type_node)) {
+        if (ctx->language == CBM_LANG_GO) {
+            add_go_type_refs(ctx, type_node, func_qn, 0);
+            return;
+        }
+        add_type_ref(ctx, extract_type_text(ctx->arena, type_node, ctx->source), func_qn,
+                     type_node);
     }
 }
 
@@ -159,14 +275,21 @@ static void extract_type_field_ref(CBMExtractCtx *ctx, TSNode node, const char *
 static void extract_ts_body_type_refs(CBMExtractCtx *ctx, TSNode node, const char *kind,
                                       const char *func_qn) {
     if (strcmp(kind, "as_expression") == 0 || strcmp(kind, "satisfies_expression") == 0) {
-        extract_type_field_ref(ctx, node, func_qn);
+        /* The grammar gives no `type` field: the type follows the expression, and
+         * `x as const` has none at all. */
+        uint32_t named = ts_node_named_child_count(node);
+        if (named > 1) {
+            add_ts_annotation_refs(ctx, ts_node_named_child(node, named - 1), func_qn, 0);
+        }
     } else if (strcmp(kind, "type_arguments") == 0) {
         uint32_t nc = ts_node_child_count(node);
         for (uint32_t i = 0; i < nc; i++) {
             TSNode child = ts_node_child(node, i);
             if (strcmp(ts_node_type(child), "type_identifier") == 0 ||
                 strcmp(ts_node_type(child), "identifier") == 0) {
-                add_type_ref(ctx, cbm_node_text(ctx->arena, child, ctx->source), func_qn);
+                add_type_ref(ctx, cbm_node_text(ctx->arena, child, ctx->source), func_qn, child);
+            } else if (ts_node_is_named(child)) {
+                add_ts_annotation_refs(ctx, child, func_qn, 0);
             }
         }
     } else if (strcmp(kind, "variable_declarator") == 0) {
@@ -174,10 +297,7 @@ static void extract_ts_body_type_refs(CBMExtractCtx *ctx, TSNode node, const cha
         for (uint32_t i = 0; i < nc; i++) {
             TSNode child = ts_node_child(node, i);
             if (strcmp(ts_node_type(child), "type_annotation") == 0) {
-                if (ts_node_child_count(child) > 0) {
-                    TSNode inner = ts_node_child(child, ts_node_child_count(child) - SKIP_ONE);
-                    add_type_ref(ctx, extract_type_text(ctx->arena, inner, ctx->source), func_qn);
-                }
+                add_ts_annotation_refs(ctx, child, func_qn, 0);
             }
         }
     }
@@ -197,7 +317,7 @@ static void extract_java_body_type_refs(CBMExtractCtx *ctx, TSNode node, const c
                 for (uint32_t j = 0; j < nta; j++) {
                     TSNode ta = ts_node_child(child, j);
                     if (strcmp(ts_node_type(ta), "type_identifier") == 0) {
-                        add_type_ref(ctx, cbm_node_text(ctx->arena, ta, ctx->source), func_qn);
+                        add_type_ref(ctx, cbm_node_text(ctx->arena, ta, ctx->source), func_qn, ta);
                     }
                 }
             }
@@ -229,7 +349,8 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
         if (strcmp(kind, "assignment") == 0) {
             TSNode type_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
             if (!ts_node_is_null(type_node)) {
-                add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), func_qn);
+                add_type_ref(ctx, cbm_node_text(ctx->arena, type_node, ctx->source), func_qn,
+                             type_node);
             }
         }
         break;
@@ -333,10 +454,10 @@ static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkSta
         return;
     }
 
-    const char *func_qn;
-    if (state->enclosing_class_qn) {
-        func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, func_name);
-    } else {
+    /* The scope a call in this body would get. file + bare name misses a Go package's
+     * directory-based module and a Go receiver, leaving a scope no graph node carries. */
+    const char *func_qn = cbm_declaration_scope_qn(ctx, node, cbm_lang_spec(ctx->language), state);
+    if (!func_qn) {
         func_qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, func_name);
     }
 
@@ -347,15 +468,53 @@ static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkSta
     extract_return_type_refs(ctx, node, func_qn);
 }
 
+/* Every name of a type, wherever it is written: an annotation, a field, a heritage
+ * clause, a generic argument, `as` and `satisfies`. Declaring it is not using it,
+ * and the last segment of `Ns.Type` belongs to the whole path. */
+static void process_ts_type_name(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "nested_type_identifier") != 0 && strcmp(kind, "type_identifier") != 0) {
+        return;
+    }
+    TSNode parent = ts_node_parent(node);
+    const char *parent_kind = ts_node_is_null(parent) ? "" : ts_node_type(parent);
+    bool declaring = strcmp(parent_kind, "class_declaration") == 0 ||
+                     strcmp(parent_kind, "abstract_class_declaration") == 0 ||
+                     strcmp(parent_kind, "class") == 0 ||
+                     strcmp(parent_kind, "interface_declaration") == 0 ||
+                     strcmp(parent_kind, "type_alias_declaration") == 0;
+    if (strcmp(parent_kind, "nested_type_identifier") == 0 ||
+        strcmp(parent_kind, "type_parameter") == 0 ||
+        (declaring && ts_node_eq(node, ts_node_child_by_field_name(parent, TS_FIELD("name"))))) {
+        return;
+    }
+    add_type_ref(ctx, cbm_node_text(ctx->arena, node, ctx->source), func_qn, node);
+}
+
 void handle_type_refs(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->function_node_types || !spec->function_node_types[0]) {
         return;
     }
 
-    if (cbm_kind_in_set(node, spec->function_node_types)) {
+    int before = ctx->result->type_refs.count;
+    if (ts_family(ctx->language)) {
+        process_ts_type_name(ctx, node, state->enclosing_func_qn);
+    } else if (cbm_kind_in_set(node, spec->function_node_types)) {
         extract_signature_type_refs(ctx, node, state);
+    } else {
+        process_body_type_ref(ctx, node, state->enclosing_func_qn);
+    }
+    if (before == ctx->result->type_refs.count) {
         return;
     }
-
-    process_body_type_ref(ctx, node, state->enclosing_func_qn);
+    uint32_t scope_id = state->root_lexical_scope_id;
+    for (int i = state->scope_top - 1; i >= 0; i--) {
+        if (state->scopes[i].lexical_scope_id) {
+            scope_id = state->scopes[i].lexical_scope_id;
+            break;
+        }
+    }
+    for (int i = before; i < ctx->result->type_refs.count; i++) {
+        ctx->result->type_refs.items[i].lexical_scope_id = scope_id;
+    }
 }

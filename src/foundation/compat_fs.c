@@ -41,6 +41,7 @@ struct cbm_dir {
     cbm_dirent_t entry;
     bool first;
     bool done;
+    bool failed;
 };
 
 cbm_dir_t *cbm_opendir(const char *path) {
@@ -86,12 +87,17 @@ cbm_dir_t *cbm_opendir(const char *path) {
     return d;
 }
 
+bool cbm_dir_failed(const cbm_dir_t *d) {
+    return !d || d->failed;
+}
+
 cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     if (!d || d->done) {
         return NULL;
     }
     if (!d->first) {
         if (!FindNextFileW(d->find_handle, &d->find_data)) {
+            d->failed = GetLastError() != ERROR_NO_MORE_FILES;
             d->done = true;
             return NULL;
         }
@@ -102,6 +108,7 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
            (d->find_data.cFileName[1] == L'\0' ||
             (d->find_data.cFileName[1] == L'.' && d->find_data.cFileName[2] == L'\0'))) {
         if (!FindNextFileW(d->find_handle, &d->find_data)) {
+            d->failed = GetLastError() != ERROR_NO_MORE_FILES;
             d->done = true;
             return NULL;
         }
@@ -109,12 +116,16 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
     char *u8 = cbm_wide_to_utf8(d->find_data.cFileName);
     if (!u8) {
+        d->failed = true;
         d->done = true;
         return NULL;
     }
     size_t nlen = strlen(u8);
     if (nlen >= CBM_DIRENT_NAME_MAX) {
-        nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+        d->failed = true;
+        d->done = true;
+        free(u8);
+        return NULL;
     }
     memcpy(d->entry.name, u8, nlen);
     d->entry.name[nlen] = '\0';
@@ -792,6 +803,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 struct cbm_dir {
     DIR *dir;
     cbm_dirent_t entry;
+    bool failed;
 };
 
 cbm_dir_t *cbm_opendir(const char *path) {
@@ -811,12 +823,22 @@ cbm_dir_t *cbm_opendir(const char *path) {
     return d;
 }
 
+bool cbm_dir_failed(const cbm_dir_t *d) {
+    return !d || d->failed;
+}
+
 cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
-    if (!d || !d->dir) {
+    if (!d || !d->dir || d->failed) {
         return NULL;
     }
     struct dirent *de;
-    while ((de = readdir(d->dir)) != NULL) {
+    for (;;) {
+        errno = 0;
+        de = readdir(d->dir);
+        if (!de) {
+            d->failed = errno != 0;
+            return NULL;
+        }
         /* Skip "." and ".." */
         if (de->d_name[0] == '.' &&
             (de->d_name[SKIP_ONE] == '\0' ||
@@ -825,7 +847,8 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         size_t nlen = strlen(de->d_name);
         if (nlen >= CBM_DIRENT_NAME_MAX) {
-            nlen = CBM_DIRENT_NAME_MAX - SKIP_ONE;
+            d->failed = true;
+            return NULL;
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
@@ -848,7 +871,6 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         d->entry.d_type = type;
         return &d->entry;
     }
-    return NULL;
 }
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {

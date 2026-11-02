@@ -412,24 +412,23 @@ TEST(doc_mentions_php_incremental_equals_full) {
     ASSERT_EQ(dm_index(repo, inc_db, NULL), 0);
     ASSERT_TRUE(php_edge(inc_db, "src.use.user", "src.lib.a"));
 
-    /* a doc edit: the file is repaired alone */
+    /* A doc edit rebuilds the resolver generation. */
     th_write_file(TH_PATH(repo, "src/use.php"), "<?php\n"
                                                 "namespace App;\n"
                                                 "/** Uses {@see \\Lib\\a()} and {@see Nope}. */\n"
                                                 "function user() {}\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "doc edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
 
     /* a body edit in the target file: its persisted scope is unchanged */
     th_write_file(TH_PATH(repo, "src/lib.php"),
                   "<?php\nnamespace Lib;\n\nfunction a() { return 1; }\nfunction b() {}\n");
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "body edit", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     ASSERT_TRUE(php_edge(inc_db, "src.use.user", "src.lib.a"));
 
-    /* the function goes: the files that name it are repaired, nothing else */
+    /* The function goes: the rebuilt generation re-resolves its references. */
     th_write_file(TH_PATH(repo, "src/lib.php"), "<?php\nnamespace Lib;\nfunction b() {}\n");
-    ASSERT_EQ(
-        dm_step(repo, inc_db, full_db, "function removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
-        0);
+    ASSERT_EQ(dm_step(repo, inc_db, full_db, "function removed", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
+              0);
     char props[512];
     int n = 0;
     dm_edge(inc_db, "src.use.user", "src.lib.a", props, sizeof(props), &n);

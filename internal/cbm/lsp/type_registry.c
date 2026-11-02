@@ -716,6 +716,169 @@ CBMRegisteredType *cbm_registry_type_for_update(CBMTypeRegistry *head, const cha
     return NULL;
 }
 
+static int namespace_type_compare(const void *left, const void *right) {
+    const CBMRegistryNamespaceTypeEntry *a = left, *b = right;
+    int order = strcmp(a->namespace_qn, b->namespace_qn);
+    if (!order)
+        order = strcmp(a->short_name, b->short_name);
+    return order ? order : (a->type_index > b->type_index) - (a->type_index < b->type_index);
+}
+
+/* Declared namespaces are independent of file/directory QNs. Build this
+ * exact-name domain once with finalization; never synthesize alias types. */
+static void build_namespace_type_index(CBMTypeRegistry *reg, CBMArena *arena) {
+    reg->namespace_types = NULL;
+    reg->namespace_type_count = 0;
+    reg->namespace_type_upto = -1;
+    int count = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        const CBMRegisteredType *type = &reg->types[i];
+        if (type->namespace_qn && type->short_name && type->qualified_name)
+            count++;
+    }
+    if (!count) {
+        reg->namespace_type_upto = reg->type_count;
+        return;
+    }
+    if ((size_t)count > SIZE_MAX / sizeof(*reg->namespace_types))
+        return;
+    CBMRegistryNamespaceTypeEntry *items = cbm_arena_alloc(arena, (size_t)count * sizeof(*items));
+    if (!items)
+        return;
+    int at = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        const CBMRegisteredType *type = &reg->types[i];
+        if (type->namespace_qn && type->short_name && type->qualified_name)
+            items[at++] = (CBMRegistryNamespaceTypeEntry){type->namespace_qn, type->short_name, i};
+    }
+    qsort(items, (size_t)count, sizeof(*items), namespace_type_compare);
+    reg->namespace_types = items;
+    reg->namespace_type_count = count;
+    reg->namespace_type_upto = reg->type_count;
+}
+
+void cbm_registry_types_in_namespace(const CBMTypeRegistry *reg, const char *namespace_qn,
+                                     const char *name, CBMNamespaceTypeIter *out) {
+    if (!out)
+        return;
+    *out = (CBMNamespaceTypeIter){.reg = reg,
+                                  .namespace_qn = namespace_qn,
+                                  .name = name,
+                                  .complete = reg && namespace_qn && name,
+                                  .open = true};
+}
+
+const CBMRegisteredType *cbm_namespace_type_next(CBMNamespaceTypeIter *it,
+                                                 const CBMTypeRegistry **owner) {
+    if (owner)
+        *owner = NULL;
+    if (!it || !it->complete)
+        return NULL;
+    while (it->reg) {
+        const CBMTypeRegistry *reg = it->reg;
+        if (it->open) {
+            if (++it->links > 64 || reg->namespace_type_upto != reg->type_count ||
+                reg->namespace_type_count < 0 || reg->namespace_type_count > reg->type_count ||
+                (reg->namespace_type_count && !reg->namespace_types)) {
+                it->complete = false;
+                return NULL;
+            }
+            int lo = 0, hi = reg->namespace_type_count;
+            while (lo < hi) {
+                int mid = lo + (hi - lo) / 2;
+                const CBMRegistryNamespaceTypeEntry *entry = &reg->namespace_types[mid];
+                int order = strcmp(entry->namespace_qn, it->namespace_qn);
+                if (!order)
+                    order = strcmp(entry->short_name, it->name);
+                it->visits++;
+                if (order < 0)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            it->position = lo;
+            it->open = false;
+        }
+        while (it->position < reg->namespace_type_count) {
+            if (++it->visits > 65536) {
+                it->complete = false;
+                return NULL;
+            }
+            const CBMRegistryNamespaceTypeEntry *entry = &reg->namespace_types[it->position++];
+            if (strcmp(entry->namespace_qn, it->namespace_qn) ||
+                strcmp(entry->short_name, it->name))
+                break;
+            if (entry->type_index < 0 || entry->type_index >= reg->type_count) {
+                it->complete = false;
+                return NULL;
+            }
+            if (owner)
+                *owner = reg;
+            return &reg->types[entry->type_index];
+        }
+        it->reg = reg->fallback;
+        it->open = true;
+    }
+    return NULL;
+}
+
+void cbm_registry_types_with_qn(const CBMTypeRegistry *reg, const char *qualified_name,
+                                CBMTypeQNIter *out) {
+    if (!out)
+        return;
+    *out = (CBMTypeQNIter){.reg = reg,
+                           .qualified_name = qualified_name,
+                           .complete = reg && qualified_name && qualified_name[0],
+                           .open = true};
+}
+const CBMRegisteredType *cbm_type_qn_next(CBMTypeQNIter *it, const CBMTypeRegistry **owner) {
+    if (owner)
+        *owner = NULL;
+    if (!it || !it->complete)
+        return NULL;
+    while (it->reg) {
+        const CBMTypeRegistry *reg = it->reg;
+        if (it->open) {
+            if (++it->links > 64 || reg->type_count < 0 ||
+                reg->type_qn_entry_count != reg->type_count ||
+                (reg->type_count && (!reg->types || !reg->type_qn_entries ||
+                                     !reg->type_qn_buckets || reg->type_qn_bucket_count <= 0))) {
+                it->complete = false;
+                return NULL;
+            }
+            it->position = -1;
+            if (reg->type_count) {
+                int bucket =
+                    (int)(fnv1a(it->qualified_name) & (uint64_t)(reg->type_qn_bucket_count - 1));
+                it->position = reg->type_qn_buckets[bucket];
+            }
+            it->open = false;
+        }
+        while (it->position >= 0) {
+            if (++it->visits > 16384 || it->position >= reg->type_qn_entry_count) {
+                it->complete = false;
+                return NULL;
+            }
+            const CBMRegistryHashEntry *entry = &reg->type_qn_entries[it->position];
+            it->position = entry->next_index;
+            if (entry->payload_index < 0 || entry->payload_index >= reg->type_count) {
+                it->complete = false;
+                return NULL;
+            }
+            const CBMRegisteredType *candidate = &reg->types[entry->payload_index];
+            if (candidate->qualified_name &&
+                !strcmp(candidate->qualified_name, it->qualified_name)) {
+                if (owner)
+                    *owner = reg;
+                return candidate;
+            }
+        }
+        it->reg = reg->fallback;
+        it->open = true;
+    }
+    return NULL;
+}
+
 void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     if (!reg || !idx_arena)
         return;
@@ -725,6 +888,7 @@ void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     build_type_embed_index(reg, idx_arena);
     build_ffunc_short_index(reg, idx_arena);
     build_type_short_index(reg, idx_arena);
+    build_namespace_type_index(reg, idx_arena);
 }
 
 void cbm_registry_finalize(CBMTypeRegistry *reg) {

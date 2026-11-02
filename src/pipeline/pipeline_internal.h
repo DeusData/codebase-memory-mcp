@@ -26,6 +26,7 @@
 #include <string.h>
 
 typedef struct cbm_pipeline_frozen cbm_pipeline_frozen_t;
+typedef struct cbm_shared_resolver cbm_shared_resolver_t;
 
 typedef enum {
     CBM_PIPELINE_FROZEN_OK = 0,
@@ -248,6 +249,13 @@ bool cbm_pipeline_frozen_manifests_equal(cbm_pipeline_t *p, const cbm_file_hash_
                                          int left_count, const cbm_file_hash_t *right,
                                          int right_count);
 
+#include "resolve/lookup.h"
+cbm_resolution_t cbm_registry_resolve_observed(const cbm_registry_t *, const char *name,
+                                               const char *module, const char **keys,
+                                               const char **values, int count, CBMLanguage,
+                                               const char *scope, bool invocation,
+                                               cbm_resolve_lookup_context_t *);
+
 /* Internal explicit-language resolution; public raw/lineage APIs stay raw. */
 cbm_resolution_t cbm_registry_resolve_lang(const cbm_registry_t *r, const char *callee_name,
                                            const char *module_qn, const char **import_map_keys,
@@ -363,7 +371,8 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
 /* Per-worker manifest collection entry. */
 typedef struct {
     char *pkg_name;  /* heap: "@myorg/pkg", "github.com/foo/bar" */
-    char *entry_rel; /* heap: "packages/pkg/src/index" (no extension) */
+    char *entry_rel; /* heap: module path, or exact value for a typed Node fact */
+    bool node_fact;  /* only the Node configuration collector may set this */
 } cbm_pkg_entry_t;
 
 /* Growable array of package entries (per-worker, no thread contention). */
@@ -371,6 +380,7 @@ typedef struct {
     cbm_pkg_entry_t *items;
     int count;
     int cap;
+    bool incomplete; /* sticky: a missing configuration fact forbids publication */
 } cbm_pkg_entries_t;
 
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
@@ -441,6 +451,14 @@ typedef struct {
      * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
      * Indexed by file position in the files[] array. Owned by pipeline.c. */
     CBMFileResult **result_cache;
+    /* Immutable export proofs shared by all resolution workers. */
+    cbm_shared_resolver_t *shared_resolver;
+    /* ECMAScript export surfaces, ready before the cross-file type pass. */
+    struct cbm_ecma_table *ecma_surfaces;
+    /* Immutable Rust name model, sealed before import edges are projected. */
+    struct cbm_rust_project *rust_project;
+    cbm_resolve_stats_t *resolver_stats; /* run-owned; workers borrow until join */
+    _Atomic bool resolver_failed;
 
     /* Run-owned immutable snapshot; direct borrow also works for probe contexts
      * whose pipeline back-pointer is NULL. Workers only write the fatal latch. */
@@ -611,7 +629,8 @@ static inline bool cbm_pipeline_test_extraction_ok(cbm_pipeline_ctx_t *ctx, CBML
 enum {
     CBM_PIPELINE_TEST_FAULT_EXTRACT_NULL = 1u << 0,
     CBM_PIPELINE_TEST_FAULT_DEF_MODULES_NULL = 1u << 1,
-    CBM_PIPELINE_TEST_FAULT_COLLECT_SPILL_NULL = 1u << 2
+    CBM_PIPELINE_TEST_FAULT_COLLECT_SPILL_NULL = 1u << 2,
+    CBM_PIPELINE_TEST_FAULT_RESOLVER_SPILL_NULL = 1u << 3
 };
 void cbm_pipeline_test_set_fault_mask(cbm_pipeline_t *p, unsigned mask);
 unsigned cbm_pipeline_test_fault_mask(const cbm_pipeline_t *p);
@@ -718,6 +737,14 @@ void cbm_pipeline_diagram_parent_edge(cbm_pipeline_ctx_t *ctx, const CBMDefiniti
 void cbm_pipeline_diagram_arrows(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result);
 
 /* Get the current pipeline's package map (NULL if none). */
+/* Package-map keys under this prefix hold a raw value, not a dotted QN.
+ *   dart: a Dart package's name -> its repo-relative lib directory
+ *   swift-dir: a SwiftPM target's directory -> the target's name
+ *   swift-target: a SwiftPM target's name -> its directory */
+#define CBM_PKGMAP_RAW_PREFIX "@cbm:raw:"
+#define CBM_PKGMAP_DART_ROOT_PREFIX "@cbm:raw:dart:"
+#define CBM_PKGMAP_SWIFT_DIR_PREFIX "@cbm:raw:swift-dir:"
+#define CBM_PKGMAP_SWIFT_TARGET_PREFIX "@cbm:raw:swift-target:"
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 
@@ -782,11 +809,13 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  * binding the extractor marked as an `axios.create(...)` instance
  * (`http_client` node property), write the request URL to `out` (the
  * instance's literal `http_base_url` joined with a '/'-leading path, the path
- * unchanged when the base is unknown or the URL is absolute) and return true.
+ * unchanged when the URL is absolute) and return true. Default imports use
+ * an exact source audit; an unknown base cannot prove a relative endpoint.
  * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
  * route-registration or registry fallback, so a wrapper client's `api.get`
  * is never mistaken for an Express `app.get` route registration. */
-bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+bool cbm_pipeline_http_client_call_url(const cbm_shared_resolver_t *resolver,
+                                       const cbm_gbuf_t *gbuf, const char *project, const char *rel,
                                        const CBMFileResult *result, const char **imp_keys,
                                        const char **imp_vals, int imp_count, const CBMCall *call,
                                        char *out, size_t out_sz);
@@ -904,6 +933,9 @@ bool cbm_pipeline_php_vendor_call(const cbm_php_vendor_names_t *value, const CBM
                                   const CBMCall *call);
 bool cbm_pipeline_php_vendor_usage(const cbm_php_vendor_names_t *value, const CBMFileResult *result,
                                    const CBMUsage *usage);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_pipeline_php_test_fail_projection_once(void);
+#endif
 int cbm_pipeline_php_create_import_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                          const char *rel, const char *file_qn,
                                          const cbm_gbuf_node_t *file, CBMHashTable *namespace_map);
@@ -923,6 +955,11 @@ CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
                                                      const char *const *namespaces,
                                                      const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
+/* Enrich the map with source-audited Rust module trees and configured C/C++
+ * include roots. A false result leaves a partial map which the caller must
+ * discard; it must never become a completed lookup domain. */
+bool cbm_pipeline_import_context_build(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                       int count, CBMFileResult **cache, CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
@@ -1042,6 +1079,25 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
  * The single decision point for BOTH the sequential semantic pass and the
  * parallel per-file resolve — the two venues must never diverge. */
 const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
+
+/* Immutable source-audited class bindings for the structural passes. Built
+ * once before workers; every source must match its extraction snapshot.
+ * Kotlin/C# namespace lookup additionally requires the complete graph file domain.
+ * C++ uses one proven quoted include; Rust uses declared module import bindings.
+ * These facts do not authorize method dispatch or controlled resolver edges. */
+typedef struct cbm_semantic_bindings cbm_semantic_bindings_t;
+cbm_semantic_bindings_t *cbm_semantic_bindings_build(cbm_pipeline_ctx_t *ctx,
+                                                     const cbm_file_info_t *files, int count,
+                                                     CBMFileResult **cache);
+void cbm_semantic_bindings_free(cbm_semantic_bindings_t *bindings);
+const char *cbm_semantic_class_base(const cbm_semantic_bindings_t *bindings,
+                                    const CBMDefinition *definition, const char *base,
+                                    const cbm_gbuf_node_t *candidate);
+
+/* Exact trait-impl occurrence plus source-audited Struct/Interface declarations. */
+bool cbm_semantic_rust_implementation(const cbm_semantic_bindings_t *bindings, const char *rel,
+                                      const CBMImplTrait *implementation, const char **struct_qn,
+                                      const char **trait_qn);
 
 /* Explicit-language override detection on the full graph (serial tail).
  * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches
@@ -1353,6 +1409,12 @@ typedef struct {
     const char *image_default_of;
     const char *image_override_of;
     const char *default_image;
+    /* Physical image scalar before decoding/interpolation; copied from its
+     * exact YAML node. COMPLETE requires an unambiguous supported surface. */
+    const char *image_spelling;
+    uint32_t image_start_byte;
+    uint32_t image_end_byte;
+    bool image_complete;
     const char *dockerfile;
     const char **deps;
     int ndeps;
@@ -1600,6 +1662,9 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
  * boundary so late additions/deletions cannot escape a frozen file list. */
 int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
+/* Fresh canonical project-path state/hash/length validation; errors fail closed. */
+bool cbm_pipeline_captured_inputs_match(cbm_pipeline_t *p, const cbm_gbuf_captured_input_t *inputs,
+                                        size_t count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe.
@@ -1684,8 +1749,11 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      are preserved and dotted-name collisions are disambiguated before section
  *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
  *      and diagram owners agree.
+ *  13: evidence-admitted cross-file resolution and per-occurrence outcomes
+ *      publish together. Version 12 lacks strict proof projection and resolver
+ *      quality accounting, so unchanged files rebuild once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -1847,10 +1915,20 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 typedef struct {
     const char *candidate_qn;
     bool calls_emitted;
+    /* This occurrence is a route registration: its Route node and handler edge
+     * represent it in the graph whether or not any CALLS edge survives. */
+    bool route_registered;
 } CBMCallEvidence;
 void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
                                           const CBMFileResult *result,
                                           const CBMCallEvidence *evidence);
+/* Shared-mode capture retains exact identity until coordinator projection.
+ * Legacy candidates are diagnostic data; their emission flags are ignored. */
+void cbm_pipeline_record_unresolved_calls_for_projection(cbm_pipeline_t *p, const char *rel_path,
+                                                         const CBMFileResult *result,
+                                                         const char *file_scope,
+                                                         const CBMCallEvidence *evidence);
+bool cbm_pipeline_reconcile_unresolved_calls(cbm_pipeline_t *p, const cbm_gbuf_t *graph);
 void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p);
 void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
                                        bool *complete);

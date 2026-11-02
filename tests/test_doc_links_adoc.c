@@ -261,7 +261,7 @@ TEST(adoc_links_incremental) {
                   "        helper();\n"
                   "    }\n"
                   "}\n");
-    ASSERT_EQ(dm_step(repo, db, full_db, "tag moved", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_EQ(dm_step(repo, db, full_db, "tag moved", CBM_INCREMENTAL_ROUTE_FORCED_FULL), 0);
     /* a component attribute changes: every page re-resolves */
     th_write_file(TH_PATH(repo, "docs/antora.yml"),
                   "name: guide\n"

@@ -54,6 +54,10 @@ cbm_dir_t *cbm_opendir(const char *path);
  * valid until the next cbm_readdir call on the same handle. */
 cbm_dirent_t *cbm_readdir(cbm_dir_t *d);
 
+/* Sticky enumeration failure, distinct from clean EOF. NULL is an error.
+ * Check before closing when complete directory coverage is required. */
+bool cbm_dir_failed(const cbm_dir_t *d);
+
 /* Close directory handle. */
 void cbm_closedir(cbm_dir_t *d);
 

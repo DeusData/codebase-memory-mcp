@@ -8,9 +8,11 @@
  * Each file is read and parsed ONCE (Phase 3A). The CBMFileResult is cached
  * and reused for resolution (Phase 4), eliminating 3x redundant I/O + parsing.
  *
- * Depends on: worker_pool, graph_buffer (shared IDs + merge), extraction (cbm.h)
+ * Depends on: worker_pool, graph_buffer (shared IDs + merge), extraction
+ * (cbm.h)
  */
 #include "foundation/constants.h"
+#include "pipeline/import_resolve.h"
 
 enum {
     PP_RING = 4,
@@ -68,39 +70,43 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
  * operator/caller choice). */
 #define PP_RETAIN_TOTAL_HARD_MAX_BYTES (1024ULL * 1024 * 1024)  /* 1 GiB default ceiling */
 #define PP_RETAIN_PER_FILE_HARD_MAX_BYTES (32ULL * 1024 * 1024) /* 32 MiB per file */
-#include "pipeline/pipeline.h"
-#include "pipeline/pipeline_internal.h"
-#include "pipeline/doc_links.h" /* cbm_doclinks_resolve_file: MENTIONS beside CALLS */
-#include "result_spill.h"
-#include "foundation/platform.h"     /* cbm_resolve_cache_dir */
-#include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
-#include "pipeline/lsp_resolve.h"
-#include "pipeline/laravel_routing.h"
-#include "lsp/rust_cargo.h"
-#include "lsp/c_lsp.h"
-#include "lsp/py_lsp.h"
-#include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
-#include "pipeline/worker_pool.h"
+#include "arena.h"
+#include "cbm.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
-#include "foundation/compat_thread.h"
-#include "foundation/mem_core.h"
-#include "graph_buffer/graph_buffer.h"
-#include "service_patterns.h"
-#include "foundation/platform.h"
-#include "foundation/hash_table.h"
-#include "foundation/log.h"
-#include "foundation/slab_alloc.h"
-#include "foundation/mem.h"
-#include "foundation/str_util.h"
-#include "foundation/profile.h"
 #include "foundation/compat_regex.h"
+#include "foundation/compat_thread.h"
+#include "foundation/hash_table.h"
 #include "foundation/limits.h"
-#include "cbm.h"
-#include "arena.h"
+#include "foundation/log.h"
+#include "foundation/mem.h"
+#include "foundation/mem_core.h"
+#include "foundation/platform.h" /* cbm_resolve_cache_dir */
+#include "foundation/platform.h"
+#include "foundation/profile.h"
+#include "foundation/slab_alloc.h"
+#include "foundation/str_util.h"
+#include "graph_buffer/graph_buffer.h"
+#include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
+#include "lsp/c_lsp.h"
+#include "lsp/oo_strict.h"
+#include "lsp/py_lsp.h"
+#include "lsp/rust_cargo.h"
 #include "macro_table.h"
-#include "simhash/minhash.h"
+#include "pipeline/doc_links.h" /* cbm_doclinks_resolve_file: MENTIONS beside CALLS */
+#include "pipeline/laravel_routing.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include "pipeline/shared_resolver.h"
+#include "pipeline/worker_pool.h"
+#include "resolve/policy.h"
+#include "resolve/proof.h"
+#include "result_spill.h"
 #include "semantic/ast_profile.h"
+#include "service_patterns.h"
+#include "simhash/minhash.h"
 
 #include <errno.h>
 #include <stdatomic.h>
@@ -111,9 +117,10 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include <time.h>
 
 /* Back-pressure nap-cycle counter (test observability): each execution of the
- * over-budget collect+nap gate counts one cycle. Lets tests assert the gate does
- * not re-pay the full nap tax on every file pull when napping cannot reclaim
- * memory (the resident floor, not in-flight transients, holds the budget). */
+ * over-budget collect+nap gate counts one cycle. Lets tests assert the gate
+ * does not re-pay the full nap tax on every file pull when napping cannot
+ * reclaim memory (the resident floor, not in-flight transients, holds the
+ * budget). */
 static _Atomic long g_bp_nap_cycles = 0;
 static _Atomic uint64_t g_lsp_linear_fallback_rows = 0;
 /* Defined here, declared in lsp_resolve.h — the uncapped tail-match scan's
@@ -261,10 +268,12 @@ static char *read_file(const char *path, int *out_len, long *out_size,
     if (out_size) {
         *out_size = size;
     }
-    if (size <= 0) {
+    /* A zero-byte source is a complete, captured file, not a missing result.
+     * Empty package files must remain in resolver generation summaries. */
+    if (size < 0) {
         (void)fclose(f);
         if (out_status) {
-            *out_status = CBM_READ_EMPTY;
+            *out_status = CBM_READ_OPEN_FAIL;
         }
         return NULL;
     }
@@ -513,11 +522,14 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     int n;
     if (is_fn) {
         n = snprintf(buf, bufsize,
-                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%d,"
+                     "{\"complexity\":%d,\"cognitive\":%d,\"loop_count\":%d,\"loop_depth\":%"
+                     "d,"
                      "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
-                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
+                     "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":"
+                     "%s,"
                      "\"unguarded_recursion\":%s,"
-                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%s",
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%"
+                     "s",
                      def->complexity, def->cognitive, def->loop_count, def->loop_depth,
                      def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
                      def->linear_scan_in_loop, def->alloc_in_loop,
@@ -554,7 +566,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
     append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
     append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
-    /* A document definition's facts (an ADR's id, status, date, ...): key, value pairs. */
+    /* A document definition's facts (an ADR's id, status, date, ...): key, value
+     * pairs. */
     for (const char **kv = def->extra_props; kv && kv[0] && kv[SKIP_ONE]; kv += PAIR_LEN) {
         append_json_string(buf, bufsize, &pos, kv[0], kv[SKIP_ONE]);
     }
@@ -573,7 +586,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         append_json_string(buf, bufsize, &pos, "sp", def->structural_profile);
     }
 
-    /* Body tokens — raw identifiers from function body AST for semantic search. */
+    /* Body tokens — raw identifiers from function body AST for semantic search.
+     */
     if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
         append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
     }
@@ -585,9 +599,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
 }
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
- * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
- * and pxc_module_is_dir() (pass_lsp_cross.c) so same-module callee resolution
- * keys against the directory-based def-node QNs in the registry. */
+ * (Java/Go package). MUST match cbm_lang_module_is_dir()
+ * (internal/cbm/helpers.c) and pxc_module_is_dir() (pass_lsp_cross.c) so
+ * same-module callee resolution keys against the directory-based def-node QNs
+ * in the registry. */
 static bool pp_module_is_dir(CBMLanguage lang) {
     return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
 }
@@ -691,14 +706,16 @@ typedef struct {
     cbm_pipeline_ctx_t *pctx;         /* spill store + mode latch live here */
     _Atomic uint8_t *slot_state;      /* per file: 0 in progress, 1 cached, 2 parked */
     _Atomic int spill_sweeps_running; /* workers inside pp_spill_sweep right now */
-    int spill_env;        /* CBM_MEM_SPILL for this run: 1 force, 0 off, 2 budget decides */
-    cbm_mutex_t spill_mu; /* serializes the one store open */
+    int spill_env;                 /* CBM_MEM_SPILL for this run: 1 force, 0 off, 2 budget decides
+                                    */
+    cbm_mutex_t spill_mu;          /* serializes the one store open */
     _Atomic int spill_unavailable; /* store could not open: never retry */
 
     cbm_pkg_entries_t *pkg_entries; /* per-worker manifest arrays (separate allocation) */
 
     bool retain_sources;              /* copy source into result->arena for cross-file LSP */
-    size_t retain_total_budget_bytes; /* project-wide retention cap (peak-RSS bound) */
+    size_t retain_total_budget_bytes; /* project-wide retention cap (peak-RSS
+                                         bound) */
     size_t retain_per_file_max_bytes; /* per-file retention cap */
     _Atomic int64_t retained_bytes;   /* total source bytes copied into result arenas */
     _Atomic int retain_cap_warned;    /* WARN index.retain_capped emitted once per run */
@@ -727,13 +744,13 @@ typedef struct {
     cbm_scale_probe_t scale;
 } extract_ctx_t;
 
-/* Cap on the number of index.file_oversized WARN lines (the full list still goes
- * to the response/logfile — this only throttles the stderr noise). */
+/* Cap on the number of index.file_oversized WARN lines (the full list still
+ * goes to the response/logfile — this only throttles the stderr noise). */
 enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Upper bound of build_def_props' fixed prefix: the Function/Method metrics
- * literal (about 330 B) with nine ints and seven true/false/test_role strings at
- * their widest stays under 600 B. */
+ * literal (about 330 B) with nine ints and seven true/false/test_role strings
+ * at their widest stays under 600 B. */
 enum { PP_PROPS_PREFIX_MAX = CBM_SZ_1K };
 
 /* Serialized size of one optional field as append_json_string emits it
@@ -756,10 +773,10 @@ static size_t pp_arr_field_len(const char *key, const char **arr) {
 
 /* A def's properties buffer, sized so EVERY field build_def_props appends fits:
  * the fixed metrics prefix (PP_PROPS_PREFIX_MAX) plus each optional field's
- * whole serialized form. A field that does not fit is dropped whole, so a buffer
- * sized for only some of them let a long signature, decorator list or parameter
- * list squeeze out the MinHash fingerprint ("fp"), structural profile ("sp") and
- * body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
+ * whole serialized form. A field that does not fit is dropped whole, so a
+ * buffer sized for only some of them let a long signature, decorator list or
+ * parameter list squeeze out the MinHash fingerprint ("fp"), structural profile
+ * ("sp") and body tokens ("bt") behind them: no SIMILAR_TO edge and fewer
  * SEMANTICALLY_RELATED edges for exactly the widest definitions (jellyfin's
  * ImageController actions, 2026-10-18). fp/sp/bt are appended behind their own
  * room checks, so both the check's reserve and the field are counted. Returns
@@ -1157,7 +1174,7 @@ static void pp_charge_probe(extract_ctx_t *ec, bool over) {
     cbm_mem_class_log(first_over ? "charge.first_over" : "charge.step");
 }
 
-static void extract_worker(int worker_id, void *ctx_ptr) {
+static void extract_worker_impl(int worker_id, void *ctx_ptr) {
     extract_ctx_t *ec = ctx_ptr;
     extract_worker_state_t *ws = &ec->workers[worker_id];
 
@@ -1282,7 +1299,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * index and status stays "indexed". No-op unless the supervisor set
          * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
          * single-threaded recovery run instead takes the sequential path
-         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
+         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both.
+         */
         if (cbm_index_is_quarantined(fi->rel_path)) {
             const char *phase = cbm_index_quarantine_phase(fi->rel_path);
             if (!phase) {
@@ -1426,11 +1444,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                      result->tree_nodes);
             pp_err_add(errs, fi->rel_path, how_far, "walk_truncated");
         } else if (result->lsp_skipped && !result->has_error) {
-            /* has_error already recorded its precise cause above. Indexed, but without the per-file
-             * and cross-file LSP refinement: the same kind of hole from the other direction.
-             * Nothing in production sets this any more except a truncated walk (handled above) and
-             * the test seam — it is reported anyway, so that if something sets it again the gap
-             * arrives named, not silent. */
+            /* has_error already recorded its precise cause above. Indexed, but
+             * without the per-file and cross-file LSP refinement: the same kind of
+             * hole from the other direction. Nothing in production sets this any more
+             * except a truncated walk (handled above) and the test seam — it is
+             * reported anyway, so that if something sets it again the gap arrives
+             * named, not silent. */
             char size_text[CBM_SZ_64];
             snprintf(size_text, sizeof(size_text), "%u nodes", result->tree_nodes);
             pp_err_add(errs, fi->rel_path, size_text, "lsp_skipped");
@@ -1546,7 +1565,16 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
     /* Final cleanup (parser already destroyed in loop, just slab state) */
     cbm_work_arena_release(); /* the working arena kept between files */
     cbm_slab_destroy_thread();
-    cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset cache */
+    cbm_kind_in_set_free_cache(); /* free this worker thread's node-type bitset
+                                     cache */
+}
+
+static void extract_worker(int worker_id, void *ctx_ptr) {
+    extract_ctx_t *context = ctx_ptr;
+    cbm_resolve_stats_t *previous =
+        cbm_resolve_stats_bind(context->pctx ? context->pctx->resolver_stats : NULL);
+    extract_worker_impl(worker_id, ctx_ptr);
+    cbm_resolve_stats_bind(previous);
 }
 
 static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_entries,
@@ -1576,7 +1604,8 @@ static void log_extract_mem_stats(int worker_count) {
     }
 }
 
-/* Forward declaration: macro table builder lives in pipeline.c (shared path). */
+/* Forward declaration: macro table builder lives in pipeline.c (shared path).
+ */
 CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
                                                 const char *repo_path);
 
@@ -1644,7 +1673,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     }
     memset(workers, 0, (size_t)worker_count * sizeof(extract_worker_state_t));
 
-    /* Per-worker manifest entry arrays (separate from cache-line-aligned worker state) */
+    /* Per-worker manifest entry arrays (separate from cache-line-aligned worker
+     * state) */
     cbm_pkg_entries_t *pkg_entries = calloc((size_t)worker_count, sizeof(cbm_pkg_entries_t));
     if (!pkg_entries) {
         cbm_aligned_free(workers);
@@ -1731,7 +1761,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_scale_end(&ec.scale);
     CBM_PROF_END_N("parallel_extract", "3_dispatch_workers_parallel", t_dispatch, file_count);
 
-    /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not thread-safe) */
+    /* Sub-phase: Merge all local gbufs into main gbuf (SEQUENTIAL, gbuf not
+     * thread-safe) */
     CBM_PROF_START(t_merge);
     int total_nodes = 0;
     int total_errors = 0;
@@ -1799,7 +1830,8 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
 /* ── Phase 3B: Serial Registry Build ─────────────────────────────── */
 
-/* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
+/* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns
+ * edge count. */
 /* `file_node_id` is the defining file's node id (0 when it has none), looked up
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
@@ -1878,36 +1910,7 @@ static void pp_add_file_doc(const cbm_gbuf_node_t *file_node, const char *doc) {
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                 const char *rel, CBMHashTable *namespace_map) {
-    int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!source_node) {
-        free(file_qn);
-        return 0;
-    }
-    if (cbm_language_for_filename(rel) == CBM_LANG_PHP) {
-        count = cbm_pipeline_php_create_import_edges(ctx, result, rel, file_qn, source_node,
-                                                     namespace_map);
-    } else {
-        for (int j = 0; j < result->imports.count; j++) {
-            CBMImport *imp = &result->imports.items[j];
-            if (!imp->module_path) {
-                continue;
-            }
-            const cbm_gbuf_node_t *target =
-                cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-            if (target && target->id != source_node->id) {
-                char esc_ln[CBM_SZ_128];
-                cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-                char imp_props[CBM_SZ_256];
-                snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-                cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
-                count++;
-            }
-        }
-    }
-    free(file_qn);
-    return count;
+    return cbm_pipeline_create_import_edges(ctx, result, rel, namespace_map);
 }
 
 /* Find channel source node (enclosing function or file). */
@@ -1989,6 +1992,11 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_free(CBM_MEM_CLASS_OTHER, namespaces);
     }
     free(rels);
+    /* This coordinator owns the context while it is built, including spilled
+     * source results. Workers only consume the completed binding snapshots. */
+    if (namespace_map)
+        (void)cbm_pipeline_import_context_build(ctx, files, file_count, result_cache,
+                                                namespace_map);
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
@@ -2026,7 +2034,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             int64_t file_node_id = file_node ? file_node->id : 0;
             free(file_qn);
             pp_add_file_doc(file_node, result->module_doc);
-            /* Bounds the function-local detection to this file (pass_definitions.c). */
+            /* Bounds the function-local detection to this file (pass_definitions.c).
+             */
             size_t py_prefix_len = files[i].language == CBM_LANG_PYTHON
                                        ? cbm_pipeline_fqn_symbol_prefix_len(ctx->project_name, rel)
                                        : 0;
@@ -2107,6 +2116,7 @@ typedef struct {
      * cbm_run_X_lsp_cross_with_registry — skip per-file build entirely.
      * Stored as CBMCrossLspRegistries* (typedef from pass_lsp_cross.h). */
     CBMCrossLspRegistries *cross_registries;
+    const cbm_semantic_bindings_t *structural_bindings;
 
     /* Parsed once on the coordinator thread and borrowed read-only by resolve
      * workers.  The pointer is installed into each worker's TLS slot so Rust's
@@ -2114,10 +2124,10 @@ typedef struct {
     const CBMCargoManifest *rust_manifest;
 
     /* F4: LAZILY-built shared Rust registry (built ONCE, on the first NULL-filter
-     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust files
-     * all filter to subsets never pay the O(all_defs) build + multi-GB RSS. Built
-     * under rust_shared_mu into rust_shared_arena, published via rust_shared_reg;
-     * torn down after the worker dispatch. */
+     * rust file — the ~all_defs amplifier files). Not eager: repos whose rust
+     * files all filter to subsets never pay the O(all_defs) build + multi-GB RSS.
+     * Built under rust_shared_mu into rust_shared_arena, published via
+     * rust_shared_reg; torn down after the worker dispatch. */
     _Atomic(CBMTypeRegistry *) rust_shared_reg;
     cbm_mutex_t rust_shared_mu;
     CBMArena rust_shared_arena;
@@ -2168,8 +2178,8 @@ typedef struct {
 /* Minimum buffer space needed per arg JSON object */
 #define CBM_ARG_JSON_GUARD CBM_SZ_32
 
-/* Append arg data as JSON to edge properties: ,"args":[{"i":0,"e":"x","v":"val"},...]
- * Returns new position in buffer. */
+/* Append arg data as JSON to edge properties:
+ * ,"args":[{"i":0,"e":"x","v":"val"},...] Returns new position in buffer. */
 /* Sanitize expression string for JSON (in-place). */
 static void sanitize_expr(char *expr_buf, const char *expr) {
     if (expr) {
@@ -2443,7 +2453,8 @@ static bool emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
                                    const cbm_gbuf_node_t *target, const CBMCall *call,
                                    const cbm_resolution_t *res) {
     /* A CALLS edge needs a real target; the HTTP/ASYNC external-client bypass
-     * (#523) can reach emit_service_edge with target==NULL, so guard the deref. */
+     * (#523) can reach emit_service_edge with target==NULL, so guard the deref.
+     */
     if (!target) {
         return false;
     }
@@ -2451,13 +2462,15 @@ static bool emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_2K];
     int n = snprintf(props, sizeof(props),
-                     "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d",
+                     "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\","
+                     "\"candidates\":%d",
                      esc_c, res->confidence, res->strategy ? res->strategy : "unknown",
                      res->candidate_count);
     return finalize_and_emit(gbuf, source->id, target->id, "CALLS", props, n, call);
 }
 
-/* Classify a resolved call by library identity and emit the appropriate edge. */
+/* Classify a resolved call by library identity and emit the appropriate edge.
+ */
 /* Create Route node + CALLS + HANDLES edges for a route registration call.
  * route_mount is the framework mount of the registering file ("/api" for a
  * Laravel 11+ `withRouting(api: ...)` file, #1146) or "". */
@@ -2503,8 +2516,8 @@ static bool emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
-                char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                       closing brace */
+                char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf
+                                       cuts the closing brace */
                 char esc_h2[CBM_SZ_512];
                 cbm_json_escape(esc_h2, sizeof(esc_h2), hres.qualified_name);
                 snprintf(hp, sizeof(hp), "{\"handler\":\"%s\"}", esc_h2);
@@ -2674,7 +2687,8 @@ bool extract_grpc_service_method(const char *callee, char *service, size_t srv_s
     }
     snprintf(method, meth_sz, "%s", last_dot + SKIP_ONE);
 
-    /* Extract service name: everything before the last dot, stripped of prefixes/suffixes */
+    /* Extract service name: everything before the last dot, stripped of
+     * prefixes/suffixes */
     size_t prefix_len = (size_t)(last_dot - callee);
     char raw[CBM_SZ_256];
     if (prefix_len >= sizeof(raw)) {
@@ -2754,19 +2768,20 @@ static void emit_grpc_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, cons
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_1K];
     snprintf(props, sizeof(props),
-             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\",\"confidence\":%.2f}", esc_c,
-             service, method, res->confidence);
+             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\","
+             "\"confidence\":%.2f}",
+             esc_c, service, method, res->confidence);
     cbm_gbuf_insert_edge(gbuf, source->id, route_id, "GRPC_CALLS", props);
 }
 
 /* Emit GRAPHQL_CALLS edge. The Route is keyed by the operation NAME only
  * (#598), never by the operation text:
- *   named operation          -> __graphql__<Name>                  name "<Name>"
- *   anonymous query/mutation/ -> __graphql__<type>__anonymous       name "(anonymous <type>)"
- *   subscription (incl. the `{ ... }` query shorthand)
- *   no GraphQL document      -> __graphql__operation__anonymous    name "(anonymous operation)"
- *   (URL, variable, missing string argument)
- * Keys are bounded by the GraphQL Name grammar and deterministic. */
+ *   named operation          -> __graphql__<Name>                  name
+ * "<Name>" anonymous query/mutation/ -> __graphql__<type>__anonymous       name
+ * "(anonymous <type>)" subscription (incl. the `{ ... }` query shorthand) no
+ * GraphQL document      -> __graphql__operation__anonymous    name "(anonymous
+ * operation)" (URL, variable, missing string argument) Keys are bounded by the
+ * GraphQL Name grammar and deterministic. */
 static void emit_graphql_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
                               const cbm_resolution_t *res) {
     const char *op_type = "operation";
@@ -2847,13 +2862,14 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                               const char **imp_keys, const char **imp_vals, int imp_count,
-                              bool suppress_plain_calls, const char *route_mount,
-                              CBMLanguage lang) {
+                              bool suppress_plain_calls, const char *route_mount, CBMLanguage lang,
+                              CBMCallEvidence *evidence) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
-    /* Also detect route registration by callee name suffix alone (handles unresolved
-     * local variables like app.include_router where QN resolution fails). */
+    /* Also detect route registration by callee name suffix alone (handles
+     * unresolved local variables like app.include_router where QN resolution
+     * fails). */
     if (svc == CBM_SVC_NONE && cbm_service_pattern_route_method(call->callee_name) != NULL) {
         svc = CBM_SVC_ROUTE_REG;
     }
@@ -2874,6 +2890,7 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         const char *handler_ref = NULL;
         const char *route_path = find_route_path_in_args(call, &handler_ref, lang);
         if (route_path) {
+            evidence->route_registered = true;
             return emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                            registry, main_gbuf, imp_keys, imp_vals, imp_count,
                                            route_mount, lang);
@@ -2927,7 +2944,8 @@ static bool emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
                                      const CBMCall *call, const char *module_qn,
                                      const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                      const char **imp_keys, const char **imp_vals, int imp_count,
-                                     const char *route_mount, CBMLanguage lang) {
+                                     const char *route_mount, CBMLanguage lang,
+                                     CBMCallEvidence *evidence) {
     if (cbm_service_pattern_route_method(call->callee_name) == NULL) {
         return false;
     }
@@ -2938,6 +2956,7 @@ static bool emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
     const char *handler_ref = NULL;
     const char *route_path = find_route_path_in_args(call, &handler_ref, lang);
     if (route_path) {
+        evidence->route_registered = true;
         return emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                        registry, main_gbuf, imp_keys, imp_vals, imp_count,
                                        route_mount, lang);
@@ -3441,10 +3460,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 field_index_built = true;
             }
             arrow_bound =
-                cbm_pipeline_c_member_call_resolve(
+                cbm_pipeline_c_member_call_resolve_at(
                     &result->resolved_calls, field_index_ready ? &field_index : NULL, rc->main_gbuf,
                     rc->registry, rc->project_name, call->enclosing_func_qn, call->callee_name,
-                    cbm_c_member_rule_file(lang, rel), &res) != NULL;
+                    cbm_c_member_rule_file(lang, rel), call->site_start_byte, call->site_end_byte,
+                    call->source_origin, &res) != NULL;
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -3556,9 +3576,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * receiver's binding, before the #523 spelling check and the
          * route-registration suffix fallback. MUST match pass_calls.c. */
         char client_url[CBM_SZ_512];
-        if (cbm_pipeline_http_client_call_url(rc->main_gbuf, rc->project_name, rel, result,
-                                              imp_keys, imp_vals, imp_count, call, client_url,
-                                              sizeof(client_url))) {
+        if (cbm_pipeline_http_client_call_url(
+                rc->pctx ? rc->pctx->shared_resolver : NULL, rc->main_gbuf, rc->project_name, rel,
+                result, imp_keys, imp_vals, imp_count, call, client_url, sizeof(client_url))) {
             cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
                                         .confidence = PP_HALF_CONF,
                                         .strategy = "http_client_instance"};
@@ -3566,6 +3586,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                          CBM_SVC_HTTP, client_url);
             continue;
         }
+        if (cbm_shared_resolver_http_candidate_receiver(rc->pctx ? rc->pctx->shared_resolver : NULL,
+                                                        rel, call))
+            continue;
         /* A PHP call on a proven vendor class is classified by that class
          * (#1186): it skipped the registry above, so the route-verb fallback
          * would otherwise mint a route registration for
@@ -3584,7 +3607,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 site_evidence->calls_emitted |=
                     emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
                                       module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                      imp_count, false, route_mount, lang);
+                                      imp_count, false, route_mount, lang, site_evidence);
                 continue;
             }
         }
@@ -3600,6 +3623,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            site_evidence->candidate_qn = cbm_registry_diagnostic_candidate(
+                rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang);
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
@@ -3612,7 +3637,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 site_evidence->calls_emitted |=
                     emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                       module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                      imp_count, true, route_mount, lang);
+                                      imp_count, true, route_mount, lang, site_evidence);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
@@ -3676,10 +3701,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                         cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
                     field_index_built = true;
                 }
-                target_node = cbm_pipeline_c_member_call_resolve(
+                target_node = cbm_pipeline_c_member_call_resolve_at(
                     &result->resolved_calls, field_index_ready ? &field_index : NULL, rc->main_gbuf,
                     rc->registry, rc->project_name, call->enclosing_func_qn, call->callee_name,
-                    cbm_c_member_rule_file(lang, rel), &res);
+                    cbm_c_member_rule_file(lang, rel), call->site_start_byte, call->site_end_byte,
+                    call->source_origin, &res);
                 if (!target_node || source_node->id == target_node->id) {
                     continue;
                 }
@@ -3692,7 +3718,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * behind the refused binding still gets its Route. */
             site_evidence->calls_emitted |= emit_xlang_refused_route(
                 ws->local_edge_buf, source_node, call, module_qn, rc->registry, rc->main_gbuf,
-                imp_keys, imp_vals, imp_count, route_mount, lang);
+                imp_keys, imp_vals, imp_count, route_mount, lang, site_evidence);
             continue;
         }
         if (target_node && source_node->id != target_node->id &&
@@ -3723,7 +3749,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 if (url_or_topic) {
                     site_evidence->calls_emitted |= emit_service_edge(
                         ws->local_edge_buf, source_node, NULL, call, &res, module_qn, rc->registry,
-                        rc->main_gbuf, imp_keys, imp_vals, imp_count, false, route_mount, lang);
+                        rc->main_gbuf, imp_keys, imp_vals, imp_count, false, route_mount, lang,
+                        site_evidence);
                     ws->calls_resolved++;
                 }
             }
@@ -3731,9 +3758,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         site_evidence->candidate_qn = target_node->qualified_name;
         _rc_t0 = extract_now_ns();
-        site_evidence->calls_emitted |= emit_service_edge(
-            ws->local_edge_buf, source_node, target_node, call, &res, module_qn, rc->registry,
-            rc->main_gbuf, imp_keys, imp_vals, imp_count, drop_plain_call, route_mount, lang);
+        site_evidence->calls_emitted |=
+            emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
+                              rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
+                              drop_plain_call, route_mount, lang, site_evidence);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;
@@ -3777,9 +3805,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         if (usage->kind == CBM_USAGE_VALUE &&
             cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel),
                                         usage->is_member_access)) {
-            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
                 &result->resolved_calls, field_index_ready ? &field_index : NULL,
-                usage->enclosing_func_qn, usage->ref_name);
+                usage->enclosing_func_qn, usage->ref_name, usage->site_start_byte,
+                usage->site_end_byte, usage->source_origin);
             char member_esc[CBM_SZ_256];
             cbm_json_escape(member_esc, sizeof(member_esc), usage->ref_name);
             char member_props[CBM_SZ_512];
@@ -3971,9 +4000,10 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         /* C member read/write: same owner join as resolve_file_usages. Mirrors
          * the sequential twin (pass_usages.c). */
         if (cbm_c_member_binds_by_owner(cbm_c_member_rule_file(lang, rel), rw->is_member_access)) {
-            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+            cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
                 &result->resolved_calls, field_index_ready ? &field_index : NULL,
-                rw->enclosing_func_qn, rw->var_name);
+                rw->enclosing_func_qn, rw->var_name, rw->site_start_byte, rw->site_end_byte,
+                rw->source_origin);
             const char *member_edge = rw->is_write ? "WRITES" : "READS";
             const CBMResolvedCall *owner;
             bool typed = false;
@@ -4043,6 +4073,19 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                  const pp_file_scope_t *fs, const char *mq, const char **ik,
                                  const char **iv, int ic,
                                  const cbm_php_vendor_names_t *php_vendor) {
+    /* Bases only the shared resolver can follow: reexports and star imports. */
+    for (size_t b = 0; fs->lang == CBM_LANG_PYTHON && rc->pctx; b++) {
+        const char *base_qn =
+            cbm_shared_resolver_python_base(rc->pctx->shared_resolver, def->qualified_name, b);
+        if (!base_qn)
+            break;
+        const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, base_qn);
+        if (bn && node->id != bn->id) {
+            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id,
+                                 cbm_semantic_base_edge_type(bn), "{}");
+            ws->semantic_resolved++;
+        }
+    }
     if (!def->base_classes) {
         return;
     }
@@ -4059,6 +4102,12 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             rc->registry, rc->main_gbuf, def->qualified_name, def->base_classes[b], fs->lang);
         if (!bqn) {
             bqn = resolve_as_class(rc->registry, def->base_classes[b], mq, ik, iv, ic, fs->lang);
+            if ((fs->lang == CBM_LANG_TYPESCRIPT || fs->lang == CBM_LANG_TSX ||
+                 fs->lang == CBM_LANG_KOTLIN || fs->lang == CBM_LANG_PHP ||
+                 fs->lang == CBM_LANG_CSHARP || fs->lang == CBM_LANG_CPP) &&
+                def->label && !strcmp(def->label, "Class"))
+                bqn = cbm_semantic_class_base(rc->structural_bindings, def, def->base_classes[b],
+                                              bqn ? cbm_gbuf_find_by_qn(rc->main_gbuf, bqn) : NULL);
             if (!bqn || cbm_python_external_base_contradicts(
                             fs->lang, fs->imports, def->base_classes[b], bqn, rc->main_gbuf,
                             rc->project_name, fs->rel)) {
@@ -4140,8 +4189,9 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
             char dp[CBM_SZ_512];
             snprintf(dp, sizeof(dp), "{\"decorator\":\"%s\"}", esc_dec);
             cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn_id, "DECORATES", dp);
-            /* Ensure a reference-style edge exists so the decorator appears in queries
-             * without being misclassified as a real call by downstream passes. */
+            /* Ensure a reference-style edge exists so the decorator appears in
+             * queries without being misclassified as a real call by downstream
+             * passes. */
             cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, dn_id, "USAGE", "{}");
             ws->semantic_resolved++;
         }
@@ -4169,17 +4219,10 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count, lang);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
-        CBMImplTrait *it = &result->impl_traits.items[t];
-        if (!it->trait_name || !it->struct_name) {
+        const char *tqn = NULL, *sqn = NULL;
+        if (!cbm_semantic_rust_implementation(rc->structural_bindings, rel,
+                                              &result->impl_traits.items[t], &sqn, &tqn))
             continue;
-        }
-        const char *tqn = resolve_as_class(rc->registry, it->trait_name, module_qn, imp_keys,
-                                           imp_vals, imp_count, lang);
-        const char *sqn = resolve_as_class(rc->registry, it->struct_name, module_qn, imp_keys,
-                                           imp_vals, imp_count, lang);
-        if (!tqn || !sqn) {
-            continue;
-        }
         const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(rc->main_gbuf, tqn);
         const cbm_gbuf_node_t *sn = cbm_gbuf_find_by_qn(rc->main_gbuf, sqn);
         if (tn && sn && tn->id != sn->id) {
@@ -4189,11 +4232,12 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
     }
 }
 
-/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by the
- * first worker that hits a NULL-filter rust file; later null-files reuse it. Fast
- * path is a lock-free atomic load; the build happens under rust_shared_mu into the
- * dedicated rust_shared_arena (never a shared pipeline arena from a worker thread).
- * Returns NULL if there are no defs (caller falls back to the per-file build). */
+/* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by
+ * the first worker that hits a NULL-filter rust file; later null-files reuse
+ * it. Fast path is a lock-free atomic load; the build happens under
+ * rust_shared_mu into the dedicated rust_shared_arena (never a shared pipeline
+ * arena from a worker thread). Returns NULL if there are no defs (caller falls
+ * back to the per-file build). */
 static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
     CBMTypeRegistry *p = atomic_load_explicit(&rc->rust_shared_reg, memory_order_acquire);
     if (p)
@@ -4218,7 +4262,8 @@ static CBMTypeRegistry *pp_rust_shared_registry(resolve_ctx_t *rc) {
 }
 
 /* void*-typed adapter so the shared dispatch helper (pass_lsp_cross.c) can
- * borrow the lazily-built shared Rust registry without knowing resolve_ctx_t. */
+ * borrow the lazily-built shared Rust registry without knowing resolve_ctx_t.
+ */
 static CBMTypeRegistry *pp_rust_shared_registry_get(void *ctx) {
     return pp_rust_shared_registry((resolve_ctx_t *)ctx);
 }
@@ -4233,6 +4278,26 @@ static int pp_call_reference_site_count(const CBMFileResult *result, CBMLanguage
     return count;
 }
 
+/* Legacy local passes can fill every site with high-confidence name results
+ * without running source proof adapters. No language may discharge project-
+ * registry work with those rows: only an immutable proof for this exact
+ * occurrence may suppress it. This is a constant-time scheduling check, not
+ * edge admission. */
+static bool pp_has_source_proof(const CBMResolvedCall *resolved) {
+    const cbm_resolve_proof_view_t *proof = cbm_resolve_proof_view(resolved->evidence.proof);
+    return proof && proof->kind == CBM_PROOF_OCCURRENCE_BINDING && proof->predecessors_closed &&
+           cbm_resolve_admit(&proof->outcome) &&
+           resolved->evidence.analysis == proof->outcome.analysis &&
+           resolved->evidence.rule == proof->outcome.rule &&
+           resolved->evidence.facts == proof->outcome.facts &&
+           resolved->site_end_byte > resolved->site_start_byte &&
+           resolved->site_start_byte == proof->key.start_byte &&
+           resolved->site_end_byte == proof->key.end_byte &&
+           resolved->source_origin == proof->source.source_origin && resolved->callee_qn &&
+           !strcmp(resolved->callee_qn, proof->outcome.target) && resolved->caller_qn &&
+           proof->source.scope && !strcmp(resolved->caller_qn, proof->source.scope);
+}
+
 static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
     int count = 0;
     for (int i = 0; i < result->resolved_calls.count; i++) {
@@ -4240,7 +4305,7 @@ static int pp_qualified_lsp_site_count(const CBMFileResult *result) {
         if ((resolved->kind == CBM_RESOLVED_INVOCATION ||
              resolved->kind == CBM_RESOLVED_CALL_REFERENCE) &&
             resolved->caller_qn && resolved->callee_qn &&
-            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR) {
+            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR && pp_has_source_proof(resolved)) {
             count++;
         }
     }
@@ -4265,7 +4330,8 @@ static bool pp_has_pending_lsp_site(const CBMFileResult *result) {
             resolved->site_end_byte <= resolved->site_start_byte) {
             continue;
         }
-        if (resolved->reason || resolved->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if (resolved->reason || resolved->confidence < CBM_LSP_CONFIDENCE_FLOOR ||
+            !pp_has_source_proof(resolved)) {
             return true;
         }
     }
@@ -4292,8 +4358,14 @@ static CBMFileResult *resolve_load_result(resolve_ctx_t *rc, resolve_worker_stat
 
 static void resolve_capture_coverage(const resolve_ctx_t *rc, const char *rel,
                                      const CBMFileResult *result, const CBMCallEvidence *evidence) {
-    cbm_pipeline_record_unresolved_calls(rc->pctx ? rc->pctx->pipeline : NULL, rel, result,
-                                         evidence);
+    if (rc->pctx && rc->pctx->shared_resolver) {
+        const cbm_gbuf_node_t *file = cbm_pipeline_file_node(rc->main_gbuf, rc->project_name, rel);
+        cbm_pipeline_record_unresolved_calls_for_projection(
+            rc->pctx->pipeline, rel, result, file ? file->qualified_name : NULL, evidence);
+    } else {
+        cbm_pipeline_record_unresolved_calls(rc->pctx ? rc->pctx->pipeline : NULL, rel, result,
+                                             evidence);
+    }
 }
 
 /* A C member access binds only through a field-owner row. The per-file walk
@@ -4315,9 +4387,9 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
         if (usage->kind != CBM_USAGE_VALUE || !usage->is_member_access || !usage->ref_name) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners =
-            cbm_pipeline_lsp_field_cursor(&result->resolved_calls, ready ? &field_index : NULL,
-                                          usage->enclosing_func_qn, usage->ref_name);
+        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
+            &result->resolved_calls, ready ? &field_index : NULL, usage->enclosing_func_qn,
+            usage->ref_name, usage->site_start_byte, usage->site_end_byte, usage->source_origin);
         unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
     }
     for (int i = 0; i < result->rw.count && !unowned; i++) {
@@ -4325,9 +4397,9 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
         if (!rw->is_member_access || !rw->var_name) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners =
-            cbm_pipeline_lsp_field_cursor(&result->resolved_calls, ready ? &field_index : NULL,
-                                          rw->enclosing_func_qn, rw->var_name);
+        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
+            &result->resolved_calls, ready ? &field_index : NULL, rw->enclosing_func_qn,
+            rw->var_name, rw->site_start_byte, rw->site_end_byte, rw->source_origin);
         unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
     }
     for (int i = 0; i < result->calls.count && !unowned; i++) {
@@ -4336,16 +4408,17 @@ static bool pp_has_unowned_c_member(const CBMFileResult *result, CBMLanguage lan
             (!strchr(call->callee_name, '.') && !strstr(call->callee_name, "->"))) {
             continue;
         }
-        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor(
+        cbm_pipeline_lsp_field_cursor_t owners = cbm_pipeline_lsp_field_cursor_at(
             &result->resolved_calls, ready ? &field_index : NULL, call->enclosing_func_qn,
-            cbm_lsp_bare_segment(call->callee_name));
+            cbm_lsp_bare_segment(call->callee_name), call->site_start_byte, call->site_end_byte,
+            call->source_origin);
         unowned = cbm_pipeline_lsp_field_next(&owners) == NULL;
     }
     cbm_pipeline_lsp_field_index_free(&field_index);
     return unowned;
 }
 
-static void resolve_worker(int worker_id, void *ctx_ptr) {
+static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
     resolve_ctx_t *rc = ctx_ptr;
     resolve_worker_state_t *ws = &rc->workers[worker_id];
 
@@ -4436,19 +4509,27 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         int qualified_lsp_sites = pp_qualified_lsp_site_count(result);
         bool pending_lsp_site = pp_has_pending_lsp_site(result);
         bool unowned_c_member = pp_has_unowned_c_member(result, lang, rel);
+        /* C and C++ values, fields and written types bind in the translation unit as
+         * well, and the Java, Kotlin and C# strict walk binds its own fields and types, so
+         * a file with no call left to resolve can still hold those sites. The sequential
+         * route has no such filter and the two routes must agree. */
+        bool value_sites =
+            (lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+             cbm_oo_language(lang)) &&
+            (result->usages.count > 0 || result->rw.count > 0 || result->type_refs.count > 0);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              (((semantic_sites > 0 || pending_lsp_site) &&
                (jvm_cross_lsp || rust_workspace_cross_lsp || pending_lsp_site ||
                 qualified_lsp_sites < semantic_sites)) ||
-              unowned_c_member) &&
+              unowned_c_member || value_sites) &&
              !is_generated) ||
             result->has_test_definition_owners;
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
-            result->rw.count == 0 && result->defs.count == 0 && result->impl_traits.count == 0 &&
-            !cross_lsp_eligible) {
+            result->rw.count == 0 && result->type_refs.count == 0 && result->defs.count == 0 &&
+            result->impl_traits.count == 0 && !cross_lsp_eligible) {
             resolve_capture_coverage(rc, rel, result, NULL);
             continue;
         }
@@ -4460,8 +4541,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, result, &imp_keys,
-                                 &imp_vals, &imp_count);
+        if (cbm_pxc_build_import_map(rc->pctx, rel, lang, result, &imp_keys, &imp_vals,
+                                     &imp_count) != 0)
+            atomic_store(&rc->pctx->resolver_failed, true);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
         cbm_php_vendor_names_t php_vendor;
@@ -4542,15 +4624,17 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 int lsp_count = 0;
                 bool own_lsp_map = cbm_pxc_result_has_type_only_import(result);
                 if (own_lsp_map) {
-                    cbm_pxc_build_import_map_ex(rc->main_gbuf, rc->project_name, rel, lang, result,
-                                                true, &lsp_keys, &lsp_vals, &lsp_count);
+                    if (cbm_pxc_build_import_map_ex(rc->pctx, rel, lang, result, true, &lsp_keys,
+                                                    &lsp_vals, &lsp_count) != 0)
+                        atomic_store(&rc->pctx->resolver_failed, true);
                 }
-                cbm_pxc_dispatch_file_with_php_bindings(
+                cbm_pxc_dispatch_file_with_imports(
                     lang, result, lsp_source, lsp_source_len, rel, def_module, rc->cross_registries,
                     rc->module_def_index, rc->all_defs, rc->def_count,
                     own_lsp_map ? lsp_keys : imp_keys, own_lsp_map ? lsp_vals : imp_vals,
                     own_lsp_map ? lsp_count : imp_count, pp_rust_shared_registry_get, rc,
-                    &php_vendor);
+                    &php_vendor,
+                    cbm_pipeline_import_snapshot(rc->main_gbuf, rc->project_name, rel, result));
                 if (own_lsp_map) {
                     cbm_pxc_free_import_map(lsp_keys, lsp_vals, lsp_count);
                 }
@@ -4648,6 +4732,22 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                                       ws->local_edge_buf);
         }
 
+        if (rc->pctx && rc->pctx->shared_resolver) {
+            cbm_resolver_file_t input = {.ctx = rc->pctx,
+                                         .registry = rc->registry,
+                                         .graph = rc->main_gbuf,
+                                         .output = ws->local_edge_buf,
+                                         .result = result,
+                                         .rel_path = rel,
+                                         .module_qn = module_qn,
+                                         .language = lang,
+                                         .import_keys = imp_keys,
+                                         .import_values = imp_vals,
+                                         .import_count = imp_count};
+            if (!cbm_shared_resolver_file(rc->pctx->shared_resolver, &input))
+                atomic_store(&rc->pctx->resolver_failed, true);
+        }
+
     resolve_file_cleanup:
         /* Capture the resolved file and side evidence before releasing either,
          * including files loaded from the spill store. */
@@ -4681,6 +4781,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_service_pattern_cache_end();
     cbm_pxc_thread_scratch_end();
     file_node_cache_clear();
+}
+
+static void resolve_worker(int worker_id, void *ctx_ptr) {
+    resolve_ctx_t *context = ctx_ptr;
+    cbm_resolve_stats_t *previous =
+        cbm_resolve_stats_bind(context->pctx ? context->pctx->resolver_stats : NULL);
+    resolve_worker_impl(worker_id, ctx_ptr);
+    cbm_resolve_stats_bind(previous);
 }
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
@@ -4722,6 +4830,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
 
+    cbm_semantic_bindings_t *structural_bindings =
+        cbm_semantic_bindings_build(ctx, files, file_count, result_cache);
+    if (!structural_bindings) {
+        cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
+        cbm_aligned_free(workers);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+
     bool have_rust = false;
     for (int i = 0; i < file_count; i++) {
         if (files[i].language == CBM_LANG_RUST &&
@@ -4760,6 +4876,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .def_modules = def_modules,
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
+        .structural_bindings = structural_bindings,
         .rust_manifest = rust_manifest_ptr,
         .lsp_failures = lsp_failures,
     };
@@ -4771,7 +4888,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_mutex_init(&rc.rust_shared_mu);
     rc.rust_shared_arena_live = false;
 
-    /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution, PARALLEL) */
+    /* Sub-phase: Dispatch resolve workers (per-file call/usage resolution,
+     * PARALLEL) */
     CBM_PROF_START(t_resolve_dispatch);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
     cbm_scale_begin(&rc.scale, "parallel_resolve", (long)file_count);
@@ -4785,9 +4903,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                                         "lsp_skipped");
     }
     cbm_free(CBM_MEM_CLASS_OTHER, lsp_failures);
+    cbm_semantic_bindings_free(structural_bindings);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
-     * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
-     * all QNs, so freeing all_defs afterward is safe). */
+     * Free its dedicated arena + the lock (registry was self-contained: it
+     * strdup'd all QNs, so freeing all_defs afterward is safe). */
     if (rc.rust_shared_arena_live) {
         cbm_arena_destroy(&rc.rust_shared_arena);
         rc.rust_shared_arena_live = false;
@@ -4803,6 +4922,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     int total_usages = 0;
     int total_semantic = 0;
     int total_lsp_overrides = 0;
+    size_t resolution_rows = 0;
+    for (int i = 0; i < worker_count; i++)
+        resolution_rows += cbm_gbuf_resolution_count(workers[i].local_edge_buf);
+    (void)cbm_gbuf_reserve_resolutions(ctx->gbuf, resolution_rows); /* a failure only costs room */
     for (int i = 0; i < worker_count; i++) {
         if (workers[i].local_edge_buf) {
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_edge_buf);

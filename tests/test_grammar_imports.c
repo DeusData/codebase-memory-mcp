@@ -136,6 +136,16 @@ TEST(grammar_imports_extracted) {
             continue;
         }
         int got = r->imports.count;
+        for (int j = 0; j < got; j++) {
+            const CBMImport *import = &r->imports.items[j];
+            if (import->source_origin != CBM_SOURCE_ORIGIN_RAW ||
+                import->site_end_byte <= import->site_start_byte ||
+                import->site_end_byte > strlen(c->content)) {
+                fprintf(stderr, "  [IMPORTS] FAIL %-12s occurrence %d has invalid source span\n",
+                        c->name, j);
+                failures++;
+            }
+        }
         cbm_free_result(r);
         if (got < c->expected) {
             fprintf(stderr, "  [IMPORTS] FAIL %-12s imports=%d expected>=%d%s%s\n", c->name, got,

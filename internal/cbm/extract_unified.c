@@ -937,6 +937,39 @@ static const char *py_nearest_scope_qn(const WalkState *state) {
 }
 
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
+/* Is this function a member of an anonymous class body? Kotlin's grammar sometimes
+ * reads `object : T() { members }` as a call of the literal with a trailing lambda. */
+static bool jvm_anonymous_member(CBMLanguage language, TSNode function) {
+    if (language != CBM_LANG_JAVA && language != CBM_LANG_KOTLIN) {
+        return false;
+    }
+    TSNode body = ts_node_parent(function);
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    TSNode owner = ts_node_parent(body);
+    if (ts_node_is_null(owner)) {
+        return false;
+    }
+    const char *owner_kind = ts_node_type(owner);
+    if (strcmp(ts_node_type(body), "class_body") == 0) {
+        return strcmp(owner_kind, "object_creation_expression") == 0 ||
+               strcmp(owner_kind, "object_literal") == 0;
+    }
+    if (language != CBM_LANG_KOTLIN || strcmp(ts_node_type(body), "statements") != 0 ||
+        strcmp(owner_kind, "lambda_literal") != 0) {
+        return false;
+    }
+    TSNode annotated = ts_node_parent(owner);
+    TSNode suffix = ts_node_is_null(annotated) ? annotated : ts_node_parent(annotated);
+    TSNode call = ts_node_is_null(suffix) ? suffix : ts_node_parent(suffix);
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0 ||
+        ts_node_named_child_count(call) == 0) {
+        return false;
+    }
+    return strcmp(ts_node_type(ts_node_named_child(call, 0)), "object_literal") == 0;
+}
+
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
     /* Raw configured definitions already own the canonical QN, including
@@ -944,6 +977,13 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     const char *configured_qn = cbm_test_definition_qn(ctx, node);
     if (configured_qn) {
         return configured_qn;
+    }
+
+    /* A member of an anonymous class has no node of its own. Like a lambda's body,
+     * its body belongs to the enclosing declaration; a QN of its own named a source
+     * no node carries, and every call in it was dropped. */
+    if (jvm_anonymous_member(ctx->language, node) && state->enclosing_func_qn) {
+        return state->enclosing_func_qn;
     }
 
     (void)spec;
@@ -1089,7 +1129,12 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * SCSS mixin, SQL create_function, Julia short-form, etc., so
      * push_boundary_scopes never pushed a SCOPE_FUNC and the calls inside were
      * mis-attributed to the enclosing Module (QUALITY_ANALYSIS gap #3). */
-    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
+    if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
+        cbm_js_function_inside_class_member(node)) {
+        return NULL;
+    }
+    TSNode name_node = cbm_resolve_func_name_in_source(node, ctx->language, ctx->source);
     if (ts_node_is_null(name_node)) {
         return NULL;
     }
@@ -1194,6 +1239,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
+        /* `companion object { }` is named Companion by the language. */
+        if (ts_node_is_null(name_node) && state && state->enclosing_class_qn &&
+            strcmp(ts_node_type(node), "companion_object") == 0) {
+            return cbm_arena_sprintf(ctx->arena, "%s.Companion", state->enclosing_class_qn);
+        }
     }
     /* Objective-C: class_interface / class_implementation have no `name` field;
      * the class name is a plain `identifier` child. Without this the walk pushes
@@ -2461,6 +2511,43 @@ static TSNode objectscript_routine_preceding_tag(TSNode node) {
     return (TSNode){0};
 }
 
+/* A Python default is evaluated while its enclosing namespace executes,
+ * before the new function is called. Keep the declaration's lexical frame
+ * (including annotation/parameter metadata), but borrow its displaced caller
+ * for exactly the value subtree. The normal scope pop restores body ownership. */
+static bool push_python_default_owner(CBMExtractCtx *ctx, TSNode node, WalkState *state,
+                                      uint32_t depth, const char *field) {
+    if (ctx->language != CBM_LANG_PYTHON || !field || strcmp(field, "value") ||
+        state->scope_top == 0)
+        return false;
+    TSNode parameter = ts_node_parent(node);
+    const char *kind = ts_node_type(parameter);
+    if (strcmp(kind, "default_parameter") && strcmp(kind, "typed_default_parameter"))
+        return false;
+    TSNode parameters = ts_node_parent(parameter);
+    TSNode function = ts_node_parent(parameters);
+    if (strcmp(ts_node_type(parameters), "parameters") ||
+        strcmp(ts_node_type(function), "function_definition"))
+        return false;
+    const CBMWalkScope *frame = &state->scopes[state->scope_top - SKIP_ONE];
+    const CBMLexicalScope *scope = lexical_scope_by_id(state, frame->lexical_scope_id);
+    if (frame->kind != SCOPE_FUNC || !scope || scope->start_byte != ts_node_start_byte(function) ||
+        scope->end_byte != ts_node_end_byte(function))
+        return false;
+    const char *caller = frame->prev_enclosing_func_qn;
+    if (!push_scope(state, SCOPE_LEXICAL, depth, NULL)) {
+        state->lexical_binding_tracking_failed = true;
+        return false;
+    }
+    state->enclosing_func_qn = caller;
+    return true;
+}
+
+const char *cbm_declaration_scope_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                     WalkState *state) {
+    return compute_func_qn(ctx, node, spec, state);
+}
+
 static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                 WalkState *state, uint32_t depth) {
     for (int i = 0; i < state->scope_top; i++) {
@@ -2873,6 +2960,8 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
              * the old whole-stack recompute here was O(depth) per node and
              * quadratic on the deep-nesting torture tests. */
             pop_expired_scopes(&state, depth);
+            (void)push_python_default_owner(ctx, node, &state, depth,
+                                            ts_tree_cursor_current_field_name(&cursor));
             (void)push_pre_node_scope(ctx, node, spec, &state, depth);
 
             handle_string_constants(ctx, node, &state);

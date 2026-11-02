@@ -4,6 +4,7 @@
 #include "str_util.h"
 #include "arena.h" // CBMArena, cbm_arena_alloc/strdup/strndup
 #include "foundation/constants.h"
+#include <stdint.h>
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -334,6 +335,93 @@ bool cbm_is_project_index_db(const char *filename) {
         return false;
     }
     return !cbm_is_internal_cache_db(filename);
+}
+
+static bool utf8_is_continuation(unsigned char c) {
+    return (c & 0xC0) == 0x80;
+}
+
+size_t cbm_utf8_sequence_len(const unsigned char *p, const unsigned char *end) {
+    size_t remaining = (size_t)(end - p);
+    unsigned char c = *p;
+    if (c < 0x80) {
+        return 1;
+    }
+    if (c >= 0xC2 && c <= 0xDF && remaining >= 2 && utf8_is_continuation(p[1])) {
+        return 2;
+    }
+    if (c == 0xE0 && remaining >= 3 && p[1] >= 0xA0 && p[1] <= 0xBF && utf8_is_continuation(p[2])) {
+        return 3;
+    }
+    if (c >= 0xE1 && c <= 0xEC && remaining >= 3 && utf8_is_continuation(p[1]) &&
+        utf8_is_continuation(p[2])) {
+        return 3;
+    }
+    if (c == 0xED && remaining >= 3 && p[1] >= 0x80 && p[1] <= 0x9F && utf8_is_continuation(p[2])) {
+        return 3;
+    }
+    if (c >= 0xEE && c <= 0xEF && remaining >= 3 && utf8_is_continuation(p[1]) &&
+        utf8_is_continuation(p[2])) {
+        return 3;
+    }
+    if (c == 0xF0 && remaining >= 4 && p[1] >= 0x90 && p[1] <= 0xBF && utf8_is_continuation(p[2]) &&
+        utf8_is_continuation(p[3])) {
+        return 4;
+    }
+    if (c >= 0xF1 && c <= 0xF3 && remaining >= 4 && utf8_is_continuation(p[1]) &&
+        utf8_is_continuation(p[2]) && utf8_is_continuation(p[3])) {
+        return 4;
+    }
+    if (c == 0xF4 && remaining >= 4 && p[1] >= 0x80 && p[1] <= 0x8F && utf8_is_continuation(p[2]) &&
+        utf8_is_continuation(p[3])) {
+        return 4;
+    }
+    return 0;
+}
+
+bool cbm_utf8_valid(const char *s, size_t len) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *end = p + len;
+    while (p < end) {
+        size_t n = cbm_utf8_sequence_len(p, end);
+        if (n == 0) {
+            return false;
+        }
+        p += n;
+    }
+    return true;
+}
+
+char *cbm_utf8_lossy_dup(cbm_mem_class_t cls, const char *s, size_t len, size_t *out_len) {
+    enum { REPLACEMENT_LEN = 3 };
+    if (!s || len > (SIZE_MAX - 1) / REPLACEMENT_LEN) {
+        return NULL;
+    }
+    char *out = cbm_alloc(cls, len * REPLACEMENT_LEN + 1);
+    if (!out) {
+        return NULL;
+    }
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *end = p + len;
+    unsigned char *dst = (unsigned char *)out;
+    while (p < end) {
+        size_t n = cbm_utf8_sequence_len(p, end);
+        if (n > 0) {
+            memcpy(dst, p, n);
+            dst += n;
+            p += n;
+        } else {
+            *dst++ = 0xEF;
+            *dst++ = 0xBF;
+            *dst++ = 0xBD;
+            p++;
+        }
+    }
+    *dst = '\0';
+    if (out_len) {
+        *out_len = (size_t)(dst - (unsigned char *)out);
+    }
+    return out;
 }
 
 int cbm_utf8_trim_partial(char *buf) {

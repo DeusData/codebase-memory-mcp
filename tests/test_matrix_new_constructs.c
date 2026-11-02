@@ -2,8 +2,8 @@
  * test_matrix_new_constructs.c — New-constructs probe across languages.
  *
  * Green = guard (node/edge already produced correctly).
- * Red   = bug found (node/edge not produced as expected; kept with a brief
- *         comment naming the suspected root cause).
+ * Missing proved relations are resolver quality debt; a false target is a bug.
+ * Source-authored relation oracles keep those outcomes separate.
  *
  * Probed construct families (each spans multiple languages):
  *   1. Type aliases / typedefs / `type X = ...`
@@ -17,9 +17,8 @@
  *   9. Nested / local / inner functions calling enclosing scope
  *  10. Module / namespace nesting (module nodes + CONTAINS)
  *
- * Strategy: assert expected nodes or edges; RED means the pipeline is missing
- * something, not that the fixture is wrong.  We use assertive floors (>= 1 for
- * the presence of a node class) so grammar refreshes don't flip green tests.
+ * Structural floors remain node guards. Migrated relation checks enumerate
+ * genuine source occurrences, require retained controls, and reject wrong edges.
  *
  * Do NOT register in test_main.c — run via standalone suite_matrix_new_constructs().
  */
@@ -27,6 +26,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "resolver_quality.h"
 #include "cbm.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
@@ -58,33 +58,39 @@ typedef struct {
 
 static void mn_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\') *p = '/';
+        if (*p == '\\')
+            *p = '/';
     }
 }
 
 static cbm_store_t *mn_open_indexed(MN_LangProj *lp) {
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project) return NULL;
+    if (!lp->project)
+        return NULL;
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
+    if (!home)
+        home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv) return NULL;
+    if (!lp->srv)
+        return NULL;
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp) free(resp);
+    if (resp)
+        free(resp);
     return cbm_store_open_path(lp->dbpath);
 }
 
 static cbm_store_t *mn_index_files(MN_LangProj *lp, const MN_LangFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_mn_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir))
+        return NULL;
     mn_to_fwd_slashes(lp->tmpdir);
     for (int i = 0; i < nfiles; i++) {
         char path[700];
@@ -95,8 +101,9 @@ static cbm_store_t *mn_index_files(MN_LangProj *lp, const MN_LangFile *files, in
             cbm_mkdir_p(path, 0755);
             *slash = '/';
         }
-        FILE *f = fopen(path, "wb");
-        if (!f) return NULL;
+        FILE *f = cbm_fopen(path, "wb");
+        if (!f)
+            return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
@@ -104,8 +111,12 @@ static cbm_store_t *mn_index_files(MN_LangProj *lp, const MN_LangFile *files, in
 }
 
 static void mn_cleanup(MN_LangProj *lp, cbm_store_t *store) {
-    if (store) cbm_store_close(store);
-    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
+    if (store)
+        cbm_store_close(store);
+    if (lp->srv) {
+        cbm_mcp_server_free(lp->srv);
+        lp->srv = NULL;
+    }
     free(lp->project);
     lp->project = NULL;
     th_rmtree(lp->tmpdir);
@@ -147,47 +158,14 @@ static int mn_named_node_match_count(cbm_store_t *store, const char *project, co
     return matches;
 }
 
-static int mn_exact_edge_by_qn_suffix(cbm_store_t *store, const char *project,
-                                      const char *edge_type, const char *source_suffix,
-                                      const char *target_suffix) {
-    cbm_node_t *sources = NULL;
-    cbm_node_t *targets = NULL;
-    int source_count = 0;
-    int target_count = 0;
-    if (cbm_store_find_nodes_by_qn_suffix(store, project, source_suffix, &sources, &source_count) !=
-            CBM_STORE_OK ||
-        cbm_store_find_nodes_by_qn_suffix(store, project, target_suffix, &targets, &target_count) !=
-            CBM_STORE_OK ||
-        source_count != 1 || target_count != 1) {
-        cbm_store_free_nodes(sources, source_count);
-        cbm_store_free_nodes(targets, target_count);
-        return -1;
-    }
-    cbm_edge_t *edges = NULL;
-    int edge_count = 0;
-    int matches = -1;
-    if (cbm_store_find_edges_by_source_type(store, sources[0].id, edge_type, &edges, &edge_count) ==
-        CBM_STORE_OK) {
-        matches = 0;
-        for (int i = 0; i < edge_count; i++) {
-            if (edges[i].target_id == targets[0].id) {
-                matches++;
-            }
-        }
-    }
-    cbm_store_free_edges(edges, edge_count);
-    cbm_store_free_nodes(sources, source_count);
-    cbm_store_free_nodes(targets, target_count);
-    return matches;
-}
-
 /* Sum type-like nodes (Class + Struct + Interface + Enum + Trait + Type). */
 static int mn_type_nodes(cbm_store_t *store, const char *project) {
     static const char *labels[] = {"Class", "Struct", "Interface", "Enum", "Trait", "Type", NULL};
     int total = 0;
     for (int i = 0; labels[i]; i++) {
         int n = mn_count_label(store, project, labels[i]);
-        if (n > 0) total += n;
+        if (n > 0)
+            total += n;
     }
     return total;
 }
@@ -198,11 +176,11 @@ static int mn_callables_with_outbound(cbm_store_t *store, const char *project) {
     int total = 0;
     for (int i = 0; callable_labels[i]; i++) {
         cbm_search_params_t p = {0};
-        p.project    = project;
-        p.label      = callable_labels[i];
+        p.project = project;
+        p.label = callable_labels[i];
         p.min_degree = 1;
         p.max_degree = -1;
-        p.limit      = 100;
+        p.limit = 100;
         cbm_search_output_t out = {0};
         if (cbm_store_search(store, &p, &out) == CBM_STORE_OK)
             total += out.count;
@@ -216,7 +194,7 @@ typedef struct {
     int ok;
     int functions;
     int methods;
-    int types;   /* all type-like combined */
+    int types; /* all type-like combined */
     int calls;
     int callers;
     int inherits;
@@ -229,14 +207,14 @@ static MN_Metrics mn_metrics_files(const MN_LangFile *files, int nfiles) {
     cbm_store_t *store = mn_index_files(&lp, files, nfiles);
     MN_Metrics m = {0};
     if (store) {
-        m.ok             = 1;
-        m.functions      = mn_count_label(store, lp.project, "Function");
-        m.methods        = mn_count_label(store, lp.project, "Method");
-        m.types          = mn_type_nodes(store, lp.project);
-        m.calls          = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
-        m.callers        = mn_callables_with_outbound(store, lp.project);
-        m.inherits       = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
-        m.implements     = cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS");
+        m.ok = 1;
+        m.functions = mn_count_label(store, lp.project, "Function");
+        m.methods = mn_count_label(store, lp.project, "Method");
+        m.types = mn_type_nodes(store, lp.project);
+        m.calls = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
+        m.callers = mn_callables_with_outbound(store, lp.project);
+        m.inherits = cbm_store_count_edges_by_type(store, lp.project, "INHERITS");
+        m.implements = cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS");
         m.defines_method = cbm_store_count_edges_by_type(store, lp.project, "DEFINES_METHOD");
     }
     mn_cleanup(&lp, store);
@@ -246,6 +224,228 @@ static MN_Metrics mn_metrics_files(const MN_LangFile *files, int nfiles) {
 static MN_Metrics mn_metrics(const char *filename, const char *content) {
     MN_LangFile f = {filename, content};
     return mn_metrics_files(&f, 1);
+}
+
+/* Source-authored obligations replace aggregate CALLS floors. The covered
+ * callers contain every project call listed below; external library bodies,
+ * anonymous closure bodies and unrelated callers remain outside this domain. */
+typedef struct {
+    const char *test, *caller, *needle, *target, *declaration, *label;
+    int line;
+    unsigned occurrence;
+    bool required; /* the strict resolver admits this binding: losing it is a failure */
+} MN_Golden;
+static const MN_Golden mn_goldens[] = {
+    {"mn_type_alias_rust", "run", "parse(\"42\")", "parse", "fn parse(s: &str) -> Res<i32> {",
+     "Function", 3, 0, true},
+    {"mn_multiple_trait_bounds_rust", "run", "print_both(42)", "print_both",
+     "fn print_both<T: Debug + Display>(val: T) {", "Function", 3, 0, true},
+    {"mn_multiple_trait_bounds_rust", "run", "print_both(\"hello\")", "print_both",
+     "fn print_both<T: Debug + Display>(val: T) {", "Function", 3, 0, true},
+    {"mn_extension_rust_impl", "demo", "Queue::new()", "new",
+     "    pub fn new() -> Self { Queue { buf: std::collections::VecDeque::new() } }", "Method", 6,
+     0, true},
+    {"mn_extension_rust_impl", "demo", "q.enqueue(1)", "enqueue",
+     "    pub fn enqueue(&mut self, item: T) { self.buf.push_back(item); }", "Method", 7, 0, true},
+    {"mn_extension_rust_impl", "demo", "q.dequeue()", "dequeue",
+     "    pub fn dequeue(&mut self) -> Option<T> { self.buf.pop_front() }", "Method", 8, 0, true},
+    {"mn_record_kotlin_data_class", "anon", "User(\"anon\", 0)", "User",
+     "data class User(val name: String, val age: Int) {", "Class", 1, 0, true},
+    {"mn_record_kotlin_data_class", "run", "User.anon()", "anon",
+     "        fun anon(): User = User(\"anon\", 0)", "Method", 6, 0, true},
+    {"mn_record_kotlin_data_class", "run", "User.anon().greet()", "greet",
+     "    fun greet(): String = \"Hi, $name\"", "Method", 3, 0, true},
+    {"mn_record_rust_derive", "origin", "Self::new(0.0, 0.0)", "new",
+     "    fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 8, 0, true},
+    {"mn_record_rust_derive", "run", "Point::new(3.0, 0.0)", "new",
+     "    fn new(x: f64, y: f64) -> Self { Point { x, y } }", "Method", 8, 0, true},
+    {"mn_record_rust_derive", "run", "Point::origin()", "origin",
+     "    fn origin() -> Self { Self::new(0.0, 0.0) }", "Method", 12, 0, true},
+    {"mn_record_rust_derive", "run", "a.distance(&Point::origin())", "distance",
+     "    fn distance(&self, other: &Self) -> f64 {", "Method", 9, 0, true},
+    {"mn_default_params_python", "farewell", "greet(name, prefix=msg)", "greet",
+     "def greet(name, prefix='Hello', suffix='!'):", "Function", 1, 0, true},
+    {"mn_default_params_python", "run", "farewell('World')", "farewell",
+     "def farewell(name, msg='Goodbye'):", "Function", 5, 0, true},
+    {"mn_default_params_rust", "default_connect", "connect(host, None)", "connect",
+     "fn connect(host: &str, port: Option<u16>) -> String {", "Function", 1, 0, true},
+    {"mn_default_params_rust", "run", "default_connect(\"localhost\")", "default_connect",
+     "fn default_connect(host: &str) -> String {", "Function", 6, 0, true},
+    {"mn_default_params_ts", "warn", "log(msg, 'warn')", "log",
+     "function log(msg: string, level: string = 'info', ts: number = Date.now()): string {",
+     "Function", 1, 0, false},
+    {"mn_default_params_ts", "run", "warn('something wrong')", "warn",
+     "function warn(msg: string): string { return log(msg, 'warn'); }", "Function", 5, 0, false},
+    {"mn_pattern_match_rust", "process", "format_ok(v)", "format_ok",
+     "fn format_ok(v: i32) -> String { format!(\"ok:{}\", v) }", "Function", 1, 0, true},
+    {"mn_pattern_match_rust", "process", "format_err(e)", "format_err",
+     "fn format_err(e: &str) -> String { format!(\"err:{}\", e) }", "Function", 2, 0, true},
+    {"mn_pattern_match_rust", "run", "process(Ok(42))", "process",
+     "fn process(res: Result<i32, &str>) -> String {", "Function", 4, 0, true},
+    {"mn_pattern_match_python", "dispatch", "handle_quit()", "handle_quit",
+     "def handle_quit():", "Function", 1, 1, true},
+    {"mn_pattern_match_python", "dispatch", "handle_go(direction)", "handle_go",
+     "def handle_go(direction):", "Function", 5, 1, true},
+    {"mn_pattern_match_python", "dispatch", "handle_unknown(command)", "handle_unknown",
+     "def handle_unknown(cmd):", "Function", 9, 0, true},
+    {"mn_pattern_match_python", "run", "dispatch('quit')", "dispatch",
+     "def dispatch(command):", "Function", 13, 0, true},
+    {"mn_pattern_match_kotlin", "eval", "onNum(v)", "onNum",
+     "fun onNum(n: Int): String = \"num:$n\"", "Function", 1, 0, false},
+    {"mn_pattern_match_kotlin", "eval", "onStr(v)", "onStr",
+     "fun onStr(s: String): String = \"str:$s\"", "Function", 2, 0, false},
+    {"mn_pattern_match_kotlin", "eval", "onOther()", "onOther", "fun onOther(): String = \"other\"",
+     "Function", 3, 1, true},
+    {"mn_pattern_match_kotlin", "run", "eval(42)", "eval", "fun eval(v: Any): String = when (v) {",
+     "Function", 5, 0, true},
+    {"mn_pattern_match_ts", "dispatch", "handleOk(payload as number)", "handleOk",
+     "function handleOk(v: number): string { return `ok:${v}`; }", "Function", 1, 0, false},
+    {"mn_pattern_match_ts", "dispatch", "handleFail(payload as string)", "handleFail",
+     "function handleFail(e: string): string { return `fail:${e}`; }", "Function", 2, 0, false},
+    {"mn_pattern_match_ts", "dispatch", "handlePending()", "handlePending",
+     "function handlePending(): string { return 'pending'; }", "Function", 3, 1, false},
+    {"mn_pattern_match_ts", "run", "dispatch('ok', 42)", "dispatch",
+     "function dispatch(tag: string, payload?: unknown): string {", "Function", 5, 0, false},
+    {"mn_nested_function_rust", "run", "make_adder(10)", "make_adder",
+     "fn make_adder(base: i32) -> impl Fn(i32) -> i32 {", "Function", 3, 0, true},
+    {"mn_nested_function_rust", "run", "double(5)", "double", "fn double(x: i32) -> i32 { x * 2 }",
+     "Function", 1, 0, true},
+    {"mn_nested_function_rust", "run", "add10(double(5))", NULL, "    move |x| double(x) + base",
+     "Function", 4, 0, false},
+    {"mn_nested_function_ts", "run", "makeTransformer(10)", "makeTransformer",
+     "function makeTransformer(offset: number): (n: number) => number {", "Function", 3, 0, false},
+    {"mn_nested_function_ts", "run", "base(5)", "base",
+     "function base(x: number): number { return x + 1; }", "Function", 1, 0, false},
+    {"mn_nested_function_ts", "run", "t(base(5))", NULL,
+     "    return (n: number) => base(n) + offset;", "Function", 4, 0, false},
+    {"mn_module_php_namespace", "double", "$this->add($n, $n)", "add",
+     "    public function add(int $a, int $b): int {", "Method", 5, 0, true},
+    {"mn_module_ts_namespace", "ns.App.Utils.normalise", "clamp(v, 0, 1)", "ns.App.Utils.clamp",
+     "        export function clamp(v: number, lo: number, hi: number): number {", "Function", 3,
+     0, false},
+    {"mn_module_ts_namespace", "ns.App.Config.constructor", "Utils.normalise(t)",
+     "ns.App.Utils.normalise",
+     "        export function normalise(v: number): number { return clamp(v, 0, 1); }", "Function",
+     6, 0, false},
+    {"mn_module_ts_namespace", "run", "new App.Config(0.5)", "ns.App.Config.constructor",
+     "        constructor(t: number) { this.threshold = Utils.normalise(t); }", "Method", 10, 0, false},
+    {"mn_module_tsx_namespace", "ns.App.Utils.normalise", "clamp(v, 0, 1)", "ns.App.Utils.clamp",
+     "        export function clamp(v: number, lo: number, hi: number): number {", "Function", 3,
+     0, false},
+    {"mn_module_tsx_namespace", "ns.App.Config.constructor", "Utils.normalise(t)",
+     "ns.App.Utils.normalise",
+     "        export function normalise(v: number): number { return clamp(v, 0, 1); }", "Function",
+     6, 0, false},
+    {"mn_module_tsx_namespace", "run", "new App.Config(0.5)", "ns.App.Config.constructor",
+     "        constructor(t: number) { this.threshold = Utils.normalise(t); }", "Method", 10, 0, false},
+};
+/* TypeScript forms the shared resolver proves now. Everything else stays a counted gap. */
+static bool mn_required(const MN_Golden *g) {
+    if (!g->target)
+        return false;
+    if (g->required)
+        return true;
+    if (!strcmp(g->test, "mn_default_params_ts") || !strcmp(g->test, "mn_pattern_match_ts") ||
+        !strcmp(g->test, "mn_nested_function_ts"))
+        return true;
+    return (!strcmp(g->test, "mn_module_ts_namespace") ||
+            !strcmp(g->test, "mn_module_tsx_namespace")) &&
+           !strcmp(g->needle, "clamp(v, 0, 1)");
+}
+
+static bool mn_quality(const char *test, const char *filename, const char *content) {
+    if (!strncmp(test, "test_", 5))
+        test += 5;
+    const MN_LangFile files[] = {{filename, content},
+                                 {"quality_control.py",
+                                  "def exact_target():\n    return 1\n"
+                                  "def exact_caller():\n    return exact_target()\n"}};
+    const RQ_Source sources[] = {{.path = files[0].name, .text = files[0].content},
+                                 {.path = files[1].name, .text = files[1].content}};
+    RQ_Expected expected[12] = {{.case_id = "required-local-control",
+                                 .site = {.file = "quality_control.py",
+                                          .caller = "exact_caller",
+                                          .needle = "exact_target()",
+                                          .occurrence_index = 1},
+                                 .relation = "CALLS",
+                                 .target = {.file = "quality_control.py",
+                                            .suffix = "quality_control.exact_target",
+                                            .label = "Function",
+                                            .declaration_line = 1,
+                                            .declaration_text = "def exact_target():"},
+                                 .mode = RQ_REQUIRED}};
+    char ids[12][100];
+    size_t n = 1, required = 1;
+    for (size_t i = 0; i < sizeof(mn_goldens) / sizeof(mn_goldens[0]); i++) {
+        const MN_Golden *g = mn_goldens + i;
+        if (strcmp(test, g->test))
+            continue;
+        if (n == sizeof(expected) / sizeof(expected[0]))
+            return false;
+        snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
+        expected[n] = (RQ_Expected){
+            .case_id = ids[n],
+            .site = {.file = filename,
+                     .caller = g->caller,
+                     .needle = g->needle,
+                     .occurrence_index = g->occurrence},
+            .relation = "CALLS",
+            .target = {.file = filename,
+                       .suffix = g->target,
+                       .label = g->label,
+                       .declaration_line = g->line,
+                       .declaration_text = g->declaration},
+            .mode = mn_required(g) ? RQ_REQUIRED : RQ_KNOWN_GAP,
+            .gap_id = g->target ? "construct-binding-proof-missing"
+                                : "callable-identity-not-materialized",
+            .why =
+                g->target
+                    ? "Generic/conditional, namespace or effectful value binding needs a complete "
+                      "proof to this independently authored callable declaration."
+                    : "The genuine invocation targets a returned closure. Its source anchor "
+                      "records the missing callable identity without accepting a variable node "
+                      "as the target.",
+            .tried = "The original full production harness failed its v69 call floor. Original "
+                     "source bytes and structural assertions remain intact; each covered caller "
+                     "now enumerates its project call sites and a required control checks the "
+                     "same publication path."};
+        required += mn_required(g);
+        n++;
+    }
+    if (n == 1)
+        return false;
+    /* The harness audits a known target under every role: `anon(): User` names the class
+     * it also constructs, and that signature is a USAGE of it. */
+    if (!strcmp(test, "mn_record_kotlin_data_class")) {
+        if (n == sizeof(expected) / sizeof(expected[0]))
+            return false;
+        snprintf(ids[n], sizeof(ids[n]), "%s-%zu", test, n);
+        expected[n] = (RQ_Expected){
+            .case_id = ids[n],
+            .site = {.file = filename, .caller = "anon", .needle = "User", .occurrence_index = 1},
+            .relation = "USAGE",
+            .target = {.file = filename,
+                       .suffix = "User",
+                       .label = "Class",
+                       .declaration_line = 1,
+                       .declaration_text = "data class User(val name: String, val age: Int) {"},
+            .mode = RQ_REQUIRED};
+        required++;
+        n++;
+    }
+    MN_LangProj lp;
+    cbm_store_t *store = mn_index_files(&lp, files, 2);
+    RQ_Report report = {0};
+    bool ok = store && rq_check_project_declarations(store, lp.project, test, sources, 2, expected,
+                                                     n, NULL, 0, &report, stderr);
+    mn_cleanup(&lp, store);
+    return ok && report.genuine == n && report.found == required && report.missing == n - required;
+}
+static MN_Metrics mn_quality_metrics(const char *filename, const char *content, const char *test,
+                                     bool *quality) {
+    MN_Metrics metrics = mn_metrics(filename, content);
+    *quality = mn_quality(test, filename, content);
+    return metrics;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -259,12 +459,12 @@ static MN_Metrics mn_metrics(const char *filename, const char *content) {
 
 /* Go: type alias `type Meters = float64` — functions around it must appear. */
 TEST(mn_type_alias_go) {
-    MN_Metrics m = mn_metrics("unit.go",
-        "package unit\n\n"
-        "type Meters = float64\n"
-        "type Seconds = float64\n\n"
-        "func Speed(dist Meters, t Seconds) Meters { return dist / t }\n\n"
-        "func Run() Meters { return Speed(100, 9.58) }\n");
+    MN_Metrics m =
+        mn_metrics("unit.go", "package unit\n\n"
+                              "type Meters = float64\n"
+                              "type Seconds = float64\n\n"
+                              "func Speed(dist Meters, t Seconds) Meters { return dist / t }\n\n"
+                              "func Run() Meters { return Speed(100, 9.58) }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.calls >= 1);
@@ -273,12 +473,11 @@ TEST(mn_type_alias_go) {
 
 /* Go: named type `type UserID int` must produce Function nodes alongside it. */
 TEST(mn_type_alias_go_named) {
-    MN_Metrics m = mn_metrics("ids.go",
-        "package ids\n\n"
-        "type UserID int\n"
-        "type OrderID int\n\n"
-        "func NewUser(id UserID) UserID { return id }\n\n"
-        "func NewOrder(id OrderID) OrderID { return id }\n");
+    MN_Metrics m = mn_metrics("ids.go", "package ids\n\n"
+                                        "type UserID int\n"
+                                        "type OrderID int\n\n"
+                                        "func NewUser(id UserID) UserID { return id }\n\n"
+                                        "func NewOrder(id OrderID) OrderID { return id }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     /* Type alias may produce a Type/Class node or nothing; just check no crash. */
@@ -287,11 +486,11 @@ TEST(mn_type_alias_go_named) {
 
 /* TypeScript: `type ID = string | number` — functions still created. */
 TEST(mn_type_alias_ts) {
-    MN_Metrics m = mn_metrics("alias.ts",
-        "type ID = string | number;\n"
-        "type Callback<T> = (err: Error | null, val: T) => void;\n\n"
-        "function makeId(n: number): ID { return n % 2 === 0 ? n : String(n); }\n\n"
-        "function formatId(id: ID): string { return `id:${id}`; }\n");
+    MN_Metrics m = mn_metrics(
+        "alias.ts", "type ID = string | number;\n"
+                    "type Callback<T> = (err: Error | null, val: T) => void;\n\n"
+                    "function makeId(n: number): ID { return n % 2 === 0 ? n : String(n); }\n\n"
+                    "function formatId(id: ID): string { return `id:${id}`; }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     PASS();
@@ -299,25 +498,27 @@ TEST(mn_type_alias_ts) {
 
 /* Rust: `type Result<T> = std::result::Result<T, String>` — functions appear. */
 TEST(mn_type_alias_rust) {
-    MN_Metrics m = mn_metrics("alias.rs",
-        "type Res<T> = Result<T, String>;\n\n"
-        "fn parse(s: &str) -> Res<i32> {\n"
-        "    s.parse::<i32>().map_err(|e| e.to_string())\n"
-        "}\n\n"
-        "fn run() -> Res<i32> { parse(\"42\") }\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("alias.rs",
+                                      "type Res<T> = Result<T, String>;\n\n"
+                                      "fn parse(s: &str) -> Res<i32> {\n"
+                                      "    s.parse::<i32>().map_err(|e| e.to_string())\n"
+                                      "}\n\n"
+                                      "fn run() -> Res<i32> { parse(\"42\") }\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* C: typedef — functions surrounding it must still appear. */
 TEST(mn_type_alias_c_typedef) {
-    MN_Metrics m = mn_metrics("vec.c",
-        "typedef struct { float x; float y; } Vec2;\n"
-        "typedef float Scalar;\n\n"
-        "Scalar dot(Vec2 a, Vec2 b) { return a.x*b.x + a.y*b.y; }\n\n"
-        "Scalar magnitude(Vec2 v) { return dot(v, v); }\n");
+    MN_Metrics m =
+        mn_metrics("vec.c", "typedef struct { float x; float y; } Vec2;\n"
+                            "typedef float Scalar;\n\n"
+                            "Scalar dot(Vec2 a, Vec2 b) { return a.x*b.x + a.y*b.y; }\n\n"
+                            "Scalar magnitude(Vec2 v) { return dot(v, v); }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.calls >= 1);
@@ -326,11 +527,10 @@ TEST(mn_type_alias_c_typedef) {
 
 /* C++: `using Seconds = double` — functions appear, alias does not crash. */
 TEST(mn_type_alias_cpp_using) {
-    MN_Metrics m = mn_metrics("time.cpp",
-        "using Seconds = double;\n"
-        "using Minutes = double;\n\n"
-        "Seconds toSec(Minutes m) { return m * 60.0; }\n\n"
-        "Minutes toMin(Seconds s) { return s / 60.0; }\n");
+    MN_Metrics m = mn_metrics("time.cpp", "using Seconds = double;\n"
+                                          "using Minutes = double;\n\n"
+                                          "Seconds toSec(Minutes m) { return m * 60.0; }\n\n"
+                                          "Minutes toMin(Seconds s) { return s / 60.0; }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.calls >= 0); /* cross-call between them is optional */
@@ -339,11 +539,11 @@ TEST(mn_type_alias_cpp_using) {
 
 /* Kotlin: `typealias Handler = (String) -> Unit` — functions appear. */
 TEST(mn_type_alias_kotlin) {
-    MN_Metrics m = mn_metrics("handler.kt",
-        "typealias Handler = (String) -> Unit\n"
-        "typealias Predicate = (Int) -> Boolean\n\n"
-        "fun dispatch(h: Handler, msg: String) = h(msg)\n\n"
-        "fun filter(pred: Predicate, n: Int): Boolean = pred(n)\n");
+    MN_Metrics m =
+        mn_metrics("handler.kt", "typealias Handler = (String) -> Unit\n"
+                                 "typealias Predicate = (Int) -> Boolean\n\n"
+                                 "fun dispatch(h: Handler, msg: String) = h(msg)\n\n"
+                                 "fun filter(pred: Predicate, n: Int): Boolean = pred(n)\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     PASS();
@@ -351,14 +551,13 @@ TEST(mn_type_alias_kotlin) {
 
 /* Python: `TypeAlias` annotation (PEP 613) — functions must appear. */
 TEST(mn_type_alias_python) {
-    MN_Metrics m = mn_metrics("types.py",
-        "from typing import TypeAlias\n\n"
-        "Vector: TypeAlias = list[float]\n"
-        "Matrix: TypeAlias = list[list[float]]\n\n\n"
-        "def dot(a: Vector, b: Vector) -> float:\n"
-        "    return sum(x * y for x, y in zip(a, b))\n\n\n"
-        "def norm(v: Vector) -> float:\n"
-        "    return dot(v, v) ** 0.5\n");
+    MN_Metrics m = mn_metrics("types.py", "from typing import TypeAlias\n\n"
+                                          "Vector: TypeAlias = list[float]\n"
+                                          "Matrix: TypeAlias = list[list[float]]\n\n\n"
+                                          "def dot(a: Vector, b: Vector) -> float:\n"
+                                          "    return sum(x * y for x, y in zip(a, b))\n\n\n"
+                                          "def norm(v: Vector) -> float:\n"
+                                          "    return dot(v, v) ** 0.5\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     PASS();
@@ -379,22 +578,22 @@ TEST(mn_type_alias_python) {
 
 /* Java: multi-level exception hierarchy in one file → INHERITS edges. */
 TEST(mn_exception_hierarchy_java) {
-    static const MN_LangFile f[] = {{"Exc.java",
-        "package app;\n\n"
-        "class AppException extends RuntimeException {\n"
-        "    AppException(String msg) { super(msg); }\n"
-        "}\n\n"
-        "class ValidationException extends AppException {\n"
-        "    ValidationException(String field) { super(\"invalid: \" + field); }\n"
-        "}\n\n"
-        "class NotFoundException extends AppException {\n"
-        "    NotFoundException(String id) { super(\"not found: \" + id); }\n"
-        "}\n\n"
-        "class Service {\n"
-        "    void check(String s) throws ValidationException {\n"
-        "        if (s == null) throw new ValidationException(\"s\");\n"
-        "    }\n"
-        "}\n"}};
+    static const MN_LangFile f[] = {
+        {"Exc.java", "package app;\n\n"
+                     "class AppException extends RuntimeException {\n"
+                     "    AppException(String msg) { super(msg); }\n"
+                     "}\n\n"
+                     "class ValidationException extends AppException {\n"
+                     "    ValidationException(String field) { super(\"invalid: \" + field); }\n"
+                     "}\n\n"
+                     "class NotFoundException extends AppException {\n"
+                     "    NotFoundException(String id) { super(\"not found: \" + id); }\n"
+                     "}\n\n"
+                     "class Service {\n"
+                     "    void check(String s) throws ValidationException {\n"
+                     "        if (s == null) throw new ValidationException(\"s\");\n"
+                     "    }\n"
+                     "}\n"}};
     MN_Metrics m = mn_metrics_files(f, 1);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 3); /* AppException, ValidationException, NotFoundException */
@@ -409,18 +608,17 @@ TEST(mn_exception_hierarchy_java) {
  * BUG: extract_defs.c captures "(ValueError)" not "ValueError" for Python base names.
  * This test reproduces the bug: types are created but INHERITS edge is not produced. */
 TEST(mn_exception_hierarchy_python) {
-    MN_Metrics m = mn_metrics("exc.py",
-        "class AppError(Exception):\n"
-        "    pass\n\n\n"
-        "class ValidationError(AppError):\n"
-        "    def __init__(self, field):\n"
-        "        super().__init__(f'invalid: {field}')\n\n\n"
-        "class NotFoundError(AppError):\n"
-        "    def __init__(self, key):\n"
-        "        super().__init__(f'not found: {key}')\n\n\n"
-        "def check(s):\n"
-        "    if s is None:\n"
-        "        raise ValidationError('s')\n");
+    MN_Metrics m = mn_metrics("exc.py", "class AppError(Exception):\n"
+                                        "    pass\n\n\n"
+                                        "class ValidationError(AppError):\n"
+                                        "    def __init__(self, field):\n"
+                                        "        super().__init__(f'invalid: {field}')\n\n\n"
+                                        "class NotFoundError(AppError):\n"
+                                        "    def __init__(self, key):\n"
+                                        "        super().__init__(f'not found: {key}')\n\n\n"
+                                        "def check(s):\n"
+                                        "    if s is None:\n"
+                                        "        raise ValidationError('s')\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 2); /* AppError, ValidationError, NotFoundError */
     /* EXPECTED RED — Python base_classes extraction bug (parens in name) prevents
@@ -431,20 +629,20 @@ TEST(mn_exception_hierarchy_python) {
 
 /* C#: exception hierarchy — INHERITS edges for same-file chain. */
 TEST(mn_exception_hierarchy_csharp) {
-    MN_Metrics m = mn_metrics("Exc.cs",
-        "namespace App {\n"
-        "    class AppException : System.Exception {\n"
-        "        public AppException(string msg) : base(msg) {}\n"
-        "    }\n\n"
-        "    class DbException : AppException {\n"
-        "        public DbException(string q) : base(\"db: \" + q) {}\n"
-        "    }\n\n"
-        "    class Repo {\n"
-        "        public void Query(string q) {\n"
-        "            if (q == null) throw new DbException(q);\n"
-        "        }\n"
-        "    }\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("Exc.cs", "namespace App {\n"
+                             "    class AppException : System.Exception {\n"
+                             "        public AppException(string msg) : base(msg) {}\n"
+                             "    }\n\n"
+                             "    class DbException : AppException {\n"
+                             "        public DbException(string q) : base(\"db: \" + q) {}\n"
+                             "    }\n\n"
+                             "    class Repo {\n"
+                             "        public void Query(string q) {\n"
+                             "            if (q == null) throw new DbException(q);\n"
+                             "        }\n"
+                             "    }\n"
+                             "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 2); /* AppException, DbException, Repo */
     /* DbException->AppException must resolve (both same-file). */
@@ -454,12 +652,12 @@ TEST(mn_exception_hierarchy_csharp) {
 
 /* Kotlin: exception class hierarchy — KNOWN RED: Kotlin `:` supertype not parsed. */
 TEST(mn_exception_hierarchy_kotlin) {
-    MN_Metrics m = mn_metrics("Exc.kt",
-        "class AppException(msg: String) : Exception(msg)\n\n"
-        "class ApiException(code: Int, msg: String) : AppException(\"[$code] $msg\")\n\n"
-        "fun check(code: Int) {\n"
-        "    if (code != 200) throw ApiException(code, \"err\")\n"
-        "}\n");
+    MN_Metrics m = mn_metrics(
+        "Exc.kt", "class AppException(msg: String) : Exception(msg)\n\n"
+                  "class ApiException(code: Int, msg: String) : AppException(\"[$code] $msg\")\n\n"
+                  "fun check(code: Int) {\n"
+                  "    if (code != 200) throw ApiException(code, \"err\")\n"
+                  "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1); /* AppException, ApiException */
     /* REAL BUG: Kotlin `class X : Base(...)` supertype after the `:` is not
@@ -472,20 +670,20 @@ TEST(mn_exception_hierarchy_kotlin) {
 
 /* C++: exception class hierarchy via `std::exception`. */
 TEST(mn_exception_hierarchy_cpp) {
-    MN_Metrics m = mn_metrics("exc.cpp",
-        "#include <stdexcept>\n"
-        "#include <string>\n\n"
-        "class AppError : public std::runtime_error {\n"
-        "public:\n"
-        "    explicit AppError(const std::string &msg) : std::runtime_error(msg) {}\n"
-        "};\n\n"
-        "class DbError : public AppError {\n"
-        "public:\n"
-        "    explicit DbError(const std::string &q) : AppError(\"db: \" + q) {}\n"
-        "};\n\n"
-        "void check(const std::string &q) {\n"
-        "    if (q.empty()) throw DbError(q);\n"
-        "}\n");
+    MN_Metrics m = mn_metrics(
+        "exc.cpp", "#include <stdexcept>\n"
+                   "#include <string>\n\n"
+                   "class AppError : public std::runtime_error {\n"
+                   "public:\n"
+                   "    explicit AppError(const std::string &msg) : std::runtime_error(msg) {}\n"
+                   "};\n\n"
+                   "class DbError : public AppError {\n"
+                   "public:\n"
+                   "    explicit DbError(const std::string &q) : AppError(\"db: \" + q) {}\n"
+                   "};\n\n"
+                   "void check(const std::string &q) {\n"
+                   "    if (q.empty()) throw DbError(q);\n"
+                   "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1); /* AppError, DbError */
     /* DbError->AppError must resolve same-file. */
@@ -495,17 +693,17 @@ TEST(mn_exception_hierarchy_cpp) {
 
 /* TypeScript: error class hierarchy — KNOWN RED: TS extends extraction broken. */
 TEST(mn_exception_hierarchy_ts) {
-    MN_Metrics m = mn_metrics("err.ts",
-        "class AppError extends Error {\n"
-        "    constructor(public code: number, msg: string) { super(msg); }\n"
-        "}\n\n"
-        "class NotFoundError extends AppError {\n"
-        "    constructor(id: string) { super(404, `not found: ${id}`); }\n"
-        "}\n\n"
-        "function lookup(id: string): number {\n"
-        "    if (id === '') throw new NotFoundError(id);\n"
-        "    return 42;\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("err.ts", "class AppError extends Error {\n"
+                             "    constructor(public code: number, msg: string) { super(msg); }\n"
+                             "}\n\n"
+                             "class NotFoundError extends AppError {\n"
+                             "    constructor(id: string) { super(404, `not found: ${id}`); }\n"
+                             "}\n\n"
+                             "function lookup(id: string): number {\n"
+                             "    if (id === '') throw new NotFoundError(id);\n"
+                             "    return 42;\n"
+                             "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     /* REAL BUG: TypeScript `class X extends Base` stores the `extends` keyword (or
@@ -527,18 +725,17 @@ TEST(mn_exception_hierarchy_ts) {
 /* Python: multiple bases `class C(A, B):` — should produce 2+ INHERITS edges.
  * KNOWN RED: Python extraction bug with parens in base_classes. */
 TEST(mn_multiple_inheritance_python) {
-    MN_Metrics m = mn_metrics("multi.py",
-        "class Flyable:\n"
-        "    def fly(self):\n"
-        "        return 'fly'\n\n\n"
-        "class Swimmable:\n"
-        "    def swim(self):\n"
-        "        return 'swim'\n\n\n"
-        "class Duck(Flyable, Swimmable):\n"
-        "    def quack(self):\n"
-        "        return self.fly() + self.swim()\n\n\n"
-        "def make_duck():\n"
-        "    return Duck()\n");
+    MN_Metrics m = mn_metrics("multi.py", "class Flyable:\n"
+                                          "    def fly(self):\n"
+                                          "        return 'fly'\n\n\n"
+                                          "class Swimmable:\n"
+                                          "    def swim(self):\n"
+                                          "        return 'swim'\n\n\n"
+                                          "class Duck(Flyable, Swimmable):\n"
+                                          "    def quack(self):\n"
+                                          "        return self.fly() + self.swim()\n\n\n"
+                                          "def make_duck():\n"
+                                          "    return Duck()\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 2); /* Flyable, Swimmable, Duck */
     /* EXPECTED RED — Python base extraction still embeds parens; registry miss.
@@ -549,22 +746,21 @@ TEST(mn_multiple_inheritance_python) {
 
 /* C++: multiple inheritance — 2 INHERITS edges expected for same-file. */
 TEST(mn_multiple_inheritance_cpp) {
-    MN_Metrics m = mn_metrics("multi.cpp",
-        "class Flyable { public: virtual void fly() {} };\n"
-        "class Swimmable { public: virtual void swim() {} };\n\n"
-        "class Duck : public Flyable, public Swimmable {\n"
-        "public:\n"
-        "    void fly() override {}\n"
-        "    void swim() override {}\n"
-        "    void quack() {}\n"
-        "};\n\n"
-        "void run() {\n"
-        "    Duck d;\n"
-        "    d.fly();\n"
-        "    d.swim();\n"
-        "}\n");
+    MN_Metrics m = mn_metrics("multi.cpp", "class Flyable { public: virtual void fly() {} };\n"
+                                           "class Swimmable { public: virtual void swim() {} };\n\n"
+                                           "class Duck : public Flyable, public Swimmable {\n"
+                                           "public:\n"
+                                           "    void fly() override {}\n"
+                                           "    void swim() override {}\n"
+                                           "    void quack() {}\n"
+                                           "};\n\n"
+                                           "void run() {\n"
+                                           "    Duck d;\n"
+                                           "    d.fly();\n"
+                                           "    d.swim();\n"
+                                           "}\n");
     ASSERT_TRUE(m.ok);
-    ASSERT_TRUE(m.types >= 2); /* Flyable, Swimmable, Duck */
+    ASSERT_TRUE(m.types >= 2);    /* Flyable, Swimmable, Duck */
     ASSERT_TRUE(m.inherits >= 2); /* Duck->Flyable + Duck->Swimmable */
     PASS();
 }
@@ -572,14 +768,14 @@ TEST(mn_multiple_inheritance_cpp) {
 /* Java: multiple `implements` — should produce IMPLEMENTS (not INHERITS) edges. */
 TEST(mn_multiple_interfaces_java) {
     static const MN_LangFile f[] = {{"Multi.java",
-        "package app;\n\n"
-        "interface Flyable { void fly(); }\n"
-        "interface Swimmable { void swim(); }\n\n"
-        "class Duck implements Flyable, Swimmable {\n"
-        "    public void fly() { System.out.println(\"fly\"); }\n"
-        "    public void swim() { System.out.println(\"swim\"); }\n"
-        "    public void quack() { fly(); swim(); }\n"
-        "}\n"}};
+                                     "package app;\n\n"
+                                     "interface Flyable { void fly(); }\n"
+                                     "interface Swimmable { void swim(); }\n\n"
+                                     "class Duck implements Flyable, Swimmable {\n"
+                                     "    public void fly() { System.out.println(\"fly\"); }\n"
+                                     "    public void swim() { System.out.println(\"swim\"); }\n"
+                                     "    public void quack() { fly(); swim(); }\n"
+                                     "}\n"}};
     MN_Metrics m = mn_metrics_files(f, 1);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 2); /* Flyable, Swimmable, Duck */
@@ -591,16 +787,15 @@ TEST(mn_multiple_interfaces_java) {
 
 /* C#: class implementing multiple interfaces. */
 TEST(mn_multiple_interfaces_csharp) {
-    MN_Metrics m = mn_metrics("Multi.cs",
-        "namespace App {\n"
-        "    interface IFlyable { void Fly(); }\n"
-        "    interface ISwimmable { void Swim(); }\n\n"
-        "    class Duck : IFlyable, ISwimmable {\n"
-        "        public void Fly() { }\n"
-        "        public void Swim() { }\n"
-        "        public void Quack() { Fly(); Swim(); }\n"
-        "    }\n"
-        "}\n");
+    MN_Metrics m = mn_metrics("Multi.cs", "namespace App {\n"
+                                          "    interface IFlyable { void Fly(); }\n"
+                                          "    interface ISwimmable { void Swim(); }\n\n"
+                                          "    class Duck : IFlyable, ISwimmable {\n"
+                                          "        public void Fly() { }\n"
+                                          "        public void Swim() { }\n"
+                                          "        public void Quack() { Fly(); Swim(); }\n"
+                                          "    }\n"
+                                          "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 2);
     ASSERT_TRUE(m.implements + m.inherits >= 1);
@@ -609,15 +804,15 @@ TEST(mn_multiple_interfaces_csharp) {
 
 /* TypeScript: implements multiple interfaces — KNOWN RED: TS extraction broken. */
 TEST(mn_multiple_interfaces_ts) {
-    MN_Metrics m = mn_metrics("Multi.ts",
-        "interface Flyable { fly(): string; }\n"
-        "interface Swimmable { swim(): string; }\n\n"
-        "class Duck implements Flyable, Swimmable {\n"
-        "    fly(): string { return 'fly'; }\n"
-        "    swim(): string { return 'swim'; }\n"
-        "    quack(): string { return this.fly() + this.swim(); }\n"
-        "}\n\n"
-        "function run(): string { return new Duck().quack(); }\n");
+    MN_Metrics m =
+        mn_metrics("Multi.ts", "interface Flyable { fly(): string; }\n"
+                               "interface Swimmable { swim(): string; }\n\n"
+                               "class Duck implements Flyable, Swimmable {\n"
+                               "    fly(): string { return 'fly'; }\n"
+                               "    swim(): string { return 'swim'; }\n"
+                               "    quack(): string { return this.fly() + this.swim(); }\n"
+                               "}\n\n"
+                               "function run(): string { return new Duck().quack(); }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     /* REAL BUG: TypeScript `class Duck implements Flyable, Swimmable` — the
@@ -631,32 +826,33 @@ TEST(mn_multiple_interfaces_ts) {
 /* Rust: multiple trait bounds on a generic function — traits are types, not INHERITS.
  * Checks that the function node is created even with complex trait bounds. */
 TEST(mn_multiple_trait_bounds_rust) {
-    MN_Metrics m = mn_metrics("bounds.rs",
-        "use std::fmt::{Debug, Display};\n\n"
-        "fn print_both<T: Debug + Display>(val: T) {\n"
-        "    println!(\"{:?} {}\", val, val);\n"
-        "}\n\n"
-        "fn run() {\n"
-        "    print_both(42);\n"
-        "    print_both(\"hello\");\n"
-        "}\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("bounds.rs",
+                                      "use std::fmt::{Debug, Display};\n\n"
+                                      "fn print_both<T: Debug + Display>(val: T) {\n"
+                                      "    println!(\"{:?} {}\", val, val);\n"
+                                      "}\n\n"
+                                      "fn run() {\n"
+                                      "    print_both(42);\n"
+                                      "    print_both(\"hello\");\n"
+                                      "}\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Kotlin: class implementing multiple interfaces — KNOWN RED: `:` not parsed. */
 TEST(mn_multiple_interfaces_kotlin) {
-    MN_Metrics m = mn_metrics("Multi.kt",
-        "interface Flyable { fun fly(): String }\n"
-        "interface Swimmable { fun swim(): String }\n\n"
-        "class Duck : Flyable, Swimmable {\n"
-        "    override fun fly() = \"fly\"\n"
-        "    override fun swim() = \"swim\"\n"
-        "    fun quack() = fly() + swim()\n"
-        "}\n\n"
-        "fun run() = Duck().quack()\n");
+    MN_Metrics m = mn_metrics("Multi.kt", "interface Flyable { fun fly(): String }\n"
+                                          "interface Swimmable { fun swim(): String }\n\n"
+                                          "class Duck : Flyable, Swimmable {\n"
+                                          "    override fun fly() = \"fly\"\n"
+                                          "    override fun swim() = \"swim\"\n"
+                                          "    fun quack() = fly() + swim()\n"
+                                          "}\n\n"
+                                          "fun run() = Duck().quack()\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 2);
     /* REAL BUG: Kotlin `class Duck : Flyable, Swimmable` — supertype list after
@@ -678,12 +874,12 @@ TEST(mn_multiple_interfaces_kotlin) {
 
 /* Kotlin: extension function on a standard type — should be a Function node. */
 TEST(mn_extension_kotlin) {
-    MN_Metrics m = mn_metrics("ext.kt",
-        "fun String.titleCase(): String =\n"
-        "    split(\" \").joinToString(\" \") { it.capitalize() }\n\n"
-        "fun String.wordCount(): Int = trim().split(\"\\\\s+\".toRegex()).size\n\n"
-        "fun processTitle(s: String): String = s.titleCase()\n\n"
-        "fun run(): Int = \"hello world\".wordCount()\n");
+    MN_Metrics m = mn_metrics(
+        "ext.kt", "fun String.titleCase(): String =\n"
+                  "    split(\" \").joinToString(\" \") { it.capitalize() }\n\n"
+                  "fun String.wordCount(): Int = trim().split(\"\\\\s+\".toRegex()).size\n\n"
+                  "fun processTitle(s: String): String = s.titleCase()\n\n"
+                  "fun run(): Int = \"hello world\".wordCount()\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     PASS();
@@ -691,16 +887,15 @@ TEST(mn_extension_kotlin) {
 
 /* Go: method on a named type in the same file — must produce Method node. */
 TEST(mn_extension_go_receiver) {
-    MN_Metrics m = mn_metrics("stack.go",
-        "package ds\n\n"
-        "type Stack []int\n\n"
-        "func (s *Stack) Push(v int) { *s = append(*s, v) }\n\n"
-        "func (s Stack) Peek() int {\n"
-        "    if len(s) == 0 { return -1 }\n"
-        "    return s[len(s)-1]\n"
-        "}\n\n"
-        "func (s Stack) Len() int { return len(s) }\n\n"
-        "func NewStack() Stack { return Stack{} }\n");
+    MN_Metrics m = mn_metrics("stack.go", "package ds\n\n"
+                                          "type Stack []int\n\n"
+                                          "func (s *Stack) Push(v int) { *s = append(*s, v) }\n\n"
+                                          "func (s Stack) Peek() int {\n"
+                                          "    if len(s) == 0 { return -1 }\n"
+                                          "    return s[len(s)-1]\n"
+                                          "}\n\n"
+                                          "func (s Stack) Len() int { return len(s) }\n\n"
+                                          "func NewStack() Stack { return Stack{} }\n");
     ASSERT_TRUE(m.ok);
     /* Push, Peek, Len are Methods; NewStack is a Function. */
     ASSERT_TRUE(m.functions + m.methods >= 3);
@@ -709,7 +904,9 @@ TEST(mn_extension_go_receiver) {
 
 /* Rust: impl on a struct (external-style impl block) — Methods appear. */
 TEST(mn_extension_rust_impl) {
-    MN_Metrics m = mn_metrics("queue.rs",
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics(
+        "queue.rs",
         "pub struct Queue<T> {\n"
         "    buf: std::collections::VecDeque<T>,\n"
         "}\n\n"
@@ -723,31 +920,32 @@ TEST(mn_extension_rust_impl) {
         "    let mut q: Queue<i32> = Queue::new();\n"
         "    q.enqueue(1);\n"
         "    let _ = q.dequeue();\n"
-        "}\n");
+        "}\n",
+        __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions + m.methods >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* C#: extension method in a static class — must produce Method node. */
 TEST(mn_extension_csharp) {
-    MN_Metrics m = mn_metrics("Ext.cs",
-        "namespace App {\n"
-        "    static class StringExtensions {\n"
-        "        public static string TitleCase(this string s) {\n"
-        "            if (string.IsNullOrEmpty(s)) return s;\n"
-        "            return char.ToUpper(s[0]) + s.Substring(1);\n"
-        "        }\n"
-        "        public static int WordCount(this string s) =>\n"
-        "            s.Trim().Split(' ').Length;\n"
-        "    }\n\n"
-        "    class Processor {\n"
-        "        public string Process(string s) => s.TitleCase();\n"
-        "        public int Count(string s) => s.WordCount();\n"
-        "    }\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("Ext.cs", "namespace App {\n"
+                             "    static class StringExtensions {\n"
+                             "        public static string TitleCase(this string s) {\n"
+                             "            if (string.IsNullOrEmpty(s)) return s;\n"
+                             "            return char.ToUpper(s[0]) + s.Substring(1);\n"
+                             "        }\n"
+                             "        public static int WordCount(this string s) =>\n"
+                             "            s.Trim().Split(' ').Length;\n"
+                             "    }\n\n"
+                             "    class Processor {\n"
+                             "        public string Process(string s) => s.TitleCase();\n"
+                             "        public int Count(string s) => s.WordCount();\n"
+                             "    }\n"
+                             "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.methods >= 2);
@@ -756,23 +954,22 @@ TEST(mn_extension_csharp) {
 
 /* Swift: extension on a struct adding a method — must produce Function/Method node. */
 TEST(mn_extension_swift) {
-    MN_Metrics m = mn_metrics("ext.swift",
-        "struct Point {\n"
-        "    var x: Double\n"
-        "    var y: Double\n"
-        "}\n\n"
-        "extension Point {\n"
-        "    func magnitude() -> Double {\n"
-        "        return (x * x + y * y).squareRoot()\n"
-        "    }\n"
-        "    func scaled(by factor: Double) -> Point {\n"
-        "        return Point(x: x * factor, y: y * factor)\n"
-        "    }\n"
-        "}\n\n"
-        "func run() -> Double {\n"
-        "    let p = Point(x: 3.0, y: 4.0)\n"
-        "    return p.magnitude()\n"
-        "}\n");
+    MN_Metrics m = mn_metrics("ext.swift", "struct Point {\n"
+                                           "    var x: Double\n"
+                                           "    var y: Double\n"
+                                           "}\n\n"
+                                           "extension Point {\n"
+                                           "    func magnitude() -> Double {\n"
+                                           "        return (x * x + y * y).squareRoot()\n"
+                                           "    }\n"
+                                           "    func scaled(by factor: Double) -> Point {\n"
+                                           "        return Point(x: x * factor, y: y * factor)\n"
+                                           "    }\n"
+                                           "}\n\n"
+                                           "func run() -> Double {\n"
+                                           "    let p = Point(x: 3.0, y: 4.0)\n"
+                                           "    return p.magnitude()\n"
+                                           "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions >= 1);
@@ -790,54 +987,54 @@ TEST(mn_extension_swift) {
 
 /* Python: @property getter + setter — class must appear, methods present. */
 TEST(mn_getset_python_property) {
-    MN_Metrics m = mn_metrics("account.py",
-        "class Account:\n"
-        "    def __init__(self, balance):\n"
-        "        self._balance = balance\n\n"
-        "    @property\n"
-        "    def balance(self):\n"
-        "        return self._balance\n\n"
-        "    @balance.setter\n"
-        "    def balance(self, value):\n"
-        "        if value < 0:\n"
-        "            raise ValueError('negative balance')\n"
-        "        self._balance = value\n\n"
-        "    def deposit(self, amount):\n"
-        "        self.balance = self.balance + amount\n\n\n"
-        "def make_account(initial):\n"
-        "    return Account(initial)\n");
+    MN_Metrics m = mn_metrics("account.py", "class Account:\n"
+                                            "    def __init__(self, balance):\n"
+                                            "        self._balance = balance\n\n"
+                                            "    @property\n"
+                                            "    def balance(self):\n"
+                                            "        return self._balance\n\n"
+                                            "    @balance.setter\n"
+                                            "    def balance(self, value):\n"
+                                            "        if value < 0:\n"
+                                            "            raise ValueError('negative balance')\n"
+                                            "        self._balance = value\n\n"
+                                            "    def deposit(self, amount):\n"
+                                            "        self.balance = self.balance + amount\n\n\n"
+                                            "def make_account(initial):\n"
+                                            "    return Account(initial)\n");
     ASSERT_TRUE(m.ok);
-    ASSERT_TRUE(m.types >= 1); /* class Account */
+    ASSERT_TRUE(m.types >= 1);     /* class Account */
     ASSERT_TRUE(m.functions >= 1); /* make_account */
     PASS();
 }
 
 /* C#: auto-property and computed property — class and methods. */
 TEST(mn_getset_csharp) {
-    MN_Metrics m = mn_metrics("Temp.cs",
-        "namespace App {\n"
-        "    class Temperature {\n"
-        "        private double _celsius;\n"
-        "        public double Celsius {\n"
-        "            get => _celsius;\n"
-        "            set { if (value < -273.15) throw new System.ArgumentException(); _celsius = value; }\n"
-        "        }\n"
-        "        public double Fahrenheit {\n"
-        "            get => Celsius * 9.0 / 5.0 + 32;\n"
-        "            set => Celsius = (value - 32) * 5.0 / 9.0;\n"
-        "        }\n"
-        "        public bool IsBoiling() => Celsius >= 100;\n"
-        "    }\n"
-        "}\n");
+    MN_Metrics m = mn_metrics("Temp.cs", "namespace App {\n"
+                                         "    class Temperature {\n"
+                                         "        private double _celsius;\n"
+                                         "        public double Celsius {\n"
+                                         "            get => _celsius;\n"
+                                         "            set { if (value < -273.15) throw new "
+                                         "System.ArgumentException(); _celsius = value; }\n"
+                                         "        }\n"
+                                         "        public double Fahrenheit {\n"
+                                         "            get => Celsius * 9.0 / 5.0 + 32;\n"
+                                         "            set => Celsius = (value - 32) * 5.0 / 9.0;\n"
+                                         "        }\n"
+                                         "        public bool IsBoiling() => Celsius >= 100;\n"
+                                         "    }\n"
+                                         "}\n");
     ASSERT_TRUE(m.ok);
-    ASSERT_TRUE(m.types >= 1); /* class Temperature */
+    ASSERT_TRUE(m.types >= 1);   /* class Temperature */
     ASSERT_TRUE(m.methods >= 1); /* IsBoiling at minimum */
     PASS();
 }
 
 /* Kotlin: custom get/set on a property — class and methods must appear. */
 TEST(mn_getset_kotlin) {
-    MN_Metrics m = mn_metrics("Circle.kt",
+    MN_Metrics m = mn_metrics(
+        "Circle.kt",
         "class Circle(private var _radius: Double) {\n"
         "    var radius: Double\n"
         "        get() = _radius\n"
@@ -857,17 +1054,17 @@ TEST(mn_getset_kotlin) {
 
 /* TypeScript: getter/setter on a class — class node + method nodes. */
 TEST(mn_getset_typescript) {
-    MN_Metrics m = mn_metrics("Rect.ts",
-        "class Rectangle {\n"
-        "    private _w: number;\n"
-        "    private _h: number;\n\n"
-        "    constructor(w: number, h: number) { this._w = w; this._h = h; }\n\n"
-        "    get width(): number { return this._w; }\n"
-        "    set width(v: number) { if (v < 0) throw new Error(); this._w = v; }\n"
-        "    get area(): number { return this._w * this._h; }\n\n"
-        "    scale(f: number): void { this.width = this._w * f; }\n"
-        "}\n\n"
-        "function run(): number { return new Rectangle(3, 4).area; }\n");
+    MN_Metrics m = mn_metrics(
+        "Rect.ts", "class Rectangle {\n"
+                   "    private _w: number;\n"
+                   "    private _h: number;\n\n"
+                   "    constructor(w: number, h: number) { this._w = w; this._h = h; }\n\n"
+                   "    get width(): number { return this._w; }\n"
+                   "    set width(v: number) { if (v < 0) throw new Error(); this._w = v; }\n"
+                   "    get area(): number { return this._w * this._h; }\n\n"
+                   "    scale(f: number): void { this.width = this._w * f; }\n"
+                   "}\n\n"
+                   "function run(): number { return new Rectangle(3, 4).area; }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions >= 1);
@@ -877,18 +1074,18 @@ TEST(mn_getset_typescript) {
 /* Swift: computed property in a struct — struct and functions must appear. */
 TEST(mn_getset_swift) {
     MN_Metrics m = mn_metrics("rect.swift",
-        "struct Rect {\n"
-        "    var width: Double\n"
-        "    var height: Double\n\n"
-        "    var area: Double { return width * height }\n"
-        "    var perimeter: Double { return 2 * (width + height) }\n"
-        "    var isSquare: Bool { return width == height }\n\n"
-        "    mutating func scale(by factor: Double) {\n"
-        "        width *= factor\n"
-        "        height *= factor\n"
-        "    }\n"
-        "}\n\n"
-        "func run() -> Double { return Rect(width: 3, height: 4).area }\n");
+                              "struct Rect {\n"
+                              "    var width: Double\n"
+                              "    var height: Double\n\n"
+                              "    var area: Double { return width * height }\n"
+                              "    var perimeter: Double { return 2 * (width + height) }\n"
+                              "    var isSquare: Bool { return width == height }\n\n"
+                              "    mutating func scale(by factor: Double) {\n"
+                              "        width *= factor\n"
+                              "        height *= factor\n"
+                              "    }\n"
+                              "}\n\n"
+                              "func run() -> Double { return Rect(width: 3, height: 4).area }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions >= 1);
@@ -905,7 +1102,8 @@ TEST(mn_getset_swift) {
 
 /* Java: record with a custom method. */
 TEST(mn_record_java) {
-    MN_Metrics m = mn_metrics("Point.java",
+    MN_Metrics m = mn_metrics(
+        "Point.java",
         "package app;\n\n"
         "record Point(double x, double y) {\n"
         "    double distanceTo(Point other) {\n"
@@ -926,25 +1124,28 @@ TEST(mn_record_java) {
 
 /* Kotlin: data class with custom methods and companion. */
 TEST(mn_record_kotlin_data_class) {
-    MN_Metrics m = mn_metrics("User.kt",
-        "data class User(val name: String, val age: Int) {\n"
-        "    fun isAdult(): Boolean = age >= 18\n"
-        "    fun greet(): String = \"Hi, $name\"\n\n"
-        "    companion object {\n"
-        "        fun anon(): User = User(\"anon\", 0)\n"
-        "    }\n"
-        "}\n\n"
-        "fun run(): String = User.anon().greet()\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("User.kt",
+                                      "data class User(val name: String, val age: Int) {\n"
+                                      "    fun isAdult(): Boolean = age >= 18\n"
+                                      "    fun greet(): String = \"Hi, $name\"\n\n"
+                                      "    companion object {\n"
+                                      "        fun anon(): User = User(\"anon\", 0)\n"
+                                      "    }\n"
+                                      "}\n\n"
+                                      "fun run(): String = User.anon().greet()\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions + m.methods >= 2);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* C#: record type. */
 TEST(mn_record_csharp) {
-    MN_Metrics m = mn_metrics("Point.cs",
+    MN_Metrics m = mn_metrics(
+        "Point.cs",
         "namespace App {\n"
         "    record Point(double X, double Y) {\n"
         "        public double DistanceTo(Point other) {\n"
@@ -966,21 +1167,20 @@ TEST(mn_record_csharp) {
 
 /* Python: dataclass with post_init and method. */
 TEST(mn_record_python_dataclass) {
-    MN_Metrics m = mn_metrics("vec.py",
-        "from dataclasses import dataclass\n"
-        "import math\n\n\n"
-        "@dataclass\n"
-        "class Vector:\n"
-        "    x: float\n"
-        "    y: float\n\n"
-        "    def magnitude(self):\n"
-        "        return math.sqrt(self.x ** 2 + self.y ** 2)\n\n"
-        "    def dot(self, other):\n"
-        "        return self.x * other.x + self.y * other.y\n\n\n"
-        "def unit(x, y):\n"
-        "    v = Vector(x, y)\n"
-        "    m = v.magnitude()\n"
-        "    return Vector(x / m, y / m)\n");
+    MN_Metrics m = mn_metrics("vec.py", "from dataclasses import dataclass\n"
+                                        "import math\n\n\n"
+                                        "@dataclass\n"
+                                        "class Vector:\n"
+                                        "    x: float\n"
+                                        "    y: float\n\n"
+                                        "    def magnitude(self):\n"
+                                        "        return math.sqrt(self.x ** 2 + self.y ** 2)\n\n"
+                                        "    def dot(self, other):\n"
+                                        "        return self.x * other.x + self.y * other.y\n\n\n"
+                                        "def unit(x, y):\n"
+                                        "    v = Vector(x, y)\n"
+                                        "    m = v.magnitude()\n"
+                                        "    return Vector(x / m, y / m)\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions >= 1);
@@ -989,7 +1189,9 @@ TEST(mn_record_python_dataclass) {
 
 /* Rust: struct with #[derive(Debug, Clone)] and impl methods. */
 TEST(mn_record_rust_derive) {
-    MN_Metrics m = mn_metrics("point.rs",
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics(
+        "point.rs",
         "#[derive(Debug, Clone, PartialEq)]\n"
         "struct Point {\n"
         "    x: f64,\n"
@@ -1005,25 +1207,25 @@ TEST(mn_record_rust_derive) {
         "fn run() -> f64 {\n"
         "    let a = Point::new(3.0, 0.0);\n"
         "    a.distance(&Point::origin())\n"
-        "}\n");
+        "}\n",
+        __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions + m.methods >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Scala: case class with companion object. */
 TEST(mn_record_scala_case_class) {
-    MN_Metrics m = mn_metrics("user.scala",
-        "case class User(name: String, age: Int) {\n"
-        "    def isAdult: Boolean = age >= 18\n"
-        "    def greet: String = s\"Hi, $name\"\n"
-        "}\n\n"
-        "object User {\n"
-        "    def anon: User = User(\"anon\", 0)\n"
-        "}\n\n"
-        "def run: String = User.anon.greet\n");
+    MN_Metrics m = mn_metrics("user.scala", "case class User(name: String, age: Int) {\n"
+                                            "    def isAdult: Boolean = age >= 18\n"
+                                            "    def greet: String = s\"Hi, $name\"\n"
+                                            "}\n\n"
+                                            "object User {\n"
+                                            "    def anon: User = User(\"anon\", 0)\n"
+                                            "}\n\n"
+                                            "def run: String = User.anon.greet\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.functions + m.methods >= 2);
@@ -1040,30 +1242,31 @@ TEST(mn_record_scala_case_class) {
 
 /* Python: default arguments — function nodes + CALLS. */
 TEST(mn_default_params_python) {
-    MN_Metrics m = mn_metrics("greet.py",
-        "def greet(name, prefix='Hello', suffix='!'):\n"
-        "    return f'{prefix}, {name}{suffix}'\n\n\n"
-        "def farewell(name, msg='Goodbye'):\n"
-        "    return greet(name, prefix=msg)\n\n\n"
-        "def run():\n"
-        "    return farewell('World')\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("greet.py",
+                                      "def greet(name, prefix='Hello', suffix='!'):\n"
+                                      "    return f'{prefix}, {name}{suffix}'\n\n\n"
+                                      "def farewell(name, msg='Goodbye'):\n"
+                                      "    return greet(name, prefix=msg)\n\n\n"
+                                      "def run():\n"
+                                      "    return farewell('World')\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Go: variadic function — function node + call. */
 TEST(mn_variadic_go) {
-    MN_Metrics m = mn_metrics("sum.go",
-        "package math\n\n"
-        "func sum(vals ...int) int {\n"
-        "    total := 0\n"
-        "    for _, v := range vals { total += v }\n"
-        "    return total\n"
-        "}\n\n"
-        "func sumPair(a, b int) int { return sum(a, b) }\n\n"
-        "func run() int { return sumPair(sum(1, 2, 3), 4) }\n");
+    MN_Metrics m = mn_metrics("sum.go", "package math\n\n"
+                                        "func sum(vals ...int) int {\n"
+                                        "    total := 0\n"
+                                        "    for _, v := range vals { total += v }\n"
+                                        "    return total\n"
+                                        "}\n\n"
+                                        "func sumPair(a, b int) int { return sum(a, b) }\n\n"
+                                        "func run() int { return sumPair(sum(1, 2, 3), 4) }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
     ASSERT_TRUE(m.calls >= 1);
@@ -1072,28 +1275,30 @@ TEST(mn_variadic_go) {
 
 /* Rust: default via Option<T> pattern — function and call still resolve. */
 TEST(mn_default_params_rust) {
-    MN_Metrics m = mn_metrics("cfg.rs",
-        "fn connect(host: &str, port: Option<u16>) -> String {\n"
-        "    let p = port.unwrap_or(8080);\n"
-        "    format!(\"{}:{}\", host, p)\n"
-        "}\n\n"
-        "fn default_connect(host: &str) -> String {\n"
-        "    connect(host, None)\n"
-        "}\n\n"
-        "fn run() -> String { default_connect(\"localhost\") }\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("cfg.rs",
+                                      "fn connect(host: &str, port: Option<u16>) -> String {\n"
+                                      "    let p = port.unwrap_or(8080);\n"
+                                      "    format!(\"{}:{}\", host, p)\n"
+                                      "}\n\n"
+                                      "fn default_connect(host: &str) -> String {\n"
+                                      "    connect(host, None)\n"
+                                      "}\n\n"
+                                      "fn run() -> String { default_connect(\"localhost\") }\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Kotlin: default + named parameters — function nodes + CALLS. */
 TEST(mn_named_params_kotlin) {
-    MN_Metrics m = mn_metrics("fmt.kt",
-        "fun format(value: Int, radix: Int = 10, prefix: String = \"\") =\n"
-        "    prefix + value.toString(radix)\n\n"
-        "fun hexStr(n: Int) = format(n, radix = 16, prefix = \"0x\")\n\n"
-        "fun run() = hexStr(255)\n");
+    MN_Metrics m =
+        mn_metrics("fmt.kt", "fun format(value: Int, radix: Int = 10, prefix: String = \"\") =\n"
+                             "    prefix + value.toString(radix)\n\n"
+                             "fun hexStr(n: Int) = format(n, radix = 16, prefix = \"0x\")\n\n"
+                             "fun run() = hexStr(255)\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
     ASSERT_TRUE(m.calls >= 1);
@@ -1102,31 +1307,33 @@ TEST(mn_named_params_kotlin) {
 
 /* TypeScript: optional parameters with defaults — function nodes + CALLS. */
 TEST(mn_default_params_ts) {
-    MN_Metrics m = mn_metrics("log.ts",
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics(
+        "log.ts",
         "function log(msg: string, level: string = 'info', ts: number = Date.now()): string {\n"
         "    return `[${level}] ${ts}: ${msg}`;\n"
         "}\n\n"
         "function warn(msg: string): string { return log(msg, 'warn'); }\n\n"
-        "function run(): string { return warn('something wrong'); }\n");
+        "function run(): string { return warn('something wrong'); }\n",
+        __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* C: variadic function (stdarg) — function node must still appear. */
 TEST(mn_variadic_c) {
-    MN_Metrics m = mn_metrics("fmt.c",
-        "#include <stdarg.h>\n"
-        "#include <stdio.h>\n\n"
-        "static int my_printf(const char *fmt, ...) {\n"
-        "    va_list ap;\n"
-        "    va_start(ap, fmt);\n"
-        "    int n = vprintf(fmt, ap);\n"
-        "    va_end(ap);\n"
-        "    return n;\n"
-        "}\n\n"
-        "int run(int x) { return my_printf(\"%d\", x); }\n");
+    MN_Metrics m = mn_metrics("fmt.c", "#include <stdarg.h>\n"
+                                       "#include <stdio.h>\n\n"
+                                       "static int my_printf(const char *fmt, ...) {\n"
+                                       "    va_list ap;\n"
+                                       "    va_start(ap, fmt);\n"
+                                       "    int n = vprintf(fmt, ap);\n"
+                                       "    va_end(ap);\n"
+                                       "    return n;\n"
+                                       "}\n\n"
+                                       "int run(int x) { return my_printf(\"%d\", x); }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.calls >= 1);
@@ -1143,104 +1350,113 @@ TEST(mn_variadic_c) {
 
 /* Rust: match expression with function calls in arms. */
 TEST(mn_pattern_match_rust) {
-    MN_Metrics m = mn_metrics("msg.rs",
-        "fn format_ok(v: i32) -> String { format!(\"ok:{}\", v) }\n"
-        "fn format_err(e: &str) -> String { format!(\"err:{}\", e) }\n\n"
-        "fn process(res: Result<i32, &str>) -> String {\n"
-        "    match res {\n"
-        "        Ok(v)  => format_ok(v),\n"
-        "        Err(e) => format_err(e),\n"
-        "    }\n"
-        "}\n\n"
-        "fn run() -> String { process(Ok(42)) }\n");
+    bool quality = false;
+    MN_Metrics m =
+        mn_quality_metrics("msg.rs",
+                           "fn format_ok(v: i32) -> String { format!(\"ok:{}\", v) }\n"
+                           "fn format_err(e: &str) -> String { format!(\"err:{}\", e) }\n\n"
+                           "fn process(res: Result<i32, &str>) -> String {\n"
+                           "    match res {\n"
+                           "        Ok(v)  => format_ok(v),\n"
+                           "        Err(e) => format_err(e),\n"
+                           "    }\n"
+                           "}\n\n"
+                           "fn run() -> String { process(Ok(42)) }\n",
+                           __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Python: structural pattern matching (match/case, Python 3.10+) — calls resolve. */
 TEST(mn_pattern_match_python) {
-    MN_Metrics m = mn_metrics("cmd.py",
-        "def handle_quit():\n"
-        "    return 'quit'\n\n\n"
-        "def handle_go(direction):\n"
-        "    return f'go {direction}'\n\n\n"
-        "def handle_unknown(cmd):\n"
-        "    return f'unknown: {cmd}'\n\n\n"
-        "def dispatch(command):\n"
-        "    match command:\n"
-        "        case 'quit':\n"
-        "            return handle_quit()\n"
-        "        case ('go', direction):\n"
-        "            return handle_go(direction)\n"
-        "        case _:\n"
-        "            return handle_unknown(command)\n\n\n"
-        "def run():\n"
-        "    return dispatch('quit')\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("cmd.py",
+                                      "def handle_quit():\n"
+                                      "    return 'quit'\n\n\n"
+                                      "def handle_go(direction):\n"
+                                      "    return f'go {direction}'\n\n\n"
+                                      "def handle_unknown(cmd):\n"
+                                      "    return f'unknown: {cmd}'\n\n\n"
+                                      "def dispatch(command):\n"
+                                      "    match command:\n"
+                                      "        case 'quit':\n"
+                                      "            return handle_quit()\n"
+                                      "        case ('go', direction):\n"
+                                      "            return handle_go(direction)\n"
+                                      "        case _:\n"
+                                      "            return handle_unknown(command)\n\n\n"
+                                      "def run():\n"
+                                      "    return dispatch('quit')\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Kotlin: when expression with function calls in branches. */
 TEST(mn_pattern_match_kotlin) {
-    MN_Metrics m = mn_metrics("eval.kt",
-        "fun onNum(n: Int): String = \"num:$n\"\n"
-        "fun onStr(s: String): String = \"str:$s\"\n"
-        "fun onOther(): String = \"other\"\n\n"
-        "fun eval(v: Any): String = when (v) {\n"
-        "    is Int    -> onNum(v)\n"
-        "    is String -> onStr(v)\n"
-        "    else      -> onOther()\n"
-        "}\n\n"
-        "fun run() = eval(42)\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("eval.kt",
+                                      "fun onNum(n: Int): String = \"num:$n\"\n"
+                                      "fun onStr(s: String): String = \"str:$s\"\n"
+                                      "fun onOther(): String = \"other\"\n\n"
+                                      "fun eval(v: Any): String = when (v) {\n"
+                                      "    is Int    -> onNum(v)\n"
+                                      "    is String -> onStr(v)\n"
+                                      "    else      -> onOther()\n"
+                                      "}\n\n"
+                                      "fun run() = eval(42)\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* TypeScript: switch with calls in each case branch. */
 TEST(mn_pattern_match_ts) {
-    MN_Metrics m = mn_metrics("status.ts",
-        "function handleOk(v: number): string { return `ok:${v}`; }\n"
-        "function handleFail(e: string): string { return `fail:${e}`; }\n"
-        "function handlePending(): string { return 'pending'; }\n\n"
-        "function dispatch(tag: string, payload?: unknown): string {\n"
-        "    switch (tag) {\n"
-        "        case 'ok': return handleOk(payload as number);\n"
-        "        case 'fail': return handleFail(payload as string);\n"
-        "        default: return handlePending();\n"
-        "    }\n"
-        "}\n\n"
-        "function run(): string { return dispatch('ok', 42); }\n");
+    bool quality = false;
+    MN_Metrics m =
+        mn_quality_metrics("status.ts",
+                           "function handleOk(v: number): string { return `ok:${v}`; }\n"
+                           "function handleFail(e: string): string { return `fail:${e}`; }\n"
+                           "function handlePending(): string { return 'pending'; }\n\n"
+                           "function dispatch(tag: string, payload?: unknown): string {\n"
+                           "    switch (tag) {\n"
+                           "        case 'ok': return handleOk(payload as number);\n"
+                           "        case 'fail': return handleFail(payload as string);\n"
+                           "        default: return handlePending();\n"
+                           "    }\n"
+                           "}\n\n"
+                           "function run(): string { return dispatch('ok', 42); }\n",
+                           __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Go: type switch with function calls in each case. */
 TEST(mn_pattern_match_go) {
-    MN_Metrics m = mn_metrics("switch.go",
-        "package sw\n\n"
-        "func handleInt(n int) string { return \"int\" }\n"
-        "func handleStr(s string) string { return \"str\" }\n"
-        "func handleOther() string { return \"other\" }\n\n"
-        "func dispatch(v interface{}) string {\n"
-        "    switch x := v.(type) {\n"
-        "    case int:\n"
-        "        return handleInt(x)\n"
-        "    case string:\n"
-        "        return handleStr(x)\n"
-        "    default:\n"
-        "        _ = x\n"
-        "        return handleOther()\n"
-        "    }\n"
-        "}\n\n"
-        "func run() string { return dispatch(42) }\n");
+    MN_Metrics m = mn_metrics("switch.go", "package sw\n\n"
+                                           "func handleInt(n int) string { return \"int\" }\n"
+                                           "func handleStr(s string) string { return \"str\" }\n"
+                                           "func handleOther() string { return \"other\" }\n\n"
+                                           "func dispatch(v interface{}) string {\n"
+                                           "    switch x := v.(type) {\n"
+                                           "    case int:\n"
+                                           "        return handleInt(x)\n"
+                                           "    case string:\n"
+                                           "        return handleStr(x)\n"
+                                           "    default:\n"
+                                           "        _ = x\n"
+                                           "        return handleOther()\n"
+                                           "    }\n"
+                                           "}\n\n"
+                                           "func run() string { return dispatch(42) }\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
     ASSERT_TRUE(m.calls >= 1);
@@ -1259,16 +1475,15 @@ TEST(mn_pattern_match_go) {
 
 /* Python: nested function returned as closure; outer calls inner. */
 TEST(mn_nested_function_python) {
-    MN_Metrics m = mn_metrics("clos.py",
-        "def multiplier(factor):\n"
-        "    def inner(x):\n"
-        "        return x * factor\n"
-        "    return inner\n\n\n"
-        "def apply(fn, val):\n"
-        "    return fn(val)\n\n\n"
-        "def run():\n"
-        "    double = multiplier(2)\n"
-        "    return apply(double, 21)\n");
+    MN_Metrics m = mn_metrics("clos.py", "def multiplier(factor):\n"
+                                         "    def inner(x):\n"
+                                         "        return x * factor\n"
+                                         "    return inner\n\n\n"
+                                         "def apply(fn, val):\n"
+                                         "    return fn(val)\n\n\n"
+                                         "def run():\n"
+                                         "    double = multiplier(2)\n"
+                                         "    return apply(double, 21)\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2); /* multiplier, apply, run (inner is nested) */
     ASSERT_TRUE(m.calls >= 1);
@@ -1277,16 +1492,15 @@ TEST(mn_nested_function_python) {
 
 /* Go: inner function literal calling outer parameter. */
 TEST(mn_nested_function_go) {
-    MN_Metrics m = mn_metrics("nest.go",
-        "package nest\n\n"
-        "func helper(x int) int { return x * 2 }\n\n"
-        "func makeDoubler() func(int) int {\n"
-        "    return func(x int) int { return helper(x) }\n"
-        "}\n\n"
-        "func run(n int) int {\n"
-        "    f := makeDoubler()\n"
-        "    return f(n) + helper(n)\n"
-        "}\n");
+    MN_Metrics m = mn_metrics("nest.go", "package nest\n\n"
+                                         "func helper(x int) int { return x * 2 }\n\n"
+                                         "func makeDoubler() func(int) int {\n"
+                                         "    return func(x int) int { return helper(x) }\n"
+                                         "}\n\n"
+                                         "func run(n int) int {\n"
+                                         "    f := makeDoubler()\n"
+                                         "    return f(n) + helper(n)\n"
+                                         "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2); /* helper, makeDoubler, run */
     ASSERT_TRUE(m.calls >= 1);
@@ -1295,51 +1509,56 @@ TEST(mn_nested_function_go) {
 
 /* Rust: nested closure calling outer free function. */
 TEST(mn_nested_function_rust) {
-    MN_Metrics m = mn_metrics("nest.rs",
-        "fn double(x: i32) -> i32 { x * 2 }\n\n"
-        "fn make_adder(base: i32) -> impl Fn(i32) -> i32 {\n"
-        "    move |x| double(x) + base\n"
-        "}\n\n"
-        "fn run() -> i32 {\n"
-        "    let add10 = make_adder(10);\n"
-        "    add10(double(5))\n"
-        "}\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("nest.rs",
+                                      "fn double(x: i32) -> i32 { x * 2 }\n\n"
+                                      "fn make_adder(base: i32) -> impl Fn(i32) -> i32 {\n"
+                                      "    move |x| double(x) + base\n"
+                                      "}\n\n"
+                                      "fn run() -> i32 {\n"
+                                      "    let add10 = make_adder(10);\n"
+                                      "    add10(double(5))\n"
+                                      "}\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* TypeScript: nested arrow functions + calls in outer. */
 TEST(mn_nested_function_ts) {
-    MN_Metrics m = mn_metrics("nest.ts",
-        "function base(x: number): number { return x + 1; }\n\n"
-        "function makeTransformer(offset: number): (n: number) => number {\n"
-        "    return (n: number) => base(n) + offset;\n"
-        "}\n\n"
-        "function run(): number {\n"
-        "    const t = makeTransformer(10);\n"
-        "    return t(base(5));\n"
-        "}\n");
+    bool quality = false;
+    MN_Metrics m =
+        mn_quality_metrics("nest.ts",
+                           "function base(x: number): number { return x + 1; }\n\n"
+                           "function makeTransformer(offset: number): (n: number) => number {\n"
+                           "    return (n: number) => base(n) + offset;\n"
+                           "}\n\n"
+                           "function run(): number {\n"
+                           "    const t = makeTransformer(10);\n"
+                           "    return t(base(5));\n"
+                           "}\n",
+                           __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
 /* Java: inner (non-static) class with method calling outer. */
 TEST(mn_nested_function_java) {
-    MN_Metrics m = mn_metrics("Outer.java",
-        "package app;\n\n"
-        "class Outer {\n"
-        "    private int base;\n"
-        "    Outer(int b) { this.base = b; }\n\n"
-        "    private int double_(int x) { return x * 2; }\n\n"
-        "    class Inner {\n"
-        "        int compute(int x) { return double_(x) + base; }\n"
-        "    }\n\n"
-        "    int run(int n) { return new Inner().compute(n); }\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("Outer.java", "package app;\n\n"
+                                 "class Outer {\n"
+                                 "    private int base;\n"
+                                 "    Outer(int b) { this.base = b; }\n\n"
+                                 "    private int double_(int x) { return x * 2; }\n\n"
+                                 "    class Inner {\n"
+                                 "        int compute(int x) { return double_(x) + base; }\n"
+                                 "    }\n\n"
+                                 "    int run(int n) { return new Inner().compute(n); }\n"
+                                 "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.methods >= 2);
@@ -1350,13 +1569,13 @@ TEST(mn_nested_function_java) {
 TEST(mn_nested_function_c) {
     /* C doesn't have nested functions in the standard; use a helper+closure
      * pattern that any C grammar parses without extensions. */
-    MN_Metrics m = mn_metrics("nest.c",
-        "static int scale(int x, int factor) { return x * factor; }\n\n"
-        "static int apply_double(int x) { return scale(x, 2); }\n\n"
-        "static int apply_triple(int x) { return scale(x, 3); }\n\n"
-        "int run(int n) {\n"
-        "    return apply_double(n) + apply_triple(n);\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("nest.c", "static int scale(int x, int factor) { return x * factor; }\n\n"
+                             "static int apply_double(int x) { return scale(x, 2); }\n\n"
+                             "static int apply_triple(int x) { return scale(x, 3); }\n\n"
+                             "int run(int n) {\n"
+                             "    return apply_double(n) + apply_triple(n);\n"
+                             "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 4);
     ASSERT_TRUE(m.calls >= 1);
@@ -1380,8 +1599,7 @@ typedef struct {
     int config_class;
     int clamp_function;
     int normalise_function;
-    int normalise_calls_clamp;
-    int constructor_calls_normalise;
+    bool quality;
 } MN_TSNamespaceObservation;
 
 static MN_TSNamespaceObservation mn_observe_ts_namespace(const char *filename) {
@@ -1416,25 +1634,23 @@ static MN_TSNamespaceObservation mn_observe_ts_namespace(const char *filename) {
                                                      ".ns.App.Utils.clamp");
         o.normalise_function = mn_named_node_match_count(store, lp.project, "normalise", "Function",
                                                          ".ns.App.Utils.normalise");
-        o.normalise_calls_clamp = mn_exact_edge_by_qn_suffix(
-            store, lp.project, "CALLS", "ns.App.Utils.normalise", "ns.App.Utils.clamp");
-        o.constructor_calls_normalise = mn_exact_edge_by_qn_suffix(
-            store, lp.project, "CALLS", "ns.App.Config.constructor", "ns.App.Utils.normalise");
+        o.quality = mn_quality(!strcmp(filename, "ns.ts") ? "mn_module_ts_namespace"
+                                                          : "mn_module_tsx_namespace",
+                               filename, source);
     }
     mn_cleanup(&lp, store);
     return o;
 }
 
-#define MN_ASSERT_TS_NAMESPACE(o)                      \
-    do {                                               \
-        ASSERT_EQ((o).app_module, 1);                  \
-        ASSERT_EQ((o).utils_module, 1);                \
-        ASSERT_EQ((o).namespace_classes, 0);           \
-        ASSERT_EQ((o).config_class, 1);                \
-        ASSERT_EQ((o).clamp_function, 1);              \
-        ASSERT_EQ((o).normalise_function, 1);          \
-        ASSERT_EQ((o).normalise_calls_clamp, 1);       \
-        ASSERT_EQ((o).constructor_calls_normalise, 1); \
+#define MN_ASSERT_TS_NAMESPACE(o)             \
+    do {                                      \
+        ASSERT_EQ((o).app_module, 1);         \
+        ASSERT_EQ((o).utils_module, 1);       \
+        ASSERT_EQ((o).namespace_classes, 0);  \
+        ASSERT_EQ((o).config_class, 1);       \
+        ASSERT_EQ((o).clamp_function, 1);     \
+        ASSERT_EQ((o).normalise_function, 1); \
+        ASSERT_TRUE((o).quality);             \
     } while (0)
 
 /* TypeScript: nested namespace functions remain free functions with exact QNs. */
@@ -1454,19 +1670,18 @@ TEST(mn_module_tsx_namespace) {
 
 /* C++: namespace with nested classes and functions. */
 TEST(mn_module_cpp_namespace) {
-    MN_Metrics m = mn_metrics("ns.cpp",
-        "namespace math {\n"
-        "namespace detail {\n"
-        "    static double square(double x) { return x * x; }\n"
-        "}\n\n"
-        "double hypotenuse(double a, double b) {\n"
-        "    return detail::square(a) + detail::square(b);\n"
-        "}\n"
-        "}\n\n"
-        "int main() {\n"
-        "    double h = math::hypotenuse(3.0, 4.0);\n"
-        "    return (int)h;\n"
-        "}\n");
+    MN_Metrics m = mn_metrics("ns.cpp", "namespace math {\n"
+                                        "namespace detail {\n"
+                                        "    static double square(double x) { return x * x; }\n"
+                                        "}\n\n"
+                                        "double hypotenuse(double a, double b) {\n"
+                                        "    return detail::square(a) + detail::square(b);\n"
+                                        "}\n"
+                                        "}\n\n"
+                                        "int main() {\n"
+                                        "    double h = math::hypotenuse(3.0, 4.0);\n"
+                                        "    return (int)h;\n"
+                                        "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 2);
     /* REAL BUG: every call here is namespace-scope-qualified with `::`
@@ -1480,20 +1695,20 @@ TEST(mn_module_cpp_namespace) {
 
 /* C#: nested namespaces with classes. */
 TEST(mn_module_csharp_namespace) {
-    MN_Metrics m = mn_metrics("Ns.cs",
-        "namespace App {\n"
-        "    namespace Util {\n"
-        "        class Formatter {\n"
-        "            public static string Format(int n) => $\"[{n}]\";\n"
-        "        }\n"
-        "    }\n"
-        "    namespace Domain {\n"
-        "        class Order {\n"
-        "            public int Id;\n"
-        "            public string Label() => Util.Formatter.Format(Id);\n"
-        "        }\n"
-        "    }\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("Ns.cs", "namespace App {\n"
+                            "    namespace Util {\n"
+                            "        class Formatter {\n"
+                            "            public static string Format(int n) => $\"[{n}]\";\n"
+                            "        }\n"
+                            "    }\n"
+                            "    namespace Domain {\n"
+                            "        class Order {\n"
+                            "            public int Id;\n"
+                            "            public string Label() => Util.Formatter.Format(Id);\n"
+                            "        }\n"
+                            "    }\n"
+                            "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
     ASSERT_TRUE(m.methods >= 1);
@@ -1502,17 +1717,17 @@ TEST(mn_module_csharp_namespace) {
 
 /* Rust: nested mod blocks with pub fn. */
 TEST(mn_module_rust_mod) {
-    MN_Metrics m = mn_metrics("lib.rs",
-        "mod math {\n"
-        "    pub fn square(x: i32) -> i32 { x * x }\n\n"
-        "    pub mod trig {\n"
-        "        pub fn approx_sin(x: f64) -> f64 { x - x*x*x/6.0 }\n"
-        "        pub fn approx_cos(x: f64) -> f64 { 1.0 - x*x/2.0 }\n"
-        "    }\n"
-        "}\n\n"
-        "pub fn run() -> i32 {\n"
-        "    math::square(4) + (math::trig::approx_sin(0.1) * 100.0) as i32\n"
-        "}\n");
+    MN_Metrics m =
+        mn_metrics("lib.rs", "mod math {\n"
+                             "    pub fn square(x: i32) -> i32 { x * x }\n\n"
+                             "    pub mod trig {\n"
+                             "        pub fn approx_sin(x: f64) -> f64 { x - x*x*x/6.0 }\n"
+                             "        pub fn approx_cos(x: f64) -> f64 { 1.0 - x*x/2.0 }\n"
+                             "    }\n"
+                             "}\n\n"
+                             "pub fn run() -> i32 {\n"
+                             "    math::square(4) + (math::trig::approx_sin(0.1) * 100.0) as i32\n"
+                             "}\n");
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.functions >= 3);
     PASS();
@@ -1522,15 +1737,13 @@ TEST(mn_module_rust_mod) {
 TEST(mn_module_python_package) {
     static const MN_LangFile f[] = {
         {"pkg/__init__.py", "from .util import add\n"},
-        {"pkg/util.py",
-         "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n"},
-        {"main.py",
-         "from .pkg import add\n\n\ndef run():\n    return add(1, 2)\n"}};
+        {"pkg/util.py", "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n"},
+        {"main.py", "from .pkg import add\n\n\ndef run():\n    return add(1, 2)\n"}};
     MN_LangProj lp;
     cbm_store_t *store = mn_index_files(&lp, f, 3);
     int functions = store ? mn_count_label(store, lp.project, "Function") : 0;
-    int imports   = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : 0;
-    int ok        = (store != NULL);
+    int imports = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : 0;
+    int ok = (store != NULL);
     mn_cleanup(&lp, store);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(functions >= 2); /* add, sub, run */
@@ -1562,20 +1775,22 @@ TEST(mn_module_java_package) {
 
 /* PHP: namespace declaration and class. */
 TEST(mn_module_php_namespace) {
-    MN_Metrics m = mn_metrics("Calc.php",
-        "<?php\n"
-        "namespace App\\Util;\n\n"
-        "class Calc {\n"
-        "    public function add(int $a, int $b): int {\n"
-        "        return $a + $b;\n"
-        "    }\n"
-        "    public function double(int $n): int {\n"
-        "        return $this->add($n, $n);\n"
-        "    }\n"
-        "}\n");
+    bool quality = false;
+    MN_Metrics m = mn_quality_metrics("Calc.php",
+                                      "<?php\n"
+                                      "namespace App\\Util;\n\n"
+                                      "class Calc {\n"
+                                      "    public function add(int $a, int $b): int {\n"
+                                      "        return $a + $b;\n"
+                                      "    }\n"
+                                      "    public function double(int $n): int {\n"
+                                      "        return $this->add($n, $n);\n"
+                                      "    }\n"
+                                      "}\n",
+                                      __func__, &quality);
     ASSERT_TRUE(m.ok);
     ASSERT_TRUE(m.types >= 1);
-    ASSERT_TRUE(m.calls >= 1);
+    ASSERT_TRUE(quality);
     PASS();
 }
 
