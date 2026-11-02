@@ -220,6 +220,10 @@ char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source);
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// C#: a conversion operator has no name, its `implicit` or `explicit` names it. An indexer's
+// `this` does. Null for anything else.
+TSNode cbm_csharp_keyword_name(TSNode node);
+
 // Find every child node matching `kind` (unlike cbm_find_child_by_kind,
 // which stops at the first match). Writes up to `max` nodes into `out`;
 // returns how many were found. Repeated sibling nodes of the same kind are

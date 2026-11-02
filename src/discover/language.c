@@ -337,6 +337,7 @@ static const ext_entry_t EXT_TABLE[] = {
      * .NET repository's package references, target frameworks, build hooks and
      * project layout — none of which were reachable while these were unmapped. */
     {".csproj", CBM_LANG_XML},
+    {".projitems", CBM_LANG_XML},
     {".vbproj", CBM_LANG_XML},
     {".fsproj", CBM_LANG_XML},
     {".props", CBM_LANG_XML},

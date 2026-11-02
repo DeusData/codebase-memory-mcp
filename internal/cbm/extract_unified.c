@@ -970,6 +970,48 @@ static bool jvm_anonymous_member(CBMLanguage language, TSNode function) {
     return strcmp(ts_node_type(ts_node_named_child(call, 0)), "object_literal") == 0;
 }
 
+/* A local function has no node. Two C# shapes only look like one: a method of an extension block
+ * the grammar took for a constructor has a node of its own (#2071), and so may a member after a
+ * statement the grammar lost, which is why it can carry an access modifier no local function can.
+ */
+static bool local_function_without_node(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    const char *outer = state->enclosing_func_qn;
+    if (!outer) {
+        return false;
+    }
+    const char *kind = ts_node_type(node);
+    if (ctx->language == CBM_LANG_KOTLIN) {
+        TSNode parent = ts_node_parent(node);
+        return strcmp(kind, "function_declaration") == 0 && !ts_node_is_null(parent) &&
+               strcmp(ts_node_type(parent), "statements") == 0;
+    }
+    if (ctx->language != CBM_LANG_CSHARP || strcmp(kind, "local_function_statement") != 0) {
+        return false;
+    }
+    static const char EXTENSION[] = ".extension";
+    size_t outer_size = strlen(outer);
+    size_t suffix_size = sizeof(EXTENSION) - 1;
+    if (outer_size >= suffix_size && strcmp(outer + outer_size - suffix_size, EXTENSION) == 0) {
+        return false;
+    }
+    bool member = false;
+    TSTreeCursor cursor = ts_tree_cursor_new(node);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(child), "modifier") != 0) {
+                continue;
+            }
+            const char *word = ctx->source + ts_node_start_byte(child);
+            member = member || strncmp(word, "public", 6) == 0 ||
+                     strncmp(word, "private", 7) == 0 || strncmp(word, "protected", 9) == 0 ||
+                     strncmp(word, "internal", 8) == 0;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    return !member;
+}
+
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
     /* Raw configured definitions already own the canonical QN, including
@@ -982,7 +1024,9 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     /* A member of an anonymous class has no node of its own. Like a lambda's body,
      * its body belongs to the enclosing declaration; a QN of its own named a source
      * no node carries, and every call in it was dropped. */
-    if (jvm_anonymous_member(ctx->language, node) && state->enclosing_func_qn) {
+    if ((jvm_anonymous_member(ctx->language, node) ||
+         local_function_without_node(ctx, node, state)) &&
+        state->enclosing_func_qn) {
         return state->enclosing_func_qn;
     }
     /* Nor has a Rust fn nested in a function body, or a method of an impl written there, and
@@ -2798,6 +2842,19 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 state->os_type_map.count = 0;
                 state->os_type_map.class_base_count = 0;
             }
+        }
+    } else if (ctx->language == CBM_LANG_CSHARP &&
+               strcmp(ts_node_type(node), "property_declaration") == 0 &&
+               state->enclosing_class_qn) {
+        /* A property has its node. What its accessors, its expression body and its initializer
+         * call belongs to it, not to the file. */
+        TSNode name = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        if (!ts_node_is_null(name)) {
+            (void)push_function_scope(
+                state, depth,
+                cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn,
+                                  cbm_node_text(ctx->arena, name, ctx->source)),
+                node);
         }
     } else if (ctx->language == CBM_LANG_NIX && strcmp(ts_node_type(node), "binding") == 0 &&
                cbm_nix_binding_is_attrset_scope(node)) {

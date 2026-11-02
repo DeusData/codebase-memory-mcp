@@ -1,4 +1,5 @@
 #include "oo_internal.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -247,6 +248,11 @@ static bool cs_has_ref_modifier(const cs_text_t *t, TSNode node) {
     for (uint32_t i = 0; i < count; i++) {
         TSNode part = ts_node_child(node, i);
         const char *kind = ts_node_type(part);
+        /* `ref T value` can parse as a ref type; `ref readonly` also takes a plain argument. */
+        if (!strcmp(kind, "ref_type")) {
+            const char *text = cs_text(t, part);
+            return !text || !strstr(text, "readonly");
+        }
         if (!strcmp(kind, "ref") || !strcmp(kind, "out"))
             return true;
         if (!strcmp(kind, "modifier")) {
@@ -254,6 +260,22 @@ static bool cs_has_ref_modifier(const cs_text_t *t, TSNode node) {
             if (text && (!strcmp(text, "ref") || !strcmp(text, "out")))
                 return true;
         }
+    }
+    return false;
+}
+
+/* `in` and `ref readonly` parameters take a plain argument and a `ref` one. */
+static bool cs_ref_optional(const cs_text_t *t, TSNode node) {
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode part = ts_node_child(node, i);
+        const char *kind = ts_node_type(part);
+        const char *text =
+            !strcmp(kind, "modifier") || !strcmp(kind, "ref_type") ? cs_text(t, part) : NULL;
+        if (!strcmp(kind, "in") || !strcmp(kind, "readonly") ||
+            (text &&
+             (!strcmp(text, "in") || !strcmp(text, "readonly") || strstr(text, "readonly"))))
+            return true;
     }
     return false;
 }
@@ -275,11 +297,13 @@ static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, b
             TSNode type = cs_field(child, "type");
             if (refs) {
                 refs[total] = cs_typeref(&h->text, type);
-                if (refs[total] && cs_has_ref_modifier(&h->text, child)) {
+                bool optional_ref = cs_ref_optional(&h->text, child);
+                if (refs[total] && (optional_ref || cs_has_ref_modifier(&h->text, child))) {
                     oo_typeref_t *by_ref = cbm_arena_alloc(h->text.arena, sizeof(*by_ref));
                     if (by_ref) {
                         *by_ref = *refs[total];
-                        by_ref->by_ref = true;
+                        by_ref->by_ref = !optional_ref;
+                        by_ref->ref_optional = optional_ref;
                         refs[total] = by_ref;
                     }
                 }
@@ -316,6 +340,8 @@ static void ch_parameters(const ch_t *h, oo_callable_t *callable, TSNode list, b
         callable->min_args = 0;
     callable->max_args = variadic ? -1 : total;
 }
+
+static const char CW_INDEXER[] = "this";
 
 static const char *ch_graph(const ch_t *h, TSNode node, const char *name) {
     const CBMDefinition *def = oo_defs_find(&h->defs, 'C', cs_line(node), name);
@@ -359,6 +385,22 @@ static void ch_method(ch_t *h, oo_type_t *type, TSNode node) {
     }
 }
 
+/* An indexer: the callable behind `x[i]`, which has a node named `this`. */
+static void ch_indexer(ch_t *h, oo_type_t *type, TSNode node) {
+    oo_callable_t *callable = cbm_arena_calloc(h->text.arena, sizeof(*callable));
+    if (!callable)
+        return;
+    callable->name = CW_INDEXER;
+    callable->graph_qn = ch_graph(h, node, CW_INDEXER);
+    callable->owner = type;
+    callable->file = h->file;
+    callable->ns = type->ns;
+    callable->flags = cs_member_flags(cs_modifiers(&h->text, node), type);
+    ch_parameters(h, callable, cs_field(node, "parameters"), NULL);
+    callable->ret = cs_typeref(&h->text, cs_field(node, "type"));
+    oo_index_method(h->ix, type, callable);
+}
+
 static void ch_field(ch_t *h, oo_type_t *type, const char *name, TSNode node, TSNode type_node,
                      unsigned modifiers, uint32_t forced) {
     if (!name)
@@ -380,11 +422,23 @@ static void ch_type(ch_t *h, TSNode node, oo_type_t *owner, const char *ns);
 
 static void ch_members(ch_t *h, oo_type_t *type, TSNode body, const char *ns) {
     uint32_t count = ts_node_is_null(body) ? 0 : ts_node_named_child_count(body);
+    /* A contract's members are the implementation's; a nested type may still be its own. */
+    bool contract = oo_type_is_implemented_elsewhere(type, h->file);
     for (uint32_t i = 0; i < count; i++) {
         TSNode member = ts_node_named_child(body, i);
         const char *kind = ts_node_type(member);
+        if (contract && strcmp(kind, "class_declaration") && strcmp(kind, "struct_declaration") &&
+            strcmp(kind, "interface_declaration") && strcmp(kind, "enum_declaration") &&
+            strcmp(kind, "record_declaration") && strcmp(kind, "record_struct_declaration") &&
+            strcmp(kind, "delegate_declaration"))
+            continue;
+        /* C# 18.6.2: an explicit interface member implementation is no member of the type's. */
+        if (!ts_node_is_null(cs_child(member, "explicit_interface_specifier")))
+            continue;
         if (!strcmp(kind, "method_declaration") || !strcmp(kind, "constructor_declaration")) {
             ch_method(h, type, member);
+        } else if (!strcmp(kind, "indexer_declaration")) {
+            ch_indexer(h, type, member);
         } else if (!strcmp(kind, "property_declaration")) {
             ch_field(h, type, cs_name(&h->text, cs_field(member, "name")), member,
                      cs_field(member, "type"), cs_modifiers(&h->text, member), 0);
@@ -403,6 +457,10 @@ static void ch_members(ch_t *h, oo_type_t *type, TSNode body, const char *ns) {
                     ch_field(h, type, cs_name(&h->text, cs_field(declarator, "name")), declarator,
                              field_type, modifiers, forced);
             }
+        } else if (!strcmp(kind, "conversion_operator_declaration")) {
+            const char *text = cs_text(&h->text, member);
+            if (text && strstr(text, "implicit"))
+                type->flags |= OO_F_CONVERTS;
         } else if (!strcmp(kind, "enum_member_declaration")) {
             const char *name = cs_name(&h->text, cs_field(member, "name"));
             oo_field_t *field = name ? cbm_arena_calloc(h->text.arena, sizeof(*field)) : NULL;
@@ -448,6 +506,10 @@ static void ch_type(ch_t *h, TSNode node, oo_type_t *owner, const char *ns) {
         flags |= OO_F_INTERFACE;
     if (cs_is(node, "enum_declaration"))
         flags |= OO_F_ENUM;
+    if (cs_is(node, "delegate_declaration"))
+        flags |= OO_F_DELEGATE;
+    if (cs_is(node, "struct_declaration") || cs_is(node, "record_struct_declaration"))
+        flags |= OO_F_VALUE;
     if (oo_members_broken(node))
         flags |= OO_F_INCOMPLETE;
     const CBMDefinition *def = oo_defs_find(&h->defs, 'T', cs_line(node), name);
@@ -455,6 +517,10 @@ static void ch_type(ch_t *h, TSNode node, oo_type_t *owner, const char *ns) {
                                     def ? def->qualified_name : NULL, flags);
     if (!type)
         return;
+    if (oo_type_is_implemented_elsewhere(type, h->file)) {
+        ch_members(h, type, cs_field(node, "body"), ns);
+        return;
+    }
     if (!type->tparams)
         type->tparams = cs_tparams(&h->text, node, &type->tparam_count);
     TSNode bases = cs_child(node, "base_list");
@@ -467,6 +533,22 @@ static void ch_type(ch_t *h, TSNode node, oo_type_t *owner, const char *ns) {
         if (cs_is(base, "argument_list"))
             continue;
         oo_type_add_super(h->ix, type, cs_typeref(&h->text, base), h->file, ns);
+    }
+    /* A delegate's signature is its Invoke, which has no node of its own. */
+    if (cs_is(node, "delegate_declaration")) {
+        oo_callable_t *invoke = cbm_arena_calloc(h->text.arena, sizeof(*invoke));
+        if (invoke) {
+            invoke->name = "Invoke";
+            invoke->owner = type;
+            invoke->file = h->file;
+            invoke->ns = ns;
+            ch_parameters(h, invoke, cs_field(node, "parameters"), NULL);
+            invoke->ret = cs_typeref(&h->text, cs_field(node, "type"));
+            oo_index_method(h->ix, type, invoke);
+            type->abstract_method = invoke;
+            type->abstract_count = 1;
+        }
+        return;
     }
     /* A primary constructor: its parameters; a record's are also properties. */
     TSNode primary = cs_child(node, "parameter_list");
@@ -592,17 +674,33 @@ bool oo_csharp_harvest(cbm_oo_index_t *ix, const char *rel, const CBMFileResult 
 
 /* ── Walk ───────────────────────────────────────────────────────────── */
 
+/* One call's lambda arguments. Their parameter types come from the declaration the call selects,
+ * so they are walked after selection, once each. */
+typedef struct {
+    TSNode *nodes; /* By argument position; a null node is no lambda. */
+    int count;
+    bool walked;
+    oo_value_t last; /* The last lambda's expression body. */
+} cw_lambdas_t;
+
 typedef struct {
     oo_walk_t *w;
     cs_text_t text;
     int depth;
     bool static_method;
     bool in_nameof;
+    cw_lambdas_t *lambdas;       /* The call whose declaration is being selected. */
+    const oo_value_t *type_args; /* What the call being selected spells: `Get<Foo>()`. */
+    int type_arg_count;
+    oo_value_t pattern_subject; /* What the pattern being walked is matched against. */
 } cw_t;
 
 static oo_value_t cw_expr(cw_t *c, TSNode node);
 static void cw_members(cw_t *c, TSNode body, const oo_type_t *type);
 static void cw_type(cw_t *c, TSNode node, const oo_type_t *owner);
+
+static void cw_attribute_lists(cw_t *c, TSNode owner);
+static bool cw_lambda_to_declared(cw_t *c, TSNode lambda, TSNode type);
 
 static void cw_children(cw_t *c, TSNode node) {
     uint32_t count = ts_node_is_null(node) ? 0 : ts_node_named_child_count(node);
@@ -623,8 +721,13 @@ static void cw_type_mentions(cw_t *c, TSNode node, unsigned depth) {
         oo_value_t value = cw_ref(c, mentioned);
         if (value.type && value.type->graph_qn &&
             !(mentioned && oo_names_tparam(w, mentioned->name))) {
-            oo_emit_type_ref(w, node, value.type->graph_qn, "csharp-type-name-lookup");
-            oo_emit_usage(w, node, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+            /* `A.B<T>` occurs as `B`; its USES_TYPE carrier may also span a plain `A.B`. */
+            TSNode last = cs_is(node, "qualified_name") ? cs_field(node, "name") : node;
+            TSNode leaf = cs_is(last, "generic_name") ? cs_child(last, "identifier") : last;
+            oo_emit_type_ref(w, leaf, value.type->graph_qn, "csharp-type-name-lookup");
+            if (!ts_node_eq(leaf, node))
+                oo_emit_type_ref(w, node, value.type->graph_qn, "csharp-type-name-lookup");
+            oo_emit_usage(w, leaf, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
                           CBM_RESOLVE_RULE_DECLARED_TYPE, "csharp-type-name-lookup");
         }
         TSNode list = cs_is(node, "generic_name") ? cs_child(node, "type_argument_list")
@@ -653,6 +756,48 @@ static oo_value_t cw_declared(cw_t *c, TSNode type, oo_value_t initial) {
 /* Target-typed `new()`: the declared type names the class. */
 static void cw_implicit_creation(cw_t *c, TSNode node, const oo_value_t *target);
 
+/* `[Foo(Bar.Baz)]`: the class is Foo or FooAttribute (C# 23.3), and its arguments are expressions
+ * of the scope around the declaration. Both spellings existing is an error, so the first found is
+ * it. */
+static void cw_attribute(cw_t *c, TSNode attribute) {
+    oo_walk_t *w = c->w;
+    TSNode name = cs_field(attribute, "name");
+    const oo_typeref_t *written = cs_typeref(&c->text, name);
+    oo_value_t value = cw_ref(c, written);
+    if (!value.type && written && written->name) {
+        oo_typeref_t suffixed = *written;
+        suffixed.name = cbm_arena_sprintf(w->arena, "%sAttribute", written->name);
+        if (suffixed.name)
+            value = cw_ref(c, &suffixed);
+    }
+    if (value.type && value.type->graph_qn) {
+        TSNode site = cs_is(name, "qualified_name") ? cs_field(name, "name") : name;
+        oo_emit_usage(w, site, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+                      CBM_RESOLVE_RULE_DECLARED_TYPE, "csharp-attribute-name-lookup");
+    }
+    TSNode arguments = cs_child(attribute, "attribute_argument_list");
+    uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode argument = ts_node_named_child(arguments, i);
+        uint32_t parts = ts_node_named_child_count(argument);
+        if (parts)
+            (void)cw_expr(c, ts_node_named_child(argument, parts - 1));
+    }
+}
+
+static void cw_attribute_lists(cw_t *c, TSNode owner) {
+    uint32_t count = ts_node_is_null(owner) ? 0 : ts_node_named_child_count(owner);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode list = ts_node_named_child(owner, i);
+        if (!cs_is(list, "attribute_list"))
+            continue;
+        uint32_t attributes = ts_node_named_child_count(list);
+        for (uint32_t a = 0; a < attributes; a++)
+            if (cs_is(ts_node_named_child(list, a), "attribute"))
+                cw_attribute(c, ts_node_named_child(list, a));
+    }
+}
+
 static void cw_variable_declaration(cw_t *c, TSNode node) {
     TSNode type = cs_field(node, "type");
     uint32_t count = ts_node_named_child_count(node);
@@ -671,7 +816,8 @@ static void cw_variable_declaration(cw_t *c, TSNode node) {
         }
         oo_value_t initial = oo_value_unknown();
         bool implicit = cs_is(initializer, "implicit_object_creation_expression");
-        if (!ts_node_is_null(initializer) && !implicit)
+        if (!ts_node_is_null(initializer) && !implicit &&
+            !cw_lambda_to_declared(c, initializer, type))
             initial = cw_expr(c, initializer);
         oo_value_t value = cw_declared(c, type, initial);
         if (implicit)
@@ -688,6 +834,7 @@ static void cw_bind_parameters(cw_t *c, TSNode list) {
         if (cs_is(child, "parameter")) {
             TSNode type = cs_field(child, "type");
             const char *name = cs_name(&c->text, cs_field(child, "name"));
+            cw_attribute_lists(c, child);
             cw_type_mentions(c, type, 0);
             oo_bind(c->w, name,
                     ts_node_is_null(type) ? oo_value_unknown()
@@ -717,7 +864,28 @@ static TSNode cw_argument_value(TSNode argument) {
     return parts ? ts_node_named_child(argument, parts - 1) : (TSNode){0};
 }
 
-static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count) {
+static bool cw_is_lambda(TSNode node) {
+    return cs_is(node, "lambda_expression") || cs_is(node, "anonymous_method_expression");
+}
+
+/* How many parameters a lambda declares, or -1 for `delegate { }`, which fits any. */
+static int cw_lambda_arity(TSNode lambda) {
+    TSNode parameters = cs_field(lambda, "parameters");
+    if (cs_is(parameters, "implicit_parameter") || cs_is(parameters, "identifier"))
+        return 1;
+    if (ts_node_is_null(parameters))
+        return -1;
+    int total = 0;
+    uint32_t count = ts_node_child_count(parameters);
+    for (uint32_t i = 0; i < count; i++)
+        total += cs_is(ts_node_child(parameters, i), "parameter");
+    return total;
+}
+
+/* A named argument (`isFinalBlock: false`) says nothing about its position, so its type does not
+ * take part in overload choice. A lambda waits for selection when the caller collects it. */
+static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count,
+                                      cw_lambdas_t *deferred) {
     uint32_t children = ts_node_is_null(list) ? 0 : ts_node_named_child_count(list);
     int count = 0;
     for (uint32_t i = 0; i < children; i++)
@@ -726,12 +894,31 @@ static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count) {
     *out_count = count;
     oo_value_t *values =
         count ? cbm_arena_calloc(c->w->arena, (size_t)count * sizeof(*values)) : NULL;
+    if (deferred && count) {
+        deferred->nodes = cbm_arena_calloc(c->w->arena, (size_t)count * sizeof(TSNode));
+        deferred->count = deferred->nodes ? count : 0;
+    }
     int at = 0;
     for (uint32_t i = 0; i < children; i++) {
         TSNode argument = ts_node_named_child(list, i);
         if (!cs_is(argument, "argument"))
             continue;
-        oo_value_t value = cw_expr(c, cw_argument_value(argument));
+        TSNode expression = cw_argument_value(argument);
+        bool named = ts_node_named_child_count(argument) > 1 &&
+                     (cs_is(ts_node_named_child(argument, 0), "name_colon") ||
+                      !ts_node_is_null(cs_field(argument, "name")));
+        bool lambda = cw_is_lambda(expression);
+        oo_value_t value = oo_value_unknown();
+        if (lambda && !named && deferred && deferred->nodes) {
+            deferred->nodes[at] = expression;
+        } else {
+            value = cw_expr(c, expression);
+            if (named)
+                value = oo_value_unknown();
+        }
+        value.function_literal = lambda && !named;
+        if (value.function_literal)
+            value.lambda_parameters = cw_lambda_arity(expression) + 1;
         value.by_ref = cs_has_ref_modifier(&c->text, argument);
         if (values)
             values[at] = value;
@@ -740,14 +927,192 @@ static const oo_value_t *cw_arguments(cw_t *c, TSNode list, int *out_count) {
     return values;
 }
 
-static bool cw_external_accepts(const char *declared, const oo_value_t *value) {
-    if (!value->external)
+/* A lambda under the parameter types its target gave, `count` of them, or none known at -1. */
+static oo_value_t cw_lambda_typed(cw_t *c, TSNode node, const oo_value_t *types, int count) {
+    oo_walk_t *w = c->w;
+    oo_frame_t frame;
+    oo_frame_push(w, &frame);
+    TSNode parameters = cs_field(node, "parameters");
+    if (cs_is(parameters, "implicit_parameter") || cs_is(parameters, "identifier")) {
+        oo_bind(w, cs_name(&c->text, parameters), count == 1 ? types[0] : oo_value_unknown());
+    } else {
+        /* A written type wins; a name alone takes the target's. */
+        uint32_t children = ts_node_is_null(parameters) ? 0 : ts_node_child_count(parameters);
+        int total = 0, at = 0;
+        for (uint32_t i = 0; i < children; i++)
+            total += cs_is(ts_node_child(parameters, i), "parameter");
+        cw_bind_parameters(c, parameters);
+        for (uint32_t i = 0; i < children && total == count; i++) {
+            TSNode parameter = ts_node_child(parameters, i);
+            if (!cs_is(parameter, "parameter"))
+                continue;
+            if (ts_node_is_null(cs_field(parameter, "type")))
+                oo_bind(w, cs_name(&c->text, cs_field(parameter, "name")), types[at]);
+            at++;
+        }
+    }
+    oo_value_t body = cw_expr(c, cs_field(node, "body"));
+    oo_frame_pop(w);
+    return body;
+}
+
+static bool cw_imports_system(const oo_file_t *file) {
+    for (int i = 0; file && i < file->import_count; i++)
+        if (file->imports[i].star && !file->imports[i].statik &&
+            !strcmp(file->imports[i].path, "System"))
+            return true;
+    return false;
+}
+
+/* System's generic delegates when the project does not declare them: an identity-marked spelling
+ * (`Func`2`) that the declaring file reads from `using System`, or spells out. */
+static int cw_functional_parameters(cw_t *c, const oo_value_t *function, const oo_file_t *file,
+                                    oo_value_t *out, int capacity) {
+    if (function->type && !strcmp(function->type->name, "Expression`1") && function->arg_count == 1)
+        return cw_functional_parameters(c, &function->args[0], file, out, capacity);
+    if (function->type)
+        return oo_functional_parameters(c->w, function, out, capacity);
+    if (!function->external || function->dims)
+        return -1;
+    const char *leaf = strrchr(function->external, '.');
+    if (leaf && strncmp(function->external, "System.", 7))
+        return -1;
+    if (!leaf && !cw_imports_system(file))
+        return -1;
+    leaf = leaf ? leaf + 1 : function->external;
+    int args = function->arg_count;
+    if (args > capacity)
+        return -1;
+    int count = -1;
+    if (!strncmp(leaf, "Action`", 7))
+        count = args;
+    else if (!strncmp(leaf, "Func`", 5))
+        count = args - 1;
+    else if (!strcmp(leaf, "Predicate`1") || !strcmp(leaf, "Converter`2"))
+        count = 1;
+    if (count >= 0) {
+        for (int i = 0; i < count; i++)
+            out[i] = function->args[i];
+        return count;
+    }
+    if (!strcmp(leaf, "Comparison`1") && args == 1 && capacity >= 2) {
+        out[0] = function->args[0];
+        out[1] = function->args[0];
+        return 2;
+    }
+    return -1;
+}
+
+enum { CW_LAMBDA_PARAMETERS = 8 };
+
+/* `Func<Doc, int> f = d => d.Go();`: the declared type is the target. */
+static bool cw_lambda_to_declared(cw_t *c, TSNode lambda, TSNode type) {
+    if (!cw_is_lambda(lambda) || ts_node_is_null(type) || cs_is(type, "implicit_type"))
         return false;
+    oo_value_t declared = cw_ref(c, cs_typeref(&c->text, type));
+    oo_value_t types[CW_LAMBDA_PARAMETERS];
+    int count = cw_functional_parameters(c, &declared, c->w->f, types, CW_LAMBDA_PARAMETERS);
+    (void)cw_lambda_typed(c, lambda, types, count);
+    return true;
+}
+
+/* Walk a call's lambdas: under the selected declaration, under a standard collection method of
+ * `receiver` called `name`, or with unknown parameters when neither applies. */
+static void cw_finish_lambdas(cw_t *c, cw_lambdas_t *lambdas, const oo_callable_t *callee,
+                              const oo_subst_t *subst, const oo_value_t *receiver,
+                              const char *name) {
+    if (!lambdas || lambdas->walked)
+        return;
+    lambdas->walked = true;
+    oo_walk_t *w = c->w;
+    for (int i = 0; i < lambdas->count; i++) {
+        if (ts_node_is_null(lambdas->nodes[i]))
+            continue;
+        oo_value_t types[CW_LAMBDA_PARAMETERS];
+        int count = -1;
+        if (callee && callee->params && callee->param_count) {
+            int index = i < callee->param_count ? i : callee->param_count - 1;
+            if (callee->params[index]) {
+                oo_scope_t scope = oo_scope_of_callable(callee);
+                oo_value_t function = oo_value_from_ref(w, callee->params[index], &scope, subst);
+                count = cw_functional_parameters(c, &function, callee->file, types,
+                                                 CW_LAMBDA_PARAMETERS);
+            }
+        } else if (receiver && name) {
+            count = oo_stdlib_lambda_parameters(w, receiver, name, i, lambdas->count, types,
+                                                CW_LAMBDA_PARAMETERS);
+        }
+        lambdas->last = cw_lambda_typed(c, lambdas->nodes[i], types, count);
+    }
+}
+
+static bool cw_word_in(const char *leaf, const char *const *names) {
+    size_t length = strcspn(leaf, "`");
+    for (int i = 0; names[i]; i++)
+        if (strlen(names[i]) == length && !strncmp(leaf, names[i], length))
+            return true;
+    return false;
+}
+
+static const char *const CW_SEQUENCE_INTERFACES[] = {
+    "IEnumerable", "ICollection", "IReadOnlyCollection", "IList", "IReadOnlyList", NULL};
+
+/* A BCL collection reaches the sequence interfaces it implements; an array reaches them all
+ * (C# 17.1.2). */
+static bool cw_external_accepts(const char *declared, const oo_value_t *value) {
     const char *a = strrchr(declared, '.');
     a = a ? a + 1 : declared;
+    if (value->dims > 0)
+        return cw_word_in(a, CW_SEQUENCE_INTERFACES);
+    if (!value->external)
+        return false;
     const char *b = strrchr(value->external, '.');
     b = b ? b + 1 : value->external;
-    return !strcmp(a, b);
+    if (!strcmp(a, b))
+        return true;
+    static const char *const collections[] = {"List",
+                                              "HashSet",
+                                              "SortedSet",
+                                              "LinkedList",
+                                              "Queue",
+                                              "Stack",
+                                              "ImmutableArray",
+                                              "ImmutableList",
+                                              "ObservableCollection",
+                                              "Collection",
+                                              "ReadOnlyCollection",
+                                              NULL};
+    return cw_word_in(a, CW_SEQUENCE_INTERFACES) && cw_word_in(b, collections);
+}
+
+/* A project type that lists this outside interface among its supertypes, at any depth. */
+static bool cw_type_implements_external(const oo_type_t *type, const char *declared) {
+    enum { MAX_STEPS = 64 };
+    const oo_type_t *queue[MAX_STEPS];
+    int head = 0, tail = 0;
+    const char *wanted = strrchr(declared, '.');
+    wanted = wanted ? wanted + 1 : declared;
+    queue[tail++] = type;
+    while (head < tail) {
+        const oo_type_t *current = queue[head++];
+        for (int i = 0; i < current->super_count; i++) {
+            const oo_super_t *super = &current->supers[i];
+            if (super->resolved) {
+                bool seen = false;
+                for (int j = 0; j < tail && !seen; j++)
+                    seen = queue[j] == super->resolved;
+                if (!seen && tail < MAX_STEPS)
+                    queue[tail++] = super->resolved;
+                continue;
+            }
+            const char *spelled = super->ref ? super->ref->name : NULL;
+            const char *leaf = spelled ? strrchr(spelled, '.') : NULL;
+            leaf = leaf ? leaf + 1 : spelled;
+            if (leaf && !strcmp(leaf, wanted))
+                return true;
+        }
+    }
+    return false;
 }
 
 static bool cw_extension_accepts(oo_walk_t *w, const oo_callable_t *candidate,
@@ -764,10 +1129,16 @@ static bool cw_extension_accepts(oo_walk_t *w, const oo_callable_t *candidate,
         return bound.type && value->type && oo_is_subtype(w->ix, value->type, bound.type);
     }
     oo_value_t receiver = oo_value_from_ref(w, ref, &scope, NULL);
+    /* An array reaches the sequence interfaces, here or in a core library. */
+    if (value->dims > receiver.dims && !receiver.dims)
+        return receiver.type ? cw_word_in(receiver.type->name, CW_SEQUENCE_INTERFACES)
+                             : receiver.external && cw_external_accepts(receiver.external, value);
     if (receiver.dims != value->dims)
         return false;
     if (receiver.type)
         return value->type && oo_is_subtype(w->ix, value->type, receiver.type);
+    if (receiver.external && value->type)
+        return cw_type_implements_external(value->type, receiver.external);
     return receiver.external && cw_external_accepts(receiver.external, value);
 }
 
@@ -825,38 +1196,153 @@ static oo_select_t cw_select_extension(cw_t *c, const oo_value_t *value, const c
 }
 
 static oo_value_t cw_emit_selected(cw_t *c, TSNode site, const oo_select_t *selected,
-                                   const char *decision) {
+                                   const char *decision, const oo_value_t *receiver, int argc,
+                                   const oo_value_t *args) {
     oo_walk_t *w = c->w;
+    const oo_value_t *spelled = c->type_args;
+    int spelled_count = c->type_arg_count;
+    c->type_args = NULL;
+    c->type_arg_count = 0;
     if (selected->status != OO_SEL_UNIQUE || !selected->callable)
         return oo_value_unknown();
     if (selected->callable->graph_qn)
         oo_emit_call(w, site, selected->callable->graph_qn, CBM_RESOLVE_RULE_TYPE_MEMBER,
                      CBM_RESOLVE_FACT_RECEIVER_TYPED, decision);
-    return oo_callable_return(w, selected->callable, selected->subst);
+    const oo_subst_t *subst =
+        oo_infer_call_subst(w, selected->callable, selected->subst, receiver, args, argc);
+    oo_subst_t *given = spelled && spelled_count == selected->callable->tparam_count
+                            ? cbm_arena_alloc(w->arena, sizeof(*given))
+                            : NULL;
+    if (given) {
+        *given = (oo_subst_t){.tparams = selected->callable->tparams,
+                              .count = spelled_count,
+                              .args = spelled,
+                              .arg_count = spelled_count,
+                              .next = selected->subst};
+        subst = given;
+    }
+    cw_finish_lambdas(c, c->lambdas, selected->callable, subst, NULL, NULL);
+    return oo_callable_return(w, selected->callable, subst);
+}
+
+/* The type arguments a generic call spells, read once its arguments are walked. */
+static void cw_spell_type_args(cw_t *c, TSNode name) {
+    c->type_args = NULL;
+    c->type_arg_count = 0;
+    if (!cs_is(name, "generic_name"))
+        return;
+    TSNode list = cs_child(name, "type_argument_list");
+    int count = cs_type_args_count(list);
+    oo_value_t *values =
+        count ? cbm_arena_calloc(c->w->arena, (size_t)count * sizeof(*values)) : NULL;
+    if (!values)
+        return;
+    for (int i = 0; i < count; i++)
+        values[i] = cw_ref(c, cs_typeref(&c->text, ts_node_named_child(list, (uint32_t)i)));
+    c->type_args = values;
+    c->type_arg_count = count;
+}
+
+/* C# 8.2: a keyword type is an alias of its System type. A project that declares that type (a core
+ * library) has it as a receiver; everywhere else it stays external. */
+static oo_value_t cw_keyword_receiver(const cw_t *c, const oo_value_t *value) {
+    static const struct {
+        const char *keyword, *type;
+    } ALIASES[] = {
+        {"string", "System.String"}, {"object", "System.Object"}, {"int", "System.Int32"},
+        {"uint", "System.UInt32"},   {"long", "System.Int64"},    {"ulong", "System.UInt64"},
+        {"short", "System.Int16"},   {"ushort", "System.UInt16"}, {"byte", "System.Byte"},
+        {"sbyte", "System.SByte"},   {"bool", "System.Boolean"},  {"char", "System.Char"},
+        {"float", "System.Single"},  {"double", "System.Double"}, {"decimal", "System.Decimal"},
+        {"nint", "System.IntPtr"},   {"nuint", "System.UIntPtr"}};
+    oo_value_t out = oo_value_unknown();
+    if (value->dims > 0 && !value->classref) {
+        /* C# 17.2.2: every array type derives from System.Array. */
+        const oo_type_t *array = oo_lookup_visible(c->w->ix, "System.Array", c->w->f);
+        return array && !(array->flags & OO_F_AMBIGUOUS) ? oo_value_of_type(array) : out;
+    }
+    if (!value->external || value->dims)
+        return out;
+    for (size_t i = 0; i < sizeof(ALIASES) / sizeof(ALIASES[0]); i++) {
+        if (strcmp(ALIASES[i].keyword, value->external))
+            continue;
+        const oo_type_t *type = oo_lookup_type(c->w->ix, ALIASES[i].type);
+        if (type && !(type->flags & OO_F_AMBIGUOUS)) {
+            out = oo_value_of_type(type);
+            out.classref = value->classref;
+        }
+        break;
+    }
+    return out;
+}
+
+/* C# 8.2.3: object's members are every class's, and ValueType's and Enum's stand in front of them
+ * for a struct and an enum. A complete hierarchy that found nothing means them, where the project
+ * declares them all. */
+static oo_select_t cw_select_object_member(cw_t *c, const oo_type_t *from, const char *name,
+                                           int argc, const oo_value_t *args) {
+    static const char *const CHAINS[][4] = {
+        {"System.Object", NULL, NULL, NULL},
+        {"System.ValueType", "System.Object", NULL, NULL},
+        {"System.Enum", "System.ValueType", "System.Object", NULL}};
+    oo_select_t selected = {.status = OO_SEL_NONE};
+    if (!from)
+        return selected;
+    int kind = (from->flags & OO_F_ENUM) ? 2 : (from->flags & OO_F_VALUE) ? 1 : 0;
+    for (const char *const *root = CHAINS[kind]; *root; root++) {
+        const oo_type_t *type = oo_lookup_visible(c->w->ix, *root, c->w->f);
+        if (!type || (type->flags & OO_F_AMBIGUOUS))
+            return (oo_select_t){.status = OO_SEL_NONE};
+    }
+    for (const char *const *root = CHAINS[kind]; *root; root++) {
+        const oo_type_t *type = oo_lookup_visible(c->w->ix, *root, c->w->f);
+        if (type == from)
+            return (oo_select_t){.status = OO_SEL_NONE};
+        oo_value_t base = oo_value_of_type(type);
+        selected = oo_select_method(c->w, &base, name, argc, args, false);
+        if (selected.status != OO_SEL_NONE)
+            return selected;
+    }
+    return selected;
 }
 
 static oo_value_t cw_member_call(cw_t *c, TSNode site, const oo_value_t *receiver, const char *name,
                                  int argc, const oo_value_t *args) {
     oo_walk_t *w = c->w;
-    if (receiver->type) {
-        oo_select_t member = oo_select_method(w, receiver, name, argc, args, receiver->classref);
+    oo_value_t keyword = cw_keyword_receiver(c, receiver);
+    const oo_value_t *lookup = keyword.type ? &keyword : receiver;
+    if (lookup->type) {
+        oo_select_t member = oo_select_method(w, lookup, name, argc, args, lookup->classref);
+        if (member.status == OO_SEL_NONE && !lookup->classref && !lookup->dims)
+            member = cw_select_object_member(c, lookup->type, name, argc, args);
         /* C# 12.8.7: a static member is not reached through an instance. */
-        if (member.status == OO_SEL_UNIQUE && !receiver->classref &&
+        if (member.status == OO_SEL_UNIQUE && !lookup->classref &&
             (member.callable->flags & OO_F_STATIC))
             return oo_value_unknown();
         if (member.status == OO_SEL_UNIQUE)
             return cw_emit_selected(c, site, &member,
-                                    receiver->classref ? "csharp-static-member"
-                                                       : "csharp-declared-receiver-member");
+                                    lookup->classref ? "csharp-static-member"
+                                                     : "csharp-declared-receiver-member",
+                                    NULL, argc, args);
         if (member.status == OO_SEL_AMBIGUOUS)
             return oo_value_unknown();
     }
     if (receiver->classref || (!receiver->type && !receiver->external))
         return oo_value_unknown();
     oo_select_t extension = cw_select_extension(c, receiver, name, argc, args);
-    if (extension.status != OO_SEL_UNIQUE)
+    if (extension.status != OO_SEL_UNIQUE) {
+        /* A standard collection method from outside the project. */
+        cw_finish_lambdas(c, c->lambdas, NULL, NULL, receiver, name);
+        if (!strcmp(name, "Select") && receiver->external && c->lambdas &&
+            oo_value_known(&c->lambdas->last))
+            return oo_external_with_element(w, receiver, c->lambdas->last);
+        if (!strcmp(name, "SelectMany") && receiver->external && c->lambdas) {
+            oo_value_t held = oo_element_of(w, &c->lambdas->last);
+            return oo_external_with_element(w, receiver, held);
+        }
         return oo_external_member_return(w, receiver, name);
-    return cw_emit_selected(c, site, &extension, "csharp-extension-method");
+    }
+    return cw_emit_selected(c, site, &extension, "csharp-extension-method", receiver, argc, args);
 }
 
 static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
@@ -880,7 +1366,8 @@ static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
             if (c->static_method && selected.status == OO_SEL_UNIQUE &&
                 !(selected.callable->flags & OO_F_STATIC))
                 return oo_value_unknown();
-            return cw_emit_selected(c, site, &selected, "csharp-enclosing-type-member");
+            return cw_emit_selected(c, site, &selected, "csharp-enclosing-type-member", NULL, argc,
+                                    args);
         }
         /* A delegate-typed member of this name is the member lookup's answer. */
         oo_subst_t *field_subst = NULL;
@@ -889,6 +1376,12 @@ static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
             return oo_value_unknown();
         if (!oo_hierarchy_complete(w->ix, r->value.type))
             complete = false;
+    }
+    if (complete && w->receiver) {
+        oo_select_t object = cw_select_object_member(c, w->receiver->value.type, name, argc, args);
+        if (object.status == OO_SEL_UNIQUE &&
+            (!c->static_method || (object.callable->flags & OO_F_STATIC)))
+            return cw_emit_selected(c, site, &object, "csharp-object-member", NULL, argc, args);
     }
     if (!complete || oo_closed_member(w, name))
         return oo_value_unknown();
@@ -914,7 +1407,7 @@ static oo_value_t cw_bare_call(cw_t *c, TSNode site, const char *name, int argc,
         return oo_value_unknown();
     oo_value_t receiver = oo_value_of_type(found);
     oo_select_t selected = oo_select_method(w, &receiver, name, argc, args, true);
-    return cw_emit_selected(c, site, &selected, "csharp-using-static");
+    return cw_emit_selected(c, site, &selected, "csharp-using-static", NULL, argc, args);
 }
 
 static const char *cw_generic_or_name(cw_t *c, TSNode node) {
@@ -955,10 +1448,10 @@ static oo_value_t cw_base_call(cw_t *c, TSNode site, const char *name, int argc,
         return oo_value_unknown();
     oo_value_t receiver = oo_value_of_type(only);
     oo_select_t selected = oo_select_method(w, &receiver, name, argc, args, false);
-    return cw_emit_selected(c, site, &selected, "csharp-base-member");
+    return cw_emit_selected(c, site, &selected, "csharp-base-member", NULL, argc, args);
 }
 
-static oo_value_t cw_invocation(cw_t *c, TSNode node) {
+static oo_value_t cw_invocation_with(cw_t *c, TSNode node, cw_lambdas_t *lambdas) {
     TSNode function = cs_field(node, "function");
     TSNode arguments = cs_field(node, "arguments");
     int argc = 0;
@@ -967,35 +1460,57 @@ static oo_value_t cw_invocation(cw_t *c, TSNode node) {
         /* nameof yields a string; a method it names is mentioned, not taken. */
         bool saved_nameof = c->in_nameof;
         c->in_nameof = saved_nameof || (name && !strcmp(name, "nameof"));
-        const oo_value_t *args = cw_arguments(c, arguments, &argc);
+        const oo_value_t *args = cw_arguments(c, arguments, &argc, lambdas);
+        c->lambdas = lambdas;
         bool was_nameof = c->in_nameof && !saved_nameof;
         c->in_nameof = saved_nameof;
         if (was_nameof)
             return oo_value_external("string");
-        return name ? cw_bare_call(c, node, name, argc, args) : oo_value_unknown();
+        cw_spell_type_args(c, function);
+        oo_value_t result = name ? cw_bare_call(c, node, name, argc, args) : oo_value_unknown();
+        c->type_args = NULL;
+        c->type_arg_count = 0;
+        return result;
     }
     if (cs_is(function, "member_access_expression")) {
         TSNode object = cs_field(function, "expression");
         const char *name = cw_generic_or_name(c, cs_field(function, "name"));
         if (cs_is(object, "base")) {
-            const oo_value_t *args = cw_arguments(c, arguments, &argc);
+            const oo_value_t *args = cw_arguments(c, arguments, &argc, lambdas);
+            c->lambdas = lambdas;
             return name ? cw_base_call(c, node, name, argc, args) : oo_value_unknown();
         }
         oo_value_t receiver = cw_expr(c, object);
-        const oo_value_t *args = cw_arguments(c, arguments, &argc);
-        return name ? cw_member_call(c, node, &receiver, name, argc, args) : oo_value_unknown();
+        const oo_value_t *args = cw_arguments(c, arguments, &argc, lambdas);
+        c->lambdas = lambdas;
+        cw_spell_type_args(c, cs_field(function, "name"));
+        oo_value_t result =
+            name ? cw_member_call(c, node, &receiver, name, argc, args) : oo_value_unknown();
+        c->type_args = NULL;
+        c->type_arg_count = 0;
+        return result;
     }
     if (cs_is(function, "conditional_access_expression")) {
         oo_value_t receiver = cw_expr(c, cs_field(function, "condition"));
         receiver.classref = false;
         TSNode binding = cs_child(function, "member_binding_expression");
         const char *name = cw_generic_or_name(c, cs_field(binding, "name"));
-        const oo_value_t *args = cw_arguments(c, arguments, &argc);
+        const oo_value_t *args = cw_arguments(c, arguments, &argc, lambdas);
+        c->lambdas = lambdas;
         return name ? cw_member_call(c, node, &receiver, name, argc, args) : oo_value_unknown();
     }
     (void)cw_expr(c, function);
-    (void)cw_arguments(c, arguments, &argc);
+    (void)cw_arguments(c, arguments, &argc, lambdas);
     return oo_value_unknown();
+}
+
+static oo_value_t cw_invocation(cw_t *c, TSNode node) {
+    cw_lambdas_t lambdas = {0};
+    cw_lambdas_t *outer = c->lambdas;
+    oo_value_t result = cw_invocation_with(c, node, &lambdas);
+    cw_finish_lambdas(c, &lambdas, NULL, NULL, NULL, NULL);
+    c->lambdas = outer;
+    return result;
 }
 
 static void cw_emit_field(cw_t *c, TSNode site, const oo_field_t *field) {
@@ -1056,7 +1571,7 @@ static oo_value_t cw_identifier(cw_t *c, TSNode node) {
     oo_value_t value = cw_ref(c, &ref);
     if (value.type || value.external)
         value.classref = true;
-    if (value.type && value.type->graph_qn)
+    if (value.type && value.type->graph_qn && !oo_names_tparam(w, name))
         oo_emit_usage(w, node, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
                       CBM_RESOLVE_RULE_DECLARED_TYPE, "csharp-type-name-lookup");
     return value;
@@ -1068,7 +1583,10 @@ static oo_value_t cw_member_access(cw_t *c, TSNode node) {
     TSNode name_node = cs_field(node, "name");
     const char *name = cw_generic_or_name(c, name_node);
     /* A dotted chain can be a namespace-qualified type. */
+    static const char ROOT[] = "global::";
     const char *spelled = cs_text(&c->text, node);
+    if (spelled && !strncmp(spelled, ROOT, sizeof(ROOT) - 1))
+        spelled += sizeof(ROOT) - 1;
     if (spelled &&
         strspn(spelled, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.") ==
             strlen(spelled)) {
@@ -1085,9 +1603,14 @@ static oo_value_t cw_member_access(cw_t *c, TSNode node) {
             oo_typeref_t ref = {.name = spelled};
             oo_name_t type_name = oo_resolve_name(w->ix, &w->scope, spelled);
             if (type_name.status == OO_NAME_TYPE) {
-                oo_value_t value = oo_value_of_type(oo_unalias(w->ix, type_name.type));
+                const oo_type_t *named = oo_unalias(w->ix, type_name.type);
+                oo_value_t value = oo_value_of_type(named);
                 (void)ref;
                 value.classref = true;
+                (void)cw_expr(c, object);
+                if (named && named->graph_qn)
+                    oo_emit_usage(w, name_node, named->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+                                  CBM_RESOLVE_RULE_DECLARED_TYPE, "csharp-type-name-lookup");
                 return value;
             }
         }
@@ -1100,6 +1623,12 @@ static oo_value_t cw_member_access(cw_t *c, TSNode node) {
         if (self.type && self.type->super_count && self.type->supers[0].resolved)
             receiver = oo_value_of_type(self.type->supers[0].resolved);
     }
+    oo_value_t keyword = cw_keyword_receiver(c, &receiver);
+    if (keyword.type)
+        receiver = keyword;
+    /* `pair.Value` on a dictionary's entry. */
+    if (name && !receiver.type && receiver.external)
+        return oo_external_member_return(w, &receiver, name);
     if (!name || !receiver.type)
         return oo_value_unknown();
     oo_subst_t *subst = NULL;
@@ -1116,6 +1645,9 @@ static oo_value_t cw_member_access(cw_t *c, TSNode node) {
         if (nested && !(nested->flags & OO_F_AMBIGUOUS)) {
             oo_value_t value = oo_value_of_type(nested);
             value.classref = true;
+            if (nested->graph_qn)
+                oo_emit_usage(w, name_node, nested->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+                              CBM_RESOLVE_RULE_DECLARED_TYPE, "csharp-nested-type-name");
             return value;
         }
     }
@@ -1126,6 +1658,8 @@ static void cw_emit_constructor(cw_t *c, TSNode site, const oo_value_t *value, i
                                 const oo_value_t *args) {
     oo_walk_t *w = c->w;
     oo_select_t selected = oo_select_constructor(w, value, argc, args);
+    if (selected.status == OO_SEL_UNIQUE)
+        cw_finish_lambdas(c, c->lambdas, selected.callable, selected.subst, NULL, NULL);
     if (selected.status == OO_SEL_UNIQUE && selected.callable->graph_qn)
         oo_emit_call(w, site, selected.callable->graph_qn, CBM_RESOLVE_RULE_LANGUAGE_BINDING,
                      CBM_RESOLVE_FACT_LANGUAGE_BOUND, "csharp-constructor-selection");
@@ -1145,13 +1679,16 @@ static void cw_initializer(cw_t *c, TSNode initializer, const oo_value_t *create
         TSNode entry = ts_node_named_child(initializer, i);
         if (cs_is(entry, "assignment_expression")) {
             TSNode left = cs_field(entry, "left");
-            (void)cw_expr(c, cs_field(entry, "right"));
+            TSNode right = cs_field(entry, "right");
+            (void)cw_expr(c, right);
             const char *name = cs_is(left, "identifier") ? cs_name(&c->text, left) : NULL;
             if (name && created->type) {
                 oo_subst_t *subst = NULL;
                 bool incomplete = false;
                 const oo_field_t *field = oo_find_field(w, created, name, &subst, &incomplete);
-                if (field)
+                /* C# 12.8.17.3: `Items = { a, b }` reads Items and adds to it. It writes nothing,
+                 * and an assignment's target has no read site to say so at. */
+                if (field && !cs_is(right, "initializer_expression"))
                     cw_emit_field(c, left, field);
             }
         } else {
@@ -1165,9 +1702,14 @@ static oo_value_t cw_object_creation(cw_t *c, TSNode node) {
     cw_type_mentions(c, type, 0);
     oo_value_t value = cw_ref(c, cs_typeref(&c->text, type));
     int argc = 0;
-    const oo_value_t *args = cw_arguments(c, cs_field(node, "arguments"), &argc);
+    cw_lambdas_t lambdas = {0};
+    const oo_value_t *args = cw_arguments(c, cs_field(node, "arguments"), &argc, &lambdas);
+    cw_lambdas_t *outer = c->lambdas;
+    c->lambdas = &lambdas;
     if (value.type)
         cw_emit_constructor(c, node, &value, argc, args);
+    cw_finish_lambdas(c, &lambdas, NULL, NULL, NULL, NULL);
+    c->lambdas = outer;
     TSNode initializer = cs_field(node, "initializer");
     if (ts_node_is_null(initializer))
         initializer = cs_child(node, "initializer_expression");
@@ -1177,9 +1719,14 @@ static oo_value_t cw_object_creation(cw_t *c, TSNode node) {
 
 static void cw_implicit_creation(cw_t *c, TSNode node, const oo_value_t *target) {
     int argc = 0;
-    const oo_value_t *args = cw_arguments(c, cs_child(node, "argument_list"), &argc);
+    cw_lambdas_t lambdas = {0};
+    const oo_value_t *args = cw_arguments(c, cs_child(node, "argument_list"), &argc, &lambdas);
+    cw_lambdas_t *outer = c->lambdas;
+    c->lambdas = &lambdas;
     if (target->type)
         cw_emit_constructor(c, node, target, argc, args);
+    cw_finish_lambdas(c, &lambdas, NULL, NULL, NULL, NULL);
+    c->lambdas = outer;
     cw_initializer(c, cs_child(node, "initializer_expression"), target);
 }
 
@@ -1191,6 +1738,19 @@ static oo_value_t cw_declaration_pattern(cw_t *c, TSNode node) {
     cw_type_mentions(c, type, 0);
     oo_bind(w, name, cw_ref(c, cs_typeref(&c->text, type)));
     return oo_value_unknown();
+}
+
+/* A local function's scope is its whole block: a call above its declaration means it too. */
+static void cw_bind_local_functions(cw_t *c, TSNode block) {
+    TSTreeCursor cursor = ts_tree_cursor_new(block);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode child = ts_tree_cursor_current_node(&cursor);
+            if (cs_is(child, "local_function_statement"))
+                oo_bind(c->w, cs_name(&c->text, cs_field(child, "name")), oo_value_unknown());
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
 }
 
 static oo_value_t cw_foreach(cw_t *c, TSNode node) {
@@ -1244,6 +1804,7 @@ static void cw_bind_query_names(cw_t *c, TSNode node, unsigned depth) {
 static oo_value_t cw_block_like(cw_t *c, TSNode node) {
     oo_frame_t frame;
     oo_frame_push(c->w, &frame);
+    cw_bind_local_functions(c, node);
     cw_children(c, node);
     oo_frame_pop(c->w);
     return oo_value_unknown();
@@ -1306,27 +1867,38 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
     }
     if (!strcmp(kind, "recursive_pattern") || !strcmp(kind, "positional_pattern_clause") ||
         !strcmp(kind, "property_pattern_clause") || !strcmp(kind, "subpattern")) {
-        /* A trailing designation binds; a member name inside is not a value. */
+        /* A trailing designation binds; a member name inside is not a value. What it binds is the
+         * type the pattern spells, or else the type of what it is matched against. */
+        oo_value_t subject = c->pattern_subject;
+        c->pattern_subject = oo_value_unknown();
+        bool recursive = !strcmp(kind, "recursive_pattern");
+        TSNode spelled = cs_field(node, "type");
+        oo_value_t bound =
+            ts_node_is_null(spelled) ? subject : cw_declared(c, spelled, oo_value_unknown());
         uint32_t parts = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < parts; i++) {
             TSNode part = ts_node_named_child(node, i);
-            if (cs_is(part, "identifier") && !strcmp(kind, "recursive_pattern"))
-                oo_bind(w, cs_name(&c->text, part), oo_value_unknown());
-            else if (!cs_is(part, "identifier") && !cs_is(part, "name_colon") &&
-                     !cs_is(part, "expression_colon"))
+            if (!cs_is(part, "identifier") && !cs_is(part, "name_colon") &&
+                !cs_is(part, "expression_colon") && !ts_node_eq(part, spelled))
                 (void)cw_expr(c, part);
         }
+        if (recursive)
+            oo_bind(w, cs_name(&c->text, cs_field(node, "name")), bound);
         return oo_value_unknown();
     }
     if (!strcmp(kind, "declaration_expression")) {
         TSNode type = cs_field(node, "type");
         const char *name = cs_name(&c->text, cs_field(node, "name"));
-        oo_bind(w, name, cw_declared(c, type, oo_value_unknown()));
-        return oo_value_unknown();
+        oo_value_t declared = cw_declared(c, type, oo_value_unknown());
+        oo_bind(w, name, declared);
+        return declared;
     }
     if (!strcmp(kind, "is_pattern_expression")) {
-        (void)cw_expr(c, cs_field(node, "expression"));
+        oo_value_t subject = cw_expr(c, cs_field(node, "expression"));
+        oo_value_t outer = c->pattern_subject;
+        c->pattern_subject = subject;
         (void)cw_expr(c, cs_field(node, "pattern"));
+        c->pattern_subject = outer;
         return oo_value_unknown();
     }
     if (!strcmp(kind, "catch_clause")) {
@@ -1398,6 +1970,10 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
             if (!strcmp(leaf, "Task`1") || !strcmp(leaf, "ValueTask`1"))
                 return value.args[0];
         }
+        /* A core library's own. */
+        if (value.type && value.arg_count == 1 &&
+            (!strcmp(value.type->name, "Task`1") || !strcmp(value.type->name, "ValueTask`1")))
+            return value.args[0];
         return oo_value_unknown();
     }
     if (!strcmp(kind, "conditional_expression")) {
@@ -1418,6 +1994,11 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
         const char *op = cs_text(&c->text, cs_field(node, "operator"));
         if (op && !strcmp(op, "??"))
             return left.type && (left.type == right.type || !oo_value_known(&right)) ? left : right;
+        /* C# 12.12.5: a string on either side of `+` makes the result a string. */
+        if (op && !strcmp(op, "+") &&
+            ((left.external && !strcmp(left.external, "string")) ||
+             (right.external && !strcmp(right.external, "string"))))
+            return oo_value_external("string");
         return oo_value_unknown();
     }
     if (!strcmp(kind, "assignment_expression")) {
@@ -1427,11 +2008,19 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
     }
     if (!strcmp(kind, "element_access_expression")) {
         oo_value_t array = cw_expr(c, cs_field(node, "expression"));
-        (void)cw_expr(c, cs_field(node, "subscript"));
+        int argc = 0;
+        const oo_value_t *args = cw_arguments(c, cs_field(node, "subscript"), &argc, NULL);
         if (array.dims > 0) {
             array.dims--;
             array.classref = false;
             return array;
+        }
+        /* A project type's indexer says what `x[i]` is. */
+        if (array.type && !array.classref) {
+            oo_select_t indexer = oo_select_method(w, &array, CW_INDEXER, argc, args, false);
+            return indexer.status == OO_SEL_UNIQUE
+                       ? oo_callable_return(w, indexer.callable, indexer.subst)
+                       : oo_value_unknown();
         }
         /* An indexer of a known collection reads its element. */
         return oo_external_member_return(w, &array, "get");
@@ -1461,10 +2050,20 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
         (void)cw_expr(c, cs_child(node, "initializer_expression"));
         return cw_ref(c, cs_typeref(&c->text, type));
     }
-    if (!strcmp(kind, "typeof_expression") || !strcmp(kind, "sizeof_expression") ||
-        !strcmp(kind, "default_expression")) {
+    if (!strcmp(kind, "typeof_expression")) {
         cw_type_mentions(c, cs_field(node, "type"), 0);
-        return oo_value_unknown();
+        const oo_type_t *type = oo_lookup_visible(w->ix, "System.Type", w->f);
+        return type && !(type->flags & OO_F_AMBIGUOUS) ? oo_value_of_type(type)
+                                                       : oo_value_unknown();
+    }
+    if (!strcmp(kind, "default_expression")) {
+        TSNode type = cs_field(node, "type");
+        cw_type_mentions(c, type, 0);
+        return cw_ref(c, cs_typeref(&c->text, type));
+    }
+    if (!strcmp(kind, "sizeof_expression")) {
+        cw_type_mentions(c, cs_field(node, "type"), 0);
+        return oo_value_external("int");
     }
     if (!strcmp(kind, "string_literal") || !strcmp(kind, "verbatim_string_literal") ||
         !strcmp(kind, "raw_string_literal") || !strcmp(kind, "interpolated_string_expression")) {
@@ -1474,20 +2073,33 @@ static oo_value_t cw_expr_kind(cw_t *c, TSNode node, const char *kind) {
     }
     if (!strcmp(kind, "integer_literal")) {
         /* The suffix decides: 1L is a long, and does not reach an int parameter. */
-        const char *digits = ts_node_start_byte(node) < ts_node_end_byte(node)
-                                 ? c->w->source + ts_node_end_byte(node) - 1
-                                 : "";
-        return oo_value_external(*digits == 'l' || *digits == 'L' ? "long" : "int");
+        uint32_t start = ts_node_start_byte(node), end = ts_node_end_byte(node);
+        char last = end > start ? (char)tolower((unsigned char)c->w->source[end - 1]) : 0;
+        char before = end > start + 1 ? (char)tolower((unsigned char)c->w->source[end - 2]) : 0;
+        if ((last == 'l' && before == 'u') || (last == 'u' && before == 'l'))
+            return oo_value_external("ulong");
+        return oo_value_external(last == 'l' ? "long" : last == 'u' ? "uint" : "int");
     }
     if (!strcmp(kind, "boolean_literal"))
         return oo_value_external("bool");
-    if (!strcmp(kind, "real_literal"))
-        return oo_value_external("double");
+    if (!strcmp(kind, "real_literal")) {
+        char last = (char)tolower((unsigned char)c->w->source[ts_node_end_byte(node) - 1]);
+        return oo_value_external(last == 'f' ? "float" : last == 'm' ? "decimal" : "double");
+    }
     if (!strcmp(kind, "character_literal"))
         return oo_value_external("char");
-    if (!strcmp(kind, "null_literal") || !strcmp(kind, "comment") ||
-        !strcmp(kind, "attribute_list") || !strcmp(kind, "discard") ||
-        !strcmp(kind, "predefined_type"))
+    if (!strcmp(kind, "predefined_type")) {
+        const char *keyword = cs_text(&c->text, node);
+        oo_value_t value = keyword ? oo_value_external(keyword) : oo_value_unknown();
+        value.classref = keyword != NULL;
+        return value;
+    }
+    if (!strcmp(kind, "null_literal")) {
+        oo_value_t nothing = oo_value_unknown();
+        nothing.null_literal = true;
+        return nothing;
+    }
+    if (!strcmp(kind, "comment") || !strcmp(kind, "attribute_list") || !strcmp(kind, "discard"))
         return oo_value_unknown();
     /* A generic name in expression position: a type used as a receiver. */
     if (!strcmp(kind, "generic_name") || !strcmp(kind, "qualified_name")) {
@@ -1549,6 +2161,10 @@ static void cw_members(cw_t *c, TSNode body, const oo_type_t *type) {
     for (uint32_t i = 0; i < count; i++) {
         TSNode member = ts_node_named_child(body, i);
         const char *kind = ts_node_type(member);
+        if (strcmp(kind, "class_declaration") && strcmp(kind, "struct_declaration") &&
+            strcmp(kind, "interface_declaration") && strcmp(kind, "enum_declaration") &&
+            strcmp(kind, "record_declaration") && strcmp(kind, "record_struct_declaration"))
+            cw_attribute_lists(c, member);
         if (!strcmp(kind, "method_declaration") || !strcmp(kind, "constructor_declaration") ||
             !strcmp(kind, "destructor_declaration") || !strcmp(kind, "operator_declaration") ||
             !strcmp(kind, "conversion_operator_declaration")) {
@@ -1585,7 +2201,7 @@ static void cw_members(cw_t *c, TSNode body, const oo_type_t *type) {
                         continue;
                     if (cs_is(piece, "implicit_object_creation_expression"))
                         cw_implicit_creation(c, piece, &declared);
-                    else
+                    else if (!cw_lambda_to_declared(c, piece, field_type))
                         (void)cw_expr(c, piece);
                 }
             }
@@ -1593,6 +2209,7 @@ static void cw_members(cw_t *c, TSNode body, const oo_type_t *type) {
                    !strcmp(kind, "interface_declaration") || !strcmp(kind, "enum_declaration") ||
                    !strcmp(kind, "record_declaration") ||
                    !strcmp(kind, "record_struct_declaration")) {
+            /* cw_type reads the attributes of a type. */
             cw_type(c, member, type);
         } else if (!strcmp(kind, "enum_member_declaration")) {
             uint32_t parts = ts_node_named_child_count(member);
@@ -1614,7 +2231,9 @@ static void cw_type(cw_t *c, TSNode node, const oo_type_t *owner) {
     const char *identity = cs_arity_name(w->arena, name, arity);
     const char *qn =
         owner ? cs_join(w->arena, owner->qn, identity) : cs_join(w->arena, w->scope.ns, identity);
-    const oo_type_t *type = qn ? oo_lookup_type(w->ix, qn) : NULL;
+    const oo_type_t *type = qn ? oo_lookup_declared(w->ix, qn, w->rel_path) : NULL;
+    /* A type's attributes read the scope around it. */
+    cw_attribute_lists(c, node);
     oo_scope_t saved = w->scope;
     if (type)
         w->scope.owner = type;
@@ -1633,7 +2252,7 @@ static void cw_type(cw_t *c, TSNode node, const oo_type_t *owner) {
             TSNode base = ts_node_named_child(bases, i);
             if (cs_is(base, "argument_list")) {
                 int argc = 0;
-                (void)cw_arguments(c, base, &argc);
+                (void)cw_arguments(c, base, &argc, NULL);
             } else {
                 cw_type_mentions(c, base, 0);
             }

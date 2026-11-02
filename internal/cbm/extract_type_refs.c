@@ -102,6 +102,24 @@ static const char *extract_type_text(CBMArena *a, TSNode node, const char *sourc
     return clean_type_name(a, cbm_node_text(a, node, source));
 }
 
+/* Java and C# spell a wrapper around the name: `ActionListener<Void>`, `Foo[]`, `Foo?`. The name
+ * is the leftmost leaf, so each level costs one child lookup. The wrapper itself when no leaf
+ * spells it exactly, as with an annotated type. */
+static TSNode jvm_clr_exact_type_site(const CBMExtractCtx *ctx, TSNode site, const char *name) {
+    enum { MAX_WRAPPERS = 8 };
+    size_t length = strlen(name);
+    TSNode at = site;
+    for (int depth = 0; depth < MAX_WRAPPERS && !ts_node_is_null(at); depth++) {
+        uint32_t start = ts_node_start_byte(at), end = ts_node_end_byte(at);
+        if (end - start == length && end <= (uint32_t)ctx->source_len &&
+            memcmp(ctx->source + start, name, length) == 0) {
+            return at;
+        }
+        at = ts_node_named_child_count(at) ? ts_node_named_child(at, 0) : (TSNode){0};
+    }
+    return site;
+}
+
 // Add a type reference for a function.
 static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *func_qn,
                          TSNode site) {
@@ -114,6 +132,9 @@ static void add_type_ref(CBMExtractCtx *ctx, const char *type_name, const char *
     }
     if (is_builtin_type(type_name)) {
         return;
+    }
+    if (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_CSHARP) {
+        site = jvm_clr_exact_type_site(ctx, site, type_name);
     }
 
     CBMTypeRef tr = {0};
@@ -231,8 +252,11 @@ static void extract_param_type_refs(CBMExtractCtx *ctx, TSNode params, const cha
 
 // Extract return type references.
 static void extract_return_type_refs(CBMExtractCtx *ctx, TSNode func_node, const char *func_qn) {
-    const char *fields[] = {"result", "return_type", "type", NULL};
+    const char *fields[] = {"result", "return_type", "type", "returns", NULL};
     for (const char **f = fields; *f; f++) {
+        if (strcmp(*f, "returns") == 0 && ctx->language != CBM_LANG_CSHARP) {
+            continue;
+        }
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt) && ts_family(ctx->language)) {
             add_ts_annotation_refs(ctx, rt, func_qn, 0);

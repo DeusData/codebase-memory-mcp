@@ -871,6 +871,9 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         if (lang == CBM_LANG_CSHARP && strcmp(kind, "operator_declaration") == 0) {
             return ts_node_child_by_field_name(node, TS_FIELD("operator"));
         }
+        if (lang == CBM_LANG_CSHARP && !ts_node_is_null(cbm_csharp_keyword_name(node))) {
+            return cbm_csharp_keyword_name(node);
+        }
 
         if (lang == CBM_LANG_HASKELL && strcmp(kind, "signature") == 0) {
             TSNode null_node = {0};
@@ -9823,7 +9826,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     if (((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
           lang == CBM_LANG_GLSL) &&
          strcmp(ck, "function_definition") == 0) ||
-        (lang == CBM_LANG_CSHARP && strcmp(ck, "operator_declaration") == 0)) {
+        (lang == CBM_LANG_CSHARP && (strcmp(ck, "operator_declaration") == 0 ||
+                                     !ts_node_is_null(cbm_csharp_keyword_name(child))))) {
         return cbm_resolve_func_name(child, lang);
     }
 

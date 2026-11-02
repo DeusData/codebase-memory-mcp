@@ -2494,6 +2494,129 @@ void cbm_pxc_dispatch_file_with_php_bindings(
                                        rust_shared_ctx, bindings, NULL);
 }
 
+/* The .NET convention for a reference assembly: <library>/ref holds a project of its own beside
+ * a <library>/src tree. Both compile one assembly name, so a type they share is one type: the
+ * reference declares its contract, the implementation (there, or forwarded to another project)
+ * its members. Returns the set of such `ref` directories; each path adds its own segments,
+ * so the cost is the length of the file list. NULL when the repository has none. */
+static CBMHashTable *pxc_csharp_reference_dirs(CBMArena *arena, const cbm_file_info_t *files,
+                                               int file_count) {
+    CBMHashTable *libraries = NULL, *references = NULL;
+    for (int i = 0; i < file_count; i++) {
+        const char *rel = files[i].rel_path;
+        if (files[i].language != CBM_LANG_CSHARP || !rel)
+            continue;
+        for (const char *at = strstr(rel, "/src/"); at; at = strstr(at + 1, "/src/")) {
+            if (!libraries)
+                libraries = cbm_ht_create(64);
+            const char *library =
+                libraries ? cbm_arena_strndup(arena, rel, (size_t)(at - rel)) : NULL;
+            if (library && !cbm_ht_get(libraries, library))
+                cbm_ht_set(libraries, library, (void *)library);
+        }
+    }
+    for (int i = 0; libraries && i < file_count; i++) {
+        const char *rel = files[i].rel_path;
+        size_t length = rel ? strlen(rel) : 0;
+        if (length < sizeof(".csproj") || strcmp(rel + length - (sizeof(".csproj") - 1), ".csproj"))
+            continue;
+        const char *slash = strrchr(rel, '/');
+        const char *dir = slash ? cbm_arena_strndup(arena, rel, (size_t)(slash - rel)) : NULL;
+        const char *base = dir ? strrchr(dir, '/') : NULL;
+        if (!base || strcmp(base, "/ref"))
+            continue;
+        const char *library = cbm_arena_strndup(arena, dir, (size_t)(base - dir));
+        if (!library || !cbm_ht_get(libraries, library))
+            continue;
+        if (!references)
+            references = cbm_ht_create(64);
+        if (references && !cbm_ht_get(references, dir))
+            cbm_ht_set(references, dir, (void *)dir);
+    }
+    cbm_ht_free(libraries);
+    return references;
+}
+
+/* A declaration that is the contract of an implementation: a reference assembly's, or one in a
+ * `<Type>.PlatformNotSupported.cs`, the .NET convention for what a target without the feature
+ * compiles instead, with every body throwing. A reference directory's ancestry is bounded by the
+ * path's depth. */
+static bool pxc_in_reference_dir(CBMArena *arena, const CBMHashTable *references, const char *rel) {
+    static const char STUB[] = ".PlatformNotSupported.cs";
+    size_t length = rel ? strlen(rel) : 0;
+    if (length >= sizeof(STUB) && !strcmp(rel + length - (sizeof(STUB) - 1), STUB))
+        return true;
+    if (!references || !rel)
+        return false;
+    char *dir = cbm_arena_strdup(arena, rel);
+    for (char *slash = dir ? strrchr(dir, '/') : NULL; slash; slash = strrchr(dir, '/')) {
+        *slash = '\0';
+        if (cbm_ht_get(references, dir))
+            return true;
+    }
+    return false;
+}
+
+/* The directories holding a build project's manifest. One pass over the file list. "." is the root.
+ */
+static CBMHashTable *pxc_project_dirs(CBMArena *arena, const cbm_file_info_t *files,
+                                      int file_count) {
+    CBMHashTable *dirs = cbm_ht_create(64);
+    for (int i = 0; dirs && i < file_count; i++) {
+        const char *rel = files[i].rel_path;
+        const char *slash = rel ? strrchr(rel, '/') : NULL;
+        const char *base = slash ? slash + 1 : rel;
+        size_t length = base ? strlen(base) : 0;
+        bool manifest = base && (!strcmp(base, "build.gradle") ||
+                                 !strcmp(base, "build.gradle.kts") || !strcmp(base, "pom.xml") ||
+                                 (length > 7 && !strcmp(base + length - 7, ".csproj")) ||
+                                 (length > 10 && !strcmp(base + length - 10, ".projitems")));
+        if (!manifest)
+            continue;
+        const char *dir = slash ? cbm_arena_strndup(arena, rel, (size_t)(slash - rel)) : ".";
+        if (dir && !cbm_ht_get(dirs, dir))
+            cbm_ht_set(dirs, dir, (void *)dir);
+    }
+    return dirs;
+}
+
+/* The nearest manifest's directory above this file. Bounded by the path's depth. */
+static const char *pxc_project_of(CBMArena *arena, const CBMHashTable *dirs, const char *rel) {
+    if (!dirs || !rel)
+        return NULL;
+    char *dir = cbm_arena_strdup(arena, rel);
+    for (char *slash = dir ? strrchr(dir, '/') : NULL; slash; slash = strrchr(dir, '/')) {
+        *slash = '\0';
+        const char *project = cbm_ht_get(dirs, dir);
+        if (project)
+            return project;
+    }
+    return cbm_ht_get(dirs, ".");
+}
+
+static void pxc_oo_add_file(const cbm_pipeline_ctx_t *ctx, cbm_oo_index_t *index,
+                            CBMFileResult **cache, const cbm_file_info_t *files, int i,
+                            CBMArena *scratch, const CBMHashTable *projects) {
+    bool loaded = false;
+    CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+    if (!result)
+        return;
+    int source_len = result->source_len;
+    const char *source = result->source;
+    char *owned = NULL;
+    if (!source || source_len <= 0) {
+        owned = pxc_read_file(files[i].path, &source_len);
+        source = owned;
+    }
+    if (source && source_len > 0) {
+        cbm_oo_index_set_project(index, pxc_project_of(scratch, projects, files[i].rel_path));
+        (void)cbm_oo_index_add_file(index, files[i].language, files[i].rel_path, result, source,
+                                    source_len);
+    }
+    cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
+    cbm_pipeline_result_release(result, loaded);
+}
+
 struct cbm_oo_index *cbm_pxc_build_oo_index(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
                                             CBMFileResult **cache, const cbm_file_info_t *files,
                                             int file_count) {
@@ -2505,26 +2628,33 @@ struct cbm_oo_index *cbm_pxc_build_oo_index(const cbm_pipeline_ctx_t *ctx, CBMAr
     cbm_oo_index_t *index = cbm_oo_index_new(arena);
     if (!index)
         return NULL;
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMHashTable *references = pxc_csharp_reference_dirs(&scratch, files, file_count);
+    CBMHashTable *projects = pxc_project_dirs(&scratch, files, file_count);
+    bool *deferred = cbm_arena_calloc(&scratch, (size_t)file_count * sizeof(bool));
+    bool any_deferred = false;
     for (int i = 0; i < file_count; i++) {
         if (!cbm_oo_language(files[i].language))
             continue;
-        bool loaded = false;
-        CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
-        if (!result)
+        if (deferred && files[i].language == CBM_LANG_CSHARP &&
+            pxc_in_reference_dir(&scratch, references, files[i].rel_path)) {
+            deferred[i] = true;
+            any_deferred = true;
             continue;
-        int source_len = result->source_len;
-        const char *source = result->source;
-        char *owned = NULL;
-        if (!source || source_len <= 0) {
-            owned = pxc_read_file(files[i].path, &source_len);
-            source = owned;
         }
-        if (source && source_len > 0)
-            (void)cbm_oo_index_add_file(index, files[i].language, files[i].rel_path, result, source,
-                                        source_len);
-        cbm_free(CBM_MEM_CLASS_EXTRACT, owned);
-        cbm_pipeline_result_release(result, loaded);
+        pxc_oo_add_file(ctx, index, cache, files, i, &scratch, projects);
     }
+    /* An implementation is in before any contract asks whether it exists. */
+    if (any_deferred) {
+        cbm_oo_index_begin_reference_files(index);
+        for (int i = 0; i < file_count; i++)
+            if (deferred[i])
+                pxc_oo_add_file(ctx, index, cache, files, i, &scratch, projects);
+    }
+    cbm_ht_free(references);
+    cbm_ht_free(projects);
+    cbm_arena_destroy(&scratch);
     cbm_oo_index_seal(index);
     return index;
 }

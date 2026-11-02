@@ -3511,14 +3511,11 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
         .site = {.file = rels[11], .caller = "PartUser.Use", .needle = "new Thing()"},
         .relation = "CALLS",
         .target = {.file = rels[9],
+                   .suffix = "cbm_cs_same_name.src.Parts.Thing.A.Thing",
+                   .label = "Class",
                    .declaration_line = 2,
                    .declaration_text = "public partial class Thing { public void Alpha() { } }"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "csharp-partial-type-identity",
-        .why = "Each partial piece of Thing has a node of its own (its QN carries its file), so "
-               "no one class node is the type this constructor call selects.",
-        .tried = "The members bind to the piece that declares them. The type itself has no single "
-                 "identity to bind to, and choosing a piece would be a guess."};
+        .mode = RQ_REQUIRED};
     RQ_Report quality[2] = {0};
     bool ok[2][N_CHECKS];
     bool all = true;
@@ -3528,8 +3525,8 @@ TEST(parallel_csharp_same_name_class_binds_by_namespace) {
                                       g ? "csharp-members-parallel" : "csharp-members-sequential",
                                       sources, N_FILES, expected, N_EXPECTED, &quality[g]));
         ASSERT_EQ(quality[g].genuine, N_EXPECTED);
-        ASSERT_EQ(quality[g].found, N_EXPECTED - 1);
-        ASSERT_EQ(quality[g].missing, 1);
+        ASSERT_EQ(quality[g].found, N_EXPECTED);
+        ASSERT_EQ(quality[g].missing, 0);
         ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
         ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
         ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");

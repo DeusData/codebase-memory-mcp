@@ -414,12 +414,26 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
         out->limitation =
             "The declaration static rules select: lexical scopes, import precedence, inherited "
             "members over resolved supertypes, arity, known argument types and exact overload "
-            "matches. Competing overloads on different nodes, lambdas with an unreadable "
+            "matches. A lambda's parameters come from the selected declaration's functional type, "
+            "and a generic method's type arguments from what one argument settles. A name several "
+            "declarations claim means the one in the file itself or the only one in the file's "
+            "build project; any other reader abstains. A C# reference assembly's declaration or "
+            "platform stub stands behind the implementation of its name, and a partial type's "
+            "mentions target the node of the file named after it. A function or extension method "
+            "in "
+            "another project's test sources is no candidate. Competing overloads on different "
+            "nodes (one signature in two platform files among them), lambdas with an unreadable "
             "receiver, members hidden by an unindexed supertype and unmodelled inference abstain. "
             "A type-shaped name is assumed not to be a field of an unindexed supertype. Implicit "
             "iterator and componentN calls share one span and are not emitted. A bare call inside "
             "an extension on an external type abstains, because that type's members are unlisted. "
-            "A C# file the grammar cannot read is read without its later conditional branches.";
+            "A C# file the grammar cannot read is read without its later conditional branches, and "
+            "with the spellings it loses members to made readable at the same spans. A C# local "
+            "function's body belongs to the member around it, a property's to the property, and a "
+            "conversion operator and an indexer have nodes of their own. C# member lookup: an "
+            "explicit interface implementation and an interface's members are no class's, an "
+            "applicable method hides the base type's, and an identical parameter is the better "
+            "conversion.";
         break;
     case CBM_LANG_RUST:
         out->adapter = "rust";

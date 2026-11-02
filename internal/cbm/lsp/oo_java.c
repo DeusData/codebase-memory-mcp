@@ -113,10 +113,11 @@ static const oo_typeref_t *j_typeref(const j_text_t *t, TSNode node) {
     } else if (!strcmp(kind, "wildcard")) {
         const char *text = j_text(t, node);
         /* `? extends X` reads as X; `? super X` and `?` read as nothing. */
-        if (text && strstr(text, "extends")) {
-            uint32_t count = ts_node_named_child_count(node);
-            return count ? j_typeref(t, ts_node_named_child(node, count - 1)) : ref;
-        }
+        uint32_t count = ts_node_named_child_count(node);
+        if (text && count && strstr(text, "extends"))
+            return j_typeref(t, ts_node_named_child(node, count - 1));
+        if (text && count && strstr(text, "super"))
+            ref->lower = j_typeref(t, ts_node_named_child(node, count - 1));
     }
     return ref;
 }
@@ -411,6 +412,12 @@ static void jh_method(jh_t *h, oo_type_t *type, TSNode node, bool is_interface) 
     callable->tparams =
         j_tparams(&h->text, j_field(node, "type_parameters"), &callable->tparam_count);
     oo_index_method(h->ix, type, callable);
+    /* JLS 9.8: Object's public methods do not count. */
+    if (is_interface && !ctor && ts_node_is_null(j_field(node, "body")) && strcmp(name, "equals") &&
+        strcmp(name, "hashCode") && strcmp(name, "toString")) {
+        type->abstract_method = callable;
+        type->abstract_count++;
+    }
 }
 
 static bool j_type_decl(TSNode node) {
@@ -567,11 +574,22 @@ bool oo_java_harvest(cbm_oo_index_t *ix, const char *rel, const CBMFileResult *f
 
 /* ── Walk ───────────────────────────────────────────────────────────── */
 
+/* One call's lambda arguments. Their parameter types come from the declaration the call selects,
+ * so they are walked after selection, once each. */
+typedef struct {
+    TSNode *nodes; /* By argument position; a null node is no lambda. */
+    int count;
+    bool walked;
+    oo_value_t last; /* The last lambda's expression body. */
+} jw_lambdas_t;
+
 typedef struct {
     oo_walk_t *w;
     j_text_t text;
     int depth;
     bool static_method;
+    jw_lambdas_t *lambdas; /* The call whose declaration is being selected. */
+    TSNode returns;        /* The enclosing method's declared result. */
 } jw_t;
 
 static oo_value_t jw_expr(jw_t *j, TSNode node);
@@ -611,6 +629,7 @@ static const oo_typeref_t *jw_type_at(jw_t *j, TSNode node) {
 }
 
 static void jw_emit_type_mentions(jw_t *j, TSNode node, unsigned depth);
+static void jw_annotations(jw_t *j, TSNode owner);
 
 /* Every type mention in a type expression: the identifier leaves at their own
  * spans, resolved in the current scope. */
@@ -621,8 +640,16 @@ static void jw_type_leaf(jw_t *j, TSNode node) {
         return;
     oo_typeref_t ref = {.name = text};
     oo_value_t value = jw_ref(j, &ref);
-    if (value.type && value.type->graph_qn && !oo_names_tparam(w, text))
-        oo_emit_type_ref(w, node, value.type->graph_qn, "java-type-name-lookup");
+    if (!value.type || !value.type->graph_qn || oo_names_tparam(w, text))
+        return;
+    oo_emit_type_ref(w, node, value.type->graph_qn, "java-type-name-lookup");
+    /* A dotted spelling's USAGE occurrence is its last segment. */
+    TSNode leaf = node;
+    uint32_t parts = ts_node_named_child_count(node);
+    if (j_is(node, "scoped_type_identifier") && parts)
+        leaf = ts_node_named_child(node, parts - 1);
+    oo_emit_usage(w, leaf, value.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+                  CBM_RESOLVE_RULE_DECLARED_TYPE, "java-type-name-lookup");
 }
 
 static void jw_emit_type_mentions(jw_t *j, TSNode node, unsigned depth) {
@@ -630,11 +657,53 @@ static void jw_emit_type_mentions(jw_t *j, TSNode node, unsigned depth) {
         return;
     if (j_is(node, "type_identifier") || j_is(node, "scoped_type_identifier")) {
         jw_type_leaf(j, node);
+        /* `Outer.Inner` also mentions Outer. */
+        if (j_is(node, "scoped_type_identifier") && ts_node_named_child_count(node))
+            jw_emit_type_mentions(j, ts_node_named_child(node, 0), depth + 1);
         return;
     }
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++)
         jw_emit_type_mentions(j, ts_node_named_child(node, i), depth + 1);
+}
+
+/* `@Nullable`, `@Foo(Bar.BAZ)`: the annotation's type and its value expressions. */
+static void jw_annotation(jw_t *j, TSNode node) {
+    oo_walk_t *w = j->w;
+    TSNode name = j_field(node, "name");
+    const char *spelled = ts_node_is_null(name) ? NULL : j_compact(&j->text, name);
+    if (spelled) {
+        oo_typeref_t ref = {.name = spelled};
+        oo_value_t type = jw_ref(j, &ref);
+        uint32_t parts = ts_node_named_child_count(name);
+        TSNode leaf =
+            j_is(name, "scoped_identifier") && parts ? ts_node_named_child(name, parts - 1) : name;
+        if (type.type && type.type->graph_qn)
+            oo_emit_usage(w, leaf, type.type->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+                          CBM_RESOLVE_RULE_DECLARED_TYPE, "java-annotation-type");
+    }
+    TSNode arguments = j_field(node, "arguments");
+    uint32_t count = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode argument = ts_node_named_child(arguments, i);
+        /* `name = value`: the name is the annotation's element. */
+        TSNode value = j_is(argument, "element_value_pair") ? j_field(argument, "value") : argument;
+        if (j_is(value, "annotation") || j_is(value, "marker_annotation"))
+            jw_annotation(j, value);
+        else
+            (void)jw_expr(j, value);
+    }
+}
+
+/* The annotations in a declaration's modifiers. */
+static void jw_annotations(jw_t *j, TSNode owner) {
+    TSNode modifiers = j_child(owner, "modifiers");
+    uint32_t count = ts_node_is_null(modifiers) ? 0 : ts_node_named_child_count(modifiers);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_named_child(modifiers, i);
+        if (j_is(child, "annotation") || j_is(child, "marker_annotation"))
+            jw_annotation(j, child);
+    }
 }
 
 static void jw_bind_declared(jw_t *j, const char *name, TSNode type, oo_value_t initial, int dims) {
@@ -656,6 +725,7 @@ static void jw_parameters(jw_t *j, TSNode parameters) {
     uint32_t count = ts_node_is_null(parameters) ? 0 : ts_node_named_child_count(parameters);
     for (uint32_t i = 0; i < count; i++) {
         TSNode parameter = ts_node_named_child(parameters, i);
+        jw_annotations(j, parameter);
         if (j_is(parameter, "formal_parameter")) {
             jw_bind_declared(j, j_text(&j->text, j_field(parameter, "name")),
                              j_field(parameter, "type"), oo_value_unknown(),
@@ -690,12 +760,19 @@ static int jw_argument_count(TSNode arguments) {
     return count;
 }
 
-/* Arguments are ordinary expressions at this site: evaluate each exactly once. */
-static const oo_value_t *jw_arguments(jw_t *j, TSNode arguments, int *out_count) {
+/* Arguments are ordinary expressions at this site: evaluate each exactly once. A lambda waits for
+ * selection when the caller collects it in `deferred`; either way it reaches only a function type.
+ */
+static const oo_value_t *jw_arguments(jw_t *j, TSNode arguments, int *out_count,
+                                      jw_lambdas_t *deferred) {
     int count = jw_argument_count(arguments);
     *out_count = count;
     oo_value_t *values =
         count ? cbm_arena_calloc(j->w->arena, (size_t)count * sizeof(*values)) : NULL;
+    if (deferred && count) {
+        deferred->nodes = cbm_arena_calloc(j->w->arena, (size_t)count * sizeof(TSNode));
+        deferred->count = deferred->nodes ? count : 0;
+    }
     int at = 0;
     uint32_t children = ts_node_is_null(arguments) ? 0 : ts_node_named_child_count(arguments);
     for (uint32_t i = 0; i < children; i++) {
@@ -703,12 +780,157 @@ static const oo_value_t *jw_arguments(jw_t *j, TSNode arguments, int *out_count)
         const char *kind = ts_node_type(child);
         if (!strcmp(kind, "line_comment") || !strcmp(kind, "block_comment"))
             continue;
-        oo_value_t value = jw_expr(j, child);
+        bool lambda = !strcmp(kind, "lambda_expression");
+        oo_value_t value = oo_value_unknown();
+        if (lambda && deferred && deferred->nodes)
+            deferred->nodes[at] = child;
+        else
+            value = jw_expr(j, child);
+        if (lambda || !strcmp(kind, "method_reference"))
+            value.function_literal = true;
+        if (lambda) {
+            TSNode parameters = j_field(child, "parameters");
+            value.lambda_parameters =
+                1 +
+                (j_is(parameters, "identifier") ? 1 : (int)ts_node_named_child_count(parameters));
+        }
         if (values)
             values[at] = value;
         at++;
     }
     return values;
+}
+
+/* JDK functional interfaces: the positions of their type arguments a lambda's parameters take.
+ * A name counts only as what the declaring file imports it from. */
+typedef struct {
+    const char *leaf, *package;
+    int count;
+    int positions[2];
+} jw_functional_t;
+
+static const jw_functional_t JW_FUNCTIONAL[] = {
+    {"Consumer", "java.util.function", 1, {0, 0}},
+    {"BiConsumer", "java.util.function", 2, {0, 1}},
+    {"Function", "java.util.function", 1, {0, 0}},
+    {"BiFunction", "java.util.function", 2, {0, 1}},
+    {"UnaryOperator", "java.util.function", 1, {0, 0}},
+    {"BinaryOperator", "java.util.function", 2, {0, 0}},
+    {"Predicate", "java.util.function", 1, {0, 0}},
+    {"BiPredicate", "java.util.function", 2, {0, 1}},
+    {"ToIntFunction", "java.util.function", 1, {0, 0}},
+    {"ToLongFunction", "java.util.function", 1, {0, 0}},
+    {"ToDoubleFunction", "java.util.function", 1, {0, 0}},
+    {"ToIntBiFunction", "java.util.function", 2, {0, 1}},
+    {"ToLongBiFunction", "java.util.function", 2, {0, 1}},
+    {"ToDoubleBiFunction", "java.util.function", 2, {0, 1}},
+    {"Comparator", "java.util", 2, {0, 0}},
+};
+
+static bool jw_imports_star(const oo_file_t *file, const char *package) {
+    for (int i = 0; file && i < file->import_count; i++)
+        if (file->imports[i].star && !file->imports[i].statik &&
+            !strcmp(file->imports[i].path, package))
+            return true;
+    return false;
+}
+
+static int jw_functional_parameters(jw_t *j, const oo_value_t *function, const oo_file_t *file,
+                                    oo_value_t *out, int capacity) {
+    if (function->type)
+        return oo_functional_parameters(j->w, function, out, capacity);
+    if (!function->external || function->dims || capacity < 2)
+        return -1;
+    const char *dot = strrchr(function->external, '.');
+    const char *leaf = dot ? dot + 1 : function->external;
+    for (size_t t = 0; t < sizeof(JW_FUNCTIONAL) / sizeof(JW_FUNCTIONAL[0]); t++) {
+        const jw_functional_t *known = &JW_FUNCTIONAL[t];
+        if (strcmp(known->leaf, leaf))
+            continue;
+        size_t package = strlen(known->package);
+        bool named = dot ? (size_t)(dot - function->external) == package &&
+                               !strncmp(function->external, known->package, package)
+                         : jw_imports_star(file, known->package);
+        if (!named)
+            return -1;
+        for (int i = 0; i < known->count; i++) {
+            int at = known->positions[i];
+            oo_value_t value = at < function->arg_count ? function->args[at] : oo_value_unknown();
+            out[i] = !oo_value_known(&value) && value.lower ? *value.lower : value;
+        }
+        return known->count;
+    }
+    return -1;
+}
+
+/* A lambda under the parameter types its target gave, `count` of them, or none known at -1. */
+static oo_value_t jw_lambda_typed(jw_t *j, TSNode node, const oo_value_t *types, int count) {
+    oo_walk_t *w = j->w;
+    oo_frame_t frame;
+    oo_frame_push(w, &frame);
+    TSNode parameters = j_field(node, "parameters");
+    if (j_is(parameters, "identifier")) {
+        oo_bind(w, j_text(&j->text, parameters), count == 1 ? types[0] : oo_value_unknown());
+    } else if (j_is(parameters, "inferred_parameters")) {
+        uint32_t names = ts_node_named_child_count(parameters);
+        for (uint32_t i = 0; i < names; i++)
+            oo_bind(w, j_text(&j->text, ts_node_named_child(parameters, i)),
+                    count == (int)names ? types[i] : oo_value_unknown());
+    } else {
+        jw_parameters(j, parameters);
+    }
+    TSNode saved_returns = j->returns;
+    j->returns = (TSNode){0};
+    oo_value_t body = jw_expr(j, j_field(node, "body"));
+    j->returns = saved_returns;
+    oo_frame_pop(w);
+    return body;
+}
+
+enum { JW_LAMBDA_PARAMETERS = 8 };
+
+/* `Consumer<Doc> c = d -> d.go();`, `return d -> d.go();`: the declared type is the target. */
+static bool jw_lambda_to_declared(jw_t *j, TSNode lambda, TSNode type) {
+    if (!j_is(lambda, "lambda_expression") || ts_node_is_null(type))
+        return false;
+    oo_value_t declared = jw_ref(j, j_typeref(&j->text, type));
+    oo_value_t types[JW_LAMBDA_PARAMETERS];
+    int count = jw_functional_parameters(j, &declared, j->w->f, types, JW_LAMBDA_PARAMETERS);
+    (void)jw_lambda_typed(j, lambda, types, count);
+    return true;
+}
+
+/* Walk a call's lambdas: under the selected declaration, under a standard collection method of
+ * `receiver` called `name`, or with unknown parameters when neither applies. */
+static void jw_finish_lambdas(jw_t *j, jw_lambdas_t *lambdas, const oo_callable_t *callee,
+                              const oo_subst_t *subst, const oo_value_t *receiver,
+                              const char *name) {
+    if (!lambdas || lambdas->walked)
+        return;
+    lambdas->walked = true;
+    oo_walk_t *w = j->w;
+    for (int i = 0; i < lambdas->count; i++) {
+        if (ts_node_is_null(lambdas->nodes[i]))
+            continue;
+        oo_value_t types[JW_LAMBDA_PARAMETERS];
+        int count = -1;
+        if (callee && callee->params && callee->param_count) {
+            int index = i < callee->param_count ? i : callee->param_count - 1;
+            if (callee->params[index]) {
+                oo_scope_t scope = oo_scope_of_callable(callee);
+                oo_value_t function = oo_value_from_ref(w, callee->params[index], &scope, subst);
+                /* `Consumer<T>... each`: the element. */
+                if (callee->max_args < 0 && index == callee->param_count - 1 && function.dims)
+                    function.dims--;
+                count = jw_functional_parameters(j, &function, callee->file, types,
+                                                 JW_LAMBDA_PARAMETERS);
+            }
+        } else if (receiver && name) {
+            count = oo_stdlib_lambda_parameters(w, receiver, name, i, lambdas->count, types,
+                                                JW_LAMBDA_PARAMETERS);
+        }
+        lambdas->last = jw_lambda_typed(j, lambdas->nodes[i], types, count);
+    }
 }
 
 static oo_value_t jw_select_emit(jw_t *j, TSNode site, const oo_value_t *receiver, const char *name,
@@ -721,7 +943,10 @@ static oo_value_t jw_select_emit(jw_t *j, TSNode site, const oo_value_t *receive
     if (selected.callable->graph_qn)
         oo_emit_call(w, site, selected.callable->graph_qn, CBM_RESOLVE_RULE_TYPE_MEMBER,
                      CBM_RESOLVE_FACT_RECEIVER_TYPED, decision);
-    return oo_callable_return(w, selected.callable, selected.subst);
+    const oo_subst_t *subst =
+        oo_infer_call_subst(w, selected.callable, selected.subst, NULL, args, argc);
+    jw_finish_lambdas(j, j->lambdas, selected.callable, subst, NULL, NULL);
+    return oo_callable_return(w, selected.callable, subst);
 }
 
 static bool jw_receiver_owns(const oo_receiver_t *receiver, const char *name) {
@@ -743,7 +968,7 @@ static oo_value_t jw_static_import_call(jw_t *j, TSNode site, const char *name, 
         const char *dot = strrchr(import->path, '.');
         const char *owner_qn =
             dot ? cbm_arena_strndup(w->arena, import->path, (size_t)(dot - import->path)) : NULL;
-        const oo_type_t *owner = owner_qn ? oo_lookup_type(w->ix, owner_qn) : NULL;
+        const oo_type_t *owner = owner_qn ? oo_lookup_visible(w->ix, owner_qn, w->f) : NULL;
         if (!owner || (owner->flags & OO_F_AMBIGUOUS))
             return oo_value_unknown();
         oo_value_t receiver = oo_value_of_type(owner);
@@ -757,7 +982,7 @@ static oo_value_t jw_static_import_call(jw_t *j, TSNode site, const char *name, 
         const oo_import_t *import = &file->imports[i];
         if (!import->statik || !import->star)
             continue;
-        const oo_type_t *owner = oo_lookup_type(w->ix, import->path);
+        const oo_type_t *owner = oo_lookup_visible(w->ix, import->path, w->f);
         /* Members of an unindexed class take part in the same overload set. */
         if (!owner || (owner->flags & OO_F_AMBIGUOUS))
             return oo_value_unknown();
@@ -871,8 +1096,8 @@ static oo_value_t jw_identifier(jw_t *j, TSNode node) {
                                    ? import->path
                                    : cbm_arena_strndup(w->arena, import->path,
                                                        strlen(import->path) - strlen(name) - 1);
-        const oo_type_t *owner = owner_qn ? oo_lookup_type(w->ix, owner_qn) : NULL;
-        if (!owner)
+        const oo_type_t *owner = owner_qn ? oo_lookup_visible(w->ix, owner_qn, w->f) : NULL;
+        if (!owner || (owner->flags & OO_F_AMBIGUOUS))
             continue;
         oo_value_t receiver = oo_value_of_type(owner);
         oo_subst_t *subst = NULL;
@@ -926,7 +1151,7 @@ static oo_value_t jw_field_access(jw_t *j, TSNode node) {
                          (oo_find_field(w, &r->value, head, &subst, &incomplete) || incomplete));
                 }
             }
-            const oo_type_t *exact = variable ? NULL : oo_lookup_type(w->ix, text);
+            const oo_type_t *exact = variable ? NULL : oo_lookup_visible(w->ix, text, w->f);
             if (exact && !(exact->flags & OO_F_AMBIGUOUS)) {
                 oo_value_t value = oo_value_of_type(exact);
                 value.classref = true;
@@ -947,13 +1172,16 @@ static oo_value_t jw_field_access(jw_t *j, TSNode node) {
         if (nested && !(nested->flags & OO_F_AMBIGUOUS)) {
             oo_value_t value = oo_value_of_type(nested);
             value.classref = true;
+            if (nested->graph_qn)
+                oo_emit_usage(w, field_node, nested->graph_qn, CBM_RESOLVED_TYPE_REFERENCE,
+                              CBM_RESOLVE_RULE_DECLARED_TYPE, "java-nested-type-name");
             return value;
         }
     }
     return oo_value_unknown();
 }
 
-static oo_value_t jw_method_invocation(jw_t *j, TSNode node) {
+static oo_value_t jw_method_invocation_with(jw_t *j, TSNode node, jw_lambdas_t *lambdas) {
     oo_walk_t *w = j->w;
     TSNode object = j_field(node, "object");
     TSNode name_node = j_field(node, "name");
@@ -965,12 +1193,14 @@ static oo_value_t jw_method_invocation(jw_t *j, TSNode node) {
     }
     if (ts_node_is_null(object)) {
         int argc = 0;
-        const oo_value_t *args = jw_arguments(j, arguments, &argc);
+        const oo_value_t *args = jw_arguments(j, arguments, &argc, lambdas);
+        j->lambdas = lambdas;
         return jw_bare_call(j, node, name, argc, args);
     }
     if (j_is(object, "super")) {
         int argc = 0;
-        const oo_value_t *args = jw_arguments(j, arguments, &argc);
+        const oo_value_t *args = jw_arguments(j, arguments, &argc, lambdas);
+        j->lambdas = lambdas;
         /* super.m() selects from the direct supertypes of the enclosing class. */
         const oo_value_t self = jw_this_value(w);
         if (!self.type)
@@ -996,12 +1226,39 @@ static oo_value_t jw_method_invocation(jw_t *j, TSNode node) {
     if (j_is(object, "field_access") && j_is(j_field(object, "field"), "super"))
         receiver.classref = false;
     int argc = 0;
-    const oo_value_t *args = jw_arguments(j, arguments, &argc);
-    if (!receiver.type)
+    const oo_value_t *args = jw_arguments(j, arguments, &argc, lambdas);
+    j->lambdas = lambdas;
+    if (!receiver.type) {
+        jw_finish_lambdas(j, lambdas, NULL, NULL, &receiver, name);
+        /* `map` yields what its lambda's expression produced, in the same kind of container, and
+         * `flatMap` what that holds. */
+        if ((!strcmp(name, "map") || !strcmp(name, "mapToObj")) && receiver.external &&
+            oo_value_known(&lambdas->last))
+            return oo_external_with_element(w, &receiver, lambdas->last);
+        if (!strcmp(name, "flatMap") && receiver.external) {
+            oo_value_t held = oo_element_of(w, &lambdas->last);
+            return oo_external_with_element(w, &receiver, held);
+        }
+        oo_value_t made = oo_jdk_factory_result(w, &receiver, name, args, argc);
+        if (oo_value_known(&made))
+            return made;
         return oo_external_member_return(w, &receiver, name);
-    return jw_select_emit(j, node, &receiver, name, argc, args, receiver.classref,
-                          receiver.classref ? "java-static-member"
-                                            : "java-declared-receiver-member");
+    }
+    oo_value_t result =
+        jw_select_emit(j, node, &receiver, name, argc, args, receiver.classref,
+                       receiver.classref ? "java-static-member" : "java-declared-receiver-member");
+    /* A project collection's `forEach` comes from the JDK supertype. */
+    jw_finish_lambdas(j, lambdas, NULL, NULL, &receiver, name);
+    return result;
+}
+
+static oo_value_t jw_method_invocation(jw_t *j, TSNode node) {
+    jw_lambdas_t lambdas = {0};
+    jw_lambdas_t *outer = j->lambdas;
+    oo_value_t result = jw_method_invocation_with(j, node, &lambdas);
+    jw_finish_lambdas(j, &lambdas, NULL, NULL, NULL, NULL);
+    j->lambdas = outer;
+    return result;
 }
 
 static void jw_anonymous_body(jw_t *j, TSNode body, oo_value_t super_value) {
@@ -1055,12 +1312,15 @@ static oo_value_t jw_object_creation(jw_t *j, TSNode node) {
         jw_emit_type_mentions(j, type_node, 0);
     }
     int argc = 0;
-    const oo_value_t *args = jw_arguments(j, arguments, &argc);
+    jw_lambdas_t lambdas = {0};
+    const oo_value_t *args = jw_arguments(j, arguments, &argc, &lambdas);
     TSNode body = j_child(node, "class_body");
     if (value.type && !ts_node_is_null(body) && (value.type->flags & OO_F_INTERFACE)) {
         /* An anonymous implementation of an interface has only Object's constructor. */
     } else if (value.type) {
         oo_select_t selected = oo_select_constructor(w, &value, argc, args);
+        if (selected.status == OO_SEL_UNIQUE)
+            jw_finish_lambdas(j, &lambdas, selected.callable, selected.subst, NULL, NULL);
         if (selected.status == OO_SEL_UNIQUE && selected.callable->graph_qn)
             oo_emit_call(w, node, selected.callable->graph_qn, CBM_RESOLVE_RULE_LANGUAGE_BINDING,
                          CBM_RESOLVE_FACT_LANGUAGE_BOUND, "java-constructor-selection");
@@ -1070,6 +1330,7 @@ static oo_value_t jw_object_creation(jw_t *j, TSNode node) {
                          CBM_RESOLVE_FACT_LANGUAGE_BOUND | CBM_RESOLVE_FACT_CLASS_CALLABLE,
                          "java-implicit-default-constructor");
     }
+    jw_finish_lambdas(j, &lambdas, NULL, NULL, NULL, NULL);
     if (!ts_node_is_null(body))
         jw_anonymous_body(j, body, value);
     return value;
@@ -1083,8 +1344,9 @@ static oo_value_t jw_local_variable(jw_t *j, TSNode node) {
         if (!j_is(declarator, "variable_declarator"))
             continue;
         TSNode value_node = j_field(declarator, "value");
-        oo_value_t initial =
-            ts_node_is_null(value_node) ? oo_value_unknown() : jw_expr(j, value_node);
+        oo_value_t initial = oo_value_unknown();
+        if (!ts_node_is_null(value_node) && !jw_lambda_to_declared(j, value_node, type))
+            initial = jw_expr(j, value_node);
         jw_bind_declared(j, j_text(&j->text, j_field(declarator, "name")), type, initial,
                          j_dimensions(j_field(declarator, "dimensions")));
     }
@@ -1140,7 +1402,10 @@ static oo_value_t jw_lambda(jw_t *j, TSNode node) {
         oo_bind(w, j_text(&j->text, parameters), oo_value_unknown());
     else
         jw_parameters(j, parameters);
+    TSNode saved_returns = j->returns;
+    j->returns = (TSNode){0};
     (void)jw_expr(j, j_field(node, "body"));
+    j->returns = saved_returns;
     oo_frame_pop(w);
     return oo_value_unknown();
 }
@@ -1279,6 +1544,14 @@ static void jw_local_class(jw_t *j, TSNode node) {
 
 static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
     oo_walk_t *w = j->w;
+    /* `Doc.class` is a Class<Doc>, which is how `<T> T get(Class<T> type)` gets its T. */
+    if (!strcmp(kind, "class_literal") && ts_node_named_child_count(node) == 1) {
+        jw_children(j, node);
+        oo_value_t of = jw_ref(j, j_typeref(&j->text, ts_node_named_child(node, 0)));
+        of.classref = false;
+        oo_value_t klass = oo_value_external("Class");
+        return oo_external_with_element(w, &klass, of);
+    }
     switch (kind[0]) {
     case 'i':
         if (!strcmp(kind, "identifier"))
@@ -1432,6 +1705,9 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
             return oo_value_unknown();
         break;
     case 'r':
+        if (!strcmp(kind, "return_statement") && ts_node_named_child_count(node) == 1 &&
+            jw_lambda_to_declared(j, ts_node_named_child(node, 0), j->returns))
+            return oo_value_unknown();
         if (!strcmp(kind, "resource")) {
             TSNode name = j_field(node, "name");
             if (ts_node_is_null(name))
@@ -1477,7 +1753,7 @@ static oo_value_t jw_expr_kind(jw_t *j, TSNode node, const char *kind) {
         /* super(...) and this(...) only need their arguments walked. */
         (void)jw_expr(j, j_field(node, "object"));
         int argc = 0;
-        (void)jw_arguments(j, j_field(node, "arguments"), &argc);
+        (void)jw_arguments(j, j_field(node, "arguments"), &argc, NULL);
         return oo_value_unknown();
     }
     jw_children(j, node);
@@ -1510,6 +1786,9 @@ static void jw_method(jw_t *j, TSNode node) {
         j_tparams(&j->text, j_field(node, "type_parameters"), &w->scope.tparam_count);
     oo_frame_t frame;
     oo_frame_push(w, &frame);
+    TSNode saved_returns = j->returns;
+    j->returns = j_field(node, "type");
+    jw_annotations(j, node);
     jw_emit_type_mentions(j, j_field(node, "type"), 0);
     if (j_is(node, "compact_constructor_declaration")) {
         /* The header's components are this constructor's parameters. */
@@ -1519,18 +1798,23 @@ static void jw_method(jw_t *j, TSNode node) {
         jw_parameters(j, j_field(node, "parameters"));
     }
     (void)jw_expr(j, j_field(node, "body"));
+    j->returns = saved_returns;
     oo_frame_pop(w);
     w->scope = saved;
     j->static_method = saved_static;
 }
 
 static void jw_field_declaration(jw_t *j, TSNode node) {
+    jw_annotations(j, node);
     jw_emit_type_mentions(j, j_field(node, "type"), 0);
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
         TSNode declarator = ts_node_named_child(node, i);
-        if (j_is(declarator, "variable_declarator"))
-            (void)jw_expr(j, j_field(declarator, "value"));
+        if (!j_is(declarator, "variable_declarator"))
+            continue;
+        TSNode value = j_field(declarator, "value");
+        if (!jw_lambda_to_declared(j, value, j_field(node, "type")))
+            (void)jw_expr(j, value);
     }
 }
 
@@ -1553,7 +1837,7 @@ static void jw_class_body(jw_t *j, TSNode body, const oo_type_t *type) {
             oo_frame_pop(j->w);
         } else if (j_is(member, "enum_constant")) {
             int argc = 0;
-            (void)jw_arguments(j, j_field(member, "arguments"), &argc);
+            (void)jw_arguments(j, j_field(member, "arguments"), &argc, NULL);
             TSNode constant_body = j_field(member, "body");
             if (!ts_node_is_null(constant_body))
                 jw_anonymous_body(j, constant_body, oo_value_of_type(type));
@@ -1573,7 +1857,9 @@ static void jw_type_decl(jw_t *j, TSNode node, const oo_type_t *owner) {
         return;
     const char *qn =
         owner ? j_join(w->arena, owner->qn, name) : j_join(w->arena, w->f->package, name);
-    const oo_type_t *type = qn ? oo_lookup_type(w->ix, qn) : NULL;
+    const oo_type_t *type = qn ? oo_lookup_declared(w->ix, qn, w->rel_path) : NULL;
+    /* A class's annotations read the scope around it. */
+    jw_annotations(j, node);
     oo_scope_t saved = w->scope;
     if (type)
         w->scope.owner = type;
@@ -1602,7 +1888,7 @@ void oo_java_resolve(oo_walk_t *w, TSNode root) {
     oo_file_t *file = cbm_arena_alloc(w->arena, sizeof(*file));
     if (!file)
         return;
-    *file = (oo_file_t){.rel = "",
+    *file = (oo_file_t){.rel = w->rel_path ? w->rel_path : "",
                         .package = package,
                         .language = CBM_LANG_JAVA,
                         .imports = imports,

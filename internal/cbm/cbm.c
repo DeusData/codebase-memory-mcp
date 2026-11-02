@@ -1099,11 +1099,349 @@ static bool csharp_line_starts(const char *line, size_t room, const char *word) 
     return room >= length && !strncmp(line, word, length);
 }
 
+/* True when what ends just before `at` lets a unary operator start an expression there:
+ * punctuation, or `return`, `ref` and `out`. An identifier or `)` before a star is multiplication.
+ */
+static bool csharp_expression_may_start(const char *view, uint32_t at) {
+    static const char *const WORDS[] = {"return", "ref", "out", NULL};
+    uint32_t p = at;
+    while (p > 0 && isspace((unsigned char)view[p - 1]))
+        p--;
+    if (p == 0)
+        return true;
+    if (strchr("=(,>{;:?&|!+-*/%<[", view[p - 1]))
+        return true;
+    for (const char *const *word = WORDS; *word; word++) {
+        uint32_t size = (uint32_t)strlen(*word);
+        if (p >= size && !strncmp(view + p - size, *word, size) &&
+            (p == size ||
+             !(isalnum((unsigned char)view[p - size - 1]) || view[p - size - 1] == '_')))
+            return true;
+    }
+    return false;
+}
+
+static bool csharp_word_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* `=` or a compound assignment at `at`, after blanks. */
+static bool csharp_assignment_follows(const char *view, uint32_t length, uint32_t at) {
+    while (at < length && (view[at] == ' ' || view[at] == '\t'))
+        at++;
+    if (at + 2 >= length)
+        return false;
+    if (view[at] == '=')
+        return view[at + 1] != '=' && view[at + 1] != '>';
+    if (view[at] && strchr("+-*/%&|^", view[at]) && view[at + 1] == '=')
+        return true;
+    return view[at + 2] == '=' && (!strncmp(view + at, "??", 2) || !strncmp(view + at, "<<", 2) ||
+                                   !strncmp(view + at, ">>", 2));
+}
+
+/* Blanks `from` up to `to`, keeping the lines. */
+static void csharp_view_blank(char *view, uint32_t from, uint32_t to) {
+    for (uint32_t i = from; i < to; i++)
+        if (view[i] != '\n' && view[i] != '\r')
+            view[i] = ' ';
+}
+
+/* `*(T*)p`, `*(p + 1)` and `*++p`: the grammar loses a whole file to a star in front of a
+ * parenthesis or an increment. Blank the star. `(T*)p` then reads as a cast to T, which is what the
+ * dereference yields. As an assignment's target no such form reads, and a write through a pointer
+ * names no member of its own, so the whole target becomes `_`. The scan stops at the statement's
+ * end, so the pass stays linear. */
+static void csharp_view_blank_dereference(char *view, uint32_t length) {
+    for (uint32_t i = 0; i + 2 < length; i++) {
+        if (view[i] != '*')
+            continue;
+        bool may_start = csharp_expression_may_start(view, i);
+        if (may_start && ((view[i + 1] == '+' && view[i + 2] == '+') ||
+                          (view[i + 1] == '-' && view[i + 2] == '-'))) {
+            view[i] = ' ';
+            continue;
+        }
+        if (view[i + 1] != '(')
+            continue;
+        uint32_t j = i + 2;
+        int depth = 1;
+        while (j < length && depth > 0 && view[j] != ';' && view[j] != '{' && view[j] != '}') {
+            depth += view[j] == '(';
+            depth -= view[j] == ')';
+            j++;
+        }
+        if (depth != 0)
+            continue;
+        uint32_t end = j < length && view[j] == '&' ? j + 1 : j;
+        int operand_depth = 0;
+        for (; end < length && view[end] != ';' && view[end] != '\n'; end++) {
+            char c = view[end];
+            operand_depth += c == '(';
+            operand_depth -= c == ')';
+            if (operand_depth < 0 ||
+                (operand_depth == 0 && !csharp_word_char(c) && c != '.' && c != ')'))
+                break;
+        }
+        if (csharp_assignment_follows(view, length, end)) {
+            csharp_view_blank(view, i, end);
+            view[i] = '_';
+            continue;
+        }
+        if (!may_start)
+            continue;
+        view[i] = ' ';
+        for (uint32_t k = j - 2; k > i && view[k] == '*'; k--)
+            view[k] = ' ';
+    }
+}
+
+/* `a?.b = c`, `a?[i] = c` (C# 14): the grammar has no null-conditional assignment, and what it
+ * loses can take the members after the statement with it. `a .b = c` assigns the same member. Each
+ * chain is read once, so the pass stays linear. */
+static void csharp_view_blank_conditional_target(char *view, uint32_t length) {
+    for (uint32_t i = 0; i + 1 < length; i++) {
+        if (view[i] != '?' || (view[i + 1] != '.' && view[i + 1] != '['))
+            continue;
+        uint32_t end = i + 1;
+        int depth = 0;
+        for (; end < length && view[end] != '\n' && view[end] != ';'; end++) {
+            char c = view[end];
+            if (c == '[' || c == '(') {
+                depth++;
+            } else if (c == ']' || c == ')') {
+                if (depth == 0)
+                    break;
+                depth--;
+            } else if (depth == 0 && !csharp_word_char(c) && c != '.' && c != '?') {
+                break;
+            }
+        }
+        if (depth == 0 && csharp_assignment_follows(view, length, end)) {
+            for (uint32_t k = i; k < end; k++) {
+                depth += view[k] == '[' || view[k] == '(';
+                depth -= view[k] == ']' || view[k] == ')';
+                if (depth == 0 && view[k] == '?' && (view[k + 1] == '.' || view[k + 1] == '['))
+                    view[k] = ' ';
+            }
+        }
+        i = end;
+    }
+}
+
+/* The brace closing the one at `open`, or `length`. Comments, strings and characters hold none. */
+static uint32_t csharp_matching_brace(const char *view, uint32_t length, uint32_t open) {
+    int depth = 0;
+    for (uint32_t i = open; i < length; i++) {
+        char c = view[i];
+        if (c == '/' && view[i + 1] == '/') {
+            const char *newline = memchr(view + i, '\n', length - i);
+            if (!newline)
+                return length;
+            i = (uint32_t)(newline - view);
+        } else if (c == '/' && view[i + 1] == '*') {
+            const char *close = strstr(view + i + 2, "*/");
+            if (!close)
+                return length;
+            i = (uint32_t)(close - view) + 1;
+        } else if (c == '"') {
+            bool verbatim = i > 0 && (view[i - 1] == '@' ||
+                                      (view[i - 1] == '$' && i > 1 && view[i - 2] == '@'));
+            if (!strncmp(view + i, "\"\"\"", 3)) {
+                const char *close = strstr(view + i + 3, "\"\"\"");
+                if (!close)
+                    return length;
+                i = (uint32_t)(close - view) + 2;
+                continue;
+            }
+            for (i++; i < length; i++) {
+                if (!verbatim && view[i] == '\\')
+                    i++;
+                else if (verbatim && view[i] == '"' && view[i + 1] == '"')
+                    i++;
+                else if (view[i] == '"' || (!verbatim && view[i] == '\n'))
+                    break;
+            }
+        } else if (c == '\'') {
+            if (view[i + 1] == '\\') {
+                const char *close = memchr(view + i + 2, '\'', length - i - 2);
+                if (!close)
+                    return length;
+                i = (uint32_t)(close - view);
+            } else if (view[i + 1] && view[i + 2] == '\'') {
+                i += 2;
+            }
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}' && --depth == 0) {
+            return i;
+        }
+    }
+    return length;
+}
+
+/* An extension block (C# 14) the grammar cannot read: `extension<T>(Vector128<T>) where ... { ...
+ * }`. It knows a block with a named, non-generic receiver as a constructor, so a named receiver
+ * only loses what is in the way. A block with no receiver name has none to lose: its braces go, and
+ * its members, which are the enclosing static class's in the assembly too, stand as that class's.
+ * Every search resumes past what it read, so the pass stays linear. */
+static void csharp_view_open_extension_blocks(char *view, uint32_t length) {
+    static const char WORD[] = "extension";
+    enum { WORD_LENGTH = sizeof(WORD) - 1 };
+    for (char *hit = view; (hit = strstr(hit, WORD)) != NULL; hit += WORD_LENGTH) {
+        uint32_t start = (uint32_t)(hit - view);
+        uint32_t p = start;
+        while (p > 0 && (view[p - 1] == ' ' || view[p - 1] == '\t'))
+            p--;
+        if (p > 0 && view[p - 1] != '\n')
+            continue;
+        uint32_t i = start + WORD_LENGTH;
+        uint32_t generic = i;
+        if (i < length && view[i] == '<') {
+            int angle = 0;
+            for (; i < length && view[i] != '\n'; i++) {
+                angle += view[i] == '<';
+                angle -= view[i] == '>';
+                if (angle == 0)
+                    break;
+            }
+            if (i >= length || view[i] != '>')
+                continue;
+            i++;
+        }
+        uint32_t generic_end = i;
+        if (i >= length || view[i] != '(')
+            continue;
+        uint32_t open = i;
+        int depth = 0;
+        for (; i < length && view[i] != '\n'; i++) {
+            depth += view[i] == '(';
+            depth -= view[i] == ')';
+            if (depth == 0)
+                break;
+        }
+        if (i >= length || view[i] != ')' || i == open + 1)
+            continue;
+        uint32_t close = i;
+        for (i = close + 1; i < length && !strchr("{};=", view[i]); i++) {}
+        if (i >= length || view[i] != '{')
+            continue;
+        /* `(Stream stream)` names its receiver: a word with something in front of it. */
+        uint32_t word = close;
+        while (word > open + 1 && csharp_word_char(view[word - 1]))
+            word--;
+        uint32_t before = word;
+        while (before > open + 1 && view[before - 1] == ' ')
+            before--;
+        bool named = word < close && before > open + 1;
+        if (named) {
+            csharp_view_blank(view, generic, generic_end);
+            csharp_view_blank(view, close + 1, i);
+            continue;
+        }
+        uint32_t end = csharp_matching_brace(view, length, i);
+        if (end >= length)
+            continue;
+        csharp_view_blank(view, start, i + 1);
+        view[end] = ' ';
+    }
+}
+
+static bool csharp_word_in(const char *word, size_t size, const char *const *set) {
+    for (; *set; set++)
+        if (strlen(*set) == size && !strncmp(word, *set, size))
+            return true;
+    return false;
+}
+
+/* `safe` (as in `safe extern`) and `closed` (on a class) are modifiers the grammar does not have:
+ * it took `safe` for the return type and `extern` for the method's name. Modifiers say nothing a
+ * name needs. Each is a modifier only between words that show it: another modifier before, a word
+ * after. */
+static void csharp_view_blank_new_modifiers(char *view, uint32_t length) {
+    static const char *const BEFORE[] = {"public",   "private", "protected", "internal", "static",
+                                         "extern",   "unsafe",  "readonly",  "partial",  "new",
+                                         "override", "sealed",  "abstract",  "virtual",  NULL};
+    static const char *const CLASS_WORDS[] = {"class", "record", "partial", NULL};
+    static const struct {
+        const char *word;
+        const char *const *after; /* NULL: any word. */
+    } MODIFIERS[] = {{"safe", NULL}, {"closed", CLASS_WORDS}};
+    for (size_t m = 0; m < sizeof(MODIFIERS) / sizeof(MODIFIERS[0]); m++) {
+        size_t size = strlen(MODIFIERS[m].word);
+        for (char *hit = view; (hit = strstr(hit, MODIFIERS[m].word)) != NULL; hit += size) {
+            if ((hit > view && csharp_word_char(hit[-1])) || csharp_word_char(hit[size]))
+                continue;
+            char *after = hit + size;
+            while (*after == ' ')
+                after++;
+            char *after_end = after;
+            while (csharp_word_char(*after_end))
+                after_end++;
+            if (after_end == after ||
+                (MODIFIERS[m].after &&
+                 !csharp_word_in(after, (size_t)(after_end - after), MODIFIERS[m].after)))
+                continue;
+            char *before_end = hit;
+            while (before_end > view && before_end[-1] == ' ')
+                before_end--;
+            char *before = before_end;
+            while (before > view && csharp_word_char(before[-1]))
+                before--;
+            if (csharp_word_in(before, (size_t)(before_end - before), BEFORE))
+                memset(hit, ' ', size);
+        }
+    }
+    (void)length;
+}
+
+/* `bool async`, `if (async)`, `async: true`: an identifier the grammar takes for the modifier. Only
+ * the parse sees this spelling: every name is read back from the source at the same span. */
+static void csharp_view_rename_async_identifier(char *view, uint32_t length) {
+    static const char WORD[] = "async";
+    enum { WORD_LENGTH = sizeof(WORD) - 1 };
+    for (char *at = view; (at = strstr(at, WORD)) != NULL; at += WORD_LENGTH) {
+        bool starts = at == view || !(isalnum((unsigned char)at[-1]) || at[-1] == '_');
+        char *next = at + WORD_LENGTH;
+        if (!starts || isalnum((unsigned char)*next) || *next == '_')
+            continue;
+        while (next < view + length && (*next == ' ' || *next == '\t'))
+            next++;
+        if (*next && strchr("),:;?&|.]", *next))
+            at[WORD_LENGTH - 1] = '_';
+        else if (next[0] == '=' && next[1] != '>')
+            at[WORD_LENGTH - 1] = '_';
+    }
+}
+
+/* `$@"""{x}"""`: a doubled quote in a verbatim interpolated string is one quote of its text. */
+static void csharp_view_blank_doubled_quotes(char *view, uint32_t length) {
+    for (uint32_t i = 0; i + 2 < length; i++) {
+        bool opens = (view[i] == '$' && view[i + 1] == '@' && view[i + 2] == '"') ||
+                     (view[i] == '@' && view[i + 1] == '$' && view[i + 2] == '"');
+        if (!opens)
+            continue;
+        uint32_t j = i + 3;
+        while (j < length) {
+            if (view[j] != '"') {
+                j++;
+            } else if (j + 1 < length && view[j + 1] == '"') {
+                view[j] = view[j + 1] = ' ';
+                j += 2;
+            } else {
+                break;
+            }
+        }
+        i = j;
+    }
+}
+
 /* C#: the grammar reads `#if` only where a whole statement or member can stand, and
  * does not know `ref partial struct`. Either can turn a whole file into one ERROR,
  * taking every type it declares with it. This view has the same length and the same
  * lines: conditional directives and the branches after a file's first one are blank,
- * and so is that `ref`. Only a file the grammar could not otherwise read uses it. */
+ * and so is that `ref`. So are the three spellings repaired below, seen to break whole files
+ * on dotnet/runtime (Task.cs, EventSource.cs, Vector2.cs, every test with a `bool async`).
+ * Only a file the grammar could not otherwise read uses it. */
 static char *csharp_parse_view(const char *source, uint32_t length, bool *hid_branch) {
     enum { MAX_DEPTH = 64 };
     char *view = cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)length + 1);
@@ -1157,6 +1495,12 @@ static char *csharp_parse_view(const char *source, uint32_t length, bool *hid_br
         if (!strncmp(next, "struct", 6))
             memset(ref, ' ', 3);
     }
+    csharp_view_blank_dereference(view, length);
+    csharp_view_rename_async_identifier(view, length);
+    csharp_view_blank_doubled_quotes(view, length);
+    csharp_view_blank_conditional_target(view, length);
+    csharp_view_open_extension_blocks(view, length);
+    csharp_view_blank_new_modifiers(view, length);
     return view;
 }
 

@@ -630,7 +630,9 @@ static const char KOTLIN_DIRECT_8[] =
     "package duplicate\n"
     "class Duplicate {\n"
     " fun same(value: Int): Int = value\n"
-    "}\n"
+    "}\n";
+static const char KOTLIN_DIRECT_8_USE[] =
+    "package duplicate\n"
     "fun invalid(value: Duplicate, number: Int): Int = value.same(number)\n";
 static const char KOTLIN_DIRECT_9[] = "package duplicate\n"
                                       "class Duplicate {\n"
@@ -976,7 +978,7 @@ static const RQ_Forbidden KOTLIN_DIRECT_FORBIDDEN[] = {
      .relation = "CALLS",
      .any_target = true},
     {.case_id = "duplicate-class-domain",
-     .site = {.file = "Duplicate.kt",
+     .site = {.file = "DuplicateUse.kt",
               .caller = "invalid",
               .needle = "value.same(number)",
               .occurrence_index = 0},
@@ -1000,6 +1002,7 @@ TEST(resolver_kotlin_primitive_arguments_and_lexical_members_require_proofs) {
             {.path = "Shadow.kt", .text = KOTLIN_DIRECT_6},
             {.path = "Alias.kt", .text = KOTLIN_DIRECT_7},
             {.path = "Duplicate.kt", .text = KOTLIN_DIRECT_8},
+            {.path = "DuplicateUse.kt", .text = KOTLIN_DIRECT_8_USE},
             {.path = "DuplicateOther.kt", .text = KOTLIN_DIRECT_9},
             {.path = "Decoy.kt", .text = KOTLIN_DIRECT_10},
         };

@@ -210,7 +210,13 @@ static oo_tparam_t *kt_tparams(const kt_text_t *t, TSNode owner, int *out_count)
     return items;
 }
 
-enum { KT_MOD_PRIVATE = 1, KT_MOD_OVERRIDE = 2, KT_MOD_INNER = 4, KT_MOD_ABSTRACT = 8 };
+enum {
+    KT_MOD_PRIVATE = 1,
+    KT_MOD_OVERRIDE = 2,
+    KT_MOD_INNER = 4,
+    KT_MOD_ABSTRACT = 8,
+    KT_MOD_DATA = 16
+};
 
 static unsigned kt_modifiers(const kt_text_t *t, TSNode node) {
     unsigned flags = 0;
@@ -232,6 +238,8 @@ static unsigned kt_modifiers(const kt_text_t *t, TSNode node) {
             flags |= KT_MOD_INNER;
         else if (!strcmp(text, "abstract"))
             flags |= KT_MOD_ABSTRACT;
+        else if (!strcmp(text, "data"))
+            flags |= KT_MOD_DATA;
     }
     return flags;
 }
@@ -249,7 +257,8 @@ static TSNode kt_after_colon(TSNode node, const char *stop_a, const char *stop_b
         }
         if (kt_is(child, stop_a) || (stop_b && kt_is(child, stop_b)))
             break;
-        if (seen)
+        /* `suspend` and annotations stand in front of the type itself. */
+        if (seen && !kt_is(child, "type_modifiers"))
             return child;
     }
     return (TSNode){0};
@@ -346,6 +355,7 @@ static void kh_parameters(const kh_t *h, oo_callable_t *callable, TSNode paramet
     uint32_t count = ts_node_is_null(parameters) ? 0 : ts_node_child_count(parameters);
     const oo_typeref_t **refs =
         count ? cbm_arena_calloc(h->text.arena, count * sizeof(*refs)) : NULL;
+    const char **names = count ? cbm_arena_calloc(h->text.arena, count * sizeof(*names)) : NULL;
     int total = 0, optional = 0;
     bool vararg = false, pending_vararg = false;
     for (uint32_t i = 0; i < count; i++) {
@@ -361,6 +371,8 @@ static void kh_parameters(const kh_t *h, oo_callable_t *callable, TSNode paramet
                 type = ts_node_named_child(child, parts - 1);
             if (refs)
                 refs[total] = kt_typeref(&h->text, type);
+            if (names)
+                names[total] = kt_name(&h->text, kt_child(child, "simple_identifier"));
             total++;
             if (pending_vararg && !vararg)
                 callable->vararg_position = total;
@@ -376,6 +388,7 @@ static void kh_parameters(const kh_t *h, oo_callable_t *callable, TSNode paramet
         }
     }
     callable->params = refs;
+    callable->param_names = names;
     callable->param_count = total;
     callable->min_args = total - optional - (vararg ? 1 : 0);
     if (callable->min_args < 0)
@@ -543,6 +556,7 @@ static void kh_primary_constructor(kh_t *h, oo_type_t *type, TSNode primary) {
     callable->flags = OO_F_CTOR;
     kh_parameters(h, callable, primary);
     oo_index_method(h->ix, type, callable);
+    type->primary = callable;
     uint32_t count = ts_node_named_child_count(primary);
     for (uint32_t i = 0; i < count; i++) {
         TSNode parameter = ts_node_named_child(primary, i);
@@ -616,6 +630,8 @@ static void kh_type(kh_t *h, TSNode node, oo_type_t *owner) {
         flags |= OO_F_PRIVATE;
     if (modifiers & KT_MOD_INNER)
         flags |= OO_F_INNER;
+    if (modifiers & KT_MOD_DATA)
+        flags |= OO_F_DATA;
     if (oo_members_broken(node))
         flags |= OO_F_INCOMPLETE;
     const CBMDefinition *def = oo_defs_find(&h->defs, 'T', kt_line(node), name);
@@ -884,6 +900,15 @@ static bool kt_hidden(const oo_value_t *value, const char *name) {
             if (!strcmp(value->hidden->names[i], name))
                 return true;
     return false;
+}
+
+/* What an anonymous object's own property holds, seen from outside. Unknown for a function. */
+static oo_value_t kt_hidden_value(const oo_value_t *value, const char *name) {
+    if (value->hidden && value->hidden->values)
+        for (int i = 0; i < value->hidden->count; i++)
+            if (!strcmp(value->hidden->names[i], name))
+                return value->hidden->values[i];
+    return oo_value_unknown();
 }
 
 static oo_select_t kt_select_list(oo_walk_t *w, const kt_list_t *list, int argc,
@@ -1157,6 +1182,18 @@ static oo_value_t kt_summary_first(oo_walk_t *w, const oo_sumstep_t *step, const
                 if (incomplete)
                     return oo_value_unknown();
             }
+            /* `val at = datetime("at")` on an extension of the enclosing type. */
+            for (int level = 0; step->argc >= 0 && level < KT_LEVEL_COUNT; level++) {
+                kt_list_t list = {.count = 0};
+                kt_level_functions(w, scope, step->name, level, &list);
+                if (list.overflow)
+                    return oo_value_unknown();
+                oo_select_t extension = kt_select_list(w, &list, step->argc, NULL, &receiver, true);
+                if (extension.status == OO_SEL_UNIQUE)
+                    return oo_callable_return(w, extension.callable, extension.subst);
+                if (extension.status == OO_SEL_AMBIGUOUS)
+                    return oo_value_unknown();
+            }
             if (pass == 0 && type->companion)
                 receiver = oo_value_of_type(type->companion);
             else
@@ -1241,6 +1278,7 @@ typedef struct {
     kt_text_t text;
     int depth;
     kw_args_t *free_args;
+    oo_hidden_t *object_members; /* The anonymous object whose members are being walked. */
 } kw_t;
 
 static oo_value_t kw_expr(kw_t *k, TSNode node);
@@ -1268,6 +1306,29 @@ static oo_value_t kw_ref(kw_t *k, const oo_typeref_t *ref) {
         }
     }
     return ref ? oo_value_from_ref(w, ref, &w->scope, NULL) : oo_value_unknown();
+}
+
+static void kw_type_mentions(kw_t *k, TSNode node, unsigned depth);
+
+/* `@InternalApi`, `@OptIn(InternalApi::class)`, in a declaration's modifiers. */
+static void kw_annotations(kw_t *k, TSNode owner) {
+    TSNode modifiers = kt_child(owner, "modifiers");
+    uint32_t count = ts_node_is_null(modifiers) ? 0 : ts_node_named_child_count(modifiers);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode annotation = ts_node_named_child(modifiers, i);
+        if (!kt_is(annotation, "annotation"))
+            continue;
+        uint32_t parts = ts_node_named_child_count(annotation);
+        for (uint32_t p = 0; p < parts; p++) {
+            TSNode part = ts_node_named_child(annotation, p);
+            if (kt_is(part, "user_type")) {
+                kw_type_mentions(k, part, 0);
+            } else if (kt_is(part, "constructor_invocation")) {
+                kw_type_mentions(k, kt_child(part, "user_type"), 0);
+                kw_children(k, kt_child(part, "value_arguments"));
+            }
+        }
+    }
 }
 
 /* Every type mention inside an annotation, at the identifier's own span. */
@@ -1467,16 +1528,52 @@ static void kt_stdlib_lambda(oo_walk_t *w, const char *name, const oo_value_t *r
     }
 }
 
-static void kw_bind_destructured(kw_t *k, TSNode node) {
+/* `componentN` of a destructured value (Kotlin spec 8.4): a pair, a triple or a map entry from the
+ * standard library, a list's element, a data class's primary constructor, or the operator itself.
+ */
+static oo_value_t kt_component(oo_walk_t *w, const oo_value_t *value, int position) {
+    if (!value || value->dims)
+        return oo_value_unknown();
+    if (value->external) {
+        const char *dot = strrchr(value->external, '.');
+        const char *leaf = dot ? dot + 1 : value->external;
+        bool tuple = (!strcmp(leaf, "Pair") && value->arg_count == 2) ||
+                     (!strcmp(leaf, "Triple") && value->arg_count == 3) ||
+                     (!strcmp(leaf, "Entry") && value->arg_count == 2) ||
+                     (!strcmp(leaf, "MutableEntry") && value->arg_count == 2);
+        if (tuple)
+            return position < value->arg_count ? value->args[position] : oo_value_unknown();
+        return oo_element_of(w, value);
+    }
+    if (!value->type)
+        return oo_value_unknown();
+    oo_subst_t *subst = oo_subst_of(w, value);
+    char method[32];
+    snprintf(method, sizeof(method), "component%d", position + 1);
+    oo_select_t selected = oo_select_method(w, value, method, 0, NULL, false);
+    if (selected.status == OO_SEL_UNIQUE)
+        return oo_callable_return(w, selected.callable, selected.subst);
+    const oo_callable_t *primary = value->type->primary;
+    if ((value->type->flags & OO_F_DATA) && primary && primary->params &&
+        position < primary->param_count && primary->params[position]) {
+        oo_scope_t scope = oo_scope_of_callable(primary);
+        return oo_value_from_ref(w, primary->params[position], &scope, subst);
+    }
+    return oo_value_unknown();
+}
+
+static void kw_bind_destructured(kw_t *k, TSNode node, const oo_value_t *source) {
     uint32_t count = ts_node_named_child_count(node);
+    int position = 0;
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_named_child(node, i);
         if (kt_is(child, "variable_declaration")) {
             const char *name = kt_name(&k->text, kt_child(child, "simple_identifier"));
             TSNode declared = kt_after_colon(child, "=", NULL);
             oo_bind(k->w, name,
-                    ts_node_is_null(declared) ? oo_value_unknown()
-                                              : kw_ref(k, kt_typeref(&k->text, declared)));
+                    !ts_node_is_null(declared) ? kw_ref(k, kt_typeref(&k->text, declared))
+                                               : kt_component(k->w, source, position));
+            position++;
         }
     }
 }
@@ -1489,7 +1586,9 @@ static oo_value_t kw_lambda(kw_t *k, TSNode lambda, const oo_value_t *expected,
     oo_frame_push(w, &frame);
     bool pushed = false;
     const oo_value_t *function = expected && expected->fn_ref ? expected : NULL;
-    if (function && function->fn_receiver && oo_value_known(function->fn_receiver)) {
+    bool settled = function && !(ctx && oo_ref_unsettled(ctx->callee, function->fn_ref->fn_receiver,
+                                                         ctx->subst));
+    if (settled && function->fn_receiver && oo_value_known(function->fn_receiver)) {
         pushed = oo_receiver_push(w, *function->fn_receiver, false) != NULL;
     } else if (function && function->fn_ref->fn_receiver) {
         /* A receiver exists whose type could not be read. */
@@ -1548,7 +1647,7 @@ static oo_value_t kw_lambda(kw_t *k, TSNode lambda, const oo_value_t *expected,
                 oo_bind(w, name, value);
                 index++;
             } else if (kt_is(parameter, "multi_variable_declaration")) {
-                kw_bind_destructured(k, parameter);
+                kw_bind_destructured(k, parameter, index == 0 ? &first_parameter : NULL);
                 index++;
             }
         }
@@ -1572,6 +1671,7 @@ struct kw_args {
     TSNode nodes[32];
     oo_value_t values[32];
     bool lambda[32];
+    const char *names[32]; /* A named argument lands on that parameter, not at its position. */
     int count;
     bool overflow;
     kw_args_t *next_free;
@@ -1621,16 +1721,18 @@ static void kw_collect_args(kw_t *k, TSNode suffix, kw_args_t *args) {
             continue;
         }
         TSNode lambda = kw_lambda_of(argument);
+        uint32_t parts = ts_node_named_child_count(argument);
+        bool named = parts >= 2 && kt_is(ts_node_named_child(argument, 0), "simple_identifier");
         args->nodes[args->count] = argument;
         args->lambda[args->count] = !ts_node_is_null(lambda);
+        args->names[args->count] =
+            named ? kt_name(&k->text, ts_node_named_child(argument, 0)) : NULL;
         args->values[args->count] = oo_value_unknown();
-        args->values[args->count].function_literal = !ts_node_is_null(lambda);
+        args->values[args->count].function_literal = !ts_node_is_null(lambda) && !named;
         if (ts_node_is_null(lambda)) {
-            uint32_t parts = ts_node_named_child_count(argument);
             TSNode value = parts ? ts_node_named_child(argument, parts - 1) : (TSNode){0};
             oo_value_t read = kw_expr(k, value);
-            /* A named argument lands on a parameter of that name, not this position. */
-            if (parts < 2 || !kt_is(ts_node_named_child(argument, 0), "simple_identifier"))
+            if (!named)
                 args->values[args->count] = read;
         }
         args->count++;
@@ -1642,6 +1744,7 @@ static void kw_collect_args(kw_t *k, TSNode suffix, kw_args_t *args) {
             continue;
         args->nodes[args->count] = child;
         args->lambda[args->count] = true;
+        args->names[args->count] = NULL;
         args->values[args->count] = oo_value_unknown();
         args->values[args->count].function_literal = true;
         args->count++;
@@ -1650,9 +1753,15 @@ static void kw_collect_args(kw_t *k, TSNode suffix, kw_args_t *args) {
 
 /* The parameter a positional or trailing argument lands on. */
 static const oo_typeref_t *kw_param_for(const oo_callable_t *callee, int index, int total,
-                                        bool trailing) {
+                                        bool trailing, const char *named) {
     if (!callee || !callee->params || !callee->param_count)
         return NULL;
+    if (named) {
+        for (int i = 0; callee->param_names && i < callee->param_count; i++)
+            if (callee->param_names[i] && !strcmp(callee->param_names[i], named))
+                return callee->params[i];
+        return NULL;
+    }
     if (trailing && index == total - 1)
         return callee->params[callee->param_count - 1];
     return index < callee->param_count
@@ -1675,7 +1784,7 @@ static oo_value_t kw_finish_lambdas(kw_t *k, const kw_args_t *args, const oo_cal
         ctx.subst = subst;
         oo_value_t expected = oo_value_unknown();
         bool trailing = kt_is(args->nodes[i], "annotated_lambda");
-        const oo_typeref_t *ref = kw_param_for(callee, i, args->count, trailing);
+        const oo_typeref_t *ref = kw_param_for(callee, i, args->count, trailing, args->names[i]);
         if (ref && callee) {
             oo_scope_t scope = oo_scope_of_callable(callee);
             expected = oo_value_from_ref(w, ref, &scope, subst);
@@ -1728,6 +1837,7 @@ static kw_implicit_t kw_implicit_member(kw_t *k, TSNode name_site, const char *n
     oo_walk_t *w = k->w;
     kw_implicit_t out = {0};
     bool no_outer_instance = false;
+    bool own_property = false;
     for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
         bool blocked =
             no_outer_instance && !(r->value.type && (r->value.type->flags & OO_F_OBJECT));
@@ -1735,10 +1845,13 @@ static kw_implicit_t kw_implicit_member(kw_t *k, TSNode name_site, const char *n
         if (blocked)
             continue;
         for (int i = 0; i < r->own_count; i++) {
-            if (!strcmp(r->own_names[i], name)) {
+            if (strcmp(r->own_names[i], name))
+                continue;
+            if (!r->own_function || r->own_function[i]) {
                 out.stop = true;
                 return out;
             }
+            own_property = true;
         }
         if (r->unknown) {
             out.unknown_receiver = true;
@@ -1796,6 +1909,8 @@ static kw_implicit_t kw_implicit_member(kw_t *k, TSNode name_site, const char *n
             return out;
         }
     }
+    /* No function of the name anywhere: the call is the own property's invoke. */
+    out.stop = out.stop || own_property;
     return out;
 }
 
@@ -1807,6 +1922,14 @@ static oo_select_t kw_free_call(kw_t *k, const char *name, int argc, const oo_va
     *type_value = oo_value_unknown();
     oo_typeref_t ref = {.name = name};
     oo_name_t type_name = oo_resolve_name(w->ix, &w->scope, name);
+    for (const oo_receiver_t *r = w->receiver; r; r = r->parent) {
+        const oo_type_t *nested =
+            r->object_super && r->value.type ? oo_find_nested(w->ix, r->value.type, name) : NULL;
+        if (nested && !(nested->flags & OO_F_AMBIGUOUS)) {
+            type_name = (oo_name_t){.status = OO_NAME_TYPE, .type = nested};
+            break;
+        }
+    }
     bool shadowed_type = oo_lookup_local(w, cbm_arena_sprintf(w->arena, "#type:%s", name)) != NULL;
     if (shadowed_type)
         return (oo_select_t){.status = OO_SEL_AMBIGUOUS};
@@ -2124,7 +2247,12 @@ static oo_value_t kw_member_call_with(kw_t *k, TSNode node, TSNode navigation, T
     kw_lambda_ctx_t ctx = {0};
     if (!target)
         kt_stdlib_lambda(w, name, &receiver, &ctx);
-    oo_value_t lambda_value = kw_finish_lambdas(k, args, target, subst, &ctx);
+    /* `Users.insert { ... }`: the receiver settles a `T.() -> Unit`'s T. */
+    const oo_subst_t *lambda_subst =
+        target && !args->overflow
+            ? oo_infer_call_subst(w, target, subst, &receiver, kw_arg_values(args), args->count)
+            : subst;
+    oo_value_t lambda_value = kw_finish_lambdas(k, args, target, lambda_subst, &ctx);
     if (!target) {
         if (ctx.result_is_lambda)
             return lambda_value;
@@ -2192,6 +2320,7 @@ static oo_value_t kw_object_body(kw_t *k, TSNode object, TSNode members) {
         oo_receiver_t *receiver = oo_receiver_push(w, value, false);
         if (receiver) {
             receiver->unknown = !value.type;
+            receiver->object_super = true;
             pushed++;
         }
     }
@@ -2204,28 +2333,41 @@ static oo_value_t kw_object_body(kw_t *k, TSNode object, TSNode members) {
         uint32_t members_count = ts_node_is_null(members) ? 0 : ts_node_named_child_count(members);
         const char **names =
             members_count ? cbm_arena_calloc(w->arena, members_count * sizeof(*names)) : NULL;
+        bool *functions =
+            members_count ? cbm_arena_calloc(w->arena, members_count * sizeof(*functions)) : NULL;
+        oo_value_t *values =
+            members_count ? cbm_arena_calloc(w->arena, members_count * sizeof(*values)) : NULL;
         int n = 0;
         for (uint32_t i = 0; i < members_count; i++) {
             TSNode member = ts_node_named_child(members, i);
             const char *name = NULL;
-            if (kt_is(member, "function_declaration"))
+            bool function = kt_is(member, "function_declaration");
+            if (function)
                 name = kt_name(&k->text, kt_child(member, "simple_identifier"));
             else if (kt_is(member, "property_declaration"))
                 name = kt_name(&k->text, kt_child(kt_child(member, "variable_declaration"),
                                                   "simple_identifier"));
-            if (name && names)
+            if (name && names && functions) {
+                functions[n] = function;
                 names[n++] = name;
+            }
         }
         own->own_names = names;
         own->own_count = n;
+        own->own_function = functions;
+        own->own_values = values;
         if (hidden) {
             hidden->names = names;
             hidden->count = n;
+            hidden->values = values;
         }
     }
     oo_frame_t frame;
     oo_frame_push(w, &frame);
+    oo_hidden_t *outer_members = k->object_members;
+    k->object_members = hidden;
     kw_members(k, members, NULL);
+    k->object_members = outer_members;
     oo_frame_pop(w);
     for (int i = 0; i < pushed; i++)
         oo_receiver_pop(w);
@@ -2285,13 +2427,16 @@ static oo_value_t kw_identifier(kw_t *k, TSNode node) {
             continue;
         for (int i = 0; i < r->own_count; i++)
             if (!strcmp(r->own_names[i], name))
-                return oo_value_unknown();
+                return r->own_values ? r->own_values[i] : oo_value_unknown();
         if (r->unknown) {
             unknown = true;
             continue;
         }
         if (!r->value.type)
             continue;
+        /* An anonymous object's own member, which has no node. */
+        if (kt_hidden(&r->value, name))
+            return kt_hidden_value(&r->value, name);
         oo_subst_t *subst = NULL;
         bool incomplete = false;
         const oo_field_t *field = oo_find_field(w, &r->value, name, &subst, &incomplete);
@@ -2358,7 +2503,7 @@ static oo_value_t kw_navigation(kw_t *k, TSNode node) {
         size_t head_length = strcspn(text, ".");
         char *head = cbm_arena_strndup(w->arena, text, head_length);
         const oo_type_t *exact =
-            head && !oo_lookup_local(w, head) ? oo_lookup_type(w->ix, text) : NULL;
+            head && !oo_lookup_local(w, head) ? oo_lookup_visible(w->ix, text, w->f) : NULL;
         if (exact && !(exact->flags & OO_F_AMBIGUOUS)) {
             bool shadow = false;
             for (const oo_receiver_t *r = w->receiver; r && !shadow; r = r->parent)
@@ -2371,7 +2516,9 @@ static oo_value_t kw_navigation(kw_t *k, TSNode node) {
         }
     }
     oo_value_t receiver = kw_expr(k, receiver_node);
-    if (!name || (!receiver.type && !receiver.external) || kt_hidden(&receiver, name))
+    if (name && kt_hidden(&receiver, name))
+        return kt_hidden_value(&receiver, name);
+    if (!name || (!receiver.type && !receiver.external))
         return oo_value_unknown();
     if (receiver.type) {
         oo_subst_t *subst = NULL;
@@ -2413,7 +2560,8 @@ static oo_value_t kw_navigation(kw_t *k, TSNode node) {
             return kt_field_type(w, extension, NULL);
         }
     }
-    return oo_value_unknown();
+    /* `entry.value`, `pair.first`. */
+    return receiver.external ? oo_external_member_return(w, &receiver, name) : oo_value_unknown();
 }
 
 /* The operator method a desugared expression calls, at the expression's span. */
@@ -2682,7 +2830,7 @@ static oo_value_t kw_property(kw_t *k, TSNode node) {
             initial = value;
     }
     if (!ts_node_is_null(multi)) {
-        kw_bind_destructured(k, multi);
+        kw_bind_destructured(k, multi, &initial);
     } else if (!ts_node_is_null(variable)) {
         const char *name = kt_name(&k->text, kt_child(variable, "simple_identifier"));
         TSNode declared = kt_after_colon(variable, "=", NULL);
@@ -2715,7 +2863,8 @@ static oo_value_t kw_for(kw_t *k, TSNode node) {
     }
     oo_frame_push(w, &frame);
     if (!ts_node_is_null(multi)) {
-        kw_bind_destructured(k, multi);
+        oo_value_t element = oo_element_of(w, &iterable);
+        kw_bind_destructured(k, multi, &element);
     } else if (!ts_node_is_null(variable)) {
         const char *name = kt_name(&k->text, kt_child(variable, "simple_identifier"));
         TSNode declared = kt_after_colon(variable, "=", NULL);
@@ -3171,8 +3320,10 @@ static void kw_members(kw_t *k, TSNode body, const oo_type_t *owner) {
         TSNode member = ts_node_named_child(body, i);
         const char *kind = ts_node_type(member);
         if (!strcmp(kind, "function_declaration")) {
+            kw_annotations(k, member);
             kw_function(k, member);
         } else if (!strcmp(kind, "property_declaration")) {
+            kw_annotations(k, member);
             /* A member property: initializer, accessors, annotation. */
             oo_frame_t frame;
             oo_frame_push(w, &frame);
@@ -3189,7 +3340,9 @@ static void kw_members(kw_t *k, TSNode body, const oo_type_t *owner) {
                 }
             }
             TSNode variable = kt_child(member, "variable_declaration");
-            kw_type_mentions(k, kt_after_colon(variable, "=", NULL), 0);
+            TSNode declared = kt_after_colon(variable, "=", NULL);
+            kw_type_mentions(k, declared, 0);
+            oo_value_t held = oo_value_unknown();
             uint32_t parts = ts_node_named_child_count(member);
             for (uint32_t p = 0; p < parts; p++) {
                 TSNode part = ts_node_named_child(member, p);
@@ -3220,7 +3373,19 @@ static void kw_members(kw_t *k, TSNode body, const oo_type_t *owner) {
                     kw_children(k, part);
                     continue;
                 }
-                (void)kw_expr(k, part);
+                oo_value_t value = kw_expr(k, part);
+                if (!ts_node_eq(part, declared))
+                    held = value;
+            }
+            oo_hidden_t *members = k->object_members;
+            if (members && members->values) {
+                if (!ts_node_is_null(declared))
+                    held = kw_ref(k, kt_typeref(&k->text, declared));
+                held.classref = false;
+                const char *held_name = kt_name(&k->text, kt_child(variable, "simple_identifier"));
+                for (int m = 0; held_name && m < members->count; m++)
+                    if (!strcmp(members->names[m], held_name))
+                        members->values[m] = held;
             }
             if (pushed)
                 oo_receiver_pop(w);
@@ -3228,7 +3393,10 @@ static void kw_members(kw_t *k, TSNode body, const oo_type_t *owner) {
             oo_frame_pop(w);
         } else if (!strcmp(kind, "class_declaration") || !strcmp(kind, "object_declaration") ||
                    !strcmp(kind, "companion_object")) {
+            oo_hidden_t *outer_members = k->object_members;
+            k->object_members = NULL;
             kw_class_like(k, member, owner);
+            k->object_members = outer_members;
         } else if (!strcmp(kind, "anonymous_initializer")) {
             (void)kw_block(k, kt_child(member, "statements"));
         } else if (!strcmp(kind, "secondary_constructor")) {
@@ -3284,7 +3452,9 @@ static void kw_class_like(kw_t *k, TSNode node, const oo_type_t *owner) {
         return;
     const char *qn =
         owner ? kt_join(w->arena, owner->qn, name) : kt_join(w->arena, w->f->package, name);
-    const oo_type_t *type = qn ? oo_lookup_type(w->ix, qn) : NULL;
+    const oo_type_t *type = qn ? oo_lookup_declared(w->ix, qn, w->rel_path) : NULL;
+    /* A class's annotations read the scope around it. */
+    kw_annotations(k, node);
     bool usable = type && !(type->flags & OO_F_AMBIGUOUS);
     oo_scope_t saved = w->scope;
     if (type)
@@ -3359,6 +3529,7 @@ static void kw_top_level(kw_t *k, TSNode parent, bool in_error) {
         } else if (!strcmp(kind, "class_declaration") || !strcmp(kind, "object_declaration")) {
             kw_class_like(k, child, NULL);
         } else if (!strcmp(kind, "function_declaration")) {
+            kw_annotations(k, child);
             kw_function(k, child);
         } else if (!strcmp(kind, "property_declaration") ||
                    !strcmp(kind, "anonymous_initializer") ||

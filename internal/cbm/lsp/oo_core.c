@@ -34,8 +34,9 @@ cbm_oo_index_t *cbm_oo_index_new(CBMArena *arena) {
     ix->functions = cbm_ht_create(1024);
     ix->props = cbm_ht_create(1024);
     ix->ext_static = cbm_ht_create(256);
+    ix->files = cbm_ht_create(256);
     if (!ix->types || !ix->methods || !ix->fields || !ix->functions || !ix->props ||
-        !ix->ext_static) {
+        !ix->ext_static || !ix->files) {
         cbm_oo_index_free(ix);
         return NULL;
     }
@@ -51,12 +52,58 @@ void cbm_oo_index_free(cbm_oo_index_t *ix) {
     cbm_ht_free(ix->functions);
     cbm_ht_free(ix->props);
     cbm_ht_free(ix->ext_static);
+    cbm_ht_free(ix->files);
     ix->types = ix->methods = ix->fields = ix->functions = ix->props = ix->ext_static = NULL;
+    ix->files = NULL;
 }
 
 static const char *oo_key(char *buffer, size_t capacity, const char *a, const char *b) {
     int length = snprintf(buffer, capacity, "%s\x1f%s", a ? a : "", b ? b : "");
     return length > 0 && (size_t)length < capacity ? buffer : NULL;
+}
+
+static const char *file_rel_or(const char *rel) {
+    return rel ? rel : "";
+}
+
+/* Gradle and Maven: `src/test/...`, `src/internalClusterTest/...`, any source set named *Test. */
+static bool oo_jvm_test_source(const char *rel) {
+    for (const char *at = strstr(rel, "src/"); at; at = strstr(at + 1, "src/")) {
+        if (at != rel && at[-1] != '/')
+            continue;
+        const char *set = at + 4;
+        size_t length = strcspn(set, "/");
+        if (set[length] != '/' || length < 4)
+            continue;
+        if (!strncmp(set + length - 4, "test", 4) || !strncmp(set + length - 4, "Test", 4))
+            return true;
+    }
+    return false;
+}
+
+/* .NET: a test project, by its own directory: `<lib>/tests`, `<name>.Tests`. A helper library under
+ * a tests directory (dotnet/runtime's Common/tests/TestUtilities) is read by every test project. */
+static bool oo_csharp_test_project(const char *project) {
+    if (!project)
+        return false;
+    const char *slash = strrchr(project, '/');
+    const char *at = slash ? slash + 1 : project;
+    size_t length = strlen(at);
+    return !strcmp(at, "tests") || !strcmp(at, "test") ||
+           (length > 6 && !strcmp(at + length - 6, ".Tests")) ||
+           (length > 5 && !strcmp(at + length - 5, ".Test"));
+}
+
+/* Test sources are the leaves of a build: another project's code does not read them, unless it
+ * compiles the very file. So a free name never reaches a function or an extension method there from
+ * outside: `items.Concat(x)` in one test project does not mean another test project's helper in an
+ * enclosing namespace. A type named outright still binds, since a shared source file reads it. */
+static bool oo_file_outside_tests(const cbm_oo_index_t *ix, const oo_file_t *declared,
+                                  const oo_file_t *reader) {
+    if (!declared || !declared->test_source || !reader || !declared->project)
+        return false;
+    const oo_file_t *indexed = reader->project ? reader : cbm_ht_get(ix->files, reader->rel);
+    return indexed && indexed->project && strcmp(indexed->project, declared->project);
 }
 
 const oo_file_t *oo_index_file(cbm_oo_index_t *ix, CBMLanguage lang, const char *rel,
@@ -67,13 +114,107 @@ const oo_file_t *oo_index_file(cbm_oo_index_t *ix, CBMLanguage lang, const char 
         ix->failed = true;
         return NULL;
     }
-    *file = (oo_file_t){.rel = cbm_arena_strdup(ix->arena, rel ? rel : ""),
-                        .package = cbm_arena_strdup(ix->arena, package ? package : ""),
-                        .language = lang,
-                        .imports = imports,
-                        .import_count = import_count,
-                        .has_error = has_error};
+    *file =
+        (oo_file_t){.rel = cbm_arena_strdup(ix->arena, rel ? rel : ""),
+                    .package = cbm_arena_strdup(ix->arena, package ? package : ""),
+                    .language = lang,
+                    .imports = imports,
+                    .import_count = import_count,
+                    .has_error = has_error,
+                    .reference = ix->reference_files,
+                    .test_source = lang == CBM_LANG_CSHARP ? oo_csharp_test_project(ix->project)
+                                                           : oo_jvm_test_source(file_rel_or(rel)),
+                    .project = ix->project};
+    if (ix->project)
+        cbm_ht_set(ix->files, file->rel, file);
     return file;
+}
+
+void cbm_oo_index_set_project(cbm_oo_index_t *ix, const char *project_dir) {
+    if (ix)
+        ix->project = project_dir ? cbm_arena_strdup(ix->arena, project_dir) : NULL;
+}
+
+void cbm_oo_index_begin_reference_files(cbm_oo_index_t *ix) {
+    if (ix)
+        ix->reference_files = true;
+}
+
+bool oo_type_is_implemented_elsewhere(const oo_type_t *type, const oo_file_t *file) {
+    return file && file->reference && type && type->file && !type->file->reference;
+}
+
+/* One more declaration of a name. The first keeps its members under the plain qualified name, and
+ * the index entry for the name becomes a holder of the declarations with no members of its own.
+ * Each later one is its own type, keyed by its file, so its members and nested types stay apart. */
+static oo_type_t *oo_index_variant(cbm_oo_index_t *ix, oo_type_t *prior, const char *qn,
+                                   const char *name, const oo_file_t *f, const char *ns,
+                                   const oo_type_t *owner, const char *graph_qn, uint32_t flags) {
+    oo_type_t *holder = prior;
+    if (!(prior->flags & OO_F_AMBIGUOUS)) {
+        holder = cbm_arena_calloc(ix->arena, sizeof(*holder));
+        if (!holder) {
+            ix->failed = true;
+            return prior;
+        }
+        *holder = *prior;
+        holder->flags |= OO_F_AMBIGUOUS;
+        holder->graph_qn = NULL;
+        holder->graph_count = 0;
+        holder->variants = prior;
+        holder->next_in_index = NULL;
+        cbm_ht_set(ix->types, prior->qn, holder);
+        ix->has_variants = true;
+    }
+    /* Twice in one file, as in two `#if` branches, is one graph node. */
+    for (const oo_type_t *v = holder->variants; v; v = v->next_variant)
+        if (v->file == f)
+            return (oo_type_t *)v;
+    const char *key = cbm_arena_sprintf(ix->arena, "%s\x1e%d", qn, ++ix->variant_serial);
+    oo_type_t *variant = cbm_arena_calloc(ix->arena, sizeof(*variant));
+    const char *short_name = cbm_arena_strdup(ix->arena, name);
+    if (!variant || !key || !short_name) {
+        ix->failed = true;
+        return holder;
+    }
+    *variant = (oo_type_t){.qn = key,
+                           .name = short_name,
+                           .graph_qn = graph_qn ? cbm_arena_strdup(ix->arena, graph_qn) : NULL,
+                           .graph_count = graph_qn ? 1 : 0,
+                           .file = f,
+                           .ns = ns ? cbm_arena_strdup(ix->arena, ns) : "",
+                           .owner = owner,
+                           .flags = flags,
+                           .next_in_index = ix->all_types,
+                           .next_variant = holder->variants};
+    holder->variants = variant;
+    ix->all_types = variant;
+    cbm_ht_set(ix->types, key, variant);
+    return variant;
+}
+
+/* The file named after a type (`Foo.cs` for `Foo` and `Foo<T>`). */
+static bool oo_file_named_after(const char *rel, const char *name) {
+    const char *slash = rel ? strrchr(rel, '/') : NULL;
+    const char *base = slash ? slash + 1 : rel;
+    size_t length = strcspn(name, "`");
+    return base && !strncmp(base, name, length) && !strcmp(base + length, ".cs");
+}
+
+/* A partial type is one type with a node per file. A mention of the type needs one of them, and
+ * every one is a declaration of it, so this picks by a pure function of the set: the file named
+ * after the type, then the smallest path. Its members keep their own nodes. */
+static void oo_partial_representative(cbm_oo_index_t *ix, oo_type_t *type, const oo_file_t *f,
+                                      const char *graph_qn) {
+    type->graph_count++;
+    if (!graph_qn || !f)
+        return;
+    bool named = oo_file_named_after(f->rel, type->name);
+    bool held = type->graph_rel && oo_file_named_after(type->graph_rel, type->name);
+    if (type->graph_qn && (held != named ? held : strcmp(type->graph_rel, f->rel) <= 0))
+        return;
+    type->graph_qn = cbm_arena_strdup(ix->arena, graph_qn);
+    type->graph_rel = f->rel;
 }
 
 oo_type_t *oo_index_type(cbm_oo_index_t *ix, const char *qn, const char *name, const oo_file_t *f,
@@ -83,16 +224,17 @@ oo_type_t *oo_index_type(cbm_oo_index_t *ix, const char *qn, const char *name, c
         return NULL;
     oo_type_t *prior = cbm_ht_get(ix->types, qn);
     if (prior) {
+        if (oo_type_is_implemented_elsewhere(prior, f))
+            return prior;
         /* C# partial declarations are one type with several graph nodes. Any
          * other repeated qualified name is two types the index cannot tell
          * apart (expect/actual, multi-release sources): never choose one. */
-        if ((prior->flags & OO_F_PARTIAL) && (flags & OO_F_PARTIAL)) {
-            prior->graph_count++;
-            prior->graph_qn = NULL;
-        } else {
-            prior->flags |= OO_F_AMBIGUOUS;
+        if (!(prior->flags & OO_F_AMBIGUOUS) && (prior->flags & OO_F_PARTIAL) &&
+            (flags & OO_F_PARTIAL)) {
+            oo_partial_representative(ix, prior, f, graph_qn);
+            return prior;
         }
-        return prior;
+        return oo_index_variant(ix, prior, qn, name, f, ns, owner, graph_qn, flags);
     }
     oo_type_t *type = cbm_arena_calloc(ix->arena, sizeof(*type));
     const char *key = cbm_arena_strdup(ix->arena, qn);
@@ -105,6 +247,7 @@ oo_type_t *oo_index_type(cbm_oo_index_t *ix, const char *qn, const char *name, c
                         .name = short_name,
                         .graph_qn = graph_qn ? cbm_arena_strdup(ix->arena, graph_qn) : NULL,
                         .graph_count = graph_qn ? 1 : 0,
+                        .graph_rel = f ? f->rel : NULL,
                         .file = f,
                         .ns = ns ? cbm_arena_strdup(ix->arena, ns) : "",
                         .owner = owner,
@@ -175,6 +318,81 @@ void oo_index_ext_static(cbm_oo_index_t *ix, const char *ns, oo_callable_t *call
 
 const oo_type_t *oo_lookup_type(const cbm_oo_index_t *ix, const char *qn) {
     return qn ? cbm_ht_get(ix->types, qn) : NULL;
+}
+
+const oo_type_t *oo_lookup_declared(const cbm_oo_index_t *ix, const char *qn, const char *rel) {
+    const oo_type_t *type = oo_lookup_type(ix, qn);
+    if (!type || !(type->flags & OO_F_AMBIGUOUS) || !rel)
+        return type;
+    for (const oo_type_t *v = type->variants; v; v = v->next_variant)
+        if (v->file && !strcmp(v->file->rel, rel))
+            return v;
+    return type;
+}
+
+/* The declaration of a several-claimed name this file means, or NULL: its own file's, then the only
+ * one in its project (C# CS0436, and javac's and kotlinc's own sources: a project's declaration
+ * shadows one it could only read from elsewhere). Linear in that name's declarations. */
+static const oo_type_t *oo_variant_for(const cbm_oo_index_t *ix, const oo_type_t *holder,
+                                       const oo_file_t *file) {
+    if (!holder || !holder->variants || !file)
+        return NULL;
+    const oo_file_t *indexed = file->project ? file : cbm_ht_get(ix->files, file->rel);
+    const char *project = indexed ? indexed->project : NULL;
+    const oo_type_t *in_project = NULL;
+    int count = 0;
+    for (const oo_type_t *v = holder->variants; v; v = v->next_variant) {
+        if (!v->file)
+            continue;
+        if (!strcmp(v->file->rel, file->rel))
+            return v;
+        if (project && v->file->project && !strcmp(project, v->file->project)) {
+            in_project = v;
+            count++;
+        }
+    }
+    return count == 1 ? in_project : NULL;
+}
+
+const oo_type_t *oo_lookup_visible(const cbm_oo_index_t *ix, const char *qn,
+                                   const oo_file_t *file) {
+    const oo_type_t *exact = oo_lookup_type(ix, qn);
+    if (!qn || !ix->has_variants)
+        return exact;
+    if (exact && (exact->flags & OO_F_AMBIGUOUS)) {
+        const oo_type_t *variant = oo_variant_for(ix, exact, file);
+        return variant ? variant : exact;
+    }
+    /* A dotted name through a several-claimed outer type. Bounded by its dots. */
+    char prefix[OO_KEY_MAX];
+    size_t length = strlen(qn);
+    if (length >= sizeof(prefix))
+        return exact;
+    memcpy(prefix, qn, length + 1);
+    for (char *dot = strchr(prefix, '.'); dot; dot = strchr(dot + 1, '.')) {
+        *dot = '\0';
+        const oo_type_t *outer = cbm_ht_get(ix->types, prefix);
+        *dot = '.';
+        if (!outer || !(outer->flags & OO_F_AMBIGUOUS))
+            continue;
+        const oo_type_t *type = oo_variant_for(ix, outer, file);
+        if (!type)
+            return outer;
+        const char *rest = qn + (dot - prefix) + 1;
+        while (type && *rest) {
+            const char *next = strchr(rest, '.');
+            size_t part = next ? (size_t)(next - rest) : strlen(rest);
+            char segment[256];
+            if (part >= sizeof(segment))
+                return NULL;
+            memcpy(segment, rest, part);
+            segment[part] = '\0';
+            type = oo_find_nested(ix, type, segment);
+            rest = next ? next + 1 : rest + part;
+        }
+        return type;
+    }
+    return exact;
 }
 
 static void *oo_list_get(const CBMHashTable *table, const char *a, const char *b) {
@@ -379,11 +597,15 @@ const oo_type_t *oo_find_nested(const cbm_oo_index_t *ix, const oo_type_t *type,
 
 /* ── Names ──────────────────────────────────────────────────────────── */
 
-static oo_name_t oo_name_type(const oo_type_t *type) {
+static oo_name_t oo_name_type(const cbm_oo_index_t *ix, const oo_file_t *file,
+                              const oo_type_t *type) {
     if (!type)
         return (oo_name_t){.status = OO_NAME_UNKNOWN};
-    if (type->flags & OO_F_AMBIGUOUS)
-        return (oo_name_t){.status = OO_NAME_AMBIGUOUS};
+    if (type->flags & OO_F_AMBIGUOUS) {
+        type = oo_variant_for(ix, type, file);
+        if (!type)
+            return (oo_name_t){.status = OO_NAME_AMBIGUOUS};
+    }
     return (oo_name_t){.status = OO_NAME_TYPE, .type = type};
 }
 
@@ -421,12 +643,15 @@ static bool oo_lexical_name(const cbm_oo_index_t *ix, const oo_scope_t *scope, c
             }
         }
         if (!strcmp(type->name, segment)) {
-            *out = oo_name_type(type);
+            /* Inside its own body a type's name is this declaration. */
+            *out = (oo_name_t){.status = OO_NAME_TYPE, .type = type};
+            if (type->flags & OO_F_AMBIGUOUS)
+                *out = oo_name_type(ix, scope->file, type);
             return true;
         }
         const oo_type_t *nested = oo_find_nested(ix, type, segment);
         if (nested) {
-            *out = oo_name_type(nested);
+            *out = oo_name_type(ix, scope->file, nested);
             return true;
         }
     }
@@ -438,18 +663,24 @@ static oo_name_t oo_star_name(const cbm_oo_index_t *ix, const oo_file_t *file, c
     const oo_type_t *found = NULL;
     for (int i = 0; i < file->import_count; i++) {
         const oo_import_t *import = &file->imports[i];
-        if (!import->star || import->statik)
+        if (!import->star)
             continue;
         if (only_ns && strcmp(import->ns ? import->ns : "", only_ns))
             continue;
-        const oo_type_t *candidate = oo_qualified(ix, import->path, segment);
+        /* A static import brings the type's nested types in as well (JLS 7.5.4, C# 14.5.4). */
+        const oo_type_t *imported =
+            import->statik ? oo_lookup_visible(ix, import->path, file) : NULL;
+        const oo_type_t *candidate = !import->statik ? oo_qualified(ix, import->path, segment)
+                                     : imported && !(imported->flags & OO_F_AMBIGUOUS)
+                                         ? oo_find_nested(ix, imported, segment)
+                                         : NULL;
         if (!candidate)
             continue;
         if (found && found != candidate)
             return (oo_name_t){.status = OO_NAME_AMBIGUOUS};
         found = candidate;
     }
-    return oo_name_type(found);
+    return oo_name_type(ix, file, found);
 }
 
 static oo_name_t oo_jvm_simple(const cbm_oo_index_t *ix, const oo_scope_t *scope,
@@ -461,9 +692,9 @@ static oo_name_t oo_jvm_simple(const cbm_oo_index_t *ix, const oo_scope_t *scope
         const oo_import_t *import = &file->imports[i];
         if (import->star || !import->local || strcmp(import->local, segment))
             continue;
-        const oo_type_t *type = cbm_ht_get(ix->types, import->path);
+        const oo_type_t *type = oo_lookup_visible(ix, import->path, file);
         if (type) {
-            oo_name_t name = oo_name_type(type);
+            oo_name_t name = oo_name_type(ix, file, type);
             name.via_import = true;
             return name;
         }
@@ -471,7 +702,7 @@ static oo_name_t oo_jvm_simple(const cbm_oo_index_t *ix, const oo_scope_t *scope
     }
     const oo_type_t *own = oo_qualified(ix, file->package, segment);
     if (own)
-        return oo_name_type(own);
+        return oo_name_type(ix, file, own);
     oo_name_t star = oo_star_name(ix, file, segment, NULL);
     if (star.status != OO_NAME_UNKNOWN) {
         star.via_import = true;
@@ -491,16 +722,16 @@ static oo_name_t oo_cs_simple(const cbm_oo_index_t *ix, const oo_scope_t *scope,
     for (;;) {
         const oo_type_t *member = oo_qualified(ix, prefix, segment);
         if (member)
-            return oo_name_type(member);
+            return oo_name_type(ix, scope->file, member);
         const oo_file_t *file = scope->file;
         for (int i = 0; i < file->import_count; i++) {
             const oo_import_t *import = &file->imports[i];
             if (import->star || !import->local || strcmp(import->local, segment) ||
                 strcmp(import->ns ? import->ns : "", prefix))
                 continue;
-            const oo_type_t *type = cbm_ht_get(ix->types, import->path);
+            const oo_type_t *type = oo_lookup_visible(ix, import->path, file);
             if (type) {
-                oo_name_t name = oo_name_type(type);
+                oo_name_t name = oo_name_type(ix, file, type);
                 name.via_import = true;
                 return name;
             }
@@ -560,14 +791,14 @@ oo_name_t oo_resolve_name(const cbm_oo_index_t *ix, const oo_scope_t *scope, con
                 return (oo_name_t){.status = OO_NAME_UNKNOWN};
             rest = next ? next + 1 : NULL;
         }
-        return oo_name_type(type);
+        return oo_name_type(ix, scope->file, type);
     }
     if (head.status == OO_NAME_AMBIGUOUS)
         return head;
     /* Not a type in scope: the spelling can only be fully qualified. */
-    const oo_type_t *exact = cbm_ht_get(ix->types, name);
+    const oo_type_t *exact = oo_lookup_visible(ix, name, scope->file);
     if (exact)
-        return oo_name_type(exact);
+        return oo_name_type(ix, scope->file, exact);
     return (oo_name_t){.status = OO_NAME_EXTERNAL, .external = name};
 }
 
@@ -656,6 +887,17 @@ oo_value_t oo_value_from_ref(oo_walk_t *w, const oo_typeref_t *ref, const oo_sco
         w->depth--;
         return value;
     }
+    if (!ref->name && ref->lower) {
+        oo_value_t value = oo_value_unknown();
+        oo_value_t *lower = cbm_arena_alloc(w->arena, sizeof(*lower));
+        if (lower) {
+            w->depth++;
+            *lower = oo_value_from_ref(w, ref->lower, scope, subst);
+            w->depth--;
+            value.lower = lower;
+        }
+        return value;
+    }
     if (!ref->name)
         return oo_value_unknown();
     oo_name_t name = oo_resolve_name(w->ix, scope, ref->name);
@@ -664,7 +906,7 @@ oo_value_t oo_value_from_ref(oo_walk_t *w, const oo_typeref_t *ref, const oo_sco
     switch (name.status) {
     case OO_NAME_TPARAM: {
         const oo_value_t *bound = oo_subst_lookup(subst, name.tparam);
-        if (bound)
+        if (bound && (oo_value_known(bound) || bound->lower))
             value = *bound;
         else if (name.tparam->bound)
             value = oo_value_from_ref(w, name.tparam->bound, scope, subst);
@@ -846,6 +1088,8 @@ static bool oo_name_in(const char *leaf, const char *const *names) {
     return false;
 }
 
+static bool oo_same_value(const oo_value_t *a, const oo_value_t *b);
+
 static const char *const OO_ONE_ARG_COLLECTIONS[] = {"Iterable",
                                                      "MutableIterable",
                                                      "Collection",
@@ -887,6 +1131,20 @@ static const char *const OO_ONE_ARG_COLLECTIONS[] = {"Iterable",
                                                      "ReadOnlyMemory",
                                                      NULL};
 
+static const char *const OO_MAPS[] = {"Map",
+                                      "MutableMap",
+                                      "HashMap",
+                                      "LinkedHashMap",
+                                      "TreeMap",
+                                      "SortedMap",
+                                      "NavigableMap",
+                                      "ConcurrentHashMap",
+                                      "ConcurrentMap",
+                                      "Dictionary",
+                                      "IDictionary",
+                                      "IReadOnlyDictionary",
+                                      NULL};
+
 oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value) {
     if (!value)
         return oo_value_unknown();
@@ -899,8 +1157,18 @@ oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value) {
     char leaf[64];
     if (value->external && value->arg_count == 1 &&
         oo_plain_leaf(value->external, leaf, sizeof(leaf)) &&
-        oo_name_in(leaf, OO_ONE_ARG_COLLECTIONS))
+        oo_name_in(leaf, OO_ONE_ARG_COLLECTIONS)) {
+        /* `? super X` yields nothing known; `? extends X` already reads as X. */
         return value->args[0];
+    }
+    /* Kotlin and C# iterate a map's entries. Java does not compile this. */
+    if (value->external && value->arg_count == 2 &&
+        oo_plain_leaf(value->external, leaf, sizeof(leaf)) && oo_name_in(leaf, OO_MAPS)) {
+        oo_value_t entry = oo_value_external("Entry");
+        entry.args = value->args;
+        entry.arg_count = 2;
+        return entry;
+    }
     if (!value->type)
         return oo_value_unknown();
     /* A project type's own Iterable<X> supertype, with its arguments substituted. */
@@ -970,10 +1238,12 @@ oo_value_t oo_external_member_return(oo_walk_t *w, const oo_value_t *value, cons
                                            "ElementAt",
                                            NULL};
     static const char *const same[] = {
-        "iterator",   "listIterator", "stream",  "filter",        "sorted", "distinct",
-        "limit",      "skip",         "toList",  "toMutableList", "toSet",  "asSequence",
-        "asIterable", "reversed",     "subList", "take",          "drop",   "filterNotNull",
-        "Where",      "ToList",       "ToArray", "AsEnumerable",  NULL};
+        "iterator",   "listIterator", "stream",    "filter",         "sorted",   "distinct",
+        "limit",      "skip",         "toList",    "toMutableList",  "toSet",    "asSequence",
+        "asIterable", "reversed",     "subList",   "take",           "drop",     "filterNotNull",
+        "peek",       "takeWhile",    "dropWhile", "parallelStream", "parallel", "sequential",
+        "Where",      "ToList",       "ToArray",   "AsEnumerable",   NULL};
+    static const char *const optional_of[] = {"findFirst", "findAny", "min", "max", NULL};
     if (value->arg_count == 1 && oo_name_in(leaf, OO_ONE_ARG_COLLECTIONS)) {
         if (oo_name_in(name, elements))
             return value->args[0];
@@ -982,26 +1252,164 @@ oo_value_t oo_external_member_return(oo_walk_t *w, const oo_value_t *value, cons
             copy.classref = false;
             return copy;
         }
+        if (oo_name_in(name, optional_of) && !strcmp(leaf, "Stream")) {
+            oo_value_t optional = *value;
+            optional.classref = false;
+            optional.external = "Optional";
+            return optional;
+        }
     }
-    static const char *const maps[] = {"Map",
-                                       "MutableMap",
-                                       "HashMap",
-                                       "LinkedHashMap",
-                                       "TreeMap",
-                                       "SortedMap",
-                                       "NavigableMap",
-                                       "ConcurrentHashMap",
-                                       "ConcurrentMap",
-                                       "Dictionary",
-                                       "IDictionary",
-                                       "IReadOnlyDictionary",
-                                       NULL};
+    /* A map entry, or a pair. */
+    if (value->arg_count == 2 && (!strcmp(leaf, "Entry") || !strcmp(leaf, "MutableEntry") ||
+                                  !strcmp(leaf, "KeyValuePair") || !strcmp(leaf, "Pair"))) {
+        static const char *const keys[] = {"getKey", "key", "Key", "first", NULL};
+        static const char *const vals[] = {"getValue", "value", "Value", "second", NULL};
+        if (oo_name_in(name, keys))
+            return value->args[0];
+        if (oo_name_in(name, vals))
+            return value->args[1];
+    }
     static const char *const map_values[] = {"get",       "getValue", "getOrDefault",    "getOrPut",
                                              "getOrElse", "remove",   "computeIfAbsent", NULL};
-    if (value->arg_count == 2 && oo_name_in(leaf, maps) && oo_name_in(name, map_values))
+    if (value->arg_count == 2 && oo_name_in(leaf, OO_MAPS) && oo_name_in(name, map_values))
         return value->args[1];
-    (void)w;
+    if (value->arg_count == 2 && oo_name_in(leaf, OO_MAPS)) {
+        /* The map's views: what iterating them, or their stream, yields. */
+        oo_value_t view = oo_value_unknown();
+        if (!strcmp(name, "keySet")) {
+            view = oo_value_external("Set");
+            view.args = &value->args[0];
+            view.arg_count = 1;
+        } else if (!strcmp(name, "values")) {
+            view = oo_value_external("Collection");
+            view.args = &value->args[1];
+            view.arg_count = 1;
+        } else if (!strcmp(name, "entrySet")) {
+            oo_value_t *entry = cbm_arena_alloc(w->arena, sizeof(*entry));
+            if (entry) {
+                *entry = oo_value_external("Entry");
+                entry->args = value->args;
+                entry->arg_count = 2;
+                view = oo_value_external("Set");
+                view.args = entry;
+                view.arg_count = 1;
+            }
+        }
+        return view;
+    }
     return oo_value_unknown();
+}
+
+oo_value_t oo_external_with_element(oo_walk_t *w, const oo_value_t *value, oo_value_t element) {
+    oo_value_t *slot = cbm_arena_alloc(w->arena, sizeof(*slot));
+    if (!slot || !value->external || !oo_value_known(&element))
+        return oo_value_unknown();
+    *slot = element;
+    slot->classref = false;
+    oo_value_t copy = *value;
+    copy.classref = false;
+    copy.args = slot;
+    copy.arg_count = 1;
+    return copy;
+}
+
+oo_value_t oo_jdk_factory_result(oo_walk_t *w, const oo_value_t *receiver, const char *name,
+                                 const oo_value_t *args, int argc) {
+    char leaf[64];
+    if (!receiver->classref || !receiver->external || argc < 1 || !args ||
+        strncmp(receiver->external, "java.util.", 10) != 0 ||
+        !oo_plain_leaf(receiver->external, leaf, sizeof(leaf)))
+        return oo_value_unknown();
+    static const struct {
+        const char *owner, *factory, *result;
+        bool copies; /* The argument is a collection whose element carries over. */
+    } FACTORIES[] = {{"Optional", "of", "Optional", false},
+                     {"Optional", "ofNullable", "Optional", false},
+                     {"List", "of", "List", false},
+                     {"Set", "of", "Set", false},
+                     {"List", "copyOf", "List", true},
+                     {"Set", "copyOf", "Set", true},
+                     {"Stream", "of", "Stream", false},
+                     {"Arrays", "asList", "List", false},
+                     {"Arrays", "stream", "Stream", false},
+                     {"Collections", "singletonList", "List", false},
+                     {"Collections", "singleton", "Set", false},
+                     {"Collections", "unmodifiableList", "List", true},
+                     {"Collections", "unmodifiableSet", "Set", true},
+                     {"Collections", "unmodifiableCollection", "Collection", true}};
+    for (size_t i = 0; i < sizeof(FACTORIES) / sizeof(FACTORIES[0]); i++) {
+        if (strcmp(FACTORIES[i].owner, leaf) || strcmp(FACTORIES[i].factory, name))
+            continue;
+        oo_value_t element = args[0];
+        if (FACTORIES[i].copies) {
+            element = oo_element_of(w, &args[0]);
+        } else if (argc == 1 && element.dims > 0) {
+            element.dims--;
+        } else {
+            for (int k = 1; k < argc; k++)
+                if (!oo_same_value(&element, &args[k]))
+                    return oo_value_unknown();
+        }
+        oo_value_t made = oo_value_external(FACTORIES[i].result);
+        return oo_external_with_element(w, &made, element);
+    }
+    return oo_value_unknown();
+}
+
+int oo_stdlib_lambda_parameters(oo_walk_t *w, const oo_value_t *receiver, const char *name,
+                                int position, int argc, oo_value_t *out, int capacity) {
+    static const char *const each[] = {
+        /* Java: Iterable, Collection, Stream, Optional. */
+        "forEach", "forEachOrdered", "removeIf", "filter", "map", "mapToInt", "mapToLong",
+        "mapToDouble", "mapToObj", "flatMap", "anyMatch", "allMatch", "noneMatch", "peek",
+        "takeWhile", "dropWhile", "ifPresent", "ifPresentOrElse",
+        /* C#: List and Enumerable. */
+        "ForEach", "Exists", "Find", "FindAll", "FindIndex", "FindLast", "FindLastIndex",
+        "RemoveAll", "TrueForAll", "Where", "Select", "SelectMany", "Any", "All", "First",
+        "FirstOrDefault", "Last", "LastOrDefault", "Single", "SingleOrDefault", "Count",
+        "LongCount", "OrderBy", "OrderByDescending", "ThenBy", "ThenByDescending", "GroupBy",
+        "ToDictionary", "ToLookup", "Sum", "Min", "Max", "Average", "SkipWhile", "TakeWhile",
+        "DistinctBy", "MinBy", "MaxBy", "Sort", NULL};
+    static const char *const pair[] = {"sorted", "sort", "min", "max", NULL};
+    if (!receiver || capacity < 2 || position < 0)
+        return -1;
+    char leaf[64];
+    if (receiver->external && receiver->arg_count == 2 &&
+        oo_plain_leaf(receiver->external, leaf, sizeof(leaf)) && !strcmp(leaf, "Map")) {
+        if ((!strcmp(name, "forEach") || !strcmp(name, "replaceAll")) && position == 0) {
+            out[0] = receiver->args[0];
+            out[1] = receiver->args[1];
+            return 2;
+        }
+        if (!strcmp(name, "computeIfAbsent") && position == 1) {
+            out[0] = receiver->args[0];
+            return 1;
+        }
+        if ((!strcmp(name, "computeIfPresent") || !strcmp(name, "compute")) && position == 1) {
+            out[0] = receiver->args[0];
+            out[1] = receiver->args[1];
+            return 2;
+        }
+        if (!strcmp(name, "merge") && position == 2) {
+            out[0] = receiver->args[1];
+            out[1] = receiver->args[1];
+            return 2;
+        }
+        return -1;
+    }
+    oo_value_t element = oo_element_of(w, receiver);
+    if (!oo_value_known(&element))
+        return -1;
+    if (oo_name_in(name, pair) && argc == 1 && position == 0) {
+        out[0] = element;
+        out[1] = element;
+        return 2;
+    }
+    if (oo_name_in(name, each) && position == 0) {
+        out[0] = element;
+        return 1;
+    }
+    return -1;
 }
 
 /* ── Member selection ───────────────────────────────────────────────── */
@@ -1063,6 +1471,9 @@ static bool oo_private_visible(const oo_walk_t *w, const oo_type_t *owner) {
 }
 
 bool oo_callable_visible(const oo_walk_t *w, const oo_callable_t *callable) {
+    if (callable->file && callable->file->test_source && w->f &&
+        oo_file_outside_tests(w->ix, callable->file, w->f))
+        return false;
     if (!(callable->flags & OO_F_PRIVATE))
         return true;
     if (callable->owner)
@@ -1183,17 +1594,47 @@ static bool oo_scalar_mismatch(CBMLanguage language, const char *parameter,
 
 /* NO only when both sides are known to differ; an unknown keeps the candidate
  * so that it continues to compete. */
+/* C# 8.2.3: object, ValueType and Enum stand above every type of their kind, unspelled. */
+static bool oo_csharp_root_accepts(const oo_type_t *root, const oo_type_t *type) {
+    if (!strcmp(root->qn, "System.Object"))
+        return true;
+    if (!strcmp(root->qn, "System.ValueType"))
+        return (type->flags & (OO_F_VALUE | OO_F_ENUM)) != 0;
+    return !strcmp(root->qn, "System.Enum") && (type->flags & OO_F_ENUM);
+}
+
+/* C#: `T[]` reaches `Span<T>` and its kin, and no other element. */
+static bool oo_span_of_another_element(const oo_value_t *parameter, const oo_value_t *argument) {
+    static const char *const SPANS[] = {"Span`1",           "ReadOnlySpan`1", "Memory`1",
+                                        "ReadOnlyMemory`1", "Span",           "ReadOnlySpan",
+                                        "Memory",           "ReadOnlyMemory", NULL};
+    if (argument->dims != 1 || parameter->arg_count != 1 || parameter->dims)
+        return false;
+    const char *leaf = parameter->type ? parameter->type->name : oo_leaf(parameter->external);
+    if (!leaf || !oo_name_in(leaf, SPANS))
+        return false;
+    const oo_value_t *element = &parameter->args[0];
+    if (element->dims)
+        return false;
+    if (element->type && argument->type)
+        return element->type != argument->type;
+    return element->external && argument->external &&
+           strcmp(oo_leaf(element->external), oo_leaf(argument->external)) != 0;
+}
+
 static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
                                  const oo_subst_t *subst, const oo_value_t *args, int argc) {
     oo_scope_t scope = oo_scope_of_callable(callable);
     for (int i = 0; i < argc && i < OO_ARG_SLOTS; i++) {
         int index = i < callable->param_count ? i : callable->param_count - 1;
-        /* A closing function literal lands on the last parameter, defaults between. */
-        if (args[i].function_literal && i == argc - 1)
+        /* A Kotlin closing function literal lands on the last parameter, defaults between. */
+        if (args[i].function_literal && i == argc - 1 && callable->file &&
+            callable->file->language == CBM_LANG_KOTLIN)
             index = callable->param_count - 1;
         if (index < 0 || !callable->params || !callable->params[index])
             continue;
-        if (args[i].by_ref != callable->params[index]->by_ref)
+        if (args[i].by_ref != callable->params[index]->by_ref &&
+            !callable->params[index]->ref_optional)
             return true;
         if (callable->max_args < 0 && index == callable->param_count - 1)
             continue; /* Variadic element versus array conversion is not modelled. */
@@ -1206,14 +1647,44 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
         oo_value_t parameter = oo_value_from_ref(w, callable->params[index], &scope, subst);
         const oo_value_t *argument = &args[i];
         if (argument->function_literal) {
-            /* A literal converts to a function type or an interface, nothing else. */
-            if (parameter.type && !(parameter.type->flags & OO_F_INTERFACE))
+            /* A literal converts to a function type or an interface, nothing else. In C#
+             * it converts to a delegate, or to the expression tree of one. */
+            bool csharp = callable->file && callable->file->language == CBM_LANG_CSHARP;
+            if (parameter.type &&
+                !(parameter.type->flags & (csharp ? OO_F_DELEGATE : OO_F_INTERFACE)) &&
+                !(csharp && !strcmp(parameter.type->name, "Expression`1")))
                 return true;
-            if (parameter.external && (oo_builtin_name(oo_leaf(parameter.external)) ||
-                                       !strcmp(oo_leaf(parameter.external), "String")))
+            char collection[64];
+            if (parameter.external &&
+                (oo_builtin_name(oo_leaf(parameter.external)) ||
+                 !strcmp(oo_leaf(parameter.external), "String") ||
+                 !strcmp(oo_leaf(parameter.external), "string") ||
+                 (oo_plain_leaf(parameter.external, collection, sizeof(collection)) &&
+                  (oo_name_in(collection, OO_ONE_ARG_COLLECTIONS) ||
+                   oo_name_in(collection, OO_MAPS)))))
                 return true;
+            /* `x => ...` does not reach a delegate of two parameters. */
+            if (argument->lambda_parameters) {
+                oo_value_t shape[OO_ARG_SLOTS];
+                int fits = parameter.type
+                               ? oo_functional_parameters(w, &parameter, shape, OO_ARG_SLOTS)
+                               : -1;
+                if (fits >= 0 && fits != argument->lambda_parameters - 1)
+                    return true;
+                if (parameter.external && csharp) {
+                    const char *leaf = oo_leaf(parameter.external);
+                    int arity = parameter.arg_count;
+                    if ((!strncmp(leaf, "Func`", 5) &&
+                         arity - 1 != argument->lambda_parameters - 1) ||
+                        (!strncmp(leaf, "Action`", 7) && arity != argument->lambda_parameters - 1))
+                        return true;
+                }
+            }
             continue;
         }
+        if (callable->file && callable->file->language == CBM_LANG_CSHARP &&
+            oo_span_of_another_element(&parameter, argument))
+            return true;
         /* Array is final: a project class is never one. */
         if (parameter.external && !strcmp(oo_leaf(parameter.external), "Array") && argument->type &&
             oo_hierarchy_complete(w->ix, argument->type))
@@ -1228,17 +1699,31 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
                 return true;
             continue;
         }
+        /* C# 10.2: a user-defined implicit conversion is declared on either side, and an
+         * array reaches the generic collection interfaces. Neither is on the type's hierarchy. */
+        bool csharp = callable->file && callable->file->language == CBM_LANG_CSHARP;
         if (parameter.type && argument->type) {
             if (parameter.dims != argument->dims ||
                 !oo_is_subtype(w->ix, argument->type, parameter.type)) {
+                bool converts =
+                    csharp &&
+                    (oo_csharp_root_accepts(parameter.type, argument->type) ||
+                     (parameter.type->flags & OO_F_CONVERTS) ||
+                     (argument->type->flags & OO_F_CONVERTS) ||
+                     (argument->dims > parameter.dims && (parameter.type->flags & OO_F_INTERFACE)));
                 /* An unresolved supertype could still make it assignable. */
-                if (oo_hierarchy_complete(w->ix, argument->type))
+                if (!converts && oo_hierarchy_complete(w->ix, argument->type))
                     return true;
             }
         } else if (parameter.type && argument->external && !argument->fn_ref) {
             /* A literal or JDK value versus a project parameter: only a primitive
-             * or String literal is certainly not that class. */
-            if (oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE)
+             * or String literal is certainly not that class. C#: an integer reaches an
+             * enum as a literal 0, and a project declaring the scalars themselves (a core
+             * library) has them implement its own interfaces. */
+            bool converts =
+                csharp && ((parameter.type->flags & (OO_F_CONVERTS | OO_F_INTERFACE | OO_F_ENUM)) ||
+                           argument->dims);
+            if (!converts && oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE)
                 return true;
         } else if (parameter.external && argument->external) {
             if (parameter.dims != argument->dims) {
@@ -1251,7 +1736,8 @@ static bool oo_argument_excludes(oo_walk_t *w, const oo_callable_t *callable,
                                           parameter.external, argument)) {
                 return true;
             }
-        } else if (parameter.external && argument->type && oo_builtin_name(parameter.external)) {
+        } else if (parameter.external && argument->type && oo_builtin_name(parameter.external) &&
+                   !(csharp && (argument->type->flags & OO_F_CONVERTS))) {
             return true;
         }
     }
@@ -1292,10 +1778,133 @@ static bool oo_arguments_exact(oo_walk_t *w, const oo_callable_t *callable, cons
     return true;
 }
 
+/* Which arguments have their own type as this declaration's parameter, one bit each. */
+static uint32_t oo_identical_arguments(oo_walk_t *w, const oo_callable_t *callable,
+                                       const oo_subst_t *subst, const oo_value_t *args, int argc) {
+    enum { MASK_BITS = 32 };
+    uint32_t mask = 0;
+    if (!callable->params)
+        return 0;
+    oo_scope_t scope = oo_scope_of_callable(callable);
+    for (int i = 0; i < argc && i < callable->param_count && i < MASK_BITS; i++) {
+        const oo_typeref_t *ref = callable->params[i];
+        if (!ref || (callable->max_args < 0 && i == callable->param_count - 1))
+            continue;
+        /* C# infers T as the argument's own type: its conversion is an identity. */
+        if (oo_ref_is_tparam(callable, ref)) {
+            if (oo_value_known(&args[i]) && callable->file &&
+                callable->file->language == CBM_LANG_CSHARP)
+                mask |= 1u << i;
+            continue;
+        }
+        oo_value_t parameter = oo_value_from_ref(w, ref, &scope, subst);
+        if (args[i].type ? args[i].type == parameter.type && args[i].dims == parameter.dims
+                         : oo_same_external(&args[i], &parameter))
+            mask |= 1u << i;
+    }
+    return mask;
+}
+
 typedef struct {
     const oo_callable_t *callable;
     oo_subst_t *subst;
 } oo_candidate_t;
+
+static bool oo_same_graph_node(const oo_callable_t *a, const oo_callable_t *b) {
+    return a->graph_qn && b->graph_qn && !strcmp(a->graph_qn, b->graph_qn);
+}
+
+/* Every argument certainly reaches this declaration's parameter: known, and of its type, a subtype,
+ * a scalar it widens to, or an array of a span's element. Not excluded is not the same thing: an
+ * argument from outside the project could still fail to convert to a project's parameter. */
+static bool oo_arguments_certainly_fit(oo_walk_t *w, const oo_callable_t *callable,
+                                       const oo_subst_t *subst, const oo_value_t *args, int argc) {
+    static const char *const SPANS[] = {"Span`1",           "ReadOnlySpan`1", "Memory`1",
+                                        "ReadOnlyMemory`1", "Span",           "ReadOnlySpan",
+                                        "Memory",           "ReadOnlyMemory", NULL};
+    static const char *const ROOTS[] = {"object", "Object", NULL};
+    if (argc > callable->param_count || !callable->params || callable->max_args < 0)
+        return false;
+    oo_scope_t scope = oo_scope_of_callable(callable);
+    for (int i = 0; i < argc; i++) {
+        const oo_value_t *argument = &args[i];
+        const oo_typeref_t *ref = callable->params[i];
+        if (!ref)
+            return false;
+        if (argument->function_literal || oo_ref_is_tparam(callable, ref))
+            continue;
+        oo_value_t parameter = oo_value_from_ref(w, ref, &scope, subst);
+        const char *to = parameter.type ? parameter.type->name : oo_leaf(parameter.external);
+        if (!to)
+            return false;
+        if (argument->null_literal) {
+            if (oo_scalar_of(to) != OO_SCALAR_NONE && oo_scalar_of(to) != OO_SCALAR_STRING)
+                return false;
+            continue;
+        }
+        if (!oo_value_known(argument))
+            return false;
+        if (oo_name_in(to, ROOTS) && !parameter.dims)
+            continue;
+        bool fits = false;
+        if (argument->type && parameter.type)
+            fits = argument->dims == parameter.dims &&
+                   oo_is_subtype(w->ix, argument->type, parameter.type);
+        else if (argument->external && parameter.external && argument->dims == parameter.dims)
+            fits = !strcmp(oo_leaf(argument->external), to) ||
+                   (oo_scalar_of(to) != OO_SCALAR_NONE &&
+                    oo_scalar_of(oo_leaf(argument->external)) != OO_SCALAR_NONE);
+        /* An array reaches a span; a span of another element is excluded already. */
+        if (!fits && argument->dims == 1 && oo_name_in(to, SPANS))
+            fits = true;
+        if (!fits)
+            return false;
+    }
+    return true;
+}
+
+/* An identical parameter is a better conversion than any other. A candidate with every identity
+ * any rival has, and one more, cannot lose an argument to it, and each rival loses one to it. The
+ * call compiles, so it has a best member, and no rival can be that. */
+static int oo_best_by_identity(oo_walk_t *w, const oo_candidate_t *candidates, int count,
+                               const oo_value_t *args, int argc) {
+    uint32_t masks[OO_MAX_CANDIDATES];
+    for (int i = 0; i < count; i++)
+        masks[i] =
+            oo_identical_arguments(w, candidates[i].callable, candidates[i].subst, args, argc);
+    for (int i = 0; i < count; i++) {
+        bool beats_all =
+            masks[i] != 0 &&
+            oo_arguments_certainly_fit(w, candidates[i].callable, candidates[i].subst, args, argc);
+        for (int j = 0; j < count && beats_all; j++)
+            if (i != j && !oo_same_graph_node(candidates[i].callable, candidates[j].callable))
+                beats_all = !(masks[j] & ~masks[i]) && masks[j] != masks[i];
+        if (beats_all)
+            return i;
+    }
+    return -1;
+}
+
+/* C# 12.8.10.2: a method declared in a base type leaves the set when an applicable one in a more
+ * derived type stands. */
+static int oo_keep_most_derived(oo_walk_t *w, oo_candidate_t *candidates, int count,
+                                const oo_value_t *args, int argc) {
+    bool removed[OO_MAX_CANDIDATES] = {false};
+    for (int j = 0; j < count; j++) {
+        if (!oo_arguments_certainly_fit(w, candidates[j].callable, candidates[j].subst, args, argc))
+            continue;
+        for (int i = 0; i < count; i++)
+            removed[i] =
+                removed[i] || (candidates[i].callable->owner != candidates[j].callable->owner &&
+                               oo_is_subtype(w->ix, candidates[j].callable->owner,
+                                             candidates[i].callable->owner));
+    }
+    int kept = 0;
+    for (int i = 0; i < count; i++)
+        if (!removed[i])
+            candidates[kept++] = candidates[i];
+    return kept;
+}
 
 static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, int count, int argc,
                                     const oo_value_t *args) {
@@ -1326,6 +1935,15 @@ static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, in
             }
         }
     }
+    bool csharp =
+        candidates[0].callable->file && candidates[0].callable->file->language == CBM_LANG_CSHARP;
+    if (out.status == OO_SEL_AMBIGUOUS && args && argc >= 0 && csharp) {
+        count = oo_keep_most_derived(w, candidates, count, args, argc);
+        out.status = OO_SEL_UNIQUE;
+        for (int i = 1; i < count; i++)
+            if (!oo_same_graph_node(candidates[0].callable, candidates[i].callable))
+                out.status = OO_SEL_AMBIGUOUS;
+    }
     if (out.status == OO_SEL_AMBIGUOUS && args && argc > 0) {
         int exact = -1, matches = 0;
         for (int i = 0; i < count; i++) {
@@ -1334,8 +1952,22 @@ static oo_select_t oo_select_finish(oo_walk_t *w, oo_candidate_t *candidates, in
                 matches++;
             }
         }
-        if (matches == 1) {
+        bool one_node = matches > 1;
+        for (int i = 0; i < count && one_node; i++)
+            if (oo_arguments_exact(w, candidates[i].callable, candidates[i].subst, args, argc) &&
+                (!candidates[i].callable->graph_qn || !candidates[exact].callable->graph_qn ||
+                 strcmp(candidates[i].callable->graph_qn, candidates[exact].callable->graph_qn)))
+                one_node = false;
+        if (matches == 1 || one_node) {
             candidates[0] = candidates[exact];
+            count = 1;
+            out.status = OO_SEL_UNIQUE;
+        }
+    }
+    if (out.status == OO_SEL_AMBIGUOUS && args && argc > 0) {
+        int best = oo_best_by_identity(w, candidates, count, args, argc);
+        if (best >= 0) {
+            candidates[0] = candidates[best];
             count = 1;
             out.status = OO_SEL_UNIQUE;
         }
@@ -1364,6 +1996,11 @@ static oo_select_t oo_select_in_hierarchy(oo_walk_t *w, const oo_value_t *receiv
     bool seen = false;
     while (h->head < h->tail) {
         oo_step_t step = h->steps[h->head++];
+        /* C# 12.5.1: the base types of a class or struct are its base classes. An interface's
+         * members are not among its members. */
+        if ((step.type->flags & OO_F_INTERFACE) && !(receiver->type->flags & OO_F_INTERFACE) &&
+            step.type->file && step.type->file->language == CBM_LANG_CSHARP)
+            continue;
         for (const oo_callable_t *c = oo_lookup_methods(w->ix, step.type->qn, name); c;
              c = c->next) {
             if (c->flags & OO_F_CTOR)
@@ -1506,6 +2143,53 @@ const oo_field_t *oo_find_field(oo_walk_t *w, const oo_value_t *receiver, const 
     return NULL;
 }
 
+/* JLS 9.8: an interface with one abstract method, its own or inherited, counting a redeclaration
+ * once and leaving out one a subinterface implemented. An external supertype cannot add a second:
+ * the lambda would not compile. The walk is bounded by OO_MAX_HIERARCHY. */
+int oo_functional_parameters(oo_walk_t *w, const oo_value_t *function, oo_value_t *out,
+                             int capacity) {
+    if (!function || !function->type || function->dims ||
+        !(function->type->flags & (OO_F_INTERFACE | OO_F_DELEGATE)))
+        return -1;
+    oo_hierarchy_t walk, *h = &walk;
+    h->head = h->tail = 0;
+    h->w = w;
+    h->truncated = false;
+    oo_hierarchy_add(h, *function);
+    const oo_callable_t *only = NULL;
+    oo_subst_t *only_subst = NULL;
+    while (h->head < h->tail) {
+        oo_step_t step = h->steps[h->head++];
+        if (step.type->abstract_count > 1)
+            return -1;
+        const oo_callable_t *declared = step.type->abstract_method;
+        if (declared) {
+            bool implemented = false;
+            for (int i = 0; i + 1 < h->head && !implemented; i++)
+                for (const oo_callable_t *m =
+                         oo_lookup_methods(w->ix, h->steps[i].type->qn, declared->name);
+                     m && !implemented; m = m->next)
+                    implemented = m != h->steps[i].type->abstract_method;
+            if (!implemented && only && strcmp(only->name, declared->name))
+                return -1;
+            if (!implemented && !only) {
+                only = declared;
+                only_subst = step.subst;
+            }
+        }
+        oo_hierarchy_expand(h, &step);
+    }
+    if (!only || h->truncated || only->param_count > capacity ||
+        (only->param_count && !only->params))
+        return -1;
+    oo_scope_t scope = oo_scope_of_callable(only);
+    for (int i = 0; i < only->param_count; i++) {
+        oo_value_t value = oo_value_from_ref(w, only->params[i], &scope, only_subst);
+        out[i] = !oo_value_known(&value) && value.lower ? *value.lower : value;
+    }
+    return only->param_count;
+}
+
 oo_select_t oo_select_from_list(oo_walk_t *w, const oo_callable_t *list, int argc,
                                 const oo_value_t *args, const oo_value_t *receiver) {
     oo_candidate_t candidates[OO_MAX_CANDIDATES];
@@ -1528,6 +2212,100 @@ oo_select_t oo_select_from_list(oo_walk_t *w, const oo_callable_t *list, int arg
     if (count)
         return oo_select_finish(w, candidates, count, argc, args);
     return (oo_select_t){.status = seen ? OO_SEL_MISMATCH : OO_SEL_NONE};
+}
+
+/* What one parameter says about one type parameter, given the value passed to it. */
+static oo_value_t oo_tparam_from(oo_walk_t *w, const oo_typeref_t *ref, const char *tparam,
+                                 const oo_value_t *value) {
+    if (!ref || !ref->name || !value)
+        return oo_value_unknown();
+    if (!strcmp(ref->name, tparam)) {
+        if (ref->dims > value->dims)
+            return oo_value_unknown();
+        oo_value_t element = *value;
+        element.dims -= ref->dims;
+        element.classref = false;
+        return element;
+    }
+    if (!ref->args || ref->dims)
+        return oo_value_unknown();
+    int count = 0;
+    while (ref->args[count])
+        count++;
+    for (int k = 0; k < count; k++) {
+        const oo_typeref_t *arg = ref->args[k];
+        const oo_typeref_t *written = arg && arg->lower ? arg->lower : arg;
+        if (!written || !written->name || strcmp(written->name, tparam))
+            continue;
+        /* The same generic type: positions match. Anything else only through a known element. */
+        const char *declared = oo_leaf(ref->name);
+        const char *actual = value->type ? value->type->name : oo_leaf(value->external);
+        size_t stem = strcspn(declared, "`");
+        if (actual && value->arg_count == count && !strncmp(declared, actual, stem) &&
+            (actual[stem] == 0 || actual[stem] == 0x60))
+            return value->args[k];
+        if (count == 1)
+            return oo_element_of(w, value);
+    }
+    return oo_value_unknown();
+}
+
+static bool oo_same_value(const oo_value_t *a, const oo_value_t *b) {
+    return a->dims == b->dims && a->type == b->type &&
+           (a->type || (a->external && b->external && !strcmp(a->external, b->external)));
+}
+
+bool oo_ref_unsettled(const oo_callable_t *callee, const oo_typeref_t *ref,
+                      const oo_subst_t *subst) {
+    if (!callee || !ref || !ref->name)
+        return false;
+    for (int i = 0; i < callee->tparam_count; i++) {
+        if (strcmp(callee->tparams[i].name, ref->name))
+            continue;
+        const oo_value_t *bound = oo_subst_lookup(subst, &callee->tparams[i]);
+        return !bound || !oo_value_known(bound);
+    }
+    return false;
+}
+
+const oo_subst_t *oo_infer_call_subst(oo_walk_t *w, const oo_callable_t *callee,
+                                      const oo_subst_t *subst, const oo_value_t *receiver,
+                                      const oo_value_t *args, int argc) {
+    if (!callee || !callee->tparam_count)
+        return subst;
+    oo_value_t *values = cbm_arena_calloc(w->arena, (size_t)callee->tparam_count * sizeof(*values));
+    oo_subst_t *inferred = values ? cbm_arena_alloc(w->arena, sizeof(*inferred)) : NULL;
+    if (!inferred)
+        return subst;
+    bool any = false;
+    for (int t = 0; t < callee->tparam_count; t++) {
+        const char *name = callee->tparams[t].name;
+        bool conflict = false;
+        oo_value_t found = oo_value_unknown();
+        for (int i = -1; i < argc && i < callee->param_count && !conflict; i++) {
+            const oo_typeref_t *ref = i < 0            ? callee->receiver
+                                      : callee->params ? callee->params[i]
+                                                       : NULL;
+            const oo_value_t *value = i < 0 ? receiver : &args[i];
+            oo_value_t one = oo_tparam_from(w, ref, name, value);
+            if (!oo_value_known(&one))
+                continue;
+            conflict = oo_value_known(&found) && !oo_same_value(&found, &one);
+            found = one;
+        }
+        if (!conflict && oo_value_known(&found)) {
+            values[t] = found;
+            any = true;
+        }
+    }
+    if (!any)
+        return subst;
+    *inferred = (oo_subst_t){.tparams = callee->tparams,
+                             .count = callee->tparam_count,
+                             .args = values,
+                             .arg_count = callee->tparam_count,
+                             .next = (oo_subst_t *)subst};
+    return inferred;
 }
 
 oo_value_t oo_kotlin_eval_summary(oo_walk_t *w, const oo_exprsum_t *summary,

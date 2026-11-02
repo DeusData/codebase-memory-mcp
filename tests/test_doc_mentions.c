@@ -235,7 +235,7 @@ static const struct {
 static bool dm_namespace_source(char *out, size_t cap, size_t index, bool file_scoped) {
     const char *recovery = dm_namespace_cases[index].recovery
                                ? "public class ParseEdge { unsafe void M(void* p) { "
-                                 "_r = ref *(int*)p; } }\n"
+                                 "_r = ref * (int*)p; } }\n"
                                : "";
     int n = snprintf(out, cap,
                      "namespace %s%s"
@@ -509,7 +509,7 @@ TEST(doc_mentions_cs_namespace_boundaries) {
         const char *id, *header, *footer, *name;
     } cases[] = {
         {"bare_keyword", "namespace class{\n",
-         "public class ParseEdge { unsafe void M(void* p) { _r = ref *(int*)p; } }\n}\n", NULL},
+         "public class ParseEdge { unsafe void M(void* p) { _r = ref * (int*)p; } }\n}\n", NULL},
         {"adjacent_file", "namespace@Boundary;\n", "", "Boundary"},
         {"adjacent_block", "namespace@Boundary {\n", "}\n", "Boundary"},
         {"verbatim_keyword_file", "namespace @class;\n", "", "class"},
@@ -1001,14 +1001,15 @@ TEST(doc_mentions_cs_utf8_surfaces) {
  * recovery closes blocks early and late, which would otherwise move the
  * declarations after the error into another namespace or outer type. */
 TEST(doc_mentions_cs_scope_parse_errors) {
-    /* `ref *(int*)p` is beyond the vendored grammar: the method swallows the
+    /* `ref * (int*)p` is beyond the vendored grammar, and the parse view reads it
+     * only without the space: the method swallows the
      * class's closing brace, `P` becomes a local, `Two` a nested class of
      * `One`, and the namespace an error node. */
     const char *late = "namespace A\n"                                           /* 1 */
                        "{\n"                                                     /* 2 */
                        "    public class One\n"                                  /* 3 */
                        "    {\n"                                                 /* 4 */
-                       "        unsafe void M(void* p) { _r = ref *(int*)p; }\n" /* 5 */
+                       "        unsafe void M(void* p) { _r = ref * (int*)p; }\n" /* 5 */
                        "        public int P;\n"                                 /* 6 */
                        "    }\n"                                                 /* 7 */
                        "    public class Two { }\n"                              /* 8 */
@@ -1121,7 +1122,8 @@ TEST(doc_mentions_cs_scope_parse_errors) {
     s = r->doc_scope;
     ASSERT_NOT_NULL(s);
     ASSERT_NOT_NULL(strstr(s, "R\t1\t0\t1\t9\tNet\n"));
-    ASSERT_NOT_NULL(strstr(s, "T\t1\t3\t7\tc!\t-\tVerb\t\t"));
+    /* The parse view blanks the doubled quotes, so nothing of Verb is hidden. */
+    ASSERT_NOT_NULL(strstr(s, "T\t1\t3\t7\tc\t-\tVerb\t\t"));
     ASSERT_NOT_NULL(strstr(s, "T\t1\t8\t8\tc"));
     ASSERT_NOT_NULL(strstr(s, "\tAfter\t\t"));
     ASSERT_NULL(strstr(s, "\nX\t"));
@@ -1171,12 +1173,12 @@ TEST(doc_mentions_cs_scope_parse_errors) {
     cbm_free_result(r);
 
     /* A member whose header did not parse is hidden, and its type says so:
-     * `safe extern` comes back as a method named `extern`. */
+     * an unknown modifier comes back as a return type, and `extern` as the method. */
     const char *hidden = "namespace C\n"
                          "{\n"
                          "    public class Holey\n" /* 3 */
                          "    {\n"
-                         "        public safe extern int Hidden();\n" /* 5 */
+                         "        public fancy extern int Hidden();\n" /* 5 */
                          "        public int Seen;\n"                 /* 6 */
                          "    }\n"                                    /* 7 */
                          "}\n";
@@ -3917,7 +3919,7 @@ static void dm_write_resolver_fixture(const char *tmp) {
         "    }\n"
         "    public class Holey\n"
         "    {\n"
-        "        public safe extern int Hidden();\n"
+        "        public fancy extern int Hidden();\n"
         "        /// <summary><see cref=\"Hidden\"/> <see cref=\"int\"/></summary>\n"
         "        public int Seen;\n"
         "    }\n"
@@ -6037,7 +6039,7 @@ TEST(doc_mentions_cs_scan_nested_holes) {
                          "{\n"
                          "    public class Deep\n" /* 3 */
                          "    {\n"
-                         "        unsafe void E(void* p) { _r = ref *(int*)p; }\n"
+                         "        unsafe void E(void* p) { _r = ref * (int*)p; }\n"
                          "        void M() { s = $\"a{$\"b{$\"c{1}\"}\"}\"; }\n"
                          "        public int Q;\n" /* 7 */
                          "    }\n"                 /* 8 */
@@ -6060,7 +6062,7 @@ TEST(doc_mentions_cs_scan_nested_holes) {
                              "{\n"
                              "    public class Deep\n"
                              "    {\n"
-                             "        unsafe void E(void* p) { _r = ref *(int*)p; }\n"
+                             "        unsafe void E(void* p) { _r = ref * (int*)p; }\n"
                              "        void M() { s = ",
                              "$\"{", DM_DEEP, closers);
     free(closers);

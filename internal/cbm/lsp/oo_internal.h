@@ -25,7 +25,11 @@ enum {
     OO_F_COMPANION = 1u << 11,
     OO_F_INCOMPLETE = 1u << 12, /* Syntax errors hid part of this declaration. */
     OO_F_PROPERTY_GET = 1u << 13,
-    OO_F_INNER = 1u << 14
+    OO_F_INNER = 1u << 14,
+    OO_F_DELEGATE = 1u << 15, /* C#: its Invoke is the type's one callable shape. */
+    OO_F_CONVERTS = 1u << 16, /* C#: declares a user-defined implicit conversion. */
+    OO_F_VALUE = 1u << 18,    /* C#: a struct. Its object members come through ValueType. */
+    OO_F_DATA = 1u << 17      /* Kotlin data class: its primary constructor gives componentN. */
 };
 
 typedef struct oo_typeref {
@@ -35,7 +39,9 @@ typedef struct oo_typeref {
     bool function;                  /* Kotlin function type: args are its parameters. */
     const struct oo_typeref *fn_receiver;
     const struct oo_typeref *fn_return;
-    bool by_ref; /* C# `ref` or `out` parameter. */
+    bool by_ref;       /* C# `ref` or `out` parameter. */
+    bool ref_optional; /* C# `in` or `ref readonly`: takes `ref` and a plain argument. */
+    const struct oo_typeref *lower; /* Java `? super X`: reads as nothing, takes an X. */
 } oo_typeref_t;
 
 typedef struct {
@@ -56,6 +62,9 @@ typedef struct oo_file {
     oo_import_t *imports;
     int import_count;
     bool has_error;
+    bool reference;      /* C#: a reference assembly's source. */
+    bool test_source;    /* Its project's tests: nothing outside that project reads them. */
+    const char *project; /* The build project this file compiles in, or NULL. */
 } oo_file_t;
 
 typedef struct oo_type oo_type_t;
@@ -70,8 +79,9 @@ typedef struct {
 
 struct oo_type {
     const char *qn, *name;
-    const char *graph_qn; /* NULL when no single declaration node represents it. */
+    const char *graph_qn; /* A partial type's node for the whole type; see oo_index_type. */
     int graph_count;
+    const char *graph_rel; /* The file of graph_qn. */
     const oo_file_t *file;
     const char *ns;
     const oo_type_t *owner;
@@ -84,6 +94,13 @@ struct oo_type {
     const oo_typeref_t *alias_of;
     const oo_type_t *companion; /* Kotlin companion object. */
     oo_type_t *next_in_index;
+    const struct oo_callable *abstract_method; /* The last one declared here, for a lambda. */
+    int abstract_count;
+    /* A name several declarations claim. The index holds one OO_F_AMBIGUOUS entry for the name;
+     * `variants` lists the declarations, each with its own members. A variant's qn is unique. */
+    const oo_type_t *variants;
+    const oo_type_t *next_variant;
+    const struct oo_callable *primary; /* Kotlin primary constructor. */
 };
 
 typedef struct oo_exprsum oo_exprsum_t;
@@ -96,6 +113,7 @@ typedef struct oo_callable {
     int min_args, max_args; /* max_args -1: variadic. */
     int vararg_position;    /* Kotlin: 1 + the vararg's index; it need not be last. */
     const oo_typeref_t **params;
+    const char **param_names; /* Kotlin: for a named argument. */
     int param_count;
     const oo_typeref_t *ret;
     const oo_exprsum_t *ret_expr; /* Kotlin expression body without an annotation. */
@@ -147,6 +165,11 @@ struct cbm_oo_index {
     CBMHashTable *ext_static; /* C#: ns \x1f name -> extension methods */
     oo_type_t *all_types;
     bool sealed, failed;
+    bool reference_files; /* C#: the files being added are reference assemblies. */
+    const char *project;  /* The build project of the files being added. */
+    CBMHashTable *files;  /* rel -> oo_file_t, for a file with a project. */
+    bool has_variants;
+    int variant_serial; /* Keys each later declaration of a several-claimed name. */
 };
 
 /* Members an anonymous object declares itself: they have no index entry and
@@ -154,6 +177,7 @@ struct cbm_oo_index {
 typedef struct {
     const char **names;
     int count;
+    struct oo_value *values; /* A property's type as its declaration gave it; unknown otherwise. */
 } oo_hidden_t;
 
 typedef struct oo_value {
@@ -163,14 +187,17 @@ typedef struct oo_value {
     int arg_count;
     int dims;
     bool classref;         /* Denotes the type itself rather than an instance. */
+    bool null_literal;     /* C#: `null`, which reaches any reference parameter. */
     bool function_literal; /* An argument spelled as a lambda: its own type is not read. */
     bool small_literal;    /* An integer literal: it fits a narrower or wider parameter. */
     bool by_ref;           /* C#: passed with `ref` or `out`. */
+    int lambda_parameters; /* A function literal's parameter count plus one; 0 when not known. */
     const oo_hidden_t *hidden;
     /* Kotlin function value. */
     const struct oo_value *fn_receiver;
     const struct oo_value *fn_return;
     const oo_typeref_t *fn_ref;
+    const struct oo_value *lower; /* `? super X`: unknown as a value, X as a lambda parameter. */
 } oo_value_t;
 
 typedef enum {
@@ -238,8 +265,11 @@ typedef struct oo_receiver {
     oo_value_t value;
     bool unknown;           /* A receiver exists whose member set cannot be listed. */
     bool anonymous;         /* Own members have no index entry. */
+    bool object_super;      /* A supertype of the anonymous object being walked. */
     const char **own_names; /* Anonymous body member names. */
     int own_count;
+    const bool *own_function;          /* Kotlin: each own name is a function, not a property. */
+    const struct oo_value *own_values; /* Kotlin: what each own property holds, once walked. */
     bool static_context;
     bool extension;
     struct oo_receiver *parent;
@@ -285,7 +315,17 @@ void oo_index_function(cbm_oo_index_t *ix, const char *ns, oo_callable_t *callab
 void oo_index_prop(cbm_oo_index_t *ix, const char *ns, oo_field_t *field);
 void oo_index_ext_static(cbm_oo_index_t *ix, const char *ns, oo_callable_t *callable);
 
+/* A reference assembly declares this type's name, and an implementation has it:
+ * the declaration in `file` adds nothing to the type. */
+bool oo_type_is_implemented_elsewhere(const oo_type_t *type, const oo_file_t *file);
+
 const oo_type_t *oo_lookup_type(const cbm_oo_index_t *ix, const char *qn);
+/* The declaration this file is lexically inside of, when `qn` has several. */
+const oo_type_t *oo_lookup_declared(const cbm_oo_index_t *ix, const char *qn, const char *rel);
+/* The type a dotted name means from this file: one declaration of a name several claim is meant
+ * when it is in the file itself, or is the only one in the file's project. Otherwise the entry
+ * comes back with OO_F_AMBIGUOUS. */
+const oo_type_t *oo_lookup_visible(const cbm_oo_index_t *ix, const char *qn, const oo_file_t *file);
 const oo_callable_t *oo_lookup_methods(const cbm_oo_index_t *ix, const char *qn, const char *name);
 const oo_field_t *oo_lookup_fields(const cbm_oo_index_t *ix, const char *qn, const char *name);
 const oo_callable_t *oo_lookup_functions(const cbm_oo_index_t *ix, const char *ns,
@@ -331,6 +371,21 @@ bool oo_names_tparam(const oo_walk_t *w, const char *name);
 oo_value_t oo_element_of(oo_walk_t *w, const oo_value_t *value);
 /* The declared result of a standard collection accessor, or unknown. */
 oo_value_t oo_external_member_return(oo_walk_t *w, const oo_value_t *value, const char *name);
+/* The parameters a lambda takes for a standard collection method on a known element type: how many,
+ * or -1 when the method is not known to take one here. `position` is the lambda's argument index.
+ */
+int oo_stdlib_lambda_parameters(oo_walk_t *w, const oo_value_t *receiver, const char *name,
+                                int position, int argc, oo_value_t *out, int capacity);
+/* The same collection with these element types: `map` on a stream or an optional. */
+oo_value_t oo_external_with_element(oo_walk_t *w, const oo_value_t *value, oo_value_t element);
+/* `Optional.of(x)`, `List.of(a, b)`, `Arrays.stream(items)`: what a JDK factory holds is spelled by
+ * its arguments. Arguments that disagree settle nothing: that is a least upper bound. */
+oo_value_t oo_jdk_factory_result(oo_walk_t *w, const oo_value_t *receiver, const char *name,
+                                 const oo_value_t *args, int argc);
+/* A lambda's parameters when the target is a project interface with one abstract method, or a C#
+ * delegate: how many, or -1 when it has no such single shape. */
+int oo_functional_parameters(oo_walk_t *w, const oo_value_t *function, oo_value_t *out,
+                             int capacity);
 /* Follows a type's aliases to the declared type. */
 const oo_type_t *oo_unalias(const cbm_oo_index_t *ix, const oo_type_t *type);
 
@@ -359,6 +414,15 @@ oo_select_t oo_select_from_list(oo_walk_t *w, const oo_callable_t *list, int arg
                                 const oo_value_t *args, const oo_value_t *receiver);
 bool oo_callable_visible(const oo_walk_t *w, const oo_callable_t *callable);
 oo_value_t oo_callable_return(oo_walk_t *w, const oo_callable_t *callable, const oo_subst_t *subst);
+/* `subst` plus the callee's own type parameters that one argument (or the receiver of an
+ * extension) settles. Two arguments that disagree settle nothing: that is a least upper bound. */
+/* `ref` names one of the callee's type parameters that nothing settled: its value is only a bound,
+ * which says what the type at least has, not what it lacks. */
+bool oo_ref_unsettled(const oo_callable_t *callee, const oo_typeref_t *ref,
+                      const oo_subst_t *subst);
+const oo_subst_t *oo_infer_call_subst(oo_walk_t *w, const oo_callable_t *callee,
+                                      const oo_subst_t *subst, const oo_value_t *receiver,
+                                      const oo_value_t *args, int argc);
 
 /* Walk state. */
 bool oo_walk_init(oo_walk_t *w, const cbm_oo_index_t *ix, CBMArena *arena, const char *source,
