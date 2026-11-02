@@ -7085,6 +7085,52 @@ TEST(extract_ts_route_handler_after_inline_middleware) {
     PASS();
 }
 
+/* Find an in-body call by the route path it registers; returns the call or NULL. */
+static const CBMCall *find_call_by_path(CBMFileResult *r, const char *path) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->first_string_arg && strcmp(c->first_string_arg, path) == 0) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+/* #2883: a handler passed as a call rather than as a bare reference. Go builds
+ * the handler from its dependencies, so the argument is `handler(deps)` — a
+ * call_expression, which the handler scan does not match, so the route lost its
+ * HANDLES edge entirely. */
+TEST(extract_go_route_handler_wrapped_in_call_issue2883) {
+    CBMFileResult *r =
+        extract("func adminList(deps string) func() { return nil }\n"
+                "func main() { g.GET(\"/accounts\", adminList(deps)) }\n",
+                CBM_LANG_GO, "t", "main.go");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *c = find_call_by_path(r, "/accounts");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "adminList");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #2883: axum nests the handler inside a verb combinator, so the handler
+ * argument is `post(api::responses::handle)` — again a call_expression. The
+ * handler is the reference inside the call, not the combinator. */
+TEST(extract_rust_route_handler_in_verb_combinator_issue2883) {
+    CBMFileResult *r =
+        extract("fn main() { Router::new().route(\"/v1/responses\", "
+                "post(api::responses::handle)); }\n",
+                CBM_LANG_RUST, "t", "main.rs");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *c = find_call_by_path(r, "/v1/responses");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "api::responses::handle");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1009 (composed builders): a builder whose template inlines an earlier
  * builder's call plus a query string: `return \`${basePath(id)}?${params}\``.
  * The known-substitution is inlined and the query string is truncated, so the
@@ -14958,6 +15004,8 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
+    RUN_TEST(extract_go_route_handler_wrapped_in_call_issue2883);
+    RUN_TEST(extract_rust_route_handler_in_verb_combinator_issue2883);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
     RUN_TEST(extract_c_url_builder_gated_issue1009);
     RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);

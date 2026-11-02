@@ -3201,6 +3201,78 @@ static const char *php_class_route_handler(CBMExtractCtx *ctx, TSNode arg) {
     return php_is_identifier(method) ? cbm_arena_sprintf(ctx->arena, "%s::%s", cls, method) : NULL;
 }
 
+/* True for node kinds that reference a function without calling it. */
+static bool is_handler_ref_kind(const char *kind) {
+    return strcmp(kind, "identifier") == 0 || strcmp(kind, "member_expression") == 0 ||
+           strcmp(kind, "selector_expression") == 0 || strcmp(kind, "attribute") == 0 ||
+           strcmp(kind, "field_expression") == 0 || strcmp(kind, "name") == 0 ||
+           strcmp(kind, "scoped_identifier") == 0;
+}
+
+/* True when `callee` names an HTTP verb combinator (axum `post(h)`), compared
+ * case-insensitively on the last path segment so `Method::post` matches too. */
+static bool is_http_verb_combinator(const char *callee) {
+    static const char *const verbs[] = {"get",  "post",    "put",  "delete",  "patch",
+                                        "head", "options", "any",  "trace",   "connect"};
+    if (callee == NULL || callee[0] == '\0') {
+        return false;
+    }
+    const char *last = callee;
+    for (const char *p = callee; *p != '\0'; p++) {
+        if (*p == '.' || *p == ':' || *p == '\\' || *p == '/') {
+            last = p + 1;
+        }
+    }
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcasecmp(last, verbs[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Handler reference carried by a call_expression argument, or NULL.
+ *
+ * A handler is often passed wrapped in a call rather than as a bare reference:
+ * Go builds it from dependencies (`g.GET("/x", handler(deps))`) and axum wraps
+ * it in a verb combinator (`post(handler)`). Both are call_expressions, which
+ * the scan in extract_handler_arg does not match, so the HANDLES edge was
+ * dropped entirely (#2883). Unwrap them: the callee is the handler for the Go
+ * shape, the first argument is the handler when the callee is a verb. */
+static const char *handler_from_call_arg(CBMExtractCtx *ctx, TSNode arg) {
+    const char *kind = ts_node_type(arg);
+    if (strcmp(kind, "call_expression") != 0 && strcmp(kind, "call") != 0) {
+        return NULL;
+    }
+    TSNode callee = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+    if (ts_node_is_null(callee) && ts_node_named_child_count(arg) > 0) {
+        callee = ts_node_named_child(arg, 0);
+    }
+    if (ts_node_is_null(callee)) {
+        return NULL;
+    }
+    const char *callee_text = cbm_node_text(ctx->arena, callee, ctx->source);
+    if (callee_text == NULL || callee_text[0] == '\0') {
+        return NULL;
+    }
+    if (!is_http_verb_combinator(callee_text)) {
+        return callee_text;
+    }
+    /* Verb combinator: the handler is the first reference inside the call. */
+    TSNode call_args = ts_node_child_by_field_name(arg, TS_FIELD("arguments"));
+    if (ts_node_is_null(call_args)) {
+        return NULL;
+    }
+    uint32_t n = ts_node_named_child_count(call_args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode inner = ts_node_named_child(call_args, i);
+        if (is_handler_ref_kind(ts_node_type(inner))) {
+            return cbm_node_text(ctx->arena, inner, ctx->source);
+        }
+    }
+    return NULL;
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     /* The LAST eligible argument wins, and every argument is examined.
      * Express, Fastify, gin and Laravel all put middleware between the route
@@ -3239,6 +3311,23 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
                 handler = h;
+            }
+        }
+    }
+    if (handler == NULL) {
+        /* Nothing matched as a bare reference. Second pass: unwrap a handler
+         * passed as a call (`handler(deps)`, `post(handler)`). Consulted only
+         * when the plain scan found nothing, so every argument shape that
+         * resolves today keeps winning. */
+        for (uint32_t ai = HANDLER_START_IDX; ai < nc; ai++) {
+            TSNode arg2 = ts_node_named_child(args, ai);
+            if (strcmp(ts_node_type(arg2), "argument") == 0 &&
+                ts_node_named_child_count(arg2) > 0) {
+                arg2 = ts_node_named_child(arg2, 0);
+            }
+            const char *wrapped = handler_from_call_arg(ctx, arg2);
+            if (wrapped != NULL && wrapped[0] != '\0') {
+                handler = wrapped;
             }
         }
     }
