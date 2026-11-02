@@ -261,6 +261,54 @@ for name, pattern, why in REQUIRED:
     if path.exists() and not re.search(pattern, path.read_text()):
         failures.append(f"{name}: missing required `{pattern}` — {why}")
 
+# glibc floor (#2486; contract shape from #2573): the standard Linux release
+# binaries, amd64 AND arm64, build inside ONE ubuntu:22.04 image pinned by
+# digest; the composition gate is told that image's floor; the PR leg builds in
+# the same image with the same floor. A tag, a second digest, a Linux leg back
+# on a hosted runner's userland or a dropped floor lets the floor drift with no
+# other check noticing until a user's loader refuses the binary.
+def without_comments(text: str) -> str:
+    return "\n".join(line for line in text.splitlines()
+                     if not line.lstrip().startswith("#"))
+
+def job_body(text: str, job: str) -> str:
+    match = re.search(rf"(?ms)^  {re.escape(job)}:\s*\n(.*?)(?=^  [A-Za-z0-9_-]+:\s*$|\Z)", text)
+    return match.group(1) if match else ""
+
+FLOOR_IMAGE = r"ubuntu:22\.04@sha256:[0-9a-f]{64}"
+FLOORS = {"CBM_GLIBC_FLOOR": "2.35", "CBM_GLIBCXX_FLOOR": "3.4.30"}
+if (workflows / "_build.yml").exists() and (workflows / "pr.yml").exists():
+    build_text = without_comments((workflows / "_build.yml").read_text())
+    pr_text = without_comments((workflows / "pr.yml").read_text())
+    build_linux = job_body(build_text, "build-linux")
+    floor_images = set()
+    for leg, body in (("_build.yml build-linux", build_linux),
+                      ("pr.yml glibc-floor", job_body(pr_text, "glibc-floor"))):
+        image = re.search(rf"(?m)^    container:\s*\n      image:\s*({FLOOR_IMAGE})\s*$", body)
+        if not image:
+            failures.append(f"{leg}: must run in a container pinned by digest to "
+                            f"ubuntu:22.04 (`image: ubuntu:22.04@sha256:<64 hex>`)")
+        else:
+            floor_images.add(image.group(1))
+        for var, value in FLOORS.items():
+            if not re.search(rf'(?m)^\s+{var}:\s*"{re.escape(value)}"\s*$', body):
+                failures.append(f"{leg}: must declare {var}: \"{value}\" for the "
+                                f"composition gate (the pinned image's floor)")
+        if "check-binary-composition.sh" not in body and \
+                "prepare-release-candidates.sh" not in body:
+            failures.append(f"{leg}: must run the composition gate on the "
+                            f"container-built binary")
+    if len(floor_images) > 1:
+        failures.append("_build.yml build-linux and pr.yml glibc-floor must pin the SAME "
+                        "ubuntu:22.04 digest: " + ", ".join(sorted(floor_images)))
+    arches = sorted(re.findall(r"(?m)^          - arch:\s*(\S+)\s*$", build_linux))
+    if arches != ["amd64", "arm64"]:
+        failures.append("_build.yml build-linux: must build exactly the amd64 and arm64 "
+                        f"standard Linux binaries, found {arches}")
+    if re.search(r"(?m)^\s+goos:\s*linux\s*$", job_body(build_text, "build-unix")):
+        failures.append("_build.yml build-unix: a standard Linux leg is back on a hosted "
+                        "runner's userland; it belongs in build-linux's pinned container")
+
 # Defender posture: hosted Windows runners have real-time protection
 # POLICY-LOCKED OFF (verified 2026-07-27: WinDefend starts, Set-MpPreference
 # accepts, RTP stays off), so runner jobs must NOT gate on enabling it; the
