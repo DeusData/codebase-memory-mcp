@@ -2676,6 +2676,9 @@ TEST(cli_no_hooks_plan_covers_every_hook_installer_family) {
     write_test_file(path, "{}\n");
     snprintf(path, sizeof(path), "%s/.copilot/mcp-config.json", tmpdir);
     write_test_file(path, "{}\n");
+    /* #1180: a bare ~/.claude is not a Claude Code install; its settings.json is. */
+    snprintf(path, sizeof(path), "%s/.claude/settings.json", tmpdir);
+    write_test_file(path, "{}\n");
 
     const char *const commands[] = {"qodercli", "kimi",   "duo",    "devin", "gemini",
                                     "copilot",  "auggie", "hermes", "droid"};
