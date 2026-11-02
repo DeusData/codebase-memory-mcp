@@ -319,6 +319,15 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      "/\n",
      2,
      {"emp_pkg", "hire", NULL}},
+    {"vbnet",
+     CBM_LANG_VISUALBASIC,
+     "Worker.vb",
+     "Imports System.Text\nNamespace Demo\nPublic Class Worker\n"
+     "Private _count As Integer\nPublic Sub New()\nEnd Sub\n"
+     "Public Function Calculate(x As Integer) As Integer\nReturn x\nEnd Function\n"
+     "End Class\nEnd Namespace\n",
+     3,
+     {"Worker", "Calculate", "_count", NULL}},
     {"smali",
      CBM_LANG_SMALI,
      "A.smali",

@@ -1291,5 +1291,19 @@
     "filenames": [],
     "has_scanner": true,
     "module_root": "source_file"
+  },
+  {
+    "name": "vbnet",
+    "enum": "VISUALBASIC",
+    "display": "Visual Basic .NET",
+    "ts_func": "tree_sitter_vbnet",
+    "repo": "https://github.com/govindbanura/tree-sitter-vbnet",
+    "subdir": "",
+    "extensions": [
+      ".vb"
+    ],
+    "filenames": [],
+    "has_scanner": true,
+    "module_root": "source_file"
   }
 ]

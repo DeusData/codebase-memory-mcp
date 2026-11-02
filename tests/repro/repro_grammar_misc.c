@@ -2,7 +2,7 @@
  * repro_grammar_misc.c -- FINAL per-grammar INVARIANT battery covering the
  * remaining MISCELLANEOUS language family (hardware-description, CFML dialects,
  * niche scripting, structural assembly/linker/tablegen/ledger/IaC). This file
- * completes the all-162-grammar reproduce-first coverage: every grammar-backed
+ * completes the all-163-grammar reproduce-first coverage: every grammar-backed
  * CBM_LANG_* now has a per-language RED/GREEN row on the bug-repro board.
  * CBM_LANG_OBJECTSCRIPT_EXPORT is intentionally excluded from the grammar
  * count because Studio Export XML is transformed to ObjectScript UDL first.

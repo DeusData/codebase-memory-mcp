@@ -156,6 +156,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"mojo", "Class:1,Function:1,Method:1,Module:1"},
     {"arkts", "Field:1,Function:1,Method:1,Module:1,Struct:1"},
     {"plsql", "Class:1,Function:1,Module:1"},
+    {"vbnet", "Class:1,Field:1,Method:2,Module:1"},
     {"smali", "Class:1,Function:1,Module:1"},
     {"systemverilog", "Class:1,Function:1,Module:1"},
     {"verilog", "Class:1,Module:1"},
@@ -316,7 +317,8 @@ static int non_module_defs(CBMFileResult *r) {
 static const char *MUST_EXTRACT_DEFS[] = {
     "agda",   "pony",          "move",     "cobol",    "janet",    "pine",  "smali",  "verilog",
     "vhdl",   "systemverilog", "protobuf", "graphql",  "thrift",   "capnp", "smithy", "wit",
-    "prisma", "cmake",         "puppet",   "tablegen", "assembly", "nasm",  "plsql",  NULL};
+    "prisma", "cmake",         "puppet",   "tablegen", "assembly", "nasm",  "plsql",
+    "vbnet",  NULL};
 
 TEST(grammar_code_extracts_defs) {
     int failures = 0;

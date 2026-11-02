@@ -973,6 +973,33 @@ TEST(ruby_constructor_callee_is_constant_path) {
 }
 
 /* --- C# --- */
+TEST(visual_basic_types_methods_calls_and_imports) {
+    const char *src =
+        "Imports System.Text\n"
+        "Namespace Demo\n"
+        "Public Class Worker\n"
+        "Inherits BaseWorker\n"
+        "Implements IDisposable\n"
+        "Private _count As Integer\n"
+        "Public Property Name As String\n"
+        "Public Sub New(value As Integer)\n_count = value\nEnd Sub\n"
+        "Public Function Calculate(x As Integer) As Integer\n"
+        "Helper(x)\nMe.Save()\nReturn x\nEnd Function\n"
+        "End Class\nEnd Namespace\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VISUALBASIC, "t", "Worker.vb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Worker"));
+    ASSERT(has_def(r, "Method", "Worker"));
+    ASSERT(has_def(r, "Method", "Calculate"));
+    ASSERT(has_def(r, "Field", "_count"));
+    ASSERT(has_def(r, "Field", "Name"));
+    ASSERT_GTE(r->calls.count, 2);
+    ASSERT_GTE(r->imports.count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(csharp_class) {
     CBMFileResult *r = extract("namespace App { public class Service { public void Run() {} public "
                                "int Compute(int x) => x * 2; } }",
@@ -14635,6 +14662,7 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(ruby_constructor_callee_is_constant_path);
     RUN_TEST(csharp_class);
+    RUN_TEST(visual_basic_types_methods_calls_and_imports);
     RUN_TEST(csharp_interface);
     RUN_TEST(csharp_extension_block_members);
     RUN_TEST(csharp_constructor_of_type_named_extension);

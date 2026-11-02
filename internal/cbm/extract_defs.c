@@ -4605,6 +4605,39 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
 
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    /* VB.NET puts Inherits/Implements statements directly among a type's
+     * children and gives them no superclass/interface field. */
+    if (lang == CBM_LANG_VISUALBASIC) {
+        const char *vb_bases[MAX_BASES];
+        int vb_count = 0;
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc && vb_count < MAX_BASES_MINUS_1; i++) {
+            TSNode stmt = ts_node_named_child(node, i);
+            const char *sk = ts_node_type(stmt);
+            if (strcmp(sk, "inherits_statement") != 0 &&
+                strcmp(sk, "implements_statement") != 0) {
+                continue;
+            }
+            uint32_t bc = ts_node_named_child_count(stmt);
+            for (uint32_t j = 0; j < bc && vb_count < MAX_BASES_MINUS_1; j++) {
+                char *base = cbm_node_text(a, ts_node_named_child(stmt, j), source);
+                if (base && base[0]) {
+                    vb_bases[vb_count++] = base;
+                }
+            }
+        }
+        if (vb_count > 0) {
+            const char **result =
+                (const char **)cbm_arena_alloc(a, (size_t)(vb_count + 1) * sizeof(*result));
+            if (result) {
+                for (int i = 0; i < vb_count; i++) {
+                    result[i] = vb_bases[i];
+                }
+                result[vb_count] = NULL;
+                return result;
+            }
+        }
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -6982,7 +7015,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->enclosing_class_qn &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
          ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX ||
-         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_NIX ||
+         ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_VISUALBASIC ||
+         ctx->language == CBM_LANG_NIX ||
          ctx->language == CBM_LANG_PYTHON)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, qn_name);
     }
@@ -9015,6 +9049,11 @@ static void drop_c_typedefs_shadowed_by_tags(CBMExtractCtx *ctx, int first) {
 
 // Find the body/members node inside a class node
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
+    /* VB.NET type declarations carry members directly. Their repeated `body`
+     * field exposes only the first member through child_by_field_name. */
+    if (lang == CBM_LANG_VISUALBASIC) {
+        return class_node;
+    }
     // Try field names first
     static const char *body_fields[] = {"body", "members", "class_body", "declaration_list", NULL};
     for (const char **f = body_fields; *f; f++) {
@@ -9581,8 +9620,10 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
          * under the owning class using the class name (`Explicit.Explicit`).
          * Classes with only an implicit constructor do not enter this branch
          * and therefore do not gain a fabricated callable target. */
-        if (ctx->language == CBM_LANG_KOTLIN &&
-            strcmp(ts_node_type(method_node), "secondary_constructor") == 0) {
+        if ((ctx->language == CBM_LANG_KOTLIN &&
+             strcmp(ts_node_type(method_node), "secondary_constructor") == 0) ||
+            (ctx->language == CBM_LANG_VISUALBASIC &&
+             strcmp(ts_node_type(method_node), "constructor_declaration") == 0)) {
             TSNode constructor_name = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
             if (ts_node_is_null(constructor_name)) {
                 constructor_name = cbm_find_child_by_kind(class_node, "type_identifier");
@@ -12107,6 +12148,63 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
     return true;
 }
 
+/* VB.NET fields declare one or more variable_declarator children and carry
+ * their type in an as_clause rather than a `type` field. Properties/events do
+ * expose `name` directly. Emit every declarator instead of dropping the whole
+ * declaration in the generic C-family path. */
+static bool extract_visual_basic_fields(CBMExtractCtx *ctx, TSNode child, const char *class_qn,
+                                        const CBMLangSpec *spec) {
+    if (ctx->language != CBM_LANG_VISUALBASIC) {
+        return false;
+    }
+    CBMArena *a = ctx->arena;
+    const char *kind = ts_node_type(child);
+    TSNode names[CBM_SZ_64];
+    int name_count = 0;
+    if (strcmp(kind, "field_declaration") == 0) {
+        uint32_t nc = ts_node_named_child_count(child);
+        for (uint32_t i = 0; i < nc && name_count < CBM_SZ_64; i++) {
+            TSNode declarator = ts_node_named_child(child, i);
+            if (strcmp(ts_node_type(declarator), "variable_declarator") != 0) {
+                continue;
+            }
+            TSNode name = ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+            if (!ts_node_is_null(name)) {
+                names[name_count++] = name;
+            }
+        }
+    } else {
+        TSNode name = ts_node_child_by_field_name(child, TS_FIELD("name"));
+        if (!ts_node_is_null(name)) {
+            names[name_count++] = name;
+        }
+    }
+    TSNode as_clause =
+        find_first_descendant_by_kind(child, "as_clause", CBM_DESCENDANT_MAX_DEPTH);
+    for (int i = 0; i < name_count; i++) {
+        char *name = cbm_node_text(a, names[i], ctx->source);
+        if (!name || !name[0]) {
+            continue;
+        }
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = name;
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+        def.label = "Field";
+        def.file_path = ctx->rel_path;
+        def.parent_class = class_qn;
+        def.return_type =
+            ts_node_is_null(as_clause) ? NULL : cbm_node_text(a, as_clause, ctx->source);
+        def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
+        def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+        def.is_exported = cbm_is_exported(name, ctx->language);
+        def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
+        def.docstring = extract_member_docstring(ctx, child);
+        cbm_defs_push(&ctx->result->defs, a, def);
+    }
+    return true;
+}
+
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec) {
     if (!spec->field_node_types || !spec->field_node_types[0]) {
@@ -12150,6 +12248,9 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
          * a plain child rather than a C-style declarator/type field; handle them
          * up front so the generic "type"-field path below doesn't skip them. */
         if (extract_schema_field(ctx, child, class_qn)) {
+            continue;
+        }
+        if (extract_visual_basic_fields(ctx, child, class_qn, spec)) {
             continue;
         }
 
