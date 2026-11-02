@@ -1793,6 +1793,8 @@ typedef struct {
      * proxy buffer has no section text or function tokens to recompute
      * them); a row whose node is gone resolves to nothing when read. */
     bool doc_candidates_in_place;
+    /* Threads for the digests of the resolver evidence; below 2 means this thread. */
+    int workers;
 } cbm_pipeline_generation_t;
 
 /* Serialize and fully populate a sibling staging database, then atomically

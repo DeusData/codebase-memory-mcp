@@ -1,6 +1,7 @@
 #ifndef CBM_SQLITE_WRITER_H
 #define CBM_SQLITE_WRITER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // --- Input structs (flat, borrowed strings) ---
@@ -89,6 +90,28 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
                         const char *indexed_at, CBMDumpNode *nodes, int node_count,
                         CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,
                         int vector_count, CBMDumpTokenVec *token_vecs, int token_vec_count);
+
+// --- WITHOUT ROWID tables, streamed ---
+//
+// A table of the caller's own, written straight to pages like the rest of this file,
+// for rows too many to send through SQL one at a time. Rows must arrive in primary-key
+// order with the key columns first, as SQLite itself stores such a table. Several tables
+// may be open at once, between open and the first append_nodes. create_sql is what
+// sqlite_master will say and must outlive finalize; it decides everything SQLite will
+// assume about the rows.
+typedef struct cbm_writer_table cbm_writer_table_t;
+
+cbm_writer_table_t *cbm_writer_table_begin(cbm_db_writer_t *w, const char *name,
+                                           const char *create_sql);
+void cbm_writer_row_begin(cbm_writer_table_t *t);
+void cbm_writer_row_null(cbm_writer_table_t *t);
+void cbm_writer_row_int(cbm_writer_table_t *t, int64_t value);
+void cbm_writer_row_text(cbm_writer_table_t *t, const char *text);
+void cbm_writer_row_blob(cbm_writer_table_t *t, const void *data, int length);
+// False once a write has failed; the failure is sticky and finalize reports it too.
+bool cbm_writer_row_end(cbm_writer_table_t *t);
+// Frees t. Every table begun must be ended before the first append_nodes.
+bool cbm_writer_table_end(cbm_writer_table_t *t);
 
 // Byte offset of 1-based page `page_num` in the output file. 64-bit on every
 // platform, so databases larger than 2 GiB are addressed correctly on Windows.

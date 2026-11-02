@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "foundation/mem_core.h"
 #include <errno.h>
 
 #ifdef _WIN32
@@ -1081,6 +1082,13 @@ static uint8_t *build_index_entry_unique_2int_2text_rowid(int64_t v1, int64_t v2
 
 // Ensure leaves array has capacity for one more entry.
 // Returns false on allocation failure.
+static uint8_t *sep_cell_copy(const uint8_t *cell, int length) {
+    uint8_t *copy = (uint8_t *)malloc((size_t)length);
+    if (copy)
+        memcpy(copy, cell, (size_t)length);
+    return copy;
+}
+
 static bool pb_ensure_leaf_cap(PageBuilder *pb) {
     if (pb->leaf_count < pb->leaf_cap) {
         return true;
@@ -1309,8 +1317,7 @@ static bool pb_promote_and_flush(PageBuilder *pb, uint8_t **cells, int *cell_len
         return false;
     }
     pb->leaves[pb->leaf_count].max_key = 0;
-    pb->leaves[pb->leaf_count].sep_cell = (uint8_t *)malloc(cell_lens[prev_idx]);
-    memcpy(pb->leaves[pb->leaf_count].sep_cell, cells[prev_idx], cell_lens[prev_idx]);
+    pb->leaves[pb->leaf_count].sep_cell = sep_cell_copy(cells[prev_idx], cell_lens[prev_idx]);
     pb->leaves[pb->leaf_count].sep_cell_len = cell_lens[prev_idx];
 
     // Un-add the last cell — it's promoted to the interior separator.
@@ -1382,8 +1389,7 @@ static uint32_t write_index_btree(FILE *fp, uint32_t *next_page, uint8_t **cells
         }
         pb.leaves[pb.leaf_count].max_key = 0;
         int last = count - SKIP_ONE;
-        pb.leaves[pb.leaf_count].sep_cell = (uint8_t *)malloc(cell_lens[last]);
-        memcpy(pb.leaves[pb.leaf_count].sep_cell, cells[last], cell_lens[last]);
+        pb.leaves[pb.leaf_count].sep_cell = sep_cell_copy(cells[last], cell_lens[last]);
         pb.leaves[pb.leaf_count].sep_cell_len = cell_lens[last];
         pb_flush_leaf(&pb);
     }
@@ -1777,9 +1783,12 @@ static uint32_t build_node_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpNo
 // --- Main entry point ---
 
 /* Write context passed to sub-phases of cbm_write_db. */
+enum { WRITER_MAX_EXTRA_TABLES = 8 };
 typedef struct {
     FILE *fp;
     uint32_t next_page;
+    MasterEntry extra_tables[WRITER_MAX_EXTRA_TABLES];
+    int extra_table_count;
     char final_path[CBM_SZ_4K];
     char temp_path[CBM_SZ_4K];
     const char *project;
@@ -2324,7 +2333,15 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     };
 
     int master_count = sizeof(master) / sizeof(master[0]);
-    int rc2 = write_master_page1(fp, master, master_count, next_page);
+    MasterEntry *all = (MasterEntry *)cbm_alloc(
+        CBM_MEM_CLASS_DUMP, sizeof(master) + (size_t)w->extra_table_count * sizeof(*all));
+    if (!all) {
+        return discard_writer_output(w, ERR_WRITE_FAILED);
+    }
+    memcpy(all, master, sizeof(master));
+    memcpy(all + master_count, w->extra_tables, (size_t)w->extra_table_count * sizeof(*all));
+    int rc2 = write_master_page1(fp, all, master_count + w->extra_table_count, next_page);
+    cbm_free(CBM_MEM_CLASS_DUMP, all);
     if (rc2 != 0) {
         return discard_writer_output(w, rc2);
     }
@@ -2375,6 +2392,204 @@ cbm_db_writer_t *cbm_writer_open(const char *path) {
     return w;
 }
 
+/* A row's serial types go first in its record, so the values wait in a buffer until the
+ * row ends. Nothing per row is allocated: this runs millions of times. */
+enum { TABLE_MAX_COLUMNS = 64, TABLE_INITIAL_ROW = 1024 };
+struct cbm_writer_table {
+    cbm_db_writer_t *w;
+    PageBuilder pb;
+    const char *name, *sql;
+    int64_t serials[TABLE_MAX_COLUMNS];
+    int columns;
+    uint8_t *values;
+    size_t values_used, values_capacity;
+    uint8_t *cell;
+    size_t cell_capacity;
+    int last_cell_length; /* The last cell on the current leaf, should it be promoted. */
+    bool failed;
+};
+
+static bool table_room(uint8_t **buffer, size_t *capacity, size_t needed) {
+    if (needed <= *capacity)
+        return true;
+    size_t next = *capacity ? *capacity : TABLE_INITIAL_ROW;
+    while (next < needed)
+        next *= GROWTH_FACTOR;
+    uint8_t *grown = (uint8_t *)cbm_realloc(CBM_MEM_CLASS_DUMP, *buffer, next);
+    if (!grown)
+        return false;
+    *buffer = grown;
+    *capacity = next;
+    return true;
+}
+
+cbm_writer_table_t *cbm_writer_table_begin(cbm_db_writer_t *w, const char *name,
+                                           const char *create_sql) {
+    if (!w || w->err || w->node_rows_written || w->wc.extra_table_count >= WRITER_MAX_EXTRA_TABLES)
+        return NULL;
+    cbm_writer_table_t *t = (cbm_writer_table_t *)cbm_calloc(CBM_MEM_CLASS_DUMP, sizeof(*t));
+    if (!t)
+        return NULL;
+    t->w = w;
+    t->name = name;
+    t->sql = create_sql;
+    pb_init(&t->pb, w->wc.fp, w->nodes_pb.next_page, true);
+    return t;
+}
+
+void cbm_writer_row_begin(cbm_writer_table_t *t) {
+    t->columns = 0;
+    t->values_used = 0;
+}
+
+static void table_column(cbm_writer_table_t *t, int64_t serial, const void *data, size_t length) {
+    if (t->columns >= TABLE_MAX_COLUMNS ||
+        !table_room(&t->values, &t->values_capacity, t->values_used + length)) {
+        t->failed = true;
+        return;
+    }
+    t->serials[t->columns++] = serial;
+    if (length)
+        memcpy(t->values + t->values_used, data, length);
+    t->values_used += length;
+}
+
+void cbm_writer_row_null(cbm_writer_table_t *t) {
+    table_column(t, 0, NULL, 0);
+}
+
+void cbm_writer_row_int(cbm_writer_table_t *t, int64_t value) {
+    int64_t serial = int_serial_type(value);
+    int bytes = int_storage_bytes((int)serial);
+    uint8_t encoded[SERIAL_SIZE_INT64];
+    put_int_be(encoded, value, bytes);
+    table_column(t, serial, encoded, (size_t)bytes);
+}
+
+void cbm_writer_row_text(cbm_writer_table_t *t, const char *text) {
+    size_t length = strlen(text);
+    table_column(t, text_serial_type((int)length), text, length);
+}
+
+void cbm_writer_row_blob(cbm_writer_table_t *t, const void *data, int length) {
+    table_column(t, (int64_t)length * BLOB_SERIAL_MUL + BLOB_SERIAL_BASE, data, (size_t)length);
+}
+
+/* Written leaves come from the shared page counter, since the tables interleave. */
+static void table_flush_leaf(cbm_writer_table_t *t) {
+    uint32_t *next_page = &t->w->nodes_pb.next_page;
+    t->pb.next_page = *next_page;
+    pb_flush_leaf(&t->pb);
+    *next_page = t->pb.next_page;
+}
+
+static bool table_note_separator(cbm_writer_table_t *t, const uint8_t *cell, int length) {
+    if (!pb_ensure_leaf_cap(&t->pb))
+        return false;
+    uint8_t *separator = sep_cell_copy(cell, length);
+    if (!separator)
+        return false;
+    PageRef *leaf = &t->pb.leaves[t->pb.leaf_count];
+    leaf->max_key = 0;
+    leaf->sep_cell = separator;
+    leaf->sep_cell_len = length;
+    return true;
+}
+
+static bool table_add_cell(cbm_writer_table_t *t, const uint8_t *cell, int length) {
+    if (!pb_cell_fits(&t->pb, length) && t->pb.cell_count > 0) {
+        /* The leaf's last cell moves up as the separator, as in write_index_btree. */
+        int last = t->last_cell_length;
+        if (!table_note_separator(t, t->pb.page + t->pb.content_offset, last))
+            return false;
+        t->pb.cell_count--;
+        t->pb.content_offset += last;
+        t->pb.ptr_offset -= CELL_PTR_SIZE;
+        table_flush_leaf(t);
+    }
+    if (!pb_cell_fits(&t->pb, length))
+        return false;
+    pb_add_cell(&t->pb, cell, length);
+    t->last_cell_length = length;
+    return true;
+}
+
+bool cbm_writer_row_end(cbm_writer_table_t *t) {
+    if (t->failed)
+        return false;
+    int serial_bytes = 0;
+    for (int i = 0; i < t->columns; i++)
+        serial_bytes += varint_len(t->serials[i]);
+    int header = serial_bytes + varint_len(serial_bytes + VARINT_MIN_LEN);
+    if (varint_len(header) != header - serial_bytes)
+        header = serial_bytes + varint_len(header);
+    size_t payload = (size_t)header + t->values_used;
+    if (payload > INT32_MAX ||
+        !table_room(&t->cell, &t->cell_capacity, payload + VARINT_BUF_SIZE)) {
+        t->failed = true;
+        return false;
+    }
+    int at = put_varint(t->cell, (int64_t)payload);
+    at += put_varint(t->cell + at, header);
+    for (int i = 0; i < t->columns; i++)
+        at += put_varint(t->cell + at, t->serials[i]);
+    memcpy(t->cell + at, t->values, t->values_used);
+    at += (int)t->values_used;
+    bool ok;
+    if ((int64_t)payload > INDEX_OVERFLOW_MAX_LOCAL) {
+        uint8_t *whole = cells_alloc((size_t)at);
+        int length = at;
+        if (whole) {
+            memcpy(whole, t->cell, (size_t)at);
+            whole = overflowize_index_cell(t->pb.fp, &t->w->nodes_pb.next_page, whole, &length);
+        }
+        ok = whole && table_add_cell(t, whole, length);
+        if (whole)
+            cells_free(whole);
+    } else {
+        ok = table_add_cell(t, t->cell, at);
+    }
+    t->failed = !ok;
+    return ok;
+}
+
+bool cbm_writer_table_end(cbm_writer_table_t *t) {
+    if (!t)
+        return false;
+    bool ok = !t->failed;
+    uint32_t *next_page = &t->w->nodes_pb.next_page;
+    uint32_t root = 0;
+    if (ok && t->pb.cell_count > 0) {
+        /* Nothing reads the last leaf's separator, but the interior builder frees it. */
+        ok = table_note_separator(t, t->pb.page + t->pb.content_offset, t->last_cell_length);
+        if (ok)
+            table_flush_leaf(t);
+    }
+    if (ok) {
+        t->pb.next_page = *next_page;
+        if (t->pb.leaf_count == 0)
+            root = write_empty_index_leaf(t->pb.fp, next_page);
+        else if (t->pb.leaf_count == SKIP_ONE)
+            root = t->pb.leaves[0].page_num;
+        else {
+            root = pb_build_interior(&t->pb, true);
+            *next_page = t->pb.next_page;
+        }
+        ok = root != 0;
+    }
+    if (ok) {
+        t->w->wc.extra_tables[t->w->wc.extra_table_count++] =
+            (MasterEntry){"table", t->name, t->name, root, t->sql};
+    } else {
+        t->w->err = ERR_WRITE_FAILED;
+    }
+    pb_free(&t->pb);
+    cbm_free(CBM_MEM_CLASS_DUMP, t->values);
+    cbm_free(CBM_MEM_CLASS_DUMP, t->cell);
+    cbm_free(CBM_MEM_CLASS_DUMP, t);
+    return ok;
+}
+
 int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int count) {
     if (!w) {
         return CBM_NOT_FOUND;
@@ -2412,6 +2627,8 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     uint32_t nodes_root = 0;
     if (err == 0) {
         if (w->node_rows_written == 0) {
+            /* Streamed tables may already hold pages past the first. */
+            w->wc.next_page = w->nodes_pb.next_page;
             pb_free(&w->nodes_pb);
             nodes_root = write_table_btree(w->wc.fp, &w->wc.next_page, NULL, NULL, NULL, 0, false);
         } else {

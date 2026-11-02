@@ -1,6 +1,7 @@
 #include "policy.h"
 #include "proof.h"
 #include "foundation/mem_core.h"
+#include "foundation/fast_format.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -9,11 +10,19 @@
 char *cbm_resolve_properties_tail(const cbm_resolve_record_t *record, int32_t *line) {
     const char *json = record->properties_json ? record->properties_json : "{}";
     char head[160];
-    int head_length = snprintf(
-        head, sizeof(head),
-        "{\"strategy\":\"shared_resolver\",\"resolver_rule\":%d,\"start_byte\":%u,\"end_byte\":%u,"
-        "\"source_origin\":%u",
-        (int)record->result.rule, record->start_byte, record->end_byte, record->source_origin);
+    char *head_end = head;
+#define HEAD_TEXT(literal) head_end = cbm_put_text(head_end, literal, sizeof(literal) - 1)
+    HEAD_TEXT("{\"strategy\":\"shared_resolver\",\"resolver_rule\":");
+    head_end = cbm_put_u64(head_end, (uint64_t)record->result.rule);
+    HEAD_TEXT(",\"start_byte\":");
+    head_end = cbm_put_u64(head_end, record->start_byte);
+    HEAD_TEXT(",\"end_byte\":");
+    head_end = cbm_put_u64(head_end, record->end_byte);
+    HEAD_TEXT(",\"source_origin\":");
+    head_end = cbm_put_u64(head_end, record->source_origin);
+#undef HEAD_TEXT
+    *head_end = '\0';
+    int head_length = (int)(head_end - head);
     const char *rest = json;
     size_t before = strlen(json);
     const char *after = NULL;

@@ -1239,7 +1239,7 @@ TEST(resolver_generation_publish_keeps_the_wal_small) {
     ASSERT_EQ(sqlite3_exec(cbm_store_get_db(store), "PRAGMA wal_autocheckpoint=8", NULL, NULL, NULL),
               SQLITE_OK);
     cbm_store_resolver_test_set_progress_rows(256);
-    int rc = cbm_store_resolver_publish_generation(store, "proj", rows, ROWS, NULL, 0, NULL, 0);
+    int rc = cbm_store_resolver_publish_generation(store, "proj", rows, ROWS, NULL, 0, NULL, 0, 1);
     cbm_store_resolver_test_set_progress_rows(0);
     bool present = false;
     int current = cbm_store_resolver_current(store, "proj", &present);

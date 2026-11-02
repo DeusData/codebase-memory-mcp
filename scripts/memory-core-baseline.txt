@@ -12,7 +12,7 @@ internal/cbm/lsp/c_lsp.c	4
 internal/cbm/lsp/perl_lsp.c	21
 internal/cbm/macro_table.c	1
 internal/cbm/service_patterns.c	2
-internal/cbm/sqlite_writer.c	74
+internal/cbm/sqlite_writer.c	73
 src/cli/activation_transaction.c	78
 src/cli/agent_clients.c	73
 src/cli/agent_profiles.c	7
@@ -68,7 +68,7 @@ src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
 src/pipeline/pass_k8s.c	6
 src/pipeline/pass_lsp_cross.c	46
-src/pipeline/pass_parallel.c	29
+src/pipeline/pass_parallel.c	28
 src/pipeline/pass_pkgmap.c	63
 src/pipeline/pass_semantic.c	3
 src/pipeline/pass_tests.c	3

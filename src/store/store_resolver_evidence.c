@@ -9,7 +9,10 @@
 #include "resolve/policy.h"
 #include "resolve/proof.h"
 #include "resolve/snapshot.h"
+#include "pipeline/worker_pool.h"
+#include "sqlite_writer.h"
 #include <yyjson/yyjson.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,7 +174,15 @@ enum {
     VERIFIED_SOURCE_SLOTS = 1 << 12,
     /* One line per this many stored rows keeps a long write visibly alive: the
      * worker's log is the supervisor's no-progress heartbeat. */
-    PROGRESS_ROWS = 1 << 20
+    PROGRESS_ROWS = 1 << 20,
+    /* Composed facts are digested this many at a time, in order, and forgotten. */
+    FACT_BATCH = 1 << 16,
+    /* Fewer jobs than this are not worth starting threads for. */
+    FACT_INLINE_JOBS = 256,
+    ROOT_CHUNK_ROWS = 1 << 12,
+    FACT_TEXT_MEMO_SLOTS = 1 << 12,
+    /* A new file's first project: see cbm_resolver_stage. */
+    DIRECT_PID = 1
 };
 
 typedef struct {
@@ -196,22 +207,46 @@ typedef struct {
     const char *content, *file, *project, *configuration;
     uint32_t origin;
 } verified_source_t;
+/* A string's length and whether it needs escaping, by address: every string a fact
+ * holds outlives the write, and a project repeats the same few in every fact. */
+typedef struct {
+    const char *pointer;
+    size_t length;
+    bool plain;
+} fact_text_memo_t;
 typedef struct fact_text {
     char *bytes;
     size_t length, capacity;
     bool plain;
+    fact_text_memo_t *memo;
 } fact_text_t;
+/* What is left of a write once its rows are in pages: everything the two remaining
+ * tables need, so the fact table and its digests can go before the graph is written. */
+struct cbm_resolver_stage {
+    char *table_sql[4];
+    const cbm_resolve_summary_t **summaries;
+    uint32_t *summary_proofs;
+    size_t summary_count;
+    const cbm_resolve_file_t **files;
+    char (*derived)[65];
+    size_t file_count;
+};
 typedef struct {
     sqlite3 *db;
     const char *project;
     sqlite3_int64 pid;
     sqlite3_stmt *text, *fact, *support, *occurrence;
+    /* Set instead of the statements when rows go straight into a new file's pages. */
+    cbm_writer_table_t *text_table, *fact_table, *support_table, *occurrence_table;
     evidence_id_t *ids;
     size_t capacity, id_count;
-    size_t count; /* Facts written, which is also the last fact id. */
+    size_t count;     /* Facts planned, which is also the last fact id. */
+    uintptr_t *order; /* Fact id - 1 -> its node, or its row with the low bit set. */
+    size_t order_capacity;
+    const char **valid_text;
+    int workers;
     unsigned char *digests;
     size_t digest_capacity, digest_count;
-    unsigned char last_digest[DIGEST_BYTES];
     dict_slot_t *dict;
     size_t dict_capacity, dict_count;
     dict_cache_t *cache;
@@ -224,7 +259,6 @@ typedef struct {
     bool commit_batches;
     const cbm_resolve_file_t *const *files;
     size_t file_count;
-    struct fact_text fact_text;
 } evidence_write_t;
 
 static const char *text(const char *value) {
@@ -264,6 +298,26 @@ static bool finish_row(evidence_write_t *w, sqlite3_stmt *s, bool ok, const char
         ok = note_rows(w, stage);
     }
     return ok;
+}
+
+static bool table_finish(evidence_write_t *w, cbm_writer_table_t *table, bool ok,
+                         const char *stage) {
+    ok = ok && cbm_writer_row_end(table);
+    if (ok) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_STORED_RECORDS, 1);
+        ok = note_rows(w, stage);
+    }
+    return ok;
+}
+/* A NULL text id means the empty string, as bind_optional writes it. */
+static bool table_text_id(cbm_writer_table_t *table, sqlite3_int64 id) {
+    if (id < 0)
+        return false;
+    if (id)
+        cbm_writer_row_int(table, id);
+    else
+        cbm_writer_row_null(table);
+    return true;
 }
 
 /* ── String dictionary ───────────────────────────────────────────── */
@@ -323,10 +377,20 @@ static sqlite3_int64 dict_id(evidence_write_t *w, const char *value, bool stable
         if (!owned)
             return -1;
         sqlite3_int64 id = (sqlite3_int64)++w->dict_count;
-        bool ok = sqlite3_bind_int64(w->text, 1, w->pid) == SQLITE_OK &&
-                  sqlite3_bind_int64(w->text, 2, id) == SQLITE_OK && bind_text(w->text, 3, owned);
-        if (!finish_row(w, w->text, ok, "text"))
-            return -1;
+        if (w->text_table) {
+            cbm_writer_row_begin(w->text_table);
+            cbm_writer_row_int(w->text_table, w->pid);
+            cbm_writer_row_int(w->text_table, id);
+            cbm_writer_row_text(w->text_table, owned);
+            if (!table_finish(w, w->text_table, true, "text"))
+                return -1;
+        } else {
+            bool ok = sqlite3_bind_int64(w->text, 1, w->pid) == SQLITE_OK &&
+                      sqlite3_bind_int64(w->text, 2, id) == SQLITE_OK &&
+                      bind_text(w->text, 3, owned);
+            if (!finish_row(w, w->text, ok, "text"))
+                return -1;
+        }
         *slot = (dict_slot_t){.text = owned, .hash = hash, .id = id};
     }
     if (cached)
@@ -356,13 +420,13 @@ static size_t pointer_hash(const cbm_resolve_proof_t *node) {
     uintptr_t value = (uintptr_t)node >> 3;
     return (size_t)(value ^ (value >> 17));
 }
-static evidence_id_t *id_slot(evidence_write_t *w, const cbm_resolve_proof_t *node) {
+static evidence_id_t *id_slot(const evidence_write_t *w, const cbm_resolve_proof_t *node) {
     size_t at = pointer_hash(node) & (w->capacity - 1);
     while (w->ids[at].node && w->ids[at].node != node)
         at = (at + 1) & (w->capacity - 1);
     return &w->ids[at];
 }
-static evidence_id_t *find_id(evidence_write_t *w, const cbm_resolve_proof_t *node) {
+static evidence_id_t *find_id(const evidence_write_t *w, const cbm_resolve_proof_t *node) {
     if (!node || !w->capacity)
         return NULL;
     evidence_id_t *entry = id_slot(w, node);
@@ -405,10 +469,8 @@ static bool grow_ids(evidence_write_t *w) {
 static const unsigned char *id_digest(const evidence_write_t *w, const evidence_id_t *entry) {
     return w->digests + (size_t)entry->digest * DIGEST_BYTES;
 }
-/* Call grow_ids first. */
-static void hold_id(evidence_write_t *w, const cbm_resolve_proof_t *node, uint32_t id,
-                    const unsigned char *digest) {
-    memcpy(w->digests + w->digest_count * DIGEST_BYTES, digest, DIGEST_BYTES);
+/* Call grow_ids first. The digest slot is filled once every node has its id. */
+static void hold_id(evidence_write_t *w, const cbm_resolve_proof_t *node, uint32_t id) {
     *id_slot(w, node) =
         (evidence_id_t){.node = node, .id = id, .digest = (uint32_t)w->digest_count};
     w->digest_count++;
@@ -537,16 +599,26 @@ static void fact_append(fact_text_t *t, const char *bytes, size_t length) {
     memcpy(t->bytes + t->length, bytes, length);
     t->length += length;
 }
+static fact_text_memo_t *fact_memo(fact_text_t *t, const char *value) {
+    uintptr_t address = (uintptr_t)value;
+    fact_text_memo_t *slot = &t->memo[(address ^ (address >> 13)) & (FACT_TEXT_MEMO_SLOTS - 1)];
+    if (slot->pointer != value) {
+        size_t length = 0;
+        bool plain = true;
+        for (const unsigned char *p = (const unsigned char *)value; *p; p++, length++)
+            plain = plain && *p >= 0x20 && *p <= 0x7e && *p != '"' && *p != '\\';
+        *slot = (fact_text_memo_t){.pointer = value, .length = length, .plain = plain};
+    }
+    return slot;
+}
 static void fact_str(fact_text_t *t, const char *key, size_t key_length, const char *value) {
-    size_t length = 0;
-    for (const unsigned char *p = (const unsigned char *)text(value); *p; p++, length++) {
-        if (*p < 0x20 || *p > 0x7e || *p == '"' || *p == '\\') {
-            t->plain = false;
-            return;
-        }
+    const fact_text_memo_t *known = fact_memo(t, text(value));
+    if (!known->plain) {
+        t->plain = false;
+        return;
     }
     fact_append(t, key, key_length);
-    fact_append(t, text(value), length);
+    fact_append(t, known->pointer, known->length);
     fact_append(t, "\"", 1);
 }
 static void fact_num(fact_text_t *t, const char *key, size_t key_length, uint64_t value) {
@@ -623,17 +695,27 @@ static bool note_type_digest(evidence_write_t *w, const cbm_resolve_proof_view_t
 }
 /* resolver_facts builds its payload from these strings, and a payload must stay
  * strict JSON, as fact_json's was. Source text that is not UTF-8 is stored as
- * fact_json would have written it. A plain fact has already been checked. */
-static bool bind_fact_text(evidence_write_t *w, sqlite3_stmt *s, int col, const char *value) {
-    if (w->fact_text.plain || !value || cbm_utf8_valid(value, strlen(value)))
-        return bind_id(w, s, col, value);
+ * fact_json would have written it. Each address needs checking once. */
+static sqlite3_int64 fact_text_id(evidence_write_t *w, const char *value) {
+    if (!value || !*value)
+        return dict_id(w, value, true);
+    const char **checked = &w->valid_text[dict_cache_at(value)];
+    if (*checked == value)
+        return dict_id(w, value, true);
+    if (cbm_utf8_valid(value, strlen(value))) {
+        *checked = value;
+        return dict_id(w, value, true);
+    }
     size_t length = 0;
     char *clean = cbm_utf8_lossy_dup(CBM_MEM_CLASS_STORE, value, strlen(value), &length);
     if (!clean)
-        return false;
-    bool ok = bind_optional(s, col, dict_id(w, clean, false));
+        return -1;
+    sqlite3_int64 id = dict_id(w, clean, false);
     cbm_free(CBM_MEM_CLASS_STORE, clean);
-    return ok;
+    return id;
+}
+static bool bind_fact_text(evidence_write_t *w, sqlite3_stmt *s, int col, const char *value) {
+    return bind_optional(s, col, fact_text_id(w, value));
 }
 static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, size_t id,
                       const unsigned char *digest) {
@@ -668,47 +750,108 @@ static bool bind_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, si
            bind_fact_text(w, s, 30, v->outcome.reason) &&
            sqlite3_bind_int(s, 31, v->predecessors_closed ? 1 : 0) == SQLITE_OK;
 }
-/* node is NULL for a composed fact, which only its row will ever cite. */
-static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v,
-                       const cbm_resolve_proof_t *node, size_t *written) {
-    if (!v || !source_matches(w, &v->source) || w->count >= UINT32_MAX || (node && !grow_ids(w)))
-        return false;
-    bool plain = fact_plain_text(&w->fact_text, v);
+static bool table_fact_text(evidence_write_t *w, const char *value) {
+    return table_text_id(w->fact_table, fact_text_id(w, value));
+}
+/* The same columns as bind_fact, for a row going straight into a page. */
+static bool table_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v, size_t id,
+                       const unsigned char *digest) {
+    cbm_writer_table_t *t = w->fact_table;
+    cbm_writer_row_begin(t);
+    cbm_writer_row_int(t, w->pid);
+    cbm_writer_row_int(t, (sqlite3_int64)id);
+    cbm_writer_row_int(t, (int)v->kind);
+    cbm_writer_row_blob(t, digest, DIGEST_BYTES);
+    bool ok = table_fact_text(w, v->source.project) && table_fact_text(w, v->source.file) &&
+              table_fact_text(w, v->source.module) && table_fact_text(w, v->source.scope) &&
+              table_fact_text(w, v->source.content_identity) &&
+              table_fact_text(w, v->source.configuration_identity);
+    cbm_writer_row_int(t, v->source.source_origin);
+    ok = ok && table_fact_text(w, v->key.lookup_domain) && table_fact_text(w, v->key.lookup_key) &&
+         table_fact_text(w, v->key.declaration_identity) &&
+         table_fact_text(w, v->key.binding_identity) && table_fact_text(w, v->key.type_identity) &&
+         table_fact_text(w, v->key.detail);
+    cbm_writer_row_int(t, v->key.start_byte);
+    cbm_writer_row_int(t, v->key.end_byte);
+    cbm_writer_row_int(t, v->key.origin);
+    cbm_writer_row_int(t, v->key.flags);
+    cbm_writer_row_int(t, v->key.lookup_closed ? 1 : 0);
+    cbm_writer_row_int(t, (int)v->outcome.binding);
+    cbm_writer_row_int(t, (int)v->outcome.domain);
+    cbm_writer_row_int(t, (int)v->outcome.analysis);
+    cbm_writer_row_int(t, (int)v->outcome.rule);
+    cbm_writer_row_int(t, v->outcome.facts);
+    ok = ok && table_fact_text(w, v->outcome.target);
+    cbm_writer_row_int(t, (sqlite3_int64)v->outcome.candidate_count);
+    ok = ok && table_fact_text(w, v->outcome.reason);
+    cbm_writer_row_int(t, v->predecessors_closed ? 1 : 0);
+    return table_finish(w, t, ok, "facts");
+}
+
+/* What a fact is digested from: its text, then each premise's digest. Reads only what
+ * planning has fixed, so any number of these run at once. */
+static bool fact_digest(const evidence_write_t *w, const cbm_resolve_proof_view_t *v,
+                        fact_text_t *fact_text, unsigned char digest[DIGEST_BYTES]) {
+    bool plain = fact_plain_text(fact_text, v);
     char *json = plain ? NULL : fact_json(v);
     if (!plain && !json)
         return false;
-    uint32_t id = (uint32_t)(w->count + 1);
     cbm_sha256_ctx hash;
     cbm_sha256_init(&hash);
-    cbm_resolve_hash_text(&hash, plain ? w->fact_text.bytes : json);
+    cbm_resolve_hash_text(&hash, plain ? fact_text->bytes : json);
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+    for (size_t i = 0; i < v->premise_count; i++) {
+        const evidence_id_t *premise = find_id(w, v->premises[i]);
+        if (!premise)
+            return false;
+        char hex[65];
+        digest_hex(id_digest(w, premise), hex);
+        cbm_resolve_hash_text(&hash, hex);
+    }
+    cbm_sha256_final(&hash, digest);
+    return true;
+}
+static void fact_text_end(fact_text_t *fact_text) {
+    cbm_free(CBM_MEM_CLASS_STORE, fact_text->bytes);
+    cbm_free(CBM_MEM_CLASS_STORE, fact_text->memo);
+}
+static bool fact_text_begin(fact_text_t *fact_text) {
+    *fact_text = (fact_text_t){0};
+    fact_text->memo =
+        cbm_calloc(CBM_MEM_CLASS_STORE, FACT_TEXT_MEMO_SLOTS * sizeof(*fact_text->memo));
+    return fact_text->memo != NULL;
+}
+
+/* One fact's row and its support rows. The digest is already known. */
+static bool write_fact_row(evidence_write_t *w, const cbm_resolve_proof_view_t *v, size_t id,
+                           const unsigned char *digest) {
     bool ok = true;
     for (size_t i = 0; ok && i < v->premise_count; i++) {
-        evidence_id_t *premise = find_id(w, v->premises[i]);
-        ok = premise != NULL;
-        if (ok) {
-            char hex[65];
-            digest_hex(id_digest(w, premise), hex);
-            cbm_resolve_hash_text(&hash, hex);
-            ok = finish_row(w, w->support,
-                            sqlite3_bind_int64(w->support, 1, w->pid) == SQLITE_OK &&
-                                sqlite3_bind_int64(w->support, 2, (sqlite3_int64)id) == SQLITE_OK &&
-                                sqlite3_bind_int64(w->support, 3, (sqlite3_int64)i) == SQLITE_OK &&
-                                sqlite3_bind_int64(w->support, 4, (sqlite3_int64)premise->id) ==
-                                    SQLITE_OK,
-                            "supports");
+        const evidence_id_t *premise = find_id(w, v->premises[i]);
+        if (w->support_table) {
+            ok = premise != NULL;
+            if (ok) {
+                cbm_writer_row_begin(w->support_table);
+                cbm_writer_row_int(w->support_table, w->pid);
+                cbm_writer_row_int(w->support_table, (sqlite3_int64)id);
+                cbm_writer_row_int(w->support_table, (sqlite3_int64)i);
+                cbm_writer_row_int(w->support_table, (sqlite3_int64)premise->id);
+                ok = table_finish(w, w->support_table, true, "supports");
+            }
+            continue;
         }
+        ok = premise &&
+             finish_row(w, w->support,
+                        sqlite3_bind_int64(w->support, 1, w->pid) == SQLITE_OK &&
+                            sqlite3_bind_int64(w->support, 2, (sqlite3_int64)id) == SQLITE_OK &&
+                            sqlite3_bind_int64(w->support, 3, (sqlite3_int64)i) == SQLITE_OK &&
+                            sqlite3_bind_int64(w->support, 4, (sqlite3_int64)premise->id) ==
+                                SQLITE_OK,
+                        "supports");
     }
-    cbm_sha256_final(&hash, w->last_digest);
-    cbm_free(CBM_MEM_CLASS_OTHER, json);
-    ok = ok && note_type_digest(w, v, w->last_digest) &&
-         finish_row(w, w->fact, bind_fact(w, v, id, w->last_digest), "facts");
-    if (ok) {
-        if (node)
-            hold_id(w, node, id, w->last_digest);
-        w->count++;
-        *written = id;
-    }
-    return ok;
+    return ok && note_type_digest(w, v, digest) &&
+           (w->fact_table ? table_fact(w, v, id, digest)
+                          : finish_row(w, w->fact, bind_fact(w, v, id, digest), "facts"));
 }
 
 /* Each distinct fact after its premises, so a fact id always follows the ids it
@@ -716,7 +859,24 @@ static bool write_fact(evidence_write_t *w, const cbm_resolve_proof_view_t *v,
  * would cost a gigabyte on the largest repositories. Recursion is bounded because
  * a node's depth is checked when it is made, and a cycle cannot be built from
  * immutable nodes. */
-static bool write_facts_from(evidence_write_t *w, const cbm_resolve_proof_t *node) {
+static bool plan_fact(evidence_write_t *w, uintptr_t ref, size_t *id) {
+    if (w->count >= UINT32_MAX)
+        return false;
+    if (w->count == w->order_capacity) {
+        size_t next = w->order_capacity ? w->order_capacity * 2 : 1024;
+        if (next > SIZE_MAX / sizeof(*w->order))
+            return false;
+        uintptr_t *order = cbm_realloc(CBM_MEM_CLASS_STORE, w->order, next * sizeof(*order));
+        if (!order)
+            return false;
+        w->order = order;
+        w->order_capacity = next;
+    }
+    w->order[w->count++] = ref;
+    *id = w->count;
+    return true;
+}
+static bool plan_facts_from(evidence_write_t *w, const cbm_resolve_proof_t *node) {
     cbm_resolve_stats_add(CBM_RESOLVE_STAT_PROPAGATED_FACTS, 1);
     if (find_id(w, node))
         return true;
@@ -724,10 +884,13 @@ static bool write_facts_from(evidence_write_t *w, const cbm_resolve_proof_t *nod
     if (!v || (v->premise_count && !v->premises))
         return false;
     for (size_t i = 0; i < v->premise_count; i++)
-        if (!write_facts_from(w, v->premises[i]))
+        if (!plan_facts_from(w, v->premises[i]))
             return false;
-    size_t written = 0;
-    return write_fact(w, v, node, &written);
+    size_t id = 0;
+    if (!source_matches(w, &v->source) || !grow_ids(w) || !plan_fact(w, (uintptr_t)node, &id))
+        return false;
+    hold_id(w, node, (uint32_t)id);
+    return true;
 }
 
 /* Roots are sorted structurally, so fact ids do not depend on occurrence order. A
@@ -760,6 +923,17 @@ static bool compose_fact(composed_fact_t *fact, const cbm_resolve_record_t *row,
     return cbm_resolve_proof_compose(&fact->view, CBM_PROOF_OCCURRENCE_BINDING, &source, &key,
                                      &outcome, fact->premises, count, true);
 }
+/* The same fact when only its payload will be read: a root's fingerprint is already known. */
+static bool compose_fact_payload(composed_fact_t *fact, const cbm_resolve_record_t *row,
+                                 const char *project) {
+    cbm_resolve_proof_source_t source;
+    cbm_resolve_proof_key_t key;
+    cbm_resolve_result_t outcome;
+    size_t count = 0;
+    cbm_resolve_record_envelope(row, project, &source, &key, &outcome, fact->premises, &count);
+    return cbm_resolve_proof_compose_payload(&fact->view, CBM_PROOF_OCCURRENCE_BINDING, &source,
+                                             &key, &outcome, fact->premises, count, true);
+}
 /* Composition of these rows already succeeded when their fingerprints were taken. */
 static const cbm_resolve_proof_view_t *root_view(const fact_root_t *root, composed_fact_t *fact) {
     if (!root_is_row(root))
@@ -781,8 +955,8 @@ static int compare_roots(const void *left, const void *right) {
 /* A composed root that compares equal to its neighbour is one fact with it, as
  * interning would have made them: the first writes it and the others take its id.
  * Two nodes are the same fact only if they are the same node. */
-static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_root_t *previous,
-                       const cbm_resolve_record_t *rows, size_t *last_id) {
+static bool plan_root(evidence_write_t *w, const fact_root_t *root, const fact_root_t *previous,
+                      const cbm_resolve_record_t *rows, size_t *last_id) {
     bool same =
         previous && (root_is_row(root) || root_is_row(previous)) && !compare_roots(previous, root);
     if (!root_is_row(root)) {
@@ -790,29 +964,147 @@ static bool write_root(evidence_write_t *w, const fact_root_t *root, const fact_
         if (same && !find_id(w, node)) {
             if (!grow_ids(w))
                 return false;
-            hold_id(w, node, (uint32_t)*last_id, w->last_digest);
+            hold_id(w, node, (uint32_t)*last_id);
             return true;
         }
-        if (!write_facts_from(w, node))
+        if (!plan_facts_from(w, node))
             return false;
-        const evidence_id_t *entry = find_id(w, node);
-        *last_id = entry->id;
-        memcpy(w->last_digest, id_digest(w, entry), DIGEST_BYTES);
+        *last_id = find_id(w, node)->id;
         return true;
     }
     const cbm_resolve_record_t *row = root_row(root);
     if (!same) {
         composed_fact_t fact;
-        if (!compose_fact(&fact, row, w->project))
+        if (!compose_fact_payload(&fact, row, w->project))
             return false;
         for (size_t i = 0; i < fact.view.premise_count; i++)
-            if (!write_facts_from(w, fact.view.premises[i]))
+            if (!plan_facts_from(w, fact.view.premises[i]))
                 return false;
-        if (!write_fact(w, &fact.view, NULL, last_id))
+        if (!source_matches(w, &fact.view.source) || !plan_fact(w, root->ref, last_id))
             return false;
     }
     w->row_facts[row - rows] = (uint32_t)*last_id;
     return true;
+}
+
+/* ── Digests ─────────────────────────────────────────────────────── */
+
+enum { PROOF_DEPTH_LEVELS = CBM_RESOLVE_PROOF_MAX_DEPTH };
+
+/* Workers take jobs from one counter and stop on the first failure. */
+typedef struct {
+    const evidence_write_t *w;
+    const evidence_id_t **nodes; /* Node digests: one depth at a time. */
+    size_t count;
+    const uintptr_t *refs; /* Composed digests: one batch at a time. */
+    composed_fact_t *facts;
+    unsigned char *digests;
+    _Atomic size_t next;
+    _Atomic bool failed;
+} digest_pass_t;
+
+static bool digest_job(digest_pass_t *pass, size_t job, fact_text_t *fact_text) {
+    const evidence_write_t *w = pass->w;
+    if (pass->nodes) {
+        const evidence_id_t *entry = pass->nodes[job];
+        return fact_digest(w, cbm_resolve_proof_view(entry->node), fact_text,
+                           w->digests + (size_t)entry->digest * DIGEST_BYTES);
+    }
+    if (!(pass->refs[job] & 1))
+        return true;
+    const cbm_resolve_record_t *row =
+        (const cbm_resolve_record_t *)(pass->refs[job] & ~(uintptr_t)1);
+    return compose_fact_payload(&pass->facts[job], row, w->project) &&
+           fact_digest(w, &pass->facts[job].view, fact_text, pass->digests + job * DIGEST_BYTES);
+}
+static void digest_worker(int worker, void *context) {
+    (void)worker;
+    digest_pass_t *pass = context;
+    fact_text_t fact_text;
+    if (!fact_text_begin(&fact_text)) {
+        atomic_store(&pass->failed, true);
+        return;
+    }
+    for (;;) {
+        size_t job = atomic_fetch_add_explicit(&pass->next, 1, memory_order_relaxed);
+        if (job >= pass->count || atomic_load_explicit(&pass->failed, memory_order_relaxed))
+            break;
+        if (!digest_job(pass, job, &fact_text))
+            atomic_store(&pass->failed, true);
+    }
+    fact_text_end(&fact_text);
+}
+static bool digest_run(const evidence_write_t *w, digest_pass_t *pass) {
+    atomic_init(&pass->next, 0);
+    atomic_init(&pass->failed, false);
+    if (w->workers <= 1 || pass->count < FACT_INLINE_JOBS) {
+        digest_worker(0, pass);
+    } else {
+        cbm_parallel_for_opts_t options = {.max_workers = w->workers, .force_pthreads = false};
+        cbm_parallel_for(w->workers, digest_worker, pass, options);
+    }
+    return !atomic_load(&pass->failed);
+}
+/* Every node's digest, shallowest first: a premise is always shallower than the fact
+ * citing it, so one depth at a time finds its premises done. */
+static bool digest_nodes(evidence_write_t *w) {
+    if (!w->id_count)
+        return true;
+    size_t counts[PROOF_DEPTH_LEVELS + 1] = {0};
+    for (size_t i = 0; i < w->capacity; i++) {
+        if (w->ids[i].node) {
+            uint32_t depth = cbm_resolve_proof_view(w->ids[i].node)->depth;
+            if (depth > PROOF_DEPTH_LEVELS)
+                return false;
+            counts[depth]++;
+        }
+    }
+    const evidence_id_t **sorted = cbm_alloc(CBM_MEM_CLASS_STORE, w->id_count * sizeof(*sorted));
+    if (!sorted)
+        return false;
+    size_t starts[PROOF_DEPTH_LEVELS + 2] = {0};
+    for (size_t depth = 0; depth <= PROOF_DEPTH_LEVELS; depth++)
+        starts[depth + 1] = starts[depth] + counts[depth];
+    size_t placed[PROOF_DEPTH_LEVELS + 1];
+    memcpy(placed, starts, sizeof(placed));
+    for (size_t i = 0; i < w->capacity; i++)
+        if (w->ids[i].node)
+            sorted[placed[cbm_resolve_proof_view(w->ids[i].node)->depth]++] = &w->ids[i];
+    bool ok = true;
+    for (size_t depth = 0; ok && depth <= PROOF_DEPTH_LEVELS; depth++) {
+        if (!counts[depth])
+            continue;
+        digest_pass_t pass = {.w = w, .nodes = sorted + starts[depth], .count = counts[depth]};
+        ok = digest_run(w, &pass);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, sorted);
+    return ok;
+}
+/* Rows in fact-id order. A composed fact's digest is needed once, for its own row, so a
+ * batch is composed and digested together and dropped when its rows are written. */
+static bool write_planned_facts(evidence_write_t *w) {
+    composed_fact_t *facts = cbm_alloc(CBM_MEM_CLASS_STORE, FACT_BATCH * sizeof(*facts));
+    unsigned char *digests = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)FACT_BATCH * DIGEST_BYTES);
+    bool ok = facts && digests;
+    for (size_t first = 0; ok && first < w->count; first += FACT_BATCH) {
+        size_t count = w->count - first < FACT_BATCH ? w->count - first : FACT_BATCH;
+        digest_pass_t pass = {
+            .w = w, .count = count, .refs = w->order + first, .facts = facts, .digests = digests};
+        ok = digest_run(w, &pass);
+        for (size_t i = 0; ok && i < count; i++) {
+            uintptr_t ref = w->order[first + i];
+            if (ref & 1) {
+                ok = write_fact_row(w, &facts[i].view, first + i + 1, digests + i * DIGEST_BYTES);
+            } else {
+                const cbm_resolve_proof_t *node = (const cbm_resolve_proof_t *)ref;
+                ok = write_fact_row(w, cbm_resolve_proof_view(node), first + i + 1,
+                                    id_digest(w, find_id(w, node)));
+            }
+        }
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, facts);
+    cbm_free(CBM_MEM_CLASS_STORE, digests);
+    return ok;
 }
 static bool write_facts(evidence_write_t *w, fact_root_t *roots, size_t count,
                         const cbm_resolve_record_t *rows) {
@@ -824,12 +1116,12 @@ static bool write_facts(evidence_write_t *w, fact_root_t *roots, size_t count,
         qsort(roots, count, sizeof(*roots), compare_roots);
     size_t last_id = 0;
     for (size_t i = 0; i < count; i++)
-        if (!write_root(w, &roots[i], i ? &roots[i - 1] : NULL, rows, &last_id))
+        if (!plan_root(w, &roots[i], i ? &roots[i - 1] : NULL, rows, &last_id))
             return false;
-    return true;
+    return digest_nodes(w) && write_planned_facts(w);
 }
 /* A row's occurrence fact, or the node it already has. */
-static bool collect_row_roots(evidence_write_t *w, const cbm_resolve_record_t *row,
+static bool collect_row_roots(const evidence_write_t *w, const cbm_resolve_record_t *row,
                               fact_root_t *roots, size_t *count) {
     if (row->envelope_pending) {
         composed_fact_t fact;
@@ -845,6 +1137,63 @@ static bool collect_row_roots(evidence_write_t *w, const cbm_resolve_record_t *r
         roots[(*count)++] = (fact_root_t){.fingerprint = row->binding_proof->value.fingerprint,
                                           .ref = (uintptr_t)row->binding_proof};
     return true;
+}
+/* Fingerprinting a composed fact hashes all its text. A chunk of rows owns a known stretch
+ * of roots, so the chunks need no coordination and the roots keep their row order. */
+typedef struct {
+    const evidence_write_t *w;
+    const cbm_resolve_record_t *rows;
+    size_t row_count;
+    fact_root_t *roots;
+    const size_t *chunk_starts;
+    _Atomic size_t next;
+    _Atomic bool failed;
+} root_pass_t;
+
+static void root_worker(int worker, void *context) {
+    (void)worker;
+    root_pass_t *pass = context;
+    size_t chunks = (pass->row_count + ROOT_CHUNK_ROWS - 1) / ROOT_CHUNK_ROWS;
+    for (;;) {
+        size_t chunk = atomic_fetch_add_explicit(&pass->next, 1, memory_order_relaxed);
+        if (chunk >= chunks)
+            break;
+        size_t first = chunk * ROOT_CHUNK_ROWS;
+        size_t last =
+            first + ROOT_CHUNK_ROWS < pass->row_count ? first + ROOT_CHUNK_ROWS : pass->row_count;
+        size_t at = pass->chunk_starts[chunk];
+        for (size_t i = first; i < last; i++)
+            if (!collect_row_roots(pass->w, &pass->rows[i], pass->roots, &at))
+                atomic_store(&pass->failed, true);
+    }
+}
+static bool collect_all_row_roots(const evidence_write_t *w, const cbm_resolve_record_t *rows,
+                                  size_t count, fact_root_t *roots, size_t *root_count) {
+    if (!count)
+        return true;
+    size_t chunks = (count + ROOT_CHUNK_ROWS - 1) / ROOT_CHUNK_ROWS;
+    size_t *starts = cbm_alloc(CBM_MEM_CLASS_STORE, chunks * sizeof(*starts));
+    if (!starts)
+        return false;
+    size_t at = *root_count;
+    for (size_t i = 0; i < count; i++) {
+        if (i % ROOT_CHUNK_ROWS == 0)
+            starts[i / ROOT_CHUNK_ROWS] = at;
+        at += (rows[i].envelope_pending || rows[i].result.proof) + (rows[i].binding_proof != NULL);
+    }
+    root_pass_t pass = {
+        .w = w, .rows = rows, .row_count = count, .roots = roots, .chunk_starts = starts};
+    atomic_init(&pass.next, 0);
+    atomic_init(&pass.failed, false);
+    if (w->workers <= 1 || chunks == 1) {
+        root_worker(0, &pass);
+    } else {
+        cbm_parallel_for_opts_t options = {.max_workers = w->workers, .force_pthreads = false};
+        cbm_parallel_for(w->workers, root_worker, &pass, options);
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, starts);
+    *root_count = at;
+    return !atomic_load(&pass.failed);
 }
 
 /* ── Generation reset ────────────────────────────────────────────── */
@@ -870,17 +1219,20 @@ static bool project_id(sqlite3 *db, const char *project, sqlite3_int64 *pid) {
     sqlite3_finalize(s);
     return ok;
 }
-static bool reset_tables(sqlite3 *db, const char *project, sqlite3_int64 *pid) {
+static bool reset_tables(sqlite3 *db, const char *project, sqlite3_int64 *pid, bool rows_written) {
     char *schema = schema_sql();
     bool created = schema && sqlite3_exec(db, schema, NULL, NULL, NULL) == SQLITE_OK;
     cbm_free(CBM_MEM_CLASS_STORE, schema);
     if (!created || !project_id(db, project, pid))
         return false;
+    /* Those rows were written for the first project of a new file. */
+    if (rows_written && *pid != DIRECT_PID)
+        return false;
     const char *by_pid[] = {"DELETE FROM resolver_text WHERE pid=?",
                             "DELETE FROM resolver_occurrence_rows WHERE pid=?",
                             "DELETE FROM resolver_fact_rows WHERE pid=?",
                             "DELETE FROM resolver_support_rows WHERE pid=?"};
-    for (size_t i = 0; i < sizeof(by_pid) / sizeof(by_pid[0]); i++) {
+    for (size_t i = 0; !rows_written && i < sizeof(by_pid) / sizeof(by_pid[0]); i++) {
         sqlite3_stmt *s = NULL;
         bool ok = sqlite3_prepare_v2(db, by_pid[i], -1, &s, NULL) == SQLITE_OK &&
                   sqlite3_bind_int64(s, 1, *pid) == SQLITE_OK && sqlite3_step(s) == SQLITE_DONE;
@@ -944,6 +1296,38 @@ static bool bind_occurrence(evidence_write_t *w, const cbm_resolve_record_t *row
            sqlite3_bind_int64(s, 23, proof) == SQLITE_OK &&
            sqlite3_bind_int64(s, 24, binding ? (sqlite3_int64)binding->id : 0) == SQLITE_OK;
 }
+static bool table_occurrence(evidence_write_t *w, const cbm_resolve_record_t *row, size_t ordinal,
+                             sqlite3_int64 proof, const evidence_id_t *binding) {
+    cbm_writer_table_t *t = w->occurrence_table;
+    const cbm_resolve_result_t *r = &row->result;
+    int32_t line = -1;
+    cbm_writer_row_begin(t);
+    cbm_writer_row_int(t, w->pid);
+    cbm_writer_row_int(t, (sqlite3_int64)ordinal);
+    bool ok = table_text_id(t, dict_id(w, row->file_path, true)) &&
+              table_text_id(t, dict_id(w, row->scope, true)) &&
+              table_text_id(t, dict_id(w, row->relation, true)) &&
+              table_text_id(t, dict_id(w, row->spelling, true));
+    cbm_writer_row_int(t, row->start_byte);
+    cbm_writer_row_int(t, (sqlite3_int64)row->end_byte - row->start_byte);
+    cbm_writer_row_int(t, (int)row->source_origin);
+    cbm_writer_row_int(t, (int)r->binding);
+    cbm_writer_row_int(t, (int)r->domain);
+    cbm_writer_row_int(t, (int)r->analysis);
+    cbm_writer_row_int(t, (int)r->rule);
+    cbm_writer_row_int(t, r->facts);
+    ok = ok && table_text_id(t, dict_id(w, r->target, true));
+    cbm_writer_row_int(t, (sqlite3_int64)r->candidate_count);
+    ok = ok && table_text_id(t, dict_id(w, r->reason, true));
+    cbm_writer_row_int(t, row->emitted ? 1 : 0);
+    ok = ok && table_text_id(t, properties_id(w, row, &line));
+    cbm_writer_row_int(t, line);
+    ok = ok && table_text_id(t, dict_id(w, row->content_identity, true)) &&
+         table_text_id(t, dict_id(w, row->configuration_identity, true));
+    cbm_writer_row_int(t, proof);
+    cbm_writer_row_int(t, binding ? (sqlite3_int64)binding->id : 0);
+    return table_finish(w, t, ok, "occurrences");
+}
 static bool write_occurrences(evidence_write_t *w, const cbm_resolve_record_t *rows, size_t count) {
     for (size_t i = 0; i < count; i++) {
         evidence_id_t *node = rows[i].envelope_pending ? NULL : find_id(w, rows[i].result.proof);
@@ -959,11 +1343,13 @@ static bool write_occurrences(evidence_write_t *w, const cbm_resolve_record_t *r
                                              .source_origin = rows[i].source_origin};
         /* A claimed emitted row must satisfy the same admission as its edge.
          * A failed metadata write aborts publication, never fabricates zero. */
-        if (rows[i].proof_borrowed ||
-            (rows[i].emitted &&
-             (!cbm_resolve_record_admit(&rows[i]) || !proof || !source_matches(w, &source))) ||
-            !finish_row(w, w->occurrence, bind_occurrence(w, &rows[i], i, proof, binding),
-                        "occurrences"))
+        if (rows[i].proof_borrowed || (rows[i].emitted && (!cbm_resolve_record_admit(&rows[i]) ||
+                                                           !proof || !source_matches(w, &source))))
+            return false;
+        if (w->occurrence_table
+                ? !table_occurrence(w, &rows[i], i, proof, binding)
+                : !finish_row(w, w->occurrence, bind_occurrence(w, &rows[i], i, proof, binding),
+                              "occurrences"))
             return false;
     }
     return true;
@@ -981,30 +1367,26 @@ static int compare_summaries(const void *a, const void *b) {
         order = left->kind < right->kind ? -1 : 1;
     return order;
 }
-static bool write_summaries(evidence_write_t *w, const cbm_resolve_summary_t *const *rows,
-                            size_t count) {
+static bool write_summaries(evidence_write_t *w, const cbm_resolver_stage_t *stage) {
     sqlite3_stmt *s = NULL;
     bool ok = sqlite3_prepare_v2(
                   w->db, "INSERT INTO resolver_derived_bindings VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                   -1, &s, NULL) == SQLITE_OK;
-    for (size_t i = 0; ok && i < count; i++) {
-        const cbm_resolve_summary_t *row = rows[i];
-        evidence_id_t *proof = find_id(w, row->result.proof);
-        ok = !row->proof_borrowed &&
-             finish_row(w, s,
-                        bind_text(s, 1, w->project) && bind_text(s, 2, row->file_path) &&
-                            bind_text(s, 3, row->key) &&
-                            sqlite3_bind_int64(s, 4, row->kind) == SQLITE_OK &&
-                            sqlite3_bind_int(s, 5, row->module) == SQLITE_OK &&
-                            sqlite3_bind_int(s, 6, row->closed) == SQLITE_OK &&
-                            sqlite3_bind_int(s, 7, row->result.binding) == SQLITE_OK &&
-                            sqlite3_bind_int(s, 8, row->result.domain) == SQLITE_OK &&
-                            sqlite3_bind_int(s, 9, row->result.analysis) == SQLITE_OK &&
-                            bind_text(s, 10, row->result.target) &&
-                            sqlite3_bind_int64(s, 11, proof ? (sqlite3_int64)proof->id : 0) ==
-                                SQLITE_OK &&
-                            bind_text(s, 12, row->payload_json),
-                        "derived_bindings");
+    for (size_t i = 0; ok && i < stage->summary_count; i++) {
+        const cbm_resolve_summary_t *row = stage->summaries[i];
+        ok = finish_row(
+            w, s,
+            bind_text(s, 1, w->project) && bind_text(s, 2, row->file_path) &&
+                bind_text(s, 3, row->key) && sqlite3_bind_int64(s, 4, row->kind) == SQLITE_OK &&
+                sqlite3_bind_int(s, 5, row->module) == SQLITE_OK &&
+                sqlite3_bind_int(s, 6, row->closed) == SQLITE_OK &&
+                sqlite3_bind_int(s, 7, row->result.binding) == SQLITE_OK &&
+                sqlite3_bind_int(s, 8, row->result.domain) == SQLITE_OK &&
+                sqlite3_bind_int(s, 9, row->result.analysis) == SQLITE_OK &&
+                bind_text(s, 10, row->result.target) &&
+                sqlite3_bind_int64(s, 11, (sqlite3_int64)stage->summary_proofs[i]) == SQLITE_OK &&
+                bind_text(s, 12, row->payload_json),
+            "derived_bindings");
     }
     sqlite3_finalize(s);
     return ok;
@@ -1036,16 +1418,28 @@ static void hash_type_states(evidence_write_t *w, cbm_sha256_ctx *hash, const ch
         cbm_resolve_hash_text(hash, hex);
     }
 }
-static bool write_files(evidence_write_t *w, const cbm_resolve_summary_t *const *rows,
-                        size_t count) {
-    sqlite3_stmt *s = NULL;
-    bool ok = sqlite3_prepare_v2(
-                  w->db, "INSERT INTO resolver_file_summaries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", -1,
-                  &s, NULL) == SQLITE_OK;
+/* Each file's digest of its derived facts and each summary's fact id: all that the two
+ * remaining tables take from the facts. */
+static bool decide_stage(evidence_write_t *w, cbm_resolver_stage_t *stage) {
+    const cbm_resolve_summary_t *const *rows = stage->summaries;
+    size_t count = stage->summary_count;
+    stage->summary_proofs =
+        count ? cbm_alloc(CBM_MEM_CLASS_STORE, count * sizeof(*stage->summary_proofs)) : NULL;
+    stage->derived = stage->file_count ? cbm_alloc(CBM_MEM_CLASS_STORE,
+                                                   stage->file_count * sizeof(*stage->derived))
+                                       : NULL;
+    if ((count && !stage->summary_proofs) || (stage->file_count && !stage->derived))
+        return false;
+    for (size_t i = 0; i < count; i++) {
+        if (rows[i]->proof_borrowed)
+            return false;
+        const evidence_id_t *proof = find_id(w, rows[i]->result.proof);
+        stage->summary_proofs[i] = proof ? proof->id : 0;
+    }
     if (w->type_count > 1)
         qsort(w->types, w->type_count, sizeof(*w->types), compare_type_digest);
     size_t at = 0;
-    for (size_t i = 0; ok && i < w->file_count; i++) {
+    for (size_t i = 0; i < w->file_count; i++) {
         const cbm_resolve_file_t *file = w->files[i];
         cbm_sha256_ctx hash;
         cbm_sha256_init(&hash);
@@ -1070,8 +1464,17 @@ static bool write_files(evidence_write_t *w, const cbm_resolve_summary_t *const 
             cbm_resolve_hash_text(&hash, hex);
         }
         hash_type_states(w, &hash, file->file_path);
-        char derived[65];
-        cbm_resolve_hash_finish(&hash, derived);
+        cbm_resolve_hash_finish(&hash, stage->derived[i]);
+    }
+    return true;
+}
+static bool write_files(evidence_write_t *w, const cbm_resolver_stage_t *stage) {
+    sqlite3_stmt *s = NULL;
+    bool ok = sqlite3_prepare_v2(
+                  w->db, "INSERT INTO resolver_file_summaries VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", -1,
+                  &s, NULL) == SQLITE_OK;
+    for (size_t i = 0; ok && i < stage->file_count; i++) {
+        const cbm_resolve_file_t *file = stage->files[i];
         ok = finish_row(
             w, s,
             bind_text(s, 1, w->project) && bind_text(s, 2, file->file_path) &&
@@ -1082,7 +1485,7 @@ static bool write_files(evidence_write_t *w, const cbm_resolve_summary_t *const 
                 bind_text(s, 7, file->configuration_identity) &&
                 sqlite3_bind_int64(s, 8, (sqlite3_int64)file->raw_length) == SQLITE_OK &&
                 sqlite3_bind_int64(s, 9, (sqlite3_int64)file->preprocessed_length) == SQLITE_OK &&
-                bind_text(s, 10, file->extracted_summary) && bind_text(s, 11, derived) &&
+                bind_text(s, 10, file->extracted_summary) && bind_text(s, 11, stage->derived[i]) &&
                 sqlite3_bind_int(s, 12, file->complete) == SQLITE_OK,
             "file_summaries");
     }
@@ -1103,29 +1506,102 @@ static bool prepare_writer(evidence_write_t *w) {
                               "?,?,?,?,?,?,?,?,?,?,?,?,?)",
                               -1, &w->occurrence, NULL) == SQLITE_OK;
 }
-bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_resolve_record_t *rows,
-                                 size_t count, const cbm_resolve_file_t *files, size_t file_count,
-                                 const cbm_resolve_summary_t *summaries, size_t summary_count,
-                                 bool commit_batches) {
-    if (!db || !project || (!rows && count) || (!files && file_count) ||
+void cbm_store_resolver_stage_free(cbm_resolver_stage_t *stage) {
+    if (!stage)
+        return;
+    for (size_t i = 0; i < sizeof(stage->table_sql) / sizeof(stage->table_sql[0]); i++)
+        cbm_free(CBM_MEM_CLASS_STORE, stage->table_sql[i]);
+    cbm_free(CBM_MEM_CLASS_STORE, stage->summaries);
+    cbm_free(CBM_MEM_CLASS_STORE, stage->summary_proofs);
+    cbm_free(CBM_MEM_CLASS_STORE, stage->files);
+    cbm_free(CBM_MEM_CLASS_STORE, stage->derived);
+    cbm_free(CBM_MEM_CLASS_STORE, stage);
+}
+/* A table's CREATE as sqlite_schema keeps it: without IF NOT EXISTS or the ';'. */
+static char *table_create_sql(const char *table) {
+    static const char opening[] = "CREATE TABLE IF NOT EXISTS ";
+    size_t name_length = strlen(table);
+    const char *at = resolver_schema;
+    while ((at = strstr(at, opening)) != NULL) {
+        const char *name = at + sizeof(opening) - 1;
+        if (!strncmp(name, table, name_length) && name[name_length] == '(') {
+            const char *end = strchr(name, ';');
+            if (!end)
+                return NULL;
+            size_t length = (size_t)(end - name);
+            char *out = cbm_alloc(CBM_MEM_CLASS_STORE, sizeof("CREATE TABLE ") + length);
+            if (out) {
+                memcpy(out, "CREATE TABLE ", sizeof("CREATE TABLE ") - 1);
+                memcpy(out + sizeof("CREATE TABLE ") - 1, name, length);
+                out[sizeof("CREATE TABLE ") - 1 + length] = '\0';
+            }
+            return out;
+        }
+        at = name;
+    }
+    return NULL;
+}
+static bool begin_tables(evidence_write_t *w, cbm_db_writer_t *direct,
+                         cbm_resolver_stage_t *stage) {
+    static const char *const names[] = {"resolver_text", "resolver_fact_rows",
+                                        "resolver_support_rows", "resolver_occurrence_rows"};
+    cbm_writer_table_t **tables[] = {&w->text_table, &w->fact_table, &w->support_table,
+                                     &w->occurrence_table};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        stage->table_sql[i] = table_create_sql(names[i]);
+        if (!stage->table_sql[i])
+            return false;
+        *tables[i] = cbm_writer_table_begin(direct, names[i], stage->table_sql[i]);
+        if (!*tables[i])
+            return false;
+    }
+    return true;
+}
+static bool end_tables(evidence_write_t *w) {
+    cbm_writer_table_t **tables[] = {&w->text_table, &w->fact_table, &w->support_table,
+                                     &w->occurrence_table};
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        if (*tables[i])
+            ok = cbm_writer_table_end(*tables[i]) && ok;
+        *tables[i] = NULL;
+    }
+    return ok;
+}
+/* One write, with its rows going to the statements on db or to direct's pages. In the
+ * second case db is NULL, and *out takes what the store still has to write. */
+static bool evidence_run(sqlite3 *db, cbm_db_writer_t *direct, const char *project,
+                         const cbm_resolve_record_t *rows, size_t count,
+                         const cbm_resolve_file_t *files, size_t file_count,
+                         const cbm_resolve_summary_t *summaries, size_t summary_count,
+                         bool commit_batches, int workers, cbm_resolver_stage_t **out) {
+    if ((!db && !direct) || !project || (!rows && count) || (!files && file_count) ||
         (!summaries && summary_count) || count > (SIZE_MAX - summary_count) / 2 ||
         file_count > SIZE_MAX / sizeof(void *) || summary_count > SIZE_MAX / sizeof(void *))
         return false;
     size_t root_capacity = summary_count;
     for (size_t i = 0; i < count; i++)
-        root_capacity += (rows[i].result.proof != NULL) + (rows[i].binding_proof != NULL);
+        root_capacity +=
+            (rows[i].envelope_pending || rows[i].result.proof) + (rows[i].binding_proof != NULL);
     if (root_capacity > SIZE_MAX / sizeof(fact_root_t))
         return false;
     fact_root_t *roots =
         root_capacity ? cbm_alloc(CBM_MEM_CLASS_STORE, root_capacity * sizeof(*roots)) : NULL;
+    cbm_resolver_stage_t *stage = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*stage));
     const cbm_resolve_file_t **ordered_files =
         file_count ? cbm_alloc(CBM_MEM_CLASS_STORE, file_count * sizeof(*ordered_files)) : NULL;
     const cbm_resolve_summary_t **ordered_summaries =
         summary_count ? cbm_alloc(CBM_MEM_CLASS_STORE, summary_count * sizeof(*ordered_summaries))
                       : NULL;
     dict_cache_t *cache = cbm_calloc(CBM_MEM_CLASS_STORE, DICT_CACHE_SLOTS * sizeof(*cache));
-    bool ok = (!root_capacity || roots) && (!file_count || ordered_files) &&
+    bool ok = (!root_capacity || roots) && stage && (!file_count || ordered_files) &&
               (!summary_count || ordered_summaries) && cache;
+    if (stage) {
+        stage->summaries = ordered_summaries;
+        stage->summary_count = summary_count;
+        stage->files = ordered_files;
+        stage->file_count = file_count;
+    }
     size_t root_count = 0;
     for (size_t i = 0; ok && i < summary_count; i++) {
         ordered_summaries[i] = &summaries[i];
@@ -1143,8 +1619,12 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     evidence_write_t *writer = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*writer));
     if (!writer) {
         cbm_free(CBM_MEM_CLASS_STORE, roots);
-        cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
-        cbm_free(CBM_MEM_CLASS_STORE, ordered_summaries);
+        if (stage) {
+            cbm_store_resolver_stage_free(stage);
+        } else {
+            cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
+            cbm_free(CBM_MEM_CLASS_STORE, ordered_summaries);
+        }
         cbm_free(CBM_MEM_CLASS_STORE, cache);
         return false;
     }
@@ -1154,21 +1634,29 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     w->files = ordered_files;
     w->file_count = file_count;
     w->cache = cache;
+    w->valid_text = cbm_calloc(CBM_MEM_CLASS_STORE, DICT_CACHE_SLOTS * sizeof(*w->valid_text));
+    ok = ok && w->valid_text;
     w->commit_batches = commit_batches;
+    w->workers = workers;
     cbm_arena_init(&w->owned);
     w->row_facts = count ? cbm_calloc(CBM_MEM_CLASS_STORE, count * sizeof(*w->row_facts)) : NULL;
 #if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
     held_digests = 0;
 #endif
     ok = ok && (!count || w->row_facts);
-    for (size_t i = 0; ok && i < count; i++)
-        ok = collect_row_roots(w, &rows[i], roots, &root_count);
-    ok = ok && reset_tables(db, project, &w->pid) && prepare_writer(w) &&
-         write_facts(w, roots, root_count, rows);
+    ok = ok && collect_all_row_roots(w, rows, count, roots, &root_count);
+    if (direct) {
+        w->pid = DIRECT_PID;
+        ok = ok && begin_tables(w, direct, stage);
+    } else {
+        ok = ok && reset_tables(db, project, &w->pid, false) && prepare_writer(w);
+    }
+    ok = ok && write_facts(w, roots, root_count, rows);
     cbm_free(CBM_MEM_CLASS_STORE, roots);
-    ok = ok && write_occurrences(w, rows, count) &&
-         write_summaries(w, ordered_summaries, summary_count) &&
-         write_files(w, ordered_summaries, summary_count);
+    ok = ok && write_occurrences(w, rows, count) && decide_stage(w, stage);
+    ok = end_tables(w) && ok;
+    if (!direct)
+        ok = ok && write_summaries(w, stage) && write_files(w, stage);
     sqlite3_finalize(w->text);
     sqlite3_finalize(w->fact);
     sqlite3_finalize(w->support);
@@ -1180,12 +1668,48 @@ bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_res
     cbm_free(CBM_MEM_CLASS_STORE, w->digests);
     cbm_free(CBM_MEM_CLASS_STORE, w->dict);
     cbm_free(CBM_MEM_CLASS_STORE, w->types);
-    cbm_free(CBM_MEM_CLASS_STORE, w->fact_text.bytes);
+    cbm_free(CBM_MEM_CLASS_STORE, w->order);
+    cbm_free(CBM_MEM_CLASS_STORE, w->valid_text);
     cbm_free(CBM_MEM_CLASS_STORE, w->row_facts);
     cbm_free(CBM_MEM_CLASS_STORE, cache);
     cbm_arena_destroy(&w->owned);
     cbm_free(CBM_MEM_CLASS_STORE, writer);
-    cbm_free(CBM_MEM_CLASS_STORE, ordered_files);
-    cbm_free(CBM_MEM_CLASS_STORE, ordered_summaries);
+    if (ok && out)
+        *out = stage;
+    else
+        cbm_store_resolver_stage_free(stage);
+    return ok;
+}
+bool cbm_store_resolver_evidence(sqlite3 *db, const char *project, const cbm_resolve_record_t *rows,
+                                 size_t count, const cbm_resolve_file_t *files, size_t file_count,
+                                 const cbm_resolve_summary_t *summaries, size_t summary_count,
+                                 bool commit_batches, int workers) {
+    return db && evidence_run(db, NULL, project, rows, count, files, file_count, summaries,
+                              summary_count, commit_batches, workers, NULL);
+}
+cbm_resolver_stage_t *cbm_store_resolver_stage_write(cbm_db_writer_t *writer, const char *project,
+                                                     const cbm_resolve_record_t *rows, size_t count,
+                                                     const cbm_resolve_file_t *files,
+                                                     size_t file_count,
+                                                     const cbm_resolve_summary_t *summaries,
+                                                     size_t summary_count, int workers) {
+    cbm_resolver_stage_t *stage = NULL;
+    return writer && evidence_run(NULL, writer, project, rows, count, files, file_count, summaries,
+                                  summary_count, false, workers, &stage)
+               ? stage
+               : NULL;
+}
+bool cbm_store_resolver_stage_finish(sqlite3 *db, const char *project,
+                                     const cbm_resolver_stage_t *stage) {
+    if (!db || !project || !stage)
+        return false;
+    evidence_write_t *w = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*w));
+    if (!w)
+        return false;
+    w->db = db;
+    w->project = project;
+    bool ok = reset_tables(db, project, &w->pid, true) && write_summaries(w, stage) &&
+              write_files(w, stage);
+    cbm_free(CBM_MEM_CLASS_STORE, w);
     return ok;
 }
