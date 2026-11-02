@@ -24,6 +24,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 enum { PHP_MAX_WRITES = 8, PHP_MAX_EXPR_DEPTH = 24 };
 

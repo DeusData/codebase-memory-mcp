@@ -1176,6 +1176,10 @@ typedef struct {
     /* TypeScript: 0 not asked yet, 1 the file leaves the global utility types alone, 2 it declares
      * or imports one of them under its own meaning. */
     signed char ts_global_types;
+    /* C#: the first named file-scoped namespace of the tree under cs_file_ns_top. */
+    const void *cs_file_ns_top;
+    const char *cs_file_ns_name;
+    uint32_t cs_file_ns_start;
 } CBMExtractCtx;
 
 /* Internal configured-definition seams. No declarations pointer enters a result. */
@@ -1309,6 +1313,31 @@ TSTree *cbm_parse_source_repairing_ex(TSParser *parser, CBMLanguage language, co
  * extraction and the semantic passes read one tree shape. */
 TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
                            TSParseOptions opts);
+/* Exactly ts_parser_parse_string(parser, NULL, source, length), for the passes that read a
+ * file's plain parse. See cbm_parse_bind. */
+TSTree *cbm_parse_plain(TSParser *parser, const char *source, uint32_t length);
+/* A finished parse this thread may hand out. Until the next bind, a parse of exactly these
+ * bytes in this grammar and a compatible mode returns a copy of bound->tree instead of
+ * parsing: a tree is a pure function of those inputs. A file ending in a newline parses the
+ * same whether or not cbm_parse_source would have terminated it. NULL unbinds. */
+typedef enum {
+    CBM_PARSE_NONE = 0,
+    CBM_PARSE_PLAIN,      /* cbm_parse_plain */
+    CBM_PARSE_TERMINATED, /* cbm_parse_source */
+    CBM_PARSE_C           /* cbm_parse_c_source */
+} cbm_parse_mode_t;
+typedef struct {
+    cbm_parse_mode_t mode;
+    const TSLanguage *language;
+    const char *source;
+    uint32_t length;
+    TSTree *tree;
+} cbm_parse_bound_t;
+void cbm_parse_bind(const cbm_parse_bound_t *bound);
+/* Between begin and end this thread keeps its own parses of one file, under the same rule,
+ * so the passes a worker runs over that file share them. begin also ends the last one. */
+void cbm_parse_memo_begin(void);
+void cbm_parse_memo_end(void);
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.

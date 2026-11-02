@@ -11,7 +11,8 @@
  * INVALIDATIONS counts binding versions replaced;
  * STORED_RECORDS counts successful resolver metadata row writes;
  * SYNTAX_CHILD_STEPS counts the sibling steps taken to enumerate a node's named
- * children, the cost that was quadratic when each child was fetched by index. */
+ * children, the cost that was quadratic when each child was fetched by index;
+ * SYNTAX_INDEX_NODES counts the nodes a syntax index listed to answer such questions. */
 typedef enum {
     CBM_RESOLVE_STAT_LOOKUP_PROBES,
     CBM_RESOLVE_STAT_CANDIDATE_VISITS,
@@ -19,6 +20,7 @@ typedef enum {
     CBM_RESOLVE_STAT_INVALIDATIONS,
     CBM_RESOLVE_STAT_STORED_RECORDS,
     CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS,
+    CBM_RESOLVE_STAT_SYNTAX_INDEX_NODES,
     CBM_RESOLVE_STAT_COUNT
 } cbm_resolve_stat_t;
 

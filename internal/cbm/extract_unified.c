@@ -14,6 +14,7 @@ enum { MAX_INFRA_BINDINGS = 8 };
 #include <stdint.h> // uint32_t, uint8_t
 #include <string.h>
 #include <strings.h> // strcasecmp (ObjectScript type inference)
+#include "resolve/syntax_index.h"
 
 // --- Scope stack management ---
 

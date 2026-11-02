@@ -28,6 +28,7 @@
 #include "tree_sitter/api.h"
 #include <stdint.h>
 #include <string.h>
+#include "resolve/syntax_index.h"
 
 enum {
     CHAN_CONST_CAP = 256,  /* max tracked identifiers per file */

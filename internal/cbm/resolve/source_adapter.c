@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 enum { SOURCE_MAX_VISITS = 4000000, SOURCE_MAX_DEPTH = 400 };
 
@@ -423,7 +424,7 @@ static TSTree *parse_source(const CBMFileResult *result, CBMLanguage language, c
         return NULL;
     TSTree *tree = NULL;
     if (ts_parser_set_language(parser, cbm_ts_language(language)))
-        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        tree = cbm_parse_plain(parser, source, (uint32_t)source_len);
     ts_parser_delete(parser);
     *owned = tree;
     return tree;
@@ -585,7 +586,10 @@ bool cbm_source_collect(cbm_source_table_t *table, const CBMFileResult *result,
                               .source_len = source_len,
                               .writable = table,
                               .root = ts_tree_root_node(tree)};
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     (usable ? adapter->collect : adapter->collect_unusable)(&walk);
+    cbm_syntax_index_end(&syntax);
     cbm_ht_free(walk.def_index);
     if (walk.failure)
         table->incomplete[language] = true;
@@ -637,7 +641,10 @@ cbm_source_unit_t *cbm_source_unit_build(CBMArena *arena, const cbm_source_table
                               .table = table,
                               .unit = unit,
                               .root = ts_tree_root_node(tree)};
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     adapter->resolve(&walk);
+    cbm_syntax_index_end(&syntax);
     cbm_ht_free(walk.def_index);
     if (walk.failure) {
         unit->failure = walk.failure;

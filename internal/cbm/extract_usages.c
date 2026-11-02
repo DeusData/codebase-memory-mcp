@@ -12,6 +12,7 @@ enum { LAST_IDX = 1 };
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 #include <stdatomic.h>

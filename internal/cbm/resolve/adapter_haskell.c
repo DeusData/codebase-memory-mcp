@@ -29,6 +29,7 @@
 #include "source_adapter_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include "syntax_index.h"
 
 #define HS_EXPORT_KEY_PREFIX "&export:"
 #define HS_EXPORTS_ALL "&exports_all"

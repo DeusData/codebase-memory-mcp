@@ -34,6 +34,7 @@
  * abstains in cbm_source_unique_qn rather than picking one. */
 #include "source_adapter_internal.h"
 #include <stdlib.h>
+#include "syntax_index.h"
 
 typedef struct {
     const char *local;

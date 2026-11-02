@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "resolve/syntax_index.h"
 
 /* Local constants. */
 enum {

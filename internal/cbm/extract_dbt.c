@@ -39,6 +39,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include "resolve/syntax_index.h"
 
 /* Local constants. */
 enum { DBT_FIRST_LINE = 1 };

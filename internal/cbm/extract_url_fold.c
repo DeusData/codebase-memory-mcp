@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "resolve/syntax_index.h"
 
 /* FOLD_BUF matches the template flattener's limit; FOLD_MAX_DEPTH bounds the
  * recursion of nested `a + b + c` chains and templates; object-literal endpoint

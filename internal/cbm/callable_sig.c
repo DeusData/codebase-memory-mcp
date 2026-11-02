@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "resolve/syntax_index.h"
 
 enum {
     SIG_DEPTH_LIMIT = 64,                   /* type subtree recursion bound */

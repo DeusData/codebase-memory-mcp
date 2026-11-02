@@ -235,7 +235,7 @@ bool cbm_php_collect_source_facts(CBMArena *arena, const char *source, int sourc
     if (!parser)
         return false;
     ts_parser_set_language(parser, tree_sitter_php_only());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+    TSTree *tree = cbm_parse_plain(parser, source, (uint32_t)source_len);
     ts_parser_delete(parser);
     if (!tree)
         return false;

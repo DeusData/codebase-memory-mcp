@@ -11,6 +11,7 @@ enum { MAX_EXCEPTION_NAME_LEN = 100, LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 // Field name length for ts_node_child_by_field_name() calls.
 #define FIELD_LEN_CONSTRUCTOR 11 // strlen("constructor")

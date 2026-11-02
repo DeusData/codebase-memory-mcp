@@ -48,6 +48,7 @@
 // Atomic counters for profiling parse vs extraction time (nanoseconds).
 // Accessed from multiple threads; using _Atomic for safe accumulation.
 #include <stdatomic.h>
+#include "resolve/syntax_index.h"
 static _Atomic uint64_t total_parse_ns = 0;
 static _Atomic uint64_t total_extract_ns = 0;
 static _Atomic uint64_t total_lsp_ns = 0;
@@ -539,6 +540,110 @@ static TSPoint cbm_source_end_point(const char *source, uint32_t len) {
     return end;
 }
 
+static CBM_TLS const cbm_parse_bound_t *tl_parse_bound;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+/* Parses answered by a bound tree, in this process. */
+_Atomic size_t cbm_parse_test_trees_shared;
+#endif
+
+void cbm_parse_bind(const cbm_parse_bound_t *bound) {
+    tl_parse_bound = bound;
+}
+
+/* Two parses of one file can differ: a file with no final newline in its two modes, or
+ * a C-family file. Past that a pass is asking about another file, so the oldest goes. */
+enum { CBM_PARSE_MEMO_ENTRIES = 2 };
+typedef struct {
+    bool active;
+    int next;
+    cbm_parse_bound_t entries[CBM_PARSE_MEMO_ENTRIES];
+} cbm_parse_memo_t;
+static CBM_TLS cbm_parse_memo_t tl_parse_memo;
+
+static void cbm_parse_memo_drop(cbm_parse_bound_t *entry) {
+    if (entry->tree)
+        ts_tree_delete(entry->tree);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, (void *)entry->source);
+    *entry = (cbm_parse_bound_t){.mode = CBM_PARSE_NONE};
+}
+
+void cbm_parse_memo_end(void) {
+    for (int i = 0; i < CBM_PARSE_MEMO_ENTRIES; i++)
+        cbm_parse_memo_drop(&tl_parse_memo.entries[i]);
+    tl_parse_memo.active = false;
+    tl_parse_memo.next = 0;
+}
+
+void cbm_parse_memo_begin(void) {
+    cbm_parse_memo_end();
+    tl_parse_memo.active = true;
+}
+
+/* A parser reading only part of the file makes another tree of the same bytes. */
+static bool cbm_parse_whole_file(const TSParser *parser) {
+    uint32_t count = 0;
+    const TSRange *ranges = ts_parser_included_ranges(parser, &count);
+    return count == 1 && ranges[0].start_byte == 0 && ranges[0].end_byte == UINT32_MAX;
+}
+
+static bool cbm_parse_answers(const cbm_parse_bound_t *bound, const TSParser *parser,
+                              const char *source, uint32_t length, cbm_parse_mode_t mode) {
+    if (!bound || !bound->tree || bound->length != length || !length ||
+        ts_parser_language(parser) != bound->language)
+        return false;
+    if (mode != bound->mode &&
+        (mode == CBM_PARSE_C || bound->mode == CBM_PARSE_C || source[length - 1] != '\n'))
+        return false;
+    return source == bound->source || !memcmp(source, bound->source, length);
+}
+
+static TSTree *cbm_parse_take_bound(const TSParser *parser, const char *source, uint32_t length,
+                                    cbm_parse_mode_t mode) {
+    const cbm_parse_bound_t *found = NULL;
+    if (tl_parse_bound || tl_parse_memo.active) {
+        if (!cbm_parse_whole_file(parser))
+            return NULL;
+        if (cbm_parse_answers(tl_parse_bound, parser, source, length, mode))
+            found = tl_parse_bound;
+        for (int i = 0; !found && tl_parse_memo.active && i < CBM_PARSE_MEMO_ENTRIES; i++)
+            if (cbm_parse_answers(&tl_parse_memo.entries[i], parser, source, length, mode))
+                found = &tl_parse_memo.entries[i];
+    }
+    if (!found)
+        return NULL;
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    atomic_fetch_add_explicit(&cbm_parse_test_trees_shared, 1, memory_order_relaxed);
+#endif
+    return ts_tree_copy(found->tree);
+}
+
+static void cbm_parse_memo_keep(const TSParser *parser, const char *source, uint32_t length,
+                                cbm_parse_mode_t mode, const TSTree *tree) {
+    if (!tl_parse_memo.active || !tree || !length || !cbm_parse_whole_file(parser))
+        return;
+    char *copy = cbm_alloc(CBM_MEM_CLASS_EXTRACT, length);
+    if (!copy)
+        return;
+    memcpy(copy, source, length);
+    cbm_parse_bound_t *entry = &tl_parse_memo.entries[tl_parse_memo.next];
+    tl_parse_memo.next = (tl_parse_memo.next + 1) % CBM_PARSE_MEMO_ENTRIES;
+    cbm_parse_memo_drop(entry);
+    *entry = (cbm_parse_bound_t){.mode = mode,
+                                 .language = ts_parser_language(parser),
+                                 .source = copy,
+                                 .length = length,
+                                 .tree = ts_tree_copy(tree)};
+}
+
+TSTree *cbm_parse_plain(TSParser *parser, const char *source, uint32_t length) {
+    TSTree *bound = cbm_parse_take_bound(parser, source, length, CBM_PARSE_PLAIN);
+    if (bound)
+        return bound;
+    TSTree *tree = ts_parser_parse_string(parser, NULL, source, length);
+    cbm_parse_memo_keep(parser, source, length, CBM_PARSE_PLAIN, tree);
+    return tree;
+}
+
 /* #2078: parse every file as if its last line were terminated.
  *
  * Many grammars treat the line terminator as part of the construct it ends --
@@ -561,6 +666,9 @@ static TSPoint cbm_source_end_point(const char *source, uint32_t len) {
  * A file that is empty or already ends in "\n" is parsed exactly as before. */
 TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
                          TSParseOptions opts) {
+    TSTree *bound = cbm_parse_take_bound(parser, source, source_len, CBM_PARSE_TERMINATED);
+    if (bound)
+        return bound;
     CBMStringInput input = {source, source_len, source_len > 0 && source[source_len - 1] != '\n'};
     TSInput ts_input = {&input, cbm_string_read, TSInputEncodingUTF8, NULL};
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
@@ -576,6 +684,7 @@ TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_l
         };
         ts_tree_edit(tree, &drop_virtual_newline);
     }
+    cbm_parse_memo_keep(parser, source, source_len, CBM_PARSE_TERMINATED, tree);
     return tree;
 }
 
@@ -1381,7 +1490,12 @@ static TSTree *cbm_parse_c_source_defined(TSParser *parser, const char *source, 
 
 TSTree *cbm_parse_c_source(TSParser *parser, const char *source, uint32_t source_len,
                            TSParseOptions opts) {
-    return cbm_parse_c_source_defined(parser, source, source_len, opts, NULL);
+    TSTree *bound = cbm_parse_take_bound(parser, source, source_len, CBM_PARSE_C);
+    if (bound)
+        return bound;
+    TSTree *tree = cbm_parse_c_source_defined(parser, source, source_len, opts, NULL);
+    cbm_parse_memo_keep(parser, source, source_len, CBM_PARSE_C, tree);
+    return tree;
 }
 
 // --- Parse timeout callback ---
@@ -5297,6 +5411,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
 
     TSNode root = ts_tree_root_node(tree);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
 
     /* No file is disqualified from the LSP walks by how long its parse took.
      *
@@ -6087,6 +6203,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     atomic_fetch_add(&total_parse_ns, t1 - t0);
     atomic_fetch_add(&total_extract_ns, t2 - t1);
     atomic_fetch_add(&total_files, 1);
+
+    cbm_syntax_index_end(&syntax);
 
     // Retain tree for cross-file LSP reuse (caller frees via cbm_free_tree)
     result->cached_tree = tree;

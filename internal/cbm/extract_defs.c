@@ -10,6 +10,7 @@
 #include "foundation/sha256.h"
 #include "foundation/mem_core.h" // cbm_realloc/cbm_free -- walk_defs stack
 #include "extract_node_stack.h"
+#include "resolve/stats.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
@@ -19,6 +20,7 @@
 #include <stdlib.h>          // malloc/free (child-collection scratch)
 #include <string.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 // Buffer sizes for local arrays (base classes, params, return types).
 #define MAX_COMMENT_LEN 500
@@ -1903,6 +1905,7 @@ static bool doc_memo_fill(CBMArena *a, doc_memo_ent_t *e, TSNode parent) {
         } while (k < n && ts_tree_cursor_goto_next_sibling(&cur));
     }
     ts_tree_cursor_delete(&cur);
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, k);
     e->node = parent;
     e->n = k;
     e->used = true;
@@ -2008,6 +2011,10 @@ static TSNode doc_parent(CBMExtractCtx *ctx, TSNode node) {
     const doc_memo_ent_t *e = doc_memo_ancestor((const doc_memo_t *)ctx->doc_memo, node);
     if (!e) {
         e = doc_memo_get(ctx, ctx->root);
+    } else {
+        /* Use keeps it cached: a wide root evicted by its children's narrow lists is listed
+         * again every few definitions. */
+        ((doc_memo_ent_t *)e)->stamp = ++((doc_memo_t *)ctx->doc_memo)->clock;
     }
     while (e) {
         int k = doc_memo_containing(e, node);
@@ -9019,7 +9026,9 @@ static const char *cs_namespace_decl_name(CBMArena *a, TSNode ns, const char *so
  * grammar does not know (a `ref partial struct` with members does it), leaving
  * the types after it parented straight under the compilation unit. Calling
  * those global would let them hide every imported type of the same name. */
-static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *source) {
+static const char *cs_type_decl_namespace(CBMExtractCtx *ctx, TSNode node) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
     const char *acc = NULL;
     bool file_scoped = false;
     TSNode top = node;
@@ -9039,18 +9048,23 @@ static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *
         return acc;
     }
     uint32_t start = ts_node_start_byte(node);
-    uint32_t n = ts_node_named_child_count(top);
-    for (uint32_t i = 0; i < n; i++) {
-        TSNode c = ts_node_named_child(top, i);
-        if (ts_node_start_byte(c) >= start) {
-            break;
-        }
-        if (strcmp(ts_node_type(c), "file_scoped_namespace_declaration") == 0) {
-            const char *name = cs_namespace_decl_name(a, c, source);
-            if (name) {
-                return acc ? cbm_arena_sprintf(a, "%s.%s", name, acc) : name;
+    if (ctx->cs_file_ns_top != top.id) {
+        ctx->cs_file_ns_top = top.id;
+        ctx->cs_file_ns_name = NULL;
+        uint32_t n = ts_node_named_child_count(top);
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_SYNTAX_CHILD_STEPS, n);
+        for (uint32_t i = 0; i < n && !ctx->cs_file_ns_name; i++) {
+            TSNode c = ts_node_named_child(top, i);
+            if (strcmp(ts_node_type(c), "file_scoped_namespace_declaration") == 0) {
+                ctx->cs_file_ns_name = cs_namespace_decl_name(a, c, source);
+                ctx->cs_file_ns_start = ts_node_start_byte(c);
             }
         }
+    }
+    /* Children come in source order: one that starts first precedes this type. */
+    if (ctx->cs_file_ns_name && ctx->cs_file_ns_start < start) {
+        const char *name = ctx->cs_file_ns_name;
+        return acc ? cbm_arena_sprintf(a, "%s.%s", name, acc) : name;
     }
     if (acc) {
         return acc;
@@ -9464,7 +9478,7 @@ static void emit_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *s
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     if (ctx->language == CBM_LANG_CSHARP && !ctx->enclosing_class_qn) {
-        def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
+        def.decl_namespace = cs_type_decl_namespace(ctx, node);
     }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     // Go identity alias `type A = B` (#2033): keep the aliased type text so the

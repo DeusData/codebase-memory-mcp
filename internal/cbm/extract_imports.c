@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <string.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 /* Local constants for magic number elimination. */
 enum {

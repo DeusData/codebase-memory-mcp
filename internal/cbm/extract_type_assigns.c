@@ -9,6 +9,7 @@
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
+#include "resolve/syntax_index.h"
 
 // Extract type from new_expression / object_creation_expression.
 static const char *extract_new_expr_type(CBMArena *a, TSNode rhs, const char *source) {
