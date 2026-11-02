@@ -2,10 +2,15 @@
 # Regression contract for clang-tidy's `,-warnings-as-errors` diagnostic suffix
 # (#2442). With WarningsAsErrors enabled, clang-tidy prints an analyzer check as
 # [clang-analyzer-<check>,-warnings-as-errors]; a gate that only accepts
-# [<check>] drops every such line and reports a clean gate. A suffixed finding
-# WITH an argued whitelist entry must be counted under its plain check name and
-# suppressed (exit 0, "1 argued false positive"). Every assertion is reported,
-# so a regression names what broke.
+# [<check>] drops every such line and reports a clean gate. Both directions are
+# pinned, and every assertion is reported, so a regression names what broke:
+#   1. a suffixed finding WITH an argued whitelist entry is counted under its
+#      plain check name and suppressed (exit 0, "1 argued false positive");
+#   2. a suffixed finding WITHOUT an entry fails the gate (exit 1) and is
+#      reported under its plain check name. This is the negative assertion: a
+#      parser that drops the suffixed line reports clean (exit 0) here.
+# Reverting the suffix group in FINDING_RE (scripts/lint-mem-gate.py) turns
+# both red.
 #
 # The gate runs from inside the fixture directory with RELATIVE paths. On the
 # Windows leg python3 is a native MSYS2 build: MSYS converts path ARGUMENTS for
@@ -39,6 +44,10 @@ cat > "$FIX/sample.c" <<'EOF'
 int sample(int *value) {
     return *value;
 }
+
+int unlisted(int *value) {
+    return *value;
+}
 EOF
 
 # A native Windows python3 writes CRLF; strip it before the hash is reused.
@@ -60,7 +69,7 @@ EOF
 
 SUFFIX='[clang-analyzer-core.NullDereference,-warnings-as-errors]'
 
-# Whitelisted: counted under the plain check name, then suppressed.
+# 1. Whitelisted: counted under the plain check name, then suppressed.
 rc=0
 printf '%s\n' "sample.c:2:12: warning: possible null dereference $SUFFIX" \
     | run_gate > /dev/null 2> "$FIX/whitelisted.err" || rc=$?
@@ -73,8 +82,24 @@ if ! grep -q 'memory gate clean (1 argued false positive' "$FIX/whitelisted.err"
     show "$FIX/whitelisted.err"
 fi
 
+# 2. Not whitelisted: the gate must fail and name the finding.
+rc=0
+printf '%s\n' "sample.c:6:12: warning: possible null dereference $SUFFIX" \
+    | run_gate > /dev/null 2> "$FIX/unlisted.err" || rc=$?
+if [ "$rc" -ne 1 ]; then
+    fail "an unwhitelisted suffixed finding left the gate at exit $rc, expected 1" \
+        "(exit 0 = the suffixed line was parsed as no finding, #2442)"
+    show "$FIX/unlisted.err"
+fi
+if ! grep -qF 'sample.c:6: possible null dereference [clang-analyzer-core.NullDereference]' "$FIX/unlisted.err" ||
+    ! grep -qF 'no whitelist entry for unlisted()' "$FIX/unlisted.err" ||
+    ! grep -qF '1 finding(s) unaccounted for' "$FIX/unlisted.err"; then
+    fail "the gate did not report the unwhitelisted suffixed finding under its plain check name"
+    show "$FIX/unlisted.err"
+fi
+
 if [ "$failures" -ne 0 ]; then
     echo "lint-mem-gate warning suffix contract: $failures assertion(s) failed" >&2
     exit 1
 fi
-echo 'lint-mem-gate warning suffix contract passed'
+echo 'lint-mem-gate warning suffix contract passed (whitelisted + unwhitelisted suffixed findings)'
