@@ -750,6 +750,50 @@ TEST(resolver_oo_csharp_static_selection_parallel) {
 /* A work budget must not decide graph content: the last site of a very large file
  * binds exactly like the first. Real case: a 4,000-line form-binding test in Play lost
  * thousands of sites to a per-file proof budget, in no particular order of importance. */
+/* A long import list is searched another way than a short one; the answer is the same. */
+static int oo_long_imports_binds(const char *extension, const char *unused_import,
+                                 const char *real_import, const char *head, const char *main_body,
+                                 const char *service_path, const char *service, const char *source,
+                                 const char *target) {
+    enum { UNUSED = 24 };
+    char text[4096];
+    size_t at = (size_t)snprintf(text, sizeof(text), "%s", head);
+    for (int i = 0; i < UNUSED; i++)
+        at += (size_t)snprintf(text + at, sizeof(text) - at, unused_import, i, i);
+    at += (size_t)snprintf(text + at, sizeof(text) - at, "%s%s", real_import, main_body);
+    char main_path[64];
+    snprintf(main_path, sizeof(main_path), "client/Main.%s", extension);
+    OOFile files[] = {{main_path, text}, {service_path, service}};
+    OOIndex index;
+    bool opened = oo_open(&index, files, 2, false, extension);
+    int edges = opened ? oo_edges(&index, "CALLS", source, target) : -1;
+    oo_close(&index);
+    return edges;
+}
+TEST(resolver_oo_long_import_list_still_binds) {
+    ASSERT_EQ(oo_long_imports_binds("java", "import other.Unused%d;\n", "import api.Service;\n",
+                                    "package client;\n",
+                                    "class Main { void run(Service s) { s.call(); } }\n",
+                                    "api/Service.java",
+                                    "package api;\npublic class Service { public void call() {} }\n",
+                                    "Main.run", "Service.call"),
+              1);
+    ASSERT_EQ(oo_long_imports_binds("kt", "import other.Unused%d\n", "import api.Service\n",
+                                    "package client\n",
+                                    "class Main { fun run(s: Service) { s.call() } }\n",
+                                    "api/Service.kt",
+                                    "package api\nclass Service { fun call() {} }\n", "Main.run",
+                                    "Service.call"),
+              1);
+    ASSERT_EQ(oo_long_imports_binds(
+                  "cs", "using Unused%d = Other.Unused%d;\n", "using S = Api.Service;\n", "",
+                  "namespace Client { class Main { void Run(S s) { s.Call(); } } }\n", "api/Service.cs",
+                  "namespace Api { public class Service { public void Call() {} } }\n", "Main.Run",
+                  "Service.Call"),
+              1);
+    PASS();
+}
+
 TEST(resolver_oo_large_file_binds_its_last_site) {
     enum { SITES = 40000 };
     const char *head = "package big;\nclass Big {\n  void target() {}\n  void many() {\n";
@@ -2830,6 +2874,7 @@ TEST(resolver_oo_declaration_index_outlives_a_spilled_result) {
 
 SUITE(resolver_oo) {
     RUN_TEST(resolver_oo_declaration_index_outlives_a_spilled_result);
+    RUN_TEST(resolver_oo_long_import_list_still_binds);
     RUN_TEST(resolver_oo_java_static_selection);
     RUN_TEST(resolver_oo_java_static_selection_parallel);
     RUN_TEST(resolver_oo_kotlin_static_selection);

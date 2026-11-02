@@ -25,6 +25,7 @@
  * responsibility — there are no surprise back-edges between sections.
  */
 
+#include "lsp_work.h"
 #include "rust_lsp.h"
 #include "rust_cargo.h"
 #include "../helpers.h"
@@ -343,12 +344,9 @@ static const char *rust_resolve_use(RustLSPContext *ctx, const char *local_name)
     if (!ctx || !local_name) {
         return NULL;
     }
-    for (int i = 0; i < ctx->use_count; i++) {
-        if (strcmp(ctx->use_local_names[i], local_name) == 0) {
-            return ctx->use_module_paths[i];
-        }
-    }
-    return NULL;
+    int i = cbm_name_rows_first(&ctx->use_rows, ctx->arena, ctx->use_local_names, ctx->use_count,
+                                local_name);
+    return i >= 0 ? ctx->use_module_paths[i] : NULL;
 }
 
 /* The Rust prelude is auto-imported into every module. We map each name
@@ -5357,10 +5355,18 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     ctx->self_trait_qn = saved_trait;
 }
 
+static void rust_lsp_process_tree(RustLSPContext *ctx, TSNode root);
+
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
     if (ts_node_is_null(root))
         return;
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, root.tree);
+    rust_lsp_process_tree(ctx, root);
+    cbm_syntax_index_end(&syntax);
+}
 
+static void rust_lsp_process_tree(RustLSPContext *ctx, TSNode root) {
     /* Pass 0: collect macro_rules! definitions before walking bodies so
      * macro_invocation handlers can expand user-defined macros. */
     rust_collect_macro_rules(ctx, root);
@@ -5575,6 +5581,8 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
 void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
                                    const char *module_qn, TSNode root, const char *source) {
 
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, root.tree);
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 
@@ -5734,25 +5742,20 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                         fld_types[fld_count] = ft_t;
                         fld_count++;
                     }
-                    if (fld_count > 0) {
-                        for (int ti = 0; ti < reg->type_count; ti++) {
-                            if (reg->types[ti].qualified_name &&
-                                strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
-                                const char **names = (const char **)cbm_arena_alloc(
-                                    arena, (fld_count + 1) * sizeof(const char *));
-                                const CBMType **types = (const CBMType **)cbm_arena_alloc(
-                                    arena, (fld_count + 1) * sizeof(const CBMType *));
-                                for (int fi = 0; fi < fld_count; fi++) {
-                                    names[fi] = fld_names[fi];
-                                    types[fi] = fld_types[fi];
-                                }
-                                names[fld_count] = NULL;
-                                types[fld_count] = NULL;
-                                reg->types[ti].field_names = names;
-                                reg->types[ti].field_types = types;
-                                break;
-                            }
+                    int ti = fld_count > 0 ? cbm_idxmemo_get(&type_idx, type_qn) : -1;
+                    if (ti >= 0) {
+                        const char **names = (const char **)cbm_arena_alloc(
+                            arena, (fld_count + 1) * sizeof(const char *));
+                        const CBMType **types = (const CBMType **)cbm_arena_alloc(
+                            arena, (fld_count + 1) * sizeof(const CBMType *));
+                        for (int fi = 0; fi < fld_count; fi++) {
+                            names[fi] = fld_names[fi];
+                            types[fi] = fld_types[fi];
                         }
+                        names[fld_count] = NULL;
+                        types[fld_count] = NULL;
+                        reg->types[ti].field_names = names;
+                        reg->types[ti].field_types = types;
                     }
                 }
             }
@@ -5768,38 +5771,34 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 const char *trait_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
 
                 /* Mark as interface and collect method names. */
-                for (int ti = 0; ti < reg->type_count; ti++) {
-                    if (!reg->types[ti].qualified_name)
-                        continue;
-                    if (strcmp(reg->types[ti].qualified_name, trait_qn) == 0) {
-                        reg->types[ti].is_interface = true;
-                        if (!ts_node_is_null(body)) {
-                            const char *methods[64];
-                            int mc = 0;
-                            uint32_t bc = ts_node_named_child_count(body);
-                            for (uint32_t j = 0; j < bc && mc < 63; j++) {
-                                TSNode item = ts_node_named_child(body, j);
-                                const char *ik = ts_node_type(item);
-                                if (strcmp(ik, "function_item") != 0 &&
-                                    strcmp(ik, "function_signature_item") != 0)
-                                    continue;
-                                TSNode mn = ts_node_child_by_field_name(item, "name", 4);
-                                if (ts_node_is_null(mn))
-                                    continue;
-                                char *mname = cbm_node_text(arena, mn, source);
-                                if (mname)
-                                    methods[mc++] = mname;
-                            }
-                            if (mc > 0) {
-                                const char **arr = (const char **)cbm_arena_alloc(
-                                    arena, (mc + 1) * sizeof(const char *));
-                                for (int mi = 0; mi < mc; mi++)
-                                    arr[mi] = methods[mi];
-                                arr[mc] = NULL;
-                                reg->types[ti].method_names = arr;
-                            }
+                int ti = cbm_idxmemo_get(&type_idx, trait_qn);
+                if (ti >= 0) {
+                    reg->types[ti].is_interface = true;
+                    if (!ts_node_is_null(body)) {
+                        const char *methods[64];
+                        int mc = 0;
+                        uint32_t bc = ts_node_named_child_count(body);
+                        for (uint32_t j = 0; j < bc && mc < 63; j++) {
+                            TSNode item = ts_node_named_child(body, j);
+                            const char *ik = ts_node_type(item);
+                            if (strcmp(ik, "function_item") != 0 &&
+                                strcmp(ik, "function_signature_item") != 0)
+                                continue;
+                            TSNode mn = ts_node_child_by_field_name(item, "name", 4);
+                            if (ts_node_is_null(mn))
+                                continue;
+                            char *mname = cbm_node_text(arena, mn, source);
+                            if (mname)
+                                methods[mc++] = mname;
                         }
-                        break;
+                        if (mc > 0) {
+                            const char **arr = (const char **)cbm_arena_alloc(
+                                arena, (mc + 1) * sizeof(const char *));
+                            for (int mi = 0; mi < mc; mi++)
+                                arr[mi] = methods[mi];
+                            arr[mc] = NULL;
+                            reg->types[ti].method_names = arr;
+                        }
                     }
                 }
             }
@@ -5820,6 +5819,11 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         tmp.registry = reg;
         tmp.module_qn = module_qn;
 
+        CBMIdxMemo free_idx = {0}; /* the first free function of each name */
+        for (int k = 0; k < reg->func_count; k++) {
+            if (reg->funcs[k].qualified_name && !reg->funcs[k].receiver_type)
+                cbm_idxmemo_put_if_absent(&free_idx, arena, reg->funcs[k].qualified_name, k);
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -5834,20 +5838,14 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                 continue;
             const CBMType *ret = rust_parse_type_node(&tmp, rtn);
             const char *fn_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, fname);
-            for (int k = 0; k < reg->func_count; k++) {
+            int k = cbm_idxmemo_get(&free_idx, fn_qn);
+            if (k >= 0) {
                 CBMRegisteredFunc *rf = &reg->funcs[k];
-                if (!rf->qualified_name)
-                    continue;
-                if (rf->receiver_type)
-                    continue; /* free fns only */
-                if (strcmp(rf->qualified_name, fn_qn) != 0)
-                    continue;
                 const CBMType **ret_arr =
                     (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
                 ret_arr[0] = ret;
                 ret_arr[1] = NULL;
                 rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
-                break;
             }
         }
     }
@@ -5978,14 +5976,9 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                         /* Found a matching curated derive. Register the
                          * trait QN as an embedded_type on the receiver
                          * AND synthesize the method entries. */
-                        CBMRegisteredType *rt = NULL;
-                        for (int ti = 0; ti < reg->type_count; ti++) {
-                            if (reg->types[ti].qualified_name &&
-                                strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0) {
-                                rt = &reg->types[ti];
-                                break;
-                            }
-                        }
+                        CBM_LSP_WORK(1);
+                        int derive_type = cbm_idxmemo_get(&type_idx, d->qualified_name);
+                        CBMRegisteredType *rt = derive_type >= 0 ? &reg->types[derive_type] : NULL;
                         if (!rt)
                             break;
 
@@ -6051,6 +6044,15 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
      * registered functions have no return-type signature and chained
      * method calls (`File::open().read()`) break. */
     if (!ts_node_is_null(root)) {
+        CBMIdxMemo method_idx = {0}; /* the first function of each receiver and name */
+        for (int k = 0; k < reg->func_count; k++) {
+            const CBMRegisteredFunc *rf = &reg->funcs[k];
+            if (rf->receiver_type && rf->short_name) {
+                cbm_idxmemo_put_if_absent(
+                    &method_idx, arena,
+                    cbm_arena_sprintf(arena, "%s\x1f%s", rf->receiver_type, rf->short_name), k);
+            }
+        }
         uint32_t rnc = ts_node_child_count(root);
         for (uint32_t i = 0; i < rnc; i++) {
             TSNode top = ts_node_child(root, i);
@@ -6096,20 +6098,15 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
                     ret = cbm_type_named(arena, type_qn);
                 }
                 /* Patch the registered function's signature. */
-                for (int k = 0; k < reg->func_count; k++) {
+                int k = cbm_idxmemo_get(&method_idx,
+                                        cbm_arena_sprintf(arena, "%s\x1f%s", type_qn, mname));
+                if (k >= 0) {
                     CBMRegisteredFunc *rf = &reg->funcs[k];
-                    if (!rf->receiver_type || !rf->short_name)
-                        continue;
-                    if (strcmp(rf->receiver_type, type_qn) != 0)
-                        continue;
-                    if (strcmp(rf->short_name, mname) != 0)
-                        continue;
                     const CBMType **ret_arr =
                         (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
                     ret_arr[0] = ret;
                     ret_arr[1] = NULL;
                     rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
-                    break;
                 }
             }
         }
@@ -6147,6 +6144,7 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         }
         rust_registered_type_add_embedded(arena, rt, trait_qn);
     }
+    cbm_syntax_index_end(&syntax);
 }
 
 void cbm_run_rust_lsp_with_manifest(CBMArena *arena, CBMFileResult *result, const char *source,

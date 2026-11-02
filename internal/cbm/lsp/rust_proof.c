@@ -7,6 +7,7 @@
 #include "foundation/hash_table.h"
 #include <stdlib.h>
 #include <string.h>
+#include "../resolve/syntax_index.h"
 
 typedef struct {
     const char *qn;
@@ -835,6 +836,8 @@ static void rust_proof_resolve(CBMArena *arena, const char *source, int length,
     if (!tree)
         return;
     TSNode root = ts_tree_root_node(tree);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     /* Append through a private descriptor; publish only after complete analysis.
      * Arena growth preserves the original buffer and its committed prefix. */
     CBMResolvedCallArray staged = *out;
@@ -925,6 +928,7 @@ static void rust_proof_resolve(CBMArena *arena, const char *source, int length,
     cbm_ht_free(context.imports);
     cbm_ht_free(context.callers);
     cbm_ht_free(context.local_types);
+    cbm_syntax_index_end(&syntax);
     ts_tree_delete(tree);
 }
 

@@ -2317,6 +2317,7 @@ void oo_csharp_resolve(oo_walk_t *w, TSNode root) {
                         .imports = imports.items,
                         .import_count = imports.count,
                         .has_error = ts_node_has_error(root)};
+    oo_file_chain_imports(w->arena, file);
     w->f = file;
     w->scope = (oo_scope_t){.file = file, .ns = ""};
     cw_namespace_items(&c, root);

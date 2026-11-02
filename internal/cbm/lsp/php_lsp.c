@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "../resolve/syntax_index.h"
 
 #define PHP_EVAL_MAX_DEPTH 32
 #define PHP_USE_INITIAL_CAP 16
@@ -186,7 +187,10 @@ void php_lsp_add_use(PHPLSPContext *ctx, const char *local_name, const char *tar
 }
 
 static const char *find_use(PHPLSPContext *ctx, const char *local_name, int kind) {
-    for (int i = 0; i < ctx->use_count; i++) {
+    for (int i = cbm_name_rows_first(&ctx->use_rows, ctx->arena, ctx->use_local_names,
+                                     ctx->use_count, local_name);
+         i >= 0; i = cbm_name_rows_next(&ctx->use_rows, ctx->use_local_names, ctx->use_count,
+                                        local_name, i)) {
         if ((int)ctx->use_kinds[i] != kind)
             continue;
         if (strcmp(ctx->use_local_names[i], local_name) == 0)
@@ -326,7 +330,11 @@ static const CBMRegisteredType *lookup_type_with_project(PHPLSPContext *ctx, con
 
     const CBMRegisteredType *best = NULL;
     int best_score = -1;
-    for (int i = 0; ctx->registry && i < ctx->registry->type_count; i++) {
+    CBMTypeShortIter named = {0};
+    if (ctx->registry)
+        cbm_registry_types_by_short_name(ctx->registry, short_name, &named);
+    for (int i = -1; ctx->registry && (i = cbm_type_short_iter_next(&named)) >= 0;) {
+        CBM_LSP_WORK(1);
         const CBMRegisteredType *cand = &ctx->registry->types[i];
         if (!cand->short_name || strcmp(cand->short_name, short_name) != 0)
             continue;
@@ -809,25 +817,8 @@ static void bind_phpdoc_var(PHPLSPContext *ctx, const char *docstring) {
 /* Walk siblings backwards from `node` to find a leading PHPDoc comment
  * ("/**...asterisk-slash"). Returns cleaned doc text or NULL. */
 static char *fetch_leading_phpdoc(PHPLSPContext *ctx, TSNode node) {
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent))
-        return NULL;
-    uint32_t nc = ts_node_child_count(parent);
-    /* Find index of node within parent. */
-    int idx = -1;
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(parent, i);
-        if (ts_node_eq(c, node)) {
-            idx = (int)i;
-            break;
-        }
-    }
-    if (idx <= 0)
-        return NULL;
-    for (int i = idx - 1; i >= 0; i--) {
-        TSNode c = ts_node_child(parent, (uint32_t)i);
-        if (ts_node_is_null(c))
-            continue;
+    for (TSNode c = cbm_syntax_previous_child(node); !ts_node_is_null(c);
+         c = cbm_syntax_previous_child(c)) {
         const char *k = ts_node_type(c);
         if (strcmp(k, "comment") == 0) {
             char *raw = php_node_text(ctx, c);
@@ -1203,7 +1194,10 @@ static const CBMType *eval_function_call_type(PHPLSPContext *ctx, TSNode call_no
     }
     if (!f && ctx->registry) {
         /* Walk the symbol table by short_name as a last resort. */
-        for (int i = 0; i < ctx->registry->func_count; i++) {
+        CBMFreeFuncIter named;
+        cbm_registry_free_funcs_by_short_name(ctx->registry, name, &named);
+        for (int i = -1; (i = cbm_free_func_iter_next(&named)) >= 0;) {
+            CBM_LSP_WORK(1);
             const CBMRegisteredFunc *cand = &ctx->registry->funcs[i];
             if (cand->receiver_type)
                 continue;
@@ -1697,7 +1691,11 @@ static void resolve_function_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKi
      * file's project (i.e. with the longest module-prefix overlap). */
     const CBMRegisteredFunc *best = NULL;
     int best_score = -1;
-    for (int i = 0; ctx->registry && i < ctx->registry->func_count; i++) {
+    CBMFreeFuncIter named = {0};
+    if (ctx->registry)
+        cbm_registry_free_funcs_by_short_name(ctx->registry, name, &named);
+    for (int i = -1; ctx->registry && (i = cbm_free_func_iter_next(&named)) >= 0;) {
+        CBM_LSP_WORK(1);
         const CBMRegisteredFunc *cand = &ctx->registry->funcs[i];
         if (cand->receiver_type)
             continue;
@@ -4401,6 +4399,8 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
     if (!result || !arena || ts_node_is_null(root))
         return;
 
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, root.tree);
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
 
@@ -4541,6 +4541,7 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         /* Reset namespace/use state — process_file will re-collect. */
         ctx.current_namespace_qn = "";
         ctx.use_count = 0;
+        ctx.use_rows = (CBMNameRows){0};
     }
 
     /* Trait flattening registered methods after the index was built; lookups
@@ -4562,6 +4563,7 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
         }
     }
     cbm_arena_destroy(&idx_arena);
+    cbm_syntax_index_end(&syntax);
 }
 
 /* ── Cross-file + batch ───────────────────────────────────────── */
@@ -4835,6 +4837,8 @@ void cbm_run_php_lsp_cross_with_bindings_with_source(
         }
     }
     TSNode root = ts_tree_root_node(tree);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
@@ -4894,6 +4898,7 @@ void cbm_run_php_lsp_cross_with_bindings_with_source(
         ctx.current_namespace_qn = "";
         /* Reset to caller-supplied uses only — process_file re-adds AST uses. */
         ctx.use_count = supplied_use_count;
+        ctx.use_rows = (CBMNameRows){0};
     }
 
     php_lsp_process_file(&ctx, root);
@@ -4902,6 +4907,7 @@ void cbm_run_php_lsp_cross_with_bindings_with_source(
     cbm_php_proof_resolve_with_source(arena, source, source_len, module_qn, root, &reg, bindings,
                                       defs, def_count, out, source_context);
     cbm_arena_destroy(&idx_arena);
+    cbm_syntax_index_end(&syntax);
 
     if (owns_tree && tree)
         ts_tree_delete(tree);

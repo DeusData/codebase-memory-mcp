@@ -48,6 +48,7 @@
 #ifndef CBM_LSP_KOTLIN_LSP_H
 #define CBM_LSP_KOTLIN_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -96,6 +97,7 @@ typedef struct KotlinLSPContext {
     const char **import_targets; /* full FQN being imported */
     CBMKotlinUseKind *import_kinds;
     int import_count;
+    CBMNameRows import_rows;
     int import_cap;
 
     /* Current declaration context. */

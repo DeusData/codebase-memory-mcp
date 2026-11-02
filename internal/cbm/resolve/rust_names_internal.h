@@ -1,6 +1,8 @@
 #ifndef CBM_RESOLVE_RUST_NAMES_INTERNAL_H
 #define CBM_RESOLVE_RUST_NAMES_INTERNAL_H
 
+#include "../lsp/lsp_name_rows.h"
+#include "stats.h"
 #include "rust_names.h"
 #include "../arena.h"
 #include "foundation/hash_table.h"
@@ -146,6 +148,19 @@ struct rs_impl {
     struct rs_impl *next_self; /* next impl with the same self item */
 };
 
+/* The scope of a path's rows in ext_rows. Two paths may share one; a reader compares paths. */
+static inline const void *rs_ext_scope(const char *path) {
+    uint64_t hash = UINT64_C(0xCBF29CE484222325);
+    for (const char *at = path; *at; at++)
+        hash = (hash ^ (unsigned char)*at) * UINT64_C(0x100000001B3);
+    return (const void *)(uintptr_t)hash;
+}
+
+typedef struct rs_impl_row {
+    const struct rs_impl *impl;
+    int position;
+} rs_impl_row_t;
+
 struct rs_item {
     rs_assoc_const_t *consts; /* a trait's */
     const rs_assoc_const_t **sorted_consts;
@@ -217,6 +232,9 @@ struct rs_mod {
     rs_use_t *uses;  /* named leaves */
     rs_use_t *globs; /* glob leaves */
     rs_impl_t *impls;
+    /* A long impls list by start byte, then list position: each impl walked looks itself up. */
+    const struct rs_impl_row *impl_rows;
+    int nimpl_rows;
     rs_mod_t *children; /* inline children */
     rs_mod_t *next_child;
     /* A module-level macro may expand to items that shadow a glob import, so
@@ -305,7 +323,28 @@ struct rs_inst {
     rs_inst_t *parent;
     const char *dir; /* where this module's `mod x;` files live */
     rs_child_t *children;
+    /* A long list, by name, in list order. A flat crate root can hold thousands of modules. */
+    const rs_child_t **child_by_row;
+    CBMNameRows child_rows;
 };
+
+/* The children to look at for a name, in list order: those of that name in a long list,
+ * all of them in a short one, so a caller still compares names. */
+static inline const rs_child_t *rs_child_first(const rs_inst_t *inst, const char *name, int *row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (!inst->child_by_row)
+        return inst->children;
+    *row = cbm_name_rows_lookup(&inst->child_rows, NULL, name);
+    return *row >= 0 ? inst->child_by_row[*row] : NULL;
+}
+static inline const rs_child_t *rs_child_after(const rs_inst_t *inst, const rs_child_t *child,
+                                               int *row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (!inst->child_by_row)
+        return child->next;
+    *row = inst->child_rows.next[*row];
+    return *row >= 0 ? inst->child_by_row[*row] : NULL;
+}
 
 typedef struct rs_extern {
     const char *name;
@@ -341,6 +380,9 @@ struct cbm_rust_project {
     rs_package_t *packages;
     rs_crate_t *crates;
     CBMHashTable *ext_impls;  /* normalized path -> impls on that type outside the project */
+    /* A long ext_impls by path and method, in each path's order: each std method call asks. */
+    const rs_impl_t **ext_by_row;
+    CBMNameRows ext_rows;
     rs_impl_t *blanket_impls; /* impl<T> Trait for T */
     CBMHashTable *patches;    /* manifest dir, separator, name -> [patch.crates-io] entry */
     bool sealed;

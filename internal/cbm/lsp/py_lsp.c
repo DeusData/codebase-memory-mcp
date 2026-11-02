@@ -15,6 +15,8 @@
 #include "../helpers.h"
 #include "../../../src/foundation/hash_table.h" /* module-scope suffix index (re-exports) */
 #include "lsp_node_iter.h"
+#include "../resolve/stats.h"
+#include "../resolve/syntax_index.h"
 #include "tree_sitter/api.h"
 #include <ctype.h>
 #include <limits.h>
@@ -395,34 +397,63 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     py_lsp_init_for_stage(ctx, arena, source, source_len, registry, module_qn, out, "context");
 }
 
+/* The syntax of the import statements, by the names their items bind; it lives for one
+ * walk of the file. */
+typedef struct {
+    TSNode statement;
+    uint32_t position;
+} PyImportItem;
+
+struct PyImportJoin {
+    CBMArena *arena;
+    CBMNameRows by_name; /* (statement, name) and (NULL, name) -> items that bind the name */
+    PyImportItem *items;
+    int item_count, item_capacity;
+};
+
+/* The import rows with this local name, in row order. */
+static int py_import_row_first(PyLSPContext *ctx, const char *local) {
+    return cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                               ctx->import_count, local);
+}
+
+static int py_import_row_next(const PyLSPContext *ctx, const char *local, int row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    return cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names, ctx->import_count, local,
+                              row);
+}
+
 void py_lsp_add_import(PyLSPContext *ctx, const char *local_name, const char *module_qn) {
     if (!ctx || !local_name || !module_qn)
         return;
 
     int new_count = ctx->import_count + 1;
-    const char **names =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)(new_count + 1) * sizeof(const char *));
-    const char **qns =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)(new_count + 1) * sizeof(const char *));
-    unsigned char *kinds =
-        (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(unsigned char));
-    if (!names || !qns || !kinds)
-        return;
+    if (new_count >= ctx->import_capacity) {
+        int capacity = ctx->import_capacity ? ctx->import_capacity * 2 : 16;
+        const char **names = (const char **)cbm_arena_alloc(ctx->arena, (size_t)(capacity + 1) *
+                                                                            sizeof(const char *));
+        const char **qns = (const char **)cbm_arena_alloc(ctx->arena, (size_t)(capacity + 1) *
+                                                                          sizeof(const char *));
+        unsigned char *kinds =
+            (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(unsigned char));
+        if (!names || !qns || !kinds)
+            return;
 
-    for (int i = 0; i < ctx->import_count; i++) {
-        names[i] = ctx->import_local_names[i];
-        qns[i] = ctx->import_module_qns[i];
-        kinds[i] = ctx->import_kinds ? ctx->import_kinds[i] : 0;
+        for (int i = 0; i < ctx->import_count; i++) {
+            names[i] = ctx->import_local_names[i];
+            qns[i] = ctx->import_module_qns[i];
+            kinds[i] = ctx->import_kinds[i];
+        }
+        ctx->import_local_names = names;
+        ctx->import_module_qns = qns;
+        ctx->import_kinds = kinds;
+        ctx->import_capacity = capacity;
     }
-    names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
-    qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
-    kinds[ctx->import_count] = 0;
-    names[new_count] = NULL;
-    qns[new_count] = NULL;
-
-    ctx->import_local_names = names;
-    ctx->import_module_qns = qns;
-    ctx->import_kinds = kinds;
+    ctx->import_local_names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
+    ctx->import_module_qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->import_kinds[ctx->import_count] = 0;
+    ctx->import_local_names[new_count] = NULL;
+    ctx->import_module_qns[new_count] = NULL;
     ctx->import_count = new_count;
 }
 
@@ -577,14 +608,17 @@ static const char *py_canonical_from_import_qn(PyLSPContext *ctx, TSNode stateme
  * local; selecting the first would turn conflicting runtime identities into
  * false semantic proof. */
 static void py_import_match_statement(PyLSPContext *ctx, TSNode stmt, const char *local,
-                                      const char *qn, PyImportSyntaxMatch *match) {
+                                      const char *qn, PyImportSyntaxMatch *match,
+                                      uint32_t from_item, uint32_t to_item) {
     if (!ctx || ts_node_is_null(stmt) || !local || !qn || !match)
         return;
     const char *stmt_kind = ts_node_type(stmt);
     if (strcmp(stmt_kind, "import_from_statement") == 0) {
         TSNode module = py_from_import_module_node(stmt);
         uint32_t import_count = ts_node_named_child_count(stmt);
-        for (uint32_t j = 0; j < import_count; j++) {
+        if (import_count > to_item)
+            import_count = to_item;
+        for (uint32_t j = from_item; j < import_count; j++) {
             TSNode item = ts_node_named_child(stmt, j);
             if (!ts_node_is_null(module) && ts_node_eq(item, module))
                 continue;
@@ -611,7 +645,9 @@ static void py_import_match_statement(PyLSPContext *ctx, TSNode stmt, const char
     if (strcmp(stmt_kind, "import_statement") != 0)
         return;
     uint32_t import_count = ts_node_named_child_count(stmt);
-    for (uint32_t j = 0; j < import_count; j++) {
+    if (import_count > to_item)
+        import_count = to_item;
+    for (uint32_t j = from_item; j < import_count; j++) {
         TSNode item = ts_node_named_child(stmt, j);
         const char *kind = ts_node_type(item);
         if (strcmp(kind, "aliased_import") == 0) {
@@ -637,6 +673,86 @@ static void py_import_match_statement(PyLSPContext *ctx, TSNode stmt, const char
     }
 }
 
+/* One name an item binds, under the statement and, for a statement of the module's own
+ * list, under NULL. */
+static bool py_import_join_item_name(PyLSPContext *ctx, TSNode stmt, uint32_t position,
+                                     const char *name, bool module_list) {
+    struct PyImportJoin *join = ctx->import_join;
+    for (int scope = module_list ? 0 : 1; scope < 2; scope++) {
+        if (join->item_count == join->item_capacity) {
+            int capacity = join->item_capacity ? join->item_capacity * 2 : 32;
+            PyImportItem *items =
+                (PyImportItem *)cbm_arena_alloc(join->arena, (size_t)capacity * sizeof(*items));
+            if (!items)
+                return false;
+            if (join->item_count)
+                memcpy(items, join->items, (size_t)join->item_count * sizeof(*items));
+            join->items = items;
+            join->item_capacity = capacity;
+        }
+        int row = join->item_count;
+        join->items[row] = (PyImportItem){.statement = stmt, .position = position};
+        if (!cbm_name_rows_add(join->arena, &join->by_name, scope ? stmt.id : NULL, name, row))
+            return false;
+        join->item_count++;
+    }
+    return true;
+}
+
+/* Files stmt's items under exactly the names py_import_match_statement matches them on:
+ * an alias, a from-import's whole name, and each dotted prefix of a plain import's path.
+ * False when memory ran out; the statement then counts as not joined. */
+static bool py_import_join_statement(PyLSPContext *ctx, TSNode stmt, bool module_list) {
+    if (!ctx->import_join)
+        return false;
+    struct PyImportJoin *join = ctx->import_join;
+    if (cbm_name_rows_lookup(&join->by_name, stmt.id, NULL) >= 0)
+        return true;
+    const char *stmt_kind = ts_node_type(stmt);
+    bool from_import = strcmp(stmt_kind, "import_from_statement") == 0;
+    if (!from_import && strcmp(stmt_kind, "import_statement") != 0)
+        return false;
+    TSNode module = from_import ? py_from_import_module_node(stmt) : (TSNode){0};
+    uint32_t count = ts_node_named_child_count(stmt);
+    for (uint32_t position = 0; position < count; position++) {
+        TSNode item = ts_node_named_child(stmt, position);
+        if (from_import && !ts_node_is_null(module) && ts_node_eq(item, module))
+            continue;
+        const char *kind = ts_node_type(item);
+        bool aliased = strcmp(kind, "aliased_import") == 0;
+        if (!aliased && strcmp(kind, "identifier") != 0 && strcmp(kind, "dotted_name") != 0)
+            continue;
+        char *name = py_import_node_text_dup(
+            ctx, aliased ? ts_node_child_by_field_name(item, "alias", 5) : item);
+        if (!name)
+            continue;
+        if (!aliased && !from_import) {
+            for (char *dot = strchr(name, '.'); dot; dot = strchr(dot + 1, '.')) {
+                char *prefix = cbm_arena_strndup(join->arena, name, (size_t)(dot - name));
+                if (!prefix || !py_import_join_item_name(ctx, stmt, position, prefix, module_list))
+                    return false;
+            }
+        }
+        if (!py_import_join_item_name(ctx, stmt, position, name, module_list))
+            return false;
+    }
+    /* The statement itself, under no name: it has been through here. */
+    return py_import_join_item_name(ctx, stmt, UINT32_MAX, NULL, false);
+}
+
+/* The items that bind local, in source order; the second one settles the answer. */
+static void py_import_join_match(PyLSPContext *ctx, const void *scope, const char *local,
+                                 const char *qn, PyImportSyntaxMatch *match) {
+    const struct PyImportJoin *join = ctx->import_join;
+    for (int row = cbm_name_rows_lookup(&join->by_name, scope, local); row >= 0 && match->count < 2;
+         row = join->by_name.next[row]) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        const PyImportItem *item = &join->items[row];
+        py_import_match_statement(ctx, item->statement, local, qn, match, item->position,
+                                  item->position + 1);
+    }
+}
+
 static PyDirectImportKind py_import_match_result(PyImportSyntaxMatch *match, const char **qn_io) {
     if (!match || !qn_io)
         return PY_DIRECT_IMPORT_UNKNOWN;
@@ -655,24 +771,23 @@ static PyDirectImportKind py_import_kind_from_statement(PyLSPContext *ctx, TSNod
     if (!ctx || !local || !qn || !qn_io || ts_node_is_null(stmt))
         return PY_DIRECT_IMPORT_UNKNOWN;
     PyImportSyntaxMatch match = {0};
-    py_import_match_statement(ctx, stmt, local, qn, &match);
+    if (py_import_join_statement(ctx, stmt, false))
+        py_import_join_match(ctx, stmt.id, local, qn, &match);
+    else
+        py_import_match_statement(ctx, stmt, local, qn, &match, 0, UINT32_MAX);
     return py_import_match_result(&match, qn_io);
 }
 
-/* stmts: the root's import statements, collected once per root by the caller
- * (#1527) -- only they can match, and rescanning every top-level statement
- * once per import made classification O(imports x module size). */
+/* The root's import statements were joined once per root by the caller (#1527):
+ * only they can match, and only those of their items that bind this name. */
 static PyDirectImportKind py_import_kind_from_ast(PyLSPContext *ctx, bool have_root,
-                                                  const TSNode *stmts, uint32_t stmt_count,
                                                   const char *local, const char **qn_io) {
     const char *qn = qn_io ? *qn_io : NULL;
     if (!ctx || !local || !qn || !qn_io || !have_root)
         return PY_DIRECT_IMPORT_UNKNOWN;
 
     PyImportSyntaxMatch match = {0};
-    for (uint32_t i = 0; i < stmt_count; i++) {
-        py_import_match_statement(ctx, stmts[i], local, qn, &match);
-    }
+    py_import_join_match(ctx, NULL, local, qn, &match);
     return py_import_match_result(&match, qn_io);
 }
 
@@ -721,20 +836,13 @@ static void py_classify_imports_for_root(PyLSPContext *ctx, TSNode root) {
     /* A null root classifies every import UNKNOWN, as it always has; so does
      * a root whose statement list cannot be allocated (no proof either way). */
     bool have_root = !ts_node_is_null(root);
-    TSNode *stmts = NULL;
-    uint32_t stmt_count = 0;
     if (have_root && ctx->import_count > 0) {
         PyKids rk = py_kids(ctx->arena, root);
-        if (rk.n > 0) {
-            stmts = (TSNode *)cbm_arena_alloc(ctx->arena, (size_t)rk.n * sizeof(TSNode));
-            if (!stmts)
-                have_root = false;
-        }
-        for (uint32_t i = 0; stmts && i < rk.n; i++) {
+        for (uint32_t i = 0; have_root && i < rk.n; i++) {
             TSNode c = py_kid(&rk, i);
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "import_statement") == 0 || strcmp(ck, "import_from_statement") == 0)
-                stmts[stmt_count++] = c;
+                have_root = py_import_join_statement(ctx, c, true);
         }
     }
     for (int i = 0; i < ctx->import_count; i++) {
@@ -742,8 +850,7 @@ static void py_classify_imports_for_root(PyLSPContext *ctx, TSNode root) {
         const char *qn = ctx->import_module_qns[i];
         if (!local || !qn)
             continue;
-        PyDirectImportKind direct_kind =
-            py_import_kind_from_ast(ctx, have_root, stmts, stmt_count, local, &qn);
+        PyDirectImportKind direct_kind = py_import_kind_from_ast(ctx, have_root, local, &qn);
         ctx->import_module_qns[i] = qn;
         if (ctx->import_kinds)
             ctx->import_kinds[i] = (unsigned char)direct_kind;
@@ -1102,7 +1209,8 @@ static const char *py_exact_imported_reference_candidate(PyLSPContext *ctx,
     if (!ctx || !local_name)
         return NULL;
     const char *candidate = NULL;
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = py_import_row_first(ctx, local_name); i >= 0;
+         i = py_import_row_next(ctx, local_name, i)) {
         const char *local = ctx->import_local_names[i];
         const char *qn = ctx->import_module_qns[i];
         if (!local || !qn || strcmp(local, local_name) != 0 ||
@@ -3235,7 +3343,8 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
                  * reason-based alias join by import metadata so an unrelated
                  * local NAMED value cannot masquerade as an imported callable. */
                 if (qn && qn_short && strcmp(qn_short, fname) != 0) {
-                    for (int i = 0; i < ctx->import_count; i++) {
+                    for (int i = py_import_row_first(ctx, fname); i >= 0;
+                         i = py_import_row_next(ctx, fname, i)) {
                         const char *local = ctx->import_local_names[i];
                         const char *import_qn = ctx->import_module_qns[i];
                         if (local && import_qn && strcmp(local, fname) == 0 &&
@@ -5667,7 +5776,7 @@ static void py_replay_import_local(PyLSPContext *ctx, TSNode stmt, const char *l
     PyDirectImportKind chosen_kind = PY_IMPORT_UNCLASSIFIED;
     const char *chosen_qn = NULL;
     bool conflicting_target = false;
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = py_import_row_first(ctx, local); i >= 0; i = py_import_row_next(ctx, local, i)) {
         if ((consumed && consumed[i]) || !ctx->import_local_names[i] ||
             !ctx->import_module_qns[i] || strcmp(ctx->import_local_names[i], local) != 0) {
             continue;
@@ -5752,9 +5861,24 @@ static bool py_expression_is_annotation_only_assignment(TSNode statement) {
     return !ts_node_is_null(annotation) && ts_node_is_null(value);
 }
 
+static void py_lsp_process_tree(PyLSPContext *ctx, TSNode root);
+
 void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
     if (!ctx || ctx->eval_failure || ts_node_is_null(root))
         return;
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, root.tree);
+    CBMArena join_arena;
+    cbm_arena_init_lazy(&join_arena, 4096);
+    struct PyImportJoin join = {.arena = &join_arena};
+    ctx->import_join = &join;
+    py_lsp_process_tree(ctx, root);
+    ctx->import_join = NULL;
+    cbm_arena_destroy(&join_arena);
+    cbm_syntax_index_end(&syntax);
+}
+
+static void py_lsp_process_tree(PyLSPContext *ctx, TSNode root) {
     int resolved_start = ctx->resolved_calls ? ctx->resolved_calls->count : 0;
     int synthetic_start = ctx->syn_calls ? ctx->syn_calls->count : 0;
     /* Only invocation dedup mutates prior rows, within this fixed tail.

@@ -1,6 +1,7 @@
 #ifndef CBM_LSP_PHP_LSP_H
 #define CBM_LSP_PHP_LSP_H
 
+#include "lsp_name_rows.h"
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
@@ -42,6 +43,7 @@ typedef struct {
     const char **use_target_qns;
     enum { CBM_PHP_USE_CLASS = 0, CBM_PHP_USE_FUNCTION, CBM_PHP_USE_CONST } * use_kinds;
     int use_count;
+    CBMNameRows use_rows;
     int use_cap;
 
     /* Cross-file mode: dotted targets of the file's class `use` declarations

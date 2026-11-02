@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "syntax_index.h"
+#include "stats.h"
+#include "foundation/hash_table.h"
 
 enum {
     RS_MAX_WALK_DEPTH = 256,
@@ -59,18 +62,24 @@ static const rs_type_t RS_UNKNOWN_TYPE = {.kind = RT_UNKNOWN};
 static const char RS_RAW_POINTER[] = "std::ptr::raw";
 static const rs_type_t RS_UNIT_TYPE = {.kind = RT_UNIT};
 
+enum { RS_LOCALS_INITIAL = 32 };
+
 typedef struct rs_binding {
     const char *name;
     const rs_type_t *type;
     /* `let x;`: the first assignment settles the type. */
     bool deferred;
     struct rs_binding *next;
+    struct rs_binding *shadowed; /* the binding of this name it hides, until its scope ends */
+    unsigned depth;              /* of its scope */
 } rs_binding_t;
 
 typedef struct rs_scope {
     struct rs_scope *parent;
     rs_binding_t *bindings;
-    bool fn_boundary; /* a nested fn item cannot see the locals outside it */
+    bool fn_boundary;      /* a nested fn item cannot see the locals outside it */
+    unsigned depth;        /* outermost scope is 1 */
+    unsigned visible_from; /* the depth of the innermost fn boundary */
 } rs_scope_t;
 
 typedef struct rs_genv {
@@ -99,6 +108,7 @@ typedef struct {
     rs_query_t q;
     rs_inst_t *inst;
     rs_scope_t *scope;
+    CBMHashTable *locals; /* name -> its innermost live binding; a body can bind thousands */
     const rs_genv_t *gens;
     const rs_type_t *self_ty;
     const rs_impl_t *impl;
@@ -646,19 +656,33 @@ static void rs_emit(rs_walk_t *w, cbm_rust_site_kind_t kind, uint32_t start, uin
 /* ── Scopes ────────────────────────────────────────────────────────── */
 
 static void rs_scope_push(rs_walk_t *w, rs_scope_t *scope, bool fn_boundary) {
-    *scope = (rs_scope_t){.parent = w->scope, .fn_boundary = fn_boundary};
+    const rs_scope_t *parent = w->scope;
+    unsigned depth = parent ? parent->depth + 1 : 1;
+    *scope = (rs_scope_t){.parent = w->scope,
+                          .fn_boundary = fn_boundary,
+                          .depth = depth,
+                          .visible_from = fn_boundary || !parent ? depth : parent->visible_from};
     w->scope = scope;
 }
 
 static void rs_scope_pop(rs_walk_t *w) {
+    /* Newest first, so a name bound twice here ends at what the scope hid. */
+    for (rs_binding_t *binding = w->scope->bindings; binding; binding = binding->next) {
+        if (binding->shadowed)
+            cbm_ht_set(w->locals, binding->name, binding->shadowed);
+        else
+            cbm_ht_delete(w->locals, binding->name);
+    }
     w->scope = w->scope->parent;
 }
 
 static void rs_bind(rs_walk_t *w, const char *name, const rs_type_t *type) {
     if (!name || !w->scope)
         return;
+    if (!w->locals)
+        w->locals = cbm_ht_create(RS_LOCALS_INITIAL);
     rs_binding_t *binding = cbm_arena_alloc(w->arena, sizeof(*binding));
-    if (!binding) {
+    if (!binding || !w->locals) {
         w->failed = true;
         return;
     }
@@ -666,18 +690,20 @@ static void rs_bind(rs_walk_t *w, const char *name, const rs_type_t *type) {
     binding->type = type ? type : &RS_UNKNOWN_TYPE;
     binding->deferred = false;
     binding->next = w->scope->bindings;
+    binding->shadowed = cbm_ht_get(w->locals, name);
+    binding->depth = w->scope->depth;
     w->scope->bindings = binding;
+    cbm_ht_set(w->locals, name, binding);
 }
 
+/* A binding always goes to the innermost scope, so the newest live one of a name is the
+ * one a walk out through the scopes would meet first. */
 static rs_binding_t *rs_local(const rs_walk_t *w, const char *name) {
-    for (const rs_scope_t *scope = w->scope; scope; scope = scope->parent) {
-        for (rs_binding_t *binding = scope->bindings; binding; binding = binding->next)
-            if (!strcmp(binding->name, name))
-                return binding;
-        if (scope->fn_boundary)
-            return NULL;
-    }
-    return NULL;
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    if (!w->scope || !w->locals)
+        return NULL;
+    rs_binding_t *binding = cbm_ht_get(w->locals, name);
+    return binding && binding->depth >= w->scope->visible_from ? binding : NULL;
 }
 
 static rs_env_t rs_env_here(rs_walk_t *w) {
@@ -1107,19 +1133,38 @@ static void rs_pick_ext_impls(rs_walk_t *w, const rs_type_t *type, const char *n
     if (!path)
         return;
     const rs_fn_t *found = NULL;
-    if (!w->project->ext_impls)
+    const cbm_rust_project_t *project = w->project;
+    if (!project->ext_impls)
         return;
     /* A crate's Result<T> alias is std's Result, so impls on Result serve it. */
     static const char std_result[] = "std::result::Result";
     const char *const owners[] = {
         path, rs_ext_is_result(type) && strcmp(path, std_result) ? std_result : NULL};
-    for (size_t round = 0; round < 2 && owners[round]; round++)
-        for (const rs_impl_t *impl = cbm_ht_get(w->project->ext_impls, owners[round]); impl;
-             impl = impl->next_self) {
-            const rs_fn_t *fn = rs_fn_in(impl->methods, name, need_self);
-            if (!fn && impl->trait_item)
-                fn = rs_fn_in(impl->trait_item->methods, name, need_self);
-            if (!fn || (impl->trait_item && !rs_trait_in_scope(w, impl->trait_item)))
+    /* Only those declaring this method: one without it has nothing to say about this call. */
+    bool chained = project->ext_by_row != NULL;
+    for (size_t round = 0; round < 2 && owners[round]; round++) {
+        int row = chained
+                      ? cbm_name_rows_lookup(&project->ext_rows, rs_ext_scope(owners[round]), name)
+                      : -1;
+        const rs_impl_t *impl = !chained   ? cbm_ht_get(project->ext_impls, owners[round])
+                                : row >= 0 ? project->ext_by_row[row]
+                                           : NULL;
+        while (impl) {
+            const rs_impl_t *listed = impl;
+            if (chained) {
+                row = project->ext_rows.next[row];
+                impl = row >= 0 ? project->ext_by_row[row] : NULL;
+            } else {
+                impl = impl->next_self;
+            }
+            cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+            /* Two paths may share one scope. */
+            if (strcmp(listed->ext_path, owners[round]) != 0)
+                continue;
+            const rs_fn_t *fn = rs_fn_in(listed->methods, name, need_self);
+            if (!fn && listed->trait_item)
+                fn = rs_fn_in(listed->trait_item->methods, name, need_self);
+            if (!fn || (listed->trait_item && !rs_trait_in_scope(w, listed->trait_item)))
                 continue;
             /* This impl's own body shows the external type has an inherent method of this name. */
             if (fn->delegates_to_own_name) {
@@ -1135,6 +1180,7 @@ static void rs_pick_ext_impls(rs_walk_t *w, const rs_type_t *type, const char *n
             }
             found = fn;
         }
+    }
     if (found) {
         pick->fn = found;
         pick->self_ty = type;
@@ -4177,6 +4223,27 @@ static void rs_walk_impl_body(rs_walk_t *w, TSNode body) {
     }
 }
 
+/* The impl at this byte with this self type, first in list order. */
+static const rs_impl_t *rs_impl_at(const rs_mod_t *mod, uint32_t start, const char *text) {
+    if (!mod->impl_rows || !text)
+        return NULL;
+    int low = 0, high = mod->nimpl_rows;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (mod->impl_rows[mid].impl->start < start)
+            low = mid + 1;
+        else
+            high = mid;
+    }
+    for (; low < mod->nimpl_rows && mod->impl_rows[low].impl->start == start; low++) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+        const rs_impl_t *at = mod->impl_rows[low].impl;
+        if (at->self_syn && at->self_syn->text && !strcmp(at->self_syn->text, text))
+            return at;
+    }
+    return NULL;
+}
+
 static void rs_walk_impl(rs_walk_t *w, TSNode node) {
     const rs_genv_t *saved_gens = w->gens;
     rs_push_generics(w, node);
@@ -4193,10 +4260,13 @@ static void rs_walk_impl(rs_walk_t *w, TSNode node) {
     w->self_ty = rs_lower(&env, self_syn);
     /* The impl's own `type Target = X` answers Self::Target inside it. */
     rs_mod_t *owner = rs_mod_at(w->b.file->root, ts_node_start_byte(node), ts_node_end_byte(node));
-    const rs_impl_t *found = NULL;
-    for (const rs_impl_t *at = owner ? owner->impls : NULL; at && self_syn; at = at->next) {
+    uint32_t start = ts_node_start_byte(node);
+    const rs_impl_t *found = owner && self_syn ? rs_impl_at(owner, start, self_syn->text) : NULL;
+    for (const rs_impl_t *at = owner && !found ? owner->impls : NULL; at && self_syn;
+         at = at->next) {
+        cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
         if (at->self_syn && at->self_syn->text && self_syn->text &&
-            !strcmp(at->self_syn->text, self_syn->text) && at->start == ts_node_start_byte(node)) {
+            !strcmp(at->self_syn->text, self_syn->text) && at->start == start) {
             found = at;
             break;
         }
@@ -4275,7 +4345,9 @@ static void rs_walk_inline_mod(rs_walk_t *w, TSNode node) {
     /* Inline modules were instantiated with their parent. Same-named cfg twins
      * are matched by their span. */
     uint32_t start = ts_node_start_byte(node);
-    for (const rs_child_t *child = w->inst->children; child; child = child->next) {
+    int row = -1;
+    for (const rs_child_t *child = rs_child_first(w->inst, name, &row); child;
+         child = rs_child_after(w->inst, child, &row)) {
         if (!child->inst || strcmp(child->name, name) != 0 || !child->inst->syn->is_inline ||
             child->inst->syn->start != start)
             continue;
@@ -4393,7 +4465,11 @@ cbm_rust_file_analysis_t *cbm_rust_analyze_file(const cbm_rust_project_t *projec
         w.b = (rs_builder_t){.arena = arena, .source = source, .length = length, .file = file};
         w.q = (rs_query_t){.project = project, .arena = arena, .memo = memo};
         w.inst = file->root->instances[i];
+        cbm_syntax_index_t syntax;
+        cbm_syntax_index_begin(&syntax, root.tree);
         rs_walk_items(&w, root);
+        cbm_syntax_index_end(&syntax);
+        cbm_ht_free(w.locals);
         if (w.parser)
             ts_parser_delete(w.parser);
         ok = !w.failed;

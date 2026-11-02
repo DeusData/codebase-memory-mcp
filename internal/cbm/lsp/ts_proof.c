@@ -561,7 +561,7 @@ static const CBMRegisteredType *named_type(TSLSPContext *ctx, const char *name, 
         return qn ? exact_type(ctx, qn) : NULL;
     }
     const char *target = NULL;
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
         const char *key = ctx->import_local_names[i];
         const char *value = ctx->import_module_qns[i];
         if (!key || strcmp(key, name) != 0)

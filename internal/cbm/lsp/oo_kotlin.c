@@ -767,13 +767,16 @@ static void kt_level_functions(oo_walk_t *w, const oo_scope_t *scope, const char
         kt_list_collect(out, oo_lookup_functions(w->ix, file->package, name));
         return;
     }
-    for (int i = 0; i < file->import_count; i++) {
-        const oo_import_t *import = &file->imports[i];
-        if (level == KT_LEVEL_STAR) {
+    if (level == KT_LEVEL_STAR) {
+        for (int i = 0; i < file->import_count; i++) {
+            const oo_import_t *import = &file->imports[i];
             if (import->star)
                 kt_list_collect(out, oo_lookup_functions(w->ix, import->path, name));
-            continue;
         }
+        return;
+    }
+    for (int i = oo_import_after(file, name, -1); i >= 0; i = oo_import_after(file, name, i)) {
+        const oo_import_t *import = &file->imports[i];
         if (import->star || !import->local || strcmp(import->local, name))
             continue;
         /* The imported name may be an alias: the leaf of the path is the
@@ -796,7 +799,7 @@ static void kt_level_functions(oo_walk_t *w, const oo_scope_t *scope, const char
  * shadows every lower level, so a project namesake there is not a candidate. */
 static bool kt_explicit_external(oo_walk_t *w, const oo_scope_t *scope, const char *name) {
     const oo_file_t *file = scope->file;
-    for (int i = 0; i < file->import_count; i++) {
+    for (int i = oo_import_after(file, name, -1); i >= 0; i = oo_import_after(file, name, i)) {
         const oo_import_t *import = &file->imports[i];
         if (import->star || !import->local || strcmp(import->local, name))
             continue;
@@ -1060,7 +1063,7 @@ static oo_value_t kt_field_type(oo_walk_t *w, const oo_field_t *field, const oo_
 /* A top-level property of the scope's file: explicit import, package, star. */
 static const oo_field_t *kt_free_property(oo_walk_t *w, const oo_scope_t *scope, const char *name) {
     const oo_file_t *file = scope->file;
-    for (int i = 0; i < file->import_count; i++) {
+    for (int i = oo_import_after(file, name, -1); i >= 0; i = oo_import_after(file, name, i)) {
         const oo_import_t *import = &file->imports[i];
         if (import->star || !import->local || strcmp(import->local, name))
             continue;
@@ -1112,7 +1115,7 @@ static const oo_field_t *kt_extension_property(oo_walk_t *w, const oo_scope_t *s
                                                const oo_value_t *value, const char *name) {
     const oo_file_t *file = scope->file;
     const oo_field_t *found = NULL;
-    for (int i = 0; i < file->import_count; i++) {
+    for (int i = oo_import_after(file, name, -1); i >= 0; i = oo_import_after(file, name, i)) {
         const oo_import_t *import = &file->imports[i];
         if (import->star || !import->local || strcmp(import->local, name))
             continue;
@@ -3587,6 +3590,7 @@ void oo_kotlin_resolve(oo_walk_t *w, TSNode root) {
                         .imports = imports,
                         .import_count = import_count,
                         .has_error = ts_node_has_error(root)};
+    oo_file_chain_imports(w->arena, file);
     w->f = file;
     w->scope = (oo_scope_t){.file = file, .ns = package};
     oo_frame_t frame;

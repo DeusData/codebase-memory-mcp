@@ -5,6 +5,8 @@
 #include "../resolve/types.h"
 #include "foundation/hash_table.h"
 #include <stdint.h>
+#include "../resolve/syntax_index.h"
+#include "lsp_name_rows.h"
 
 /* Shared model of the Java, Kotlin and C# adapters. Identity of a type is its
  * language-level qualified name; graph identity is carried separately because
@@ -61,6 +63,7 @@ typedef struct oo_file {
     CBMLanguage language;
     oo_import_t *imports;
     int import_count;
+    CBMNameRows import_rows; /* explicit imports by local name, in a long list */
     bool has_error;
     bool reference;      /* C#: a reference assembly's source. */
     bool test_source;    /* Its project's tests: nothing outside that project reads them. */
@@ -253,6 +256,7 @@ typedef struct oo_local {
     oo_value_t value;
     const oo_callable_t *callable_alias;
     struct oo_local *next;
+    struct oo_local *shadowed; /* the binding of this name it hides, until its frame ends */
 } oo_local_t;
 
 typedef struct oo_frame {
@@ -292,6 +296,7 @@ typedef struct {
     const oo_file_t *f;
     const char *rel_path, *file_qn, *dir_module_scope;
     CBMHashTable *calls, *usages, *rws, *type_refs;
+    CBMHashTable *locals; /* name -> its innermost live binding; a body can bind thousands */
     oo_frame_t *frame;
     oo_receiver_t *receiver;
     oo_scope_t scope;
@@ -301,6 +306,11 @@ typedef struct {
 } oo_walk_t;
 
 /* Index construction. */
+/* Chains the file's explicit imports, before anyone reads the file. */
+void oo_file_chain_imports(CBMArena *arena, oo_file_t *file);
+/* The next import worth a look for this name, after row (-1 starts): those of the name in a
+ * chained list, every one in a short list, so a caller still compares names. */
+int oo_import_after(const oo_file_t *file, const char *name, int row);
 const oo_file_t *oo_index_file(cbm_oo_index_t *ix, CBMLanguage lang, const char *rel,
                                const char *package, oo_import_t *imports, int import_count,
                                bool has_error);

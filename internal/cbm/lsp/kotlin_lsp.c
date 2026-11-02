@@ -1032,7 +1032,10 @@ const char *kotlin_resolve_class_name(KotlinLSPContext *ctx, const char *name) {
     }
 
     /* Explicit imports */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_locals,
+                                     ctx->import_count, name);
+         i >= 0; i = cbm_name_rows_next(&ctx->import_rows, ctx->import_locals, ctx->import_count,
+                                        name, i)) {
         const char *local = ctx->import_locals[i];
         if (local && strcmp(local, name) == 0 &&
             (ctx->import_kinds[i] == CBM_KT_USE_TYPE ||
@@ -1094,7 +1097,10 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
      * symbol itself. Prove that the candidate is a registered top-level
      * function before accepting it; otherwise `import values.handler` where
      * handler is a property would fabricate a callable target. */
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_locals,
+                                     ctx->import_count, name);
+         i >= 0; i = cbm_name_rows_next(&ctx->import_rows, ctx->import_locals, ctx->import_count,
+                                        name, i)) {
         const char *local = ctx->import_locals[i];
         if (local && strcmp(local, name) == 0 &&
             (ctx->import_kinds[i] == CBM_KT_USE_FUNCTION ||
@@ -5182,6 +5188,9 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
     /* Build per-file registry. */
     CBMTypeRegistry registry;
     cbm_registry_init(&registry, arena);
+    /* Indexed once the file's declarations are in, as the cross-file pass does. A scan
+     * finds the first registration, so the index answers with that one. */
+    registry.index_first_registered = true;
 
     /* Curated stdlib */
     cbm_kotlin_stdlib_register(&registry, arena);
@@ -5219,8 +5228,13 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
     kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, module_qn, module_qn,
                     project_name, /*rel_path=*/NULL, &result->resolved_calls);
     ctx.synthetic_calls = &result->calls;
+    CBMArena index_arena;
+    cbm_arena_init(&index_arena);
+    ctx.overlay_index_arena = &index_arena;
+    registry.tail_arena = &index_arena;
 
     kotlin_lsp_process_file(&ctx, use_root);
+    cbm_arena_destroy(&index_arena);
 
     /* Inject kotlin.Any universal-method nodes (toString/equals/hashCode) so the
      * lsp_kt_any fallback emitted above has a target node to form a CALLS edge. */
@@ -5630,6 +5644,7 @@ void cbm_run_kotlin_lsp_cross_with_result(CBMArena *arena, const char *source, i
     kotlin_lsp_init(&ctx, arena, source, source_len, &overlay, module_qn ? module_qn : "",
                     module_qn ? module_qn : "", project_name, /*rel_path=*/NULL, out);
     ctx.overlay_index_arena = &idx_arena;
+    overlay.tail_arena = &idx_arena;
 
     /* Unique short type name -> registered QN, for receiver annotations that
      * name a type defined in another file without an import. Two types

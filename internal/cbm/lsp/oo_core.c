@@ -1,3 +1,4 @@
+#include "../resolve/stats.h"
 #include "oo_internal.h"
 #include "proof_bridge.h"
 #include "../resolve/policy.h"
@@ -57,9 +58,45 @@ void cbm_oo_index_free(cbm_oo_index_t *ix) {
     ix->files = NULL;
 }
 
+/* a, the separator, b; NULL when that does not fit. Every name lookup comes through here,
+ * and snprintf takes a process-wide lock on macOS. */
+static const char *oo_join(char *buffer, size_t capacity, const char *a, char separator,
+                           const char *b) {
+    size_t a_length = strlen(a), b_length = strlen(b);
+    if (a_length + 1 + b_length >= capacity)
+        return NULL;
+    memcpy(buffer, a, a_length);
+    buffer[a_length] = separator;
+    memcpy(buffer + a_length + 1, b, b_length + 1);
+    return buffer;
+}
+
 static const char *oo_key(char *buffer, size_t capacity, const char *a, const char *b) {
-    int length = snprintf(buffer, capacity, "%s\x1f%s", a ? a : "", b ? b : "");
-    return length > 0 && (size_t)length < capacity ? buffer : NULL;
+    return oo_join(buffer, capacity, a ? a : "", '\x1f', b ? b : "");
+}
+
+void oo_file_chain_imports(CBMArena *arena, oo_file_t *file) {
+    if (file->import_count < CBM_NAME_ROWS_MIN)
+        return;
+    for (int i = 0; i < file->import_count; i++) {
+        const oo_import_t *import = &file->imports[i];
+        if (!import->star && import->local &&
+            !cbm_name_rows_add(arena, &file->import_rows, NULL, import->local, i)) {
+            return;
+        }
+    }
+    file->import_rows.chained = true;
+}
+
+/* The file's imports worth a look for this name: all of a short list, those of the name
+ * in a long one. The index is read by every worker, so a long list is chained in advance. */
+int oo_import_after(const oo_file_t *file, const char *segment, int row) {
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    /* Nothing chained is not an answer: every list without a chain is walked. */
+    if (file->import_rows.chained)
+        return row < 0 ? cbm_name_rows_lookup(&file->import_rows, NULL, segment)
+                       : file->import_rows.next[row];
+    return row + 1 < file->import_count ? row + 1 : -1;
 }
 
 static const char *file_rel_or(const char *rel) {
@@ -127,6 +164,7 @@ const oo_file_t *oo_index_file(cbm_oo_index_t *ix, CBMLanguage lang, const char 
                     .project = ix->project};
     if (ix->project)
         cbm_ht_set(ix->files, file->rel, file);
+    oo_file_chain_imports(ix->arena, file);
     return file;
 }
 
@@ -575,8 +613,7 @@ const oo_type_t *oo_find_nested(const cbm_oo_index_t *ix, const oo_type_t *type,
     while (head < tail) {
         const oo_type_t *current = queue[head++];
         char buffer[OO_KEY_MAX];
-        int length = snprintf(buffer, sizeof(buffer), "%s.%s", current->qn, name);
-        if (length > 0 && (size_t)length < sizeof(buffer)) {
+        if (oo_join(buffer, sizeof(buffer), current->qn, '.', name)) {
             const oo_type_t *nested = cbm_ht_get(ix->types, buffer);
             if (nested)
                 return nested;
@@ -612,9 +649,12 @@ static oo_name_t oo_name_type(const cbm_oo_index_t *ix, const oo_file_t *file,
 static const oo_type_t *oo_qualified(const cbm_oo_index_t *ix, const char *prefix,
                                      const char *name) {
     char buffer[OO_KEY_MAX];
-    int length = prefix && prefix[0] ? snprintf(buffer, sizeof(buffer), "%s.%s", prefix, name)
-                                     : snprintf(buffer, sizeof(buffer), "%s", name);
-    return length > 0 && (size_t)length < sizeof(buffer) ? cbm_ht_get(ix->types, buffer) : NULL;
+    if (!name)
+        return NULL;
+    if (prefix && prefix[0])
+        return oo_join(buffer, sizeof(buffer), prefix, '.', name) ? cbm_ht_get(ix->types, buffer)
+                                                                  : NULL;
+    return name[0] && strlen(name) < sizeof(buffer) ? cbm_ht_get(ix->types, name) : NULL;
 }
 
 static bool oo_builtin_name(const char *name) {
@@ -688,7 +728,8 @@ static oo_name_t oo_jvm_simple(const cbm_oo_index_t *ix, const oo_scope_t *scope
     const oo_file_t *file = scope->file;
     /* JLS 6.4.1 / Kotlin spec: explicit import shadows the package, which
      * shadows on-demand imports. */
-    for (int i = 0; i < file->import_count; i++) {
+    for (int i = oo_import_after(file, segment, -1); i >= 0;
+         i = oo_import_after(file, segment, i)) {
         const oo_import_t *import = &file->imports[i];
         if (import->star || !import->local || strcmp(import->local, segment))
             continue;
@@ -724,7 +765,8 @@ static oo_name_t oo_cs_simple(const cbm_oo_index_t *ix, const oo_scope_t *scope,
         if (member)
             return oo_name_type(ix, scope->file, member);
         const oo_file_t *file = scope->file;
-        for (int i = 0; i < file->import_count; i++) {
+        for (int i = oo_import_after(file, segment, -1); i >= 0;
+             i = oo_import_after(file, segment, i)) {
             const oo_import_t *import = &file->imports[i];
             if (import->star || !import->local || strcmp(import->local, segment) ||
                 strcmp(import->ns ? import->ns : "", prefix))
@@ -2439,7 +2481,8 @@ void oo_walk_dispose(oo_walk_t *w) {
     cbm_ht_free(w->usages);
     cbm_ht_free(w->rws);
     cbm_ht_free(w->type_refs);
-    w->calls = w->usages = w->rws = w->type_refs = NULL;
+    cbm_ht_free(w->locals);
+    w->calls = w->usages = w->rws = w->type_refs = w->locals = NULL;
 }
 
 bool oo_budget(oo_walk_t *w) {
@@ -2457,30 +2500,43 @@ void oo_frame_push(oo_walk_t *w, oo_frame_t *frame) {
 }
 
 void oo_frame_pop(oo_walk_t *w) {
-    if (w->frame)
-        w->frame = w->frame->parent;
+    if (!w->frame)
+        return;
+    /* Newest first, so a name bound twice here ends at what the frame hid. */
+    for (const oo_local_t *local = w->frame->locals; local; local = local->next) {
+        if (local->shadowed)
+            cbm_ht_set(w->locals, local->name, local->shadowed);
+        else
+            cbm_ht_delete(w->locals, local->name);
+    }
+    w->frame = w->frame->parent;
 }
 
 void oo_bind(oo_walk_t *w, const char *name, oo_value_t value) {
     if (!name || !w->frame)
         return;
+    if (!w->locals)
+        w->locals = cbm_ht_create(32);
     oo_local_t *local = cbm_arena_alloc(w->arena, sizeof(*local));
-    if (!local) {
+    if (!local || !w->locals) {
         w->failed = true;
         return;
     }
-    *local = (oo_local_t){.name = name, .value = value, .next = w->frame->locals};
+    *local = (oo_local_t){.name = name,
+                          .value = value,
+                          .next = w->frame->locals,
+                          .shadowed = cbm_ht_get(w->locals, name)};
     w->frame->locals = local;
+    cbm_ht_set(w->locals, name, local);
 }
 
+/* A binding always goes to the innermost frame, so the newest live one of a name is the one
+ * a walk out through the frames would meet first. */
 const oo_local_t *oo_lookup_local(const oo_walk_t *w, const char *name) {
-    if (!name)
+    if (!name || !w->locals)
         return NULL;
-    for (const oo_frame_t *frame = w->frame; frame; frame = frame->parent)
-        for (const oo_local_t *local = frame->locals; local; local = local->next)
-            if (!strcmp(local->name, name))
-                return local;
-    return NULL;
+    cbm_resolve_stats_add(CBM_RESOLVE_STAT_LOOKUP_PROBES, 1);
+    return cbm_ht_get(w->locals, name);
 }
 
 const char *oo_text(const oo_walk_t *w, TSNode node) {
@@ -2651,11 +2707,14 @@ bool cbm_oo_index_add_file(cbm_oo_index_t *ix, CBMLanguage language, const char 
     if (!tree)
         return false;
     TSNode root = ts_tree_root_node(tree);
+    cbm_syntax_index_t syntax;
+    cbm_syntax_index_begin(&syntax, tree);
     bool ok = language == CBM_LANG_JAVA
                   ? oo_java_harvest(ix, rel_path, file, source, (size_t)source_len, root)
               : language == CBM_LANG_KOTLIN
                   ? oo_kotlin_harvest(ix, rel_path, file, source, (size_t)source_len, root)
                   : oo_csharp_harvest(ix, rel_path, file, source, (size_t)source_len, root);
+    cbm_syntax_index_end(&syntax);
     if (owned)
         ts_tree_delete(owned);
     return ok;
@@ -2686,12 +2745,15 @@ void cbm_oo_resolve_file(const cbm_oo_index_t *ix, CBMArena *arena, CBMLanguage 
             language == CBM_LANG_JAVA && file->module_qn ? file->module_qn : NULL;
         walk.file_qn = file_qn;
         TSNode root = ts_tree_root_node(tree);
+        cbm_syntax_index_t syntax;
+        cbm_syntax_index_begin(&syntax, tree);
         if (language == CBM_LANG_JAVA)
             oo_java_resolve(&walk, root);
         else if (language == CBM_LANG_KOTLIN)
             oo_kotlin_resolve(&walk, root);
         else
             oo_csharp_resolve(&walk, root);
+        cbm_syntax_index_end(&syntax);
         if (!walk.failed)
             for (int i = 0; i < staged.count; i++)
                 cbm_resolvedcall_push(out, arena, staged.items[i]);

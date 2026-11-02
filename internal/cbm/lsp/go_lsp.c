@@ -1,3 +1,5 @@
+#include "lsp_work.h"
+#include "lsp_neg_memo.h"
 #include "proof_bridge.h"
 #include "go_lsp.h"
 #include "lsp_node_iter.h"
@@ -95,12 +97,13 @@ static const char *resolve_import(GoLSPContext *ctx, const char *local_name) {
     if (!local_name || cbm_scope_contains(ctx->current_scope, local_name))
         return NULL;
     const char *target = NULL;
-    for (int i = 0; i < ctx->import_count; i++) {
-        if (strcmp(ctx->import_local_names[i], local_name) == 0) {
-            if (target && strcmp(target, ctx->import_package_qns[i]) != 0)
-                return NULL;
-            target = ctx->import_package_qns[i];
-        }
+    for (int i = cbm_name_rows_first(&ctx->import_rows, ctx->arena, ctx->import_local_names,
+                                     ctx->import_count, local_name);
+         i >= 0; i = cbm_name_rows_next(&ctx->import_rows, ctx->import_local_names,
+                                        ctx->import_count, local_name, i)) {
+        if (target && strcmp(target, ctx->import_package_qns[i]) != 0)
+            return NULL;
+        target = ctx->import_package_qns[i];
     }
     return target;
 }
@@ -2934,7 +2937,7 @@ bool cbm_go_collect_source_facts(CBMArena *arena, const char *source, int length
     if (!parser)
         return false;
     ts_parser_set_language(parser, tree_sitter_go());
-    TSTree *tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)length);
+    TSTree *tree = cbm_parse_plain(parser, source, (uint32_t)length);
     ts_parser_delete(parser);
     if (!tree)
         return false;
@@ -2966,6 +2969,9 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
     const char *module_qn = result->module_qn;
     CBMHashTable *return_facts = go_source_returns(arena, root, source, module_qn);
+    /* The first registration of each of this file's types: registering and refining
+     * them asks about every other one, and a generated file holds thousands. */
+    CBMIdxMemo own_types = {0};
 
     // Phase 1: Register all types and functions from the file's own definitions
     for (int i = 0; i < result->defs.count; i++) {
@@ -3009,6 +3015,7 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             }
 
             cbm_registry_add_type(&reg, rt);
+            cbm_idxmemo_put_if_absent(&own_types, arena, rt.qualified_name, reg.type_count - 1);
         }
 
         // Register Function/Method nodes
@@ -3105,13 +3112,16 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                     }
                 }
 
-                if (rf.receiver_type && !cbm_registry_lookup_type(&reg, rf.receiver_type)) {
+                if (rf.receiver_type && cbm_idxmemo_get(&own_types, rf.receiver_type) < 0 &&
+                    !cbm_registry_lookup_type(reg.fallback, rf.receiver_type)) {
                     const char *dot = strrchr(rf.receiver_type, '.');
                     CBMRegisteredType auto_type;
                     memset(&auto_type, 0, sizeof(auto_type));
                     auto_type.qualified_name = rf.receiver_type;
                     auto_type.short_name = dot ? dot + 1 : rf.receiver_type;
                     cbm_registry_add_type(&reg, auto_type);
+                    cbm_idxmemo_put_if_absent(&own_types, arena, auto_type.qualified_name,
+                                              reg.type_count - 1);
                 }
             }
 
@@ -3149,22 +3159,18 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                                 cbm_arena_sprintf(arena, "%s.%s", module_qn, aname);
                             const char *alias_target_qn =
                                 cbm_arena_sprintf(arena, "%s.%s", module_qn, atarget);
-                            bool found_a = false;
-                            for (int ti = 0; ti < reg.type_count; ti++) {
-                                if (reg.types[ti].qualified_name &&
-                                    strcmp(reg.types[ti].qualified_name, alias_type_qn) == 0) {
-                                    reg.types[ti].alias_of = alias_target_qn;
-                                    found_a = true;
-                                    break;
-                                }
-                            }
-                            if (!found_a) {
+                            int alias_at = cbm_idxmemo_get(&own_types, alias_type_qn);
+                            if (alias_at >= 0)
+                                reg.types[alias_at].alias_of = alias_target_qn;
+                            if (alias_at < 0) {
                                 CBMRegisteredType alias_rt;
                                 memset(&alias_rt, 0, sizeof(alias_rt));
                                 alias_rt.qualified_name = alias_type_qn;
                                 alias_rt.short_name = aname;
                                 alias_rt.alias_of = alias_target_qn;
                                 cbm_registry_add_type(&reg, alias_rt);
+                                cbm_idxmemo_put_if_absent(&own_types, arena, alias_type_qn,
+                                                          reg.type_count - 1);
                             }
                         }
                     }
@@ -3205,20 +3211,16 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                             }
                         }
                     }
-                    if (iface_method_count > 0) {
-                        for (int ti = 0; ti < reg.type_count; ti++) {
-                            if (!reg.types[ti].qualified_name ||
-                                strcmp(reg.types[ti].qualified_name, type_qn) != 0)
-                                continue;
-                            const char **names = (const char **)cbm_arena_alloc(
-                                arena, (iface_method_count + 1) * sizeof(const char *));
-                            for (int mi = 0; mi < iface_method_count; mi++) {
-                                names[mi] = iface_methods[mi];
-                            }
-                            names[iface_method_count] = NULL;
-                            reg.types[ti].method_names = names;
-                            break;
+                    int iface_at =
+                        iface_method_count > 0 ? cbm_idxmemo_get(&own_types, type_qn) : -1;
+                    if (iface_at >= 0) {
+                        const char **names = (const char **)cbm_arena_alloc(
+                            arena, (iface_method_count + 1) * sizeof(const char *));
+                        for (int mi = 0; mi < iface_method_count; mi++) {
+                            names[mi] = iface_methods[mi];
                         }
+                        names[iface_method_count] = NULL;
+                        reg.types[iface_at].method_names = names;
                     }
                     continue;
                 }
@@ -3288,11 +3290,8 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                 }
 
                 // Find the registered type and update it
-                for (int ti = 0; ti < reg.type_count; ti++) {
-                    if (!reg.types[ti].qualified_name ||
-                        strcmp(reg.types[ti].qualified_name, type_qn) != 0)
-                        continue;
-
+                int ti = cbm_idxmemo_get(&own_types, type_qn);
+                if (ti >= 0) {
                     if (embed_count > 0) {
                         const char **arr = (const char **)cbm_arena_alloc(
                             arena, (embed_count + 1) * sizeof(const char *));
@@ -3315,7 +3314,6 @@ void cbm_run_go_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                         reg.types[ti].field_names = names;
                         reg.types[ti].field_types = types;
                     }
-                    break;
                 }
             }
         }
@@ -3746,8 +3744,16 @@ static const CBMType *cbm_go_lsp_keep_known_refinement(const CBMType *candidate,
 
 // Scan AST for generic function declarations and set type_param_names + re-parse
 // return types on matching registered functions.
+enum { GO_TYPE_PARAM_MEMO_BLOCK = 4096 };
+
 static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, TSNode root,
                                          const char *source, const char *module_qn) {
+
+    // Each generic function patches the first registration of its name.
+    CBMArena memo_arena;
+    cbm_arena_init_lazy(&memo_arena, GO_TYPE_PARAM_MEMO_BLOCK);
+    CBMIdxMemo first_func = {0};
+    bool first_func_built = false;
 
     // Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²).
     uint32_t rkn = 0;
@@ -3812,7 +3818,15 @@ static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, 
 
         // Find the matching registered function and set type_param_names
         const char *func_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, func_name);
-        for (int fi = 0; fi < reg->func_count; fi++) {
+        if (!first_func_built) {
+            first_func_built = true;
+            for (int fi = 0; fi < reg->func_count; fi++)
+                cbm_idxmemo_put_if_absent(&first_func, &memo_arena, reg->funcs[fi].qualified_name,
+                                          fi);
+        }
+        CBM_LSP_WORK(1);
+        int first_row = cbm_idxmemo_get(&first_func, func_qn);
+        for (int fi = first_row >= 0 ? first_row : reg->func_count; fi < reg->func_count; fi++) {
             if (reg->funcs[fi].qualified_name &&
                 strcmp(reg->funcs[fi].qualified_name, func_qn) == 0) {
                 reg->funcs[fi].type_param_names = tp_names;
@@ -3950,6 +3964,7 @@ static void extract_type_params_from_ast(CBMArena *arena, CBMTypeRegistry *reg, 
             }
         }
     }
+    cbm_arena_destroy(&memo_arena);
 }
 
 // Forward: tree-sitter Go language (from lang_specs.c)
