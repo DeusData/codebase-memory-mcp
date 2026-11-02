@@ -228,10 +228,10 @@ TEST(doc_mentions_go_sources) {
         const char *raw;
         const char *source;
     } want[] = {
-        {"RefF", "p.pkg.F"}, {"RefS", "p.pkg.S"},     {"RefField", "p.pkg.S.Field"},
-        {"RefM", "p.pkg.M"}, /* Go method nodes have a flat name */
-        {"RefI", "p.pkg.I"}, {"RefDo", "p.pkg.I.Do"}, {"RefC", "p.pkg.C"},
-        {"RefK", "p.pkg.K"}, {"RefV", "p.pkg.V"},     {"RefA", "p.pkg.A"},
+        {"RefF", "p.pkg.F"},   {"RefS", "p.pkg.S"},     {"RefField", "p.pkg.S.Field"},
+        {"RefM", "p.pkg.S.M"}, /* #1913: Go method nodes are receiver-qualified */
+        {"RefI", "p.pkg.I"},   {"RefDo", "p.pkg.I.Do"}, {"RefC", "p.pkg.C"},
+        {"RefK", "p.pkg.K"},   {"RefV", "p.pkg.V"},     {"RefA", "p.pkg.A"},
     };
     for (size_t i = 0; i < GO_COUNT(want); i++) {
         const CBMDocLink *t = dm_find_token(r, want[i].raw);
@@ -772,14 +772,15 @@ TEST(doc_mentions_go_scope_blob) {
         "T\tAlias\ta\tal.Widget\t1",
         "T\tSame\ta\tKind\t1",
         "T\tList\ts\t-\t1",
-        /* functions and methods; two methods named Run compete for one node
-         * and the later one keeps it */
+        /* functions and methods; a method node is receiver-qualified
+         * (#1913), so a method claims no flat name and its w is `-`: the two
+         * methods named Run no longer compete */
         "F\tNew\t1",
         "F\tMap\t1",
-        "M\tWidget\tRun\t0",
-        "M\tKind\tRun\t1",
-        "M\tList\tPush\t1",
-        "M\tlower\tExported\t1",
+        "M\tWidget\tRun\t-",
+        "M\tKind\tRun\t-",
+        "M\tList\tPush\t-",
+        "M\tlower\tExported\t-",
         /* own type parameters, by the declaration's first and last line */
         "g\t36\t36\tT,U",
         "g\t42\t42\tA,B",
@@ -814,15 +815,20 @@ TEST(doc_mentions_go_scope_blob) {
     char *portable = cbm_doclink_portable_scope(s);
     ASSERT_NOT_NULL(portable);
     ASSERT_NULL(strstr(portable, "\ng\t"));
-    ASSERT_TRUE(go_has_rec(portable, "M\tKind\tRun\t1"));
+    ASSERT_TRUE(go_has_rec(portable, "M\tKind\tRun\t-"));
     ASSERT(strncmp(portable, "go1\n", 4) == 0);
     cbm_free(CBM_MEM_CLASS_OTHER, portable);
     cbm_free_result(r);
 
-    /* moving declarations changes nothing unless a node changes its owner */
+    /* moving declarations changes nothing unless a node changes its owner.
+     * Methods own no flat name (#1913), so swapping two methods of one name
+     * changes nothing either; two package-level declarations of one name
+     * still hand <dir>.<name> over when swapped */
     const char *a = "package p\n\nfunc (a A) Run() {}\nfunc (b B) Run() {}\nfunc F() {}\n";
     const char *moved = "package p\n\nfunc F() {}\n\n\nfunc (a A) Run() {}\nfunc (b B) Run() {}\n";
     const char *swapped = "package p\n\nfunc (b B) Run() {}\nfunc (a A) Run() {}\nfunc F() {}\n";
+    const char *pair = "package p\n\nfunc Open() {}\ntype Open struct{}\n";
+    const char *pair_swapped = "package p\n\ntype Open struct{}\nfunc Open() {}\n";
     CBMFileResult *ra = go_extract(a, "p/x.go");
     CBMFileResult *rm = go_extract(moved, "p/x.go");
     CBMFileResult *rs = go_extract(swapped, "p/x.go");
@@ -830,16 +836,25 @@ TEST(doc_mentions_go_scope_blob) {
     ASSERT_NOT_NULL(rm);
     ASSERT_NOT_NULL(rs);
     ASSERT_STR_EQ(ra->doc_scope, rm->doc_scope);
-    ASSERT(strcmp(ra->doc_scope, rs->doc_scope) != 0);
-    ASSERT_TRUE(go_has_rec(rs->doc_scope, "M\tA\tRun\t1"));
-    ASSERT_TRUE(go_has_rec(rs->doc_scope, "M\tB\tRun\t0"));
+    ASSERT_STR_EQ(ra->doc_scope, rs->doc_scope);
+    ASSERT_TRUE(go_has_rec(rs->doc_scope, "M\tA\tRun\t-"));
+    ASSERT_TRUE(go_has_rec(rs->doc_scope, "M\tB\tRun\t-"));
     cbm_free_result(ra);
     cbm_free_result(rm);
     cbm_free_result(rs);
+    CBMFileResult *rp = go_extract(pair, "p/x.go");
+    CBMFileResult *rq = go_extract(pair_swapped, "p/x.go");
+    ASSERT_NOT_NULL(rp);
+    ASSERT_NOT_NULL(rq);
+    ASSERT(strcmp(rp->doc_scope, rq->doc_scope) != 0);
+    ASSERT_TRUE(go_has_rec(rp->doc_scope, "T\tOpen\ts\t-\t1"));
+    ASSERT_TRUE(go_has_rec(rq->doc_scope, "F\tOpen\t1"));
+    cbm_free_result(rp);
+    cbm_free_result(rq);
 
-    /* the node <dir>.<name> is one for a function, a type, a value and the
-     * methods of that name: the last declaration keeps it, whatever its kind,
-     * and two on one line contest it */
+    /* the node <dir>.<name> is one for a function, a type and a value of
+     * that name: the last declaration keeps it, whatever its kind, and two on
+     * one line contest it. A method of that name claims nothing (#1913) */
     CBMFileResult *k1 = go_extract("package p\n\nfunc Open() {}\nfunc (t T) Open() {}\n", "p/k.go");
     CBMFileResult *k2 = go_extract("package p\n\nfunc (t T) Open() {}\nfunc Open() {}\n", "p/k.go");
     CBMFileResult *k3 = go_extract("package p\n\ntype Open int\nvar Open = 1\n"
@@ -848,14 +863,21 @@ TEST(doc_mentions_go_scope_blob) {
     ASSERT_NOT_NULL(k1);
     ASSERT_NOT_NULL(k2);
     ASSERT_NOT_NULL(k3);
-    ASSERT_TRUE(go_has_rec(k1->doc_scope, "F\tOpen\t0"));
-    ASSERT_TRUE(go_has_rec(k1->doc_scope, "M\tT\tOpen\t1"));
+    ASSERT_TRUE(go_has_rec(k1->doc_scope, "F\tOpen\t1"));
+    ASSERT_TRUE(go_has_rec(k1->doc_scope, "M\tT\tOpen\t-"));
     ASSERT_TRUE(go_has_rec(k2->doc_scope, "F\tOpen\t1"));
-    ASSERT_TRUE(go_has_rec(k2->doc_scope, "M\tT\tOpen\t0"));
+    ASSERT_TRUE(go_has_rec(k2->doc_scope, "M\tT\tOpen\t-"));
     ASSERT_TRUE(go_has_rec(k3->doc_scope, "T\tOpen\to\t-\t0"));
     ASSERT_TRUE(go_has_rec(k3->doc_scope, "V\tOpen\t0"));
-    ASSERT_TRUE(go_has_rec(k3->doc_scope, "V\tOpen\tx"));
-    ASSERT_TRUE(go_has_rec(k3->doc_scope, "M\tT\tOpen\tx"));
+    ASSERT_TRUE(go_has_rec(k3->doc_scope, "V\tOpen\t1"));
+    ASSERT_TRUE(go_has_rec(k3->doc_scope, "M\tT\tOpen\t-"));
+    /* two package-level declarations on one line contest the name */
+    CBMFileResult *k4 =
+        go_extract("package p\n\ntype Open int\nvar Open = 1; const Open = 2\n", "p/k.go");
+    ASSERT_NOT_NULL(k4);
+    ASSERT_TRUE(go_has_rec(k4->doc_scope, "T\tOpen\to\t-\t0"));
+    ASSERT_TRUE(go_has_rec(k4->doc_scope, "V\tOpen\tx"));
+    cbm_free_result(k4);
     cbm_free_result(k1);
     cbm_free_result(k2);
     cbm_free_result(k3);
@@ -1030,7 +1052,7 @@ static const char GO_ALPHA_C[] = "package alpha\n"
                                  "// Target is a target; see [A.Close] and [B.Close].\n"
                                  "func Target() {}\n"
                                  "\n"
-                                 "// Open is a type that loses its node name to the method below.\n"
+                                 "// Open is a type; a method of B below has the same name.\n"
                                  "type Open struct{}\n"
                                  "\n"
                                  "// Open opens: a method named like the type.\n"
@@ -1295,7 +1317,7 @@ TEST(doc_mentions_go_forms) {
     static const go_want_edge_t edges[] = {
         /* [Name], [Recv.Method], an interface's method, a constant, a variable */
         {"alpha.Widget", "alpha.New", "unique"},
-        {"alpha.Widget", "alpha.Run", "unique"},
+        {"alpha.Widget", "alpha.Widget.Run", "unique"},
         {"alpha.Widget", "alpha.Runner.Run", "unique"},
         {"alpha.Widget", "alpha.Max", "unique"},
         {"alpha.Widget", "alpha.Default", "unique"},
@@ -1311,7 +1333,7 @@ TEST(doc_mentions_go_forms) {
         {"alpha.New", "sub.deep.Deep", "exact"},
         {"alpha.New", "nested.pkg.Far", "exact"},
         /* [pkg.Recv.Name]: a method, a field, an interface method */
-        {"alpha.New", "beta.Do", "exact"},
+        {"alpha.New", "beta.Thing.Do", "exact"},
         {"alpha.New", "beta.Thing.Field", "exact"},
         {"alpha.New", "beta.Doer.Act", "exact"},
         /* an identifier with letters beyond ASCII */
@@ -1395,7 +1417,7 @@ TEST(doc_mentions_go_plain_text) {
     ASSERT_EQ(go_bad_rows(db, rows, GO_COUNT(rows)), 0);
     /* and none of them is an edge: Run's doc holds rows, plain text and one
      * link, to the field Widget.Size */
-    ASSERT_EQ(dm_mentions_from(db, "alpha.Run"), 1);
+    ASSERT_EQ(dm_mentions_from(db, "alpha.Widget.Run"), 1);
     ASSERT_EQ(dm_mentions_from(db, "alpha.Bare"), 0);
     static const go_want_edge_t edges[] = {
         {"alpha.Sibling", "alpha.Widget", "unique"},
@@ -1424,14 +1446,14 @@ TEST(doc_mentions_go_struct_fields) {
     static const go_want_edge_t edges[] = {
         /* the same package: a field named from a method's doc and from a
          * sibling field's doc */
-        {"alpha.Run", "alpha.Widget.Size", "exact"},
+        {"alpha.Widget.Run", "alpha.Widget.Size", "exact"},
         {"alpha.Widget.Name", "alpha.Widget.Size", "exact"},
         /* another package, by its import */
         {"alpha.New", "beta.Thing.Field", "exact"},
         {"gamma.ViaAlias", "alpha.Widget.Name", "exact"},
         /* Depth is a field of beta.Embedded, which Widget embeds: it is no
          * field of Widget */
-        {"alpha.Run", "beta.Embedded.Depth", ""},
+        {"alpha.Widget.Run", "beta.Embedded.Depth", ""},
     };
     ASSERT_EQ(go_bad_edges(db, edges, GO_COUNT(edges)), 0);
     /* the promoted field exists as a node: the test above is not vacuous */
@@ -1545,7 +1567,7 @@ TEST(doc_mentions_go_lookup_order) {
      * file that imports "fmt", the repository's own in a file that imports
      * example.com/demo/fmt */
     ASSERT_STR_EQ(go_reason(db, "alpha/a.go", "fmt.Println"), "external");
-    ASSERT_STR_EQ(go_tier(db, "alpha.Run", "fmt.Println"), "");
+    ASSERT_STR_EQ(go_tier(db, "alpha.Widget.Run", "fmt.Println"), "");
     ASSERT_STR_EQ(go_tier(db, "gamma.Local", "fmt.Println"), "exact");
     /* 5. the longest module path decides: a directory inside the root module
      * that belongs to a nested module of another path is not reachable through
@@ -1555,17 +1577,17 @@ TEST(doc_mentions_go_lookup_order) {
     ASSERT_STR_EQ(go_tier(db, "alpha.New", "sub.deep.Deep"), "exact");
     /* 6. the bare name stops at the package: beta.Make is imported and still
      * no [Make] */
-    ASSERT_STR_EQ(go_tier(db, "alpha.Run", "beta.Make"), "");
+    ASSERT_STR_EQ(go_tier(db, "alpha.Widget.Run", "beta.Make"), "");
     /* 7. members stop at the type: nothing promoted through embedding */
     ASSERT_STR_EQ(go_reason(db, "gamma/k.go", "alpha.Widget.Promoted"), "missing");
-    ASSERT_STR_EQ(go_tier(db, "gamma.ViaAlias", "beta.Promoted"), "");
+    ASSERT_STR_EQ(go_tier(db, "gamma.ViaAlias", "beta.Embedded.Promoted"), "");
     /* 8. an alias is followed for a member written with its package, to the
      * type that declares the member */
     static const go_want_edge_t alias[] = {
-        {"gamma.ViaAlias", "beta.Do", "exact"},
+        {"gamma.ViaAlias", "beta.Thing.Do", "exact"},
         {"gamma.ViaAlias", "beta.Thing.Field", "exact"},
         {"gamma.ViaAlias", "alpha.Alias", "exact"},
-        {"gamma.ViaAlias", "alpha.End", "exact"}, /* seven aliases away */
+        {"gamma.ViaAlias", "alpha.Deep10.End", "exact"}, /* seven aliases away */
         {"gamma.ViaAlias", "alpha.Widget.Name", "exact"},
     };
     ASSERT_EQ(go_bad_edges(db, alias, GO_COUNT(alias)), 0);
@@ -1638,28 +1660,42 @@ TEST(doc_mentions_go_node_owner) {
     char tmp[256];
     char db[512];
     ASSERT_EQ(go_index_lookup(tmp, sizeof(tmp), db, sizeof(db)), 0);
-    /* Go method nodes have a flat name: A.Close and B.Close share
-     * alpha.Close, and the later declaration keeps it */
-    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE qualified_name LIKE '%.alpha.Close'"),
+    /* #1913: Go method nodes are receiver-qualified. A.Close and B.Close are
+     * two nodes (no shared alpha.Close), each a target of its own */
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Method' AND "
+                           "qualified_name LIKE '%.alpha.A.Close'"),
               1);
-    ASSERT_STR_EQ(go_tier(db, "alpha.Target", "alpha.Close"), "unique");
-    ASSERT_STR_EQ(go_reason(db, "alpha/c.go", "A.Close"), "graph_gap");
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label = 'Method' AND "
+                           "qualified_name LIKE '%.alpha.B.Close'"),
+              1);
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE qualified_name LIKE '%.alpha.Close'"),
+              0);
+    ASSERT_STR_EQ(go_tier(db, "alpha.Target", "alpha.A.Close"), "unique");
+    ASSERT_STR_EQ(go_tier(db, "alpha.Target", "alpha.B.Close"), "unique");
+    ASSERT_STR_EQ(go_reason(db, "alpha/c.go", "A.Close"), "");
     ASSERT_STR_EQ(go_reason(db, "alpha/c.go", "B.Close"), "");
-    /* the doc of the method that lost the name is not attributed to the one
-     * that kept it: B.Close's [Target] is the edge, A.Close's a row */
+    /* each method's doc is attributed to its own node: both [Target]s are
+     * edges, from the line of that method's doc, and neither is a row */
     char props[512];
     int n = 0;
-    dm_edge(db, "alpha.Close", "alpha.Target", props, sizeof(props), &n);
+    dm_edge(db, "alpha.A.Close", "alpha.Target", props, sizeof(props), &n);
+    ASSERT_EQ(n, 1);
+    ASSERT_NOT_NULL(strstr(props, "\"line\":9,\"count\":1"));
+    dm_edge(db, "alpha.B.Close", "alpha.Target", props, sizeof(props), &n);
     ASSERT_EQ(n, 1);
     ASSERT_NOT_NULL(strstr(props, "\"line\":12,\"count\":1"));
-    ASSERT_EQ(dm_count(db, "SELECT line FROM doc_link_unresolved WHERE rel_path = 'alpha/c.go' "
-                           "AND raw = 'Target'"),
-              9);
-    /* a type that lost its name to a method of that name is no target, the
-     * method is */
-    ASSERT_STR_EQ(go_reason(db, "alpha/c.go", "Open"), "graph_gap");
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM doc_link_unresolved WHERE rel_path = "
+                           "'alpha/c.go' AND raw = 'Target'"),
+              0);
+    /* a type and a method of the same name no longer share a node: [Open]
+     * is the type, [B.Open] the method */
+    ASSERT_STR_EQ(go_reason(db, "alpha/c.go", "Open"), "");
+    ASSERT_EQ(dm_count(db, "SELECT COUNT(*) FROM nodes WHERE label <> 'Method' AND "
+                           "qualified_name LIKE '%.alpha.Open'"),
+              1);
     ASSERT_STR_EQ(go_tier(db, "alpha.UsesOpen", "alpha.Open"), "unique");
-    ASSERT_EQ(dm_mentions_from(db, "alpha.UsesOpen"), 1);
+    ASSERT_STR_EQ(go_tier(db, "alpha.UsesOpen", "alpha.B.Open"), "unique");
+    ASSERT_EQ(dm_mentions_from(db, "alpha.UsesOpen"), 2);
 
     /* build variants are one entity: whichever file holds the node */
     static const go_want_edge_t variants[] = {
@@ -1836,15 +1872,16 @@ TEST(doc_mentions_go_incremental_equals_full) {
     ASSERT_EQ(dm_index(repo, inc_db, NULL), 0);
     /* the preconditions the steps below move away from */
     static const go_want_edge_t before[] = {
-        {"a.Use", "b.Target", "exact"}, {"a.Use", "b.Gone", "exact"},
-        {"a.Use", "b.M", "exact"},    /* T.M, in the first file of the directory, keeps b.M */
-        {"a.Use", "b.Name", "exact"}, /* W.Name, the later declaration, keeps b.Name */
-        {"a.Use", "a.Local", "unique"}, {"a.doc.go.__file__", "a.Local", "unique"},
+        {"a.Use", "b.Target", "exact"},  {"a.Use", "b.Gone", "exact"},
+        {"a.Use", "b.T.M", "exact"}, /* #1913: every method has its own node */
+        {"a.Use", "b.W.Name", "exact"},  {"a.Use", "b.V.Name", "exact"},
+        {"b.U.M", "b.Target", "unique"}, /* U.M is a source of its own */
+        {"a.Use", "a.Local", "unique"},  {"a.doc.go.__file__", "a.Local", "unique"},
         {"a.Other", "b.Target", ""}, /* other.go does not import b */
     };
     ASSERT_EQ(go_bad_edges(inc_db, before, GO_COUNT(before)), 0);
-    ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.V.Name"), "graph_gap");
-    ASSERT_STR_EQ(go_reason(inc_db, "b/c.go", "Target"), "graph_gap"); /* U.M has no node */
+    ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.V.Name"), "");
+    ASSERT_STR_EQ(go_reason(inc_db, "b/c.go", "Target"), "");
 
     /* a doc-comment edit re-extracts the file alone */
     go_w(repo, "a/a.go", GO_INC_A_DOC_EDIT);
@@ -1880,23 +1917,27 @@ TEST(doc_mentions_go_incremental_equals_full) {
         0);
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.Gone"), "missing");
 
-    /* the method that kept a shared node name goes: the other file's method of
-     * that name takes the node over, and its doc becomes a source */
+    /* a method goes: links to it break, and another receiver's method of
+     * the same name, in another file, is untouched */
     go_w(repo, "b/b.go", GO_INC_B_NO_M);
     ASSERT_EQ(
         dm_step(repo, inc_db, full_db, "name keeper removed", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR),
         0);
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.T.M"), "missing");
-    ASSERT_STR_EQ(go_tier(inc_db, "b.M", "b.Target"), "unique");
+    ASSERT_STR_EQ(go_tier(inc_db, "b.U.M", "b.Target"), "unique");
     ASSERT_STR_EQ(go_reason(inc_db, "b/c.go", "Target"), "");
 
-    /* declaration order decides which declaration keeps a shared name:
-     * swapping two methods moves the node, for files with no edge into it too */
+    /* declaration order no longer decides anything: swapping two methods of
+     * the same name keeps both nodes and both links */
     go_w(repo, "b/d.go", GO_INC_D_SWAPPED);
-    ASSERT_EQ(dm_step(repo, inc_db, full_db, "methods swapped", CBM_INCREMENTAL_ROUTE_FORCED_FULL),
-              0);
-    ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.W.Name"), "graph_gap");
+    /* and the scope blob does not change (no method w moves), so the step
+     * is an ordinary closure repair, no longer a forced full rebuild */
+    ASSERT_EQ(
+        dm_step(repo, inc_db, full_db, "methods swapped", CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR), 0);
+    ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.W.Name"), "");
     ASSERT_STR_EQ(go_reason(inc_db, "a/a.go", "b.V.Name"), "");
+    ASSERT_STR_EQ(go_tier(inc_db, "a.Use", "b.W.Name"), "exact");
+    ASSERT_STR_EQ(go_tier(inc_db, "a.Use", "b.V.Name"), "exact");
 
     /* renaming a target */
     go_w(repo, "b/b.go", GO_INC_B_RENAME);
@@ -2006,10 +2047,20 @@ TEST(doc_mentions_go_scope_delta_rules) {
          GO_DELTA_HEAD GO_DELTA_F GO_DELTA_G GO_DELTA_T GO_DELTA_M GO_DELTA_I GO_DELTA_C
          "var (\n\tV = 2\n)\n",
          CBM_DOCLINK_DELTA_GLOBAL, NULL},
-        /* the declaration that keeps a shared node name changes */
-        {"same-named declarations swapped", twins,
-         "package p\n\nfunc (T) Open() {}\nfunc Open() {}\n", CBM_DOCLINK_DELTA_GLOBAL, NULL},
-        {"one of two same-named declarations removed", twins, "package p\n\nfunc Open() {}\n",
+        /* a method and a function of one name no longer share a node
+         * (#1913): swapping them changes no keeper */
+        {"method and function swapped", twins, "package p\n\nfunc (T) Open() {}\nfunc Open() {}\n",
+         CBM_DOCLINK_DELTA_LOCAL, ""},
+        /* the declaration that keeps a shared node name changes: two
+         * package-level declarations of one name still share <dir>.<name> */
+        {"same-named declarations swapped", "package p\n\nfunc Open() {}\ntype Open struct{}\n",
+         "package p\n\ntype Open struct{}\nfunc Open() {}\n", CBM_DOCLINK_DELTA_GLOBAL, NULL},
+        /* the method of a method/function pair removed: a member left, the
+         * function keeps its node either way */
+        {"method of a same-named pair removed", twins, "package p\n\nfunc Open() {}\n",
+         CBM_DOCLINK_DELTA_LOCAL, "Open"},
+        {"one of two same-named declarations removed",
+         "package p\n\nfunc Open() {}\ntype Open struct{}\n", "package p\n\nfunc Open() {}\n",
          CBM_DOCLINK_DELTA_GLOBAL, NULL},
         /* other files follow `type X = q.Y` through this file's imports */
         {"import changed under a qualified alias", alias,
@@ -2091,7 +2142,10 @@ TEST(doc_mentions_go_workers_agree) {
     ASSERT_STR_EQ(go_tier(par_db, "p00.T0", "p01.T0"), "exact");
     ASSERT_STR_EQ(go_reason(par_db, "p00/f0.go", "p01.Gone"), "missing");
     ASSERT_STR_EQ(go_reason(par_db, "p00/f0.go", "fmt.Println"), "external");
-    ASSERT_STR_EQ(go_reason(par_db, "p00/f0.go", "p01.T3.Close"), "graph_gap");
+    /* #1913: [p01.T3.Close] lands on its own method node now; the graph_gap
+     * reason stays covered by Shared, one name declared by every file */
+    ASSERT_STR_EQ(go_reason(par_db, "p00/f0.go", "p01.T3.Close"), "");
+    ASSERT_STR_EQ(go_tier(par_db, "p00.T0", "p01.T3.Close"), "exact");
     ASSERT_STR_EQ(go_reason(par_db, "p00/f3.go", "Shared"), "graph_gap");
     ASSERT_TRUE(dm_count(par_db, "SELECT COUNT(*) FROM edges WHERE type = 'MENTIONS'") > 100);
     dm_unlink_db(par_db);

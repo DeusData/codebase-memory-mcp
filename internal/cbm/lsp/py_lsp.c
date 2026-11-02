@@ -245,7 +245,7 @@ static void py_register_instance_field(PyLSPContext *ctx, const char *class_qn,
 static void py_bind_for_target(PyLSPContext *ctx, TSNode left, const CBMType *elem_type);
 static void py_register_lambda(PyLSPContext *ctx, const char *name, TSNode lambda_node);
 static void py_register_dict_literal(PyLSPContext *ctx, const char *name, TSNode dict_node);
-static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name);
+static int py_lookup_lambda(PyLSPContext *ctx, const char *name);
 static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, const char *key);
 static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char *container_qn);
 static void py_process_class(PyLSPContext *ctx, TSNode class_node);
@@ -895,19 +895,21 @@ static void py_register_lambda(PyLSPContext *ctx, const char *name, TSNode lambd
     }
     ctx->lambdas[ctx->lambda_count].name = cbm_arena_strdup(ctx->arena, name);
     ctx->lambdas[ctx->lambda_count].lambda_node = lambda_node;
+    ctx->lambdas[ctx->lambda_count].expanding = false;
     ctx->lambda_count++;
 }
 
-static TSNode py_lookup_lambda(PyLSPContext *ctx, const char *name) {
-    TSNode null_node = {0};
+/* Registry index of the lambda bound to `name`, or -1. An index, not a
+ * pointer: the registry array is replaced when it grows. */
+static int py_lookup_lambda(PyLSPContext *ctx, const char *name) {
     if (!ctx || !name)
-        return null_node;
+        return -1;
     for (int i = 0; i < ctx->lambda_count; i++) {
         if (ctx->lambdas[i].name && strcmp(ctx->lambdas[i].name, name) == 0) {
-            return ctx->lambdas[i].lambda_node;
+            return i;
         }
     }
-    return null_node;
+    return -1;
 }
 
 /* Helper for stripping quotes from a tree-sitter `string` node text. */
@@ -3157,12 +3159,18 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
         /* These legacy entries have no lexical frame identity. During class
          * execution, leave lambda replay unresolved instead of bypassing a
          * local shadow or running the lambda against class locals. */
-        TSNode lambda_node =
-            ctx->class_body_outer_scope ? (TSNode){0} : py_lookup_lambda(ctx, fname);
-        if (!ts_node_is_null(lambda_node)) {
+        int lambda_idx = ctx->class_body_outer_scope ? -1 : py_lookup_lambda(ctx, fname);
+        if (lambda_idx >= 0) {
+            TSNode lambda_node = ctx->lambdas[lambda_idx].lambda_node;
             TSNode params = ts_node_child_by_field_name(lambda_node, "parameters", 10);
             TSNode body = ts_node_child_by_field_name(lambda_node, "body", 4);
             TSNode args = ts_node_child_by_field_name(call_node, "arguments", 9);
+            // A lambda that reaches itself again (directly or through another
+            // lambda) would re-walk its body once per nesting level up to the
+            // walk-depth cap, and two such calls in one body double the work
+            // per level. Walk each body at most once per chain.
+            if (ctx->lambdas[lambda_idx].expanding)
+                return;
             CBMScope *saved = ctx->current_scope;
             ctx->current_scope = py_scope_push_checked(ctx);
             // Bind each lambda param to the call-site arg's type.
@@ -3195,7 +3203,9 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.<lambda>",
                                                        prev_func ? prev_func : ctx->module_qn);
             if (!ts_node_is_null(body)) {
+                ctx->lambdas[lambda_idx].expanding = true;
                 py_resolve_calls_in(ctx, body);
+                ctx->lambdas[lambda_idx].expanding = false;
             }
             ctx->enclosing_func_qn = prev_func;
             py_scope_restore(ctx, saved);
@@ -6169,10 +6179,36 @@ static void py_split_field_defs(CBMArena *arena, const char *field_defs, const c
     *types_out = types;
 }
 
+/* Qualified names of reg->types[0..noted), for a caller that registers into a
+ * registry it does not finalize until the end (cbm_py_build_cross_registry):
+ * that registry's own lookup scans every type. qns == NULL probes the
+ * registry instead. */
+typedef struct {
+    CBMHashTable *qns;
+    int noted;
+} PyKnownTypes;
+
+/* Note the types added since the last call. Run after every add_type, so an
+ * add that failed silently cannot desync set and registry. If the set cannot
+ * grow it is dropped and probes fall back to the registry. */
+static void py_note_known_types(PyKnownTypes *known, const CBMTypeRegistry *reg) {
+    for (; known && known->qns && known->noted < reg->type_count; known->noted++) {
+        const char *qn = reg->types[known->noted].qualified_name;
+        if (!qn || cbm_ht_has(known->qns, qn))
+            continue;
+        cbm_ht_set(known->qns, qn, (void *)(uintptr_t)(known->noted + 1));
+        if (!cbm_ht_has(known->qns, qn)) {
+            cbm_ht_free(known->qns);
+            known->qns = NULL;
+        }
+    }
+}
+
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
- * the source file's own defs and cross-file referenced defs. */
+ * the source file's own defs and cross-file referenced defs. known is NULL
+ * except for the shared Tier-2 build. */
 static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
-                                 CBMLSPDef *defs, int def_count) {
+                                 CBMLSPDef *defs, int def_count, PyKnownTypes *known) {
     /* Pass 1: types only — the method pass probes the registry per Method def
      * (receiver auto-registration), which is a LINEAR scan pre-finalize:
      * O(methods x types) per file (same quadratic as php_register_lsp_defs;
@@ -6196,6 +6232,7 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             }
             py_split_field_defs(arena, d->field_defs, &rt.field_names, &rt.field_types);
             cbm_registry_add_type(reg, rt);
+            py_note_known_types(known, reg);
         }
     }
     /* idx_arena == NULL skips the mid-build finalize: the tier-2 builder
@@ -6249,13 +6286,17 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
                 rf.receiver_type = d->receiver_type; /* borrowed */
-                if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                bool recv_known = known && known->qns
+                                      ? cbm_ht_has(known->qns, rf.receiver_type)
+                                      : cbm_registry_lookup_type(reg, rf.receiver_type) != NULL;
+                if (!recv_known) {
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
                     auto_t.qualified_name = rf.receiver_type;
                     const char *dot = strrchr(d->receiver_type, '.');
                     auto_t.short_name = dot ? dot + 1 : rf.receiver_type; /* borrowed substring */
                     cbm_registry_add_type(reg, auto_t);
+                    py_note_known_types(known, reg);
                 }
             }
             cbm_registry_add_func(reg, rf);
@@ -6267,7 +6308,7 @@ static bool py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
 #ifdef CBM_ENABLE_TEST_SEAMS
 bool cbm_py_lsp_test_register_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
                                    int def_count) {
-    return py_register_lsp_defs(arena, NULL, reg, defs, def_count);
+    return py_register_lsp_defs(arena, NULL, reg, defs, def_count, NULL);
 }
 #endif
 
@@ -6764,7 +6805,7 @@ CBMLSPStatus cbm_run_py_lsp_cross_status(CBMArena *arena, const char *source, in
     py_lsp_init_for_stage(&ctx, arena, source, source_len, &reg, module_qn, out, "cross");
     if (ctx.eval_failure)
         goto cross_cleanup;
-    if (!py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count)) {
+    if (!py_register_lsp_defs(arena, &idx_arena, &reg, defs, def_count, NULL)) {
         ctx.eval_failure = CBM_LSP_SCOPE_FAILED;
         goto cross_cleanup;
     }
@@ -6803,15 +6844,27 @@ CBMTypeRegistry *cbm_py_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
     cbm_registry_init(reg, arena);
     cbm_python_stdlib_register(reg, arena);
 
+    /* The registry is not finalized until the end, so probing it for each
+     * Method's receiver scanned every type: O(methods x types), single-threaded
+     * (~54 s of lsp_cross_prepare on a large Python tree). Probe a set of
+     * the registered type QNs instead; registration order is unchanged. Sized
+     * for the stdlib seed, not def_count (the mixed all-language count). NULL
+     * on allocation failure: the registry probe runs as before. */
+    PyKnownTypes known = {cbm_ht_create((uint32_t)reg->type_count), 0};
+    py_note_known_types(&known, reg);
+
     /* Filter to Python defs only — defs[] is mixed-language all_defs. */
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
         if (d->lang != CBM_LANG_PYTHON)
             continue;
         /* Reuse the existing register fn on a single-def slice (n=1 inline). */
-        if (!py_register_lsp_defs(arena, NULL, reg, d, 1))
+        if (!py_register_lsp_defs(arena, NULL, reg, d, 1, &known)) {
+            cbm_ht_free(known.qns);
             return NULL; /* caller owns the shared arena and other registries */
+        }
     }
+    cbm_ht_free(known.qns);
 
     py_mark_ambiguous_callable_bindings(reg, arena);
     cbm_registry_build_type_qn_order(reg, arena);

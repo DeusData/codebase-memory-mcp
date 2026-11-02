@@ -386,6 +386,7 @@ if [ -d "$ROOT/scripts" ] && [ -f "$ROOT/scripts/test.sh" ]; then
     HELP_ENTRIES="
 scripts/test.sh
 scripts/build.sh
+scripts/ci/codeql-retrace-vendored.sh
 scripts/lint.sh
 scripts/smoke-local.sh
 scripts/soak-legs.sh
@@ -433,6 +434,7 @@ test-infrastructure/vm/win.sh
     STRICT_ENTRIES="
 scripts/test.sh
 scripts/build.sh
+scripts/ci/codeql-retrace-vendored.sh
 scripts/lint.sh
 scripts/smoke-local.sh
 scripts/soak-legs.sh

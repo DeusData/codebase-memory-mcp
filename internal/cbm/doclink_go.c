@@ -43,10 +43,10 @@
  *                           drops these lines and so carries no line number
  *                           at all.
  *   G  path                 go.mod: the module path
- * w says who keeps the node. A Go method node has a FLAT qualified name
- * (<dir>.<Method>), so a function, the methods of every receiver, a type and
- * a value of one name all claim the node <dir>.<name>, and within a file the
- * declaration on the LAST line keeps it (cbm_gbuf_upsert_node). w is 1 for
+ * w says who keeps the node <dir>.<name>. A function, a type and a value of
+ * one name all claim it, and within a file the declaration on the LAST line
+ * keeps it (cbm_gbuf_upsert_node). A method claims nothing: its node is
+ * receiver-qualified (<dir>.<Recv>.<Method>, #1913), and its w is `-`. w is 1 for
  * that declaration, 0 for the others of that name, x when two of them start
  * on that last line, and - for a value the extractor gives no node at all
  * (it gives one to the first name of a constant spec and of a parenthesis-
@@ -1511,9 +1511,11 @@ static void go_scan_method(go_scan_t *s, TSNode m) {
         recv = "?";
         recv_len = SKIP_ONE;
     }
-    go_push_claim(s,
-                  cbm_arena_sprintf(s->tmp, "M\t%.*s\t%.*s", (int)recv_len, recv, (int)len, name),
-                  name, len, m);
+    /* #1913: a Go method node is receiver-qualified (<dir>.<Recv>.<Method>),
+     * so a method claims no flat name: w is `-`, and the method is found
+     * through its receiver (the member table), never through <dir>.<name>. */
+    (void)go_push_rec(
+        s, cbm_arena_sprintf(s->tmp, "M\t%.*s\t%.*s\t-", (int)recv_len, recv, (int)len, name));
 }
 
 /* The implied name of an embedded field: the type's own name, without

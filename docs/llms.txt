@@ -1,26 +1,49 @@
 # codebase-memory-mcp
 
-> An open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query the graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens (~3,400 vs ~412,000 across five structural queries). Parses 162 languages via vendored tree-sitter grammars, with Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust. It also generates semantic graph edges (SEMANTICALLY_RELATED for vocabulary-mismatch matches, SIMILAR_TO for near-clone detection) and supports semantic vector search via bundled nomic-embed-code embeddings compiled into the native executable — no API key, no Ollama, no Docker. Ships a native executable with an authenticated integration asset; the UI variant adds one content-addressed frontend pack. All processing is local — the embeddings run on-device; there is no embedded LLM and no API key.
+> Codebase Memory is an open-source local MCP server for AI coding agents. It connects code, documentation, configuration, and infrastructure in a persistent knowledge graph, with 17 MCP tools and native CLI access. Search for a feature, follow callers and dependencies, trace services and deployments, and inspect change impact. Indexing, graph queries, and semantic embeddings run locally without a hosted service or API key. CBM Lens is the optional visual companion, currently in open beta (v0.0.1); its optional browser model supports on-device code chat after an opt-in download.
 
-## Key facts
+## Capabilities
 
-- License: MIT, open source.
-- Languages: 158 (158 vendored tree-sitter grammars compiled into the binary).
-- Hybrid LSP type resolution: 9 language families (Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust) — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer.
-- MCP tools: 15 (search_graph incl. semantic_query vector search, trace_path (alias: trace_call_path), check_index_coverage, query_graph (Cypher), detect_changes, get_architecture, get_code_snippet, manage_adr, and more).
-- Semantic search: natural-language code discovery via bundled nomic-embed-code embeddings (768-dim, compiled into the binary); 11-signal combined scoring; fully local, no API key.
-- Semantic & similarity edges: SEMANTICALLY_RELATED (vocabulary-mismatch matches) and SIMILAR_TO (MinHash + LSH near-clone / duplicate detection).
-- Cross-repo intelligence: CROSS_* edges link nodes across multiple repos indexed in one store; multi-galaxy 3D layout and cross-repo architecture summary.
-- Cross-service linking: HTTP route ↔ call-site matching, plus gRPC/GraphQL/tRPC detection and pub/sub channels (EMITS/LISTENS_ON for Socket.IO, EventEmitter, generic buses).
+- Code exploration: symbol and structural search, BM25 text search, semantic search, source snippets and file outlines, call paths, data flow, architecture summaries, hotspots, cycles, and coverage diagnostics. The server registers 17 MCP tools.
+- Semantic and similarity relationships: bundled embeddings support natural-language discovery; SEMANTICALLY_RELATED edges connect vocabulary-mismatch matches, and SIMILAR_TO edges expose near-clone candidates.
+- Languages and formats: vendored parsers cover source, documentation, and configuration formats. Hybrid LSP adds semantic type resolution for Python, TypeScript/JavaScript/JSX/TSX, PHP, C#, Go, C/C++, Java, Kotlin, Rust, and Perl. Support and resolution depth differ by language; use the README language matrix and check_index_coverage for the indexed project.
+- Documentation connected to code: Markdown, reStructuredText, and AsciiDoc sections; PDF text pages (no OCR); supported document and language doc-comment references to code; ADR metadata and supersession. Supported diagrams and OpenAPI descriptions contribute entities, with format-specific reference-resolution limits.
+- Infrastructure and deployment: Docker/Compose, Kubernetes, Helm, Kustomize, Terraform/OpenTofu, Terragrunt, Ansible, shell, Make, and supported CI relationships. Trace deployments, images, entrypoints, configuration keys, and environment-variable access back to source when inputs can be resolved statically.
+- Cross-service and cross-repository relationships: supported HTTP, asynchronous messaging, gRPC, GraphQL, and tRPC links. Cross-repo analysis explicitly links projects indexed in the same store; missing links do not prove that no runtime relationship exists.
+- Change impact: detect_changes maps diffs to affected symbols and investigates related tests with scope: "tests"; compare_graphs compares indexed snapshots.
+- Smart CI (experimental): repository-specific changed-file rules select CI jobs; test-impact select combines static reachability, changed tests, and admitted per-test coverage to select tests. Narrowing supports C/C++ family code with supported test-harness conventions and an explicitly configured runner. Missing or doubtful evidence broadens the selection or runs all tests. Other indexed languages are not automatically supported for test narrowing. test-impact publish creates the baseline graph-and-coverage bundle. Start in shadow mode; consult the guide for version requirements.
+- Architecture decisions and runtime evidence: manage_adr stores the project's decision record; ingest_traces adds separately collected observed call relationships alongside static analysis.
+- CBM Lens open beta (v0.0.1): optional visual companion to the MCP server, with a local browser interface with source exploration, Galaxy graph navigation, architecture and behavior views, ADR editing, index-coverage diagnostics, daemon/system information, and optional local code chat. Static graph animations are not live execution traces. Activity overlays are experimental source-build features, not a standard-release promise.
+- Agent integrations: 45 automatic or conditional client surfaces. Installation configures supported MCP entries, durable instructions, skills, Scout/Verify/Auditor profiles, and applicable session, compaction, search, and read hooks. Coverage and activation vary by client and platform. Hooks provide context without blocking or replacing the user's tool call; some clients require trust or use parent-agent handoff instead.
+- Persistent operation: a per-account daemon coordinates sessions and indexing. Existing indexes can stay synchronized during eligible active MCP sessions; initial auto-indexing is separately opt-in. Optional team graph artifacts share a baseline while each user keeps a local query database.
+- Token-efficient retrieval: targeted graph queries, focused source snippets, and compact, paged results can reduce token use and repeated file reads during code exploration.
+- Distribution: native C backend, MIT license, standard native releases for macOS, Linux, and Windows include CBM Lens; Linux portable archives provide static builds. Nix and development source builds can omit the UI. Package-manager options and release verification are documented in the README.
+
+## Client coverage
+
 - Supported agents: 45 automatic/conditional client surfaces (39 automatically detected + 6 conditional/explicit): Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Grok Build, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn, Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi, Oh My Pi (omp), and Sourcegraph Cody.
-- Agent profiles: documented custom-agent formats receive Scout (fast/provisional), Verify (default/task-directed), and Auditor (bounded/full verification) definitions. Every direct tier checks exact path/scope coverage with check_index_coverage and falls back to source for flagged gaps; unsafe child-MCP formats use explicit parent handoff. Kiro and Junie use positive-allowlist Scout/Analysis server profiles (7/11 tools); Qoder combines named-server selection with exact tier-specific MCP tool IDs, while Factory uses exact registered IDs without additive whole-server exposure. Foreign Junie aliases are preserved and force parent handoff.
-- Performance: Linux kernel (28M LOC, 75K files) full index in 3 minutes → 4.81M nodes, 7.72M edges; Cypher queries in under 1ms.
-- Distribution: verified runtime set (native executable plus authenticated release-owned assets); fully static Linux builds are available in the `-portable` archives. Also available through npm, PyPI, Homebrew, Scoop, AUR, and `go install`.
+
+## Measurement and limits
+
+A March 2026 preprint across 31 real-world repositories reports 10× lower token use and 2.1× fewer tool calls compared with file-by-file exploration. These historical backend measurements cover the study’s workloads and agent setup. The paper documents the full evaluation; the README Performance section links to the research and earlier measurements.
+
+Graph evidence depends on index generation, freshness, and exact path/scope coverage. Partial, skipped, excluded, stale, or unknown coverage requires source verification, especially for absence claims. Infrastructure relationships are static, and test-selection support is narrower than language-indexing support.
 
 ## Links
 
 - Homepage: https://deusdata.github.io/codebase-memory-mcp/
-- Source code (GitHub): https://github.com/DeusData/codebase-memory-mcp
+- Source and feature reference: https://github.com/DeusData/codebase-memory-mcp
 - Latest release: https://github.com/DeusData/codebase-memory-mcp/releases/latest
+- Quick start and installation: https://github.com/DeusData/codebase-memory-mcp#quick-start
+- Documentation indexing: https://github.com/DeusData/codebase-memory-mcp#documentation-connected-to-code
+- Infrastructure and deployment: https://github.com/DeusData/codebase-memory-mcp#infrastructure-and-deployment
+- CBM Lens: https://github.com/DeusData/codebase-memory-mcp#cbm-lens-beta-code-visualization-and-source-navigation
+- Agent integrations: https://github.com/DeusData/codebase-memory-mcp#multi-agent-support
+- Smart CI guide: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/SMART_CI.md
+- Configuration: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/CONFIGURATION.md
+- MCP tools: https://github.com/DeusData/codebase-memory-mcp#mcp-tools
+- Token savings and evidence: https://deusdata.github.io/codebase-memory-mcp/#token-savings
+- Performance and research: https://github.com/DeusData/codebase-memory-mcp#performance
 - Benchmark report: https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md
 - Research paper: https://arxiv.org/abs/2603.27277
+- Security and release verification: https://github.com/DeusData/codebase-memory-mcp#security
