@@ -664,6 +664,7 @@ static void ocaml_collect_structure(cbm_source_walk_t *walk, const char *owner, 
             }
         }
     }
+    ts_tree_cursor_delete(&cursor);
 }
 
 /* Where this file stands among the modules of its build. */
