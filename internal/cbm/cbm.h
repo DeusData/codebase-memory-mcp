@@ -1531,6 +1531,8 @@ void cbm_extract_imports(CBMExtractCtx *ctx);
 /* Owned inner tree for one fully audited Vue/Svelte inline script. Absolute
  * source coordinates are preserved; NULL means the host domain is unproved. */
 TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TSRange *range);
+/* The script names a component's markup assigns. The names live in ctx->arena. */
+size_t cbm_component_template_writes(CBMExtractCtx *ctx, const char ***names);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
 void cbm_extract_type_refs(CBMExtractCtx *ctx);

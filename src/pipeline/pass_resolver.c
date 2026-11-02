@@ -205,6 +205,11 @@ struct cbm_shared_resolver {
     CBMHashTable *python_namespaces;
     bool python_unknown_namespace_escape;
     cbm_ecma_table_t *ecma;
+    /* QN of a module-level object literal + U+001F + member: the declaration it holds. */
+    CBMHashTable *ecma_literal_members;
+    /* QN of a module-level function + U+001F + member: what its `return { ... }` statements give.
+     */
+    CBMHashTable *ecma_returned_members;
     CBMHashTable *python_star_provided; /* "<module>.<name>" a closed star import binds */
     CBMHashTable *python_written;       /* "<module>.<path>" a statement stores or deletes */
     CBMHashTable *python_parent_loaded; /* a submodule its package's own __init__ loads */
@@ -2029,6 +2034,40 @@ static bool python_owner_pair_present(const cbm_shared_resolver_t *resolver,
     return false;
 }
 
+/* `export const store = { fetch() {} }`: what another file's `store.fetch()` selects. The table
+ * holds what this file's own `store.fetch()` would select, by the same member rule. */
+static bool ecma_note_literal_members(cbm_shared_resolver_t *resolver,
+                                      const cbm_resolve_binding_index_t *index) {
+    const char *owner = NULL, *member = NULL, *target = NULL;
+    for (size_t m = 0; cbm_resolve_binding_js_literal_member_at(index, m, &owner, &member, &target);
+         m++) {
+        if (!owner || !target)
+            continue;
+        const char *key = cbm_arena_sprintf(&resolver->arena, "%s\x1f%s", owner, member);
+        const char *value = cbm_arena_strdup(&resolver->arena, target);
+        if (!key || !value)
+            return false;
+        cbm_ht_set(resolver->ecma_literal_members, key, (void *)value);
+    }
+    return true;
+}
+
+static bool ecma_note_returned_members(cbm_shared_resolver_t *resolver,
+                                       const cbm_resolve_binding_index_t *index) {
+    const char *function = NULL, *member = NULL, *target = NULL;
+    for (size_t m = 0;
+         cbm_resolve_binding_js_returned_member_at(index, m, &function, &member, &target); m++) {
+        if (!function || !member || !target)
+            continue;
+        const char *key = cbm_arena_sprintf(&resolver->arena, "%s\x1f%s", function, member);
+        const char *value = cbm_arena_strdup(&resolver->arena, target);
+        if (!key || !value)
+            return false;
+        cbm_ht_set(resolver->ecma_returned_members, key, (void *)value);
+    }
+    return true;
+}
+
 static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_t *ctx,
                         const CBMFileResult *result, const cbm_file_info_t *file) {
     if (!export_language(file->language))
@@ -2083,6 +2122,9 @@ static bool export_file(cbm_shared_resolver_t *resolver, const cbm_pipeline_ctx_
         ok = audit && cbm_ecma_table_add(resolver->ecma, ctx, file->rel_path, result->module_qn,
                                          index, audit);
     }
+    if (ok && ecma_language(file->language))
+        ok = ecma_note_literal_members(resolver, index) &&
+             ecma_note_returned_members(resolver, index);
     if (ok && (file->language == CBM_LANG_JAVASCRIPT || file->language == CBM_LANG_TYPESCRIPT ||
                file->language == CBM_LANG_TSX || file->language == CBM_LANG_ARKTS))
         ok = http_file_capture(resolver, ctx, &arena, index, result, file->rel_path);
@@ -3245,6 +3287,8 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
     resolver->go_types =
         cbm_go_stabilization_new(&resolver->arena, &resolver->proofs, resolver->solver);
     resolver->ecma = cbm_ecma_table_new(&resolver->arena);
+    resolver->ecma_literal_members = cbm_ht_create(64);
+    resolver->ecma_returned_members = cbm_ht_create(64);
     resolver->source_table = cbm_source_table_new();
     cbm_source_table_set_packages(resolver->source_table, cbm_pipeline_get_pkgmap());
     resolver->complete = true;
@@ -3254,7 +3298,9 @@ cbm_shared_resolver_t *cbm_shared_resolver_build(const cbm_pipeline_ctx_t *ctx,
         !resolver->python_parent_loaded || !resolver->python_nested || !resolver->python_members ||
         !resolver->http_defaults || !resolver->http_sites || !resolver->http_unsafe ||
         !resolver->http_candidates || !resolver->http_veto || !resolver->project ||
-        !resolver->solver || !resolver->go_types || !resolver->ecma || !resolver->source_table) {
+        !resolver->solver || !resolver->go_types || !resolver->ecma ||
+        !resolver->ecma_literal_members || !resolver->ecma_returned_members ||
+        !resolver->source_table) {
         cbm_shared_resolver_free(resolver);
         return NULL;
     }
@@ -3489,6 +3535,8 @@ void cbm_shared_resolver_free(cbm_shared_resolver_t *resolver) {
     cbm_ht_free(resolver->http_veto);
     cbm_go_stabilization_dispose(resolver->go_types);
     cbm_ecma_table_free(resolver->ecma);
+    cbm_ht_free(resolver->ecma_literal_members);
+    cbm_ht_free(resolver->ecma_returned_members);
     cbm_source_table_free(resolver->source_table);
     cbm_arena_destroy(&resolver->arena);
     cbm_free(CBM_MEM_CLASS_SEMANTIC, resolver);
@@ -4128,6 +4176,11 @@ static cbm_ecma_value_t ecma_import_value(const file_resolver_t *resolver,
  * declaration only by an exact member declared in the same file. */
 static const char *ecma_member_target(file_resolver_t *resolver, const char *owner,
                                       const char *member) {
+    const char *key = cbm_arena_sprintf(resolver->arena, "%s\x1f%s", owner, member);
+    const char *literal =
+        key && resolver->shared ? cbm_ht_get(resolver->shared->ecma_literal_members, key) : NULL;
+    if (literal)
+        return literal;
     const char *qn = cbm_arena_sprintf(resolver->arena, "%s.%s", owner, member);
     const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(resolver->file->graph, qn) : NULL;
     const cbm_gbuf_node_t *base = cbm_gbuf_find_by_qn(resolver->file->graph, owner);
@@ -4251,6 +4304,44 @@ static cbm_resolve_result_t ecma_import_result(file_resolver_t *resolver,
     return ecma_finish(&query, result);
 }
 
+/* `const { open } = useThing(); open()`: what every `return { open }` of useThing names. */
+static bool ecma_returned_member_result(file_resolver_t *resolver, const char *name, uint32_t start,
+                                        uint32_t end, CBMSourceOrigin origin,
+                                        cbm_resolve_result_t *out) {
+    const cbm_resolve_js_import_t *import = NULL;
+    const char *callee = NULL, *function = NULL, *member = NULL;
+    if (!resolver->shared ||
+        !cbm_resolve_binding_js_destructured_call(resolver->bindings, name, start, end, origin,
+                                                  &import, &callee, &function, &member))
+        return false;
+    if (import)
+        function = ecma_import_result(resolver, import, callee, false, false).target;
+    const char *key =
+        function ? cbm_arena_sprintf(resolver->arena, "%s\x1f%s", function, member) : NULL;
+    const char *target = key ? cbm_ht_get(resolver->shared->ecma_returned_members, key) : NULL;
+    if (!target)
+        return false;
+    cbm_resolve_lookup_t query;
+    cbm_resolve_lookup_begin(&query, cbm_resolve_binding_lookup_context(resolver->bindings),
+                             "ecma.returned_member", name, 0, 0, CBM_SOURCE_ORIGIN_RAW);
+    (void)cbm_resolve_lookup_observe(&query, "ecma.returned_members", key, target,
+                                     CBM_RESOLVE_BINDING_UNIQUE, CBM_RESOLVE_ANALYSIS_COMPLETE, 0,
+                                     true, "ecma_returned_member_observed");
+    cbm_resolve_result_t found = {.binding = CBM_RESOLVE_BINDING_UNIQUE,
+                                  .domain = CBM_RESOLVE_DOMAIN_PROJECT,
+                                  .analysis = CBM_RESOLVE_ANALYSIS_COMPLETE,
+                                  .rule = CBM_RESOLVE_RULE_IMPORT_BINDING,
+                                  .facts = CBM_RESOLVE_FACT_EXACT_TARGET |
+                                           CBM_RESOLVE_FACT_LOOKUP_COMPLETE |
+                                           CBM_RESOLVE_FACT_IMPORT_BOUND,
+                                  .target = target,
+                                  .candidate_count = 1,
+                                  .reason = "ecma_returned_member"};
+    *out = cbm_resolve_binding_validate(resolver->bindings, name, start, end, origin,
+                                        ecma_finish(&query, found));
+    return cbm_resolve_admit(out);
+}
+
 static bool python_member_result(file_resolver_t *resolver, const char *name, uint32_t start,
                                  uint32_t end, CBMSourceOrigin origin, bool invocation,
                                  cbm_resolve_result_t *out) {
@@ -4300,6 +4391,10 @@ static cbm_resolve_result_t generic_result(file_resolver_t *resolver, const char
         return unresolved("reference_spelling_missing");
     if (ecma_language(file->language) || file->language == CBM_LANG_VUE ||
         file->language == CBM_LANG_SVELTE) {
+        cbm_resolve_result_t returned;
+        if (invocation &&
+            ecma_returned_member_result(resolver, name, start, end, origin, &returned))
+            return returned;
         cbm_resolve_result_t local =
             cbm_resolve_binding_local(resolver->bindings, name, start, end, origin);
         if (cbm_resolve_admit(&local))

@@ -1563,12 +1563,7 @@ TEST(probe_bash_functions_calls) {
                     .suffix = "log",
                     .declaration_line = 3,
                     .declaration_text = "log() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-bash-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+         .mode = RQ_REQUIRED},
         {.case_id = "probe_bash_functions_calls-2",
          .site = {.file = "deploy.sh",
                   .caller = "deploy",
@@ -1579,12 +1574,7 @@ TEST(probe_bash_functions_calls) {
                     .suffix = "log",
                     .declaration_line = 3,
                     .declaration_text = "log() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-bash-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+         .mode = RQ_REQUIRED},
         {.case_id = "probe_bash_functions_calls-3",
          .site =
              {.file = "deploy.sh", .caller = "deploy", .needle = "build", .occurrence_index = 2},
@@ -1593,12 +1583,7 @@ TEST(probe_bash_functions_calls) {
                     .suffix = "build",
                     .declaration_line = 7,
                     .declaration_text = "build() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-bash-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+         .mode = RQ_REQUIRED},
         {.case_id = "probe_bash_functions_calls-4",
          .site = {.file = "deploy.sh",
                   .caller = "main",
@@ -1609,12 +1594,15 @@ TEST(probe_bash_functions_calls) {
                     .suffix = "deploy",
                     .declaration_line = 12,
                     .declaration_text = "deploy() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-bash-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+         .mode = RQ_REQUIRED},
+        {.case_id = "probe_bash_functions_calls-5",
+         .site = {.file = "deploy.sh", .caller = "deploy", .needle = "main \"$@\""},
+         .relation = "CALLS",
+         .target = {.file = "deploy.sh",
+                    .suffix = "main",
+                    .declaration_line = 17,
+                    .declaration_text = "main() {"},
+         .mode = RQ_REQUIRED}};
     NcpMetrics m = ncp_metrics_quality("deploy.sh",
                                        "#!/usr/bin/env bash\n\n"
                                        "log() {\n"
@@ -1637,7 +1625,8 @@ TEST(probe_bash_functions_calls) {
     ASSERT_TRUE(m.functions >= 3); /* log, build, deploy, main */
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.found, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }
@@ -1655,12 +1644,7 @@ TEST(probe_bash_function_keyword) {
                     .suffix = "helper",
                     .declaration_line = 1,
                     .declaration_text = "function helper {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-bash-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."},
+         .mode = RQ_REQUIRED},
         {.case_id = "probe_bash_function_keyword-2",
          .site = {.file = "lib.sh",
                   .caller = "runner",
@@ -1671,12 +1655,7 @@ TEST(probe_bash_function_keyword) {
                     .suffix = "helper",
                     .declaration_line = 1,
                     .declaration_text = "function helper {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "no-bash-call-proof",
-         .why = "This language has no admitted semantic CALLS binding bridge; each authored local "
-                "declaration remains a genuine missing target.",
-         .tried = "The original canonical v69 probe failed its CALLS assertion; reviewed the "
-                  "unchanged fixture and current proof boundary."}};
+         .mode = RQ_REQUIRED}};
     NcpMetrics m = ncp_metrics_quality("lib.sh",
                                        "function helper {\n"
                                        "    echo \"help: $1\"\n"
@@ -1690,7 +1669,8 @@ TEST(probe_bash_function_keyword) {
     ASSERT_TRUE(m.functions >= 2);
     ASSERT_TRUE(m.quality_ok);
     ASSERT_EQ(m.quality.genuine, sizeof(expected) / sizeof(expected[0]));
-    ASSERT_EQ(m.quality.missing, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.found, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(m.quality.missing, 0);
     ASSERT_EQ(m.quality.wrong, 0);
     PASS();
 }

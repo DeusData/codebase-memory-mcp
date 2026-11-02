@@ -983,7 +983,7 @@ typedef struct {
 /* Source-authored invocation sites and full declaration-line anchors. Binding
  * classifications identify an audited missing proof stage, not a claim that
  * extraction has no additional gap. Dart, CUDA and the languages with a source
- * adapter (Ruby, Swift, Scala, Perl, Zig, Elixir, OCaml, Haskell, Erlang) are
+ * adapter (Ruby, Swift, Scala, Perl, Zig, Elixir, OCaml, Haskell, Erlang, Lua, Bash, Tcl, Vim) are
  * required capabilities. */
 static const CallOracle CALL_ORACLES[] = {
     {"ruby",
@@ -1006,12 +1006,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "function helper(x)",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Global function declarations write _ENV; the Lua subset proves only direct local function "
-     "bindings.",
-     "The original global declarations remain unchanged; lua_local_function rejects both and "
-     "records BINDING_BLOCKED."},
+     "",
+     ""},
     {"swift",
      "run",
      "helper",
@@ -1056,11 +1054,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "helper() {",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Shell function lookup versus command execution has no audited Bash binding environment.",
-     "Kept the bare helper command and preceding function declaration; the generic language gate "
-     "excludes Bash."},
+     "",
+     ""},
     {"perl",
      "run",
      "helper",
@@ -1236,10 +1233,10 @@ static const CallOracle CALL_ORACLES[] = {
      1,
      1,
      "proc helper {x} {",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Tcl proc registration and command-substitution lookup have no audited interpreter binding.",
-     "Kept the nested [helper 21] command inside run; no Tcl semantic proof adapter is selected."},
+     "",
+     ""},
     {"solidity",
      "run",
      "helper",
@@ -1638,16 +1635,15 @@ static const CallOracle CALL_ORACLES[] = {
     {"vimscript",
      "Run",
      "Helper",
-     {"call Helper()"},
-     {0},
+     {"Helper()"},
+     {1},
      1,
      1,
      "function! Helper() abort",
-     RQ_KNOWN_GAP,
+     RQ_REQUIRED,
      "binding",
-     "Vimscript named-function lookup and call-statement binding have no audited adapter.",
-     "Kept function! Helper and call Helper() with case preserved; the generic language gate "
-     "excludes Vimscript."},
+     "",
+     ""},
     {"wgsl",
      "run",
      "helper",
@@ -1839,8 +1835,8 @@ TEST(contract_calls_breadth) {
     for (int run = 0; run < RUNS; run++) {
         ASSERT(accepted[run]);
         ASSERT_EQ(reports[run].genuine, SITES);
-        ASSERT_EQ(reports[run].found, 11);   /* Dart, CUDA and the nine adapter languages */
-        ASSERT_EQ(reports[run].missing, 44); /* includes both original Fortran references */
+        ASSERT_EQ(reports[run].found, 15);   /* Dart, CUDA and the thirteen adapter languages */
+        ASSERT_EQ(reports[run].missing, 40); /* includes both original Fortran references */
     }
     ASSERT(equivalent);
     PASS();

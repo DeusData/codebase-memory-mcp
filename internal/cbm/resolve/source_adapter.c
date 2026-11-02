@@ -37,7 +37,9 @@ static const cbm_source_adapter_t *adapter_for(CBMLanguage language) {
         &cbm_source_adapter_php,     &cbm_source_adapter_elixir, &cbm_source_adapter_erlang,
         &cbm_source_adapter_perl,    &cbm_source_adapter_ruby,   &cbm_source_adapter_zig,
         &cbm_source_adapter_haskell, &cbm_source_adapter_ocaml,  &cbm_source_adapter_dart,
-        &cbm_source_adapter_swift,   &cbm_source_adapter_scala,
+        &cbm_source_adapter_swift,   &cbm_source_adapter_scala,  &cbm_source_adapter_lua,
+        &cbm_source_adapter_vim,     &cbm_source_adapter_shell,  &cbm_source_adapter_tcl,
+        &cbm_source_adapter_make,
     };
     for (size_t i = 0; i < sizeof(adapters) / sizeof(adapters[0]); i++)
         if (adapters[i]->language == language)
@@ -276,6 +278,44 @@ const char *cbm_source_def_qn(cbm_source_walk_t *walk, const char *name, uint32_
     return cbm_source_def_qn_label(walk, name, line, NULL);
 }
 
+const char *cbm_source_def_qn_at(cbm_source_walk_t *walk, const char *name, uint32_t line) {
+    if (!name || !source_def_index(walk))
+        return NULL;
+    for (const source_def_link_t *link = cbm_ht_get(walk->def_index, name); link; link = link->next)
+        if (link->def->start_line == line)
+            return link->def->qualified_name;
+    return NULL;
+}
+
+bool cbm_source_join_path(const char *directory, const char *relative, char *out, size_t capacity) {
+    char joined[1024];
+    int length =
+        snprintf(joined, sizeof(joined), "%s%s%s", directory, *directory ? "/" : "", relative);
+    if (length <= 0 || (size_t)length >= sizeof(joined) || (size_t)length >= capacity)
+        return false;
+    size_t used = 0;
+    for (char *part = joined; *part;) {
+        char *end = strchr(part, '/');
+        size_t size = end ? (size_t)(end - part) : strlen(part);
+        if (size == 2 && part[0] == '.' && part[1] == '.') {
+            if (!used)
+                return false;
+            while (used && out[used - 1] != '/')
+                used--;
+            if (used)
+                used--;
+        } else if (size && !(size == 1 && part[0] == '.')) {
+            if (used)
+                out[used++] = '/';
+            memcpy(out + used, part, size);
+            used += size;
+        }
+        part += size + (end ? 1 : 0);
+    }
+    out[used] = '\0';
+    return used > 0;
+}
+
 const char *cbm_source_table_intern(cbm_source_walk_t *walk, const char *text) {
     cbm_source_table_t *table = walk->writable;
     return text && table ? cbm_arena_strdup(&table->arena, text) : NULL;
@@ -473,8 +513,9 @@ static const char *source_gate(const cbm_source_adapter_t *adapter, const CBMFil
                                const char *source, size_t source_len) {
     if (!result || !source || !result->module_qn || source_len > UINT32_MAX)
         return "source_adapter_input_unavailable";
-    if (result->has_error || result->parse_unusable ||
-        (result->parse_incomplete && !adapter->contains_parse_damage))
+    if (!adapter->parse_errors_are_local &&
+        (result->has_error || result->parse_unusable ||
+         (result->parse_incomplete && !adapter->contains_parse_damage)))
         return "source_adapter_parse_incomplete";
     return NULL;
 }
@@ -585,6 +626,8 @@ static bool source_tree_usable(const cbm_source_adapter_t *adapter, TSTree *tree
         return false;
     TSNode root = ts_tree_root_node(tree);
     if (!ts_node_has_error(root))
+        return true;
+    if (adapter->parse_errors_are_local)
         return true;
     if (!adapter->contains_parse_damage)
         return false;

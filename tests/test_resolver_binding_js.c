@@ -627,7 +627,6 @@ TEST(resolver_binding_js_const_initialization_shadow_and_writes_abstain) {
          "}",
          "return target"},
         {"export {}; function caller() { const target = 42; return target; }", "return target"},
-        {"export const {target} = object; function caller() { return target; }", "return target"},
     };
     for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
         const char *source = fixtures[i].source;
@@ -650,12 +649,14 @@ TEST(resolver_binding_js_const_initialization_shadow_and_writes_abstain) {
 
 /* These used to be pinned as abstentions. A `let` or `var` with a later write still
  * names its one declaration, and a USAGE edge is about which declaration a name
- * selects, not which value it holds. A function const is a declared function. */
+ * selects, not which value it holds. A function const is a declared function, and a
+ * name a module-level pattern declares is that variable, whatever `object` holds. */
 TEST(resolver_binding_js_variable_and_function_const_references_bind) {
     static const char *const sources[] = {
         "export let target = 42; function caller() { return target; }",
         "export var target = 42; function caller() { return target; }",
         "export const target = () => 42; function caller() { return target; }",
+        "export const {target} = object; function caller() { return target; }",
     };
     for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
         CBMFileResult *result = cbm_extract_file(sources[i], (int)strlen(sources[i]),

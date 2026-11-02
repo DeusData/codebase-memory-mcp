@@ -38,6 +38,9 @@ bool cbm_source_adapter_supported(CBMLanguage language);
 /* All clauses and arities of one name share one graph node in this language, so
  * several same-QN definitions in one file are that one name, not a conflict. */
 bool cbm_source_adapter_one_name_one_node(CBMLanguage language);
+/* The next module name a project's `lua/` root gives this file, as a span of rel_path after
+ * from (NULL for the first): runtime/lua/vim/lsp.lua is `vim/lsp`. NULL when there is no other. */
+const char *cbm_lua_root_module(const char *rel_path, const char *from, size_t *length);
 /* Relations this language's adapter actually decides. Others stay unsupported. */
 bool cbm_source_adapter_decides_references(CBMLanguage language);
 /* This language keeps older binding rules, which decide what its adapter leaves. */

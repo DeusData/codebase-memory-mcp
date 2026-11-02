@@ -3629,9 +3629,8 @@ TEST(probe_mcp_trace_run) {
     PASS();
 }
 
-/* Deploy traversal follows retained DEPLOYS/SPAWNS edges and exact CALLS.
- * Its source-authored missing shell link is measured below; call-graph mode
- * still stops at the chart. */
+/* Deploy traversal follows retained DEPLOYS/SPAWNS edges and exact CALLS;
+ * call-graph mode still stops at the chart. */
 static int gpf_query_int(const GpfFile *files, int nfiles, const char *sql);
 
 TEST(probe_mcp_trace_deploy) {
@@ -3655,13 +3654,10 @@ TEST(probe_mcp_trace_deploy) {
                           "\"format\":\"json\"}");
     ASSERT_NOT_NULL(r);
     ASSERT_NOT_NULL(strstr(r, "install_web"));
-    /* WHY: deploy mode reaches the installing function through DEPLOYS. The
-     * exact script-to-function CALLS gap below prevents reaching the script
-     * and its CI caller; it must not be bridged by a guessed graph edge. Tried
-     * the unchanged source plus direct deployment/run edge checks. */
-    ASSERT_NULL(strstr(r, ".hack\""));
-    ASSERT_NULL(strstr(r, ".github.workflows\""));
-    ASSERT_NULL(strstr(r, "\"release\""));
+    /* Deploy mode reaches the installing function through DEPLOYS, the script through its own
+     * proven call of that function, and the CI job through SPAWNS. */
+    ASSERT_NOT_NULL(strstr(r, ".hack\""));
+    ASSERT_NOT_NULL(strstr(r, "\"release\""));
     free(r);
     r = gpf_tool_on(files, 3, "trace_path",
                     "{\"function_name\":\"web-app\",\"project\":\"%s\","
@@ -3670,7 +3666,7 @@ TEST(probe_mcp_trace_deploy) {
     ASSERT_NULL(strstr(r, "install_web"));
     free(r);
     /* Preserve the two direct non-controlled relations independently of the
-     * missing shell CALLS edge and the consumer's bounded traversal. */
+     * shell CALLS edge and the consumer's bounded traversal. */
     ASSERT_EQ(
         gpf_query_int(
             files, 3,
@@ -3696,14 +3692,7 @@ TEST(probe_mcp_trace_deploy) {
                     .label = "Function",
                     .declaration_line = 3,
                     .declaration_text = "install_web() {"},
-         .mode = RQ_KNOWN_GAP,
-         .gap_id = "bash_local_function_binding_proof_missing",
-         .why = "The script defines install_web once and invokes it directly at module scope "
-                "without rebinding; Bash lacks an audited immutable lexical binding proof.",
-         .tried =
-             "Preserved the original script/workflow/chart and exact direct DEPLOYS/SPAWNS "
-             "contracts. The missing source-authored CALLS obligation is measured with a required "
-             "ESM control in both drivers; deploy traversal must stop at that missing link."}};
+         .mode = RQ_REQUIRED}};
     ASSERT_TRUE(gpf_infra_quality(files, 3, "probe_mcp_trace_deploy", expected, 1, NULL, 0));
     PASS();
 }

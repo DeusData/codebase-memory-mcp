@@ -22,6 +22,7 @@
 #include "resolve/snapshot.h"
 
 #include "callable_sig.h"
+#include "lang_specs.h"
 #include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
@@ -1756,8 +1757,9 @@ int cbm_pxc_build_import_map_ex(const cbm_pipeline_ctx_t *ctx, const char *rel_p
                                 const char ***out_vals, int *out_count) {
     const cbm_gbuf_t *gbuf = ctx->gbuf;
     const char *project_name = ctx->project_name;
-    if (result && (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
-                   lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS))
+    if (result &&
+        (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+         lang == CBM_LANG_ARKTS || lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE))
         return cbm_pipeline_ecma_import_map(ctx, rel_path, result, include_type_only, out_keys,
                                             out_vals, out_count);
     if (result && (lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA))
@@ -1956,6 +1958,8 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_VUE:    /* its script: see cbm_pxc_dispatch_file_with_imports */
+    case CBM_LANG_SVELTE: /* its script: see cbm_pxc_dispatch_file_with_imports */
     case CBM_LANG_PHP:
     case CBM_LANG_CSHARP: /* tier-2 prebuilt registry path (pass_parallel.c) */
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
@@ -2828,6 +2832,39 @@ static void pxc_run_oo(CBMLanguage lang, CBMFileResult *result, const char *sour
     pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
+/* The parse of a component's scripts. It needs the host tree, which a retained result keeps. */
+static TSTree *pxc_component_script(CBMFileResult *result, CBMLanguage lang, const char *source,
+                                    int source_len, CBMLanguage *script_language) {
+    TSTree *host = result->cached_tree;
+    TSTree *owned = NULL;
+    if (!host) {
+        TSParser *parser = ts_parser_new();
+        if (parser && ts_parser_set_language(parser, cbm_ts_language(lang)))
+            owned = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        if (parser)
+            ts_parser_delete(parser);
+        host = owned;
+    }
+    if (!host)
+        return NULL;
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMExtractCtx context = {.arena = &arena,
+                             .result = result,
+                             .source = source,
+                             .source_len = source_len,
+                             .language = lang,
+                             .module_qn = result->module_qn,
+                             .root = ts_tree_root_node(host)};
+    TSRange range;
+    memset(&range, 0, sizeof(range));
+    TSTree *script = cbm_component_binding_tree(&context, script_language, &range);
+    cbm_arena_destroy(&arena);
+    if (owned)
+        ts_tree_delete(owned);
+    return script;
+}
+
 void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result, const char *source,
                                         int source_len, const char *rel, const char *def_module,
                                         const CBMCrossLspRegistries *cross_registries,
@@ -2844,6 +2881,23 @@ void cbm_pxc_dispatch_file_with_imports(CBMLanguage lang, CBMFileResult *result,
         return;
     }
     if (!result) {
+        return;
+    }
+    /* A component's script is a TypeScript or JavaScript module, in the original bytes: its
+     * walk is that language's, over the tree of the script alone. */
+    if (lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE) {
+        CBMLanguage script_language = CBM_LANG_JAVASCRIPT;
+        TSTree *script = pxc_component_script(result, lang, source, source_len, &script_language);
+        if (script) {
+            TSTree *host = result->cached_tree;
+            result->cached_tree = script;
+            cbm_pxc_dispatch_file_with_imports(
+                script_language, result, source, source_len, rel, def_module, cross_registries,
+                module_def_index, all_defs, all_def_count, imp_keys, imp_vals, imp_count,
+                rust_shared_get, rust_shared_ctx, bindings, imports);
+            result->cached_tree = host;
+            ts_tree_delete(script);
+        }
         return;
     }
     if (cross_registries && cross_registries->oo && cbm_oo_language(lang))

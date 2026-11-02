@@ -6059,6 +6059,18 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
             }
             cbm_run_ts_lsp(a, result, source, source_len, root, js_mode, jsx_mode, dts_mode);
         }
+        /* A component's scripts are a module of their own language. */
+        if (language == CBM_LANG_VUE || language == CBM_LANG_SVELTE) {
+            CBMLanguage script_language = CBM_LANG_JAVASCRIPT;
+            TSRange range;
+            memset(&range, 0, sizeof(range));
+            TSTree *script = cbm_component_binding_tree(&ctx, &script_language, &range);
+            if (script) {
+                cbm_run_ts_lsp(a, result, source, source_len, ts_tree_root_node(script),
+                               script_language == CBM_LANG_JAVASCRIPT, false, false);
+                ts_tree_delete(script);
+            }
+        }
         if (language == CBM_LANG_CSHARP) {
             cbm_run_cs_lsp(a, result, source, source_len, root);
         }

@@ -1133,23 +1133,19 @@ TEST(probe_vue_cross_component_import) {
         .case_id = "probe_vue_cross_component_import-exact-dependency",
         .site = {.file = "App.vue",
                  .caller = "App.vue.__file__",
-                 .needle = "import BaseButton from './BaseButton.vue'"},
+                 .needle = "BaseButton"},
         .relation = "IMPORTS",
         .target = {.file = "BaseButton.vue",
                    .suffix = "BaseButton.vue.__file__",
                    .label = "File",
                    .declaration_line = 1,
                    .declaration_text = "<template><button><slot /></button></template>"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "vue-embedded-component-import-proof",
-        .why = "Vue script imports need an audited embedded-source origin and raw literal proof.",
-        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
-                 "control, and required ESM call use full production indexing."};
+        .mode = RQ_REQUIRED};
     const RQ_Forbidden forbidden = {
         .case_id = "probe_vue_cross_component_import-invalid-target",
         .site = {.file = "App.vue",
                  .caller = "App.vue.__file__",
-                 .needle = "import BaseButton from './BaseButton.vue'"},
+                 .needle = "BaseButton"},
         .relation = "IMPORTS",
         .target = {.file = "decoy/BaseButton.vue",
                    .suffix = "decoy.BaseButton.vue.__file__",
@@ -1162,8 +1158,8 @@ TEST(probe_vue_cross_component_import) {
                                    "probe_vue_cross_component_import", &expected, &forbidden,
                                    &report));
     ASSERT_EQ(report.genuine, 2);
-    ASSERT_EQ(report.found, 1);
-    ASSERT_EQ(report.missing, 1);
+    ASSERT_EQ(report.found, 2);
+    ASSERT_EQ(report.missing, 0);
     PASS();
 }
 
@@ -1226,23 +1222,18 @@ TEST(probe_svelte_cross_component_import) {
         .case_id = "probe_svelte_cross_component_import-exact-dependency",
         .site = {.file = "App.svelte",
                  .caller = "App.svelte.__file__",
-                 .needle = "import Button from './Button.svelte';"},
+                 .needle = "Button"},
         .relation = "IMPORTS",
         .target = {.file = "Button.svelte",
                    .suffix = "Button.svelte.__file__",
                    .label = "File",
                    .declaration_line = 1,
                    .declaration_text = "<script>"},
-        .mode = RQ_KNOWN_GAP,
-        .gap_id = "svelte-embedded-component-import-proof",
-        .why =
-            "Svelte script imports need an audited embedded-source origin and raw literal proof.",
-        .tried = "Preserved original sources and indexing checks; exact target, wrong-target "
-                 "control, and required ESM call use full production indexing."};
+        .mode = RQ_REQUIRED};
     const RQ_Forbidden forbidden = {.case_id = "probe_svelte_cross_component_import-invalid-target",
                                     .site = {.file = "App.svelte",
                                              .caller = "App.svelte.__file__",
-                                             .needle = "import Button from './Button.svelte';"},
+                                             .needle = "Button"},
                                     .relation = "IMPORTS",
                                     .target = {.file = "decoy/Button.svelte",
                                                .suffix = "decoy.Button.svelte.__file__",
@@ -1255,8 +1246,8 @@ TEST(probe_svelte_cross_component_import) {
                                    "probe_svelte_cross_component_import", &expected, &forbidden,
                                    &report));
     ASSERT_EQ(report.genuine, 2);
-    ASSERT_EQ(report.found, 1);
-    ASSERT_EQ(report.missing, 1);
+    ASSERT_EQ(report.found, 2);
+    ASSERT_EQ(report.missing, 0);
     PASS();
 }
 

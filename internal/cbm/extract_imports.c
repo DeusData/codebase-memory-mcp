@@ -2312,62 +2312,92 @@ static void parse_elixir_imports(CBMExtractCtx *ctx) {
 // --- Lua imports ---
 // function_call: require("X")
 
+/* A name in a binding position that is `require`: this file's require is not the loader. */
+static bool lua_binds_require(const CBMExtractCtx *ctx, TSNode node) {
+    const char *kind = ts_node_type(node);
+    TSNode bound = (TSNode){0};
+    if (strcmp(kind, "function_declaration") == 0) {
+        bound = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    } else if (strcmp(kind, "parameters") == 0 || strcmp(kind, "variable_list") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count && ts_node_is_null(bound); i++) {
+            TSNode name = ts_node_named_child(node, i);
+            uint32_t start = ts_node_start_byte(name), end = ts_node_end_byte(name);
+            if (strcmp(ts_node_type(name), "identifier") == 0 && end - start == strlen("require") &&
+                memcmp(ctx->source + start, "require", strlen("require")) == 0)
+                bound = name;
+        }
+    }
+    if (ts_node_is_null(bound) || strcmp(ts_node_type(bound), "identifier") != 0)
+        return false;
+    uint32_t start = ts_node_start_byte(bound), end = ts_node_end_byte(bound);
+    return end - start == strlen("require") &&
+           memcmp(ctx->source + start, "require", strlen("require")) == 0;
+}
+
+/* The module of `require('a.b')` or `pcall(require, 'a.b')`, when spelled as one literal. */
+static const char *lua_required_module(CBMExtractCtx *ctx, TSNode call) {
+    TSNode callee = ts_node_child_by_field_name(call, TS_FIELD("name"));
+    TSNode arguments = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(callee) || ts_node_is_null(arguments) ||
+        strcmp(ts_node_type(callee), "identifier") != 0)
+        return NULL;
+    char *name = cbm_node_text(ctx->arena, callee, ctx->source);
+    uint32_t count = ts_node_named_child_count(arguments);
+    TSNode literal = (TSNode){0};
+    if (name && strcmp(name, "require") == 0 && count == 1) {
+        literal = ts_node_named_child(arguments, 0);
+    } else if (name && strcmp(name, "pcall") == 0 && count == 2) {
+        TSNode loader = ts_node_named_child(arguments, 0);
+        char *text = strcmp(ts_node_type(loader), "identifier") == 0
+                         ? cbm_node_text(ctx->arena, loader, ctx->source)
+                         : NULL;
+        if (text && strcmp(text, "require") == 0)
+            literal = ts_node_named_child(arguments, 1);
+    }
+    if (ts_node_is_null(literal) || strcmp(ts_node_type(literal), "string") != 0 ||
+        ts_node_named_child_count(literal) != 1)
+        return NULL;
+    TSNode content = ts_node_named_child(literal, 0);
+    return strcmp(ts_node_type(content), "string_content") == 0
+               ? cbm_node_text(ctx->arena, content, ctx->source)
+               : NULL;
+}
+
+/* A require loads a module wherever it runs, so every depth counts, and a comment that spells
+ * one loads nothing. */
 static void parse_lua_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
-
+    int first = ctx->result->imports.count;
+    bool rebound = false;
+    bool entering = true;
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
-    if (!ts_tree_cursor_goto_first_child(&cursor)) {
-        ts_tree_cursor_delete(&cursor);
-        return;
+    while (!rebound) {
+        if (entering) {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            rebound = lua_binds_require(ctx, node);
+            if (strcmp(ts_node_type(node), "function_call") == 0) {
+                const char *module = lua_required_module(ctx, node);
+                if (module && module[0]) {
+                    char *mod = cbm_arena_strdup(a, module);
+                    CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
+                    push_import_at(ctx, node, imp);
+                }
+            }
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            entering = true;
+            continue;
+        }
+        if (!ts_tree_cursor_goto_parent(&cursor))
+            break;
+        entering = false;
     }
-    do {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        // Lua: local X = require("Y") → assignment_statement or variable_declaration
-        // containing function_call(require, "Y")
-        char *text = cbm_node_text(a, node, ctx->source);
-        if (!text) {
-            continue;
-        }
-        if (strstr(text, "require") == NULL) {
-            continue;
-        }
-
-        // Simple extraction: find require("...") pattern in node text
-        const char *req = strstr(text, "require");
-        if (!req) {
-            continue;
-        }
-
-        // Find the string argument
-        const char *open = strchr(req, '(');
-        if (!open) {
-            open = strchr(req, '"');
-        }
-        if (!open) {
-            open = strchr(req, '\'');
-        }
-        if (!open) {
-            continue;
-        }
-
-        const char *q1 = strchr(open, '"');
-        const char *q2 = strchr(open, '\'');
-        if (!q1 && !q2) {
-            continue;
-        }
-        const char *start = q1 && (!q2 || q1 < q2) ? q1 : q2;
-        char delim = *start;
-        start++;
-        const char *end = strchr(start, delim);
-        if (!end) {
-            continue;
-        }
-
-        char *mod = cbm_arena_strndup(a, start, (size_t)(end - start));
-        CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
-        push_import_at(ctx, node, imp);
-    } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
+    if (rebound)
+        ctx->result->imports.count = first;
 }
 
 // --- R imports: library()/require()/source() + box::use() (#218) ---
@@ -3297,81 +3327,14 @@ static bool markup_script_host(CBMLanguage language) {
            language == CBM_LANG_ASTRO;
 }
 
-/* Component scripts have module-local bindings even without an explicit ESM
- * statement. This proof subset admits one inline script and an inert host.
- * Multiple script contexts, template expressions/directives, external scripts
- * and unknown markup remain unproved; extraction is deliberately broader. */
-static bool embedded_binding_identifier(const char *source, TSNode value) {
-    uint32_t start = ts_node_start_byte(value), end = ts_node_end_byte(value);
-    if (end <= start + 2 || source[start++] != '{' || source[--end] != '}')
-        return false;
-    while (start < end && isspace((unsigned char)source[start]))
-        start++;
-    while (end > start && isspace((unsigned char)source[end - 1]))
-        end--;
-    if (start == end || !((source[start] >= 'a' && source[start] <= 'z') ||
-                          (source[start] >= 'A' && source[start] <= 'Z') || source[start] == '_' ||
-                          source[start] == '$'))
-        return false;
-    for (uint32_t i = start + 1; i < end; i++) {
-        unsigned char c = (unsigned char)source[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-              c == '_' || c == '$'))
-            return false;
-    }
-    return true;
-}
-
-static bool embedded_binding_attribute(CBMExtractCtx *ctx, TSNode attribute, bool script,
-                                       CBMLanguage *language, unsigned *seen) {
-    uint32_t count = ts_node_named_child_count(attribute);
-    if (!count || count > 2)
-        return false;
-    TSNode name_node = ts_node_named_child(attribute, 0);
-    if (strcmp(ts_node_type(name_node), "attribute_name"))
-        return false;
-    const char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-    if (!name || !name[0])
-        return false;
-    if (script) {
-        unsigned flag = ascii_trimmed_equals(name, "lang")                        ? 1u
-                        : ctx->language == CBM_LANG_VUE && !strcmp(name, "setup") ? 2u
-                                                                                  : 0u;
-        if (!flag || (*seen & flag) || (flag == 2u && count != 1))
-            return false;
-        *seen |= flag;
-        return apply_script_attribute(ctx, attribute, language);
-    }
-    /* A Svelte event handler may capture a bare identifier, but may not run
-     * an expression while creating the handler or write a script binding. */
-    if (ctx->language == CBM_LANG_SVELTE && !strncmp(name, "on:", 3)) {
-        if (!name[3] || count != 2)
-            return false;
-        for (const char *p = name + 3; *p; p++)
-            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')))
-                return false;
-        TSNode value = ts_node_named_child(attribute, 1);
-        return !strcmp(ts_node_type(value), "expression") &&
-               embedded_binding_identifier(ctx->source, value);
-    }
-    if (!strncmp(name, "v-", 2) || !strncmp(name, "on", 2))
-        return false;
-    for (const char *p = name; *p; p++)
-        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
-              *p == '_' || *p == '-'))
-            return false;
-    /* Static attribute text cannot conceal a component expression. This is
-     * intentionally narrower than either host grammar's value syntax. */
-    uint32_t begin = ts_node_end_byte(name_node), end = ts_node_end_byte(attribute);
-    for (uint32_t i = begin; i < end; i++)
-        if (ctx->source[i] == '{' || ctx->source[i] == '}' || ctx->source[i] == '&')
-            return false;
-    return true;
-}
-
+/* A component's scripts have module-local bindings even without an explicit ESM statement. A
+ * Vue SFC's `<script>` and `<script setup>` compile to one module, as do Svelte's
+ * `context="module"` script and its instance script. Markup cannot declare a script binding:
+ * its expressions read script names and call them, and the only way they touch a binding is
+ * assigning it, which cbm_component_template_writes reports. A script loaded from `src`, or in
+ * a language this does not parse, stays unproved. */
 static bool embedded_binding_script(CBMExtractCtx *ctx, TSNode script, CBMEmbeddedBlock *block,
                                     CBMLanguage *language) {
-    unsigned attributes = 0;
     bool content = false, start_tag = false, end_tag = false;
     uint32_t count = ts_node_named_child_count(script);
     for (uint32_t i = 0; i < count; i++) {
@@ -3383,10 +3346,8 @@ static bool embedded_binding_script(CBMExtractCtx *ctx, TSNode script, CBMEmbedd
             for (uint32_t j = 0; j < children; j++) {
                 TSNode item = ts_node_named_child(child, j);
                 const char *item_kind = ts_node_type(item);
-                if (!strcmp(item_kind, "tag_name"))
-                    continue;
-                if (strcmp(item_kind, "attribute") ||
-                    !embedded_binding_attribute(ctx, item, true, language, &attributes))
+                if (!strcmp(item_kind, "attribute") ? !apply_script_attribute(ctx, item, language)
+                                                    : strcmp(item_kind, "tag_name") != 0)
                     return false;
             }
         } else if (!strcmp(kind, "end_tag") && !end_tag) {
@@ -3406,57 +3367,43 @@ TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TS
         ctx->source_len <= 0 || ts_node_is_null(ctx->root) || ts_node_has_error(ctx->root) ||
         ts_node_end_byte(ctx->root) != (uint32_t)ctx->source_len)
         return NULL;
-    enum { BINDING_HOST_STACK = 512, BINDING_HOST_NODES = 1000000 };
-    TSNode stack[BINDING_HOST_STACK];
-    size_t top = 0, visited = 0;
-    stack[top++] = ctx->root;
-    CBMEmbeddedBlock block = {0};
-    bool found = false;
+    enum { COMPONENT_SCRIPTS = 2 };
+    TSRange ranges[COMPONENT_SCRIPTS];
+    uint32_t count = 0;
+    bool usable = true;
     *language = CBM_LANG_JAVASCRIPT;
-    while (top) {
-        TSNode node = stack[--top];
-        if (++visited > BINDING_HOST_NODES)
-            return NULL;
-        const char *kind = ts_node_type(node);
-        if (!strcmp(kind, "script_element")) {
-            if (!ts_node_eq(ts_node_parent(node), ctx->root) || found ||
-                !embedded_binding_script(ctx, node, &block, language))
-                return NULL;
-            found = true;
-            continue;
-        }
-        if (!strcmp(kind, "attribute")) {
-            unsigned unused = 0;
-            if (!embedded_binding_attribute(ctx, node, false, language, &unused))
-                return NULL;
-            continue;
-        }
-        bool container = !strcmp(kind, "document") || !strcmp(kind, "element") ||
-                         !strcmp(kind, "template_element") || !strcmp(kind, "start_tag") ||
-                         !strcmp(kind, "end_tag") || !strcmp(kind, "self_closing_tag");
-        bool leaf = !strcmp(kind, "text") || !strcmp(kind, "comment") || !strcmp(kind, "tag_name");
-        if (!container && !leaf)
-            return NULL;
-        uint32_t children = ts_node_named_child_count(node);
-        if (leaf && children)
-            return NULL;
-        if (children > BINDING_HOST_STACK - top)
-            return NULL;
-        for (uint32_t i = children; i > 0; i--)
-            stack[top++] = ts_node_named_child(node, i - 1);
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            if (strcmp(ts_node_type(node), "script_element"))
+                continue;
+            CBMEmbeddedBlock block = {0};
+            CBMLanguage own = CBM_LANG_JAVASCRIPT;
+            if (count == COMPONENT_SCRIPTS || !embedded_binding_script(ctx, node, &block, &own) ||
+                (count && own != *language)) {
+                usable = false;
+                break;
+            }
+            *language = own;
+            ranges[count++] = (TSRange){.start_point = ts_node_start_point(block.content),
+                                        .end_point = ts_node_end_point(block.content),
+                                        .start_byte = ts_node_start_byte(block.content),
+                                        .end_byte = ts_node_end_byte(block.content)};
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
     }
-    if (!found)
+    ts_tree_cursor_delete(&cursor);
+    if (!usable || !count)
         return NULL;
-    *range = (TSRange){.start_point = ts_node_start_point(block.content),
-                       .end_point = ts_node_end_point(block.content),
-                       .start_byte = ts_node_start_byte(block.content),
-                       .end_byte = ts_node_end_byte(block.content)};
+    *range = ranges[0];
+    range->end_point = ranges[count - 1].end_point;
+    range->end_byte = ranges[count - 1].end_byte;
     if (range->end_byte <= range->start_byte || range->end_byte > (uint32_t)ctx->source_len)
         return NULL;
     TSParser *parser = ts_parser_new();
     TSTree *tree = NULL;
     if (parser && ts_parser_set_language(parser, cbm_ts_language(*language)) &&
-        ts_parser_set_included_ranges(parser, range, 1))
+        ts_parser_set_included_ranges(parser, ranges, count))
         tree = ts_parser_parse_string(parser, NULL, ctx->source, (uint32_t)ctx->source_len);
     if (parser)
         ts_parser_delete(parser);
@@ -3465,6 +3412,141 @@ TSTree *cbm_component_binding_tree(CBMExtractCtx *ctx, CBMLanguage *language, TS
         tree = NULL;
     }
     return tree;
+}
+
+static bool component_name_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c == '$';
+}
+
+typedef struct {
+    const char **items;
+    size_t count, capacity;
+} component_writes_t;
+
+static void component_note_write(CBMExtractCtx *ctx, component_writes_t *writes, const char *name,
+                                 size_t length) {
+    if (writes->count == writes->capacity) {
+        size_t capacity = writes->capacity ? writes->capacity * 2 : 8;
+        const char **items = cbm_arena_alloc(ctx->arena, capacity * sizeof(*items));
+        if (!items)
+            return;
+        if (writes->count)
+            memcpy(items, writes->items, writes->count * sizeof(*items));
+        writes->items = items;
+        writes->capacity = capacity;
+    }
+    const char *copy = cbm_arena_strndup(ctx->arena, name, length);
+    if (copy)
+        writes->items[writes->count++] = copy;
+}
+
+/* The names an expression assigns: `x = y`, `x += y`, `x++`. `x.y = z` writes a member and
+ * leaves the binding alone; `===`, `=>` and string contents are not assignments. */
+static void component_scan_assignments(CBMExtractCtx *ctx, component_writes_t *writes,
+                                       const char *text, size_t length) {
+    for (size_t at = 0; at < length;) {
+        unsigned char c = (unsigned char)text[at];
+        if (c == '\'' || c == '"' || c == '`') {
+            size_t close = at + 1;
+            while (close < length && text[close] != (char)c)
+                close += text[close] == '\\' ? 2 : 1;
+            at = close + 1;
+            continue;
+        }
+        if (!component_name_byte(c) || isdigit(c)) {
+            at++;
+            continue;
+        }
+        size_t begin = at;
+        while (at < length && component_name_byte((unsigned char)text[at]))
+            at++;
+        bool member = begin && text[begin - 1] == '.';
+        size_t next = at;
+        while (next < length && isspace((unsigned char)text[next]))
+            next++;
+        if (member || next >= length)
+            continue;
+        const char *rest = text + next;
+        size_t left = length - next;
+        bool plain = rest[0] == '=' && (left < 2 || (rest[1] != '=' && rest[1] != '>'));
+        bool compound = left >= 2 && rest[1] == '=' && strchr("+-*/%|&^", rest[0]);
+        bool step =
+            left >= 2 && ((rest[0] == '+' && rest[1] == '+') || (rest[0] == '-' && rest[1] == '-'));
+        if (plain || compound || step)
+            component_note_write(ctx, writes, text + begin, at - begin);
+    }
+}
+
+/* `v-model="x"` and `bind:value={x}` assign x. */
+static void component_scan_bound_name(CBMExtractCtx *ctx, component_writes_t *writes,
+                                      const char *text, size_t length) {
+    size_t at = 0;
+    while (at < length && (isspace((unsigned char)text[at]) || text[at] == '{'))
+        at++;
+    size_t begin = at;
+    while (at < length && component_name_byte((unsigned char)text[at]))
+        at++;
+    size_t end = at;
+    while (at < length && (isspace((unsigned char)text[at]) || text[at] == '}'))
+        at++;
+    if (end > begin && at == length)
+        component_note_write(ctx, writes, text + begin, end - begin);
+}
+
+static void component_scan_attribute(CBMExtractCtx *ctx, component_writes_t *writes, TSNode node) {
+    uint32_t count = ts_node_named_child_count(node);
+    if (count < 2)
+        return;
+    TSNode name = ts_node_named_child(node, 0);
+    TSNode value = ts_node_named_child(node, count - 1);
+    uint32_t begin = ts_node_start_byte(name), end = ts_node_end_byte(name);
+    const char *text = ctx->source + begin;
+    size_t size = end - begin;
+    bool bound = (size >= strlen("v-model") && !strncmp(text, "v-model", strlen("v-model"))) ||
+                 (size >= strlen("bind:") && !strncmp(text, "bind:", strlen("bind:")));
+    if (!bound && strcmp(ts_node_type(node), "directive_attribute"))
+        return;
+    uint32_t from = ts_node_start_byte(value), to = ts_node_end_byte(value);
+    bool quoted = to - from >= 2 && (ctx->source[from] == '"' || ctx->source[from] == '\'');
+    const char *body = ctx->source + from + (quoted ? 1 : 0);
+    size_t length = to - from - (quoted ? 2 : 0);
+    if (bound)
+        component_scan_bound_name(ctx, writes, body, length);
+    else
+        component_scan_assignments(ctx, writes, body, length);
+}
+
+size_t cbm_component_template_writes(CBMExtractCtx *ctx, const char ***names) {
+    component_writes_t writes = {0};
+    *names = NULL;
+    if (!ctx || !ctx->source || ts_node_is_null(ctx->root))
+        return 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    bool entering = true;
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        const char *kind = ts_node_type(node);
+        bool skip = !strcmp(kind, "script_element") || !strcmp(kind, "style_element");
+        if (entering && !skip) {
+            if (!strcmp(kind, "directive_attribute") || !strcmp(kind, "attribute"))
+                component_scan_attribute(ctx, &writes, node);
+            else if (!strcmp(kind, "expression"))
+                component_scan_assignments(ctx, &writes, ctx->source + ts_node_start_byte(node),
+                                           ts_node_end_byte(node) - ts_node_start_byte(node));
+            if (ts_tree_cursor_goto_first_child(&cursor))
+                continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            entering = true;
+            continue;
+        }
+        if (!ts_tree_cursor_goto_parent(&cursor))
+            break;
+        entering = false;
+    }
+    ts_tree_cursor_delete(&cursor);
+    *names = writes.items;
+    return writes.count;
 }
 
 static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock *block,

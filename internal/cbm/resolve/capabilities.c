@@ -53,12 +53,12 @@ static const edge_row_t edge_rows[] = {
      "entries abstain."},
     {CBM_LANG_ARKTS, SOURCE_EDGES,
      "Source JavaScript-style imports only; containing-language typed dispatch is unsupported."},
-    {CBM_LANG_VUE, CALLABLE_EDGES,
-     "One inline script with audited lexical bindings and an inert template; multiple script "
-     "contexts, template effects and external script sources abstain."},
-    {CBM_LANG_SVELTE, CALLABLE_EDGES,
-     "One inline script with audited lexical bindings; only static markup and bare-identifier "
-     "event references are supported. Multiple contexts and template effects abstain."},
+    {CBM_LANG_VUE, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
+     "Inline scripts as one module under the ECMAScript resolver; an external script source and "
+     "an unparsed script language abstain, and expressions in the template are not occurrences."},
+    {CBM_LANG_SVELTE, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
+     "Inline scripts as one module under the ECMAScript resolver; an external script source and "
+     "an unparsed script language abstain, and expressions in markup are not occurrences."},
     {CBM_LANG_PYTHON, SOURCE_EDGES | EDGE(WRITES) | EDGE(USES_TYPE),
      "Static project imports from the file's own search path, reexports and closed star imports; "
      "dynamic imports, unknown star sources and competing search-path candidates abstain."},
@@ -107,7 +107,17 @@ static const edge_row_t edge_rows[] = {
      "pubspec's own name and path dependencies; declared and constructed receiver types, and "
      "class type arguments fixed in extends clauses, along class, mixin and superclass chains. "
      "Collection element types, conditional imports and part-of by library name abstain."},
-    {CBM_LANG_LUA, EDGE(CALLS), NULL},
+    {CBM_LANG_VIMSCRIPT, EDGE(CALLS), NULL},
+    {CBM_LANG_MAKEFILE, EDGE(USAGE), NULL},
+    {CBM_LANG_BASH, EDGE(IMPORTS) | EDGE(CALLS) | EDGE(USAGE),
+     "source of a literal path relative to the script's directory or the repository root; a path "
+     "computed at runtime abstains."},
+    {CBM_LANG_TCL, EDGE(IMPORTS) | EDGE(CALLS),
+     "source of a literal path relative to the script's directory or the repository root; a path "
+     "computed at runtime abstains."},
+    {CBM_LANG_LUA, EDGE(IMPORTS) | CALLABLE_EDGES | EDGE(USAGE),
+     "require of a literal found through package.path's default forms under the requiring file's "
+     "ancestors, or under one project lua/ root; other package.path entries abstain."},
     {CBM_LANG_CSS, EDGE(IMPORTS),
      "Top-level quoted literal imports before style rules, relative to the source stylesheet; "
      "URL functions, escaping, layer ordering and remote paths abstain."},
@@ -269,14 +279,11 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
     case CBM_LANG_VUE:
     case CBM_LANG_SVELTE:
         out->adapter = "embedded_javascript_lexical";
-        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_CALLABLE;
-        out->limitation = language == CBM_LANG_VUE
-                              ? "One inline script with audited lexical bindings and an inert "
-                                "template; multiple scripts, template effects and external script "
-                                "sources abstain."
-                              : "One inline script with audited lexical bindings; static markup "
-                                "and bare-identifier event references only. Multiple script "
-                                "contexts and template effects abstain.";
+        out->proof_subsets =
+            CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT | CBM_RESOLVE_CAP_CALLABLE;
+        out->limitation = "Inline scripts as one module under the ECMAScript resolver. Markup "
+                          "assignments rebind what they spell; expressions in markup are not "
+                          "occurrences, and an external script source abstains.";
         break;
     case CBM_LANG_GO:
         out->adapter = "go";
@@ -473,11 +480,37 @@ bool cbm_resolve_capabilities(CBMLanguage language, cbm_resolve_capabilities_t *
             "receiver types with class type arguments fixed by subclasses; collection "
             "element types and conditional imports abstain.";
         break;
+    case CBM_LANG_MAKEFILE:
+        out->adapter = "make_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE;
+        out->limitation = "Variables assigned in the file that reads them; included files, the "
+                          "environment and computed names abstain.";
+        break;
+    case CBM_LANG_VIMSCRIPT:
+        out->adapter = "vim_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "Script-local, autoload and global function namespaces by name prefix; "
+                          "dict functions and Funcrefs in variables abstain.";
+        break;
+    case CBM_LANG_BASH:
+        out->adapter = "shell_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "A script's functions and those of files it sources by a literal path; "
+                          "another script is another process, and computed commands abstain.";
+        break;
+    case CBM_LANG_TCL:
+        out->adapter = "tcl_source";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT;
+        out->limitation = "A script's own procs, and procs of a file the project sources by a "
+                          "literal path; computed commands and renamed procs abstain.";
+        break;
     case CBM_LANG_LUA:
         out->adapter = "lua_source";
-        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE;
-        out->limitation = "Direct local function bindings; runtime require/export and receiver "
-                          "type proofs unimplemented.";
+        out->proof_subsets = CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                             CBM_RESOLVE_CAP_MEMBER | CBM_RESOLVE_CAP_TYPE_FLOW;
+        out->limitation = "Lexical scope, the one global namespace, table members, require through "
+                          "package.path and metatable __index. A value with more than one "
+                          "assignment, computed keys and untyped parameters abstain.";
         break;
     case CBM_LANG_ARKTS:
         out->adapter = "javascript_source";

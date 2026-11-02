@@ -544,6 +544,11 @@ PIPELINE_SRCS = \
     internal/cbm/resolve/adapter_perl.c \
     internal/cbm/resolve/adapter_ruby.c \
     internal/cbm/resolve/adapter_zig.c \
+    internal/cbm/resolve/adapter_lua.c \
+    internal/cbm/resolve/adapter_vim.c \
+    internal/cbm/resolve/adapter_shell.c \
+    internal/cbm/resolve/adapter_tcl.c \
+    internal/cbm/resolve/adapter_make.c \
     internal/cbm/resolve/adapter_haskell.c \
     internal/cbm/resolve/adapter_ocaml.c \
     internal/cbm/resolve/adapter_dart.c \

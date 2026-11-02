@@ -62,6 +62,8 @@ typedef struct {
     const cbm_resolve_js_import_t *js_import;
     /* A module-level class's own `constructor`, which `new` runs. */
     const char *js_constructor;
+    /* `const { m: x } = f()`: what calling x runs is f's returned m. */
+    const char *js_call_callee, *js_call_member;
     /* One-based index of a Python import below module level or under a
      * statement: the extractor records only top-level imports. */
     uint32_t nested_import;
@@ -124,6 +126,20 @@ typedef struct {
     const char *self_name;
     bool self_is_class;
 } binding_scope_t;
+
+/* One member of a `return { ... }` in a module-level function. A NULL member is a return of
+ * anything else, which leaves the function's value open. */
+typedef struct {
+    const char *function_name, *function_target;
+    uint32_t function_start, function_end;
+    const char *member;
+    const char *local;
+    uint32_t scope;
+    const char *value_name;
+    uint32_t value_start, value_end;
+    const char *target;
+    bool conflict;
+} js_returned_t;
 
 /* A module-scope write or an `exports.x = v` value, captured during the walk
  * and settled once every declaration in the file is known. */
@@ -264,6 +280,8 @@ struct cbm_resolve_binding_index {
     size_t import_count, import_capacity;
     js_write_t *js_writes;
     size_t js_write_count, js_write_capacity;
+    const char **markup_writes;
+    size_t markup_write_count;
     js_raw_export_t *js_raw_exports;
     size_t js_raw_export_count, js_raw_export_capacity;
     cbm_resolve_js_export_t *js_exports;
@@ -273,6 +291,8 @@ struct cbm_resolve_binding_index {
     size_t js_export_alias_count, js_export_alias_capacity;
     js_member_t *js_members;
     size_t js_member_count, js_member_capacity;
+    js_returned_t *js_returned;
+    size_t js_returned_count, js_returned_capacity;
     const char *current_this_owner;
     bool current_this_prototype;
 };
@@ -893,52 +913,8 @@ static bool supported_node(CBMLanguage language, const char *kind) {
                                                  "keyword_pattern",
                                                  "type_alias_statement",
                                                  NULL};
-    static const char *const lua[] = {"chunk",
-                                      "block",
-                                      "function_declaration",
-                                      "function_definition",
-                                      "parameters",
-                                      "identifier",
-                                      "variable",
-                                      "variable_list",
-                                      "expression_list",
-                                      "function_call",
-                                      "arguments",
-                                      "return_statement",
-                                      "assignment_statement",
-                                      "variable_declaration",
-                                      "number",
-                                      "string",
-                                      "string_content",
-                                      "escape_sequence",
-                                      "true",
-                                      "false",
-                                      "nil",
-                                      "binary_expression",
-                                      "unary_expression",
-                                      "parenthesized_expression",
-                                      "if_statement",
-                                      "elseif_statement",
-                                      "else_statement",
-                                      "while_statement",
-                                      "repeat_statement",
-                                      "for_statement",
-                                      "for_numeric_clause",
-                                      "for_generic_clause",
-                                      "do_statement",
-                                      "break_statement",
-                                      "comment",
-                                      "empty_statement",
-                                      "table_constructor",
-                                      "field",
-                                      "dot_index_expression",
-                                      "method_index_expression",
-                                      "bracket_index_expression",
-                                      NULL};
-    if (language == CBM_LANG_PYTHON)
-        return listed(kind, python) || listed(kind, python_expressions) ||
-               listed(kind, python_binders);
-    return listed(kind, lua);
+    (void)language;
+    return listed(kind, python) || listed(kind, python_expressions) || listed(kind, python_binders);
 }
 
 /* These grammar containers add no binders. The ordinary walk still audits
@@ -1019,12 +995,8 @@ static bool dynamic_name(CBMLanguage language, const char *name) {
      * here. __import__ loads a module and returns it. exec, eval, globals and
      * locals/vars are classified at the occurrence below. */
     static const char *const python[] = {"exec", "eval", "globals", NULL};
-    static const char *const lua[] = {"exec",     "eval",    "globals",    "locals",   "vars",
-                                      "setattr",  "delattr", "__import__", "__dict__", "load",
-                                      "loadfile", "dofile",  "loadstring", "setfenv",  "getfenv",
-                                      "debug",    "_ENV",    "_G",         "rawset",   NULL};
-    /* Lua environment operations have no special meaning in Python. */
-    return listed(name, language == CBM_LANG_LUA ? lua : python);
+    (void)language;
+    return listed(name, python);
 }
 
 /* An identifier is a lexical read only outside the member and keyword roles:
@@ -1127,19 +1099,6 @@ static bool python_namespace_view(cbm_resolve_binding_index_t *index, TSNode nod
                        !index->scopes[index->current_scope].class_scope;
     TSNode args = field(call, "arguments");
     return !in_function && (ts_node_is_null(args) || ts_node_named_child_count(args) == 0);
-}
-
-static bool lua_local_function(TSNode node) {
-    if (!ts_node_is_null(field(node, "local_declaration"))) {
-        return true;
-    }
-    uint32_t children = ts_node_child_count(node);
-    for (uint32_t i = 0; i < children; i++) {
-        if (kind_is(ts_node_child(node, i), "local")) {
-            return true;
-        }
-    }
-    return false;
 }
 
 /* A name bound by `if TYPE_CHECKING:` exists only for annotations; the
@@ -1276,7 +1235,7 @@ static void note_import(cbm_resolve_binding_index_t *index, TSNode node, bool ne
 }
 
 static void note_call(cbm_resolve_binding_index_t *index, TSNode node) {
-    TSNode callee = field(node, index->language == CBM_LANG_LUA ? "name" : "function");
+    TSNode callee = field(node, "function");
     if (kind_is(node, "new_expression")) {
         callee = field(node, "constructor");
     }
@@ -1306,6 +1265,9 @@ typedef struct {
     unsigned char js_binder, js_declaration, js_for_binder;
     bool js_type_level, js_ambient, js_body, js_no_site, js_this_prototype;
     const char *js_this_owner;
+    /* The module-level function a `return` here belongs to; NULL in anything nested. */
+    const char *js_function_name;
+    uint32_t js_function_start, js_function_end;
 } binding_walk_t;
 
 /* Function defaults/annotations and class bases execute in the enclosing
@@ -2926,27 +2888,37 @@ static void js_member_value(cbm_resolve_binding_index_t *index, js_member_t *row
 static void note_javascript_object_members(cbm_resolve_binding_index_t *index, const char *owner,
                                            TSNode object, bool prototype) {
     uint32_t count = ts_node_named_child_count(object);
+    /* A later key wins, so `{ ...base, m() {} }` has this m whatever base holds. A spread or a
+     * computed key can only replace what comes before it. */
+    uint32_t settled_from = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(object, i);
+        bool computed = kind_is(item, "spread_element") ||
+                        ((kind_is(item, "pair") || kind_is(item, "method_definition")) &&
+                         !kind_is(kind_is(item, "pair") ? field(item, "key") : field(item, "name"),
+                                  "property_identifier"));
+        if (computed)
+            settled_from = i + 1;
+    }
     for (uint32_t i = 0; i < count; i++) {
         TSNode item = ts_node_named_child(object, i);
         const char *member = NULL;
         js_member_t *row = NULL;
-        if (kind_is(item, "spread_element")) {
-            (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
-        } else if (kind_is(item, "shorthand_property_identifier")) {
+        if (kind_is(item, "shorthand_property_identifier")) {
             member = node_text(index, item);
             row = js_member_row(index, owner, member, prototype);
-            if (row)
+            if (row) {
                 row->local = member;
+                row->conflict = i < settled_from;
+            }
         } else if (kind_is(item, "pair") || kind_is(item, "method_definition")) {
             TSNode key = kind_is(item, "pair") ? field(item, "key") : field(item, "name");
-            if (!kind_is(key, "property_identifier")) {
-                (void)js_member_row(index, owner, JS_MEMBER_COMPUTED, prototype);
+            if (!kind_is(key, "property_identifier"))
                 continue;
-            }
             member = node_text(index, key);
             row = js_member_row(index, owner, member, prototype);
             /* `get m()` runs on the read; what a call then invokes is its return value. */
-            if (row && (child_token(item, "get") || child_token(item, "set")))
+            if (row && (i < settled_from || child_token(item, "get") || child_token(item, "set")))
                 row->conflict = true;
             else if (row)
                 js_member_value(index, row, kind_is(item, "pair") ? field(item, "value") : item,
@@ -3546,6 +3518,43 @@ static const char *js_require_pattern_member(cbm_resolve_binding_index_t *index,
     return member;
 }
 
+/* The `variable_declarator` whose pattern this name sits in, however deep. */
+static TSNode js_pattern_declarator(TSNode node) {
+    for (TSNode at = ts_node_parent(node); !ts_node_is_null(at); at = ts_node_parent(at)) {
+        if (kind_is(at, "variable_declarator"))
+            return at;
+        if (!kind_is(at, "object_pattern") && !kind_is(at, "array_pattern") &&
+            !kind_is(at, "pair_pattern") && !kind_is(at, "object_assignment_pattern") &&
+            !kind_is(at, "assignment_pattern") && !kind_is(at, "rest_pattern"))
+            break;
+    }
+    return (TSNode){0};
+}
+
+/* `const { m, n: x } = f()`: the pattern's own member of one plain call. */
+static void js_note_destructured_call(cbm_resolve_binding_index_t *index, binding_name_t *row,
+                                      TSNode node, TSNode declarator) {
+    TSNode value = js_unwrap_value(field(declarator, "value"));
+    TSNode callee = kind_is(value, "call_expression") ? field(value, "function") : (TSNode){0};
+    if (!kind_is(callee, "identifier") || child_token(value, "optional_chain"))
+        return;
+    TSNode pattern = ts_node_parent(node);
+    const char *member = NULL;
+    if (kind_is(node, "shorthand_property_identifier_pattern") &&
+        kind_is(pattern, "object_pattern")) {
+        member = row->name;
+    } else if (kind_is(pattern, "pair_pattern") && ts_node_eq(node, field(pattern, "value")) &&
+               kind_is(field(pattern, "key"), "property_identifier")) {
+        member = node_text(index, field(pattern, "key"));
+        pattern = ts_node_parent(pattern);
+    }
+    if (!member || !kind_is(pattern, "object_pattern") ||
+        !ts_node_eq(pattern, field(declarator, "name")))
+        return;
+    row->js_call_callee = node_text(index, callee);
+    row->js_call_member = member;
+}
+
 static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode node,
                                    const char *name, const binding_walk_t *state) {
     if (state->js_binder == JS_BINDER_WRITE) {
@@ -3602,6 +3611,23 @@ static void note_javascript_binder(cbm_resolve_binding_index_t *index, TSNode no
         js_set_lines(index, row, declarator);
         if (index->name_count > row)
             index->names[row].at_start = ts_node_start_byte(declarator);
+    } else if (!direct && !ts_node_is_null(js_pattern_declarator(node))) {
+        /* `const { a, b: c } = f()`: the name is declared here, whatever the value turns out
+         * to be, so a read of it names this variable. Calling it stays with what it holds.
+         * Only module level has a Variable node to name. */
+        TSNode whole = js_pattern_declarator(node);
+        bool is_const = kind_is(ts_node_parent(whole), "lexical_declaration") &&
+                        child_token(ts_node_parent(whole), "const");
+        add_name(index, name, ts_node_end_byte(whole),
+                 !module_level ? BINDING_BLOCKED
+                               : BINDING_VALUE_DECLARATION | (is_const ? BINDING_CONST_VALUE : 0));
+        if (module_level)
+            js_set_lines(index, row, whole);
+        if (index->name_count > row) {
+            index->names[row].at_start = ts_node_start_byte(whole);
+            if (is_const)
+                js_note_destructured_call(index, &index->names[row], node, whole);
+        }
     } else {
         add_name(index, name, 0, BINDING_BLOCKED);
         if (direct && kind_is(value, "this") && state->js_this_owner && index->name_count > row) {
@@ -3633,6 +3659,92 @@ static bool js_plain_member_path(const cbm_resolve_binding_index_t *index, TSNod
 
 static bool javascript_named_function_scope_kind(const char *kind) {
     return !strcmp(kind, "function_expression") || !strcmp(kind, "generator_function");
+}
+
+static js_returned_t *js_returned_row(cbm_resolve_binding_index_t *index,
+                                      const binding_walk_t *state, const char *member) {
+    js_returned_t *items = grow_array(index, index->js_returned, index->js_returned_count,
+                                      &index->js_returned_capacity, sizeof(*items));
+    if (!items)
+        return NULL;
+    index->js_returned = items;
+    js_returned_t *row = &items[index->js_returned_count++];
+    *row = (js_returned_t){.function_name = state->js_function_name,
+                           .function_start = state->js_function_start,
+                           .function_end = state->js_function_end,
+                           .member = member,
+                           .scope = state->scope};
+    return row;
+}
+
+static void js_returned_function(js_returned_t *row, TSNode value, const char *name) {
+    row->value_name = name;
+    row->value_start = ts_node_start_point(value).row + 1;
+    row->value_end = ts_node_end_point(value).row + 1;
+}
+
+/* What a module-level function returns. A later key wins, so only a spread or a computed key can
+ * take a member from what is spelled before it. */
+static void js_note_returned(cbm_resolve_binding_index_t *index, TSNode value,
+                             const binding_walk_t *state) {
+    if (!kind_is(value, "object")) {
+        (void)js_returned_row(index, state, NULL);
+        return;
+    }
+    size_t first = index->js_returned_count;
+    TSTreeCursor cursor = ts_tree_cursor_new(value);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        do {
+            TSNode item = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(item) || kind_is(item, "comment"))
+                continue;
+            TSNode key = kind_is(item, "pair")                ? field(item, "key")
+                         : kind_is(item, "method_definition") ? field(item, "name")
+                                                              : (TSNode){0};
+            if (kind_is(item, "shorthand_property_identifier")) {
+                const char *member = node_text(index, item);
+                js_returned_t *row = js_returned_row(index, state, member);
+                if (row)
+                    row->local = member;
+            } else if (kind_is(key, "property_identifier")) {
+                const char *member = node_text(index, key);
+                js_returned_t *row = js_returned_row(index, state, member);
+                TSNode held = kind_is(item, "pair") ? js_unwrap_value(field(item, "value")) : item;
+                if (!row)
+                    continue;
+                if (kind_is(held, "identifier"))
+                    row->local = node_text(index, held);
+                else if (kind_is(item, "pair") && js_function_value(held))
+                    js_returned_function(row, held, member);
+                else if (kind_is(item, "method_definition") && !child_token(item, "get") &&
+                         !child_token(item, "set"))
+                    js_returned_function(row, held, member);
+                else
+                    row->conflict = true;
+            } else {
+                for (size_t r = first; r < index->js_returned_count; r++)
+                    index->js_returned[r].conflict = true;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+}
+
+/* A module-level function, by the name and lines its extracted definition has. */
+static void js_enter_function(cbm_resolve_binding_index_t *index, TSNode node,
+                              binding_walk_t *state) {
+    state->js_function_name = NULL;
+    if (state->scope != 0)
+        return;
+    TSNode name = field(node, "name");
+    TSNode parent = ts_node_is_null(name) ? ts_node_parent(node) : (TSNode){0};
+    if (kind_is(parent, "variable_declarator") && ts_node_eq(node, field(parent, "value")))
+        name = field(parent, "name");
+    if (!kind_is(name, "identifier"))
+        return;
+    state->js_function_name = node_text(index, name);
+    state->js_function_start = ts_node_start_point(node).row + 1;
+    state->js_function_end = ts_node_end_point(node).row + 1;
 }
 
 static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, TSNode node,
@@ -3742,7 +3854,12 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         state.js_no_site = true;
     }
 
+    if (kind_is(node, "return_statement") && state.js_function_name &&
+        ts_node_named_child_count(node))
+        js_note_returned(index, js_unwrap_value(ts_node_named_child(node, 0)), &state);
+
     if (javascript_runtime_function(node)) {
+        js_enter_function(index, node, &state);
         javascript_this_owner(index, node, &state);
         index->current_this_owner = state.js_this_owner;
         index->current_this_prototype = state.js_this_prototype;
@@ -3756,6 +3873,11 @@ static binding_walk_t note_javascript_node(cbm_resolve_binding_index_t *index, T
         index->current_scope = state.scope;
         state.js_body = true;
         state.named_export = false;
+        if (state.js_function_name && kind_is(node, "arrow_function")) {
+            TSNode body = js_unwrap_value(field(node, "body"));
+            if (!kind_is(body, "statement_block"))
+                js_note_returned(index, body, &state);
+        }
         /* A function expression's own name is visible only inside it. */
         if (javascript_named_function_scope_kind(kind)) {
             const char *text = node_text(index, field(node, "name"));
@@ -4564,8 +4686,7 @@ static binding_walk_t note_node(cbm_resolve_binding_index_t *index, TSNode node,
         bool decorated = index->language == CBM_LANG_PYTHON && parent_kind &&
                          !strcmp(parent_kind, "decorated_definition");
         bool supported =
-            kind_is(name, "identifier") && !decorated &&
-            (index->language == CBM_LANG_PYTHON || (depth == 1 && lua_local_function(node)));
+            kind_is(name, "identifier") && !decorated && index->language == CBM_LANG_PYTHON;
         if (!ts_node_is_null(name)) {
             const char *text = node_text(index, name);
             add_name(index, text, ts_node_start_byte(node),
@@ -4791,6 +4912,23 @@ static bool js_row_in_space(const binding_name_t *row, js_space_t space) {
     if (space == JS_SPACE_TYPE)
         return !value_only;
     return true;
+}
+
+/* Markup assigning a script's `let` or function rebinds it like a script write would. Assigning
+ * a const is the compiler's unref, `x.value = v`, which leaves the const's value in place. */
+static void js_note_markup_writes(cbm_resolve_binding_index_t *index) {
+    for (size_t w = 0; w < index->markup_write_count; w++) {
+        const char *name = index->markup_writes[w];
+        size_t high = 0;
+        size_t low = js_name_range(index, name, strlen(name), 0, &high);
+        for (size_t r = low; r < high; r++) {
+            const binding_name_t *row = &index->names[r];
+            if (js_row_in_space(row, JS_SPACE_VALUE) && !(row->flags & BINDING_CONST_VALUE)) {
+                js_write(index, name, 0);
+                break;
+            }
+        }
+    }
 }
 
 static void js_apply_writes(cbm_resolve_binding_index_t *index) {
@@ -5212,6 +5350,112 @@ static void js_settle_members(cbm_resolve_binding_index_t *index) {
                 row->target = binding->target;
         }
     }
+}
+
+static const binding_name_t *find_lexical_name(const cbm_resolve_binding_index_t *index,
+                                               const char *name, size_t length, uint32_t scope,
+                                               cbm_resolve_lookup_t *query, js_space_t space);
+
+static int js_compare_returned(const void *left, const void *right) {
+    const js_returned_t *a = left, *b = right;
+    int order = strcmp(a->function_target ? a->function_target : "",
+                       b->function_target ? b->function_target : "");
+    if (order)
+        return order;
+    /* The rows that leave the whole function open come first. */
+    return strcmp(a->member ? a->member : "", b->member ? b->member : "");
+}
+
+/* What each function's `return` statements agree a member holds. */
+static void js_settle_returned(cbm_resolve_binding_index_t *index) {
+    int definitions = index->result->defs.count;
+    if (!index->js_returned_count || !definitions ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE)
+        return;
+    const CBMDefinition **sorted =
+        cbm_arena_alloc(index->arena, (size_t)definitions * sizeof(*sorted));
+    if (!sorted) {
+        fail_index(index, CBM_RESOLVE_ANALYSIS_FAILED, "binding_member_allocation");
+        return;
+    }
+    for (int d = 0; d < definitions; d++)
+        sorted[d] = &index->result->defs.items[d];
+    qsort(sorted, (size_t)definitions, sizeof(*sorted), js_compare_definition);
+    for (size_t r = 0; r < index->js_returned_count; r++) {
+        js_returned_t *row = &index->js_returned[r];
+        js_raw_export_t function = {.function_name = row->function_name,
+                                    .start_line = row->function_start,
+                                    .end_line = row->function_end};
+        row->function_target = js_function_target(index, sorted, &function);
+        if (!row->member || row->conflict)
+            continue;
+        if (row->value_name) {
+            js_raw_export_t value = {.function_name = row->value_name,
+                                     .start_line = row->value_start,
+                                     .end_line = row->value_end};
+            row->target = js_function_target(index, sorted, &value);
+        } else if (row->local) {
+            const binding_name_t *binding = find_lexical_name(index, row->local, strlen(row->local),
+                                                              row->scope, NULL, JS_SPACE_VALUE);
+            if (binding && !(binding->flags & BINDING_BLOCKED) &&
+                (binding->flags & BINDING_DECLARATION))
+                row->target = binding->target;
+        }
+    }
+    qsort(index->js_returned, index->js_returned_count, sizeof(*index->js_returned),
+          js_compare_returned);
+    const char *open_function = NULL;
+    for (size_t r = 0; r < index->js_returned_count;) {
+        js_returned_t *row = &index->js_returned[r];
+        size_t next = r + 1;
+        bool same = row->target != NULL;
+        while (next < index->js_returned_count &&
+               !js_compare_returned(row, &index->js_returned[next])) {
+            const char *other = index->js_returned[next].target;
+            same = same && other && !strcmp(row->target, other);
+            next++;
+        }
+        if (!row->member)
+            open_function = row->function_target;
+        bool open = !same || !row->function_target ||
+                    (open_function && !strcmp(open_function, row->function_target));
+        for (size_t at = r; at < next; at++)
+            index->js_returned[at].target = open ? NULL : row->target;
+        r = next;
+    }
+}
+
+bool cbm_resolve_binding_js_returned_member_at(const cbm_resolve_binding_index_t *index,
+                                               size_t offset, const char **function,
+                                               const char **member, const char **target) {
+    if (!index || !javascript_language(index->language) ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || offset >= index->js_returned_count)
+        return false;
+    const js_returned_t *row = &index->js_returned[offset];
+    *function = row->function_target;
+    *member = row->member;
+    *target = row->target;
+    return true;
+}
+
+bool cbm_resolve_binding_js_literal_member_at(const cbm_resolve_binding_index_t *index,
+                                              size_t offset, const char **owner,
+                                              const char **member, const char **target) {
+    if (!index || !javascript_language(index->language) ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || offset >= index->js_member_count)
+        return false;
+    const js_member_t *row = &index->js_members[offset];
+    bool conflict = false;
+    const binding_name_t *holder = js_module_row(index, row->owner, JS_SPACE_VALUE, &conflict);
+    js_member_t computed = {.owner = row->owner, .member = JS_MEMBER_COMPUTED};
+    bool open = !holder || conflict || (holder->flags & (BINDING_BLOCKED | BINDING_WRITTEN)) ||
+                holder->js_import || row->conflict || row->prototype ||
+                bsearch(&computed, index->js_members, index->js_member_count,
+                        sizeof(*index->js_members), js_compare_member);
+    *owner = holder ? holder->target : NULL;
+    *member = row->member;
+    *target = open ? NULL : row->target;
+    return true;
 }
 
 bool cbm_resolve_binding_js_exports_complete(const cbm_resolve_binding_index_t *index) {
@@ -5652,8 +5896,8 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
         return index;
     }
     bool component = language == CBM_LANG_VUE || language == CBM_LANG_SVELTE;
-    if (language != CBM_LANG_PYTHON && language != CBM_LANG_LUA && language != CBM_LANG_DART &&
-        language != CBM_LANG_RUST && !javascript_language(language) && !component) {
+    if (language != CBM_LANG_PYTHON && language != CBM_LANG_DART && language != CBM_LANG_RUST &&
+        !javascript_language(language) && !component) {
         return index;
     }
     if (!result || !source || !result->module_qn || source_len > UINT32_MAX || result->has_error ||
@@ -5695,7 +5939,11 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
                               .language = language,
                               .module_qn = result->module_qn,
                               .root = ts_tree_root_node(tree)};
+        const char **markup_writes = NULL;
+        size_t markup_write_count = cbm_component_template_writes(&host, &markup_writes);
         TSTree *script = cbm_component_binding_tree(&host, &language, &range);
+        index->markup_writes = markup_writes;
+        index->markup_write_count = markup_write_count;
         if (owned_tree)
             ts_tree_delete(owned_tree);
         tree = owned_tree = script;
@@ -5762,10 +6010,12 @@ static cbm_resolve_binding_index_t *binding_build(CBMArena *arena, const CBMFile
             python_refuse_class_comprehension_reads(index);
     }
     if (javascript_language(language)) {
+        js_note_markup_writes(index);
         js_apply_writes(index);
         audit_javascript_values(index);
         js_settle_exports(index);
         js_settle_members(index);
+        js_settle_returned(index);
         js_settle_constructors(index);
     }
     /* An explicit replacement of annotation storage can invoke user code
@@ -6158,6 +6408,37 @@ const cbm_resolve_js_import_t *cbm_resolve_binding_js_import(
 static const js_member_t *js_site_member(const cbm_resolve_binding_index_t *index, const char *name,
                                          const binding_site_t *site, cbm_resolve_lookup_t *query);
 
+bool cbm_resolve_binding_js_destructured_call(const cbm_resolve_binding_index_t *index,
+                                              const char *name, uint32_t start, uint32_t end,
+                                              CBMSourceOrigin origin,
+                                              const cbm_resolve_js_import_t **import,
+                                              const char **callee, const char **function,
+                                              const char **member) {
+    if (!index || !javascript_language(index->language) ||
+        index->analysis != CBM_RESOLVE_ANALYSIS_COMPLETE || !name ||
+        origin != CBM_SOURCE_ORIGIN_RAW || end <= start || !index->sites || !index->site_count)
+        return false;
+    binding_site_t key = {.name = name, .start = start, .end = end};
+    const binding_site_t *site =
+        bsearch(&key, index->sites, index->site_count, sizeof(*index->sites), compare_site);
+    if (!site || site->member_path || !site->invocation)
+        return false;
+    const binding_name_t *binding =
+        find_lexical_name(index, name, strlen(name), site->scope, NULL, JS_SPACE_VALUE);
+    if (!binding || !binding->js_call_member)
+        return false;
+    const binding_name_t *called =
+        find_lexical_name(index, binding->js_call_callee, strlen(binding->js_call_callee),
+                          binding->scope, NULL, JS_SPACE_VALUE);
+    if (!called || (called->flags & BINDING_BLOCKED))
+        return false;
+    *import = called->js_import;
+    *callee = binding->js_call_callee;
+    *function = (called->flags & BINDING_DECLARATION) ? called->target : NULL;
+    *member = binding->js_call_member;
+    return *import || *function;
+}
+
 bool cbm_resolve_binding_js_declaration_lines(const cbm_resolve_binding_index_t *index,
                                               const char *name, uint32_t start, uint32_t end,
                                               CBMSourceOrigin origin, uint32_t *start_line,
@@ -6263,6 +6544,11 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
         find_lexical_name(index, spelled, root_length, located->scope, &query, space);
     /* `import type` names a type, so a type position may use it. */
     bool type_import = binding && located->type_position && (binding->flags & BINDING_TYPE_IMPORT);
+    /* `const { m } = f(); m()`: f's returned m, which the caller established. */
+    bool returned_member = ecma && !dot && binding && binding->js_call_member &&
+                           candidate.rule == CBM_RESOLVE_RULE_IMPORT_BINDING &&
+                           (prior_facts & CBM_RESOLVE_FACT_IMPORT_BOUND) &&
+                           (prior_facts & CBM_RESOLVE_FACT_LOOKUP_COMPLETE);
     /* A later declaration binds a closure that runs after it, in any scope but
      * its own and never inside its own initializer. */
     bool too_early = binding && start < binding->at &&
@@ -6276,8 +6562,9 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
                        candidate.rule == CBM_RESOLVE_RULE_IMPORT_BINDING &&
                        (prior_facts & CBM_RESOLVE_FACT_IMPORT_BOUND) &&
                        (prior_facts & CBM_RESOLVE_FACT_LOOKUP_COMPLETE);
-    if (!dart_import && (!binding || ((binding->flags & BINDING_BLOCKED) && !type_import) ||
-                         (too_early && !python_deferred_site(index, located, binding)))) {
+    if (!dart_import &&
+        (!binding || ((binding->flags & BINDING_BLOCKED) && !type_import && !returned_member) ||
+         (too_early && !python_deferred_site(index, located, binding)))) {
         candidate.reason = "binding_shadowed_or_unavailable";
         return binding_query_finish(index, &query, candidate);
     }
@@ -6288,7 +6575,7 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
             return binding_query_finish(index, &query, candidate);
         }
     }
-    if (binding && (binding->flags & BINDING_VALUE_DECLARATION) &&
+    if (binding && (binding->flags & BINDING_VALUE_DECLARATION) && !returned_member &&
         (located->invocation ||
          (prior_facts & (CBM_RESOLVE_FACT_CALLABLE_TYPED | CBM_RESOLVE_FACT_RECEIVER_TYPED |
                          CBM_RESOLVE_FACT_TYPE_BOUND | CBM_RESOLVE_FACT_CLASS_CALLABLE)))) {
@@ -6303,7 +6590,7 @@ cbm_resolve_result_t cbm_resolve_binding_validate(const cbm_resolve_binding_inde
                binding->target && strcmp(binding->target, candidate.target) == 0) {
         candidate.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;
     } else if (candidate.rule == CBM_RESOLVE_RULE_IMPORT_BINDING &&
-               ((binding->flags & BINDING_IMPORT) || type_import) &&
+               ((binding->flags & BINDING_IMPORT) || type_import || returned_member) &&
                (prior_facts & CBM_RESOLVE_FACT_IMPORT_BOUND) &&
                (prior_facts & CBM_RESOLVE_FACT_LOOKUP_COMPLETE)) {
         candidate.facts |= CBM_RESOLVE_FACT_SCOPE_BOUND;

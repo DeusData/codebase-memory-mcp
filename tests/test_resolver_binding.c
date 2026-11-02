@@ -221,32 +221,6 @@ TEST(resolver_binding_exact_occurrence_and_origin_required) {
     PASS();
 }
 
-TEST(resolver_binding_lua_local_function_and_shadow) {
-    const char *sources[] = {
-        "local function helper() return 1 end\nlocal function caller() return helper() end\n",
-        "local function helper() return 1 end\nlocal function caller(helper) return helper() end\n",
-        "function helper() return 1 end\nfunction caller() return helper() end\n",
-    };
-    for (size_t i = 0; i < sizeof(sources) / sizeof(sources[0]); i++) {
-        const char *source = sources[i];
-        CBMFileResult *result = cbm_extract_file(source, (int)strlen(source), CBM_LANG_LUA, "test",
-                                                 "binding.lua", 0, NULL, NULL);
-        ASSERT_NOT_NULL(result);
-        CBMArena arena;
-        cbm_arena_init(&arena);
-        cbm_resolve_binding_index_t *index =
-            cbm_resolve_binding_build(&arena, result, CBM_LANG_LUA, source, strlen(source));
-        const CBMCall *call = find_call(result, "helper");
-        ASSERT_NOT_NULL(call);
-        cbm_resolve_result_t resolved =
-            validate_call(index, call, local_candidate(&arena, result, "helper"));
-        ASSERT_EQ(cbm_resolve_admit(&resolved), i == 0);
-        cbm_arena_destroy(&arena);
-        cbm_free_result(result);
-    }
-    PASS();
-}
-
 TEST(resolver_binding_unsupported_language_is_explicit) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -670,6 +644,5 @@ SUITE(resolver_binding) {
     RUN_TEST(resolver_binding_python_import_needs_independent_export_proof);
     RUN_TEST(resolver_binding_python_relative_import_preserves_local_authority);
     RUN_TEST(resolver_binding_exact_occurrence_and_origin_required);
-    RUN_TEST(resolver_binding_lua_local_function_and_shadow);
     RUN_TEST(resolver_binding_unsupported_language_is_explicit);
 }

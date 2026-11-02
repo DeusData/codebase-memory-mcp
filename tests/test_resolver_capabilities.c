@@ -25,7 +25,8 @@ TEST(resolver_capability_is_never_an_occurrence_proof) {
     ASSERT(cbm_resolve_capabilities(CBM_LANG_JULIA, &capability));
     ASSERT_EQ(capability.proof_subsets, 0);
     ASSERT(cbm_resolve_capabilities(CBM_LANG_LUA, &capability));
-    ASSERT_EQ(capability.proof_subsets, CBM_RESOLVE_CAP_SCOPE);
+    ASSERT(capability.proof_subsets & CBM_RESOLVE_CAP_MEMBER);
+    ASSERT_STR_EQ(capability.adapter, "lua_source");
     ASSERT(cbm_resolve_capabilities(CBM_LANG_DART, &capability));
     ASSERT(!(capability.proof_subsets & CBM_RESOLVE_CAP_TYPE_FLOW));
     PASS();
@@ -138,14 +139,15 @@ TEST(resolver_capabilities_match_existing_bounded_producers) {
     for (size_t i = 0; i < sizeof(embedded) / sizeof(embedded[0]); i++) {
         ASSERT(cbm_resolve_capabilities(embedded[i], &capability));
         ASSERT_STR_EQ(capability.adapter, "embedded_javascript_lexical");
-        ASSERT_EQ(capability.proof_subsets, CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_CALLABLE);
+        ASSERT_EQ(capability.proof_subsets, CBM_RESOLVE_CAP_SCOPE | CBM_RESOLVE_CAP_IMPORT_EXPORT |
+                                                CBM_RESOLVE_CAP_CALLABLE);
         ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_CALLS].availability,
                   CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
         ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_CALL_REFERENCE].availability,
                   CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
         ASSERT_EQ(capability.edges[CBM_RESOLVE_EDGE_IMPORTS].availability,
-                  CBM_RESOLVE_EDGE_UNSUPPORTED);
-        ASSERT_NOT_NULL(strstr(capability.limitation, "inline script"));
+                  CBM_RESOLVE_EDGE_SUPPORTED_SUBSET);
+        ASSERT_NOT_NULL(strstr(capability.limitation, "Inline scripts"));
     }
     ASSERT(cbm_resolve_capabilities(CBM_LANG_YAML, &capability));
     ASSERT_NOT_NULL(strstr(capability.edges[CBM_RESOLVE_EDGE_USAGE].limitation, "Compose"));

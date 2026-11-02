@@ -158,6 +158,25 @@ const cbm_resolve_js_import_t *cbm_resolve_binding_js_import(const cbm_resolve_b
 cbm_resolve_result_t cbm_resolve_binding_js_member(const cbm_resolve_binding_index_t *,
                                                    const char *name, uint32_t start, uint32_t end,
                                                    CBMSourceOrigin origin);
+/* The module-level object literals of this file, member by member, for another file's `x.m()`
+ * through an import of `x`: QN of x, the member's name, and the declaration it holds. False past
+ * the end; a member with no one declaration, or whose owner is written, reports a NULL target. */
+bool cbm_resolve_binding_js_literal_member_at(const cbm_resolve_binding_index_t *, size_t offset,
+                                              const char **owner, const char **member,
+                                              const char **target);
+/* The members of `return { ... }` in this file's module-level functions, for another file's
+ * `const { m } = f(); m()`: QN of f, the member's name, and the declaration every return gives it.
+ * False past the end; a member with no one declaration reports a NULL target. */
+bool cbm_resolve_binding_js_returned_member_at(const cbm_resolve_binding_index_t *, size_t offset,
+                                               const char **function, const char **member,
+                                               const char **target);
+/* This invocation calls a const destructured from one plain call: `const { m: x } = f(); x()`.
+ * f is an import or a declaration of this file; member is m. */
+bool cbm_resolve_binding_js_destructured_call(const cbm_resolve_binding_index_t *, const char *name,
+                                              uint32_t start, uint32_t end, CBMSourceOrigin origin,
+                                              const cbm_resolve_js_import_t **import,
+                                              const char **callee, const char **function,
+                                              const char **member);
 /* This occurrence names a type, in a type annotation or as its `Ns` path root. */
 bool cbm_resolve_binding_js_type_occurrence(const cbm_resolve_binding_index_t *, const char *name,
                                             uint32_t start, uint32_t end, CBMSourceOrigin origin);

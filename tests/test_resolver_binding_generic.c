@@ -842,34 +842,17 @@ TEST(resolver_binding_language_dynamic_controls_remain_blocked) {
                             "globals()['target'] = None", "locals()['target'] = None",
                             "vars()['target'] = None",
                             "setattr(sys.modules[__name__], 'target', None)"};
-    const char *lua[] = {"debug.getregistry()",
-                         "load('return nil')",
-                         "rawset(_G, 'target', nil)",
-                         "loadfile('unknown.lua')",
-                         "dofile('unknown.lua')",
-                         "loadstring('return nil')",
-                         "setfenv(1, {})",
-                         "getfenv(1)",
-                         "_ENV.target = nil",
-                         "_G.target = nil"};
-    for (int language = 0; language < 2; language++) {
-        const char *const *effects = language ? lua : python;
-        size_t count = language ? sizeof(lua) / sizeof(lua[0]) : sizeof(python) / sizeof(python[0]);
+    {
+        size_t count = sizeof(python) / sizeof(python[0]);
+        const char *const *effects = python;
         for (size_t i = 0; i < count; i++) {
             char source[512];
-            if (language)
-                snprintf(source, sizeof(source),
-                         "local function target() return 1 end\n%s\n"
-                         "local function caller() return target() end\n",
-                         effects[i]);
-            else
-                snprintf(source, sizeof(source),
-                         "def target():\n    return 1\n%s\ndef caller():\n    return target()\n",
-                         effects[i]);
-            CBMLanguage kind = language ? CBM_LANG_LUA : CBM_LANG_PYTHON;
-            CBMFileResult *file =
-                cbm_extract_file(source, (int)strlen(source), kind, "isolation",
-                                 language ? "main.lua" : "main.py", 0, NULL, NULL);
+            snprintf(source, sizeof(source),
+                     "def target():\n    return 1\n%s\ndef caller():\n    return target()\n",
+                     effects[i]);
+            CBMLanguage kind = CBM_LANG_PYTHON;
+            CBMFileResult *file = cbm_extract_file(source, (int)strlen(source), kind, "isolation",
+                                                   "main.py", 0, NULL, NULL);
             ASSERT_NOT_NULL(file);
             ASSERT(!file->has_error && !file->parse_incomplete && !file->parse_unusable);
             CBMArena arena;
@@ -891,8 +874,8 @@ TEST(resolver_binding_language_dynamic_controls_remain_blocked) {
                                              CBM_SOURCE_ORIGIN_RAW, candidate);
             bool admitted = cbm_resolve_admit(&proof);
             if (!blocked || admitted)
-                fprintf(stderr, "Dynamic control language=%d case=%zu status=%s admitted=%d\n",
-                        language, i, cbm_resolve_binding_status(index), admitted);
+                fprintf(stderr, "Dynamic control case=%zu status=%s admitted=%d\n", i,
+                        cbm_resolve_binding_status(index), admitted);
             cbm_arena_destroy(&arena);
             cbm_free_result(file);
             ASSERT(blocked);
@@ -1885,6 +1868,27 @@ TEST(resolver_binding_component_scripts_exact_local_scope) {
     } fixtures[] = {{"App.vue", "<template><p>Vue</p></template>\n<script setup lang=\"ts\">\n"
                                 "function callee(): number { return 42; }\n"
                                 "function caller(): number { return callee(); }\n</script>\n"},
+                    /* koel's SFCs: directives, bound attributes, handlers, a style block and
+                     * interpolation neither declare nor rebind a script name. */
+                    {"App.vue",
+                     "<template><Card v-if=\"caller\" :title=\"`${caller()}`\" @click.prevent=\"caller\">"
+                     "{{ caller() }}</Card></template>\n<script setup lang=\"ts\">\n"
+                     "function callee(): number { return 42; }\n"
+                     "function caller(): number { return callee(); }\n</script>\n"
+                     "<style scoped>\n.a { color: red; }\n</style>\n"},
+                    /* A normal script and `<script setup>` are one module. */
+                    {"App.vue",
+                     "<script lang=\"ts\">\nfunction callee(): number { return 42; }\n</script>\n"
+                     "<script setup lang=\"ts\" generic=\"T\">\n"
+                     "function caller(): number { return callee(); }\n</script>\n"},
+                    /* Assigning a const in markup writes its .value: the const stays. */
+                    {"App.vue",
+                     "<template><input v-model=\"count\" @click=\"count = 1\"/></template>\n"
+                     "<script setup>\nconst count = 1;\nfunction callee() { return count; }\n"
+                     "function caller() { return callee(); }\n</script>\n"},
+                    {"Toggle.svelte", "<script context=\"module\">\nfunction callee() { return 42; }\n"
+                                      "</script>\n<script>\nfunction caller() { return callee(); }\n"
+                                      "</script>\n<p>{caller()}</p>\n"},
                     {"App.vue", "<template><p>Vue</p></template>\n<script setup>\n"
                                 "function callee() { return 42; }\n"
                                 "function caller() { return callee(); }\n</script>\n"},
@@ -1907,6 +1911,14 @@ TEST(resolver_binding_component_scripts_scope_and_write_barriers) {
     } fixtures[] = {
         {"App.vue", "<template><button @click=\"callee = caller\">Change</button></template>\n"
                     "<script setup>\nfunction callee() { return 42; }\n"
+                    "function caller() { return callee(); }\n</script>\n"},
+        {"App.vue", "<template><input v-model=\"callee\"/></template>\n"
+                    "<script setup>\nfunction callee() { return 42; }\n"
+                    "function caller() { return callee(); }\n</script>\n"},
+        {"App.vue", "<template><p>x</p></template>\n<script src=\"./x.js\"></script>\n"
+                    "<script setup>\nfunction callee() { return 42; }\n"
+                    "function caller() { return callee(); }\n</script>\n"},
+        {"App.vue", "<script lang=\"coffee\">\nfunction callee() { return 42; }\n"
                     "function caller() { return callee(); }\n</script>\n"},
         {"Toggle.svelte", "<script>\nfunction callee() { return 42; }\n"
                           "function caller() { return callee(); }\n</script>\n"
@@ -2250,7 +2262,14 @@ TEST(resolver_binding_unsupported_import_carriers_do_not_authorize_paths) {
                                       "project='unsupported-imports' "
                                       "AND relation='IMPORTS' AND emitted=0 AND target='' "
                                       "AND reason='unsupported_import_language' AND file_path IN "
-                                      "('main.jsonnet','main.ncl','main.sh')") == 3 &&
+                                      "('main.jsonnet','main.ncl')") == 2 &&
+                 ok;
+            /* Shell has an import rule now: a path built at runtime is its own abstention. */
+            ok = generic_count(store, "SELECT count(*) FROM resolver_occurrences WHERE "
+                                      "project='unsupported-imports' "
+                                      "AND relation='IMPORTS' AND emitted=0 AND target='' "
+                                      "AND reason='script_source_path_computed' AND "
+                                      "file_path='main.sh'") == 1 &&
                  ok;
             ok = generic_count(store,
                                "SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "

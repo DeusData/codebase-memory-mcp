@@ -11788,21 +11788,30 @@ static void extract_lua_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
             continue;
         }
         TSNode expr_list = cbm_find_child_by_kind(child, "expression_list");
-        if (!ts_node_is_null(expr_list) && ts_node_named_child_count(expr_list) > 0) {
-            TSNode val = ts_node_named_child(expr_list, 0);
-            if (!ts_node_is_null(val) && strcmp(ts_node_type(val), "function_definition") == 0) {
-                continue;
-            }
-        }
         TSNode vars = ts_node_child_by_field_name(child, TS_FIELD("variables"));
         if (ts_node_is_null(vars)) {
             vars = cbm_find_child_by_kind(child, "variable_list");
         }
-        if (!ts_node_is_null(vars) && ts_node_named_child_count(vars) > 0) {
-            TSNode first = ts_node_named_child(vars, 0);
-            if (!ts_node_is_null(first)) {
-                push_var_def(ctx, cbm_node_text(a, first, ctx->source), node);
+        if (ts_node_is_null(vars)) {
+            continue;
+        }
+        uint32_t names = ts_node_named_child_count(vars);
+        uint32_t values = ts_node_is_null(expr_list) ? 0 : ts_node_named_child_count(expr_list);
+        /* `local describe, it = t.describe, t.it` declares both. A function value is a
+         * Function node of that name, and an attribute is not a name. */
+        for (uint32_t k = 0, position = 0; k < names; k++) {
+            TSNode name = ts_node_named_child(vars, k);
+            if (strcmp(ts_node_type(name), "identifier") != 0) {
+                continue;
             }
+            TSNode value =
+                position < values ? ts_node_named_child(expr_list, position) : (TSNode){0};
+            position++;
+            if (!ts_node_is_null(value) &&
+                strcmp(ts_node_type(value), "function_definition") == 0) {
+                continue;
+            }
+            push_var_def(ctx, cbm_node_text(a, name, ctx->source), node);
         }
     }
 }
@@ -14771,12 +14780,14 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 // the body's `name = args: ...` bindings are reached. Inner curried
                 // lambdas (`f = a: b: ...`) resolve no name and mint nothing, so the
                 // extra descent adds defs without adding noise.
+                // Lua: a test file is one `describe(name, function() ... end)`, so nearly
+                // all of its `local function`s live inside an anonymous function.
                 bool descend_into_func =
                     (ctx->language == CBM_LANG_C && cbm_test_definition_qn(ctx, node) != NULL) ||
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
                      ctx->language == CBM_LANG_ARKTS || ctx->language == CBM_LANG_ADA ||
-                     ctx->language == CBM_LANG_NIX);
+                     ctx->language == CBM_LANG_NIX || ctx->language == CBM_LANG_LUA);
                 if (!descend_into_func) {
                     continue;
                 }

@@ -3863,6 +3863,16 @@ static bool source_module_facts(const cbm_file_info_t *files, int count, CBMFile
             if (length <= 0 || (size_t)length >= sizeof(module) ||
                 !source_module_put(map, "erlang_module", module, files[i].rel_path))
                 return false;
+        } else if (files[i].language == CBM_LANG_LUA) {
+            size_t size = 0;
+            for (const char *name = cbm_lua_root_module(files[i].rel_path, NULL, &size); name;
+                 name = cbm_lua_root_module(files[i].rel_path, name, &size)) {
+                char module[PKGMAP_PATH_BUF];
+                int length = snprintf(module, sizeof(module), "%.*s", (int)size, name);
+                if (length <= 0 || (size_t)length >= sizeof(module) ||
+                    !source_module_put(map, "lua_module", module, files[i].rel_path))
+                    return false;
+            }
         } else if (files[i].language == CBM_LANG_ELIXIR && cache && cache[i]) {
             const CBMFileResult *result = cache[i];
             for (int d = 0; d < result->defs.count; d++) {
@@ -5612,6 +5622,47 @@ static const cbm_gbuf_node_t *resolve_ancestor_lib_file(const cbm_pipeline_ctx_t
     }
 }
 
+/* `require('a.b')` searches package.path, whose default is `./?.lua;./?/init.lua`. The working
+ * directory is the requiring file's or an ancestor of it; the nearest one holding the file is
+ * the program it belongs to. */
+static const cbm_gbuf_node_t *resolve_lua_ancestor_module(const cbm_pipeline_ctx_t *ctx,
+                                                          const char *source_rel,
+                                                          const char *module) {
+    char *directory = path_dirname(source_rel ? source_rel : "");
+    char current[PKGMAP_PATH_BUF];
+    int length = directory ? snprintf(current, sizeof(current), "%s", directory) : -1;
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+    if (length < 0 || (size_t)length >= sizeof(current))
+        return NULL;
+    if (!strcmp(current, "."))
+        current[0] = '\0';
+    for (;;) {
+        char path[PKGMAP_PATH_BUF];
+        static const char *const forms[] = {"%s.lua", "%s/init.lua"};
+        for (size_t f = 0; f < sizeof(forms) / sizeof(forms[0]); f++) {
+            char leaf[PKGMAP_PATH_BUF];
+            int size = snprintf(leaf, sizeof(leaf), forms[f], module);
+            int written =
+                size > 0 && (size_t)size < sizeof(leaf)
+                    ? snprintf(path, sizeof(path), "%s%s%s", current, current[0] ? "/" : "", leaf)
+                    : -1;
+            const cbm_gbuf_node_t *found =
+                written > 0 && (size_t)written < sizeof(path)
+                    ? cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, path)
+                    : NULL;
+            if (found)
+                return found;
+        }
+        if (!current[0])
+            return NULL;
+        char *slash = strrchr(current, '/');
+        if (slash)
+            *slash = '\0';
+        else
+            current[0] = '\0';
+    }
+}
+
 static const cbm_gbuf_node_t *resolve_source_module(const cbm_pipeline_ctx_t *ctx,
                                                     CBMHashTable *namespace_map, const char *kind,
                                                     const char *module, bool *ambiguous) {
@@ -5710,6 +5761,48 @@ static bool resolve_source_language_import(const cbm_pipeline_ctx_t *ctx, const 
         *reason = "haskell_declared_module";
         *out = resolve_source_module(ctx, namespace_map, "haskell_module", path, ambiguous);
         return true;
+    case CBM_LANG_BASH:
+    case CBM_LANG_TCL:
+        /* A literal path is relative to the working directory: the script's or the repository's. */
+        *reason = "script_source_path_computed";
+        if (path[0] == '/' || strpbrk(path, "$[`"))
+            return true;
+        *reason = "script_source_literal_path";
+        directory = path_dirname(source_rel);
+        if (directory && cbm_repo_rel_join(directory, path, joined, sizeof(joined)))
+            *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, directory);
+        if (!*out && cbm_repo_rel_join("", path, joined, sizeof(joined)))
+            *out = cbm_pipeline_file_node(ctx->gbuf, ctx->project_name, joined);
+        return true;
+    case CBM_LANG_LUA: {
+        char module[PKGMAP_PATH_BUF];
+        int length = snprintf(module, sizeof(module), "%s", path);
+        if (length <= 0 || (size_t)length >= sizeof(module)) {
+            *reason = "lua_module_name_too_long";
+            return true;
+        }
+        for (char *p = module; *p; p++)
+            if (*p == '.')
+                *p = '/';
+        /* The host preloads these in package.loaded: `require('os')` never reads an os.lua. */
+        static const char *const preloaded[] = {"string", "table", "math",     "io",  "os",
+                                                "debug",  "utf8",  "package",  "bit", "bit32",
+                                                "ffi",    "jit",   "coroutine"};
+        for (size_t p = 0; p < sizeof(preloaded) / sizeof(preloaded[0]); p++) {
+            if (!strcmp(module, preloaded[p])) {
+                *reason = "lua_require_of_a_preloaded_library";
+                return true;
+            }
+        }
+        *reason = "lua_require_package_path";
+        *out = resolve_lua_ancestor_module(ctx, source_rel, module);
+        if (!*out) {
+            *reason = "lua_require_lua_root";
+            *out = resolve_source_module(ctx, namespace_map, "lua_module", module, ambiguous);
+        }
+        return true;
+    }
     default:
         return false;
     }

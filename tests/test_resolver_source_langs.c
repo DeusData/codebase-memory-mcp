@@ -5206,6 +5206,1184 @@ TEST(resolver_source_ocaml_sequential_scope_and_modules) {
     PASS();
 }
 
+/* ── Lua ───────────────────────────────────────────────────────────── */
+
+/* Forms from neovim: `local clear = n.clear`, `require('test.functional.testnvim')()`, a module
+ * table returned from a `lua/` root, `Screen.new` building an instance through `__index`, and
+ * LuaCATS stubs declaring `vim.api.*` in one global namespace. */
+static const char LUA_HELPER[] = "local M = {}\n"
+                                 "\n"
+                                 "function M.greet(name)\n"
+                                 "  return name\n"
+                                 "end\n"
+                                 "\n"
+                                 "M.assigned = function() end\n"
+                                 "\n"
+                                 "function M:method()\n"
+                                 "  return self:sibling()\n"
+                                 "end\n"
+                                 "\n"
+                                 "function M:sibling()\n"
+                                 "  return M.greet('from sibling')\n"
+                                 "end\n"
+                                 "\n"
+                                 "local function hidden() end\n"
+                                 "\n"
+                                 "M.renamed = hidden\n"
+                                 "\n"
+                                 "M.conflict = hidden\n"
+                                 "M.conflict = M.greet\n"
+                                 "\n"
+                                 "M.format = function() end\n"
+                                 "\n"
+                                 "return M\n";
+static const char LUA_UTIL[] = "local M = {\n"
+                               "  eq = function() end,\n"
+                               "}\n"
+                               "\n"
+                               "function M.ok() end\n"
+                               "\n"
+                               "return M\n";
+static const char LUA_FACTORY[] = "local M = {}\n"
+                                  "\n"
+                                  "function M.clear() end\n"
+                                  "\n"
+                                  "return function()\n"
+                                  "  return M\n"
+                                  "end\n";
+static const char LUA_CLASS[] = "local Base = require('lib.base')\n"
+                                "\n"
+                                "local Class = setmetatable({}, { __index = Base })\n"
+                                "Class.__index = Class\n"
+                                "\n"
+                                "function Class.new()\n"
+                                "  local self = setmetatable({}, Class)\n"
+                                "  return self\n"
+                                "end\n"
+                                "\n"
+                                "function Class:run()\n"
+                                "  self:inherited()\n"
+                                "  return self\n"
+                                "end\n"
+                                "\n"
+                                "return Class\n";
+static const char LUA_BASE[] = "local Base = {}\n"
+                               "\n"
+                               "function Base:inherited() end\n"
+                               "\n"
+                               "return Base\n";
+static const char LUA_STUBS[] = "vim.api = {}\n"
+                                "\n"
+                                "function vim.api.nvim_thing() end\n";
+static const char LUA_SHARED[] = "function shared_global() end\n"
+                                 "\n"
+                                 "function vim.keycode(text)\n"
+                                 "  return text\n"
+                                 "end\n"
+                                 "\n"
+                                 "function usage() end\n"
+                                 "\n"
+                                 "function print(...) end\n";
+static const char LUA_OTHER[] = "function usage() end\n"
+                                "\n"
+                                "function own_script()\n"
+                                "  usage()\n"
+                                "end\n";
+static const char LUA_MAIN[] =
+    "local h = require('lib.helper')\n"
+    "local t = require('test.util')\n"
+    "local n = require('test.factory')()\n"
+    "local Class = require('lib.class')\n"
+    "local greet = h.greet\n"
+    "local helper_mod = h\n"
+    "local a, second_ok = h.greet, t.ok\n"
+    "local api = vim.api\n"
+    "local counter = 0\n"
+    "\n"
+    "local function own() end\n"
+    "\n"
+    "local function caller()\n"
+    "  h.greet('x')\n"
+    "  greet('y')\n"
+    "  second_ok(1)\n"
+    "  n.clear()\n"
+    "  own()\n"
+    "  h:method()\n"
+    "  require('lib.helper').greet('z')\n"
+    "  local c = Class.new()\n"
+    "  c:run()\n"
+    "  c:inherited()\n"
+    "  shared_global()\n"
+    "  vim.api.nvim_thing()\n"
+    "  api.nvim_thing()\n"
+    "  vim.keycode('k')\n"
+    "  t.eq(1)\n"
+    "end\n"
+    "\n"
+    "local function reads()\n"
+    "  return counter, helper_mod.renamed, second_ok\n"
+    "end\n"
+    "\n"
+    "local function shadow(greet, own)\n"
+    "  greet('p')\n"
+    "  own()\n"
+    "  local counter = 1\n"
+    "  return counter\n"
+    "end\n"
+    "\n"
+    "local function rewritten()\n"
+    "  local f = h.greet\n"
+    "  f = h.assigned\n"
+    "  f()\n"
+    "end\n"
+    "\n"
+    "local function not_proved()\n"
+    "  h.missing()\n"
+    "  h.conflict()\n"
+    "  string.format('x')\n"
+    "  print('x')\n"
+    "  usage()\n"
+    "  require('ext.lib').greet()\n"
+    "end\n"
+    "\n"
+    "local function replaced_environment()\n"
+    "  local _ENV = { shared_global = own }\n"
+    "  shared_global()\n"
+    "end\n"
+    "\n"
+    "local function scoped()\n"
+    "  do\n"
+    "    local inner = greet\n"
+    "    inner('in')\n"
+    "  end\n"
+    "  inner('out')\n"
+    "end\n"
+    "\n"
+    "local Wrapped = {}\n"
+    "local before = Wrapped.go\n"
+    "function Wrapped.go()\n"
+    "  before()\n"
+    "end\n"
+    "\n"
+    "local function with_default(opts)\n"
+    "  opts = opts or {}\n"
+    "  local setup = opts.setup\n"
+    "  function opts.setup()\n"
+    "    setup()\n"
+    "  end\n"
+    "end\n"
+    "\n"
+    "local function preloaded()\n"
+    "  require('os').shadowed_by_a_project_file()\n"
+    "end\n"
+    "\n"
+    "local function own_require(require)\n"
+    "  local z = require('lib.helper')\n"
+    "  z.greet('s')\n"
+    "end\n"
+    "\n"
+    "return { caller = caller }\n";
+
+#define LUA_HELPER_FILE "lua/lib/helper.lua"
+#define LUA_FILE "test/main_spec.lua"
+#define LUA_CALL(id, text, tfile, tsuffix, tline, tdecl)                                       \
+    SL_CALL_AT(id, LUA_FILE, "main_spec.caller", text, 0, tfile, tsuffix, "Function", tline, tdecl)
+#define LUA_DENY(id, method, text) SL_DENY_AT(id, LUA_FILE, "main_spec." method, text, 0)
+
+TEST(resolver_source_lua_values_modules_and_scope) {
+    static const RQ_Source sources[] = {
+        {.path = LUA_FILE, .text = LUA_MAIN},
+        {.path = LUA_HELPER_FILE, .text = LUA_HELPER},
+        {.path = "test/util.lua", .text = LUA_UTIL},
+        {.path = "test/factory.lua", .text = LUA_FACTORY},
+        {.path = "lua/lib/class.lua", .text = LUA_CLASS},
+        {.path = "lua/lib/base.lua", .text = LUA_BASE},
+        {.path = "meta/api.lua", .text = LUA_STUBS},
+        {.path = "shared.lua", .text = LUA_SHARED},
+        {.path = "other_script.lua", .text = LUA_OTHER},
+        {.path = "os.lua", .text = "local M = {}\nfunction M.shadowed_by_a_project_file() end\nreturn M\n"},
+    };
+    static const RQ_Expected expected[] = {
+        LUA_CALL("member-of-a-required-table", "h.greet('x')", LUA_HELPER_FILE, "helper.M.greet", 3,
+                 "function M.greet(name)"),
+        LUA_CALL("local-holding-a-member", "greet('y')", LUA_HELPER_FILE, "helper.M.greet", 3,
+                 "function M.greet(name)"),
+        LUA_CALL("second-name-of-a-local-statement", "second_ok(1)", "test/util.lua", "util.M.ok", 5,
+                 "function M.ok() end"),
+        LUA_CALL("value-a-required-function-returns", "n.clear()", "test/factory.lua",
+                 "factory.M.clear", 3, "function M.clear() end"),
+        SL_CALL_AT("local-function", LUA_FILE, "main_spec.caller", "own()", 1, LUA_FILE, "main_spec.own",
+                   "Function", 11, "local function own() end"),
+        LUA_CALL("method-of-a-required-table", "h:method()", LUA_HELPER_FILE, "helper.M:method", 9,
+                 "function M:method()"),
+        LUA_CALL("member-of-a-require-expression", "require('lib.helper').greet('z')",
+                 LUA_HELPER_FILE, "helper.M.greet", 3, "function M.greet(name)"),
+        LUA_CALL("constructor-function", "Class.new()", "lua/lib/class.lua", "class.Class.new", 6,
+                 "function Class.new()"),
+        LUA_CALL("method-of-an-instance", "c:run()", "lua/lib/class.lua", "class.Class:run", 11,
+                 "function Class:run()"),
+        LUA_CALL("metatable-index-chain", "c:inherited()", "lua/lib/base.lua",
+                 "base.Base:inherited", 3, "function Base:inherited() end"),
+        LUA_CALL("global-function-of-another-file", "shared_global()", "shared.lua",
+                 "shared.shared_global", 1, "function shared_global() end"),
+        LUA_CALL("global-table-member", "vim.api.nvim_thing()", "meta/api.lua",
+                 "api.vim.api.nvim_thing", 3, "function vim.api.nvim_thing() end"),
+        SL_CALL_AT("local-holding-a-global-table", LUA_FILE, "main_spec.caller", "api.nvim_thing()", 1,
+                   "meta/api.lua", "api.vim.api.nvim_thing", "Function", 3,
+                   "function vim.api.nvim_thing() end"),
+        LUA_CALL("function-in-a-global-table", "vim.keycode('k')", "shared.lua",
+                 "shared.vim.keycode", 3, "function vim.keycode(text)"),
+        SL_CALL_AT("self-method", LUA_HELPER_FILE, "helper.M:method", "self:sibling()", 0,
+                   LUA_HELPER_FILE, "helper.M:sibling", "Function", 13, "function M:sibling()"),
+        SL_CALL_AT("inner-block-local", LUA_FILE, "main_spec.scoped", "inner('in')", 0,
+                   LUA_HELPER_FILE, "helper.M.greet", "Function", 3, "function M.greet(name)"),
+        SL_CALL_AT("own-file-global-before-another-file", "other_script.lua",
+                   "other_script.own_script", "usage()", 1, "other_script.lua",
+                   "other_script.usage", "Function", 1, "function usage() end"),
+        SL_USE_AT("block-local-reads-the-chunk-alias", LUA_FILE, "main_spec.scoped", "greet", 10,
+                  LUA_FILE, "main_spec.greet", "Variable", 5, "local greet = h.greet"),
+        SL_USE_AT("chunk-level-local-read", LUA_FILE, "main_spec.reads", "counter", 1, LUA_FILE,
+                  "main_spec.counter", "Variable", 9, "local counter = 0"),
+        SL_USE_AT("alias-local-read", LUA_FILE, "main_spec.reads", "helper_mod", 1, LUA_FILE,
+                  "main_spec.helper_mod", "Variable", 6, "local helper_mod = h"),
+        SL_USE_AT("second-name-has-a-node", LUA_FILE, "main_spec.reads", "second_ok", 2, LUA_FILE,
+                  "main_spec.second_ok", "Variable", 7, "local a, second_ok = h.greet, t.ok"),
+        SL_USE_AT("member-read-holding-a-function", LUA_FILE, "main_spec.reads", "renamed", 0,
+                  LUA_HELPER_FILE, "helper.hidden", "Function", 17, "local function hidden() end"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        LUA_DENY("parameter-shadows-the-alias", "shadow", "greet('p')"),
+        SL_DENY_AT("parameter-shadows-the-function", LUA_FILE, "main_spec.shadow", "own()", 2),
+        SL_NO_USE_AT("inner-local-is-not-the-chunk-local", LUA_FILE, "main_spec.shadow", "counter",
+                     1),
+        LUA_DENY("a-local-written-with-another-value", "rewritten", "f()"),
+        SL_DENY_AT("function-in-a-table-field-has-no-node", LUA_FILE, "main_spec.caller", "t.eq(1)", 0),
+        LUA_DENY("member-nothing-declares", "not_proved", "h.missing()"),
+        LUA_DENY("member-with-two-declarations", "not_proved", "h.conflict()"),
+        LUA_DENY("standard-library-is-not-a-same-named-member", "not_proved", "string.format('x')"),
+        LUA_DENY("standard-global-is-not-another-files-wrapper", "not_proved", "print('x')"),
+        LUA_DENY("global-two-files-declare", "not_proved", "usage()"),
+        LUA_DENY("module-outside-the-project", "not_proved", "require('ext.lib').greet()"),
+        LUA_DENY("local-environment-replaces-globals", "replaced_environment", "shared_global()"),
+        LUA_DENY("name-past-its-block-is-a-global", "scoped", "inner('out')"),
+        LUA_DENY("parameter-named-require", "own_require", "z.greet('s')"),
+        SL_DENY_AT("read-above-the-declaration-is-the-old-value", LUA_FILE, "main_spec.Wrapped.go",
+                   "before()", 0),
+        SL_DENY_AT("parameter-default-is-not-its-only-value", LUA_FILE, "main_spec.opts.setup",
+                   "setup()", 0),
+        LUA_DENY("library-the-host-preloads", "preloaded",
+                 "require('os').shadowed_by_a_project_file()"),
+    };
+    ASSERT(sl_check("lua-rules", ".lua", "local filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* LuaCATS is what a Lua project states about a value it cannot show: a parameter, a return. An
+ * annotation is about the next line. The rest of neovim's runtime reads this way:
+ * `--- @param client vim.lsp.Client`, `vim.uv = ...` under `---@type uv`. */
+static const char LUA_THING[] = "--- @class lib.Thing\n"
+                                "local Thing = {}\n"
+                                "Thing.__index = Thing\n"
+                                "\n"
+                                "function Thing:run() end\n"
+                                "\n"
+                                "--- @return lib.Thing\n"
+                                "function Thing.make()\n"
+                                "  return mystery()\n"
+                                "end\n"
+                                "\n"
+                                "return Thing\n";
+static const char LUA_ANNOTATED[] = "local Thing = require('lib.thing')\n"
+                                    "\n"
+                                    "--- @param t lib.Thing\n"
+                                    "local function annotated(t)\n"
+                                    "  t:run()\n"
+                                    "end\n"
+                                    "\n"
+                                    "--- @param s string\n"
+                                    "local function not_a_class(s)\n"
+                                    "  s:run()\n"
+                                    "end\n"
+                                    "\n"
+                                    "local function no_annotation(u)\n"
+                                    "  u:run()\n"
+                                    "end\n"
+                                    "\n"
+                                    "--- @class lib.Shape\n"
+                                    "\n"
+                                    "local Unrelated = {}\n"
+                                    "function Unrelated.run() end\n"
+                                    "\n"
+                                    "--- @param o lib.Shape\n"
+                                    "local function class_not_adjacent(o)\n"
+                                    "  o.run()\n"
+                                    "end\n"
+                                    "\n"
+                                    "local function via_return()\n"
+                                    "  Thing.make():run()\n"
+                                    "end\n"
+                                    "\n"
+                                    "local other = mystery() --- @type lib.Thing\n"
+                                    "local function trailing()\n"
+                                    "  other:run()\n"
+                                    "end\n"
+                                    "\n"
+                                    "---@type lib.Thing\n"
+                                    "shared_thing = ...\n"
+                                    "local function typed_global()\n"
+                                    "  shared_thing:run()\n"
+                                    "end\n";
+
+TEST(resolver_source_lua_annotations_state_what_a_value_cannot) {
+    static const RQ_Source sources[] = {
+        {.path = "lua/lib/thing.lua", .text = LUA_THING},
+        {.path = "use.lua", .text = LUA_ANNOTATED},
+    };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("param-annotation", "use.lua", "use.annotated", "t:run()", 0,
+                   "lua/lib/thing.lua", "thing.Thing:run", "Function", 5, "function Thing:run() end"),
+        SL_CALL_AT("function-whose-return-is-annotated", "use.lua", "use.via_return", "Thing.make()",
+                   0, "lua/lib/thing.lua", "thing.Thing.make", "Function", 8,
+                   "function Thing.make()"),
+        SL_CALL_AT("return-annotation", "use.lua", "use.via_return", "Thing.make():run()", 0,
+                   "lua/lib/thing.lua", "thing.Thing:run", "Function", 5, "function Thing:run() end"),
+        SL_CALL_AT("trailing-type-annotation", "use.lua", "use.trailing", "other:run()", 0,
+                   "lua/lib/thing.lua", "thing.Thing:run", "Function", 5, "function Thing:run() end"),
+        SL_CALL_AT("type-annotation-on-an-assignment", "use.lua", "use.typed_global",
+                   "shared_thing:run()", 0, "lua/lib/thing.lua", "thing.Thing:run", "Function", 5,
+                   "function Thing:run() end"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("annotation-naming-no-class", "use.lua", "use.not_a_class", "s:run()", 0),
+        SL_DENY_AT("no-annotation", "use.lua", "use.no_annotation", "u:run()", 0),
+        SL_DENY_AT("class-annotation-across-a-blank-line", "use.lua", "use.class_not_adjacent",
+                   "o.run()", 0),
+    };
+    ASSERT(sl_check("lua-annotations", ".lua", "local filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* Forms from neovim: a lazy `__index` over `require(prefix .. key)`, `@module` fields of the table
+ * `vim._defer_require` is given, and a test's `local function` inside `describe(...)`. A mock in a
+ * test body does not compete with the declaration, and a factory's new table keeps its own writes. */
+static const char LUA_LAZY[] =
+    "local lazy = setmetatable({}, {\n"
+    "  __index = function(t, key)\n"
+    "    t[key] = require('lazylib.' .. key)\n"
+    "    return t[key]\n"
+    "  end,\n"
+    "})\n"
+    "local function make_deferred() return {} end\n"
+    "local deferred = make_deferred('pkg', {\n"
+    "  buf = ..., --- @module 'pkg.buf'\n"
+    "})\n"
+    "\n"
+    "local function make()\n"
+    "  return {}\n"
+    "end\n"
+    "local first = make()\n"
+    "function first.only_first() end\n"
+    "local second = make()\n"
+    "function second.only_second() end\n"
+    "\n"
+    "function global_api() end\n"
+    "\n"
+    "local function callers()\n"
+    "  lazy.sub.go()\n"
+    "  deferred.buf.format()\n"
+    "  first.only_first()\n"
+    "  global_api()\n"
+    "end\n"
+    "\n"
+    "local function no_proof()\n"
+    "  lazy.absent.go()\n"
+    "  deferred.other.format()\n"
+    "  first.only_second()\n"
+    "end\n"
+    "\n"
+    "describe('suite', function()\n"
+    "  local function nested_helper() end\n"
+    "  local function nested_caller()\n"
+    "    nested_helper()\n"
+    "  end\n"
+    "end)\n";
+
+TEST(resolver_source_lua_lazy_modules_factories_and_nested_functions) {
+    static const RQ_Source sources[] = {
+        {.path = "lazy.lua", .text = LUA_LAZY},
+        {.path = "lazylib/sub.lua", .text = "local M = {}\nfunction M.go() end\nreturn M\n"},
+        {.path = "pkg/buf.lua", .text = "local M = {}\nfunction M.format() end\nreturn M\n"},
+        {.path = "pkg/other.lua", .text = "local M = {}\nfunction M.format() end\nreturn M\n"},
+        {.path = "mock_spec.lua", .text = "local function mocks()\n"
+                                          "  global_api = function() end\n"
+                                          "end\n"},
+        {.path = "global_user.lua", .text = "local function use_global()\n"
+                                            "  global_api()\n"
+                                            "end\n"},
+    };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("lazy-index-requires-the-key", "lazy.lua", "lazy.callers", "lazy.sub.go()", 0,
+                   "lazylib/sub.lua", "sub.M.go", "Function", 2, "function M.go() end"),
+        SL_CALL_AT("module-annotated-field", "lazy.lua", "lazy.callers", "deferred.buf.format()", 0,
+                   "pkg/buf.lua", "buf.M.format", "Function", 2, "function M.format() end"),
+        SL_CALL_AT("write-through-a-factory-local", "lazy.lua", "lazy.callers", "first.only_first()",
+                   1, "lazy.lua", "lazy.first.only_first", "Function", 16,
+                   "function first.only_first() end"),
+        SL_CALL_AT("own-file-global", "lazy.lua", "lazy.callers", "global_api()", 1, "lazy.lua",
+                   "lazy.global_api", "Function", 20, "function global_api() end"),
+        SL_CALL_AT("mock-in-a-function-does-not-compete", "global_user.lua",
+                   "global_user.use_global", "global_api()", 0, "lazy.lua", "lazy.global_api",
+                   "Function", 20, "function global_api() end"),
+        SL_CALL_AT("local-function-inside-a-callback", "lazy.lua", "lazy.nested_caller",
+                   "nested_helper()", 1, "lazy.lua", "lazy.nested_helper", "Function", 36,
+                   "  local function nested_helper() end"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("lazy-module-outside-the-project", "lazy.lua", "lazy.no_proof",
+                   "lazy.absent.go()", 0),
+        SL_DENY_AT("field-the-annotation-does-not-name", "lazy.lua", "lazy.no_proof",
+                   "deferred.other.format()", 0),
+        SL_DENY_AT("write-through-the-other-factory-local", "lazy.lua", "lazy.no_proof",
+                   "first.only_second()", 0),
+    };
+    ASSERT(sl_check("lua-lazy", ".lua", "local filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* `@class C: A, B` states what a value it cannot compute holds, as neovim's test helper does with
+ * `M = vim.tbl_extend('error', M, t_global)`. One parent declaring the name selects it; two, or a
+ * parent the project has no table for, leave it open. `return a, b` gives `local x, y = f()` its y
+ * when every return agrees and no last call can give more. */
+static const char LUA_LATER_VALUES[] = "local merged = require('merged')\n"
+                                       "local open_parent = require('open_parent')\n"
+                                       "local generic = require('generic')\n"
+                                       "\n"
+                                       "local function pair()\n"
+                                       "  local function first_value() end\n"
+                                       "  local function second_value() end\n"
+                                       "  return first_value, second_value\n"
+                                       "end\n"
+                                       "\n"
+                                       "local function failing()\n"
+                                       "  local function failure_path_value() end\n"
+                                       "  if unknown_flag then\n"
+                                       "    return nil\n"
+                                       "  end\n"
+                                       "  return 1, failure_path_value\n"
+                                       "end\n"
+                                       "\n"
+                                       "local function disagree()\n"
+                                       "  local function a() end\n"
+                                       "  local function b() end\n"
+                                       "  if unknown_flag then\n"
+                                       "    return 1, a\n"
+                                       "  end\n"
+                                       "  return 1, b\n"
+                                       "end\n"
+                                       "\n"
+                                       "local function forwards()\n"
+                                       "  local function c() end\n"
+                                       "  local function third() end\n"
+                                       "  if unknown_flag then\n"
+                                       "    return c, nil, third\n"
+                                       "  end\n"
+                                       "  return c, pair()\n"
+                                       "end\n"
+                                       "\n"
+                                       "local one, two = pair()\n"
+                                       "local f1, f2 = failing()\n"
+                                       "local d1, d2 = disagree()\n"
+                                       "local g1, g2, g3 = forwards()\n"
+                                       "\n"
+                                       "local function callers()\n"
+                                       "  merged.base_fn()\n"
+                                       "  merged.extra_fn()\n"
+                                       "  merged.own_fn()\n"
+                                       "  generic.base_fn()\n"
+                                       "  two()\n"
+                                       "  f2()\n"
+                                       "  g2()\n"
+                                       "end\n"
+                                       "\n"
+                                       "local function no_proof()\n"
+                                       "  merged.both()\n"
+                                       "  open_parent.base_fn()\n"
+                                       "  d2()\n"
+                                       "  g3()\n"
+                                       "end\n";
+
+TEST(resolver_source_lua_class_parents_and_later_return_values) {
+    static const RQ_Source sources[] = {
+        {.path = "use.lua", .text = LUA_LATER_VALUES},
+        {.path = "base.lua",
+         .text = "--- @class base.mod\n"
+                 "local M = {}\n"
+                 "function M.base_fn() end\n"
+                 "function M.both() end\n"
+                 "return M\n"},
+        {.path = "extra.lua",
+         .text = "--- @class extra.mod\n"
+                 "local M = {}\n"
+                 "function M.extra_fn() end\n"
+                 "function M.both() end\n"
+                 "return M\n"},
+        {.path = "merged.lua",
+         .text = "local function own_fn() end\n"
+                 "--- @class merged.own\n"
+                 "local M = {\n"
+                 "  own_fn = own_fn,\n"
+                 "}\n"
+                 "--- @class merged.mod: merged.own, base.mod, extra.mod\n"
+                 "M = merge(M)\n"
+                 "return M\n"},
+        {.path = "open_parent.lua",
+         .text = "--- @class open.mod: base.mod, not.in.project\n"
+                 "local M = {}\n"
+                 "return M\n"},
+        {.path = "generic.lua",
+         .text = "--- @class (private, exact) gen.child<T, U> : base.mod\n"
+                 "local M = {}\n"
+                 "return M\n"},
+    };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("merged-module-first-parent", "use.lua", "use.callers", "merged.base_fn()", 0,
+                   "base.lua", "base.M.base_fn", "Function", 3, "function M.base_fn() end"),
+        SL_CALL_AT("merged-module-second-parent", "use.lua", "use.callers", "merged.extra_fn()", 0,
+                   "extra.lua", "extra.M.extra_fn", "Function", 3, "function M.extra_fn() end"),
+        SL_CALL_AT("class-table-the-write-replaced", "use.lua", "use.callers", "merged.own_fn()", 0,
+                   "merged.lua", "merged.own_fn", "Function", 1, "local function own_fn() end"),
+        SL_CALL_AT("parent-of-a-class-with-its-own-table", "use.lua", "use.callers",
+                   "generic.base_fn()", 0, "base.lua", "base.M.base_fn", "Function", 3,
+                   "function M.base_fn() end"),
+        SL_CALL_AT("second-return-value", "use.lua", "use.callers", "two()", 0, "use.lua",
+                   "second_value", "Function", 7, "  local function second_value() end"),
+        SL_CALL_AT("nil-failure-path-does-not-compete", "use.lua", "use.callers", "f2()", 0,
+                   "use.lua", "failure_path_value", "Function", 12,
+                   "  local function failure_path_value() end"),
+        SL_CALL_AT("call-in-last-place-gives-its-first", "use.lua", "use.callers", "g2()", 0,
+                   "use.lua", "first_value", "Function", 6, "  local function first_value() end"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("two-parents-declare-the-name", "use.lua", "use.no_proof", "merged.both()", 0),
+        SL_DENY_AT("parent-the-project-does-not-have", "use.lua", "use.no_proof",
+                   "open_parent.base_fn()", 0),
+        SL_DENY_AT("returns-disagree-on-the-position", "use.lua", "use.no_proof", "d2()", 0),
+        SL_DENY_AT("position-past-a-last-call", "use.lua", "use.no_proof", "g3()", 0),
+    };
+    ASSERT(sl_check("lua-later", ".lua", "local filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* The effects that once voided a whole file. None of them can rebind a local: `load` and
+ * `dofile` run elsewhere, and `_G.x = v` declares a global. What the manual says can change a
+ * binding does abstain: setfenv for free names, debug.setlocal for a local's value. */
+static const char LUA_EFFECTS[] = "local function target() return 1 end\n"
+                                  "debug.getregistry()\n"
+                                  "load('return nil')\n"
+                                  "rawset(_G, 'other', nil)\n"
+                                  "loadfile('unknown.lua')\n"
+                                  "dofile('unknown.lua')\n"
+                                  "loadstring('return nil')\n"
+                                  "local version = _G._VERSION\n"
+                                  "local function caller(...) goto done ::done:: return target() end\n"
+                                  "_G.declared = function() end\n"
+                                  "local function reads_g() return declared() end\n";
+static const char LUA_SETFENV[] = "function free_name() return 1 end\n"
+                                  "setfenv(1, {})\n"
+                                  "function caller_free() return free_name() end\n";
+static const char LUA_DEBUG[] = "local function f() return 1 end\n"
+                                "local g = f\n"
+                                "debug.setlocal(1, 1, nil)\n"
+                                "local function caller_debug() return g() end\n";
+
+TEST(resolver_source_lua_effects_that_can_change_a_binding) {
+    static const RQ_Source sources[] = {
+        {.path = "effects.lua", .text = LUA_EFFECTS},
+        {.path = "setfenv.lua", .text = LUA_SETFENV},
+        {.path = "writes_local.lua", .text = LUA_DEBUG},
+    };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("local-under-dynamic-effects", "effects.lua", "effects.caller", "target()", 1,
+                   "effects.lua", "effects.target", "Function", 1,
+                   "local function target() return 1 end"),
+        SL_CALL_AT("global-declared-through-G", "effects.lua", "effects.reads_g", "declared()", 0,
+                   "effects.lua", "effects._G.declared", "Function", 10,
+                   "_G.declared = function() end"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("setfenv-moves-free-names", "setfenv.lua", "setfenv.caller_free", "free_name()",
+                   0),
+        SL_DENY_AT("debug-setlocal-writes-locals", "writes_local.lua", "writes_local.caller_debug",
+                   "g()", 0),
+    };
+    ASSERT(sl_check("lua-effects", ".lua", "local filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── Vim script ────────────────────────────────────────────────────── */
+
+/* Forms from neovim's runtime and test/old/testdir. */
+static const char VIM_MAIN[] = "function! s:Local() abort\n"
+                               "  return 1\n"
+                               "endfunction\n"
+                               "function! s:Caller() abort\n"
+                               "  call s:Local()\n"
+                               "  call <SID>Local()\n"
+                               "  call foo#bar#baz(1)\n"
+                               "  call Global(2)\n"
+                               "  call Shared(3)\n"
+                               "  return 0\n"
+                               "endfunction\n"
+                               "function! Global(x) abort\n"
+                               "  return a:x\n"
+                               "endfunction\n"
+                               "function! s:NoProof(F) abort\n"
+                               "  call get(a:F, 'k')\n"
+                               "  call s:Missing()\n"
+                               "  call Both(1)\n"
+                               "  call Holder()\n"
+                               "  call a:F()\n"
+                               "  call wrong#place#fn()\n"
+                               "endfunction\n"
+                               "let Holder = function('Global')\n"
+                               "let s:dict = {}\n"
+                               "function s:dict.get() abort\n"
+                               "endfunction\n";
+static const char VIM_SHARED[] = "function! Shared(x) abort\n"
+                                 "  return a:x\n"
+                                 "endfunction\n"
+                                 "function! Both(x) abort\n"
+                                 "endfunction\n"
+                                 "function! Holder() abort\n"
+                                 "endfunction\n"
+                                 "function! s:Missing() abort\n"
+                                 "endfunction\n"
+                                 "function! wrong#place#fn() abort\n"
+                                 "endfunction\n";
+static const char VIM_OTHER[] = "function! Both(x) abort\n"
+                                "endfunction\n";
+static const char VIM_AUTOLOAD[] = "function! foo#bar#baz(x) abort\n"
+                                   "  return s:Inner(a:x)\n"
+                                   "endfunction\n"
+                                   "function! s:Inner(x) abort\n"
+                                   "  return a:x\n"
+                                   "endfunction\n";
+
+#define VIM_FILE "plugin/main.vim"
+#define VIM_CALL(id, text, at, tfile, tsuffix, tline, tdecl)                                   \
+    SL_CALL_AT(id, VIM_FILE, "main.s:Caller", text, at, tfile, tsuffix, "Function", tline, tdecl)
+#define VIM_DENY(id, text) SL_DENY_AT(id, VIM_FILE, "main.s:NoProof", text, 0)
+
+TEST(resolver_source_vim_name_prefixes_select_the_namespace) {
+    static const RQ_Source sources[] = {
+        {.path = VIM_FILE, .text = VIM_MAIN},
+        {.path = "plugin/shared.vim", .text = VIM_SHARED},
+        {.path = "plugin/other.vim", .text = VIM_OTHER},
+        {.path = "autoload/foo/bar.vim", .text = VIM_AUTOLOAD},
+    };
+    static const RQ_Expected expected[] = {
+        VIM_CALL("script-local", "s:Local()", 1, VIM_FILE, "main.s:Local", 1,
+                 "function! s:Local() abort"),
+        VIM_CALL("sid-spelling", "<SID>Local()", 0, VIM_FILE, "main.s:Local", 1,
+                 "function! s:Local() abort"),
+        VIM_CALL("autoload-path", "foo#bar#baz(1)", 0, "autoload/foo/bar.vim", "bar.foo#bar#baz", 1,
+                 "function! foo#bar#baz(x) abort"),
+        VIM_CALL("global-of-this-file", "Global(2)", 0, VIM_FILE, "main.Global", 12,
+                 "function! Global(x) abort"),
+        VIM_CALL("global-of-one-other-file", "Shared(3)", 0, "plugin/shared.vim", "shared.Shared", 1,
+                 "function! Shared(x) abort"),
+        SL_CALL_AT("script-local-of-an-autoload-file", "autoload/foo/bar.vim", "bar.foo#bar#baz",
+                   "s:Inner(a:x)", 0, "autoload/foo/bar.vim", "bar.s:Inner", "Function", 4,
+                   "function! s:Inner(x) abort"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        VIM_DENY("lower-case-is-a-builtin-not-a-dict-function", "get(a:F, 'k')"),
+        VIM_DENY("script-local-of-another-file", "s:Missing()"),
+        VIM_DENY("global-two-files-declare", "Both(1)"),
+        VIM_DENY("name-assigned-a-funcref", "Holder()"),
+        VIM_DENY("parameter-funcref", "a:F()"),
+        VIM_DENY("autoload-name-outside-its-path", "wrong#place#fn()"),
+    };
+    ASSERT(sl_check("vim-rules", ".vim", "let g:filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── Tcl ───────────────────────────────────────────────────────────── */
+
+/* Forms from redis's tests. `expr` syntax is a parse error in this grammar, and is in most files. */
+static const char TCL_MAIN[] = "proc local_proc {a} {\n"
+                               "    return $a\n"
+                               "}\n"
+                               "proc caller {} {\n"
+                               "    local_proc 1\n"
+                               "    wait_for_it 2\n"
+                               "    set x [wait_for_it 3]\n"
+                               "    harness_proc 31\n"
+                               "    return [expr ($x+1) / 2]\n"
+                               "}\n"
+                               "proc no_proof {} {\n"
+                               "    both 4\n"
+                               "    standalone_only 5\n"
+                               "    puts 6\n"
+                               "    $computed 7\n"
+                               "    renamed 8\n"
+                               "}\n"
+                               "namespace eval ns {\n"
+                               "    proc outer {} {\n"
+                               "        sibling 9\n"
+                               "        wait_for_it 10\n"
+                               "    }\n"
+                               "    proc sibling {x} {\n"
+                               "        return $x\n"
+                               "    }\n"
+                               "}\n";
+static const char TCL_HELPER[] = "source tests/support/util.tcl\n"
+                                 "source tests/support/other.tcl\n"
+                                 "proc harness_proc {x} {\n"
+                                 "}\n"
+                                 "proc run_test {name} {\n"
+                                 "    source tests/$name.tcl\n"
+                                 "}\n";
+static const char TCL_UTIL[] = "proc wait_for_it {x} {\n"
+                               "    return $x\n"
+                               "}\n"
+                               "proc both {} {\n"
+                               "}\n"
+                               "proc renamed {x} {\n"
+                               "}\n"
+                               "rename renamed hidden\n";
+static const char TCL_OTHER[] = "proc both {} {\n"
+                                "}\n";
+static const char TCL_STANDALONE[] = "proc standalone_only {x} {\n"
+                                     "}\n";
+
+#define TCL_FILE "tests/unit/main.tcl"
+#define TCL_DENY(id, text) SL_DENY_AT(id, TCL_FILE, "main.no_proof", text, 0)
+
+TEST(resolver_source_tcl_procs_and_shared_interpreter) {
+    static const RQ_Source sources[] = {
+        {.path = TCL_FILE, .text = TCL_MAIN},
+        {.path = "tests/helper.tcl", .text = TCL_HELPER},
+        {.path = "tests/support/util.tcl", .text = TCL_UTIL},
+        {.path = "tests/support/other.tcl", .text = TCL_OTHER},
+        {.path = "tools/standalone.tcl", .text = TCL_STANDALONE},
+    };
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("proc-of-this-script", TCL_FILE, "main.caller", "local_proc 1", 0, TCL_FILE,
+                   "main.local_proc", "Function", 1, "proc local_proc {a} {"),
+        SL_CALL_AT("proc-of-a-sourced-file", TCL_FILE, "main.caller", "wait_for_it 2", 0,
+                   "tests/support/util.tcl", "util.wait_for_it", "Function", 1,
+                   "proc wait_for_it {x} {"),
+        SL_CALL_AT("command-substitution", TCL_FILE, "main.caller", "wait_for_it 3", 0,
+                   "tests/support/util.tcl", "util.wait_for_it", "Function", 1,
+                   "proc wait_for_it {x} {"),
+        SL_CALL_AT("proc-of-the-harness-that-loads-it", TCL_FILE, "main.caller", "harness_proc 31", 0,
+                   "tests/helper.tcl", "helper.harness_proc", "Function", 3,
+                   "proc harness_proc {x} {"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        TCL_DENY("two-sourced-files-declare-it", "both 4"),
+        TCL_DENY("file-nothing-sources", "standalone_only 5"),
+        TCL_DENY("builtin-command", "puts 6"),
+        TCL_DENY("computed-command", "$computed 7"),
+        TCL_DENY("renamed-proc", "renamed 8"),
+    };
+    ASSERT(sl_check("tcl-rules", ".tcl", "set filler 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── Shell ─────────────────────────────────────────────────────────── */
+
+static const char SH_MAIN[] = "#!/bin/bash\n"
+                              "source \"$(dirname \"$0\")/lib.sh\"\n"
+                              "source scripts/literal.sh\n"
+                              "ROOT=$(dirname \"${BASH_SOURCE[0]}\")/..\n"
+                              "source \"${ROOT}/hack/init.sh\"\n"
+                              "early\n"
+                              "helper() {\n"
+                              "  later 1\n"
+                              "  lib_fn 2\n"
+                              "  literal_fn 3\n"
+                              "  init_fn 31\n"
+                              "}\n"
+                              "later() {\n"
+                              "  helper 4\n"
+                              "}\n"
+                              "early() {\n"
+                              "  :\n"
+                              "}\n"
+                              "no_proof() {\n"
+                              "  other_script_fn 5\n"
+                              "  gone 6\n"
+                              "  $computed 7\n"
+                              "  command later 8\n"
+                              "}\n"
+                              "gone() {\n"
+                              "  :\n"
+                              "}\n"
+                              "unset -f gone\n"
+                              "early 9\n"
+                              "TOP_LEVEL=1\n"
+                              "reads() {\n"
+                              "  echo \"$TOP_LEVEL\"\n"
+                              "}\n"
+                              "SHADOWED=1\n"
+                              "reads_local() {\n"
+                              "  local SHADOWED=2\n"
+                              "  echo \"$SHADOWED\"\n"
+                              "}\n";
+static const char SH_LIB[] = "lib_fn() {\n"
+                             "  :\n"
+                             "}\n";
+static const char SH_INIT[] = "init_fn() {\n"
+                              "  :\n"
+                              "}\n";
+static const char SH_LITERAL[] = "literal_fn() {\n"
+                                 "  :\n"
+                                 "}\n";
+static const char SH_OTHER[] = "other_script_fn() {\n"
+                               "  :\n"
+                               "}\n"
+                               "lib_fn() {\n"
+                               "  :\n"
+                               "}\n";
+
+#define SH_FILE "scripts/main.sh"
+
+TEST(resolver_source_shell_function_table_of_one_process) {
+    static const RQ_Source sources[] = {
+        {.path = SH_FILE, .text = SH_MAIN},
+        {.path = "scripts/lib.sh", .text = SH_LIB},
+        {.path = "scripts/literal.sh", .text = SH_LITERAL},
+        {.path = "hack/init.sh", .text = SH_INIT},
+        {.path = "tools/other.sh", .text = SH_OTHER},
+    };
+    static const RQ_Expected expected[] = {
+        SL_USE_AT("variable-of-this-file", SH_FILE, "main.reads", "TOP_LEVEL", 1, SH_FILE,
+                  "main.TOP_LEVEL", "Variable", 30, "TOP_LEVEL=1"),
+        SL_CALL_AT("body-calls-a-later-definition", SH_FILE, "main.helper", "later 1", 0, SH_FILE,
+                   "main.later", "Function", 13, "later() {"),
+        SL_CALL_AT("sourced-through-the-scripts-directory", SH_FILE, "main.helper", "lib_fn 2", 0,
+                   "scripts/lib.sh", "lib.lib_fn", "Function", 1, "lib_fn() {"),
+        SL_CALL_AT("sourced-by-a-literal-path", SH_FILE, "main.helper", "literal_fn 3", 0,
+                   "scripts/literal.sh", "literal.literal_fn", "Function", 1, "literal_fn() {"),
+        SL_CALL_AT("top-level-after-the-definition", SH_FILE, "main", "early 9", 0, SH_FILE,
+                   "main.early", "Function", 16, "early() {"),
+        SL_CALL_AT("sourced-through-a-variable-naming-a-directory", SH_FILE, "main.helper",
+                   "init_fn 31", 0, "hack/init.sh", "init.init_fn", "Function", 1, "init_fn() {"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_NO_USE_AT("name-a-function-makes-local", SH_FILE, "main.reads_local", "SHADOWED", 2),
+        SL_DENY_AT("top-level-before-the-definition", SH_FILE, "main", "early\n", 0),
+        SL_DENY_AT("another-script-is-another-process", SH_FILE, "main.no_proof",
+                   "other_script_fn 5", 0),
+        SL_DENY_AT("unset-function", SH_FILE, "main.no_proof", "gone 6", 0),
+        SL_DENY_AT("computed-command", SH_FILE, "main.no_proof", "$computed 7", 0),
+        SL_DENY_AT("command-builtin-skips-the-table", SH_FILE, "main.no_proof", "command later 8",
+                   0),
+    };
+    ASSERT(sl_check("shell-rules", ".sh", "filler=1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── Make ──────────────────────────────────────────────────────────── */
+
+/* From redis's deps/lua/Makefile. */
+static const char MAKE_MAIN[] = "INSTALL_TOP= /usr/local\n"
+                                "INSTALL_BIN= $(INSTALL_TOP)/bin\n"
+                                "FROM_ENV_COPY= $(FROM_ENV)\n"
+                                "COMPUTED= $($(INSTALL_TOP)_FLAGS)\n"
+                                "SIBLING= sibling-only\n";
+
+TEST(resolver_source_make_variables_of_the_file) {
+    static const RQ_Source sources[] = {
+        {.path = "deps/Makefile", .text = MAKE_MAIN},
+        {.path = "other/Makefile", .text = "FROM_ENV= elsewhere\n"},
+    };
+    static const RQ_Expected expected[] = {
+        SL_USE_AT("variable-assigned-in-this-file", "deps/Makefile", "Makefile",
+                  "$(INSTALL_TOP)", 0, "deps/Makefile", "Makefile.INSTALL_TOP", "Variable", 1,
+                  "INSTALL_TOP= /usr/local"),
+        SL_USE_AT("read-inside-a-computed-name", "deps/Makefile", "Makefile", "$(INSTALL_TOP)", 1,
+                  "deps/Makefile", "Makefile.INSTALL_TOP", "Variable", 1,
+                  "INSTALL_TOP= /usr/local"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_NO_USE_AT("variable-of-another-makefile", "deps/Makefile", "Makefile",
+                     "$(FROM_ENV)", 0),
+    };
+    ASSERT(sl_check("make-rules", ".mk", "FILLER= 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+/* ── Vue ───────────────────────────────────────────────────────────── */
+
+/* koel's SFC: the template's directives, the style block and the two scripts do not stop the
+ * script from being a module, and a member of an exported object literal is selected across
+ * files by the rule the literal's own file uses. */
+/* A composable's `return { a }`, as Vue and React code read it: `const { a } = useThing()`.
+ * Every return must agree, a spread takes what is before it, and what is not a function of this
+ * project selects nothing. */
+static const char COMPOSABLE[] = "const outside = () => {}\n"
+                                 "export const useThing = () => {\n"
+                                 "  const open = () => {}\n"
+                                 "  function declared() {}\n"
+                                 "  let written = () => {}\n"
+                                 "  written = () => {}\n"
+                                 "  return {\n"
+                                 "    open,\n"
+                                 "    declared,\n"
+                                 "    renamed: open,\n"
+                                 "    written,\n"
+                                 "    outside,\n"
+                                 "    inline: () => {},\n"
+                                 "    computed: open.bind(null),\n"
+                                 "  }\n"
+                                 "}\n"
+                                 "export function useSpread() {\n"
+                                 "  const before = () => {}\n"
+                                 "  const after = () => {}\n"
+                                 "  return { before, ...other(), after }\n"
+                                 "}\n"
+                                 "export function useTwoReturns(flag) {\n"
+                                 "  const one = () => {}\n"
+                                 "  const two = () => {}\n"
+                                 "  const same = () => {}\n"
+                                 "  if (flag) return { picked: one, same }\n"
+                                 "  return { picked: two, same }\n"
+                                 "}\n"
+                                 "export function useValue() {\n"
+                                 "  const hidden = () => {}\n"
+                                 "  if (other()) return { hidden }\n"
+                                 "  return makeObject()\n"
+                                 "}\n"
+                                 "export const useExpression = () => ({ made: outside })\n";
+
+static const char COMPOSABLE_USER[] =
+    "<script setup>\n"
+    "import { useThing, useSpread, useTwoReturns, useValue, useExpression } from './composable'\n"
+    "const { open, declared, renamed, written, outside, inline, computed } = useThing()\n"
+    "const { open: alias } = useThing()\n"
+    "const { before, after } = useSpread()\n"
+    "const { picked, same } = useTwoReturns(true)\n"
+    "const { hidden } = useValue()\n"
+    "const { made } = useExpression()\n"
+    "let { open: reassigned } = useThing()\n"
+    "const { open: defaulted = () => {} } = useThing()\n"
+    "const { renamed: { declared: nested_member } } = useThing()\n"
+    "\n"
+    "function calls() {\n"
+    "  open()\n"
+    "  declared()\n"
+    "  renamed()\n"
+    "  outside()\n"
+    "  inline()\n"
+    "  alias()\n"
+    "  after()\n"
+    "  same()\n"
+    "  made()\n"
+    "}\n"
+    "\n"
+    "function no_proof(parameter) {\n"
+    "  written()\n"
+    "  computed()\n"
+    "  before()\n"
+    "  picked()\n"
+    "  hidden()\n"
+    "  reassigned()\n"
+    "  defaulted()\n"
+    "  nested_member()\n"
+    "}\n"
+    "\n"
+    "function shadowed(open) {\n"
+    "  open()\n"
+    "}\n"
+    "\n"
+    "function nested() {\n"
+    "  const { open: inner } = useThing()\n"
+    "  inner()\n"
+    "}\n"
+    "</script>\n";
+
+TEST(resolver_source_vue_composable_return_selects_the_member) {
+    static const RQ_Source sources[] = {
+        {.path = "src/composable.ts", .text = COMPOSABLE},
+        {.path = "src/Main.vue", .text = COMPOSABLE_USER},
+    };
+#define COMPOSABLE_USER_FILE "src/Main.vue"
+#define COMPOSABLE_FILE "src/composable.ts"
+    static const RQ_Expected expected[] = {
+        SL_CALL_AT("shorthand-of-a-local-function", COMPOSABLE_USER_FILE, "Main.calls", "open()", 0,
+                   COMPOSABLE_FILE, "open", "Function", 3, "  const open = () => {}"),
+        SL_CALL_AT("shorthand-of-a-declaration", COMPOSABLE_USER_FILE, "Main.calls", "declared()", 0,
+                   COMPOSABLE_FILE, "declared", "Function", 4, "  function declared() {}"),
+        SL_CALL_AT("renamed-member", COMPOSABLE_USER_FILE, "Main.calls", "renamed()", 0,
+                   COMPOSABLE_FILE, "open", "Function", 3, "  const open = () => {}"),
+        SL_CALL_AT("module-level-function-returned", COMPOSABLE_USER_FILE, "Main.calls", "outside()",
+                   0, COMPOSABLE_FILE, "outside", "Function", 1, "const outside = () => {}"),
+        SL_CALL_AT("inline-function-member", COMPOSABLE_USER_FILE, "Main.calls", "inline()", 0,
+                   COMPOSABLE_FILE, "inline", "Function", 13, "    inline: () => {},"),
+        SL_CALL_AT("pattern-renames-the-local", COMPOSABLE_USER_FILE, "Main.calls", "alias()", 0,
+                   COMPOSABLE_FILE, "open", "Function", 3, "  const open = () => {}"),
+        SL_CALL_AT("after-a-spread-is-the-literals", COMPOSABLE_USER_FILE, "Main.calls", "after()",
+                   0, COMPOSABLE_FILE, "after", "Function", 19, "  const after = () => {}"),
+        SL_CALL_AT("every-return-agrees", COMPOSABLE_USER_FILE, "Main.calls", "same()", 0,
+                   COMPOSABLE_FILE, "same", "Function", 25, "  const same = () => {}"),
+        SL_CALL_AT("expression-body-object", COMPOSABLE_USER_FILE, "Main.calls", "made()", 0,
+                   COMPOSABLE_FILE, "outside", "Function", 1, "const outside = () => {}"),
+        SL_CALL_AT("function-level-destructure", COMPOSABLE_USER_FILE, "Main.nested", "inner()", 0,
+                   COMPOSABLE_FILE, "open", "Function", 3, "  const open = () => {}"),
+        SL_CALL_AT("the-composable-itself", COMPOSABLE_USER_FILE, "Main.nested", "useThing()", 5,
+                   COMPOSABLE_FILE, "useThing", "Function", 2, "export const useThing = () => {"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_DENY_AT("returned-local-is-written", COMPOSABLE_USER_FILE, "Main.no_proof", "written()",
+                   0),
+        SL_DENY_AT("member-value-is-computed", COMPOSABLE_USER_FILE, "Main.no_proof", "computed()",
+                   0),
+        SL_DENY_AT("spread-can-replace-what-is-before-it", COMPOSABLE_USER_FILE, "Main.no_proof",
+                   "before()", 0),
+        SL_DENY_AT("returns-disagree", COMPOSABLE_USER_FILE, "Main.no_proof", "picked()", 0),
+        SL_DENY_AT("another-return-is-not-an-object", COMPOSABLE_USER_FILE, "Main.no_proof",
+                   "hidden()", 0),
+        SL_DENY_AT("let-can-be-written", COMPOSABLE_USER_FILE, "Main.no_proof", "reassigned()", 0),
+        SL_DENY_AT("default-can-be-the-value", COMPOSABLE_USER_FILE, "Main.no_proof", "defaulted()",
+                   0),
+        SL_DENY_AT("nested-pattern-is-a-member-of-the-member", COMPOSABLE_USER_FILE, "Main.no_proof",
+                   "nested_member()", 0),
+        SL_DENY_AT("parameter-shadows-the-destructured-const", COMPOSABLE_USER_FILE, "Main.shadowed",
+                   "open()", 1),
+    };
+    ASSERT(sl_check("vue-composable", ".vue", "<script>const filler = 1</script>\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
+static const char VUE_SERVICE[] = "export const authService = {\n"
+                                  "  login() {\n"
+                                  "    return 1\n"
+                                  "  },\n"
+                                  "  logout: () => 2,\n"
+                                  "}\n"
+                                  "\n"
+                                  "export const written = {\n"
+                                  "  replaced() {},\n"
+                                  "}\n"
+                                  "written.replaced = () => 3\n"
+                                  "\n"
+                                  "export function plain() {}\n"
+                                  "\n"
+                                  "const base = {}\n"
+                                  "export const spreadFirst = {\n"
+                                  "  ...base,\n"
+                                  "  first() {},\n"
+                                  "}\n"
+                                  "export const spreadLast = {\n"
+                                  "  last() {},\n"
+                                  "  ...base,\n"
+                                  "}\n";
+static const char VUE_MAIN[] = "<template>\n"
+                               "  <BaseCard v-if=\"ready\" :title=\"`x`\" @click.prevent=\"go\">\n"
+                               "    {{ go() }}\n"
+                               "  </BaseCard>\n"
+                               "</template>\n"
+                               "\n"
+                               "<script lang=\"ts\">\n"
+                               "export const sharedConstant = 1\n"
+                               "</script>\n"
+                               "\n"
+                               "<script setup lang=\"ts\" generic=\"T\">\n"
+                               "import { authService, written, plain, spreadFirst, spreadLast } "
+                               "from './service'\n"
+                               "\n"
+                               "const { podcast } = defineProps<{ podcast: T }>()\n"
+                               "const ready = true\n"
+                               "function helper() {}\n"
+                               "const reads = () => podcast\n"
+                               "const reads_parameter = (podcast) => podcast\n"
+                               "const go = () => {\n"
+                               "  plain()\n"
+                               "  helper()\n"
+                               "  authService.login()\n"
+                               "  authService.logout()\n"
+                               "  authService.missing()\n"
+                               "  written.replaced()\n"
+                               "  spreadFirst.first()\n"
+                               "  spreadLast.last()\n"
+                               "  return sharedConstant\n"
+                               "}\n"
+                               "</script>\n"
+                               "\n"
+                               "<style scoped>\n"
+                               ".a { color: red; }\n"
+                               "</style>\n";
+
+#define VUE_FILE "src/Main.vue"
+
+TEST(resolver_source_vue_script_reaches_the_ecma_resolver) {
+    static const RQ_Source sources[] = {
+        {.path = VUE_FILE, .text = VUE_MAIN},
+        {.path = "src/service.ts", .text = VUE_SERVICE},
+    };
+    static const RQ_Expected expected[] = {
+        SL_USE_AT("read-of-a-destructured-const", VUE_FILE, "Main.reads", "podcast", 2, VUE_FILE,
+                  "Main.podcast", "Variable", 14,
+                  "const { podcast } = defineProps<{ podcast: T }>()"),
+        SL_CALL_AT("imported-function", VUE_FILE, "Main.go", "plain()", 0, "src/service.ts",
+                   "service.plain", "Function", 13, "export function plain() {}"),
+        SL_CALL_AT("function-of-the-script", VUE_FILE, "Main.go", "helper()", 1, VUE_FILE,
+                   "Main.helper", "Function", 16, "function helper() {}"),
+        SL_CALL_AT("method-of-an-exported-literal", VUE_FILE, "Main.go", "authService.login()", 0,
+                   "src/service.ts", "service.login", "Function", 2, "  login() {"),
+        SL_CALL_AT("member-after-a-spread-is-the-literals", VUE_FILE, "Main.go", "spreadFirst.first()",
+                   0, "src/service.ts", "service.first", "Function", 18, "  first() {},"),
+        SL_CALL_AT("arrow-of-an-exported-literal", VUE_FILE, "Main.go", "authService.logout()", 0,
+                   "src/service.ts", "service.logout", "Function", 5, "  logout: () => 2,"),
+    };
+    static const RQ_Forbidden forbidden[] = {
+        SL_NO_USE_AT("parameter-is-not-the-destructured-const", VUE_FILE, "Main.reads_parameter",
+                     "podcast", 4),
+        SL_DENY_AT("member-the-literal-does-not-have", VUE_FILE, "Main.go",
+                   "authService.missing()", 0),
+        SL_DENY_AT("member-of-a-written-literal", VUE_FILE, "Main.go", "written.replaced()", 0),
+        SL_DENY_AT("spread-can-replace-what-is-before-it", VUE_FILE, "Main.go", "spreadLast.last()", 0),
+    };
+    ASSERT(sl_check("vue-rules", ".ts", "export const filler = 1\n", sources,
+                    sizeof(sources) / sizeof(sources[0]), expected,
+                    sizeof(expected) / sizeof(expected[0]), forbidden,
+                    sizeof(forbidden) / sizeof(forbidden[0])));
+    PASS();
+}
+
 SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_elixir_modules_aliases_imports_and_arity);
     RUN_TEST(resolver_source_erlang_module_arity_export_and_import);
@@ -5245,4 +6423,15 @@ SUITE(resolver_source_langs) {
     RUN_TEST(resolver_source_scala_packages_precedence_and_receivers);
     RUN_TEST(resolver_source_haskell_imports_and_scope);
     RUN_TEST(resolver_source_ocaml_sequential_scope_and_modules);
+    RUN_TEST(resolver_source_lua_values_modules_and_scope);
+    RUN_TEST(resolver_source_lua_effects_that_can_change_a_binding);
+    RUN_TEST(resolver_source_lua_annotations_state_what_a_value_cannot);
+    RUN_TEST(resolver_source_lua_lazy_modules_factories_and_nested_functions);
+    RUN_TEST(resolver_source_lua_class_parents_and_later_return_values);
+    RUN_TEST(resolver_source_vim_name_prefixes_select_the_namespace);
+    RUN_TEST(resolver_source_tcl_procs_and_shared_interpreter);
+    RUN_TEST(resolver_source_shell_function_table_of_one_process);
+    RUN_TEST(resolver_source_make_variables_of_the_file);
+    RUN_TEST(resolver_source_vue_script_reaches_the_ecma_resolver);
+    RUN_TEST(resolver_source_vue_composable_return_selects_the_member);
 }

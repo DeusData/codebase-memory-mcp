@@ -96,6 +96,9 @@ typedef struct {
     /* optional: collects a file whose tree is unusable, when the adapter has another way to
      * read it. It sets walk->failure when it has none. */
     cbm_source_pass_fn collect_unusable;
+    /* A parse error costs this language only the commands inside it: no binding depends on
+     * the structure around an error, so the rest of the file still decides. */
+    bool parse_errors_are_local;
 } cbm_source_adapter_t;
 
 /* Per-language rule tables. A row here is what makes a language supported. */
@@ -110,6 +113,11 @@ extern const cbm_source_adapter_t cbm_source_adapter_ocaml;
 extern const cbm_source_adapter_t cbm_source_adapter_dart;
 extern const cbm_source_adapter_t cbm_source_adapter_swift;
 extern const cbm_source_adapter_t cbm_source_adapter_scala;
+extern const cbm_source_adapter_t cbm_source_adapter_lua;
+extern const cbm_source_adapter_t cbm_source_adapter_vim;
+extern const cbm_source_adapter_t cbm_source_adapter_shell;
+extern const cbm_source_adapter_t cbm_source_adapter_tcl;
+extern const cbm_source_adapter_t cbm_source_adapter_make;
 
 /* One walk of a class chain. A class appears once on a linearized chain, so a
  * revisit adds nothing: a cycle or a diamond cannot make the walk exponential. */
@@ -157,6 +165,12 @@ const char *cbm_source_def_qn(cbm_source_walk_t *walk, const char *name, uint32_
 const char *cbm_source_def_qn_of_name(cbm_source_walk_t *walk, const char *name);
 const char *cbm_source_def_qn_label(cbm_source_walk_t *walk, const char *name, uint32_t line,
                                     const char *label);
+/* The definition of this name that starts on exactly this line. For a language whose inner
+ * declaration may have no node of its own, where the enclosing one's span would also match. */
+const char *cbm_source_def_qn_at(cbm_source_walk_t *walk, const char *name, uint32_t line);
+
+/* directory/relative with `.` and `..` collapsed. False when it climbs above the repository. */
+bool cbm_source_join_path(const char *directory, const char *relative, char *out, size_t capacity);
 
 /* Phase one. Copies everything into the table; returns NULL on allocation failure. */
 cbm_source_decl_t *cbm_source_declare(cbm_source_walk_t *walk, const char *owner, const char *name,

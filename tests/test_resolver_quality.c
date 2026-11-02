@@ -35,15 +35,10 @@ static const quality_case_t QUALITY_CASES[] = {
     {"Rust", "main.rs", "actual.rs", "decoy.rs",
      "mod actual;\nuse crate::actual::target;\nfn caller() { target(); }\nfn main() {}\n",
      "pub fn target() {}\n", "pub fn target() {}\n", true, NULL, NULL},
-    /* WHY: Lua require result/export-table binding has no proof adapter.
-     * TRIED: explicit local require plus a named function in a literal table;
-     * scope-only binding cannot prove the cross-file returned member. */
     {"Lua", "main.lua", "actual.lua", "decoy.lua",
      "local actual = require('actual')\nlocal function caller() actual.target() end\n",
      "local function target() end\nreturn {target=target}\n",
-     "local function target() end\nreturn {target=target}\n", false,
-     "require return-table member binding unimplemented",
-     "explicit local require and literal returned table"},
+     "local function target() end\nreturn {target=target}\n", true, NULL, NULL},
     /* WHY: Perl's legacy engine has no cross-file proof bridge.
      * TRIED: a literal require of a file declaring a main-package sub, with
      * repository-root cwd as the fixture's execution context. */
