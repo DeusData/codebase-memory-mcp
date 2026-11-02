@@ -708,11 +708,15 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
 
 /* Fetch all CALLS edges among Function/Method nodes for a project as parallel
- * (source_id, target_id) arrays (caller frees both). For SCC / cycle analysis.
+ * (source_id, target_id) arrays, released together with
+ * cbm_store_free_call_edges. For SCC / cycle analysis.
  * Stops at max_edges and sets *truncated — never a silent cap. Returns
  * CBM_STORE_OK (or _ERR); *count is the number returned. */
 int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
                                int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated);
+
+/* Free the (source_id, target_id) arrays returned by cbm_store_fetch_call_edges. */
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
@@ -769,7 +773,9 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
- * "oversized" = not indexed at all (detail = reason). Stored in the separate
+ * "oversized" = not indexed at all (detail = reason). "unresolved_calls" is
+ * indexed source whose invocation targets were not resolved (detail = JSON
+ * array of caller, leaf, source byte span, and reason). Stored in the separate
  * index_coverage table — coverage is metadata ABOUT the graph, never mixed
  * into the graph itself. */
 typedef struct {
@@ -778,9 +784,15 @@ typedef struct {
     const char *detail;
 } cbm_coverage_row_t;
 
+/* Older generations lack precise caller attribution and resolver candidates,
+ * so their exact trace totals cannot be trusted until the project is reindexed. */
+enum { CBM_UNRESOLVED_CALL_COVERAGE_VERSION = 5 };
+
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or
  * "unavailable"; it is deliberately separate from hash_records_complete.
+ * unresolved_calls_complete describes only unresolved invocation capture;
+ * false keeps CALLS totals conservative without voiding other coverage.
  * Strings returned by cbm_store_coverage_meta_get are heap-owned. */
 typedef struct {
     const char *project;
@@ -792,6 +804,7 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
+    bool unresolved_calls_complete;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for
@@ -820,6 +833,14 @@ int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char 
  * ancestor that covers the scope. Prefix matching is segment-boundary safe. */
 int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
                                  cbm_coverage_row_t **out, int *count);
+/* Fetch bounded unresolved invocation diagnostics for one exact caller file. */
+int cbm_store_coverage_get_unresolved_path(cbm_store_t *s, const char *project,
+                                           const char *rel_path, cbm_coverage_row_t **out,
+                                           int *count);
+/* Indexed candidate existence; truncated/malformed evidence also returns true
+ * because omitted candidates cannot prove an exact inbound total. */
+int cbm_store_coverage_has_unresolved_candidate(cbm_store_t *s, const char *project,
+                                                const char *candidate, bool *out);
 
 /* Fetch/free the metadata paired with the current coverage row set. */
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);
@@ -843,10 +864,11 @@ int cbm_store_observed_lookup(cbm_store_t *s, const char *project, const char *c
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
- * cbm_store_coverage_replace materializes the coverage rows as a file-
+ * cbm_store_coverage_replace materializes the coverage FAILURE rows as a file-
  * structure graph (Project → Folder → File{kind, detail}) under this project
  * name — queryable via the normal cypher path without touching the real
- * project's graph. */
+ * project's graph. By-design not_indexed_* rows and unresolved_calls evidence
+ * stay out of it. */
 void cbm_store_coverage_shadow_project(char *dst, size_t dstsz, const char *project);
 
 void cbm_store_free_coverage(cbm_coverage_row_t *rows, int count);
@@ -1141,6 +1163,17 @@ typedef struct {
 
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content);
 int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out);
+/* Move any legacy ADR row from the graph DB's project_summaries into the
+ * per-project sidecar, once (guarded by a marker in the sidecar). Call before a
+ * rebuild deletes the old generation, and on artifact import. Returns
+ * CBM_STORE_ERR on failure so callers can preserve the old generation. */
+int cbm_store_adr_migrate_once(cbm_store_t *s);
+/* Restore ADRs from the graph DB's project_summaries into the per-project sidecar
+ * for any project the sidecar has no row for, without overwriting a local one and
+ * regardless of the migrated marker. Used on artifact import so a teammate who
+ * already indexed the project (marked sidecar, no ADR) still receives the shared
+ * ADR the artifact carries. Returns CBM_STORE_ERR on failure. */
+int cbm_store_adr_restore_from_graph_if_absent(cbm_store_t *s);
 int cbm_store_adr_delete(cbm_store_t *s, const char *project);
 int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const char **keys,
                                   const char **values, int count, cbm_adr_t *out);
@@ -1288,13 +1321,16 @@ typedef struct {
  * reported community is internally connected. The resolution parameter
  * controls granularity (higher -> more, smaller communities); 1.0 is standard.
  * Allocates *out (length *out_count == node_count) in CBM_MEM_CLASS_OTHER;
- * the caller releases it with cbm_free(CBM_MEM_CLASS_OTHER, *out). */
+ * the caller releases it with cbm_leiden_free(*out). */
 int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
 
 /* Convenience wrapper: cbm_leiden with resolution 1.0. */
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count);
+
+/* Free the result array returned by cbm_leiden / cbm_louvain. */
+void cbm_leiden_free(cbm_louvain_result_t *result);
 
 /* ── Memory management helpers ──────────────────────────────────── */
 

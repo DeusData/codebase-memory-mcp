@@ -1245,17 +1245,75 @@ TEST(go_bare_ref_never_binds_field) {
      * trailing name; is_reference_node records the inner field_identifier),
      * so the selector-vs-bare distinction arrives as the recorded
      * is_member_access signal, never as a dot in the reference text. */
-    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, false, "Field"));
+    ASSERT_TRUE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, "Field"));
     /* The member half of a selector may bind a field. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, true, "Field"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, true, "Field"));
     /* Bare references to non-fields are untouched. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Variable"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Function"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, "Variable"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, "Function"));
     /* Other languages reference their own members bare inside methods —
      * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_CSHARP, false, "Field"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_JAVA, false, "Field"));
     /* Degenerate input → nothing to judge. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_GO, false, NULL));
+    PASS();
+}
+
+TEST(go_bare_init_never_binds_init_namesake) {
+    /* Go cannot refer to a package init function, and a method or field
+     * named init needs a selector, so a bare `init` (a closure, a parameter,
+     * a `package init` clause) is always a local name. */
+    /* Every Go Function named init is a package init: refused for every
+     * registry strategy, same_module included (the pre-#1915 binding). */
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "same_module", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "import_map", "Function"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", NULL, "Function"));
+    /* A Method or Field namesake found by the name alone is refused. */
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Method"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "unique_name", "Method"));
+    ASSERT_TRUE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Field"));
+    /* ... but not one that an import- or module-aware strategy produced. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "same_module", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "import_map", "Method"));
+    /* lsp_* answers are kept: the sequential resolver emits them before its
+     * registry guards run, so refusing one here would split the resolvers. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "lsp_direct", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "lsp_direct", "Method"));
+    /* The member half of a selector (`w.init()`, `e.init`) is not bare. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, true, "init", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, true, "init", "suffix_match", "Field"));
+    /* Other names and other target kinds are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "initAll", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "Init", "suffix_match", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", "Module"));
+    /* Go only: elsewhere a bare `init()` is an ordinary call (a Java or C++
+     * method body calls its own init, a C or Python init is a function). */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(false, false, "init", "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(false, false, "init", "same_module", "Function"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, NULL, "suffix_match", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_init_bind(true, false, "init", "suffix_match", NULL));
+    PASS();
+}
+
+TEST(c_bare_ref_never_binds_field) {
+    /* #2666: a C struct member is named only as the member half of `a.b`,
+     * `a->b` or a designator `.b` (field_identifier → is_member_access). A
+     * bare C identifier — a macro argument like RUN_SELECTED_SUITE(mcp) — is
+     * never one, so it must not bind a same-named Field. */
+    ASSERT_TRUE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Field"));
+    /* The member half still binds (through the C owner rows upstream). */
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, true, "Field"));
+    /* A bare C name keeps binding globals, functions and types. */
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Variable"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Function"));
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_C, false, "Type"));
+    /* C++ (and every `.h`, parsed as C++): a method body names its own
+     * members bare, so the bind is kept. */
+    ASSERT_FALSE(cbm_suppress_bare_field_ref(CBM_LANG_CPP, false, "Field"));
     PASS();
 }
 
@@ -1412,6 +1470,72 @@ TEST(c_member_rule_covers_c_files_and_every_dot_h) {
     /* No other language, whatever the file is called. */
     ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_OBJC, "ui/View.h"));
     ASSERT_FALSE(cbm_c_member_rule_file(CBM_LANG_GO, "pkg/a.go"));
+    PASS();
+}
+
+TEST(java_call_never_binds_data_member) {
+    /* A Java call expression never names data, so a CALLS bind that landed on
+     * a Variable or a Field is a spelling collision. The shape that produces
+     * it: a record's accessors are implicit, `p.x()` finds no declared `x()`,
+     * and the short-name registry hands back the first `x` in the tree — an
+     * unrelated class's private field. */
+    ASSERT_TRUE(cbm_java_suppress_call_to_data_member(true, "Field"));
+    ASSERT_TRUE(cbm_java_suppress_call_to_data_member(true, "Variable"));
+    /* Everything callable is kept, including the constructor's Class target. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Method"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Function"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Class"));
+    /* Other languages have callable data: a Kotlin property or a C function
+     * pointer is a name that is not a method and is called all the same. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Field"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Variable"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, NULL));
+    PASS();
+}
+
+TEST(generated_member_registers_by_qn_only) {
+    /* A generated member (a Java record's implicit accessor) is found by its
+     * qualified name, never by a short-name guess. The same member registered
+     * the ordinary way is exactly what the guess binds. */
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_qn_only(r, "proj.geo.Point.Point.y", "Method");
+    ASSERT_TRUE(cbm_registry_exists(r, "proj.geo.Point.Point.y"));
+    ASSERT_STR_EQ(cbm_registry_label_of(r, "proj.geo.Point.Point.y"), "Method");
+    const char **qns = NULL;
+    int n = -1;
+    ASSERT_EQ(cbm_registry_find_by_name(r, "y", &qns, &n), 0);
+    ASSERT_EQ(n, 0);
+    cbm_resolution_t res = cbm_registry_resolve(r, "v.y", "proj.app.Caller", NULL, NULL, 0);
+    ASSERT_NULL(res.qualified_name);
+    cbm_registry_add(r, "x", "proj.geo.Point.Point.x", "Method");
+    res = cbm_registry_resolve(r, "v.x", "proj.app.Caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.geo.Point.Point.x");
+    /* Degenerate input registers nothing. */
+    cbm_registry_add_qn_only(r, NULL, "Method");
+    cbm_registry_add_qn_only(r, "proj.geo.Point.Point.z", NULL);
+    cbm_registry_add_qn_only(NULL, "proj.geo.Point.Point.z", "Method");
+    ASSERT_EQ(cbm_registry_size(r), 2);
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(generated_member_mark_on_defs_and_nodes) {
+    static const char *const record[] = {"generated", "record", NULL};
+    static const char *const later[] = {"source", "openapi", "generated", "lombok", NULL};
+    static const char *const doc[] = {"id", "ADR-7", "status", "accepted", NULL};
+    static const char *const keyless[] = {"generated", NULL};
+    ASSERT_TRUE(cbm_def_props_generated(record));
+    ASSERT_TRUE(cbm_def_props_generated(later));
+    ASSERT_FALSE(cbm_def_props_generated(doc));
+    ASSERT_FALSE(cbm_def_props_generated(keyless)); /* a key without a value is no fact */
+    ASSERT_FALSE(cbm_def_props_generated(NULL));
+    ASSERT_TRUE(
+        cbm_node_props_generated("{\"parent_class\":\"p.Point\",\"generated\":\"record\"}"));
+    ASSERT_FALSE(cbm_node_props_generated("{\"parent_class\":\"p.Point\"}"));
+    /* The word inside a value is not the key. */
+    ASSERT_FALSE(cbm_node_props_generated("{\"docstring\":\"code generated by protoc\"}"));
+    ASSERT_FALSE(cbm_node_props_generated(NULL));
     PASS();
 }
 
@@ -1685,6 +1809,307 @@ TEST(weak_call_guards_share_one_drop_list) {
         }
         ASSERT_EQ(go, go_expected);
     }
+    PASS();
+}
+
+TEST(external_import_shadow_drops_package_bound_bare_call) {
+    /* #1355: `import { eq, sql } from "drizzle-orm"` binds both names to a
+     * package outside the indexed tree, so no import-map key exists for them and
+     * a project-wide same-name guess is a fabricated edge. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "sql", .module_path = "drizzle-orm"},
+        {.local_name = "users", .module_path = "./schema"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+    /* Only the relative import materialized an IMPORTS edge. */
+    const char *keys[] = {"users"};
+
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("sql", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "suffix_match", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "field_type_hint", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "fuzzy", &arr, keys, 1, NULL, NULL));
+    /* A file whose imports all failed to materialize is still covered: the
+     * evidence is the import statement, not the map. */
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL, NULL));
+    PASS();
+}
+
+TEST(external_import_shadow_keeps_everything_else) {
+    /* Negative space: every input that is NOT "bare call bound to a package
+     * import the graph could not resolve" must keep its edge. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "normalize", .module_path = "./text-utils"},
+        {.local_name = "getRootContainer", .module_path = "@repo/shared"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+    /* The relative import and the workspace package both materialized. */
+    const char *keys[] = {"normalize", "getRootContainer"};
+    const int nkeys = 2;
+
+    /* Import-/receiver-/module-aware strategies are never this guard's business. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "import_map", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "import_map_suffix", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "same_module", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "qualified_suffix", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "lsp_ts_import", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "lsp_ts_method", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "service_pattern", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    /* A relative specifier names a path inside the tree — a missing IMPORTS edge
+     * there is an in-project gap, not an external binding. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0, NULL, NULL));
+    /* A package the import map DOES bind resolved in-graph (workspace package). */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("getRootContainer", "unique_name", &arr, keys,
+                                                     nkeys, NULL, NULL));
+    /* A name the file never imports (called with no import at all). */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("helper", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    /* Member and package/namespace-qualified callees belong to the
+     * receiver-aware guards, not to this one. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq.apply", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq::apply", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    /* Empty / absent inputs. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", NULL, &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow(NULL, "unique_name", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("", "unique_name", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", NULL, keys, nkeys, NULL, NULL));
+    PASS();
+}
+
+TEST(external_import_shadow_relative_binding_wins_the_tie) {
+    /* A name imported from BOTH a package and a relative path keeps its edge,
+     * and does so independently of the order the imports were extracted in —
+     * the relative binding is an explicit tie-break, not an emergent property
+     * of iteration order. */
+    CBMImport pkg_first[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "eq", .module_path = "./text-utils"},
+    };
+    CBMImport rel_first[] = {
+        {.local_name = "eq", .module_path = "./text-utils"},
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+    };
+    CBMImportArray a = {.items = pkg_first, .count = 2, .cap = 2};
+    CBMImportArray b = {.items = rel_first, .count = 2, .cap = 2};
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &a, NULL, 0, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &b, NULL, 0, NULL, NULL));
+    PASS();
+}
+
+TEST(external_import_shadow_windows_relative_specifier_kept) {
+    /* #1355 follow-up: a Windows-style specifier —
+     * drive-letter absolute (`C:\...` / `C:/...`) or UNC share (`\\server\...`)
+     * — names a path inside the indexed tree exactly like a POSIX "./x" or
+     * "/x". pr-smoke runs this pipeline on Windows; before this fix these
+     * specifiers fell through to "external package" and the same-name guess
+     * they'd otherwise validate got suppressed on that platform only. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "C:\\repo\\src\\text-utils.ts"},
+        {.local_name = "sql", .module_path = "C:/repo/src/text-utils.ts"},
+        {.local_name = "normalize", .module_path = "\\\\server\\share\\text-utils.ts"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 3, .cap = 3};
+
+    /* None of these materialized an import-map key (as if resolution missed
+     * them, mirroring the reported scenario) — the specifier alone must still
+     * keep the edge because it is in-tree, not external. RED before the fix
+     * (specifier_is_relative saw '.' / '/' only, so all three were classified
+     * external and suppressed); GREEN after. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("sql", "unique_name", &arr, NULL, 0, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0, NULL, NULL));
+    /* A bare package specifier without any drive letter or leading separator
+     * (e.g. "drizzle-orm") must still be external — this predicate must not
+     * become "anything with a colon or backslash". */
+    CBMImport pkg_only[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+    };
+    CBMImportArray parr = {.items = pkg_only, .count = 1, .cap = 1};
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &parr, NULL, 0, NULL, NULL));
+    PASS();
+}
+
+TEST(external_import_shadow_workspace_sibling_kept) {
+    /* #1355 / #1732: inside a workspace monorepo a BARE specifier can still name
+     * in-tree code — `import { eq } from "drizzle-orm"` written inside the
+     * drizzle-orm repository is a sibling package, not a dependency. Measured on
+     * drizzle-team/drizzle-orm at b7862528: without this check the guard removed
+     * 2609 CALLS edges, 1377 of which pointed at exactly the file the specifier
+     * names. The package map is keyed by each in-tree manifest's `name`, so the
+     * tree's own claim decides. */
+    CBMImport imports[] = {
+        {.local_name = "eq", .module_path = "drizzle-orm"},
+        {.local_name = "pgTable", .module_path = "drizzle-orm/pg-core"},
+        {.local_name = "hoisted", .module_path = "@scope/kit/sub"},
+        {.local_name = "test", .module_path = "vitest"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 4, .cap = 4};
+
+    CBMHashTable *pkgs = cbm_ht_create(8);
+    ASSERT_NOT_NULL(pkgs);
+    cbm_ht_set(pkgs, "drizzle-orm", (void *)"qn");
+    cbm_ht_set(pkgs, "@scope/kit", (void *)"qn");
+
+    /* Exact name, subpath, and scoped subpath all resolve to an in-tree
+     * package — the same-name fallback keeps its chance. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, pkgs, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("pgTable", "suffix_match", &arr, NULL, 0, pkgs, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("hoisted", "unique_name", &arr, NULL, 0, pkgs, NULL));
+    /* A genuine third-party dependency is untouched by the new check: the tree
+     * declares no package called "vitest", so the #1355 removal still happens. */
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("test", "suffix_match", &arr, NULL, 0, pkgs, NULL));
+
+    /* A tree with no manifests at all (pkgmap NULL) keeps the pre-existing
+     * specifier-shape-only contract — every one of these is external again. */
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("pgTable", "suffix_match", &arr, NULL, 0, NULL, NULL));
+
+    /* An unrelated package map must not accidentally match by prefix: "drizzle"
+     * is not "drizzle-orm", and the walk is by path segment, not by substring. */
+    CBMHashTable *other = cbm_ht_create(8);
+    ASSERT_NOT_NULL(other);
+    cbm_ht_set(other, "drizzle", (void *)"qn");
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, other, NULL));
+
+    cbm_ht_free(other);
+    cbm_ht_free(pkgs);
+    PASS();
+}
+
+TEST(external_import_shadow_declared_package_kept) {
+    /* #1355: package-path specifiers (Java, Kotlin, C#, PHP) carry NO shape
+     * that separates in-tree from third-party — `import
+     * org.jetbrains.exposed.v1.tests.shared.assertEquals` is spelled exactly
+     * like `import kotlin.test.assertEquals`, and neither is "relative". Only
+     * the tree's own `package` declarations tell them apart; the manifests the
+     * package map reads (pom.xml, build.gradle) name artifacts, not packages.
+     * Measured on JetBrains/Exposed at 0e4d81a4: without this check the guard
+     * removed 426 CALLS edges, every one of them a real in-project call into
+     * the repository's own Assert.kt. */
+    CBMImport imports[] = {
+        {.local_name = "assertEquals", .module_path = "org.example.tests.shared.assertEquals"},
+        {.local_name = "assertEquals", .module_path = "kotlin.test.assertEquals"},
+        {.local_name = "Helper", .module_path = "org.example.util.Helper"},
+        {.local_name = "URL", .module_path = "java.net.URL"},
+        {.local_name = "Logger", .module_path = "App\\Support\\Logger"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 5, .cap = 5};
+
+    CBMHashTable *nspkgs = cbm_ht_create(8);
+    ASSERT_NOT_NULL(nspkgs);
+    cbm_ht_set(nspkgs, "org.example.tests.shared", (void *)"qn");
+    cbm_ht_set(nspkgs, "org.example.util", (void *)"qn");
+    cbm_ht_set(nspkgs, "App.Support", (void *)"qn");
+
+    /* The specifier names a member of a package the tree declares, so the walk
+     * strips the member segment and finds it — the call keeps its edge. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("assertEquals", "suffix_match", &arr, NULL, 0,
+                                                     NULL, nspkgs));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("Helper", "unique_name", &arr, NULL, 0, NULL, nspkgs));
+    /* PHP writes its separator as a backslash; the key normalization has to
+     * match the namespace map's, which stores dots. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("Logger", "unique_name", &arr, NULL, 0, NULL, nspkgs));
+    /* Negative space, and the effect the census called valuable: `java.net.URL`
+     * walks to "java.net" then "java", neither declared by any project file, so
+     * a bare `URL` bound to an in-tree URL class is still cut. */
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("URL", "suffix_match", &arr, NULL, 0, NULL, nspkgs));
+    /* NULL restores the previous contract: without the declared-package set
+     * every one of these reads as external again. */
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("assertEquals", "suffix_match", &arr, NULL, 0,
+                                                    NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("Helper", "unique_name", &arr, NULL, 0, NULL, NULL));
+
+    /* The walk is by dotted segment, not by substring: a tree that declares
+     * "org.example.tests" must not claim "org.example.testsuite.helper". */
+    CBMImport near[] = {
+        {.local_name = "near", .module_path = "org.example.testsuite.helper.near"},
+    };
+    CBMImportArray narr = {.items = near, .count = 1, .cap = 1};
+    CBMHashTable *prefix_only = cbm_ht_create(8);
+    ASSERT_NOT_NULL(prefix_only);
+    cbm_ht_set(prefix_only, "org.example.tests", (void *)"qn");
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("near", "unique_name", &narr, NULL, 0, NULL,
+                                                    prefix_only));
+
+    cbm_ht_free(prefix_only);
+    cbm_ht_free(nspkgs);
+    PASS();
+}
+
+TEST(external_import_shadow_declared_prefix_is_permissive) {
+    /* #1355, known limitation pinned deliberately. The declared-package walk
+     * has no floor: once the tree declares `com.example`, a third-party
+     * library publishing under `com.example.vendor` reads as in-tree and the
+     * guard stands down. The call then keeps exactly the edge it has on main,
+     * so this direction costs a fabricated edge the guard could have removed —
+     * it never removes a real one, which is the side a call-resolution
+     * suppressor has to fail on.
+     *
+     * This test exists so the behaviour cannot change silently: tightening the
+     * walk (stopping at the first type-shaped segment, say) must flip these
+     * two assertions, not slip through unnoticed. */
+    CBMImport imports[] = {
+        {.local_name = "vendorCall", .module_path = "com.example.vendor.pkg.vendorCall"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 1, .cap = 1};
+
+    CBMHashTable *declares_prefix = cbm_ht_create(8);
+    ASSERT_NOT_NULL(declares_prefix);
+    cbm_ht_set(declares_prefix, "com.example", (void *)"qn");
+    /* The tree declares only the prefix, yet the whole subtree is treated as
+     * in-tree — the permissive direction. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("vendorCall", "unique_name", &arr, NULL, 0,
+                                                     NULL, declares_prefix));
+
+    /* Change nothing but the declared package and the guard fires again, which
+     * is what proves the previous assertion came from the prefix walk and not
+     * from some other clause standing down. */
+    CBMHashTable *declares_other = cbm_ht_create(8);
+    ASSERT_NOT_NULL(declares_other);
+    cbm_ht_set(declares_other, "com.other", (void *)"qn");
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("vendorCall", "unique_name", &arr, NULL, 0,
+                                                    NULL, declares_other));
+
+    cbm_ht_free(declares_other);
+    cbm_ht_free(declares_prefix);
     PASS();
 }
 
@@ -2270,12 +2695,17 @@ SUITE(registry) {
     RUN_TEST(registry_tie_prefers_csharp_implementation_over_ref_stub);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(go_bare_init_never_binds_init_namesake);
+    RUN_TEST(c_bare_ref_never_binds_field);
     RUN_TEST(call_onto_field_follows_language_and_shape);
     RUN_TEST(c_bare_call_does_not_weigh_field_namesakes);
     RUN_TEST(c_arrow_member_call_is_c_family_and_arrow_only);
     RUN_TEST(unique_field_qn_needs_exactly_one_field_of_that_name);
     RUN_TEST(c_member_access_binds_by_owner_only);
     RUN_TEST(c_member_rule_covers_c_files_and_every_dot_h);
+    RUN_TEST(java_call_never_binds_data_member);
+    RUN_TEST(generated_member_registers_by_qn_only);
+    RUN_TEST(generated_member_mark_on_defs_and_nodes);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
@@ -2286,6 +2716,13 @@ SUITE(registry) {
     RUN_TEST(python_import_binding_contradicts_only_foreign_chains);
     RUN_TEST(python_external_base_contradicts_django_shapes);
     RUN_TEST(weak_call_guards_share_one_drop_list);
+    RUN_TEST(external_import_shadow_drops_package_bound_bare_call);
+    RUN_TEST(external_import_shadow_keeps_everything_else);
+    RUN_TEST(external_import_shadow_relative_binding_wins_the_tie);
+    RUN_TEST(external_import_shadow_windows_relative_specifier_kept);
+    RUN_TEST(external_import_shadow_workspace_sibling_kept);
+    RUN_TEST(external_import_shadow_declared_package_kept);
+    RUN_TEST(external_import_shadow_declared_prefix_is_permissive);
     RUN_TEST(go_suppress_drops_weak_selector_matches);
     RUN_TEST(go_suppress_keeps_typed_and_import_aware_matches);
     RUN_TEST(registry_python_function_local_is_exact_only_issue1548);

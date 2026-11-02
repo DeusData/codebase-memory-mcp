@@ -142,7 +142,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev clang llvm libclang-rt-dev
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev clang llvm libclang-rt-dev
       - name: Fuzz smoke (extract, cypher, config)
         run: scripts/fuzz.sh all --runs 20000 --seed 1
       - name: Upload reproducers

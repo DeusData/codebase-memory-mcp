@@ -402,6 +402,45 @@ TEST(cv_elixir_compile_time_if) {
     PASS();
 }
 
+/* A multi-clause function under a compile-time `if`. Each branch's clauses
+ * fold into one definition spanning them (the clause fold), and the two
+ * branches stay two variants of one identity: exactly the spans 5-6 and 8-9,
+ * neither one span per clause (no fold) nor one span over both branches (a
+ * fold across the branch boundary). */
+TEST(cv_elixir_multi_clause_under_if) {
+    static const cv_file_t files[] = {{"pick.ex", "defmodule Pick do\n"                   /* 1 */
+                                                  "  def alpha(_), do: :ok\n"             /* 2 */
+                                                  "  def beta(_), do: :ok\n"              /* 3 */
+                                                  "  if Code.ensure_loaded?(:win32) do\n" /* 4 */
+                                                  "    def pick(0), do: alpha(0)\n"       /* 5 */
+                                                  "    def pick(n), do: alpha(n)\n"       /* 6 */
+                                                  "  else\n"                              /* 7 */
+                                                  "    def pick(0), do: beta(0)\n"        /* 8 */
+                                                  "    def pick(n), do: beta(n)\n"        /* 9 */
+                                                  "  end\n"                               /* 10 */
+                                                  "  def caller, do: pick(1)\n"           /* 11 */
+                                                  "end\n"}};                              /* 12 */
+    cv_proj_t p;
+    ASSERT_TRUE(cv_index(&p, files, 1));
+    cv_result_t r = cv_measure(&p, "pick", "alpha", "beta", "caller");
+    const char *span_do =
+        "SELECT COUNT(*) FROM nodes n, json_each(n.properties,'$.variants') v "
+        "WHERE n.project=?1 AND n.name=?2 AND n.label IN " CV_DEF_LABELS
+        " AND json_extract(v.value,'$.start_line')=5 AND json_extract(v.value,'$.end_line')=6";
+    const char *span_else =
+        "SELECT COUNT(*) FROM nodes n, json_each(n.properties,'$.variants') v "
+        "WHERE n.project=?1 AND n.name=?2 AND n.label IN " CV_DEF_LABELS
+        " AND json_extract(v.value,'$.start_line')=8 AND json_extract(v.value,'$.end_line')=9";
+    int do_spans = cv_count(&p, span_do, "pick", NULL);
+    int else_spans = cv_count(&p, span_else, "pick", NULL);
+    cv_cleanup(&p);
+    ASSERT_TRUE(cv_expect("elixir_multi_clause", r));
+    ASSERT_EQ(r.variant_spans, 2);
+    ASSERT_EQ(do_spans, 1);
+    ASSERT_EQ(else_spans, 1);
+    PASS();
+}
+
 /* Verilog: the identity only. Module instantiation produces no CALLS edge in
  * this graph even without any `ifdef (a general Verilog gap, not a variant
  * one), so the body and caller edges are not this suite's to assert. */
@@ -798,6 +837,7 @@ SUITE(conditional_variants) {
     RUN_TEST(cv_pascal_ifdef);
     RUN_TEST(cv_julia_static_if);
     RUN_TEST(cv_elixir_compile_time_if);
+    RUN_TEST(cv_elixir_multi_clause_under_if);
     RUN_TEST(cv_verilog_ifdef);
     RUN_TEST(cv_c_platform_files);
     RUN_TEST(cv_c_platform_directories);

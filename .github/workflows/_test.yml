@@ -57,18 +57,21 @@ jobs:
         run: |
           # Every CORE leg is tagged with the lane (scripts/ci/select-lanes.sh)
           # it serves; the tag is what lane selection filters on below.
+          # The lane names unix-macos14 and tsan-mac are kept as lane keys
+          # (select-lanes.sh, ci-ok and the lane contracts key on them); both
+          # run on macos-15 because GitHub retires the macos-14 image on 2026-11-02.
           CORE_UNIX='[
             {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","lane":"unix-x86"},
             {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++","lane":"unix-arm64"},
-            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"unix-macos14"},
+            {"os":"macos-15","cc":"cc","cxx":"c++","lane":"unix-macos14"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++","lane":"unix-macos-intel"}
           ]'
           # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
           # escape hatches): the release dry run must be all-green, every platform.
+          # macos-15 is the CORE macOS arm64 leg now, so it is not repeated here.
           BROAD_UNIX='[
             {"os":"ubuntu-22.04","cc":"gcc","cxx":"g++"},
-            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"},
-            {"os":"macos-15","cc":"cc","cxx":"c++"}
+            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"}
           ]'
           # Each Windows leg pins the msys2 environment + package arch to the
           # RUNNER architecture so the build is native, never emulated:
@@ -92,7 +95,7 @@ jobs:
           TSAN='[
             {"os":"ubuntu-latest","cc":"clang","cxx":"clang++","lane":"tsan-x86"},
             {"os":"ubuntu-24.04-arm","cc":"clang","cxx":"clang++","lane":"tsan-arm"},
-            {"os":"macos-14","cc":"cc","cxx":"c++","lane":"tsan-mac"}
+            {"os":"macos-15","cc":"cc","cxx":"c++","lane":"tsan-mac"}
           ]'
           # Lane selection. "all" (dry run, release) keeps every leg and drops
           # the tags, so those matrices -- and their job names -- stay exactly
@@ -166,7 +169,8 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev ccache
 
       # Ubuntu 23.10+ ships kernel.apparmor_restrict_unprivileged_userns=1, which
       # blocks unshare(CLONE_NEWUSER) for unprivileged users. Without this, the
@@ -367,14 +371,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y zlib1g-dev ccache
 
       - name: Install LLVM 21 (pinned diagnostic toolchain)
+        timeout-minutes: 10
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
           echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
-          sudo apt-get update
-          sudo apt-get install -y clang-21
+          APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update
+          sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y clang-21
 
       - name: Compiler cache (content-verified, restore)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -525,7 +531,8 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev ccache
+        timeout-minutes: 10
+        run: APT_RETRIES=3; [ -f /etc/apt/apt-mirrors.txt ] && APT_RETRIES=0; sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 --error-on=any update && sudo apt-get -o Acquire::Retries=$APT_RETRIES -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y clang zlib1g-dev ccache
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
@@ -587,7 +594,7 @@ jobs:
       # preflight script, so AV-interaction coverage lives there; runners run
       # without RTP by platform constraint.
 
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: ${{ matrix.msystem }}
           path-type: inherit
@@ -739,7 +746,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: CLANG64
           path-type: inherit
