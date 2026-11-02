@@ -1802,6 +1802,8 @@ extern void suite_resolver_capabilities(void);
 extern void suite_resolver_rust(void);
 extern void suite_resolver_py_types(void);
 extern void suite_resolver_python(void);
+extern void suite_resolver_python_members(void);
+extern void suite_resolver_python_flow(void);
 extern void suite_resolver_java(void);
 extern void suite_resolver_oo(void);
 extern void suite_resolver_diagnostics(void);
@@ -2443,6 +2445,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(resolver_rust);
     RUN_SELECTED_SUITE(resolver_py_types);
     RUN_SELECTED_SUITE(resolver_python);
+    RUN_SELECTED_SUITE(resolver_python_members);
+    RUN_SELECTED_SUITE(resolver_python_flow);
     RUN_SELECTED_SUITE(resolver_java);
     RUN_SELECTED_SUITE(resolver_oo);
     RUN_SELECTED_SUITE(resolver_diagnostics);

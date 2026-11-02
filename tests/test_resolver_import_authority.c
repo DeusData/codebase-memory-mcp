@@ -131,6 +131,15 @@ static authority_result_t authority_fixture(bool rust) {
             }
             cursor = end ? end + 1 : NULL;
         }
+        /* C writes no binding list to alter, so forge one: a property naming a wrong
+         * target must carry no more authority than an altered one. */
+        if (!rust) {
+            free(tampered);
+            tampered = strdup("{\"c_includes_proven\":1,"
+                              "\"c_include_bindings\":[{\"target\":\"wrong\"}]}");
+            ok = tampered != NULL;
+            target_changed = ok;
+        }
         ok = ok && target_changed &&
              cbm_gbuf_node_set_properties_json((cbm_gbuf_node_t *)file, tampered) == 0;
         out.tampered = ok && authority_binding(graph, rels[0], results[0], rust, expected);

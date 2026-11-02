@@ -109,15 +109,60 @@ TEST(resolver_python_typed_receiver_preserves_crossfile_method) {
  * it. Every case runs both drivers: sequential, and the parallel route that the
  * filler files select. */
 
-static int python_route_edges(const python_proof_file_t *files, size_t count, const char *source,
-                              const char *relation, const char *target, const char *name,
-                              const char *label, bool parallel) {
-    const char *root = th_mktempdir("cbm_python_rule");
-    if (!root)
-        return -1;
-    char repo[768], database[768];
+/* Rows of one fixture share its index, per route. A full index writes up to 57 files, and on
+ * Windows every one of them is scanned, so repeating them ran this suite past the 900 s cap. */
+typedef struct {
+    char *key; /* every path and text of the fixture this index holds */
+    char *root;
+    char database[768];
+    int rc;
+} python_route_index_t;
+
+static python_route_index_t python_routes[2];
+
+static void python_route_release(python_route_index_t *route) {
+    if (route->root)
+        th_cleanup(route->root);
+    free(route->root);
+    free(route->key);
+    memset(route, 0, sizeof(*route));
+}
+
+static char *python_fixture_key(const python_proof_file_t *files, size_t count) {
+    size_t bytes = 1;
+    for (size_t i = 0; i < count; i++)
+        bytes += strlen(files[i].path) + strlen(files[i].text) + 2;
+    char *key = malloc(bytes);
+    if (!key)
+        return NULL;
+    size_t at = 0;
+    for (size_t i = 0; i < count; i++)
+        at += (size_t)snprintf(key + at, bytes - at, "%s\x1f%s\x1e", files[i].path, files[i].text);
+    return key;
+}
+
+/* Writes and indexes the fixture for one route; the result stays until another fixture. */
+static python_route_index_t *python_route_index(const python_proof_file_t *files, size_t count,
+                                                bool parallel) {
+    python_route_index_t *route = &python_routes[parallel ? 1 : 0];
+    char *key = python_fixture_key(files, count);
+    if (key && route->key && !strcmp(route->key, key)) {
+        free(key);
+        return route;
+    }
+    python_route_release(route);
+    const char *made = key ? th_mktempdir("cbm_python_rule") : NULL;
+    route->root = made ? strdup(made) : NULL;
+    if (!route->root) {
+        free(key);
+        return NULL;
+    }
+    route->key = key;
+    const char *root = route->root;
+    char repo[768];
     snprintf(repo, sizeof(repo), "%s/repo", root);
-    snprintf(database, sizeof(database), "%s/index.db", root);
+    snprintf(route->database, sizeof(route->database), "%s/index.db", root);
+    const char *database = route->database;
     bool ok = cbm_mkdir_p(repo, 0755);
     for (size_t i = 0; ok && i < count; i++) {
         char directory[1024];
@@ -146,6 +191,18 @@ static int python_route_edges(const python_proof_file_t *files, size_t count, co
     } else {
         cbm_unsetenv("CBM_WORKERS");
     }
+    route->rc = rc;
+    return route;
+}
+
+static int python_route_edges(const python_proof_file_t *files, size_t count, const char *source,
+                              const char *relation, const char *target, const char *name,
+                              const char *label, bool parallel) {
+    python_route_index_t *route = python_route_index(files, count, parallel);
+    if (!route)
+        return -1;
+    int rc = route->rc;
+    const char *database = route->database;
     cbm_store_t *store = rc == 0 ? cbm_store_open_path_existing(database) : NULL;
     sqlite3_stmt *statement = NULL;
     int edges = -1;
@@ -166,7 +223,6 @@ static int python_route_edges(const python_proof_file_t *files, size_t count, co
     sqlite3_finalize(statement);
     if (store)
         cbm_store_close(store);
-    th_cleanup(root);
     return edges;
 }
 
@@ -1447,6 +1503,8 @@ TEST(resolver_python_decorators_keep_identity_only_when_proven) {
     PASS();
 }
 
+/* Three suites because each case indexes through both drivers: together they ran past the
+ * 900 s per-suite cap on Windows, about 500 full indexes in all. */
 SUITE(resolver_python) {
     RUN_TEST(resolver_python_ordinary_syntax_keeps_the_file);
     RUN_TEST(resolver_python_only_real_namespace_effects_are_dynamic);
@@ -1458,11 +1516,21 @@ SUITE(resolver_python) {
     RUN_TEST(resolver_python_submodule_import_survives_a_working_package);
     RUN_TEST(resolver_python_star_import_follows_the_module_interface);
     RUN_TEST(resolver_python_self_selects_through_c3_order);
+    python_route_release(&python_routes[0]);
+    python_route_release(&python_routes[1]);
+}
+
+SUITE(resolver_python_members) {
     RUN_TEST(resolver_python_super_and_class_level_receivers);
     RUN_TEST(resolver_python_receiver_types_need_a_fact);
     RUN_TEST(resolver_python_class_body_values_can_be_replaced);
     RUN_TEST(resolver_python_class_comprehension_skips_the_class);
     RUN_TEST(resolver_python_shadowed_super_and_type_are_not_the_builtins);
+    python_route_release(&python_routes[0]);
+    python_route_release(&python_routes[1]);
+}
+
+SUITE(resolver_python_flow) {
     RUN_TEST(resolver_python_rebound_receivers_abstain);
     RUN_TEST(resolver_python_module_level_instance_has_its_class);
     RUN_TEST(resolver_python_decorators_keep_identity_only_when_proven);
@@ -1471,4 +1539,6 @@ SUITE(resolver_python) {
     RUN_TEST(resolver_python_imported_class_is_the_static_callable);
     RUN_TEST(resolver_python_reexport_shadow_and_cycle_abstain);
     RUN_TEST(resolver_python_package_value_blocks_physical_submodule);
+    python_route_release(&python_routes[0]);
+    python_route_release(&python_routes[1]);
 }
