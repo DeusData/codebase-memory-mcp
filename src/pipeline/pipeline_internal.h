@@ -1684,8 +1684,13 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      are preserved and dotted-name collisions are disambiguated before section
  *      references resolve. Old indices rebuild once so Section nodes, MENTIONS
  *      and diagram owners agree.
+ *  13: a route registration keeps its HANDLES edge when the handler is passed
+ *      wrapped in a call (Go `g.GET("/x", handler(deps))`, axum
+ *      `.route("/x", post(api::responses::handle))`), and a Rust/C++ qualified
+ *      handler path is no longer sent through the PHP `::` branch. An index
+ *      built before holds neither, so it rebuilds once on upgrade.
  * The unresolved-call coverage threshold remains independent. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 12 };
+enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
 typedef struct {
     cbm_gbuf_t *gbuf;

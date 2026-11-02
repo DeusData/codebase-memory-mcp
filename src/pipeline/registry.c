@@ -2581,8 +2581,14 @@ cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const cha
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count,
                                               const cbm_gbuf_t *gbuf, CBMLanguage lang) {
+    /* The "::" split below reads PHP's "Ns\Class::method" as class + member and
+     * places it through PSR-4 / namespace-mirroring rules. Rust and C++ spell a
+     * plain qualified path with the same separator (`api::responses::handle`),
+     * so without this guard every such handler fell into the PHP branch, found
+     * no class, and returned empty instead of reaching the normal resolver
+     * (#2883). Keep the branch to the grammar whose syntax it describes. */
     const char *sep = handler_ref ? strstr(handler_ref, "::") : NULL;
-    if (!r || !sep) {
+    if (!r || !sep || lang != CBM_LANG_PHP) {
         return cbm_registry_resolve_lang(r, handler_ref, module_qn, import_map_keys,
                                          import_map_vals, import_map_count, lang);
     }
