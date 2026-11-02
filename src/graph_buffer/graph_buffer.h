@@ -231,6 +231,11 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 
+/* Delete all edges of a type that `keep` does not claim. */
+typedef bool (*cbm_gbuf_edge_keep_fn)(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *edge);
+int cbm_gbuf_delete_edges_by_type_unless(cbm_gbuf_t *gb, const char *type,
+                                         cbm_gbuf_edge_keep_fn keep);
+
 /* Delete the edges of `type` whose source node has label `label`. */
 int cbm_gbuf_delete_edges_from_label(cbm_gbuf_t *gb, const char *type, const char *label);
 

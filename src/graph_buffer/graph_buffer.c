@@ -2482,6 +2482,25 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
 
 typedef struct {
     const char *type;
+    cbm_gbuf_edge_keep_fn keep;
+} gbuf_type_unless_t;
+
+static bool gbuf_edge_type_unless(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e, const void *ud) {
+    const gbuf_type_unless_t *rule = ud;
+    return strcmp(e->type, rule->type) == 0 && !rule->keep(gb, e);
+}
+
+int cbm_gbuf_delete_edges_by_type_unless(cbm_gbuf_t *gb, const char *type,
+                                         cbm_gbuf_edge_keep_fn keep) {
+    if (!gb || !type || !keep) {
+        return CBM_NOT_FOUND;
+    }
+    gbuf_type_unless_t rule = {type, keep};
+    return gbuf_delete_edges_if(gb, gbuf_edge_type_unless, &rule);
+}
+
+typedef struct {
+    const char *type;
     const char *label;
 } gbuf_type_label_t;
 

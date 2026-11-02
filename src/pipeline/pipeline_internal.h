@@ -835,6 +835,13 @@ void cbm_pipeline_close_call_props(char *props, int n, const CBMCall *call, bool
  * of that grammar behind both passes (pass_parallel.c). */
 const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang);
 
+/* A route registration's path, and in *out_handler its handler's spelling: the
+ * first string argument with a leading slash, a Go ServeMux pattern's path, a
+ * path keyword, or a regex in the path position. The one reader behind both
+ * passes (pass_parallel.c). */
+const char *cbm_pipeline_route_path_in_args(const CBMCall *call, const char **out_handler,
+                                            CBMLanguage lang);
+
 /* The method of a route registration's Route: the verb its callee names
  * (`router.GET`), else the method its Go ServeMux pattern names
  * (`mux.HandleFunc("POST /v1/x", h)`, #2537), else the callee's own answer
@@ -842,6 +849,34 @@ const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang);
  * passes so their Routes stay byte-identical (pass_parallel.c). */
 const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang, char *buf,
                                           size_t buf_sz);
+
+/* The ,"via":"sql_relation" of a SQL lineage edge whose target its own rule
+ * selects: a relation the same script creates, or a dbt model, whose name is
+ * unique in its project by dbt's own rule. "" for any other edge
+ * (pass_route_registration.c). */
+const char *cbm_pipeline_sql_lineage_mark(CBMLanguage language, const char *rel,
+                                          const cbm_gbuf_node_t *target);
+
+/* Is this call a real route registration, by what its file spells? Set the file
+ * with begin before the first call and release it with end; one thread, one file
+ * at a time. Its first candidate builds the file's receiver bindings, in one pass
+ * (pass_route_registration.c). `path` supplies bytes extraction did not retain. */
+void cbm_route_registration_file_begin(const CBMFileResult *result, CBMLanguage language,
+                                       const char *path);
+void cbm_route_registration_file_end(void);
+bool cbm_route_registration_real(const CBMCall *call);
+/* A registration's handler the registry could not bind by name: splice its
+ * spelling and the call's span into the edge's unclosed-free JSON `props`.
+ * cbm_route_registration_link_handlers reads them. */
+void cbm_route_registration_note_handler(char *props, size_t props_size, const CBMCall *call,
+                                         const char *handler_ref);
+/* Give each such registration its HANDLES edge from what the resolver proved
+ * inside the call's span: `mux.HandleFunc("/x", s.handle)`'s method value. One
+ * pass over the proved references; a binary search per reference. */
+bool cbm_route_registration_link_handlers(cbm_gbuf_t *graph);
+/* A receiverless DSL verb the suffix table cannot see (Ruby `get '/x' do`); NULL
+ * for anything else, else its HTTP method. Worth asking _real about. */
+const char *cbm_route_registration_dsl_method(const CBMCall *call, CBMLanguage language);
 
 /* Per-file index of the names a file's imports bind onto EXTERNAL modules:
  * local name -> the binding import. Built lazily, on the first call that

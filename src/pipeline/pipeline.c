@@ -4666,7 +4666,8 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                const cbm_file_info_t *files, int file_count,
                                const cbm_file_hash_t *baseline_manifest, int baseline_count) {
-    if (!cbm_shared_resolver_project(ctx->gbuf)) {
+    if (!cbm_shared_resolver_project(ctx->gbuf) ||
+        !cbm_route_registration_link_handlers(ctx->gbuf)) {
         cbm_pipeline_mark_unresolved_capture_failed(p);
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
@@ -4680,6 +4681,9 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
     if (atomic_load(&ctx->resolver_failed))
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    /* A file-less Route with no caller or handler left, as on the incremental
+     * routes: full and incremental publish the same graph. */
+    (void)cbm_gbuf_delete_edgeless(ctx->gbuf, "Route");
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (cbm_pipeline_persist_test_take_cancel_after_predump()) {

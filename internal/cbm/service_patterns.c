@@ -569,6 +569,8 @@ static const method_suffix_t route_reg_suffixes[] = {
     {".PATCH", "PATCH"},
     {".Patch", "PATCH"},
     {".patch", "PATCH"},
+    /* Every method at once (Express, Fastify) */
+    {".all", "ANY"},
     /* Handle/HandleFunc (Go stdlib, gorilla) */
     {".Handle", "ANY"},
     {".HandleFunc", "ANY"},

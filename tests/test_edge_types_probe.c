@@ -657,9 +657,9 @@ TEST(calls_jsx_named_components_require_exact_binding) {
  *
  *  Strategy: the route_path is extracted from decorators (Python Flask/FastAPI/
  *  Django, Java Spring) or from the resolved QN matching a framework library id
- *  (Express, Fastify, Gin, ASP.NET MapGet/MapPost, Laravel).  Each fixture uses a
- *  LOCAL wrapper whose QN carries the framework substring so the sequential-path
- *  resolver (pass_calls.c → cbm_service_pattern_match → CBM_SVC_ROUTE_REG) fires.
+ *  (Express, Fastify, Gin, ASP.NET MapGet/MapPost, Laravel).  Each fixture spells
+ *  the framework's own form: a substring of a resolved QN proves nothing, so a
+ *  local wrapper named after a framework registers no route.
  *  Decorator-based frameworks (Flask, FastAPI, Django, Spring @RequestMapping) are
  *  handled via extract_route_from_decorators which sets def.route_path in the
  *  extraction result and creates Route+HANDLES during pass_definitions.
@@ -704,40 +704,30 @@ TEST(handles_drf_action_python) {
     PASS();
 }
 
-/* Express (JS/TS) — route registration must resolve to a callee QN containing
- * the "express" library substring AND pass the handler as an identifier (not an
- * inline-object method, which is never registered as a resolvable node).  We use
- * top-level wrapper functions defined in an "express"-pathed module so the
- * resolved QN (project.express.router.expressGet) carries the substring → the
- * sequential resolver classifies the call as CBM_SVC_ROUTE_REG and emits
- * Route + HANDLES (mirrors the working handles_gin_go pattern). */
+/* Express (JS/TS): a route method on the app `express()` returned, with an
+ * identifier handler. */
 TEST(handles_express_ts) {
     static const EtFile f[] = {
-        {"express/router.ts",
-         "export function expressGet(p: string, h: any): any { return h; }\n"
-         "export function expressPost(p: string, h: any): any { return h; }\n"},
-        {"users.ts", "import { expressGet, expressPost } from './express/router';\n\n"
+        {"users.ts", "import express from 'express';\n\n"
+                     "const app = express();\n\n"
                      "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
                      "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
-                     "expressGet('/users', listUsers);\n"
-                     "expressPost('/users', createUser);\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+                     "app.get('/users', listUsers);\n"
+                     "app.post('/users', createUser);\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
 
-/* Fastify (JS) — same as Express: route registration via top-level wrapper
- * functions whose resolved QN carries the "fastify" substring + identifier
- * handlers.  Inline-object methods (the previous fixture) are never registered,
- * so router.get could not resolve and no HANDLES fired. */
+/* Fastify (JS): the instance `require('fastify')()` returned, with identifier
+ * handlers. */
 TEST(handles_fastify_js) {
     static const EtFile f[] = {
-        {"fastify/server.js",
-         "function fastifyGet(p, h) { return h; }\n"
-         "function fastifyPost(p, h) { return h; }\n\n"
+        {"server.js",
+         "const fastify = require('fastify')({ logger: true });\n\n"
          "function getHealth(req, reply) { reply.send({ ok: true }); }\n\n"
          "function postOrder(req, reply) { reply.send({ created: true }); }\n\n"
-         "fastifyGet('/health', getHealth);\n"
-         "fastifyPost('/orders', postOrder);\n"}};
+         "fastify.get('/health', getHealth);\n"
+         "fastify.post('/orders', postOrder);\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -1304,11 +1294,7 @@ TEST(handles_aspnet_csharp) {
          .route_qn = "__route__GET__/products",
          .property = "method",
          .value = "GET",
-         .required = false,
-         .gap_id = "aspnet-method-group-route",
-         .why = "The route registration cannot borrow an unproved containing-class method group.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .required = true},
         {.case_id = "aspnet-handler-route-post",
          .site = {.file = "Program.cs",
                   .caller = "Program.Main",
@@ -1324,11 +1310,7 @@ TEST(handles_aspnet_csharp) {
          .route_qn = "__route__POST__/products",
          .property = "method",
          .value = "POST",
-         .required = false,
-         .gap_id = "aspnet-method-group-route",
-         .why = "The route registration cannot borrow an unproved containing-class method group.",
-         .tried = "Call binding prerequisites audited in current source; exact downstream route "
-                  "and handler identity retained separately from the seven-relation oracle."},
+         .required = true},
         {.case_id = "required-attribute-handler",
          .site = {.file = "quality/Controller.cs",
                   .caller = "QualityController.Ready",
@@ -2198,41 +2180,24 @@ TEST(routes_laravel_slashless_no_junk_issue1146) {
     PASS();
 }
 
-/* Rails (Ruby) — ActionDispatch router.  The handler MUST be passed as a bare
- * identifier (not the idiomatic `to: 'list_items'` string, which extract_handler_arg
- * cannot capture).  mapper.get resolves by name to the Mapper#get method whose QN
- * carries the "ActionDispatch" route-registration substring → ROUTE_REG → HANDLES. */
+/* Rails: the routes file's DSL, with no receiver. Its `to:` names a controller by
+ * convention, so the registration has its Route and no HANDLES here. */
 TEST(handles_rails_ruby) {
-    static const EtFile f[] = {
-        {"ActionDispatch/Routing.rb", "module ActionDispatch\n  module Routing\n"
-                                      "    class Mapper\n"
-                                      "      def get(path, handler); end\n"
-                                      "      def post(path, handler); end\n"
-                                      "    end\n  end\nend\n"},
-        {"config/routes.rb", "require_relative '../ActionDispatch/Routing'\n\n"
-                             "mapper = ActionDispatch::Routing::Mapper.new\n\n"
-                             "def list_items; end\ndef create_item; end\n\n"
-                             "mapper.get '/items', list_items\n"
-                             "mapper.post '/items', create_item\n"}};
-    ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+    static const EtFile f[] = {{"config/routes.rb", "Rails.application.routes.draw do\n"
+                                                    "  get '/items', to: 'items#index'\n"
+                                                    "end\n"}};
+    static const char *routes[] = {"/items", NULL};
+    ASSERT_TRUE(et_routes_exact_mode(f, 1, routes, false, "__route__GET__/items"));
     PASS();
 }
 
-/* Actix-web (Rust) — route registration via SAME-FILE wrapper functions whose
- * names carry the "actix_web" substring, called by bare name with an identifier
- * handler.  Same-file Rust calls resolve (cf. probe_rust_calls_edge); a
- * cross-file `actix_web::get` would NOT (Rust lsp_cross unwired + '::' path not
- * resolved by the generic resolver). */
+/* Rust: a route on the application builder, with an identifier handler. A wrapper
+ * merely named after actix_web registers nothing. */
 TEST(handles_actix_rust) {
     static const EtFile f[] = {{"actix_web_app.rs",
-                                "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
-                                "    format!(\"{}\", path)\n}\n\n"
-                                "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
-                                "    format!(\"{}\", path)\n}\n\n"
-                                "fn list_widgets() {}\nfn create_widget() {}\n\n"
+                                "fn list_widgets() {}\n\n"
                                 "fn main() {\n"
-                                "    actix_web_get(\"/widgets\", list_widgets);\n"
-                                "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
+                                "    App::new().route(\"/widgets\", list_widgets);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }

@@ -594,6 +594,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_diagrams.c \
     src/pipeline/doc_links_msbuild.c \
     src/pipeline/pass_route_nodes.c \
+    src/pipeline/pass_route_registration.c \
     src/pipeline/pass_enrichment.c \
     src/pipeline/pass_compile_commands.c \
     src/pipeline/pass_infrascan.c \

@@ -719,12 +719,29 @@ static inline bool rq_check_domain(cbm_store_t *store, const char *project, cons
         "LEFT JOIN nodes s ON s.project=r.project AND s.qualified_name=r.scope "
         "LEFT JOIN nodes t ON t.project=r.project AND t.qualified_name=r.target "
         "WHERE r.project=?1 AND r.emitted=1";
+    /* Every edge needs an attesting occurrence, except what the projection table
+     * keeps by its producer's marker and the endpoints' labels (pass_resolver.c):
+     * those have their own rule and no occurrence, so they are pinned at edge
+     * level by the resolver_infra suite and stay outside this audit. A known gap
+     * or forbidden row here speaks of occurrence proof, not of those edges. */
     const char *edges =
         "SELECT s.file_path,s.qualified_name,e.type,t.qualified_name,t.file_path,t.start_line,"
         "t.end_line,t.name,t.label,s.name,EXISTS(SELECT 1 FROM resolver_occurrences r "
         "WHERE r.project=e.project AND r.emitted=1 AND r.scope=s.qualified_name "
         "AND r.target=t.qualified_name AND r.relation=e.type),s.properties FROM edges e "
-        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1";
+        "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 "
+        "AND NOT ((e.type='CALLS' AND t.label='Route' AND "
+        "json_extract(e.properties,'$.via')='route_registration') OR "
+        "(e.type='CALLS' AND t.label='Function' AND "
+        "json_extract(e.properties,'$.strategy')='helm_include') OR "
+        "(e.type='USAGE' AND s.label='Resource' AND t.label='Resource' AND "
+        "json_extract(e.properties,'$.ref') IS NOT NULL) OR "
+        "(e.type='USAGE' AND s.label='Resource' AND t.label='Struct' AND "
+        "json_extract(e.properties,'$.ref')='crd-type') OR "
+        "(e.type='IMPORTS' AND t.label='Module' AND "
+        "json_extract(e.properties,'$.via')='helm_release_values') OR "
+        "(e.type='USAGE' AND t.label IN ('Table','View','Model') AND "
+        "json_extract(e.properties,'$.via')='sql_relation'))";
     if (valid && !report->metadata_errors) {
         const RQ_Source *domain = project_declarations_only ? sources : NULL;
         (void)rq_query(db, project, rows, false, states, count + negative_count, domain,

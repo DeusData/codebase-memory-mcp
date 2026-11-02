@@ -2292,6 +2292,10 @@ const char *cbm_pipeline_mux_route_path(const CBMCall *call, CBMLanguage lang) {
 
 const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang, char *buf,
                                           size_t buf_sz) {
+    const char *dsl = cbm_route_registration_dsl_method(call, lang);
+    if (dsl) {
+        return dsl;
+    }
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     if (method && strcmp(method, "ANY") != 0) {
         return method;
@@ -2303,8 +2307,8 @@ const char *cbm_pipeline_route_reg_method(const CBMCall *call, CBMLanguage lang,
     return method;
 }
 
-static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler,
-                                           CBMLanguage lang) {
+const char *cbm_pipeline_route_path_in_args(const CBMCall *call, const char **out_handler,
+                                            CBMLanguage lang) {
     *out_handler = NULL;
     /* 1. First string arg starting with / */
     if (is_route_path_shaped(call->first_string_arg)) {
@@ -2499,7 +2503,7 @@ static bool emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_rp);
-    bool emitted = cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props) > 0;
+    bool handled = false;
     if (handler_ref && handler_ref[0] != '\0') {
         /* Python: a handler an app factory registers is usually its local def
          * (`app.add_url_rule("/", "index", index)` inside create_app); only the
@@ -2522,10 +2526,14 @@ static bool emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                 cbm_json_escape(esc_h2, sizeof(esc_h2), hres.qualified_name);
                 snprintf(hp, sizeof(hp), "{\"handler\":\"%s\"}", esc_h2);
                 cbm_gbuf_insert_edge(gbuf, h->id, rid, "HANDLES", hp);
+                handled = true;
             }
         }
     }
-    return emitted;
+    if (!handled) {
+        cbm_route_registration_note_handler(props, sizeof(props), call, handler_ref);
+    }
+    return cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props) > 0;
 }
 
 /* Reject regex metacharacters, spaces, double-slashes in URL candidates. */
@@ -2888,8 +2896,13 @@ static bool emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
-        const char *route_path = find_route_path_in_args(call, &handler_ref, lang);
+        const char *route_path = cbm_pipeline_route_path_in_args(call, &handler_ref, lang);
         if (route_path) {
+            /* A route verb with a path that is no registration is a client call,
+             * a store key or a string method: no Route, no edge, no URL guess. */
+            if (!cbm_route_registration_real(call)) {
+                return false;
+            }
             evidence->route_registered = true;
             return emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                            registry, main_gbuf, imp_keys, imp_vals, imp_count,
@@ -2946,7 +2959,8 @@ static bool emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
                                      const char **imp_keys, const char **imp_vals, int imp_count,
                                      const char *route_mount, CBMLanguage lang,
                                      CBMCallEvidence *evidence) {
-    if (cbm_service_pattern_route_method(call->callee_name) == NULL) {
+    if (cbm_service_pattern_route_method(call->callee_name) == NULL &&
+        !cbm_route_registration_dsl_method(call, lang)) {
         return false;
     }
     cbm_svc_kind_t svc = cbm_service_pattern_match(call->callee_name);
@@ -2954,8 +2968,8 @@ static bool emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
         return false;
     }
     const char *handler_ref = NULL;
-    const char *route_path = find_route_path_in_args(call, &handler_ref, lang);
-    if (route_path) {
+    const char *route_path = cbm_pipeline_route_path_in_args(call, &handler_ref, lang);
+    if (route_path && cbm_route_registration_real(call)) {
         evidence->route_registered = true;
         return emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                        registry, main_gbuf, imp_keys, imp_vals, imp_count,
@@ -3625,7 +3639,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             site_evidence->candidate_qn = cbm_registry_diagnostic_candidate(
                 rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count, lang);
-            if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
+            if (cbm_route_registration_dsl_method(call, lang)) {
+                site_evidence->calls_emitted |= emit_xlang_refused_route(
+                    ws->local_edge_buf, source_node, call, module_qn, rc->registry, rc->main_gbuf,
+                    imp_keys, imp_vals, imp_count, route_mount, lang, site_evidence);
+            } else if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
@@ -3939,7 +3957,8 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         char uprops[CBM_SZ_512];
         char esc_ref[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
         cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
-        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"%s}", esc_ref,
+                 cbm_pipeline_sql_lineage_mark(lang, rel, tgt));
         const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
         cbm_gbuf_insert_edge(ws->local_edge_buf, src->id, tgt->id, edge_type, uprops);
         ws->usages_resolved++;
@@ -4708,8 +4727,10 @@ static void resolve_worker_impl(int worker_id, void *ctx_ptr) {
         evidence = resolve_evidence_new(rc, result);
         /* ── CALLS resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
+        cbm_route_registration_file_begin(result, lang, rc->files[file_idx].path);
         resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang,
                            &php_vendor, evidence);
+        cbm_route_registration_file_end();
         atomic_fetch_add_explicit(&rc->time_ns_calls, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 

@@ -133,7 +133,7 @@ typedef struct {
     size_t source_length;
     unsigned play;
     bool source_supported;
-    bool handlers_complete;
+    CBMHashTable *handler_gaps; /* role dir, or "F:file#play": a handler there has no known name */
 } an_t;
 
 static bool an_type(TSNode n, const char *t) {
@@ -1323,6 +1323,28 @@ static void an_applies_reset(an_t *a) {
     a->fact_n = 0;
 }
 
+/* A handler this scope holds cannot be named: a notify looking here can no
+ * longer tell which one it reaches. Other roles' and plays' lookups stay closed. */
+static void an_handler_gap(an_t *a) {
+    if (!a->handler_gaps)
+        return;
+    const char *key = a->role_dir[0] ? cbm_arena_strdup(a->arena, a->role_dir)
+                                     : cbm_arena_sprintf(a->arena, "F:%s#%u", a->file, a->play);
+    if (key)
+        cbm_ht_set(a->handler_gaps, key, a->handler_gaps);
+    else
+        atomic_store(&a->ctx->resolver_failed, true);
+}
+
+static bool an_notify_scope_closed(const an_t *a, const an_notify_t *note) {
+    if (!a->handler_gaps)
+        return false;
+    char key[CBM_SZ_2K];
+    snprintf(key, sizeof(key), "F:%s", note->scope_file);
+    return !cbm_ht_has(a->handler_gaps, key) && !(note->scope_role && note->scope_role[0] &&
+                                                  cbm_ht_has(a->handler_gaps, note->scope_role));
+}
+
 static void an_index_handler(an_t *a, const char *name, int64_t id, bool listener) {
     /* A role loads handlers/main by convention. Merely residing somewhere
      * below handlers/ is not a proof that an alternate file was loaded. */
@@ -1333,7 +1355,7 @@ static void an_index_handler(an_t *a, const char *name, int64_t id, bool listene
     }
     char key[CBM_SZ_2K];
     if (!an_literal(name) || !a->source_supported) {
-        a->handlers_complete = false;
+        an_handler_gap(a);
         return;
     }
     if (a->role_dir[0]) {
@@ -1416,19 +1438,19 @@ static void an_task(an_t *a, TSNode m, bool handler) {
     char n[CBM_SZ_256];
     if (handler) {
         if (!named && !ts_node_is_null(an_get(a, m, "name")))
-            a->handlers_complete = false;
+            an_handler_gap(a);
         if (named) {
             an_index_handler(a, name, id, false);
         }
         TSNode listen = an_get(a, m, "listen");
         uint32_t ln = an_name_count(a, listen, &list);
         if (!ln && !ts_node_is_null(listen))
-            a->handlers_complete = false;
+            an_handler_gap(a);
         for (uint32_t i = 0; i < ln; i++) {
             if (an_name_at(a, listen, list, i, n, sizeof(n))) {
                 an_index_handler(a, n, id, true);
             } else {
-                a->handlers_complete = false;
+                an_handler_gap(a);
             }
         }
     }
@@ -1552,7 +1574,7 @@ static void an_link_notifies(an_t *a) {
             continue; /* allocation failure already prevents publication */
         char properties[CBM_SZ_64], key[CBM_SZ_2K];
         snprintf(properties, sizeof(properties), "{\"via\":\"notify\",\"line\":%d}", note->line);
-        bool supported = note->supported && a->handlers_complete;
+        bool supported = note->supported && an_notify_scope_closed(a, note);
         bool found = false;
         for (int listener = 0; listener < 2; listener++) {
             const an_ids_t *ids = an_notify_targets(a, note, listener != 0, key, sizeof(key));
@@ -1781,6 +1803,7 @@ static void an_free(an_t *a) {
     if (a->handlers) {
         cbm_ht_foreach(a->handlers, an_free_ids_entry, NULL);
         cbm_ht_free(a->handlers);
+        cbm_ht_free(a->handler_gaps);
     }
     an_applies_reset(a);
     cbm_free(CBM_MEM_CLASS_OTHER, a->renders);
@@ -1806,7 +1829,7 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
                                int file_count) {
     CBMArena arena;
     cbm_arena_init_lazy(&arena, CBM_SZ_4K);
-    an_t a = {.ctx = ctx, .arena = &arena, .handlers_complete = true};
+    an_t a = {.ctx = ctx, .arena = &arena};
     an_cands_t cands = {0};
     TSParser *parser = ts_parser_new();
     CBMHashTable *file_nodes = NULL;
@@ -1853,6 +1876,7 @@ void cbm_pipeline_pass_ansible(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     /* pass 2: the tasks of the Ansible files (what each applies), then their notifies */
     an_mark_ansible(&a, &cands, files);
     a.handlers = cands.count > 0 ? cbm_ht_create(0) : NULL;
+    a.handler_gaps = cands.count > 0 ? cbm_ht_create(0) : NULL;
     a.by_rel = a.handlers ? cbm_ht_create(0) : NULL;
     if (cands.count > 0 && (!a.handlers || !a.by_rel))
         atomic_store(&ctx->resolver_failed, true);

@@ -179,25 +179,6 @@ static bool path_has_route(const char *hay, const char *needle) {
     return false;
 }
 
-/* A route prefix's segments (`items`, `api/v1`) as whole segments of a file
- * path: `app/routers/items.py`, `items/views.py`; `a` is not in
- * `docs_src/app_testing/main.py`. */
-static bool file_has_segments(const char *path, const char *segs) {
-    size_t n = strlen(segs);
-    if (n == 0) {
-        return false;
-    }
-    for (const char *p = strstr(path, segs); p; p = strstr(p + SKIP_ONE, segs)) {
-        char c = p[n];
-        bool start = p == path || p[-SKIP_ONE] == '/';
-        bool end = segs[n - SKIP_ONE] == '/' || c == '\0' || c == '/' || c == '.';
-        if (start && end) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* Check if a trailing dash-segment is a hash/project-number (strippable).
  * Returns true if the segment is short alphanumeric but not a meaningful word. */
 static bool is_hash_segment(const char *seg, size_t slen) {
@@ -524,99 +505,6 @@ static void ensure_decorator_routes(cbm_gbuf_t *gb) {
         char buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", created);
         cbm_log_info("pass.ensure_decorator_routes", "created", buf);
-    }
-}
-
-/* Phase 2b: Connect prefix Routes to decorator handler Functions.
- * For each prefix Route (__route__ANY__/path), find the CALLS edge leading to it
- * (from the registering file), derive the service directory, then find decorator
- * Routes in that directory tree and create HANDLES from their handler Functions
- * to the prefix Route. This bridges include_router → decorator → handler. */
-/* Bridge decorator handler Functions to a prefix Route. Returns number connected. */
-static int bridge_funcs_to_prefix(cbm_gbuf_t *gb, const cbm_gbuf_node_t *prefix_route,
-                                  const char *registrar_path, int dir_len,
-                                  const char *prefix_segs) {
-    const cbm_gbuf_node_t **funcs = NULL;
-    int func_count = 0;
-    cbm_gbuf_find_by_label(gb, "Function", &funcs, &func_count);
-
-    int connected = 0;
-    for (int fi = 0; fi < func_count; fi++) {
-        const cbm_gbuf_node_t *func = funcs[fi];
-        if (!func->file_path) {
-            continue;
-        }
-        if (strncmp(func->file_path, registrar_path, (size_t)dir_len) != 0) {
-            continue;
-        }
-        if (!func->properties_json || !strstr(func->properties_json, "\"route_path\"")) {
-            continue;
-        }
-        if (prefix_segs && prefix_segs[0] && !file_has_segments(func->file_path, prefix_segs)) {
-            continue;
-        }
-        cbm_gbuf_insert_edge(gb, func->id, prefix_route->id, "HANDLES",
-                             "{\"source\":\"prefix_decorator_bridge\"}");
-        connected++;
-    }
-    return connected;
-}
-
-/* Phase 2b: Connect prefix Routes to decorator handler Functions. */
-static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
-    const cbm_gbuf_node_t **routes = NULL;
-    int route_count = 0;
-    if (cbm_gbuf_find_by_label(gb, "Route", &routes, &route_count) != 0) {
-        return;
-    }
-
-    int connected = 0;
-
-    for (int ri = 0; ri < route_count; ri++) {
-        const cbm_gbuf_node_t *prefix_route = routes[ri];
-        if (!prefix_route->qualified_name ||
-            strncmp(prefix_route->qualified_name, "__route__ANY__/", SLEN("__route__ANY__/")) !=
-                0) {
-            continue;
-        }
-
-        const char *prefix_path = prefix_route->name;
-        const char *prefix_segs =
-            (prefix_path && prefix_path[0] == '/') ? prefix_path + SKIP_ONE : prefix_path;
-        /* A root mount (`app.mount("/", ...)`) names no part of a handler's
-         * path, so nothing tells its handlers from the rest of the directory:
-         * bridging it linked every decorated function there (fastapi: 702
-         * handlers to `/`, then to every infra URL through it). */
-        if (!prefix_segs || !prefix_segs[0]) {
-            continue;
-        }
-
-        const cbm_gbuf_edge_t **calls_in = NULL;
-        int calls_count = 0;
-        cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
-
-        /* Every registrar's directory, not the first CALLS edge's: their
-         * order is the workers' merge order, so the first one moved between
-         * runs of the same corpus. Edges dedup, so the union is order-free. */
-        for (int ci = 0; ci < calls_count; ci++) {
-            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[ci]->source_id);
-            if (!registrar || !registrar->file_path) {
-                continue;
-            }
-            const char *last_slash = strrchr(registrar->file_path, '/');
-            if (!last_slash) {
-                continue;
-            }
-            int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
-            connected += bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len,
-                                                prefix_segs);
-        }
-    }
-
-    if (connected > 0) {
-        char buf[CBM_SZ_16];
-        snprintf(buf, sizeof(buf), "%d", connected);
-        cbm_log_info("pass.prefix_bridge", "connected", buf);
     }
 }
 
@@ -1313,11 +1201,6 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     /* Phase 2a: ensure all functions with route_path have Route+HANDLES.
      * Handles incremental mode where unchanged files don't re-extract. */
     ensure_decorator_routes(gb);
-
-    /* Phase 2b: connect prefix Routes to decorator handler Functions.
-     * Must run BEFORE match_infra_routes so infra matching can find
-     * HANDLES edges on prefix Routes for the bridge. */
-    connect_prefix_to_decorators(gb);
 
     /* Phase 2b: match infra Routes to handler Routes by URL path */
     match_infra_routes(gb);

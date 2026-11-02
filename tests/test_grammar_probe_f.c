@@ -1043,9 +1043,12 @@ static const char k_pod_refs_app[] =
  * account, pull secret, mounted ConfigMap and claim, env sources. */
 TEST(probe_k8s_pod_spec_references) {
     static const GpfFile files[] = {{"app.yaml", k_pod_refs_app}};
-    /* WHY: a directory or shared YAML document does not select an apply domain.
-     * Tried the original six references unchanged; explicit flat membership is
-     * the supported counterpart and must retain all six exact declarations. */
+    /* WHY: a directory or shared YAML document does not select an apply domain for
+     * an occurrence proof. Tried the original six references unchanged; explicit flat
+     * membership is the supported counterpart and must retain all six exact
+     * declarations. These rows speak of occurrences only, here and in every Kubernetes
+     * and Helm probe below: pass_k8s still draws an edge by its own rule, which
+     * projection keeps by its marker. resolver_infra pins those edges. */
     const RQ_Forbidden unconfigured[] = {{.case_id = "unconfigured-pod-web-sa",
                                           .site = {.file = "app.yaml",
                                                    .caller = "app.yaml::apps/Deployment/-/web",
@@ -6935,7 +6938,10 @@ static bool gpf_image_projection(cbm_store_t *store, const char *project,
         const char *sql =
             "SELECT (SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
             "WHERE e.project=?1 AND s.qualified_name=?2 AND e.type IN "
-            "('IMPORTS','CALLS','CALL_REFERENCE','USAGE','READS','WRITES','USES_TYPE')),"
+            "('IMPORTS','CALLS','CALL_REFERENCE','USAGE','READS','WRITES','USES_TYPE') "
+            /* Kept by their producer's marker, with no occurrence to count here. */
+            "AND coalesce(json_extract(e.properties,'$.strategy'),'')<>'helm_include' "
+            "AND coalesce(json_extract(e.properties,'$.ref'),'image')='image'),"
             "(SELECT count(*) FROM resolver_occurrences r WHERE r.project=?1 AND r.emitted=1 "
             "AND r.scope=?2),"
             "(SELECT count(*) FROM resolver_occurrences r WHERE r.project=?1 AND r.emitted=1 "

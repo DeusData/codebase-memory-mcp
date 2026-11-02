@@ -318,7 +318,8 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
         char esc_ref[CBM_SZ_256];
         cbm_json_escape(esc_ref, sizeof(esc_ref), usage->ref_name);
         char uprops[CBM_SZ_512];
-        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"}", esc_ref);
+        snprintf(uprops, sizeof(uprops), "{\"callee\":\"%s\"%s}", esc_ref,
+                 cbm_pipeline_sql_lineage_mark(lang, rel, tgt));
         const char *edge_type = precise_call_reference ? "CALL_REFERENCE" : "USAGE";
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, edge_type, uprops);
         resolved++;

@@ -524,6 +524,12 @@ static yyjson_mut_val *tf_json(const tf_t *t, yyjson_mut_doc *doc, TSNode n) {
 
 static char *tf_read(const char *path, size_t *len);
 
+static bool tf_file_is_empty(const char *path) {
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_regular &&
+           !info.is_symlink && info.size == 0;
+}
+
 /* A repository file's text (cbm_alloc; capped and padded like every file
  * read; an empty file is empty text), NULL when unreadable -- or when it is
  * no file discovery took in: a symlink, or a path through one, is never
@@ -764,7 +770,8 @@ static void tf_release_push(tf_t *t, int64_t src, int64_t chart, TSNode body) {
         const char *mqn = cbm_fqn_module(t->arena, ctx->project_name, files[i]);
         const cbm_gbuf_node_t *mod = mqn ? cbm_gbuf_find_by_qn(ctx->gbuf, mqn) : NULL;
         if (mod && mod->id != src) {
-            cbm_gbuf_insert_edge(ctx->gbuf, src, mod->id, "IMPORTS", "{\"local_name\":\"values\"}");
+            cbm_gbuf_insert_edge(ctx->gbuf, src, mod->id, "IMPORTS",
+                                 "{\"local_name\":\"values\",\"via\":\"helm_release_values\"}");
             t->edges++;
         }
     }
@@ -1535,6 +1542,8 @@ static tf_mod_t *tf_mod_parse(cbm_pipeline_ctx_t *ctx, CBMArena *arena, TSParser
         snprintf(path, sizeof(path), "%s/%s", ctx->repo_path, paths[i]);
         size_t len = 0;
         char *src = tf_read(path, &len);
+        if (!src && tf_file_is_empty(path))
+            continue; /* it declares nothing and references nothing */
         TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
         if (!src || !tree)
             atomic_store(&ctx->resolver_failed, true);
@@ -2114,6 +2123,8 @@ static void tg_unit(tg_t *g, TSParser *parser, const char *rel) {
     snprintf(path, sizeof(path), "%s/%s", g->ctx->repo_path, rel);
     size_t len = 0;
     char *src = g->udir ? tf_read(path, &len) : NULL;
+    if (!src && g->udir && tf_file_is_empty(path))
+        return; /* an empty terragrunt.hcl includes nothing */
     TSTree *tree = src ? ts_parser_parse_string(parser, NULL, src, (uint32_t)len) : NULL;
     if (!src || !tree)
         atomic_store(&g->ctx->resolver_failed, true);

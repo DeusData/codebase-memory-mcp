@@ -618,20 +618,9 @@ cbm_svc_kind_t cbm_pipeline_external_import_service(cbm_external_import_index_t 
     return CBM_SVC_NONE;
 }
 
-/* The path a route registration's first argument names: the argument itself
- * when it opens with a slash, or in Go the path of a ServeMux pattern that
- * names a method or host first ("POST /v1/x", #2537; Handle / HandleFunc
- * only). NULL when it names no path. MUST match pass_parallel.c
- * find_route_path_in_args. */
 static const char *route_reg_path(const CBMCall *call, CBMLanguage lang) {
-    const char *arg = call->first_string_arg;
-    if (!arg) {
-        return NULL;
-    }
-    if (arg[0] == '/') {
-        return arg;
-    }
-    return cbm_pipeline_mux_route_path(call, lang);
+    const char *handler_ref = NULL;
+    return cbm_pipeline_route_path_in_args(call, &handler_ref, lang);
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge.
@@ -644,8 +633,10 @@ static bool handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     char mux_method[CBM_SZ_16];
     const char *method = cbm_pipeline_route_reg_method(call, lang, mux_method, sizeof(mux_method));
     char mounted[CBM_SZ_256];
-    const char *path =
-        cbm_laravel_mount_route(route_mount, route_reg_path(call, lang), mounted, sizeof(mounted));
+    const char *handler_ref = NULL;
+    const char *path = cbm_laravel_mount_route(
+        route_mount, cbm_pipeline_route_path_in_args(call, &handler_ref, lang), mounted,
+        sizeof(mounted));
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
@@ -658,23 +649,23 @@ static bool handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     char esc_fa[CBM_SZ_256];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
     cbm_json_escape(esc_fa, sizeof(esc_fa), path);
-    char props[CBM_SZ_512];
+    char props[CBM_SZ_1K];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
-    bool emitted = cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props) > 0;
-    if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
+    bool handled = false;
+    if (handler_ref != NULL && handler_ref[0] != '\0') {
         /* Python: an app factory registers its local defs
          * (`app.add_url_rule("/", "index", index)` inside create_app); only the
          * lexical lookup sees a function's locals. MUST match pass_parallel.c. */
         cbm_resolution_t hres = {0};
         if (lang == CBM_LANG_PYTHON) {
-            hres = cbm_registry_resolve_lexical(ctx->registry, call->second_arg_name,
-                                                call->enclosing_func_qn, module_qn);
+            hres = cbm_registry_resolve_lexical(ctx->registry, handler_ref, call->enclosing_func_qn,
+                                                module_qn);
         }
         if (!hres.qualified_name) {
-            hres = cbm_registry_resolve_handler(ctx->registry, call->second_arg_name, module_qn,
-                                                imp_keys, imp_vals, imp_count, ctx->gbuf, lang);
+            hres = cbm_registry_resolve_handler(ctx->registry, handler_ref, module_qn, imp_keys,
+                                                imp_vals, imp_count, ctx->gbuf, lang);
         }
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
@@ -685,10 +676,14 @@ static bool handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
                 cbm_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
                 snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
                 cbm_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
+                handled = true;
             }
         }
     }
-    return emitted;
+    if (!handled) {
+        cbm_route_registration_note_handler(props, sizeof(props), call, handler_ref);
+    }
+    return cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props) > 0;
 }
 
 /* Emit an HTTP/async route edge for a service call. */
@@ -884,6 +879,11 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  CBMLanguage lang, CBMCallEvidence *evidence) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && route_reg_path(call, lang) != NULL) {
+        /* MUST match pass_parallel.c: a route verb with a path that is no
+         * registration gets no Route, no edge and no URL guess. */
+        if (!cbm_route_registration_real(call)) {
+            return false;
+        }
         evidence->route_registered = true;
         return handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
                                          imp_count, route_mount, lang);
@@ -996,9 +996,14 @@ static bool calls_emit_route_call(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                   const char **imp_keys, const char **imp_vals, int imp_count,
                                   const char *route_mount, CBMLanguage lang,
                                   CBMCallEvidence *evidence) {
-    if (cbm_service_pattern_route_method(call->callee_name) == NULL ||
+    if ((cbm_service_pattern_route_method(call->callee_name) == NULL &&
+         !cbm_route_registration_dsl_method(call, lang)) ||
         route_reg_path(call, lang) == NULL) {
         return false;
+    }
+    /* Handled, and not a registration: the unresolved path adds no URL guess. */
+    if (!cbm_route_registration_real(call)) {
+        return true;
     }
     evidence->calls_emitted |= handle_route_registration(
         ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count, route_mount, lang);
@@ -1621,6 +1626,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_pipeline_lsp_field_index_t field_index = {0};
         bool field_index_ready =
             cbm_pipeline_lsp_field_index_build(&result->resolved_calls, &field_index);
+        cbm_route_registration_file_begin(result, files[i].language, files[i].path);
         for (int c = 0; c < result->calls.count; c++) {
             CBMCall *call = &result->calls.items[c];
             if (!call->callee_name) {
@@ -1638,6 +1644,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 unresolved++;
             }
         }
+        cbm_route_registration_file_end();
         cbm_pipeline_external_import_index_free(&ext_imports);
         cbm_pipeline_lsp_field_index_free(&field_index);
 

@@ -2211,6 +2211,13 @@ static void k8s_scope_add(const char *bundle, void *ud) {
     k8s_index_add(j->ix, key, j->id);
 }
 
+/* As k8s_scope_add, for the builds a manifest declares: a directory is none. */
+static void k8s_scope_add_declared(const char *bundle, void *ud) {
+    if (strncmp(bundle, "dir:", K8S_SLEN("dir:")) != 0) {
+        k8s_scope_add(bundle, ud);
+    }
+}
+
 static void k8s_scope_find(const char *bundle, void *ud) {
     k8s_scope_job_t *j = ud;
     char key[CBM_SZ_1K];
@@ -2271,8 +2278,17 @@ static void k8s_effective_ns(const cbm_gbuf_node_t *n, char *out, size_t out_sz)
 /* Does the target at `tgt` answer `ref` from `src`: one bundle, and the
  * namespace the reference asks for (explicit, else the source's own there)
  * agrees with the target's there? A cluster-scoped kind has no namespace. */
+/* Do the namespaces agree? strict: an unset one against a set one is not known
+ * to, since an object without a namespace lands wherever it is applied. */
+static bool k8s_ns_agrees(const char *want, const char *have, bool strict) {
+    if (!want[0] || !have[0]) {
+        return !strict || (!want[0] && !have[0]);
+    }
+    return strcmp(want, have) == 0;
+}
+
 static bool k8s_ref_meets(k8s_bundles_t *b, const k8s_ref_t *ref, const cbm_gbuf_node_t *src,
-                          const cbm_gbuf_node_t *tgt) {
+                          const cbm_gbuf_node_t *tgt, bool declared_build, bool strict) {
     k8s_member_t one_s[SKIP_ONE];
     k8s_member_t one_t[SKIP_ONE];
     k8s_members_t single_s = {.items = one_s, .cap = SKIP_ONE};
@@ -2289,9 +2305,13 @@ static bool k8s_ref_meets(k8s_bundles_t *b, const k8s_ref_t *ref, const cbm_gbuf
             if (ms->items[i].bundle != mt->items[j].bundle) {
                 continue;
             }
+            /* A kustomization or a Chart.yaml declares its build; a directory does not. */
+            if (declared_build && strncmp(ms->items[i].bundle, "dir:", K8S_SLEN("dir:")) == 0) {
+                continue;
+            }
             const char *want = ref->ns ? ref->ns : ms->items[i].ns ? ms->items[i].ns : src_ns;
             const char *have = mt->items[j].ns ? mt->items[j].ns : tgt_ns;
-            if (cluster || !want[0] || !have[0] || strcmp(want, have) == 0) {
+            if (cluster || k8s_ns_agrees(want, have, strict)) {
                 return true;
             }
         }
@@ -2311,7 +2331,7 @@ static bool k8s_ref_meets(k8s_bundles_t *b, const k8s_ref_t *ref, const cbm_gbuf
             }
             const char *want = ref->ns ? ref->ns : ds->items[i].ns ? ds->items[i].ns : src_ns;
             const char *have = dt->items[j].ns ? dt->items[j].ns : tgt_ns;
-            if (cluster || !want[0] || !have[0] || strcmp(want, have) == 0) {
+            if (cluster || k8s_ns_agrees(want, have, strict)) {
                 return true;
             }
         }
@@ -2519,6 +2539,33 @@ static bool k8s_raw_source_kind(const k8s_raw_decl_t *owner) {
            (!strcmp(owner->kind, "Job") || !strcmp(owner->kind, "CronJob"));
 }
 
+/* A custom resource that takes a built-in workload's kind name: its fields only
+ * look like a PodSpec, so no reference or image is read from them. Other custom
+ * resources declare their own schema, which the reference table already names. */
+static bool k8s_kind_impostor(const k8s_raw_decl_t *owner) {
+    static const struct {
+        const char *kind, *group, *alternate;
+    } builtin[] = {{"Pod", "core", NULL},
+                   {"ReplicationController", "core", NULL},
+                   {"ServiceAccount", "core", NULL},
+                   {"Deployment", "apps", "extensions"},
+                   {"StatefulSet", "apps", NULL},
+                   {"DaemonSet", "apps", "extensions"},
+                   {"ReplicaSet", "apps", "extensions"},
+                   {"Job", "batch", NULL},
+                   {"CronJob", "batch", NULL}};
+    if (!owner || !owner->kind || !owner->group) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(builtin) / sizeof(builtin[0]); i++) {
+        if (!strcmp(owner->kind, builtin[i].kind)) {
+            return strcmp(owner->group, builtin[i].group) != 0 &&
+                   (!builtin[i].alternate || strcmp(owner->group, builtin[i].alternate) != 0);
+        }
+    }
+    return false;
+}
+
 static bool k8s_raw_reference(k8s_facts_t *facts, const k8s_ref_t *reference) {
     if (!reference->site)
         return true; /* no fabricated occurrence for rendered templates */
@@ -2632,6 +2679,39 @@ static void k8s_raw_resolve(k8s_facts_t *facts) {
                               cbm_gbuf_resolution_proof_work(gbuf) - before, memory_order_relaxed);
 }
 
+/* The directories of kustomizations whose memberships this reader cannot
+ * enumerate (`resources: *alias`, flow lists): NULL when there are none. */
+static CBMHashTable *k8s_open_builds(const k8s_facts_t *f) {
+    CBMHashTable *dirs = NULL;
+    for (const k8s_raw_config_t *config = f->raw_configs; config; config = config->next) {
+        if (config->memberships_complete || !config->path) {
+            continue;
+        }
+        char dir[CBM_SZ_1K];
+        k8s_dirname(config->path, dir, sizeof(dir));
+        dirs = dirs ? dirs : cbm_ht_create(0);
+        if (dirs && !cbm_ht_has(dirs, dir)) {
+            char *key = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, dir);
+            if (key) {
+                cbm_ht_set(dirs, key, key);
+            }
+        }
+    }
+    return dirs;
+}
+
+static void k8s_free_open_dir(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    cbm_free(CBM_MEM_CLASS_OTHER, (void *)key);
+}
+
+static bool k8s_in_open_build(const CBMHashTable *dirs, const char *file) {
+    char dir[CBM_SZ_1K];
+    k8s_dirname(file, dir, sizeof(dir));
+    return cbm_ht_has(dirs, dir);
+}
+
 /* Draw every reference to the object(s) it names inside its bundle;
  * an unresolved reference draws nothing. An exposed route's reference
  * leaves from its Route node. */
@@ -2639,13 +2719,16 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
     int edges = 0;
     int unresolved = 0;
     CBMHashTable *ix = f->ref_n > 0 ? k8s_index_objects(ctx, b, true) : NULL;
+    CBMHashTable *open_dirs = f->ref_n > 0 ? k8s_open_builds(f) : NULL;
     k8s_ids_t found = {0};
     const cbm_gbuf_node_t **cands = NULL;
     int cand_cap = 0;
     for (int i = 0; ix && i < f->ref_n; i++) {
         const k8s_ref_t *ref = &f->refs[i];
-        if (ref->edge && !strcmp(ref->edge, "USAGE"))
-            continue; /* controlled relation: only k8s_raw_resolve may publish it */
+        /* USAGE names one object: its kind, name and namespace in the file's own
+         * document stream, else in the one build a manifest declares for it. Two
+         * candidates are alternatives, and the deployed one cannot be told. */
+        bool strict = ref->edge && !strcmp(ref->edge, "USAGE");
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(ctx->gbuf, ref->src);
         int64_t from = src ? src->id : 0;
         if (ref->route) {
@@ -2690,24 +2773,54 @@ static void k8s_resolve_refs(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8
         for (int c = 0; c < n && !own_file; c++) {
             const cbm_gbuf_node_t *t = cands[c];
             own_file = t != src && t->label && strcmp(t->label, "Resource") == 0 && t->file_path &&
-                       strcmp(t->file_path, src->file_path) == 0 && k8s_ref_meets(b, ref, src, t);
+                       strcmp(t->file_path, src->file_path) == 0 &&
+                       k8s_ref_meets(b, ref, src, t, false, strict);
         }
         int hits = 0;
+        bool conflict = false;
+        const cbm_gbuf_node_t *only = NULL;
         for (int c = 0; c < n; c++) {
             const cbm_gbuf_node_t *t = cands[c];
             if (t == src || !t->label || strcmp(t->label, "Resource") != 0 || !t->file_path ||
-                (own_file && strcmp(t->file_path, src->file_path) != 0) ||
-                !k8s_ref_meets(b, ref, src, t)) {
+                !k8s_ref_meets(b, ref, src, t, strict && strcmp(t->file_path, src->file_path) != 0,
+                               strict)) {
+                continue;
+            }
+            /* A copy in another file gives way to the file's own, as versioned
+             * manifests side by side do; inside one declared build both are
+             * declared, so a strict reference abstains. */
+            if (own_file && strcmp(t->file_path, src->file_path) != 0) {
+                conflict |= strict;
+                continue;
+            }
+            hits++;
+            if (strict) {
+                only = t;
                 continue;
             }
             cbm_gbuf_insert_edge(ctx->gbuf, from, t->id, ref->edge, props);
-            hits++;
+        }
+        if (strict) {
+            /* A build this reader cannot enumerate may hold another copy. */
+            bool open_build = !own_file && open_dirs && src && src->file_path &&
+                              k8s_in_open_build(open_dirs, src->file_path);
+            hits = hits == 1 && from > 0 && !conflict && !open_build &&
+                           !k8s_kind_impostor(ref->declaration)
+                       ? hits
+                       : 0;
+            if (hits == 1) {
+                cbm_gbuf_insert_edge(ctx->gbuf, from, only->id, ref->edge, props);
+            }
         }
         edges += hits;
         unresolved += hits == 0;
     }
     cbm_free(CBM_MEM_CLASS_OTHER, (void *)cands);
     cbm_free(CBM_MEM_CLASS_OTHER, found.items);
+    if (open_dirs) {
+        cbm_ht_foreach(open_dirs, k8s_free_open_dir, NULL);
+        cbm_ht_free(open_dirs);
+    }
     if (ix) {
         cbm_ht_foreach(ix, k8s_free_ids_entry, NULL);
         cbm_ht_free(ix);
@@ -2790,7 +2903,7 @@ static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_f
         const cbm_gbuf_node_t *crd = cbm_gbuf_find_by_id(ctx->gbuf, f->crds[order[i].crd].node);
         if (crd && crd->file_path) {
             k8s_scope_job_t j = {in_bundle, order[i].key, crd->id, NULL};
-            k8s_each_scope(b, crd->file_path, false, k8s_scope_add, &j);
+            k8s_each_scope(b, crd->file_path, false, k8s_scope_add_declared, &j);
         }
     }
     k8s_ids_t beside = {0};
@@ -2816,32 +2929,24 @@ static void k8s_link_crds(cbm_pipeline_ctx_t *ctx, k8s_bundles_t *b, const k8s_f
             if (first < 0) {
                 continue;
             }
+            /* A cluster has one CRD per group and kind. The object's declared
+             * build selects its copy; with no build, only a sole copy in the
+             * repository is that CRD. Several copies with nothing to choose
+             * between them draw nothing. */
             k8s_find_in_scopes(b, in_bundle, nodes[i]->file_path, type, false, &beside);
-            if (beside.count > 0) {
-                atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)beside.count,
-                                          memory_order_relaxed);
-                for (int r = 0; r < beside.count; r++) {
-                    if (beside.items[r] != nodes[i]->id) {
-                        cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, beside.items[r], "USAGE",
-                                             "{\"ref\":\"crd\"}");
-                        edges++;
-                    }
-                }
-                continue;
-            }
             int end = first;
             while (end < f->crd_n && strcmp(order[end].key, type) == 0) {
                 end++;
             }
+            int64_t crd_id = beside.count == 1  ? beside.items[0]
+                             : beside.count > 1 ? 0
+                             : end - first == 1 ? f->crds[order[first].crd].node
+                                                : 0;
             atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)(end - first),
                                       memory_order_relaxed);
-            for (int r = first; r < end; r++) {
-                int64_t crd_id = f->crds[order[r].crd].node;
-                if (crd_id != nodes[i]->id) {
-                    cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, crd_id, "USAGE",
-                                         "{\"ref\":\"crd\"}");
-                    edges++;
-                }
+            if (crd_id > 0 && crd_id != nodes[i]->id) {
+                cbm_gbuf_insert_edge(ctx->gbuf, nodes[i]->id, crd_id, "USAGE", "{\"ref\":\"crd\"}");
+                edges++;
             }
         }
     }
@@ -4028,7 +4133,10 @@ static void k8s_inc_call(k8s_inc_t *s, const char *name, int line, const char *v
     }
     k8s_ids_sort_unique(&s->found);
     atomic_fetch_add_explicit(&g_k8s_candidates, (uint64_t)s->found.count, memory_order_relaxed);
-    int64_t src = s->found.count > 0 ? k8s_inc_source(s, line) : 0;
+    /* Helm's named templates share one namespace across a chart and its
+     * dependencies, and two definitions of a name are resolved by load order
+     * this pass does not model: only a sole definition is the target. */
+    int64_t src = s->found.count == 1 ? k8s_inc_source(s, line) : 0;
     if (src <= 0) {
         s->unresolved++;
         return;

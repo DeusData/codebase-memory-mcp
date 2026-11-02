@@ -5414,6 +5414,71 @@ TEST(incremental_deleted_caller_drops_its_route) {
     PASS();
 }
 
+/* Full and incremental publish the same Routes. A registration keeps its Route
+ * while its file exists; deleting the file removes it on either route, and a
+ * call that only looks like one leaves no Route on either. `legacy`: through
+ * the full-load route, else closure repair. *before / *after: the Route count;
+ * *edgeless: Routes left with no edge after the deletion. */
+static bool incremental_registrar_delete(bool legacy, cbm_incremental_route_t *route, int *before,
+                                         int *after, int *edgeless) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_regc_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return false;
+    }
+    write_temp_file(tmp, "a.js",
+                    "const express = require('express');\n"
+                    "const app = express();\n"
+                    "app.get('/a', function (req, res) {});\n");
+    write_temp_file(tmp, "b.js",
+                    "const express = require('express');\n"
+                    "const app = express();\n"
+                    "app.get('/b', function (req, res) {});\n"
+                    "function probe(client, done) {\n"
+                    "  client.get('/not-a-route', done);\n"
+                    "}\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/regc.db", tmp);
+    static const char routes[] = "SELECT COUNT(*) FROM nodes WHERE label='Route'";
+    static const char lone[] =
+        "SELECT COUNT(*) FROM nodes n WHERE label='Route' AND NOT EXISTS (SELECT 1 FROM edges e "
+        "WHERE e.source_id=n.id OR e.target_id=n.id)";
+    *before = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, routes) : -1;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/a.js", tmp);
+    (void)remove(path);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    if (legacy) {
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+    }
+#else
+    (void)legacy;
+#endif
+    *after = k8s_inc_index(tmp, db_path) == 0 ? k8s_inc_count(db_path, routes) : -1;
+    *edgeless = k8s_inc_count(db_path, lone);
+    *route = cbm_pipeline_incremental_test_last_route();
+    th_rmtree(tmp);
+    return true;
+}
+
+TEST(incremental_and_full_publish_the_same_route_registrations) {
+    cbm_incremental_route_t route = CBM_INCREMENTAL_ROUTE_NONE;
+    int before = -1, after = -1, edgeless = -1;
+    ASSERT(incremental_registrar_delete(false, &route, &before, &after, &edgeless));
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(before, 2);
+    ASSERT_EQ(after, 1);
+    ASSERT_EQ(edgeless, 0);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    ASSERT(incremental_registrar_delete(true, &route, &before, &after, &edgeless));
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(before, 2);
+    ASSERT_EQ(after, 1);
+    ASSERT_EQ(edgeless, 0);
+#endif
+    PASS();
+}
+
 /* Deleting the only Dockerfile naming an image leaves no Image node behind;
  * the image another Dockerfile still names stays. `legacy`: through the
  * full-load route, else the closure-repair route. Returns the Image count
@@ -18256,10 +18321,11 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     ASSERT_EQ(http_calls_to_route(s, project, "callApi", "__route__"), 1);
     ASSERT_EQ(http_calls_to_route(s, project, "callLoad", "__route__"), 0);
     ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 1);
-    /* Unknown receiver bindings cannot produce selected-declaration CALLS. */
+    /* Client calls on an unbound receiver register nothing; `router` with a literal path
+     * and a handler does (as main pinned), and it is a Route, not a declaration. */
     ASSERT_EQ(named_edge_count(s, project, "CALLS", "callPatch", "/plans/:id"), 0);
     ASSERT_EQ(named_edge_count(s, project, "CALLS", "callSup", "/y"), 0);
-    ASSERT_EQ(named_edge_count(s, project, "CALLS", "reg", "/users"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "reg", "/users"), 1);
     /* (3) The false plain-CALLS edges are suppressed in parallel: the regex
      * receiver and the dev.load weak match to ApiThing.load. */
     ASSERT_GTE(fixture_node_count(s, project, "src/re.ts", "checkFormat", "Function"), 1);
@@ -18374,9 +18440,10 @@ static int capitalized_axios_case(int fillers) {
         ASSERT_EQ(route_registrations_from(s, project, client[i].caller), 0);
         ASSERT_EQ(http_calls_to_route(s, project, client[i].caller, client[i].typed_route), 1);
     }
-    /* A real Express handler remains; an untyped argument proves no CALLS target. */
+    /* A real Express handler remains. The receiver is untyped, but the code calls it a
+     * router and hands it a literal path and a handler: main pinned this too. */
     ASSERT_EQ(named_edge_count(s, project, "HANDLES", "listUsers", "/api/admin/users"), 1);
-    ASSERT_EQ(route_registrations_from(s, project, "mount"), 0);
+    ASSERT_EQ(route_registrations_from(s, project, "mount"), 1);
     ASSERT_EQ(http_calls_to_route(s, project, "mount", "__route__"), 0);
 
     cbm_store_close(s);
@@ -37556,6 +37623,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(incremental_shell_deploy_edit_keeps_its_edges);
     RUN_TEST(incremental_deleted_spawner_drops_its_process);
     RUN_TEST(incremental_deleted_caller_drops_its_route);
+    RUN_TEST(incremental_and_full_publish_the_same_route_registrations);
     RUN_TEST(incremental_script_request_to_compose_service_keeps_host);
     RUN_TEST(incremental_deleted_dockerfile_drops_its_image);
     RUN_TEST(incremental_dockerfile_edit_keeps_build_edges);

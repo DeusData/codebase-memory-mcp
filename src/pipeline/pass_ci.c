@@ -767,16 +767,16 @@ static void ci_dotenv_line(CBMArena *a, const char *s, size_t n, ci_env_t *env) 
     }
     size_t vl = n - v;
     bool literal = v < n && s[v] == '\'';
-    if (!ci_dotenv_value_supported(s + v, vl)) {
-        env->unsupported = true;
-    }
+    bool supported = ci_dotenv_value_supported(s + v, vl);
     const char *val = ci_unquote(s + v, &vl);
     const char *raw = cbm_arena_strndup(a, val, vl);
     const char *expanded = raw && !literal ? ci_interp(a, raw, env) : NULL;
+    /* A value this reader cannot follow spoils that variable, which stays
+     * unknown; a named key still leaves every other variable known. */
     if (!raw || (!literal && strchr(raw, '$') && !expanded))
-        env->unsupported = true;
+        supported = false;
     env->kv[PAIR_LEN * env->n] = cbm_arena_strndup(a, s + b, kl);
-    env->kv[PAIR_LEN * env->n + SKIP_ONE] = expanded ? expanded : raw;
+    env->kv[PAIR_LEN * env->n + SKIP_ONE] = !supported ? NULL : expanded ? expanded : raw;
     env->n++;
 }
 
@@ -805,6 +805,17 @@ static const char *ci_env_lookup(const ci_env_t *env, const char *name, size_t n
         }
     }
     return NULL;
+}
+
+/* Does the environment name this variable, whatever its value? */
+static bool ci_env_declares(const ci_env_t *env, const char *name, size_t nl) {
+    for (int i = env->n - SKIP_ONE; i >= 0; i--) {
+        const char *k = env->kv[(size_t)i * PAIR_LEN];
+        if (k && strlen(k) == nl && strncmp(k, name, nl) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* JSON array `list` (NULL: empty) with identifier `name` appended once. */
@@ -879,6 +890,9 @@ static const char *ci_interp_marks(CBMArena *a, const char *s, const ci_env_t *e
             after = close + SKIP_ONE;
         }
         const char *v = ci_env_lookup(env, name, nl);
+        if (!v && ci_env_declares(env, name, nl)) {
+            return NULL; /* set to a value this reader cannot follow: no default applies */
+        }
         const char *use = v;
         size_t ul = v ? strlen(v) : 0;
         if (!v || (colon && !v[0])) {

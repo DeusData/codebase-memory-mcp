@@ -4948,6 +4948,60 @@ static int compare_record(const void *left, const void *right) {
     return order;
 }
 
+/* The exceptions to "only a recorded proof publishes a controlled relation". No
+ * language rule selects these: a framework's or a deployment format's own rule
+ * decided each one, in the producer named here. Every row needs the producer's
+ * marker AND the endpoints' labels, so an ordinary edge cannot pass, and a NULL
+ * source label means the marker alone identifies the producer. NULL value: any.
+ *   route registration    pass_route_registration.c: a Route is no declaration
+ *   Helm include          pass_k8s.c: a chart family's sole `define` of the name
+ *   Kubernetes reference  pass_k8s.c: kind, name and namespace in one document
+ *                         stream or declared build; a CRD by group and kind
+ *   CRD schema            pass_operator.c: `+groupName` package and Kind struct
+ *   release values        pass_terraform.c: a helm_release's literal values file
+ *   SQL lineage           pass_usages.c: a relation its own script creates, a dbt model */
+static const struct {
+    const char *relation, *source_label, *target_label, *key, *value;
+} projection_kept[] = {{"CALLS", NULL, "Route", "via", "route_registration"},
+                       {"CALLS", NULL, "Function", "strategy", "helm_include"},
+                       {"USAGE", "Resource", "Resource", "ref", NULL},
+                       {"USAGE", "Resource", "Struct", "ref", "crd-type"},
+                       {"IMPORTS", NULL, "Module", "via", "helm_release_values"},
+                       {"USAGE", NULL, "Table", "via", "sql_relation"},
+                       {"USAGE", NULL, "View", "via", "sql_relation"},
+                       {"USAGE", NULL, "Model", "via", "sql_relation"}};
+
+static bool projection_keeps(const cbm_gbuf_t *graph, const cbm_gbuf_edge_t *edge) {
+    const cbm_gbuf_node_t *source = NULL, *target = NULL;
+    for (size_t i = 0; i < sizeof(projection_kept) / sizeof(projection_kept[0]); i++) {
+        if (strcmp(edge->type, projection_kept[i].relation))
+            continue;
+        if (!target) {
+            source = cbm_gbuf_find_by_id(graph, edge->source_id);
+            target = cbm_gbuf_find_by_id(graph, edge->target_id);
+        }
+        if (!source || !target || !target->label ||
+            strcmp(target->label, projection_kept[i].target_label) ||
+            (projection_kept[i].source_label &&
+             (!source->label || strcmp(source->label, projection_kept[i].source_label))))
+            continue;
+        /* Most CALLS target a Function: the substring settles those without a parse. */
+        const char *props = edge->properties_json;
+        if (!props || !strstr(props, projection_kept[i].value ? projection_kept[i].value
+                                                              : projection_kept[i].key))
+            continue;
+        yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+        const char *value =
+            yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), projection_kept[i].key));
+        bool kept =
+            value && (!projection_kept[i].value || !strcmp(value, projection_kept[i].value));
+        yyjson_doc_free(doc);
+        if (kept)
+            return true;
+    }
+    return false;
+}
+
 bool cbm_shared_resolver_project(cbm_gbuf_t *graph) {
     if (!graph || !cbm_gbuf_resolutions_complete(graph))
         return false;
@@ -4979,7 +5033,7 @@ bool cbm_shared_resolver_project(cbm_gbuf_t *graph) {
     static const char *const labels[] = {"CALLS",  "USAGE",     "CALL_REFERENCE", "READS",
                                          "WRITES", "USES_TYPE", "IMPORTS"};
     for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
-        if (cbm_gbuf_delete_edges_by_type(graph, labels[i]) < 0) {
+        if (cbm_gbuf_delete_edges_by_type_unless(graph, labels[i], projection_keeps) < 0) {
             cbm_free(CBM_MEM_CLASS_EXTRACT, ordered);
             return false;
         }
