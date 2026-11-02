@@ -2743,6 +2743,154 @@ TEST(cli_no_hooks_plan_covers_every_hook_installer_family) {
     PASS();
 }
 
+/* Counts the PreToolUse hooks in a Codex hooks.json: ours run hook-augment, the
+ * foreign one is matched by its exact command. */
+static void test_codex_pretool_hook_counts(const char *path, const char *foreign_command,
+                                           size_t *owned, size_t *foreign) {
+    *owned = 0U;
+    *foreign = 0U;
+    char *text = read_test_file_alloc(path);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *hooks = root ? yyjson_obj_get(root, "hooks") : NULL;
+    yyjson_val *entries = hooks ? yyjson_obj_get(hooks, "PreToolUse") : NULL;
+    size_t entry_index;
+    size_t entry_count;
+    yyjson_val *entry;
+    if (entries && yyjson_is_arr(entries)) {
+        yyjson_arr_foreach(entries, entry_index, entry_count, entry) {
+            yyjson_val *entry_hooks = yyjson_obj_get(entry, "hooks");
+            size_t hook_index;
+            size_t hook_count;
+            yyjson_val *hook;
+            if (!entry_hooks || !yyjson_is_arr(entry_hooks)) {
+                continue;
+            }
+            yyjson_arr_foreach(entry_hooks, hook_index, hook_count, hook) {
+                const char *command = yyjson_get_str(yyjson_obj_get(hook, "command"));
+                if (command && strstr(command, "hook-augment")) {
+                    (*owned)++;
+                } else if (command && strcmp(command, foreign_command) == 0) {
+                    (*foreign)++;
+                }
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    free(text);
+}
+
+/* The Codex PreToolUse Bash hook (#2719) follows the persisted opt-out in both
+ * hook representations: --no-hooks removes ours from hooks.json and from the
+ * config.toml managed block, a bare install keeps it off, the user's own
+ * PreToolUse hook and the MCP entry stay, and --hooks restores ours. */
+TEST(cli_no_hooks_removes_codex_pretool_hook) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-codex-no-hooks-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "CODEX_HOME", "PATH"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char codex_dir[640];
+    char hooks_path[768];
+    char config_path[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    test_mkdirp(codex_dir);
+    /* An installed binary at the default target names the Codex hook command;
+     * without it --skip-binary would configure the test runner itself. */
+    char binary_dir[640];
+    char binary_path[768];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(binary_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    write_test_file(binary_path, "installed binary\n");
+    const char *foreign_command = "/usr/bin/foreign-shell-audit";
+    write_test_file(hooks_path,
+                    "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":"
+                    "\"command\",\"command\":\"/usr/bin/foreign-shell-audit\"}]}]}}\n");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    size_t owned = 0U;
+    size_t foreign = 0U;
+    char *default_args[] = {"--skip-binary", "--clients=codex", "--yes"};
+    int default_rc = cli_test_cmd_install(3, default_args);
+    test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
+    bool default_json = default_rc == 0 && owned == 1U && foreign == 1U;
+
+    char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=codex", "--yes"};
+    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
+    char *json_state = read_test_file_alloc(hooks_path);
+    char *toml_state = read_test_file_alloc(config_path);
+    bool json_disabled = no_hooks_rc == 0 && owned == 0U && foreign == 1U && json_state &&
+                         !strstr(json_state, "hook-augment");
+    bool json_mcp_kept = toml_state && strstr(toml_state, "[mcp_servers.codebase-memory-mcp]") &&
+                         !strstr(toml_state, "hook-augment");
+    free(json_state);
+    free(toml_state);
+
+    int bare_rc = cli_test_cmd_install(3, default_args);
+    test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
+    bool bare_disabled = bare_rc == 0 && owned == 0U && foreign == 1U;
+
+    /* Without hooks.json the config.toml managed block carries the hooks. */
+    (void)remove(hooks_path);
+    char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=codex", "--yes"};
+    int toml_enable_rc = cli_test_cmd_install(4, hooks_args);
+    toml_state = read_test_file_alloc(config_path);
+    bool toml_enabled = toml_enable_rc == 0 && toml_state &&
+                        test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
+    free(toml_state);
+    int toml_disable_rc = cli_test_cmd_install(4, no_hooks_args);
+    toml_state = read_test_file_alloc(config_path);
+    bool toml_disabled = toml_disable_rc == 0 && toml_state &&
+                         !strstr(toml_state, "hooks.PreToolUse") &&
+                         !strstr(toml_state, "hook-augment") &&
+                         strstr(toml_state, "[mcp_servers.codebase-memory-mcp]");
+    free(toml_state);
+    int restore_rc = cli_test_cmd_install(4, hooks_args);
+    toml_state = read_test_file_alloc(config_path);
+    bool restored = restore_rc == 0 && toml_state &&
+                    test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
+    free(toml_state);
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(default_json);
+    ASSERT_TRUE(json_mcp_kept);
+    ASSERT_TRUE(toml_enabled);
+    ASSERT_TRUE(toml_disabled);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(json_disabled);
+    ASSERT_TRUE(bare_disabled);
+    PASS();
+}
+
 TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-reset-XXXXXX");
@@ -20433,6 +20581,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
     RUN_TEST(cli_install_hooks_preference_persists_and_migrates_owned_state);
     RUN_TEST(cli_no_hooks_plan_covers_every_hook_installer_family);
+    RUN_TEST(cli_no_hooks_removes_codex_pretool_hook);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
     RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);

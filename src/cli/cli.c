@@ -10755,7 +10755,13 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                 int json_result = !cbm_file_exists(hooks_json)
                                       ? CLI_OK
                                       : cbm_remove_paired_lifecycle_hooks_json(hooks_json, command);
-                hook_ok = toml_result == CLI_OK && json_result == CLI_OK;
+                /* #2719: the PreToolUse Bash hook shares hooks.json with the
+                 * lifecycle pair, so the opt-out removes it the way uninstall does. */
+                int pretool_result = !cbm_file_exists(hooks_json)
+                                         ? CLI_OK
+                                         : cbm_remove_codex_pretool_hooks_json(hooks_json, command);
+                hook_ok =
+                    toml_result == CLI_OK && json_result == CLI_OK && pretool_result == CLI_OK;
             } else if (!dry_run && use_hooks_json) {
                 hook_ok =
                     cbm_upsert_paired_lifecycle_hooks_json(hooks_json, command, command_windows,
