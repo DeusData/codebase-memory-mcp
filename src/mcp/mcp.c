@@ -21589,18 +21589,18 @@ bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv) {
     if (srv && srv->config) {
         return cbm_mcp_ignore_worktrees_enabled(srv);
     }
-    const char *cache_dir = cbm_resolve_cache_dir();
-    if (!cache_dir) {
+    const char *store_dir = cbm_resolve_cache_dir();
+    if (!store_dir) {
         return false;
     }
     char store_path[CBM_SZ_4K];
-    int written = snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache_dir);
+    int written = snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, store_dir);
     cbm_path_info_t info;
     if (written < 0 || (size_t)written >= sizeof(store_path) ||
         cbm_path_info_utf8(store_path, &info) != CBM_PATH_INFO_OK || !info.is_regular) {
         return false;
     }
-    cbm_config_t *config = cbm_config_open(cache_dir);
+    cbm_config_t *config = cbm_config_open(store_dir);
     bool enabled = config && cbm_config_get_bool(config, CBM_CONFIG_IGNORE_WORKTREES, false);
     cbm_config_close(config);
     return enabled;
