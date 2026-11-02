@@ -1,0 +1,19 @@
+{
+  "grammars": [
+    {
+      "name": "vbnet",
+      "camelcase": "Vbnet",
+      "scope": "source.vbnet",
+      "path": ".",
+      "file-types": ["vb"]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0-cbm.1",
+    "license": "MIT",
+    "description": "CBM fork of tree-sitter-vbnet with real-world VB.NET coverage",
+    "links": {
+      "repository": "https://github.com/govindbanura/tree-sitter-vbnet"
+    }
+  }
+}

@@ -13,6 +13,7 @@ extern const TSLanguage *tree_sitter_rust(void);
 extern const TSLanguage *tree_sitter_java(void);
 extern const TSLanguage *tree_sitter_cpp(void);
 extern const TSLanguage *tree_sitter_c_sharp(void);
+extern const TSLanguage *tree_sitter_vbnet(void);
 extern const TSLanguage *tree_sitter_php_only(void);
 extern const TSLanguage *tree_sitter_lua(void);
 extern const TSLanguage *tree_sitter_scala(void);
@@ -396,6 +397,31 @@ static const char *cs_assign_types[] = {"assignment_expression", "postfix_unary_
                                         "prefix_unary_expression", NULL};
 static const char *cs_throw_types[] = {"throw_statement", "throw_expression", NULL};
 static const char *cs_decorator_types[] = {"attribute", NULL};
+
+// ==================== Visual Basic .NET ====================
+static const char *vb_func_types[] = {
+    "method_declaration", "constructor_declaration", "external_method_declaration",
+    "interface_method_declaration", "abstract_method_declaration", "operator_declaration",
+    "lambda_expression", NULL};
+static const char *vb_class_types[] = {
+    "class_declaration", "module_declaration", "interface_declaration",
+    "structure_declaration", "enum_declaration", "delegate_declaration", NULL};
+static const char *vb_field_types[] = {
+    "field_declaration", "property_declaration", "interface_property_declaration",
+    "abstract_property_declaration", "event_declaration", "interface_event_declaration",
+    "custom_event_declaration", "enum_member_declaration", NULL};
+static const char *vb_module_types[] = {"source_file", NULL};
+static const char *vb_call_types[] = {
+    "invocation_expression", "generic_invocation_expression", "array_access_expression",
+    "object_creation_expression", NULL};
+static const char *vb_import_types[] = {"imports_statement", NULL};
+static const char *vb_branch_types[] = {
+    "if_statement", "for_statement", "for_each_statement", "while_statement",
+    "do_statement", "select_statement", "case_clause", "try_statement", NULL};
+static const char *vb_var_types[] = {"field_declaration", "declaration_statement", NULL};
+static const char *vb_assign_types[] = {"assignment_statement", "assignment_expression", NULL};
+static const char *vb_throw_types[] = {"throw_statement", NULL};
+static const char *vb_decorator_types[] = {"attribute", "attribute_list", NULL};
 
 // ==================== PHP ====================
 static const char *php_func_types[] = {"function_static_declaration", "anonymous_function",
@@ -2751,6 +2777,13 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                         plsql_module_types, plsql_call_types, empty_types, empty_types,
                         plsql_branch_types, empty_types, plsql_assign_types, plsql_throw_types,
                         NULL, empty_types, NULL, NULL, tree_sitter_plsql, NULL},
+
+    // CBM_LANG_VISUALBASIC
+    [CBM_LANG_VISUALBASIC] = {
+        CBM_LANG_VISUALBASIC, vb_func_types, vb_class_types, vb_field_types, vb_module_types,
+        vb_call_types, vb_import_types, vb_import_types, vb_branch_types, vb_var_types,
+        vb_assign_types, vb_throw_types, NULL, vb_decorator_types, NULL, NULL,
+        tree_sitter_vbnet, NULL},
 
 };
 

@@ -50,6 +50,7 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* C# */
     {".cs", CBM_LANG_CSHARP},
+    {".vb", CBM_LANG_VISUALBASIC},
     /* Blazor components. The C# grammar recovers the @code block; the
      * surrounding markup parses as ERROR regions and is reported via
      * parse_partial, which is why this is a best-effort mapping rather
@@ -787,6 +788,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_JAVA] = "Java",
     [CBM_LANG_CPP] = "C++",
     [CBM_LANG_CSHARP] = "C#",
+    [CBM_LANG_VISUALBASIC] = "Visual Basic .NET",
     [CBM_LANG_PHP] = "PHP",
     [CBM_LANG_LUA] = "Lua",
     [CBM_LANG_SCALA] = "Scala",

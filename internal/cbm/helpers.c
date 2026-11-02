@@ -444,6 +444,8 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
         return has_suffix(base, "Test.php");
     case CBM_LANG_CSHARP:
         return has_suffix(base, "Tests.cs") || has_suffix(base, "Test.cs");
+    case CBM_LANG_VISUALBASIC:
+        return has_suffix(base, "Tests.vb") || has_suffix(base, "Test.vb");
     case CBM_LANG_CPP:
     case CBM_LANG_C:
         return has_suffix(base, "_test.c") || has_suffix(base, "_test.cc") ||
@@ -599,6 +601,9 @@ bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     }
     if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         return strcmp(kind, "internal_module") == 0;
+    }
+    if (lang == CBM_LANG_VISUALBASIC) {
+        return strcmp(kind, "namespace_declaration") == 0;
     }
     return false;
 }

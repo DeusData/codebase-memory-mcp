@@ -1,0 +1,490 @@
+==================
+Variable Declarations
+==================
+
+Module TestModule
+    Sub Test()
+        Dim x As Integer
+        Dim y As String = "Hello"
+        Dim z = 123
+        Static a, b As Double
+    End Sub
+End Module
+
+---
+
+(source_file
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list)
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (as_clause
+            (predefined_type))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (as_clause
+            (predefined_type))
+          (string_literal)))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (integer_literal)))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier))
+        (variable_declarator
+          (identifier)
+          (as_clause
+            (predefined_type)))))))
+
+==================
+Class and Member Declarations
+==================
+
+Public Class MyClass
+    Inherits System.Object
+    Implements IDisposable
+
+    Private _field As Integer
+
+    Public Event MyEvent(sender As Object, e As EventArgs)
+
+    Public Sub New()
+        _field = 0
+    End Sub
+
+    Public Function GetValue() As Integer
+        Return _field
+    End Function
+
+    Public Property Value As Integer
+        Get
+            Return _field
+        End Get
+        Set(value As Integer)
+            _field = value
+        End Set
+    End Property
+End Class
+
+---
+
+(source_file
+  (class_declaration
+    (member_modifier)
+    (identifier)
+    (inherits_statement
+      (qualified_name
+        (simple_name
+          (identifier))
+        (simple_name
+          (identifier))))
+    (implements_statement
+      (simple_name
+        (identifier)))
+    (field_declaration
+      (member_modifier)
+      (variable_declarator
+        (identifier)
+        (as_clause
+          (predefined_type))))
+    (event_declaration
+      (member_modifier)
+      (identifier)
+      (parameter_list
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type)))
+        (parameter
+          (identifier)
+          (as_clause
+            (simple_name
+              (identifier))))))
+    (constructor_declaration
+      (member_modifier)
+      (parameter_list)
+      (assignment_statement
+        (identifier)
+        (integer_literal)))
+    (method_declaration
+      (member_modifier)
+      (identifier)
+      (parameter_list)
+      (as_clause
+        (predefined_type))
+      (return_statement
+        (identifier)))
+    (property_declaration
+      (member_modifier)
+      (identifier)
+      (as_clause
+        (predefined_type))
+      (property_getter
+        (return_statement
+          (identifier)))
+      (property_setter
+        (parameter
+          (identifier)
+          (as_clause
+            (predefined_type)))
+        (assignment_statement
+          (identifier)
+          (identifier))))))
+
+==================
+Control Flow: If Statement
+==================
+
+If x > 10 Then
+    Console.WriteLine("Greater")
+ElseIf x < 10 Then
+    Console.WriteLine("Less")
+Else
+    Console.WriteLine("Equal")
+End If
+
+---
+
+(source_file
+  (if_statement
+    (binary_expression
+      (identifier)
+      (integer_literal))
+    (expression_statement
+      (array_access_expression
+        (member_access_expression
+          (identifier)
+          (identifier))
+        (string_literal)))
+    (elseif_clause
+      (binary_expression
+        (identifier)
+        (integer_literal))
+      (expression_statement
+        (array_access_expression
+          (member_access_expression
+            (identifier)
+            (identifier))
+          (string_literal))))
+    (else_clause
+      (expression_statement
+        (array_access_expression
+          (member_access_expression
+            (identifier)
+            (identifier))
+          (string_literal))))))
+
+==================
+Control Flow: Select Case
+==================
+
+Select Case x
+    Case 1
+        ' Do something
+    Case 2, 3
+        ' Do something else
+    Case Is > 10
+        ' Do another thing
+    Case Else
+        ' Default
+End Select
+
+---
+
+(source_file
+  (select_statement
+    (identifier)
+    (case_clause
+      (case_value
+        (integer_literal))
+      (comment))
+    (case_clause
+      (case_value
+        (integer_literal))
+      (case_value
+        (integer_literal))
+      (comment))
+    (case_clause
+      (case_value
+        (integer_literal))
+      (comment))
+    (case_else_clause
+      (comment))))
+
+==================
+Control Flow: Loops
+==================
+
+For i As Integer = 1 To 10 Step 2
+    ' Loop
+Next i
+
+For Each item In collection
+    ' Loop
+Next
+
+Do While x < 100
+    x += 1
+Loop
+
+Do
+    x -= 1
+Loop Until x = 0
+
+---
+
+(source_file
+  (for_statement
+    (identifier)
+    (as_clause
+      (predefined_type))
+    (integer_literal)
+    (integer_literal)
+    (integer_literal)
+    (comment)
+    (identifier))
+  (for_each_statement
+    (identifier)
+    (identifier)
+    (comment))
+  (do_statement
+    (binary_expression
+      (identifier)
+      (integer_literal))
+    (assignment_statement
+      (identifier)
+      (integer_literal)))
+  (do_statement
+    (assignment_statement
+      (identifier)
+      (integer_literal))
+    (binary_expression
+      (identifier)
+      (integer_literal))))
+
+==================
+Expressions and Operators
+==================
+
+Module TestModule
+    Sub Test()
+        Dim a = 1 + 2 * 3 ^ 4
+        Dim b = (1 + 2) * 3
+        Dim c = -a
+        Dim d = x IsNot Nothing AndAlso y > 0
+        Dim e = If(a > b, a, b)
+    End Sub
+End Module
+
+---
+
+(source_file
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list)
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (binary_expression
+            (integer_literal)
+            (binary_expression
+              (integer_literal)
+              (binary_expression
+                (integer_literal)
+                (integer_literal))))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (binary_expression
+            (parenthesized_expression
+              (binary_expression
+                (integer_literal)
+                (integer_literal)))
+            (integer_literal))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (unary_expression
+            (identifier))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (binary_expression
+            (binary_expression
+              (identifier)
+              (nothing_literal))
+            (binary_expression
+              (identifier)
+              (integer_literal)))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (conditional_expression
+            (binary_expression
+              (identifier)
+              (identifier))
+            (identifier)
+            (identifier)))))))
+
+==================
+Attributes and Line Continuations
+==================
+
+<Serializable()> _
+Public Class AnotherClass
+    <Obsolete("Use NewMethod instead.")>
+    Public Sub OldMethod()
+    End Sub
+End Class
+
+---
+
+(source_file
+  (class_declaration
+    (attribute_list
+      (attribute
+        (simple_name
+          (identifier))
+        (attribute_argument_list)))
+    (member_modifier)
+    (identifier)
+    (method_declaration
+      (attribute_list
+        (attribute
+          (simple_name
+            (identifier))
+          (attribute_argument_list
+            (string_literal))))
+      (member_modifier)
+      (identifier)
+      (parameter_list))))
+
+==================
+Lambda Expressions
+==================
+
+Module TestModule
+    Sub Test()
+        Dim myFunc = Function(x As Integer) x * 2
+        Dim myAction = Sub(s As String) Console.WriteLine(s)
+
+        Dim multiLine = Function(x As Integer)
+                            Dim result = x + 1
+                            Return result
+                        End Function
+    End Sub
+End Module
+
+---
+
+(source_file
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list)
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (lambda_expression
+            (lambda_parameter_list
+              (lambda_parameter
+                (identifier)
+                (as_clause
+                  (predefined_type))))
+            (binary_expression
+              (identifier)
+              (integer_literal)))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (lambda_expression
+            (lambda_parameter_list
+              (lambda_parameter
+                (identifier)
+                (as_clause
+                  (predefined_type))))
+            (array_access_expression
+              (member_access_expression
+                (identifier)
+                (identifier))
+              (identifier)))))
+      (declaration_statement
+        (local_declaration_modifier)
+        (variable_declarator
+          (identifier)
+          (lambda_expression
+            (lambda_parameter_list
+              (lambda_parameter
+                (identifier)
+                (as_clause
+                  (predefined_type))))
+            (declaration_statement
+              (local_declaration_modifier)
+              (variable_declarator
+                (identifier)
+                (binary_expression
+                  (identifier)
+                  (integer_literal))))
+            (return_statement
+              (identifier))))))))
+
+==================
+Error Handling
+==================
+
+Module TestModule
+    Sub Test()
+        Try
+            ' Risky code
+        Catch ex As Exception When ex.Message.Contains("Error")
+            ' Handle specific error
+        Finally
+            ' Cleanup
+        End Try
+    End Sub
+End Module
+
+---
+
+(source_file
+  (module_declaration
+    (identifier)
+    (method_declaration
+      (identifier)
+      (parameter_list)
+      (try_statement
+        (comment)
+        (catch_block
+          (identifier)
+          (simple_name
+            (identifier))
+          (array_access_expression
+            (member_access_expression
+              (member_access_expression
+                (identifier)
+                (identifier))
+              (identifier))
+            (string_literal))
+          (comment))
+        (finally_block
+          (comment))))))
